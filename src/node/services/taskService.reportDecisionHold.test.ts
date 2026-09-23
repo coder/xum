@@ -19,6 +19,7 @@ import { ContextManagementService } from "@/node/services/contextManagement/cont
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
+import { readSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import { TaskService } from "@/node/services/taskService";
 import {
   createMockInitStateManager,
@@ -919,6 +920,127 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // The hold came from the decision alone: no ownership (settlement/receipt authority) granted.
       expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
       expect(entryOf(config, childId)?.taskAttemptId).toBe(redriven);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("an unowned re-drive whose row another backend re-admitted meanwhile: its stream end neither fences the successor's input nor publishes its report as the successor's", async () => {
+    const childId = "holdredrive002";
+    const foreign = "att_00000000000000b7";
+    const stack = await createStack(childId, { taskStatus: "running" });
+    const { config, taskService, svc, workspaceService, completions, streamStarts, sendOptions } =
+      stack;
+    const otherBackend = await createTestConfig(rootDir);
+    try {
+      await taskService.recoverInterruptedTasks();
+      await until(() => completions.length === 1, "the re-drive's stream");
+      const redriven = entryOf(config, childId)?.taskAttemptId;
+      expect(redriven).not.toBe("att_00000000000000a4");
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      // Backend B admits the row under its own attempt while this backend's stream still runs.
+      await otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === childId);
+          if (ws) {
+            ws.taskStatus = "running";
+            ws.taskAttemptId = foreign;
+            ws.taskAttemptUnproven = true;
+          }
+        }
+        return cfg;
+      });
+      // A follow-up sent now is bound to B (the current row) and queued behind the live stream.
+      expect(await workspaceService.sendMessage(childId, "b follow-up", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+      // The re-driven attempt's stream ends on a terminal agent_report.
+      stack.endStream(0, { report: "done by the re-drive" }, true);
+      // No decision of the ended stream is ever keyed by B.
+      expect(
+        (svc.streamEndDecisionsByTaskId.get(childId) ?? []).map((decision) => decision.attemptId)
+      ).not.toContain(foreign);
+      await until(() => completions.length === 2, "B's follow-up dispatched");
+      await yieldMacrotasks(20);
+      // B's input ran under B, unfenced by the re-drive's report; nothing was handed back.
+      expect(streamStarts[1]).toMatchObject({ row: foreign, status: "running" });
+      expect(stack.restoreEvents()).toHaveLength(0);
+      // B's row is exactly as its writer left it, and no report was published for it.
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: foreign,
+        taskAttemptUnproven: true,
+      });
+      expect(entryOf(config, childId)?.reportedAt).toBeUndefined();
+      expect(
+        await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
+      ).toBeNull();
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("an unowned re-drive's report publication is a CAS on its admitted attempt: a row re-admitted during the publication's own awaits is left to its writer", async () => {
+    const childId = "holdredrive003";
+    const foreign = "att_00000000000000b8";
+    const stack = await createStack(childId, { taskStatus: "running" });
+    const { config, taskService, svc, completions } = stack;
+    const otherBackend = await createTestConfig(rootDir);
+    try {
+      await taskService.recoverInterruptedTasks();
+      await until(() => completions.length === 1, "the re-drive's stream");
+      const redriven = entryOf(config, childId)?.taskAttemptId;
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      // Backend B re-admits the row right before the publication's status write, i.e. after
+      // every earlier check of the stream-end handler read the re-driven attempt.
+      let rotated = false;
+      const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+      spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        const probe = structuredClone(entryOf(config, childId));
+        if (id === childId && !rotated && probe != null) {
+          updater(probe, config.loadConfigOrDefault());
+          if (probe.taskStatus === "reported") {
+            rotated = true;
+            await otherBackend.editConfig((cfg) => {
+              for (const project of cfg.projects.values()) {
+                const ws = project.workspaces.find((w) => w.id === childId);
+                if (ws) {
+                  ws.taskStatus = "running";
+                  ws.taskAttemptId = foreign;
+                  ws.taskAttemptUnproven = true;
+                }
+              }
+              return cfg;
+            });
+          }
+        }
+        return editOriginal(id, updater, options);
+      });
+      stack.endStream(0, { report: "done by the re-drive" }, true);
+      await until(() => rotated, "the publication write");
+      await until(
+        () =>
+          !(svc.streamEndDecisionsByTaskId.get(childId) ?? []).some((d) => d.outcome === "pending"),
+        "the decision resolved"
+      );
+      await yieldMacrotasks(20);
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: foreign,
+        taskAttemptUnproven: true,
+      });
+      expect(entryOf(config, childId)?.reportedAt).toBeUndefined();
+      expect(
+        await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
+      ).toBeNull();
+      // The re-drive's decision stayed keyed by its own attempt, and no ownership was granted.
+      expect(
+        (svc.streamEndDecisionsByTaskId.get(childId) ?? []).map((decision) => decision.attemptId)
+      ).not.toContain(foreign);
+      expect(redriven).not.toBe(foreign);
+      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
     } finally {
       await stack.cleanup();
     }

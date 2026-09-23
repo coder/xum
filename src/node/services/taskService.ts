@@ -329,7 +329,11 @@ type AgentReportFinalizationResult =
   | { finalized: true }
   | {
       finalized: false;
-      reason: "invalid_structured_output" | "pending_guidance" | "terminal_interrupted";
+      reason:
+        | "invalid_structured_output"
+        | "pending_guidance"
+        | "terminal_interrupted"
+        | "superseded_attempt";
       message: string;
     };
 
@@ -2770,6 +2774,23 @@ export class TaskService implements AgentTaskIntegration {
     return entry?.taskAttemptRetiredBy == null;
   }
 
+  /**
+   * The attempt an unowned stream runs under: the one its live turn was ADMITTED for (the
+   * admitted obligation bound to the session's active turn), never the row as read now — another
+   * backend may have re-admitted the row under its own attempt while this stream ran, and this
+   * stream's end must neither decide for nor publish as that attempt. Falls back to the persisted
+   * id only for a turn admitted without an obligation (pre-identity/legacy paths).
+   */
+  private streamAttemptIdWithoutOwner(taskId: string): string | undefined {
+    const turn = this.workspaceService.getActiveTurnGeneration(taskId);
+    if (turn != null) {
+      for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
+        if (send.state === "admitted" && send.turnId === turn) return send.attemptId;
+      }
+    }
+    return this.currentTaskAttemptId(taskId);
+  }
+
   /** Sends admitted against the task's current attempt that have not claimed a turn yet. */
   private hasPendingAdmissions(taskId: string): boolean {
     const current = this.currentTaskAttemptId(taskId);
@@ -3562,7 +3583,7 @@ export class TaskService implements AgentTaskIntegration {
         unownedAttemptId: undefined as string | undefined,
       };
       if (taskOrigin.ownedAttempt == null) {
-        taskOrigin.unownedAttemptId = this.currentTaskAttemptId(payload.workspaceId);
+        taskOrigin.unownedAttemptId = this.streamAttemptIdWithoutOwner(payload.workspaceId);
       }
       // The decision this handler owes for the attempt's ended stream, registered in the event's
       // own tick so the session's turn-completion drain (a later microtask) finds it.
@@ -14428,7 +14449,9 @@ export class TaskService implements AgentTaskIntegration {
       stopEpoch: this.getWorkspaceStopEpoch(event.workspaceId),
       ownedAttempt: fallbackOwnedAttempt,
       unownedAttemptId:
-        fallbackOwnedAttempt == null ? this.currentTaskAttemptId(event.workspaceId) : undefined,
+        fallbackOwnedAttempt == null
+          ? this.streamAttemptIdWithoutOwner(event.workspaceId)
+          : undefined,
     };
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
@@ -14472,6 +14495,24 @@ export class TaskService implements AgentTaskIntegration {
     // attribution snapshot; retaining its receipts would grow the session map on every cut.
     if (!entry?.workspace.parentWorkspaceId) discardCutReceipt();
     if (!entry) return;
+    // An unowned stream whose row another writer re-admitted meanwhile (A → B, e.g. a second
+    // backend): its end is A's alone. Nothing below may run for B — no report publication, status
+    // write or recovery prompt — and A's decision resolves in the listener's finally (its held
+    // entries then meet the stale attempt at their own gates). Ownership stays untouched.
+    if (
+      entry.workspace.parentWorkspaceId &&
+      taskOrigin.ownedAttempt == null &&
+      taskOrigin.unownedAttemptId != null &&
+      this.currentTaskAttemptId(workspaceId, entry.workspace) !== taskOrigin.unownedAttemptId
+    ) {
+      log.info("[task-attempt] stream end ignored: its attempt was superseded by another writer", {
+        workspaceId,
+        attemptId: taskOrigin.unownedAttemptId,
+        messageId: event.messageId,
+      });
+      discardCutReceipt();
+      return;
+    }
     const taskIndex = this.buildAgentTaskIndex(cfg);
 
     // Parent workspaces must not end while they have active background tasks/workflows.
@@ -14898,7 +14939,8 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
         entry,
         reportArgs,
-        taskOrigin.ownedAttempt
+        taskOrigin.ownedAttempt,
+        taskOrigin.unownedAttemptId
       );
       if (finalization.finalized) {
         await this.finalizeTerminationPhaseForReportedTask(workspaceId);
@@ -16277,7 +16319,13 @@ export class TaskService implements AgentTaskIntegration {
       planFilePath?: string;
     },
     /** The attempt whose stream carried this report (see releaseReportedTaskAttempt). */
-    reportedAttempt: OwnedTaskAttempt | undefined
+    reportedAttempt: OwnedTaskAttempt | undefined,
+    /**
+     * Without an owner: the attempt the reporting stream was admitted under
+     * (streamAttemptIdWithoutOwner). The publication is a CAS on it — a row another writer
+     * re-admitted meanwhile is theirs, and this report is never published as theirs.
+     */
+    unownedReportedAttemptId?: string
   ): Promise<AgentReportFinalizationResult> {
     this.markTaskForegroundRelevant(childWorkspaceId);
 
@@ -16370,12 +16418,20 @@ export class TaskService implements AgentTaskIntegration {
         childEntry,
         latestEntryBeforeReport,
         reportArgs,
-        reportedAttempt
+        reportedAttempt,
+        reportedAttempt == null ? unownedReportedAttemptId : undefined
       );
     const published =
       bestOfParentWorkspaceId != null
         ? await this.deferredBestOfLocks.withLock(bestOfParentWorkspaceId, publish)
         : await publish();
+    if (published === "superseded") {
+      return {
+        finalized: false,
+        reason: "superseded_attempt",
+        message: "The task was re-admitted under another attempt; this report was not published.",
+      };
+    }
     if (!published) {
       return { finalized: true };
     }
@@ -16514,20 +16570,35 @@ export class TaskService implements AgentTaskIntegration {
       structuredOutput?: unknown;
       planFilePath?: string;
     },
-    reportedAttempt: OwnedTaskAttempt | undefined
-  ): Promise<{
-    parentWorkspaceId: string;
-    latestChildEntry: { projectPath: string; workspace: WorkspaceConfigEntry } | null | undefined;
-    isWorkflowOwnedChildReport: boolean;
-  } | null> {
-    // An unowned stream's decision (see StreamEndDecision) is keyed by the persisted attempt id
-    // the report is published for: the row as read before this report.
+    reportedAttempt: OwnedTaskAttempt | undefined,
+    /** See finalizeAgentTaskReport: the unowned stream's admitted attempt (CAS on the row). */
+    expectedUnownedAttemptId?: string
+  ): Promise<
+    | {
+        parentWorkspaceId: string;
+        latestChildEntry:
+          | { projectPath: string; workspace: WorkspaceConfigEntry }
+          | null
+          | undefined;
+        isWorkflowOwnedChildReport: boolean;
+      }
+    | null
+    | "superseded"
+  > {
+    // An unowned stream's decision (see StreamEndDecision) is keyed by the attempt the stream was
+    // admitted under when the caller knows it, else by the row as read before this report.
     const unownedReportedAttemptId =
-      reportedAttempt == null ? latestEntryBeforeReport?.workspace.taskAttemptId : undefined;
+      reportedAttempt == null
+        ? (expectedUnownedAttemptId ?? latestEntryBeforeReport?.workspace.taskAttemptId)
+        : undefined;
+    let superseded = false;
     // Notify clients immediately even if we can't delete the workspace yet.
     await this.editWorkspaceEntry(
       childWorkspaceId,
       (ws) => {
+        superseded =
+          expectedUnownedAttemptId != null && ws.taskAttemptId !== expectedUnownedAttemptId;
+        if (superseded) return;
         ws.taskStatus = "reported";
         ws.reportedAt = getIsoNow();
         // Successful completion resets the persisted recovery circuit breaker.
@@ -16535,6 +16606,23 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    if (superseded) {
+      log.info(
+        "[task-attempt] report not published: its attempt was superseded by another writer",
+        {
+          childWorkspaceId,
+          attemptId: expectedUnownedAttemptId,
+        }
+      );
+      // Never a continuation of the reporting attempt; its held entries are refused (they also
+      // read stale at their own gates, since the row names another attempt).
+      this.resolveStreamEndDecision(
+        childWorkspaceId,
+        this.findPendingStreamEndDecision(childWorkspaceId, undefined, expectedUnownedAttemptId),
+        "indeterminate"
+      );
+      return "superseded";
+    }
     this.clearTaskRecovery(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at
     // the parent's queue head as tool-end entries, the parent's stream stops at its next step
