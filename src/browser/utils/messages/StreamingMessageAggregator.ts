@@ -2090,7 +2090,10 @@ export class StreamingMessageAggregator {
     this.backgroundHandoffCompletion = undefined;
     const routeProvider = resolveRouteProvider(data.routeProvider, data.routedThroughGateway);
 
+    // A hidden token-budget flush turn is maintenance, not a reply: never notify with
+    // output the transcript intentionally hides (e.g. a resumed flush with no continuation).
     const suppressNotification =
+      data.muxMetadata?.contextBudgetFlush === true ||
       this.isDefaultPostCompactionContinueTurn() ||
       this.getLatestUnresolvedCompactionRequest()?.parsed.followUpContent?.dispatchOptions
         ?.source === "internal-resume";
@@ -3717,11 +3720,13 @@ export class StreamingMessageAggregator {
       // window is sealed), not a reply to the user. Its trigger row is already a hidden
       // synthetic user row; the assistant output it produces carries the same turn flag on
       // the live stream, the recovered partial, and the settled history row, so hide the
-      // whole turn by that flag rather than by the text it happens to emit.
+      // whole turn by that flag rather than by the text it happens to emit. A failed flush
+      // stays visible: its error row and retry controls are the only explanation the user gets.
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
         !showSyntheticMessages &&
         ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
-          message.metadata?.muxMetadata?.contextBudgetFlush === true ||
+          (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
+            message.metadata.error == null) ||
           isWorkflowResultMessage(message));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.

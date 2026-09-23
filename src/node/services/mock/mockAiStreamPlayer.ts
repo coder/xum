@@ -743,6 +743,9 @@ export class MockAiStreamPlayer {
           ...(event.mode && { mode: event.mode }),
           ...(event.agentId && { agentId: event.agentId }),
           ...(event.thinkingLevel && { thinkingLevel: event.thinkingLevel }),
+          // Same turn metadata the real StreamManager sends at start, so the renderer can
+          // classify the turn (e.g. hide a token-budget flush) before the first delta.
+          ...(active.muxMetadata && { muxMetadata: active.muxMetadata }),
         };
         active.model = event.model;
         active.startTime = payload.startTime;
