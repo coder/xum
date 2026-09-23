@@ -11,6 +11,7 @@ import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStora
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { AttachmentService } from "@/node/services/attachmentService";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
+import { copyPlanFileAcrossRuntimes } from "@/node/utils/runtime/helpers";
 import { drainFifoReaders } from "./fifoRelease";
 import {
   cleanupTempGitRepo,
@@ -157,6 +158,40 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     });
     await fs.rm(legacyPlanPath);
   }, 60_000);
+
+  test("six overlapping fork plan copies from a writer-less canonical FIFO settle safely", async () => {
+    // Every fork copies the source plan via copyPlanFileAcrossRuntimes (not readPlanFile), so it
+    // needs its own guard: a canonical FIFO is skipped and the regular legacy plan is copied.
+    const runtime = new LocalRuntime(repoPath);
+    const legacyPlanPath = expandTilde(getLegacyPlanFilePath(workspaceId, runtime.getXumHome()));
+    const targetNames = Array.from({ length: 6 }, (_, i) => `${workspaceName}-fork-copy-${i}`);
+    const targetPaths = targetNames.map((name) =>
+      expandTilde(getPlanFilePath(name, projectName, runtime.getXumHome()))
+    );
+    await fs.rm(planPath, { force: true });
+    execFileSync("mkfifo", [planPath]);
+    await fs.writeFile(legacyPlanPath, "# legacy\n");
+
+    const copies = targetNames.map((name) =>
+      copyPlanFileAcrossRuntimes(runtime, runtime, workspaceName, workspaceId, name, projectName)
+    );
+    let drain: Awaited<ReturnType<typeof drainFifoReaders>> | undefined;
+    try {
+      await settleWithin(fs.stat(env.config.rootDir), 2000, "unrelated fs.stat");
+      const listed = await settleWithin(env.orpc.workspace.list({}), 5000, "workspace.list");
+      expect(listed.some((w) => w.id === workspaceId)).toBe(true);
+      await settleWithin(Promise.all(copies), 5000, "6 x copyPlanFileAcrossRuntimes");
+      for (const targetPath of targetPaths) {
+        expect(await fs.readFile(targetPath, "utf8")).toBe("# legacy\n");
+      }
+    } finally {
+      drain = await drainFifoReaders(planPath, copies);
+      await fs.rm(planPath, { force: true });
+      await fs.rm(legacyPlanPath, { force: true });
+      for (const targetPath of targetPaths) await fs.rm(targetPath, { force: true });
+    }
+    expect(drain.settled).toBe(true);
+  }, 30_000);
 
   test("regular file and symlink to a regular file read normally", async () => {
     const content = "# Plan\n\nStep one.\n";

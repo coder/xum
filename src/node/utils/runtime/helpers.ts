@@ -215,7 +215,7 @@ export async function movePlanFile(
  * Copy a plan file across runtimes (e.g., during fork where source/target may be
  * different containers). Uses separate runtime handles to avoid the identity mutation
  * bug where DockerRuntime.forkWorkspace() changes this.containerName to the target.
- * Silently succeeds if source file doesn't exist at either location.
+ * Silently succeeds if no regular source file exists at either location.
  */
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
@@ -233,7 +233,11 @@ export async function copyPlanFileAcrossRuntimes(
 
   for (const candidatePath of [sourcePath, legacySourcePath]) {
     try {
-      const content = await readFileString(sourceRuntime, candidatePath);
+      // Same guard as readPlanFile: every fork reads this user/agent-writable path, so a FIFO
+      // there must be skipped (as missing) instead of parking a reader per fork.
+      const content = await readFileString(sourceRuntime, candidatePath, undefined, {
+        requireRegularFile: true,
+      });
       await writeFileString(targetRuntime, targetPath, content);
       return;
     } catch {
