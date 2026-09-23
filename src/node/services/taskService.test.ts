@@ -6788,6 +6788,7 @@ describe("TaskService", () => {
           }).getWorkspacePath(secondaryProjectPath, queuedWorkspaceName),
         },
       ],
+      projects,
     });
 
     await config.editConfig(() => ({

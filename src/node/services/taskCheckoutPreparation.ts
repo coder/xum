@@ -10,6 +10,7 @@ import {
   type TaskCheckoutPreparation,
 } from "@/common/schemas/project";
 import type { Workspace } from "@/common/types/project";
+import type { ProjectRef } from "@/common/types/workspace";
 import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -67,7 +68,7 @@ export type TaskCheckoutMismatchDimension =
   | "nonce"
   /** A secondary checkout and its admin dir are both gone (the primary reports `missing`). */
   | "missing"
-  /** The proof's secondary projects are not exactly the row's `projects[1..]`, in order. */
+  /** The proof's project list (paths, names, order) is not exactly the row's `projects`. */
   | "projects";
 
 export type TaskCheckoutPreparationState =
@@ -128,6 +129,18 @@ export interface TaskCheckoutSecondaryTarget {
 export interface CapturedTaskCheckoutIdentity extends CheckoutIdentity {
   /** Multi-project tasks: every secondary checkout, claimed with the primary (proof v2). */
   secondaries?: Array<CheckoutIdentity & { projectPath: string }>;
+  /**
+   * Multi-project tasks: the row's full project list (primary first), bound by proof v2 with the
+   * secondaries — runtime reconstruction, tool paths and patch collection consume all of it.
+   */
+  projects?: ProjectRef[];
+}
+
+/** A multi-project claim target: its checkouts, and the project list the row will publish. */
+interface TaskCheckoutClaimTarget {
+  workspacePath: string;
+  secondaries?: readonly TaskCheckoutSecondaryTarget[];
+  projects?: readonly ProjectRef[];
 }
 
 /** The claimed identity, re-verified after the prune together with the nonce it carries. */
@@ -336,18 +349,23 @@ function sameCheckoutIdentity(a: CheckoutIdentity, b: CheckoutIdentity): boolean
  * directory, and the per-checkout root/admin identities already tell the checkouts apart.
  */
 export async function claimTaskCheckoutIdentity(
-  target: { workspacePath: string; secondaries?: readonly TaskCheckoutSecondaryTarget[] },
+  target: TaskCheckoutClaimTarget,
   materializationId: string
 ): Promise<CapturedTaskCheckoutIdentity | Error> {
   assert(target.workspacePath.length > 0, "claimTaskCheckoutIdentity: workspacePath required");
   assert(/^mat_[0-9a-f]{16}$/.test(materializationId), "claimTaskCheckoutIdentity: bad id");
-  assertDistinctCheckouts(target);
+  assertClaimTarget(target);
   try {
     const identity: CapturedTaskCheckoutIdentity = await claimCheckout(
       target.workspacePath,
       materializationId
     );
     if (target.secondaries === undefined || target.secondaries.length === 0) return identity;
+    // Copied field by field: the proof must carry no `undefined`-valued or foreign keys.
+    identity.projects = target.projects!.map((project) => ({
+      projectPath: project.projectPath,
+      projectName: project.projectName,
+    }));
     identity.secondaries = [];
     for (const secondary of target.secondaries) {
       const claimed = await namingSecondary(secondary.workspacePath, () =>
@@ -404,11 +422,11 @@ async function namingSecondary<T>(workspacePath: string, fn: () => Promise<T>): 
   }
 }
 
-/** A multi-project target names each checkout once (the fork orchestrator made them distinct). */
-function assertDistinctCheckouts(target: {
-  workspacePath: string;
-  secondaries?: readonly TaskCheckoutSecondaryTarget[];
-}): void {
+/**
+ * A multi-project target names each checkout once (the fork orchestrator made them distinct) and
+ * lists the row's projects, whose `[1..]` are exactly its secondaries' projects, in order.
+ */
+function assertClaimTarget(target: TaskCheckoutClaimTarget): void {
   const secondaries = target.secondaries ?? [];
   for (const secondary of secondaries) {
     assert(secondary.projectPath.length > 0, "task checkout secondary: projectPath required");
@@ -416,6 +434,12 @@ function assertDistinctCheckouts(target: {
   }
   const paths = new Set([target.workspacePath, ...secondaries.map((s) => s.workspacePath)]);
   assert(paths.size === secondaries.length + 1, "task checkout targets must be distinct paths");
+  if (secondaries.length === 0) return;
+  assert(
+    target.projects?.length === secondaries.length + 1 &&
+      secondaries.every((s, index) => target.projects![index + 1].projectPath === s.projectPath),
+    "task checkout target: projects[1..] must be the secondaries' projects, in order"
+  );
 }
 
 /**
@@ -426,7 +450,7 @@ function assertDistinctCheckouts(target: {
  * is never stamped and never published. Every secondary claimed with it is bound the same way.
  */
 export async function bindTaskCheckoutIdentity(
-  target: { workspacePath: string; secondaries?: readonly TaskCheckoutSecondaryTarget[] },
+  target: TaskCheckoutClaimTarget,
   materializationId: string,
   expected: CapturedTaskCheckoutIdentity
 ): Promise<BoundTaskCheckoutIdentity | Error> {
@@ -603,6 +627,10 @@ export function buildTaskCheckoutPreparation(
     gitdir: identity.gitdir,
   };
   const secondaries = identity.secondaries ?? [];
+  assert(
+    secondaries.length === 0 || identity.projects?.length === secondaries.length + 1,
+    "buildTaskCheckoutPreparation: a multi-project identity carries its project list"
+  );
   const proof: TaskCheckoutPreparation =
     secondaries.length === 0
       ? { v: 1, ...primary }
@@ -615,6 +643,10 @@ export function buildTaskCheckoutPreparation(
             realpath: secondary.realpath,
             root: secondary.root,
             gitdir: secondary.gitdir,
+          })),
+          projects: identity.projects!.map((project) => ({
+            projectPath: project.projectPath,
+            projectName: project.projectName,
           })),
         };
   assert(TaskCheckoutPreparationSchema.safeParse(proof).success, "built proof must be well-formed");
@@ -710,21 +742,31 @@ function deriveDedicatedRow(
     return { kind: "runtime-mismatch", detail: "row runtime config differs from the prepared one" };
   }
   if (row.path !== proof.path) return { kind: "mismatch", dimension: "path" };
-  // A multi-project task also executes in one checkout per secondary project: a v1 proof
-  // predates binding them, and a v2 proof must bind exactly the row's `projects[1..]`, in order.
-  // (The row's projects need not be signed separately: the only lists that derive are the ones
-  // the signed proof fixes.)
-  const secondaryProjects = (row.projects ?? []).slice(1).map((project) => project.projectPath);
+  // A multi-project task also executes in one checkout per secondary project, and runtime
+  // reconstruction, tool paths and patch collection consume the row's whole `projects` list
+  // (primary repository and every name included). A v1 proof predates binding any of that; a
+  // v2 proof must bind exactly the row's list — paths and names, in order — and its secondaries
+  // must be that list's `[1..]`. (The row's projects need not be signed separately: the only
+  // lists that derive are the one the signed proof fixes.)
+  const rowProjects = row.projects ?? [];
   if (proof.v === 1) {
-    if (secondaryProjects.length > 0) {
+    if (rowProjects.length > 1) {
       return {
         kind: "unsupported",
         detail: "a v1 proof binds only the primary checkout of a multi-project task",
       };
     }
   } else if (
-    proof.secondaries.length !== secondaryProjects.length ||
-    proof.secondaries.some((secondary, index) => secondary.projectPath !== secondaryProjects[index])
+    rowProjects.length !== proof.projects.length ||
+    rowProjects.some(
+      (project, index) =>
+        project.projectPath !== proof.projects[index].projectPath ||
+        project.projectName !== proof.projects[index].projectName
+    ) ||
+    proof.secondaries.length !== proof.projects.length - 1 ||
+    proof.secondaries.some(
+      (secondary, index) => secondary.projectPath !== proof.projects[index + 1].projectPath
+    )
   ) {
     return { kind: "mismatch", dimension: "projects" };
   }
