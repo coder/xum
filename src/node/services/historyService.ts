@@ -77,7 +77,7 @@ import { log } from "./log";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { safeStringifyForCounting } from "@/common/utils/tokens/safeStringifyForCounting";
-import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
+import { normalizePersistedMessage } from "@/node/utils/messages/normalizePersistedMessage";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import {
   getContextBoundaryKind,
@@ -783,7 +783,7 @@ export class HistoryService {
           const parsed: unknown = JSON.parse(raw);
           if (!isReadableHistoryMessage(parsed))
             throw new Error("Compaction partial is unreadable");
-          partial = normalizeLegacyMuxMetadata(parsed);
+          partial = normalizePersistedMessage(parsed);
         }
         // Preparation uses provider history, including archive rows exposed by a
         // heartbeat rollback. Compare that same privacy-filtered view under the locks;
@@ -1093,7 +1093,7 @@ export class HistoryService {
       }
     }
 
-    return normalizeLegacyMuxMetadata(value as MuxMessage);
+    return normalizePersistedMessage(value as MuxMessage);
   }
 
   private parseMessages(
@@ -1783,7 +1783,7 @@ export class HistoryService {
       const messages: MuxMessage[] = [];
       for (const line of lines) {
         try {
-          messages.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+          messages.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
         } catch {
           // Skip malformed lines — same self-healing behavior as readChatHistory
         }
@@ -1851,7 +1851,7 @@ export class HistoryService {
           const line = buffer.subarray(lineStart, lineEnd).toString("utf-8").trim();
           if (line.length === 0) continue;
           try {
-            collected.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+            collected.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
           } catch {
             // Skip malformed lines
           }
@@ -1865,7 +1865,7 @@ export class HistoryService {
         const line = carryoverBytes.toString("utf-8").trim();
         if (line.length > 0) {
           try {
-            collected.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+            collected.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
           } catch {
             // skip
           }
@@ -1890,7 +1890,7 @@ export class HistoryService {
     return data === null
       ? []
       : this.parseMessages(data, logLabel, (value) =>
-          normalizeLegacyMuxMetadata(value as MuxMessage)
+          normalizePersistedMessage(value as MuxMessage)
         );
   }
 
@@ -1994,7 +1994,7 @@ export class HistoryService {
           .filter(Boolean);
         for (const trimmed of rawLines) {
           try {
-            messages.push(normalizeLegacyMuxMetadata(JSON.parse(trimmed) as MuxMessage));
+            messages.push(normalizePersistedMessage(JSON.parse(trimmed) as MuxMessage));
           } catch {
             // Skip malformed lines — same self-healing behavior as readChatHistory
           }
@@ -2016,7 +2016,7 @@ export class HistoryService {
         if (line.length > 0) {
           let msg: MuxMessage;
           try {
-            msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
+            msg = normalizePersistedMessage(JSON.parse(line) as MuxMessage);
           } catch {
             return true; // Skip malformed JSON, but never swallow a visitor's I/O failure.
           }
@@ -2093,7 +2093,7 @@ export class HistoryService {
           const line = buffer.subarray(lineStart, lineEnd).toString("utf-8").trim();
           if (line.length === 0) continue;
           try {
-            messages.push(normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage));
+            messages.push(normalizePersistedMessage(JSON.parse(line) as MuxMessage));
           } catch {
             // Skip malformed lines
           }
@@ -2112,7 +2112,7 @@ export class HistoryService {
         const line = carryoverBytes.toString("utf-8").trim();
         if (line.length > 0) {
           try {
-            const msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
+            const msg = normalizePersistedMessage(JSON.parse(line) as MuxMessage);
             const shouldContinue = await visitor([msg]);
             if (shouldContinue === false) return false;
           } catch {
@@ -2784,7 +2784,7 @@ export class HistoryService {
       const partialPath = this.getPartialPath(workspaceId);
       const data = await fs.readFile(partialPath, "utf-8");
       const message: unknown = JSON.parse(data);
-      return isReadableHistoryMessage(message) ? normalizeLegacyMuxMetadata(message) : null;
+      return isReadableHistoryMessage(message) ? normalizePersistedMessage(message) : null;
     } catch (error) {
       if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
         return null;
@@ -2940,9 +2940,7 @@ export class HistoryService {
         }
         // A failed public read is not absence evidence. Re-read under both locks, and only
         // heal malformed content; a now-valid successor or an I/O error must remain intact.
-        const current = isReadableHistoryMessage(parsed)
-          ? normalizeLegacyMuxMetadata(parsed)
-          : null;
+        const current = isReadableHistoryMessage(parsed) ? normalizePersistedMessage(parsed) : null;
         await assertStillOwned();
         if (!isDeepStrictEqual(current, expected) || !isCurrent()) return Ok(false);
         // Keep the final ownership check and removal indivisible to local cancellation.
@@ -2969,7 +2967,7 @@ export class HistoryService {
       try {
         const partialPath = this.getPartialPath(workspaceId);
         const data = await fs.readFile(partialPath, "utf-8");
-        const partialMessage = normalizeLegacyMuxMetadata(JSON.parse(data) as MuxMessage);
+        const partialMessage = normalizePersistedMessage(JSON.parse(data) as MuxMessage);
         if (partialMessage.id !== messageId) {
           return Ok(false);
         }
@@ -3267,7 +3265,7 @@ export class HistoryService {
     const content = line.at(-1) === 10 ? line.subarray(0, -1) : line;
     const text = content.toString("utf8");
     const parsed = this.parseMessages(text, filePath, (value) =>
-      isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
+      isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null
     )[0];
     const protectedReset =
       parsed !== undefined &&

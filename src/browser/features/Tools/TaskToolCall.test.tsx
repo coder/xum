@@ -55,7 +55,7 @@ const workspaceTaskArgs = {
   title: "Workspace investigation",
   run_in_background: true,
 };
-const TaskToolCall = getToolComponent("task", workspaceTaskArgs);
+const TaskToolCall = getToolComponent("task", workspaceTaskArgs, undefined);
 
 function createWorkspaceMetadata(
   overrides: Partial<FrontendWorkspaceMetadata> = {}
@@ -72,7 +72,7 @@ function createWorkspaceMetadata(
 }
 
 const taskAwaitArgs = { task_ids: ["task-1"], timeout_secs: 70 };
-const TaskAwaitToolCall = getToolComponent("task_await", taskAwaitArgs);
+const TaskAwaitToolCall = getToolComponent("task_await", taskAwaitArgs, undefined);
 
 function createToolMessage(overrides: {
   toolName: string;
@@ -126,12 +126,16 @@ describe("TaskToolCall", () => {
 
   test("renders legacy variants task calls generically", () => {
     expect(
-      getToolComponent("task", {
-        subagent_type: "explore",
-        prompt: "Review ${variant}",
-        title: "Split review",
-        variants: ["frontend", "backend"],
-      })
+      getToolComponent(
+        "task",
+        {
+          subagent_type: "explore",
+          prompt: "Review ${variant}",
+          title: "Split review",
+          variants: ["frontend", "backend"],
+        },
+        undefined
+      )
     ).toBe(GenericToolCall);
   });
 
@@ -189,7 +193,7 @@ describe("TaskToolCall", () => {
       title: "Plan task",
       run_in_background: true,
     };
-    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
     const view = render(
       <TooltipProvider>
         <AgentTaskToolCall
@@ -225,7 +229,7 @@ describe("TaskToolCall", () => {
       title: "Plan task",
       run_in_background: true,
     };
-    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
     const view = render(
       <TooltipProvider>
         <AgentTaskToolCall
@@ -274,7 +278,7 @@ describe("TaskToolCall", () => {
       title: "Explore task",
       run_in_background: true,
     };
-    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs);
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
     const view = render(
       <TooltipProvider>
         <AgentTaskToolCall
@@ -644,7 +648,7 @@ describe("TaskAwaitToolCall", () => {
 });
 
 const taskListArgs = { statuses: ["reported" as const, "interrupted" as const] };
-const TaskListToolCall = getToolComponent("task_list", taskListArgs);
+const TaskListToolCall = getToolComponent("task_list", taskListArgs, undefined);
 
 describe("TaskListToolCall", () => {
   let originalWindow: typeof globalThis.window;
@@ -679,7 +683,7 @@ describe("TaskListToolCall", () => {
 
   test("instance rows show the project basename and activity; other rows are unchanged", () => {
     const instanceArgs = { scope: "instance" as const };
-    const InstanceTaskListToolCall = getToolComponent("task_list", instanceArgs);
+    const InstanceTaskListToolCall = getToolComponent("task_list", instanceArgs, undefined);
     const view = render(
       <TooltipProvider>
         <InstanceTaskListToolCall
@@ -735,7 +739,7 @@ describe("TaskListToolCall", () => {
 });
 
 const taskRetitleArgs = { task_id: "child-task", title: "Simplicity Auditor" };
-const TaskRetitleToolCall = getToolComponent("task_retitle", taskRetitleArgs);
+const TaskRetitleToolCall = getToolComponent("task_retitle", taskRetitleArgs, undefined);
 
 describe("TaskRetitleToolCall", () => {
   let originalWindow: typeof globalThis.window;
@@ -777,7 +781,11 @@ const taskSendMessageArgs = {
   task_id: "child-task",
   message: "Use the corrected API shape.",
 };
-const TaskSendMessageToolCall = getToolComponent("task_send_message", taskSendMessageArgs);
+const TaskSendMessageToolCall = getToolComponent(
+  "task_send_message",
+  taskSendMessageArgs,
+  undefined
+);
 
 describe("TaskSendMessageToolCall", () => {
   let originalWindow: typeof globalThis.window;
@@ -1093,7 +1101,7 @@ describe("TaskSendMessageToolCall", () => {
 });
 
 const taskTerminateArgs = { task_ids: ["wfr_x"] };
-const TaskTerminateToolCall = getToolComponent("task_terminate", taskTerminateArgs);
+const TaskTerminateToolCall = getToolComponent("task_terminate", taskTerminateArgs, undefined);
 
 describe("TaskTerminateToolCall", () => {
   let originalWindow: typeof globalThis.window;

@@ -62,6 +62,7 @@ import { TimelineEventToolCall } from "../TimelineEventToolCall";
 import { SessionHistoryToolCall } from "../SessionHistoryToolCall";
 import { WorkflowResumeToolCall, WorkflowRunToolCall } from "../WorkflowRunToolCall";
 import { CompleteGoalToolCall } from "../CompleteGoalToolCall";
+import { TOOL_PAYLOAD_DEPTH_REJECTION } from "@/common/utils/tools/toolPayloadDepth";
 
 /**
  * Component type that accepts any props. We use this because:
@@ -171,10 +172,20 @@ const TOOL_SCHEMA_OVERRIDES: Record<string, ZodSchema> = {
 };
 
 /**
- * Returns the appropriate tool component for a given tool name and args.
+ * Returns the appropriate tool component for a given tool name, args and result.
  * Validates args against Zod schemas; returns GenericToolCall if validation fails or tool unknown.
+ * `result` is required so every caller decides on it: a persisted payload that exceeded the
+ * depth bound is replaced by TOOL_PAYLOAD_DEPTH_REJECTION (a string) when history is read, and
+ * tool-specific renderers assume object results (`"key" in result` throws on a string), which
+ * would replace the whole workspace view with an error. The generic card shows the placeholder.
+ * Rejected args already fall back because the string fails the schema.
  */
-export function getToolComponent(toolName: string, args: unknown): AnyToolComponent {
+export function getToolComponent(
+  toolName: string,
+  args: unknown,
+  result: unknown
+): AnyToolComponent {
+  if (result === TOOL_PAYLOAD_DEPTH_REJECTION) return GenericToolCall;
   // Object.hasOwn: toolName flows verbatim from persisted transcripts (attacker-controlled).
   // A bare index lookup returns truthy inherited members for names like "constructor",
   // which would then throw on .schema and brick the workspace view instead of degrading
