@@ -6,6 +6,7 @@ import * as path from "path";
 import { promisify } from "util";
 import type { Workspace } from "@/common/types/project";
 import { Err, Ok } from "@/common/types/result";
+import { STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { hasSrcBaseDir, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -288,6 +289,18 @@ describe("WorkspaceService structural mutation guard", () => {
       expect(physical.renamed).toEqual([]);
     });
 
+    test("a row with an empty parentWorkspaceId is protected, as the preparation validator treats it (fail closed)", async () => {
+      const malformed = taskRow("agent_empty_parent", TASK_ID, { parentWorkspaceId: "" });
+      await seed([row("root", ROOT_ID), malformed]);
+      expect(persistedRow(TASK_ID)?.parentWorkspaceId).toBe("");
+
+      expectRefused(await service.remove(TASK_ID, true), "sub-agent task");
+      expectRefused(await service.rename(TASK_ID, "agent_renamed"), "sub-agent task");
+      await expectIntact(malformed);
+      expect(physical.deleted).toEqual([]);
+      expect(physical.renamed).toEqual([]);
+    });
+
     test("a shared (isolation: none) child refuses removal even though it owns no directory", async () => {
       const root = row("root", ROOT_ID);
       const shared = taskRow("agent_shared", TASK_ID, { path: root.path, taskIsolation: "none" });
@@ -425,6 +438,55 @@ describe("WorkspaceService structural mutation guard", () => {
       await expectIntact(root);
     });
 
+    test("a footprint scan stalled on a protected task's filesystem is deadline-bounded: the removal refuses, the registration lock is released, and the late read authorizes nothing", async () => {
+      const root = row("root", ROOT_ID);
+      const task = taskRow("agent_stalled", TASK_ID, { parentWorkspaceId: "root-ws-other" });
+      await seed([root, row("other", "root-ws-other"), task]);
+      // A stalled FUSE/NFS mount under the task checkout: its `.git` probe never answers.
+      const stalledGate = Promise.withResolvers<void>();
+      const lateReadDone = Promise.withResolvers<void>();
+      const stalledPath = path.join(task.path, ".git");
+      const lstat = fsPromises.lstat;
+      const probe = spyOn(fsPromises, "lstat").mockImplementation((async (
+        ...args: Parameters<typeof fsPromises.lstat>
+      ) => {
+        if (String(args[0]) !== stalledPath) return lstat(...args);
+        await stalledGate.promise;
+        try {
+          return await lstat(...args);
+        } finally {
+          lateReadDone.resolve();
+        }
+      }) as typeof fsPromises.lstat);
+      // Shorten only the scan deadline (no knob in production): its timer fires in 20 ms.
+      const realSetTimeout = globalThis.setTimeout;
+      const timers = spyOn(globalThis, "setTimeout").mockImplementation(((
+        handler: () => void,
+        ms?: number
+      ) =>
+        realSetTimeout(
+          handler,
+          ms === STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS ? 20 : ms
+        )) as unknown as typeof setTimeout);
+      try {
+        const refused = await service.remove(ROOT_ID, true);
+        expectRefused(refused, "cannot be verified");
+        expectRefused(refused, "timed out");
+      } finally {
+        timers.mockRestore();
+      }
+      // Released on refusal: another registrant gets the lock at once.
+      const release = await acquireRegistrationLock(1_000);
+      await release();
+      // The stalled read completes late; its verdict must not reach any effect.
+      stalledGate.resolve();
+      await lateReadDone.promise;
+      probe.mockRestore();
+      await expectIntact(root);
+      await expectIntact(task);
+      expect(physical.deleted).toEqual([]);
+    });
+
     test("an unreadable config refuses a root removal instead of reading as 'no tasks'", async () => {
       const root = row("root", ROOT_ID);
       await seed([root]);
@@ -521,6 +583,26 @@ describe("WorkspaceService structural mutation guard", () => {
         expect(physical.deleted).toEqual([]);
         expect(physical.renamed).toEqual([]);
       });
+
+      test.each(["delete", "snapshot"] as const)(
+        "a legacy root without a runtimeConfig is a managed worktree for archive (%s policy): a shared child's alias refuses before archivedAt, capture or deletion",
+        async (behavior) => {
+          const legacyRoot = row("root", ROOT_ID, { runtimeConfig: undefined });
+          const shared = taskRow("agent_shared", TASK_ID, {
+            path: legacyRoot.path,
+            taskIsolation: "none",
+          });
+          await seed([legacyRoot, shared], { worktreeArchiveBehavior: behavior });
+          expect(persistedRow(ROOT_ID)?.runtimeConfig).toBeUndefined();
+
+          expectRefused(await service.archive(ROOT_ID), `"${TASK_ID}"`);
+          expect(persistedRow(ROOT_ID)?.archivedAt).toBeUndefined();
+          expect(captureSnapshotForArchive).not.toHaveBeenCalled();
+          expect(removeManagedGitWorktreeSpy).not.toHaveBeenCalled();
+          await expectIntact(legacyRoot);
+          await expectIntact(shared);
+        }
+      );
 
       test("a root whose srcBaseDir is spelled with a tilde protects a task at the expanded target", async () => {
         const tildeRoot = row("root", ROOT_ID, {

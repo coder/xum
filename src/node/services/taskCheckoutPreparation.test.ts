@@ -19,6 +19,7 @@ import {
   validateTaskCheckoutPreparation,
 } from "@/node/services/taskCheckoutPreparation";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createTestProject, saveWorkspaces } from "@/node/services/taskService.testHarness";
 
 /**
@@ -406,6 +407,65 @@ describe("taskCheckoutPreparation", () => {
     }
     expect(await state(config, "ded09")).toBe("ready");
   }, 10_000);
+
+  test("the direct identity revalidation (the producer's final pre-publication check) is bounded too and fails closed", async () => {
+    const { checkout, proof } = await prepareDedicated("ded10");
+    expect(await revalidateTaskCheckoutIdentity(proof)).toEqual({ ok: true });
+    const stat = fsPromises.stat;
+    const probe = spyOn(fsPromises, "stat").mockImplementation(((
+      ...args: Parameters<typeof fsPromises.stat>
+    ) =>
+      String(args[0]) === checkout
+        ? new Promise(() => undefined)
+        : stat(...args)) as typeof fsPromises.stat);
+    try {
+      const refused = await revalidateTaskCheckoutIdentity(proof, { timeoutMs: 50 });
+      expect(refused).toMatchObject({ ok: false, state: { kind: "unreadable" } });
+      expect(JSON.stringify(refused)).toContain("timed out");
+    } finally {
+      probe.mockRestore();
+    }
+  }, 10_000);
+
+  test("a project-dir local task of a multi-project parent anchors on the directory Config resolves for the parent (its primary project), not the `_multi` bucket key", async () => {
+    const multiRoot = rootRow("multi1", projectPath, {
+      runtimeConfig: { type: "local" },
+      projects: [{ projectPath, projectName: "repo" }],
+    });
+    const child = taskRow("mloc1", projectPath, {
+      parentWorkspaceId: "multi1",
+      runtimeConfig: { type: "local" },
+      projects: [{ projectPath, projectName: "repo" }],
+    });
+    await saveWorkspaces(config, projectPath, [child], {
+      extraProjects: [[MULTI_PROJECT_CONFIG_KEY, { workspaces: [multiRoot] }]],
+    });
+    const ready = await validateTaskCheckoutPreparation(config, "mloc1");
+    expect(ready).toMatchObject({
+      kind: "ready",
+      authority: { kind: "shared", anchorWorkspaceId: "multi1", anchorPath: projectPath },
+    });
+    if (ready.kind !== "ready") throw new Error("unreachable");
+    // The parent's primary project is an input of the derivation, so the synchronous fence
+    // must notice when it changes.
+    const elsewhere = path.join(rootDir, "elsewhere");
+    await saveWorkspaces(config, projectPath, [child], {
+      extraProjects: [
+        [
+          MULTI_PROJECT_CONFIG_KEY,
+          {
+            workspaces: [
+              { ...multiRoot, projects: [{ projectPath: elsewhere, projectName: "x" }] },
+            ],
+          },
+        ],
+      ],
+    });
+    expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toMatchObject({
+      current: false,
+    });
+    expect(await state(config, "mloc1")).toBe("shared-broken");
+  });
 
   test("shared ancestry: intermediates matter; anchor must be a ready dedicated task or a live ordinary root", async () => {
     const { checkout, row: dedicated } = await prepareDedicated("ded04");
