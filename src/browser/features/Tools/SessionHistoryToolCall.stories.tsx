@@ -58,21 +58,25 @@ export const SearchMatches: Story = {
           itemId: itemId(48213, "9f2c"),
           windowId: "w:212",
           role: "assistant",
-          text: SEARCH_ROW_A,
           // Starts mid-row and continues past the snippet.
+          startCharOffset: 120,
+          text: SEARCH_ROW_A,
           nextCharOffset: 120 + SEARCH_ROW_A.length,
         },
         {
           itemId: itemId(47108, "41ab"),
           windowId: "w:212",
           role: "user",
+          startCharOffset: 0,
           text: "Can we stop polling every workspace on the sidebar? It pegs a core on my machine.",
         },
         {
           itemId: itemId(10240, "07de"),
           windowId: "w:88",
           role: "assistant",
-          // No continuation: the snippet reached the end of its row.
+          // Starts mid-row but reaches the end of its row: no continuation, only the start
+          // reveals the leading cut.
+          startCharOffset: 212,
           text: SEARCH_ROW_C,
         },
       ],
@@ -126,8 +130,60 @@ export const ReadItemPaged: Story = {
           windowId: "w:212",
           role: "assistant",
           // A full page of limit_chars, so the row continues at the page end.
+          startCharOffset: 0,
           text: READ_ROW.slice(0, READ_PAGE_CHARS),
           nextCharOffset: READ_PAGE_CHARS,
+        },
+      ],
+    },
+  },
+};
+
+/** read_item · the next page: starts mid-row and runs to the end of the row. */
+export const ReadItemContinued: Story = {
+  args: {
+    args: {
+      action: "read_item",
+      item_id: itemId(48213, "9f2c"),
+      offset_chars: READ_PAGE_CHARS,
+      limit_chars: READ_PAGE_CHARS,
+    },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      success: true,
+      notice: NOTICE,
+      windows: [],
+      items: [
+        {
+          itemId: itemId(48213, "9f2c"),
+          windowId: "w:212",
+          role: "assistant",
+          startCharOffset: READ_PAGE_CHARS,
+          text: READ_ROW.slice(READ_PAGE_CHARS),
+        },
+      ],
+    },
+  },
+};
+
+/**
+ * read_item · the same page persisted before results reported startCharOffset: a character
+ * count and no leading cut, since the start cannot be inferred from offset_chars.
+ */
+export const ReadItemLegacyResult: Story = {
+  args: {
+    ...ReadItemContinued.args,
+    result: {
+      success: true,
+      notice: NOTICE,
+      windows: [],
+      items: [
+        {
+          itemId: itemId(48213, "9f2c"),
+          windowId: "w:212",
+          role: "assistant",
+          text: READ_ROW.slice(READ_PAGE_CHARS),
         },
       ],
     },
@@ -292,6 +348,7 @@ export const NarrowContainer: Story = {
           itemId: itemId(48213, "9f2c"),
           windowId: "w:m:assistant-message-0123456789abcdef",
           role: "assistant",
+          startCharOffset: 1_842,
           text: "Found the useWorkspaceStatus polling interval regression after the SSE migration: https://ci.example.com/runs/0123456789abcdef0123456789abcdef/artifacts/trace.json",
         },
       ],
@@ -347,4 +404,36 @@ export const NarrowLongRole: Story = {
   decorators: [narrowDecorator],
   play: ({ canvasElement }) =>
     assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-item"]'),
+};
+
+/** Narrow container · read_item with a long item ID and a wide exact range in the header. */
+export const NarrowReadItemRange: Story = {
+  args: {
+    args: {
+      action: "read_item",
+      task_id: "t_7f3c2a91d0",
+      item_id: itemId(1_048_576, "9f2c"),
+      offset_chars: 1_234_000,
+      limit_chars: READ_ROW.length,
+    },
+    status: "completed",
+    defaultExpanded: true,
+    result: {
+      success: true,
+      notice: NOTICE,
+      items: [
+        {
+          itemId: itemId(1_048_576, "9f2c"),
+          windowId: "w:m:assistant-message-0123456789abcdef",
+          role: "assistant",
+          startCharOffset: 1_234_000,
+          text: READ_ROW,
+          nextCharOffset: 1_234_000 + READ_ROW.length,
+        },
+      ],
+    },
+  },
+  decorators: [narrowDecorator],
+  play: ({ canvasElement }) =>
+    assertCardFitsNarrowContainer(canvasElement, '[data-testid="session-history-excerpt"]'),
 };

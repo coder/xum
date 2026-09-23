@@ -122,6 +122,28 @@ function plural(n: number, more: boolean, singular: string, pluralForm: string):
   return n === 1 && !more ? singular : pluralForm;
 }
 
+/**
+ * Where the item's text starts in its row, as the backend reported it (startCharOffset).
+ * Results persisted before that field existed return null, and the card never infers a start
+ * for them: offset_chars can be clamped or rounded back to keep a surrogate pair whole, and a
+ * search snippet that reaches the row end may or may not have started mid-row. A start that
+ * contradicts the reported continuation is ignored the same way.
+ */
+function startOf(item: SessionHistoryItem): number | null {
+  const start = item.startCharOffset;
+  if (start == null) return null;
+  if (item.nextCharOffset != null && item.nextCharOffset !== start + item.text.length) return null;
+  return start;
+}
+
+/** Returned characters: an exact `chars X–Y` range when the start is known, else a count. */
+function charsLabel(item: SessionHistoryItem): string {
+  const start = startOf(item);
+  return start == null
+    ? `${formatCount(item.text.length)} chars`
+    : `chars ${formatCount(start)}–${formatCount(start + item.text.length)}`;
+}
+
 function countLabel(
   args: SessionHistoryToolArgs,
   result: SessionHistoryToolResult | null
@@ -136,11 +158,8 @@ function countLabel(
   }
   const items = result.items ?? [];
   if (action === "read_item") {
-    // Returned characters only: the result reports where the page ends (nextCharOffset) but
-    // not where it starts, which can differ from the requested offset_chars (clamping,
-    // surrogate-pair rounding).
     const item = items.at(0);
-    return item == null ? null : `${formatCount(item.text.length)} chars`;
+    return item == null ? null : charsLabel(item);
   }
   const n = items.length;
   return action === "search"
@@ -173,6 +192,9 @@ const Chip: React.FC<{ tone: string; icon?: LucideIcon; children: React.ReactNod
     </span>
   );
 };
+
+/** Marks text cut off before or after the returned characters. */
+const Cut: React.FC = () => <span className="text-muted">…</span>;
 
 const SectionLabel: React.FC<{ children: React.ReactNode }> = (props) => (
   <div className="text-muted mb-1.5 text-[10px] tracking-wide uppercase">{props.children}</div>
@@ -309,8 +331,8 @@ const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> 
   }
   return (
     <div className="bg-code-bg flex max-h-[320px] flex-col gap-2.5 overflow-y-auto rounded px-3 py-2">
-      {/* Rows are snippets: the result reports where a snippet continues (nextCharOffset)
-          but not where it starts, so only the trailing cut is marked. */}
+      {/* Rows are snippets: a leading cut is marked only when the result reports a start
+          (startCharOffset), a trailing cut when it reports a continuation (nextCharOffset). */}
       <div className="text-muted -mb-1 text-[10px] tracking-wide uppercase">Snippets</div>
       {groups.map((group, gi) => (
         <div key={`${group.windowId}:${gi}`}>
@@ -337,8 +359,9 @@ const ItemList: React.FC<{ items: SessionHistoryItem[]; query: string | null }> 
                   data-testid="session-history-snippet"
                   className="text-foreground min-w-0 font-sans text-[12px] leading-normal break-words whitespace-pre-wrap"
                 >
+                  {(startOf(item) ?? 0) > 0 && <Cut />}
                   <HighlightedText text={item.text} query={props.query} />
-                  {item.nextCharOffset != null && <span className="text-muted">…</span>}
+                  {item.nextCharOffset != null && <Cut />}
                 </div>
               </div>
             ))}
@@ -365,13 +388,14 @@ const ReadExcerpt: React.FC<{ item: SessionHistoryItem }> = (props) => {
           <span className="text-muted italic">No text at the requested offset.</span>
         ) : (
           <>
+            {(startOf(item) ?? 0) > 0 && <Cut />}
             {item.text}
-            {item.nextCharOffset != null && <span className="text-muted">…</span>}
+            {item.nextCharOffset != null && <Cut />}
           </>
         )}
       </div>
       <div data-testid="session-history-page" className="text-muted mt-1.5 text-[10px]">
-        {formatCount(item.text.length)} chars
+        {charsLabel(item)}
         {item.nextCharOffset != null
           ? ` · continues at offset ${formatCount(item.nextCharOffset)}`
           : " · end of item"}
