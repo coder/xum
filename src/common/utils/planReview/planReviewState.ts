@@ -45,6 +45,8 @@ export const PlanReviewThreadSchema = z.object({
   replies: z.array(PlanReviewThreadReplySchema),
   /** Last resolve/reopen record wins. Sending feedback never resolves; only the user does. */
   resolved: z.boolean(),
+  /** Sequence of the last resolve/reopen record; absent until the user changes the status. */
+  statusHistorySequence: z.number().optional(),
 });
 
 export const PlanReviewFeedbackSchema = z.object({
@@ -212,6 +214,8 @@ export function derivePlanReviewState(
           break;
         }
         thread.resolved = record.kind === "resolve";
+        // Reopening is user activity: it must rank the thread like a new comment would.
+        thread.statusHistorySequence = historySequence;
         break;
       }
     }
@@ -242,11 +246,14 @@ function quoteForBlock(text: string, maxChars: number = PLAN_REVIEW_STATE_MAX_TE
   return JSON.stringify(clipped).replaceAll("</", "<\\/");
 }
 
-/** Sequence of the newest user activity on a thread: its opening comment or latest reply. */
+/**
+ * Sequence of the newest user activity on a thread: its opening comment, latest reply or latest
+ * resolve/reopen (only unresolved threads are ranked, so that is a reopen).
+ */
 function latestActivity(thread: PlanReviewThread): number {
   return thread.replies.reduce(
     (latest, reply) => Math.max(latest, reply.historySequence),
-    thread.historySequence
+    Math.max(thread.historySequence, thread.statusHistorySequence ?? thread.historySequence)
   );
 }
 

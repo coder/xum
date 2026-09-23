@@ -434,6 +434,45 @@ describe("formatPlanReviewStateBlock", () => {
     expect(block).toContain("5 more unresolved thread");
   });
 
+  test("ranks a reopened old thread as recent activity under the thread and character caps", () => {
+    const opening = (i: number): PlanReviewRecord => ({
+      v: 1,
+      kind: "feedback",
+      recordId: `rec_open_${i}`,
+      feedbackId: `fb_open_${i}`,
+      snapshotId: "snap_a",
+      contentHash: HASH_A,
+      comments: [
+        {
+          threadId: `thr_open_${i}`,
+          anchor: { startLine: 1, endLine: 1 },
+          quote: "# Plan",
+          body: `Comment ${i}`,
+        },
+      ],
+      replies: [],
+    });
+    const rows: MuxMessage[] = [recordRow(snapshotA), recordRow(opening(0))];
+    rows.push(recordRow(resolve("rec_res_0", "thr_open_0")));
+    for (let i = 1; i <= PLAN_REVIEW_STATE_MAX_THREADS; i++) rows.push(recordRow(opening(i)));
+    // The user reopens the oldest thread after newer ones fill the cap.
+    rows.push(recordRow(reopen("rec_reopen_0", "thr_open_0")));
+    const state = derivePlanReviewState(rows);
+
+    const capped = formatPlanReviewStateBlock(state) ?? "";
+    expect(capped).toContain('"thr_open_0" ');
+    // The oldest untouched opening is the one left out instead.
+    expect(capped).not.toContain('"thr_open_1" ');
+    expect(capped).toContain("1 more unresolved thread");
+
+    // Under a character budget that fits a single thread, the reopened one is that thread.
+    const single = formatPlanReviewStateBlock(state, 1) ?? "";
+    expect(single).toContain('"thr_open_0" ');
+    const budgeted = formatPlanReviewStateBlock(state, 100, single.length) ?? "";
+    expect(budgeted).toContain('"thr_open_0" ');
+    expect(budgeted).not.toContain(`"thr_open_${PLAN_REVIEW_STATE_MAX_THREADS}" `);
+  });
+
   test("bounds each rendered text and the whole block, never claiming completeness", () => {
     const huge: PlanReviewRecord = {
       ...feedback1,

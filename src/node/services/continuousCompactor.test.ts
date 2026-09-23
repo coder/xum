@@ -18,7 +18,11 @@ import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
-import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
+import {
+  ContinuousCompactor,
+  fingerprint,
+  type ContinuousCompactionContext,
+} from "./continuousCompactor";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
 import { HistoryService } from "./historyService";
@@ -813,6 +817,59 @@ describe("ContinuousCompactor", () => {
     expect(after[0].id).toBe(journal.boundary.id);
     expect(after.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
     expect(after.map((row) => row.id)).not.toContain("plan-snapshot");
+    expect(await journalStore.read()).toBeNull();
+  });
+
+  const hiddenResolve = (id: string) =>
+    createMuxMessage(id, "user", "<mux_plan_review>resolve</mux_plan_review>", {
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: `rec-${id}`, threadId: "t1" },
+    });
+
+  it("folds a consumed journal exactly once after a hidden record lands behind the live source", async () => {
+    // Resolving a review thread while the stream runs appends a hidden record after the live
+    // answer. The journal compares what the model saw, so restart recovery must still fold it,
+    // and the record itself must survive in full history.
+    const { journal, journalStore, dependencies } = await activateJournaledSwap();
+    await seed(hiddenResolve("resolve-mid-stream"));
+    compactor.reset("shutdown");
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    expect(await compactor.recover()).toBe(true);
+    const after = await rows();
+    expect(after[0].id).toBe(journal.boundary.id);
+    expect(after.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+    expect(await journalStore.read()).toBeNull();
+    expect(await compactor.recover()).toBe(false);
+    expect(completed).toHaveBeenCalledTimes(1);
+    const full: MuxMessage[] = [];
+    await store.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
+      full.push(...chunk);
+    });
+    expect(full.filter((row) => row.id === "resolve-mid-stream")).toHaveLength(1);
+    expect(full.filter((row) => row.id === journal.boundary.id)).toHaveLength(1);
+  });
+
+  it("recovers a journal whose source fingerprint an earlier build took over raw rows", async () => {
+    // Earlier builds fingerprinted the raw rows, including a hidden record inside the head.
+    // Such a persisted journal must still fold when nothing was appended after its source.
+    const { journal, journalStore } = await activateJournaledSwap(false, true, false, true);
+    const raw = await rows();
+    const source = raw.at(-1)!;
+    const legacyFingerprint = fingerprint([
+      ...raw.slice(0, -1),
+      { ...source, parts: source.parts.slice(0, journal.liveTailCopySpec.partIndex) },
+    ]);
+    expect(legacyFingerprint).not.toBe(journal.sourceFingerprint);
+    await writeFile(
+      journalStore.path,
+      JSON.stringify({ ...journal, sourceFingerprint: legacyFingerprint })
+    );
+    streaming = false;
+    live = undefined;
+    expect(await compactor.recover()).toBe(true);
+    expect((await rows())[0].id).toBe(journal.boundary.id);
     expect(await journalStore.read()).toBeNull();
   });
 

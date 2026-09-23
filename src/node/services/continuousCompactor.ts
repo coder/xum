@@ -90,7 +90,8 @@ interface StagedSummary {
 }
 
 /** Only durable request-affecting metadata participates: committing a partial is not an edit. */
-function fingerprint(rows: MuxMessage[]): string {
+/** Exported for journal compatibility tests (fingerprints persisted by earlier builds). */
+export function fingerprint(rows: MuxMessage[]): string {
   const hash = createHash("sha256");
   for (const row of rows) {
     const metadata = row.metadata;
@@ -129,6 +130,20 @@ function boundaryIdentity(rows: MuxMessage[]): { epoch: number; boundarySequence
 }
 
 /** Background summary + recent pages. Only the short apply is serialized with the turn. */
+/**
+ * Rows a journal's source fingerprint covers: everything before the live source plus the
+ * source's committed parts. Journals compare what the model saw (the visible projection, like
+ * the cut and head), so hidden records appended while the stream runs cannot invalidate them;
+ * raw snapshot equality still fences publication (see finalizeJournal's shouldPersist).
+ */
+function journalSourceRows(
+  rows: MuxMessage[],
+  source: MuxMessage,
+  partIndex: number
+): MuxMessage[] {
+  return [...rows.slice(0, -1), { ...source, parts: source.parts.slice(0, partIndex) }];
+}
+
 export class ContinuousCompactor {
   private generation = 0;
   private staged: StagedSummary | null = null;
@@ -489,7 +504,10 @@ export class ContinuousCompactor {
       return false;
     this.swapAttempted = staged;
     const live = this.deps.streamManager.getStreamInfo(this.deps.workspaceId);
-    const source = rows.at(-1);
+    // Model-semantic identity uses the visible projection (as cut selection and the head do):
+    // a hidden review record appended during the stream is not a newer source.
+    const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    const source = visibleRows.at(-1);
     if (!live || source?.id !== live.messageId || source.metadata?.historySequence == null)
       return false;
     const tail = this.materializeTail(staged, rows);
@@ -541,10 +559,7 @@ export class ContinuousCompactor {
         prefixSourceRows: [boundary, ...staticCopies],
         systemPrefix: z.array(z.json()).parse(exactJson(prepared.systemPrefix)),
         cacheEnabled: prepared.cacheEnabled,
-        sourceFingerprint: fingerprint([
-          ...rows.slice(0, -1),
-          { ...source, parts: source.parts.slice(0, partIndex) },
-        ]),
+        sourceFingerprint: fingerprint(journalSourceRows(visibleRows, source, partIndex)),
         postCompactionAttachments: prepared.attachments,
         preparation: prepared.preparation,
         requestProviderOptions:
@@ -644,12 +659,14 @@ export class ContinuousCompactor {
       return true;
     }
     const spec = journal.liveTailCopySpec;
-    const source = rows.at(-1);
     const identity = boundaryIdentity(rows);
-    // The journal's head fingerprint was taken from the model-visible projection the cut was
-    // selected from (see headFromRows); rebuild the head from that same projection, or a hidden
-    // record inside the head would discard a valid journal and the prefix would never fold.
+    // The journal's head and source fingerprints were taken from the model-visible projection
+    // the cut was selected from (see headFromRows and activateSwap); rebuild both from that same
+    // projection, or a hidden record inside the head or appended after the live source would
+    // discard a valid journal and the prefix would never fold. The source is still identified by
+    // the captured message id and sequence, so a genuine later visible row refuses the fold.
     const visibleRows = rows.filter((row) => !isModelHiddenMessage(row));
+    const source = visibleRows.at(-1);
     const headEnd = visibleRows.findIndex(
       (row) =>
         row.id === journal.headEnd.id && row.metadata?.historySequence === journal.headEnd.sequence
@@ -671,10 +688,13 @@ export class ContinuousCompactor {
       identity.boundarySequence !== journal.boundarySequence ||
       headEnd < 0 ||
       fingerprint(head) !== journal.headFingerprint ||
-      fingerprint([
-        ...rows.slice(0, -1),
-        { ...source, parts: source.parts.slice(0, spec.partIndex) },
-      ]) !== journal.sourceFingerprint
+      (fingerprint(journalSourceRows(visibleRows, source, spec.partIndex)) !==
+        journal.sourceFingerprint &&
+        // A journal persisted by a build that fingerprinted the raw rows still recovers when
+        // nothing was appended after its source.
+        (rows.at(-1) !== source ||
+          fingerprint(journalSourceRows(rows, source, spec.partIndex)) !==
+            journal.sourceFingerprint))
     ) {
       log.warn("[continuous-compaction] discarded mismatched journal", {
         workspaceId: this.deps.workspaceId,
