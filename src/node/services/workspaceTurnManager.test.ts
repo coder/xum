@@ -22,6 +22,10 @@ import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { QueueCutAttributionSnapshot } from "@/node/services/taskWorkspaceSeam";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -6318,6 +6322,65 @@ describe("WorkspaceTurnManager", () => {
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
       status: "error",
       error: "Stream error: provider overloaded",
+    });
+  });
+
+  test("a trailing hidden plan-review record does not block reviving a retrying workspace turn", async () => {
+    // Plan-review resolve/reopen rows are persisted as `role: user` rows but are UI state, not
+    // prompts (isModelHiddenMessage). Reconciliation must treat them like the absence of a row:
+    // the correlated prompt is still the newest PROMPT, so the retrying child revives the handle.
+    const hasPendingAutoRetry = mock((workspaceId: string) => workspaceId === "childworkspace");
+    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest({
+      hasPendingAutoRetry,
+    });
+    const muxMetadata = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_handle",
+      ownerWorkspaceId: parentId,
+      turnId: "turn",
+    };
+    expect(
+      (
+        await historyService.appendToHistory(
+          "childworkspace",
+          createMuxMessage("msg_prompt", "user", "Summarize", { muxMetadata })
+        )
+      ).success
+    ).toBe(true);
+    const resolve = {
+      v: 1 as const,
+      kind: "resolve" as const,
+      recordId: "rec_1",
+      threadId: "thr_1",
+    };
+    expect(
+      (
+        await historyService.appendToHistory(
+          "childworkspace",
+          createMuxMessage("msg_plan_review", "user", formatPlanReviewEnvelope(resolve), {
+            synthetic: true,
+            muxMetadata: buildPlanReviewMetadata(resolve),
+          })
+        )
+      ).success
+    ).toBe(true);
+    await new TaskHandleStore(config).upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "interrupted", {
+        createdWorkspace: true,
+        error: "Workspace turn interrupted after restart",
+      })
+    );
+    const internal = taskService as unknown as {
+      activeWorkspaceTurnHandleByWorkspaceId: Map<
+        string,
+        { handleId: string; ownerWorkspaceId: string }
+      >;
+    };
+    internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
+
+    expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
+      status: "running",
+      workspaceId: "childworkspace",
     });
   });
 
