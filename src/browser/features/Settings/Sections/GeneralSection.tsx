@@ -314,6 +314,10 @@ export function GeneralSection() {
   const keepScreenAwakeSavedRef = useRef(false);
   // Local saves still in flight; an external refresh must not replace the user's newest choice.
   const keepScreenAwakePendingWritesRef = useRef(0);
+  // An external config change arrived while local saves were pending; replay it once they settle
+  // so a later value accepted by the backend (e.g. from the palette command) is not lost.
+  const keepScreenAwakeRefreshDeferredRef = useRef(false);
+  const keepScreenAwakeRefreshRef = useRef<(() => Promise<void>) | null>(null);
 
   // updateCoderPrefs writes config.json on the backend. Serialize (and coalesce) updates so rapid
   // selections can't race and persist a stale value via out-of-order writes.
@@ -538,6 +542,15 @@ export function GeneralSection() {
           keepScreenAwakePendingWritesRef.current >= 0,
           "keep-awake pending write count went negative"
         );
+        if (
+          keepScreenAwakePendingWritesRef.current === 0 &&
+          keepScreenAwakeRefreshDeferredRef.current
+        ) {
+          keepScreenAwakeRefreshDeferredRef.current = false;
+          return keepScreenAwakeRefreshRef.current?.().catch(() => {
+            // Best-effort: keep the last known value and wait for the next change.
+          });
+        }
       });
   };
 
@@ -553,23 +566,29 @@ export function GeneralSection() {
     const signal = abortController.signal;
 
     const refresh = async () => {
-      // Skip while our own saves are in flight: disk may still hold an older value, and the
-      // save's completion (or rollback) already settles the switch.
+      // Defer while our own saves are in flight: disk may still hold an older value. The last
+      // save to settle replays this refresh, so a newer external value still wins.
       if (keepScreenAwakePendingWritesRef.current > 0) {
+        keepScreenAwakeRefreshDeferredRef.current = true;
         return;
       }
       const nonce = keepScreenAwakeLoadNonceRef.current;
       const cfg = await api.config.getConfig();
+      if (signal.aborted) {
+        return;
+      }
       if (
-        signal.aborted ||
         nonce !== keepScreenAwakeLoadNonceRef.current ||
         keepScreenAwakePendingWritesRef.current > 0
       ) {
+        // A local click started a save during the read; re-read once it settles.
+        keepScreenAwakeRefreshDeferredRef.current = true;
         return;
       }
       keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
       setKeepScreenAwake(keepScreenAwakeSavedRef.current);
     };
+    keepScreenAwakeRefreshRef.current = refresh;
 
     let iterator: AsyncIterator<unknown> | null = null;
     const listen = async () => {
@@ -598,6 +617,9 @@ export function GeneralSection() {
     return () => {
       abortController.abort();
       void iterator?.return?.();
+      if (keepScreenAwakeRefreshRef.current === refresh) {
+        keepScreenAwakeRefreshRef.current = null;
+      }
     };
   }, [api]);
 

@@ -808,6 +808,32 @@ describe("GeneralSection", () => {
     expect(toggle.getAttribute("aria-checked")).toBe("true");
   });
 
+  test("replays an external keep-awake change that landed during a local save", async () => {
+    const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    let resolveWrite: (() => void) | null = null;
+    updateKeepScreenAwakeMock.mockImplementation(({ enabled }) => {
+      // The backend applies our write right away, but its response is still in flight.
+      config.keepScreenAwake = enabled;
+      return new Promise<void>((resolve) => (resolveWrite = resolve));
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(resolveWrite).not.toBeNull());
+    // The palette command then turns it back off before our response arrives.
+    config.keepScreenAwake = false;
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+
+    act(() => resolveWrite?.());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
   test("renders the worktree archive behavior copy and loads the saved value", async () => {
     const { view } = renderGeneralSection({
       coderWorkspaceArchiveBehavior: "delete",
