@@ -15,6 +15,40 @@ import { streamToString } from "./streamUtils";
 type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
 
 /**
+ * Shell command for ReadFileOptions.requireRegularFile on exec-backed runtimes.
+ * `quotedPath` must already be shell-safe (quoteForRemote / an env-var reference).
+ *
+ * Acquire the descriptor first (`exec 3<`), classify THAT descriptor via
+ * `/dev/fd/3`, then stream from the same descriptor (`cat <&3`) — so the type
+ * check applies to the inode actually read, never to a stat→open pre-check.
+ * Exit codes: 65 open failed, 66 not a regular file, 67 `/dev/fd` missing
+ * (fail closed rather than silently dropping the guarantee). stderr text
+ * reaches callers through readFileViaExec's RuntimeError message.
+ *
+ * Acquisition is NOT nonblocking here (unlike the local runtimes' O_NONBLOCK
+ * open): the leading `[ -e ] && ! [ -f ]` precheck is advisory. It fails fast
+ * on a FIFO already sitting at the path, but a path replaced by a writer-less
+ * FIFO between the precheck and `exec 3<` still blocks acquisition in the
+ * exec's shell (not a libuv worker), as the plain `cat` blocks on any FIFO.
+ * Ending that shell is the transport's job: abort, stream cancel and the exec
+ * timeout end it when the signal reaches the shell; when it reaches only a
+ * client (an ssh/docker exec CLI that does not forward signals), only
+ * RemoteRuntime's remote `timeout -s KILL` wrapper does. DevcontainerRuntime's
+ * exec has no such wrapper. See execFileIO.regularFile.test.ts. The fd-based
+ * check guarantees the file type after acquisition, not a nonblocking one.
+ * Requires POSIX sh + procfs/devfs `/dev/fd` (Linux, macOS) — the same
+ * assumptions as the plain `cat` command.
+ */
+export function buildRegularFileReadCommand(quotedPath: string): string {
+  return [
+    `if [ -e ${quotedPath} ] && ! [ -f ${quotedPath} ]; then echo 'not a regular file' >&2; exit 66; fi`,
+    `exec 3<${quotedPath} || { echo 'open failed' >&2; exit 65; }`,
+    `if [ -e /dev/fd/3 ]; then [ -f /dev/fd/3 ] || { echo 'not a regular file' >&2; exit 66; }; else echo 'cannot verify regular file' >&2; exit 67; fi`,
+    `cat <&3`,
+  ].join("; ");
+}
+
+/**
  * Read file contents as a stream via exec.
  */
 export function readFileViaExec(

@@ -17,6 +17,7 @@ import type {
   WorkspaceForkResult,
   InitLogger,
   EnsureReadyResult,
+  ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError as RuntimeErrorClass } from "./Runtime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
@@ -34,6 +35,152 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport } from "./shellEnv";
 import { sanitizeXumChildEnv } from "./childProcessEnv";
+
+/**
+ * Acquire a regular file for ReadFileOptions.requireRegularFile.
+ *
+ * O_NONBLOCK makes open() of a writer-less FIFO return at once instead of
+ * blocking in the kernel (which would park a libuv worker that no abort can
+ * release); it has no effect on reads of a regular file. The type check is an
+ * fstat on the descriptor we just acquired, so whatever the path points at
+ * afterwards cannot change what is streamed.
+ *
+ * Ownership: this function owns the handle until the stream is created; on
+ * classification failure or an abort observed before hand-off it closes the
+ * handle itself. After hand-off the stream owns it (autoClose on end/error/
+ * destroy) and nothing else may close it.
+ */
+async function openRegularFileStream(
+  filePath: string,
+  resolvedPath: string,
+  abortSignal?: AbortSignal
+): Promise<Readable> {
+  // O_NONBLOCK is undefined on Windows; a plain open is the best we can do there.
+  const nonblock = fs.constants.O_NONBLOCK ?? 0;
+  const handle = await fsPromises.open(resolvedPath, fs.constants.O_RDONLY | nonblock);
+  try {
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io");
+    }
+    const stat = await handle.stat();
+    if (abortSignal?.aborted) {
+      throw new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io");
+    }
+    if (!stat.isFile()) {
+      throw new RuntimeErrorClass(`${filePath} is not a regular file`, "file_io");
+    }
+    // Inside the try so a construction failure still closes the handle; once
+    // this returns, the stream owns the handle (autoClose).
+    return handle.createReadStream({ autoClose: true });
+  } catch (err) {
+    await handle.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Wrap a (possibly lazily acquired) node Readable as a pull-based web stream
+ * with abort and cancel plumbing. `acquire` runs inside start(); a failure
+ * there surfaces as a file_io RuntimeError on the stream.
+ */
+function wrapNodeReadable(
+  filePath: string,
+  acquire: () => Readable | Promise<Readable>,
+  abortSignal?: AbortSignal
+): ReadableStream<Uint8Array> {
+  // Set once acquisition succeeds; abort/cancel arriving earlier are replayed
+  // right after acquisition so the source is never left open.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let cancelled = false;
+
+  // r19: honor caller aborts (kernel deadline, workspace removal), not just
+  // consumer cancellation — a FIFO or blocked network-mounted file can
+  // stall before yielding enough bytes for a consumer-side ceiling to
+  // cancel, leaving the pending read and its fd blocked forever. Aborting
+  // cancels the inner reader, which destroys the node stream and settles
+  // the pinned READ. It cannot release a kernel-blocked OPEN — only the
+  // nonblocking acquisition in openRegularFileStream avoids that.
+  const onAbort = () => {
+    void reader?.cancel(abortSignal?.reason).catch(() => undefined);
+  };
+  if (abortSignal?.aborted) {
+    onAbort();
+  } else {
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+  }
+  const cleanupAbortForwarder = () => {
+    abortSignal?.removeEventListener("abort", onAbort);
+  };
+
+  // Pull-based (not an eager start loop): consumers control the read rate
+  // (backpressure), and cancellation can reach the source — the old eager
+  // loop had no cancel callback, so a cancelled wrapper (e.g. mux.load's
+  // byte ceiling on /dev/zero) abandoned the reader and leaked the open
+  // file handle (r18).
+  return new ReadableStream<Uint8Array>({
+    start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      try {
+        const nodeStream = await acquire();
+        // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
+        const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
+        reader = webStream.getReader();
+        if (cancelled || abortSignal?.aborted) {
+          // Landed while acquiring (reader did not exist yet): release the source now.
+          void reader.cancel(abortSignal?.reason).catch(() => undefined);
+        }
+      } catch (err) {
+        cleanupAbortForwarder();
+        controller.error(
+          err instanceof RuntimeErrorClass
+            ? err
+            : new RuntimeErrorClass(
+                `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
+                "file_io",
+                err
+              )
+        );
+      }
+    },
+    pull: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
+      try {
+        // start() either set the reader or errored the stream (pull is not called then).
+        if (!reader) {
+          throw new Error("reader missing after start");
+        }
+        const { done, value } = await reader.read();
+        // reader.cancel() settles a pinned read as {done: true}; surface
+        // the abort as an error rather than a clean EOF so consumers do
+        // not mistake a truncated read for the whole file.
+        if (abortSignal?.aborted) {
+          cleanupAbortForwarder();
+          controller.error(new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io"));
+          return;
+        }
+        if (done) {
+          cleanupAbortForwarder();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        cleanupAbortForwarder();
+        controller.error(
+          new RuntimeErrorClass(
+            `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
+            "file_io",
+            err
+          )
+        );
+      }
+    },
+    cancel: async (reason: unknown) => {
+      cancelled = true;
+      cleanupAbortForwarder();
+      // Destroys the underlying node stream and closes the fd.
+      await reader?.cancel(reason);
+    },
+  });
+}
 
 /**
  * Abstract base class for local runtimes (both WorktreeRuntime and LocalRuntime).
@@ -222,73 +369,25 @@ export abstract class LocalBaseRuntime implements Runtime {
     return { stdout, stderr, stdin, exitCode, duration };
   }
 
-  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
     const resolvedPath = path.resolve(expandTilde(filePath));
-    const nodeStream = fs.createReadStream(resolvedPath);
-
-    // Handle errors by wrapping in a transform
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>;
-    const reader = webStream.getReader();
-
-    // r19: honor caller aborts (kernel deadline, workspace removal), not just
-    // consumer cancellation — a FIFO or blocked network-mounted file can
-    // stall before yielding enough bytes for a consumer-side ceiling to
-    // cancel, leaving the pending read and its fd blocked forever. Aborting
-    // cancels the inner reader, which destroys the node stream and settles
-    // the pinned read.
-    const onAbort = () => {
-      void reader.cancel(abortSignal?.reason).catch(() => undefined);
-    };
-    if (abortSignal?.aborted) {
-      onAbort();
-    } else {
-      abortSignal?.addEventListener("abort", onAbort, { once: true });
+    if (options?.requireRegularFile) {
+      return wrapNodeReadable(
+        filePath,
+        () => openRegularFileStream(filePath, resolvedPath, abortSignal),
+        abortSignal
+      );
     }
-    const cleanupAbortForwarder = () => {
-      abortSignal?.removeEventListener("abort", onAbort);
-    };
-
-    // Pull-based (not an eager start loop): consumers control the read rate
-    // (backpressure), and cancellation can reach the source — the old eager
-    // loop had no cancel callback, so a cancelled wrapper (e.g. mux.load's
-    // byte ceiling on /dev/zero) abandoned the reader and leaked the open
-    // file handle (r18).
-    return new ReadableStream<Uint8Array>({
-      pull: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
-        try {
-          const { done, value } = await reader.read();
-          // reader.cancel() settles a pinned read as {done: true}; surface
-          // the abort as an error rather than a clean EOF so consumers do
-          // not mistake a truncated read for the whole file.
-          if (abortSignal?.aborted) {
-            cleanupAbortForwarder();
-            controller.error(new RuntimeErrorClass(`Read of ${filePath} aborted`, "file_io"));
-            return;
-          }
-          if (done) {
-            cleanupAbortForwarder();
-            controller.close();
-            return;
-          }
-          controller.enqueue(value);
-        } catch (err) {
-          cleanupAbortForwarder();
-          controller.error(
-            new RuntimeErrorClass(
-              `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
-              "file_io",
-              err
-            )
-          );
-        }
-      },
-      cancel: async (reason: unknown) => {
-        cleanupAbortForwarder();
-        // Destroys the underlying node stream and closes the fd.
-        await reader.cancel(reason);
-      },
-    });
+    // Default: exactly the historical fs.createReadStream(path). FIFOs, devices
+    // and sockets keep their native semantics here, including a kernel-blocking
+    // open() on a writer-less FIFO — callers that cannot tolerate that opt in
+    // to requireRegularFile above.
+    const nodeStream = fs.createReadStream(resolvedPath);
+    return wrapNodeReadable(filePath, () => nodeStream, abortSignal);
   }
 
   writeFile(filePath: string, _abortSignal?: AbortSignal): WritableStream<Uint8Array> {

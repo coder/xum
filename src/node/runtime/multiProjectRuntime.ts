@@ -17,6 +17,7 @@ import type {
   WorkspaceForkResult,
   WorkspaceInitParams,
   WorkspaceInitResult,
+  ReadFileOptions,
 } from "./Runtime";
 
 export interface MultiProjectRuntimeEntry {
@@ -407,8 +408,12 @@ export class MultiProjectRuntime implements Runtime {
     });
   }
 
-  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    return this.primaryRuntime.readFile(filePath, abortSignal);
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
+    return this.primaryRuntime.readFile(filePath, abortSignal, options);
   }
 
   writeFile(filePath: string, abortSignal?: AbortSignal): WritableStream<Uint8Array> {

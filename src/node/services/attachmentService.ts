@@ -55,10 +55,14 @@ export class AttachmentService {
     const xumHome = runtime.getXumHome();
     const planFilePath = getPlanFilePath(workspaceName, projectName, xumHome);
     const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
+    // The plan path is user/agent-writable and this reader runs on every post-compaction turn:
+    // a FIFO (or other special file) there must fail like a missing plan instead of blocking the
+    // read — and, on Node, a libuv threadpool worker — indefinitely. Same guard as readPlanFile.
+    const planReadOptions = { requireRegularFile: true } as const;
 
     // Try new path first
     try {
-      const planContent = await readFileString(runtime, planFilePath);
+      const planContent = await readFileString(runtime, planFilePath, undefined, planReadOptions);
       if (planContent) {
         return {
           type: "plan_file_reference",
@@ -72,7 +76,7 @@ export class AttachmentService {
 
     // Fall back to legacy path
     try {
-      const planContent = await readFileString(runtime, legacyPlanPath);
+      const planContent = await readFileString(runtime, legacyPlanPath, undefined, planReadOptions);
       if (planContent) {
         return {
           type: "plan_file_reference",

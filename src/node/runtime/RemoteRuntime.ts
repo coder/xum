@@ -28,6 +28,7 @@ import type {
   WorkspaceForkParams,
   WorkspaceForkResult,
   EnsureReadyResult,
+  ReadFileOptions,
 } from "./Runtime";
 import { RuntimeError } from "./Runtime";
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
@@ -41,6 +42,7 @@ import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
 import { buildShellExport, buildShellPathExport } from "./shellEnv";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
+  buildRegularFileReadCommand,
   ensureDirViaExec,
   readFileViaExec,
   statViaExec,
@@ -399,12 +401,20 @@ export abstract class RemoteRuntime implements Runtime {
   /**
    * Read file contents as a stream via exec.
    */
-  readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+  readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
     return readFileViaExec(
       filePath,
       async (signal) => {
         const resolvedPath = await this.resolveFilePath(filePath, signal);
-        return this.exec(`cat ${this.quoteForRemote(resolvedPath)}`, {
+        const quotedPath = this.quoteForRemote(resolvedPath);
+        const command = options?.requireRegularFile
+          ? buildRegularFileReadCommand(quotedPath)
+          : `cat ${quotedPath}`;
+        return this.exec(command, {
           cwd: this.getBasePath(),
           timeout: 300,
           abortSignal: signal,
