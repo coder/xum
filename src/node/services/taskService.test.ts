@@ -6780,6 +6780,14 @@ describe("TaskService", () => {
       checkout: queuedCheckout,
       branch: queuedWorkspaceName,
       runtimeConfig,
+      secondaries: [
+        {
+          projectPath: secondaryProjectPath,
+          checkout: createRuntime(runtimeConfig, {
+            projectPath: secondaryProjectPath,
+          }).getWorkspacePath(secondaryProjectPath, queuedWorkspaceName),
+        },
+      ],
     });
 
     await config.editConfig(() => ({
@@ -6798,8 +6806,8 @@ describe("TaskService", () => {
                 projects,
               },
               {
-                // Prepared at creation (a queued dedicated row is never forked at launch): the
-                // primary project's checkout, claimed and bound.
+                // Prepared at creation (a queued dedicated row is never forked at launch): every
+                // project's checkout, claimed and bound (proof v2).
                 path: queuedCheckout,
                 taskCheckoutPreparation: queuedPreparation,
                 id: queuedTaskId,

@@ -86,6 +86,11 @@ interface OrchestrateForkSuccess {
   sourceRuntimeConfigUpdated: boolean;
   /** Inherited multi-project refs for child metadata (when parent is multi-project). */
   projects?: ProjectRef[];
+  /**
+   * Multi-project forks: the checkout forked (or created) for every NON-primary project, in
+   * `projects` order (`workspacePath` is the primary's). Task preparation binds each of them.
+   */
+  secondaryCheckouts?: Array<{ projectPath: string; workspacePath: string }>;
 }
 
 function normalizeForkedRuntimeConfig(
@@ -487,6 +492,15 @@ export async function orchestrateFork(
       containerWorkspacePath === containerManager.getContainerPath(newWorkspaceName),
       "Expected multi-project target runtime to keep using the shared container root"
     );
+    // One checkout per project, in `projects` order: every iteration above pushed exactly one
+    // entry or returned.
+    assert(
+      projectWorkspaces.length === projects.length &&
+        projectWorkspaces.every(
+          (entry, index) => entry.projectName === projects[index].projectName
+        ),
+      "Expected one forked checkout per project, in project order"
+    );
 
     return Ok({
       // Persist the primary project's checkout so downstream git work stays inside a repo.
@@ -496,6 +510,10 @@ export async function orchestrateFork(
       targetRuntime,
       forkedFromSource,
       projects,
+      secondaryCheckouts: projects.slice(1).map((project, index) => ({
+        projectPath: project.projectPath,
+        workspacePath: projectWorkspaces[index + 1].workspacePath,
+      })),
       ...(sourceRuntimeConfigUpdate ? { sourceRuntimeConfigUpdate } : {}),
       sourceRuntimeConfigUpdated,
     });

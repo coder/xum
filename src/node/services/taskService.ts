@@ -105,8 +105,12 @@ import {
   newMaterializationId,
   sharedTaskRowPublicationRefusal,
   type TaskCheckoutPreparation,
+  type TaskCheckoutSecondaryTarget,
 } from "@/node/services/taskCheckoutPreparation";
-import { isProtectedTaskRow } from "@/node/services/workspaceStructuralMutationGuard";
+import {
+  deriveHostLocalCheckoutPath,
+  isProtectedTaskRow,
+} from "@/node/services/workspaceStructuralMutationGuard";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -746,8 +750,55 @@ interface MaterializedTaskLaunch {
   forkedRuntimeConfig: RuntimeConfig;
   runtimeForTaskWorkspace: Runtime;
   inheritedProjects: WorkspaceMetadata["projects"];
+  /** A fresh multi-project fork's non-primary checkouts (orchestrateFork `secondaryCheckouts`). */
+  secondaryCheckouts?: TaskCheckoutSecondaryTarget[];
   sourceRuntimeConfigUpdate?: RuntimeConfig;
   reusedExistingCheckout: boolean;
+}
+
+/**
+ * The secondary checkouts of a dedicated fork as preparation targets (proof v2 binds each next
+ * to the primary): the directories orchestrateFork actually forked, cross-checked against what
+ * the row publishes. The validator matches them to the row's `projects[1..]` in order, and the
+ * runtime (like the structural guard's footprint) derives each one by name, so a divergence
+ * could never validate: it refuses the preparation instead (the assert throws inside the
+ * producer's `materialize`, so nothing is published and the checkouts are retained).
+ */
+function secondaryPreparationTargets(
+  fork: Pick<
+    MaterializedTaskLaunch,
+    "forkedRuntimeConfig" | "inheritedProjects" | "secondaryCheckouts"
+  >,
+  workspaceName: string
+): { secondaries?: TaskCheckoutSecondaryTarget[] } {
+  const secondaries = fork.secondaryCheckouts ?? [];
+  const secondaryProjects = (fork.inheritedProjects ?? []).slice(1);
+  assert(
+    secondaries.length === secondaryProjects.length &&
+      secondaries.every(
+        (secondary, index) => secondary.projectPath === secondaryProjects[index].projectPath
+      ),
+    "Task preparation: the fork's secondary checkouts do not match the task's projects"
+  );
+  for (const secondary of secondaries) {
+    const derived = deriveHostLocalCheckoutPath(
+      fork.forkedRuntimeConfig,
+      secondary.projectPath,
+      workspaceName
+    );
+    assert(
+      secondary.workspacePath === derived,
+      `Task preparation: secondary checkout ${secondary.workspacePath} is not the name-derived ${derived}`
+    );
+  }
+  return secondaries.length > 0 ? { secondaries } : {};
+}
+
+/** Every checkout a prepared fork materialized: the primary, then its secondaries. */
+function materializedCheckoutPaths(
+  fork: Pick<MaterializedTaskLaunch, "workspacePath" | "secondaryCheckouts">
+): string[] {
+  return [fork.workspacePath, ...(fork.secondaryCheckouts ?? []).map((s) => s.workspacePath)];
 }
 
 /**
@@ -5525,7 +5576,7 @@ export class TaskService implements AgentTaskIntegration {
         preparedPlans().length === 0
           ? ""
           : ` Prepared checkout(s) retained, not registered: ${preparedPlans()
-              .map((plan) => plan.prepared!.materialized.workspacePath)
+              .flatMap((plan) => materializedCheckoutPaths(plan.prepared!.materialized))
               .join(", ")}`;
       // A refusal decided before anything was owned or published (abort, fork failure): the
       // commit's own result, returned instead of thrown so nothing is settled or fenced.
@@ -5586,17 +5637,13 @@ export class TaskService implements AgentTaskIntegration {
                 ];
               })
             );
-            // Multi-project forks: this is the PRIMARY checkout only, so the one proof binds it
-            // alone (the proof schema holds one checkout identity). The secondary checkouts carry
-            // no consent state preparation could protect: multi-project workspaces load no agent
-            // plugins and read overrides from the runtime's container path, not from any project
-            // checkout. They are in the structural guard's footprint, so cooperating mutations
-            // are refused. Binding their identities needs a proof schema extension (a tracked
-            // follow-up).
+            // Multi-project forks list their secondary checkouts too: one proof (v2) binds every
+            // checkout the task executes in.
             return preparedPlans().map((plan) => ({
               workspacePath: plan.prepared!.materialized.workspacePath,
               runtimeConfig: plan.prepared!.materialized.forkedRuntimeConfig,
               materializationId: plan.prepared!.materializationId,
+              ...secondaryPreparationTargets(plan.prepared!.materialized, plan.workspaceName),
             }));
           },
           async (proofs) => {
@@ -6151,6 +6198,9 @@ export class TaskService implements AgentTaskIntegration {
       forkedRuntimeConfig: forkResult.data.forkedRuntimeConfig,
       runtimeForTaskWorkspace: forkResult.data.targetRuntime,
       inheritedProjects: forkResult.data.projects,
+      ...(forkResult.data.secondaryCheckouts != null
+        ? { secondaryCheckouts: forkResult.data.secondaryCheckouts }
+        : {}),
       ...(forkResult.data.sourceRuntimeConfigUpdate != null
         ? { sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate }
         : {}),
@@ -6212,7 +6262,7 @@ export class TaskService implements AgentTaskIntegration {
       } catch (error: unknown) {
         return Err(`${getErrorMessage(error)}${retainedNotice()}`);
       }
-      retained.push(materialized.workspacePath);
+      retained.push(...materializedCheckoutPaths(materialized));
       if (materialized.sourceRuntimeConfigUpdate) {
         // The fork learned the parent's real runtime config (what the lazy launch persisted
         // after ITS fork); the launch reuses this prepared checkout, so persist it here.
@@ -7372,6 +7422,7 @@ export class TaskService implements AgentTaskIntegration {
             forkedRuntimeConfig: RuntimeConfig;
             runtimeForTaskWorkspace: Runtime;
             inheritedProjects: ProjectRef[] | undefined;
+            secondaryCheckouts?: TaskCheckoutSecondaryTarget[];
             taskBaseCommitShaByProjectPath: Record<string, string>;
           }
         | undefined;
@@ -7382,6 +7433,7 @@ export class TaskService implements AgentTaskIntegration {
         let runtimeForTaskWorkspace: Runtime;
         let forkedFromSource: boolean;
         let inheritedProjects: ProjectRef[] | undefined;
+        let secondaryCheckouts: TaskCheckoutSecondaryTarget[] | undefined;
 
         if (useSharedWorkspace) {
           // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
@@ -7455,6 +7507,7 @@ export class TaskService implements AgentTaskIntegration {
           runtimeForTaskWorkspace = forkResult.data.targetRuntime;
           forkedFromSource = forkResult.data.forkedFromSource;
           inheritedProjects = forkResult.data.projects;
+          secondaryCheckouts = forkResult.data.secondaryCheckouts;
         }
 
         materializedCheckout = {
@@ -7491,6 +7544,7 @@ export class TaskService implements AgentTaskIntegration {
           forkedRuntimeConfig,
           runtimeForTaskWorkspace,
           inheritedProjects,
+          ...(secondaryCheckouts != null ? { secondaryCheckouts } : {}),
           taskBaseCommitShaByProjectPath,
         };
         return Ok(undefined);
@@ -7577,7 +7631,9 @@ export class TaskService implements AgentTaskIntegration {
       const retainedRefusal = (error: string): Result<never, string> => {
         assert(checkout != null, "Task.create: retained refusal before the checkout materialized");
         unregisteredCheckoutRetained = true;
-        return Err(`${error} ${retainedCheckoutNotice(checkout.workspacePath)}`);
+        return Err(
+          `${error} ${retainedCheckoutNotice(materializedCheckoutPaths(checkout).join(", "))}`
+        );
       };
       if (useSharedWorkspace) {
         const shared = await materializeCheckout();
@@ -7625,6 +7681,7 @@ export class TaskService implements AgentTaskIntegration {
                 workspacePath: checkout.workspacePath,
                 runtimeConfig: checkout.forkedRuntimeConfig,
                 materializationId: newMaterializationId(),
+                ...secondaryPreparationTargets(checkout, workspaceName),
               },
             ];
           },
