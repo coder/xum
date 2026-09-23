@@ -25,10 +25,17 @@ type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
  * (fail closed rather than silently dropping the guarantee). stderr text
  * reaches callers through readFileViaExec's RuntimeError message.
  *
- * The leading `[ -e ] && ! [ -f ]` precheck is advisory only: it fails fast on
- * a FIFO that is already sitting at the path (otherwise `exec 3<` on a
- * writer-less FIFO blocks until the exec timeout/abort). It does not close the
- * check→open race; the same-descriptor check after acquisition is what does.
+ * Acquisition is NOT nonblocking here (unlike the local runtimes' O_NONBLOCK
+ * open): the leading `[ -e ] && ! [ -f ]` precheck is advisory. It fails fast
+ * on a FIFO already sitting at the path, but a path replaced by a writer-less
+ * FIFO between the precheck and `exec 3<` still blocks acquisition in the
+ * exec's shell (not a libuv worker), as the plain `cat` blocks on any FIFO.
+ * Ending that shell is the transport's job: abort, stream cancel and the exec
+ * timeout end it when the signal reaches the shell; when it reaches only a
+ * client (an ssh/docker exec CLI that does not forward signals), only
+ * RemoteRuntime's remote `timeout -s KILL` wrapper does. DevcontainerRuntime's
+ * exec has no such wrapper. See execFileIO.regularFile.test.ts. The fd-based
+ * check guarantees the file type after acquisition, not a nonblocking one.
  * Requires POSIX sh + procfs/devfs `/dev/fd` (Linux, macOS) — the same
  * assumptions as the plain `cat` command.
  */

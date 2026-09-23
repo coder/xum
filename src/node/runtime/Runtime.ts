@@ -173,6 +173,11 @@ export interface ReadFileOptions {
    * cannot settle a kernel-blocked open — only a nonblocking acquisition can. The check is done
    * on the ACQUIRED descriptor (fstat / `/dev/fd/N`), never as a stat-then-open pre-check, so a
    * path swapped between check and read cannot change what is streamed.
+   *
+   * Acquisition: on POSIX, local runtimes open with O_NONBLOCK, so a FIFO cannot block it.
+   * Exec-backed runtimes open inside the exec's shell after an advisory precheck: a path replaced
+   * by a writer-less FIFO between precheck and open can still block that shell, as the plain
+   * `cat` did for any FIFO (cleanup bounds: see buildRegularFileReadCommand).
    */
   requireRegularFile?: boolean;
 }
