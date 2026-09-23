@@ -57,6 +57,20 @@ const composerAttachmentNames = (app: AppHarness) =>
   );
 const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
 /**
+ * Notes still attached in the workspace's review store. A send checks its notes off only after
+ * the send call resolves, which can trail the stream's end under load: wait for this to empty
+ * before asserting that nothing comes back.
+ */
+const attachedStoreReviewNotes = (app: AppHarness) =>
+  Object.values(
+    readPersistedState<{ reviews?: Record<string, { status: string; data: ReviewNoteData }> }>(
+      getReviewsKey(app.workspaceId),
+      {}
+    ).reviews ?? {}
+  )
+    .filter((review) => review.status === "attached")
+    .map((review) => review.data.userNote);
+/**
  * Bound for waits on work behind a composer send or a restore (the send's async preflight, the
  * in-process IPC hop, the backend queue, the re-render). waitFor's 1 s default passed isolated
  * but not when these app suites share the host with others (a combined jest run timed out
@@ -554,6 +568,7 @@ describe("Unsent queued message restored to the composer", () => {
       expect(sent.reviews).toEqual(reviews);
       await app.chat.expectStreamComplete();
       // The sent draft does not come back.
+      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
       await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       expect(app.view.container.textContent).not.toContain("reviews attached");
     } finally {
@@ -651,6 +666,7 @@ describe("Unsent queued message restored to the composer", () => {
       expect(countOccurrences(sent.text, "second authored")).toBe(1);
       expect(sent.reviews).toEqual([editedReview]);
       await app.chat.expectStreamComplete();
+      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
 
       // Neither the sent draft nor the discarded review comes back after another remount.
       await switchAwayAndBack();

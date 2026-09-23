@@ -790,12 +790,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const row = entryOf(config, taskId);
       expect(row?.taskStatus).toBe("reported");
       expect(row?.taskAttemptId).toMatch(ATTEMPT_ID);
-      expect(outcome.kind === "reawakened" && outcome.attemptId).toBe(row?.taskAttemptId);
+      const firstAttemptId = row!.taskAttemptId!;
+      expect(outcome.kind === "reawakened" && outcome.attemptId).toBe(firstAttemptId);
       // Lineage unproven: no settlement, no receipt can vouch for the id-less predecessor.
       expect(row?.taskAttemptUnproven).toBe(true);
       expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
         source: "reawaken",
-        attemptId: row?.taskAttemptId,
+        attemptId: firstAttemptId,
         receiptEligible: false,
       });
       expect(svc.attemptSettlementByTaskId.has(taskId)).toBe(false);
@@ -805,7 +806,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       );
       expect(svc.admittedSendsByTaskId.get(taskId)?.size).toBe(1);
       for (const send of svc.admittedSendsByTaskId.get(taskId) ?? []) {
-        expect(send.attemptId).toBe(row?.taskAttemptId);
+        expect(send.attemptId).toBe(firstAttemptId);
       }
       sendToken.onDisposed("no-work");
     });
