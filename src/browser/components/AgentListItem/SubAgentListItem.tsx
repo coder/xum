@@ -1,11 +1,5 @@
-import React, { useMemo } from "react";
+import type React from "react";
 import { cn } from "@/common/lib/utils";
-
-/**
- * Period of the animated connector dash cycle. Must match the
- * connector-dash-scroll animation duration in globals.css.
- */
-export const CONNECTOR_DASH_CYCLE_MS = 400;
 
 interface SubAgentListItemProps {
   connectorPosition: "single" | "middle" | "last";
@@ -25,33 +19,6 @@ interface SubAgentListItemProps {
   children: React.ReactNode;
 }
 
-/**
- * The dashed connector pattern is anchored to the viewport (see
- * .subagent-connector-active::before in globals.css), so two segments only
- * render one continuous pattern when their animation clocks also agree. CSS
- * animations start whenever a segment's active class is applied — a different
- * moment for every row mounted as agents spawn — so each segment supplies a
- * negative animation-delay aligned to the shared page clock, making every
- * active segment sample the same global dash phase.
- *
- * The timestamp must be captured once per animation start (keyed on `active`):
- * recomputing it on unrelated re-renders would move animation-delay while the
- * animation runs and visibly jump the phase.
- */
-type ConnectorDashSyncStyle = React.CSSProperties & { "--connector-dash-delay": string };
-
-function useConnectorDashSyncStyle(active: boolean): ConnectorDashSyncStyle | undefined {
-  return useMemo(() => {
-    if (!active) {
-      return undefined;
-    }
-    const style: ConnectorDashSyncStyle = {
-      "--connector-dash-delay": `${-(performance.now() % CONNECTOR_DASH_CYCLE_MS)}ms`,
-    };
-    return style;
-  }, [active]);
-}
-
 /** One vertical 1px connector segment with the shared dash-phase treatment. */
 function ConnectorTrunkSegment(props: {
   testId: string;
@@ -61,11 +28,9 @@ function ConnectorTrunkSegment(props: {
   style?: React.CSSProperties;
   dataAttributes?: Record<string, string>;
 }) {
-  const dashSyncStyle = useConnectorDashSyncStyle(props.active);
   const segmentStyle: React.CSSProperties & { "--connector-color": string } = {
     "--connector-color": props.isSelected ? "var(--color-border)" : "var(--color-border-light)",
     ...props.style,
-    ...dashSyncStyle,
   };
   return (
     <span
@@ -125,7 +90,6 @@ export function SubAgentListItem(props: SubAgentListItemProps) {
   const elbowLeft = Math.min(props.connectorRailX, props.childStatusCenterX);
   const elbowWidth = Math.max(1, Math.abs(props.childStatusCenterX - props.connectorRailX));
   const elbowBendsRight = props.childStatusCenterX >= props.connectorRailX;
-  const elbowDashSyncStyle = useConnectorDashSyncStyle(props.isElbowActive);
 
   return (
     <div className="relative">
@@ -178,7 +142,7 @@ export function SubAgentListItem(props: SubAgentListItemProps) {
             aria-hidden
             data-testid="subagent-connector-elbow"
             className="absolute top-1/2 h-[6px] -translate-y-full"
-            style={{ left: elbowLeft, width: elbowWidth, ...elbowDashSyncStyle }}
+            style={{ left: elbowLeft, width: elbowWidth }}
             viewBox={`0 0 ${elbowWidth} ${connectorTurnSizePx}`}
           >
             <path

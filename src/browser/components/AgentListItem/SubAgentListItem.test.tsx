@@ -76,18 +76,15 @@ describe("SubAgentListItem", () => {
     expect(trunk.getAttribute("class")).toContain("inset-y-0");
     expect(trunk.getAttribute("style")).not.toContain("bottom:");
     expect(trunk.getAttribute("class")).toContain("subagent-connector-active");
-    // Active segments align their dash animation to the shared page clock.
-    expect(trunk.getAttribute("style")).toContain("--connector-dash-delay");
     expect(view.queryByTestId("subagent-connector-pass-through")).toBeNull();
   });
 
-  test("inactive trunks render solid without a dash sync delay", () => {
+  test("inactive trunks render solid", () => {
     const view = renderItem({ connectorPosition: "middle" });
 
     const trunk = view.getByTestId("subagent-connector-trunk");
 
     expect(trunk.getAttribute("class")).not.toContain("subagent-connector-active");
-    expect(trunk.getAttribute("style") ?? "").not.toContain("--connector-dash-delay");
   });
 
   test("renders the child trunk stub when this row parents visible sub-agents", () => {

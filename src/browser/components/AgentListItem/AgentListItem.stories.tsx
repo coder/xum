@@ -1,6 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { AgentListItem } from "@/browser/components/AgentListItem/AgentListItem";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
@@ -8,7 +8,7 @@ import { TitleEditProvider } from "@/browser/contexts/WorkspaceTitleEditContext"
 import { DndProvider } from "react-dnd";
 import { HTML5Backend } from "react-dnd-html5-backend";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import { screen, waitFor, userEvent } from "@storybook/test";
+import { expect, screen, waitFor, userEvent, within } from "@storybook/test";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { NOW, createWorkspace } from "@/browser/stories/mocks/workspaces";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
@@ -21,10 +21,12 @@ import {
 } from "@/common/constants/storage";
 import type { AgentRowRenderMeta } from "@/browser/utils/ui/workspaceFiltering";
 import type { WorkspaceActivitySnapshot } from "@/common/orpc/types";
+import { SubAgentListItem } from "./SubAgentListItem";
 
 const meta: Meta<typeof AgentListItem> = {
   title: "Components/AgentListItem",
   component: AgentListItem,
+  tags: ["connector-regression"],
   parameters: {
     layout: "padded",
   },
@@ -185,7 +187,7 @@ function StoryScaffold(props: {
         <TitleEditProvider onUpdateTitle={() => Promise.resolve({ success: true })}>
           <TooltipProvider>
             <DndProvider backend={HTML5Backend}>
-              <div className="border-border bg-surface-primary w-[360px] rounded-md border p-2">
+              <div className="subagent-connector-clock border-border bg-surface-primary w-[360px] max-w-full rounded-md border p-2">
                 <div className={props.rowContainerClassName ?? "space-y-1"}>{props.children}</div>
               </div>
             </DndProvider>
@@ -727,6 +729,152 @@ export const ParentTrunkContinuity: Story = {
   args: undefined as never,
   name: "SubAgent States/Parent Trunk Continuity",
   render: renderParentTrunkContinuity,
+  play: async ({ canvasElement }) => {
+    await waitFor(async () => {
+      const canvas = within(canvasElement);
+      const parent = canvas.getByTestId("subagent-child-trunk").getBoundingClientRect();
+      const trunks = canvas
+        .getAllByTestId("subagent-connector-trunk")
+        .map((node) => node.getBoundingClientRect());
+      const elbows = canvas.getAllByTestId("subagent-connector-elbow");
+      await expect(trunks).toHaveLength(3);
+      await expect(parent.height).toBeGreaterThan(0);
+      await expect(Math.abs(parent.bottom - trunks[0].top)).toBeLessThan(1);
+      for (const [index, trunk] of trunks.entries()) {
+        await expect(trunk.height).toBeGreaterThan(0);
+        await expect(Math.abs(trunk.left - parent.left)).toBeLessThan(1);
+        const nextTop = trunks[index + 1]?.top ?? elbows[index].getBoundingClientRect().top;
+        await expect(Math.abs(trunk.bottom - nextTop)).toBeLessThan(1);
+      }
+    });
+  },
+};
+
+export const ParentTrunkContinuityPhone: Story = {
+  ...ParentTrunkContinuity,
+  name: "SubAgent States/Parent Trunk Continuity Phone",
+  parameters: {
+    pixel: { matrix: { viewports: ["phone"] } },
+    viewport: {
+      options: {
+        phone: { name: "Phone", styles: { width: "390px", height: "844px" }, type: "mobile" },
+      },
+    },
+  },
+  globals: { viewport: { value: "phone", isRotated: false } },
+  // The test runner ignores viewport globals; constrain the actual container too.
+  decorators: [
+    (Story) => (
+      <div style={{ width: 343, maxWidth: "100%" }}>
+        <Story />
+      </div>
+    ),
+  ],
+};
+
+function ConnectorAnimationLifecycleFixture() {
+  const [count, setCount] = useState(1);
+  const [active, setActive] = useState(false);
+  return (
+    <div className="subagent-connector-clock w-[340px] max-w-full">
+      <button onClick={() => setCount((value) => value + 1)}>Add child</button>
+      <button onClick={() => setActive((value) => !value)}>Toggle child</button>
+      <button
+        onClick={() => {
+          setCount(0);
+          setActive(false);
+        }}
+      >
+        Stop children
+      </button>
+      {Array.from({ length: count + 1 }, (_, index) => (
+        <SubAgentListItem
+          key={index}
+          connectorPosition="middle"
+          sharedTrunkActiveThroughRow={index !== 0 || active}
+          ancestorTrunks={[]}
+          connectorRailX={18}
+          childStatusCenterX={26}
+          isSelected={false}
+          isElbowActive={index !== 0 || active}
+        >
+          <div className="h-8 pl-8">Child {index}</div>
+        </SubAgentListItem>
+      ))}
+    </div>
+  );
+}
+
+export const ConnectorAnimationLifecycle: Story = {
+  args: undefined as never,
+  name: "SubAgent States/Connector Animation Lifecycle",
+  // Pixel intentionally disables motion; exercise the live CSS timeline in the
+  // browser test runner, leaving the pinned continuity stories for snapshots.
+  parameters: { pixel: { exclude: true } },
+  render: () => <ConnectorAnimationLifecycleFixture />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const root = canvasElement.ownerDocument.documentElement;
+    const wasInactive = root.hasAttribute("data-renderer-inactive");
+    const frame = () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+      );
+    const trunkPhases = () =>
+      Array.from(
+        canvasElement.querySelectorAll(".subagent-connector-active"),
+        (node) => getComputedStyle(node, "::before").backgroundPositionY
+      );
+    const assertSynchronized = async () => {
+      // Sample all rendered offsets in one frame before instrumented assertions yield.
+      const trunks = trunkPhases();
+      const elbows = Array.from(
+        canvasElement.querySelectorAll(".subagent-connector-elbow-active"),
+        (node) => getComputedStyle(node).strokeDashoffset
+      );
+      const elbow = canvasElement.querySelector(".subagent-connector-elbow-active")!;
+      const period = getComputedStyle(elbow)
+        .strokeDasharray.split(/[, ]+/)
+        .reduce((sum, part) => sum + Number.parseFloat(part), 0);
+      await expect(new Set(trunks).size).toBe(1);
+      await expect(new Set(elbows).size).toBe(1);
+      await expect(Number.parseFloat(elbows[0]) + Number.parseFloat(trunks[0])).toBeCloseTo(
+        period,
+        2
+      );
+    };
+    try {
+      root.removeAttribute("data-renderer-inactive");
+      const initialPhase = trunkPhases()[0];
+      await waitFor(() => expect(trunkPhases()[0]).not.toBe(initialPhase));
+      root.setAttribute("data-renderer-inactive", "");
+      await frame();
+      const pausedPhase = trunkPhases()[0];
+      // Mount and reactivate real components while the renderer's timeline is paused.
+      await userEvent.click(canvas.getByRole("button", { name: "Add child" }));
+      await userEvent.click(canvas.getByRole("button", { name: "Toggle child" }));
+      await frame();
+      await expect(trunkPhases()).toHaveLength(3);
+      await expect(trunkPhases()[0]).toBe(pausedPhase);
+      await assertSynchronized();
+      root.removeAttribute("data-renderer-inactive");
+      await waitFor(() => expect(trunkPhases()[0]).not.toBe(pausedPhase));
+      await assertSynchronized();
+      // An ordinary rerender and another late mount must not restart old phases.
+      await userEvent.click(canvas.getByRole("button", { name: "Add child" }));
+      await frame();
+      await expect(trunkPhases()).toHaveLength(4);
+      await assertSynchronized();
+      await userEvent.click(canvas.getByRole("button", { name: "Stop children" }));
+      await frame();
+      await expect(trunkPhases()).toHaveLength(0);
+      await expect(
+        canvasElement.querySelector(".subagent-connector-clock")!.getAnimations()
+      ).toHaveLength(0);
+    } finally {
+      root.toggleAttribute("data-renderer-inactive", wasInactive);
+    }
+  },
 };
 
 export const ClickKebabButton: Story = {
