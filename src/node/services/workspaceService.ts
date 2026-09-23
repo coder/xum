@@ -4485,10 +4485,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
+    let heldInputs = 0;
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
       if (session.hasQueuedMessages()) queuedMessages++;
+      // Held inputs are not queued work, but they live only in session memory: a restart would
+      // silently drop the user's unsent text, attachments and reviews.
+      if (session.getHeldInputs().length > 0) heldInputs++;
       if (session.hasPendingAutoRetry()) autoRetries++;
     }
     const blockers: RestartBlocker[] = [
@@ -4516,6 +4520,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
+      { kind: "held-inputs", count: heldInputs },
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",

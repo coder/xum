@@ -805,6 +805,8 @@ export const RestartBlockerSchema = z.object({
     "requests",
     "desktop-sessions",
     "queued-messages",
+    // Refused queued messages the session keeps for the user (AgentSession.heldInputs); memory only.
+    "held-inputs",
     "auto-retries",
     "terminals",
     "background-processes",

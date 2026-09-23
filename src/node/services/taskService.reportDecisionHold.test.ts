@@ -220,6 +220,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       getInitState: mock(() => undefined),
       waitForInit: mock(() => Promise.resolve()),
       clearInMemoryState: mock(() => undefined),
+      runningInitWorkspaceIds: mock(() => []),
     } as unknown as InitStateManager;
     const aiService = sessionHarness.aiService as unknown as AIService;
     const workspaceService = new WorkspaceService(
@@ -568,6 +569,36 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         (event) => event.type === "held-inputs-changed"
       );
       expect(heldEvents.at(-1)).toMatchObject({ heldInputs: [] });
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
+  test("a session holding refused input blocks an app restart until the input is sent or discarded (it lives only in memory)", async () => {
+    const childId = "holdrestart001";
+    const stack = await createStack(childId);
+    const { config, taskService, workspaceService, sendOptions } = stack;
+    const heldBlockers = () =>
+      workspaceService.collectRestartBlockers().filter((blocker) => blocker.kind === "held-inputs");
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      stack.endStream(0, { report: "done" }, true);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      await until(() => stack.heldInputs().length === 1, "follow-up held");
+      await until(() => !stack.sessionHarness.session.isBusy(), "turn settled");
+      // Not queued work, yet a restart would lose it.
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      expect(heldBlockers()).toEqual([{ kind: "held-inputs", count: 1 }]);
+
+      const [held] = stack.heldInputs();
+      expect(workspaceService.discardHeldInput(childId, held.id)).toEqual(Ok(undefined));
+      expect(heldBlockers()).toEqual([]);
     } finally {
       await stack.cleanup();
     }
