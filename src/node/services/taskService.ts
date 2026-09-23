@@ -103,8 +103,10 @@ import {
   isProjectDirLocalRuntime,
   isWorktreeSemanticsRuntime,
   newMaterializationId,
+  sharedTaskRowPublicationRefusal,
   type TaskCheckoutPreparation,
 } from "@/node/services/taskCheckoutPreparation";
+import { isProtectedTaskRow } from "@/node/services/workspaceStructuralMutationGuard";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -6939,52 +6941,67 @@ export class TaskService implements AgentTaskIntegration {
         workspacePath,
       });
 
+      const queuedRow: WorkspaceConfigEntry = {
+        kind: parentIsScratch ? "scratch" : undefined,
+        path: workspacePath,
+        id: taskId,
+        name: workspaceName,
+        title: args.title,
+        createdAt,
+        runtimeConfig: taskRuntimeConfig,
+        aiSettings: {
+          model: canonicalModel,
+          thinkingLevel: effectiveThinkingLevel,
+          ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+        },
+        parentWorkspaceId,
+        agentId,
+        agentType,
+        workflowTask: args.workflowTask,
+        bestOf: normalizedBestOf,
+        taskStatus: "queued",
+        // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
+        taskAttemptId: newTaskAttemptId(),
+        taskPrompt: prompt,
+        taskTrunkBranch: trunkBranch,
+        taskModelString,
+        taskThinkingLevel: effectiveThinkingLevel,
+        taskOnRefusal: args.onRefusal,
+        taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
+        taskIsolation: useSharedWorkspace ? "none" : undefined,
+        taskAttentionPolicy: args.attentionPolicy,
+        taskDesktopOwnerWorkspaceId,
+        projects: parentMeta.projects,
+      };
+      const publishQueuedRow = () =>
+        this.config.editConfig((config) => {
+          let projectConfig = config.projects.get(configProjectPath);
+          if (!projectConfig) {
+            projectConfig = { workspaces: [] };
+            config.projects.set(configProjectPath, projectConfig);
+          }
+          projectConfig.workspaces.push(queuedRow);
+          const stale = sharedTaskRowPublicationRefusal(config, taskId);
+          if (stale != null) throw new Error(`Task.create: ${stale}`);
+          this.desktopInputCoordinator.assertAdmission(config, taskId);
+          return config;
+        });
       try {
         await reserveDesktop(async () => {
-          await this.config.editConfig((config) => {
-            let projectConfig = config.projects.get(configProjectPath);
-            if (!projectConfig) {
-              projectConfig = { workspaces: [] };
-              config.projects.set(configProjectPath, projectConfig);
-            }
-
-            projectConfig.workspaces.push({
-              kind: parentIsScratch ? "scratch" : undefined,
-              path: workspacePath,
-              id: taskId,
-              name: workspaceName,
-              title: args.title,
-              createdAt,
-              runtimeConfig: taskRuntimeConfig,
-              aiSettings: {
-                model: canonicalModel,
-                thinkingLevel: effectiveThinkingLevel,
-                ...(effectiveReasoningMode != null
-                  ? { reasoningMode: effectiveReasoningMode }
-                  : {}),
-              },
-              parentWorkspaceId,
-              agentId,
-              agentType,
-              workflowTask: args.workflowTask,
-              bestOf: normalizedBestOf,
-              taskStatus: "queued",
-              // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
-              taskAttemptId: newTaskAttemptId(),
-              taskPrompt: prompt,
-              taskTrunkBranch: trunkBranch,
-              taskModelString,
-              taskThinkingLevel: effectiveThinkingLevel,
-              taskOnRefusal: args.onRefusal,
-              taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
-              taskIsolation: useSharedWorkspace ? "none" : undefined,
-              taskAttentionPolicy: args.attentionPolicy,
-              taskDesktopOwnerWorkspaceId,
-              projects: parentMeta.projects,
-            });
-            this.desktopInputCoordinator.assertAdmission(config, taskId);
-            return config;
-          });
+          if (!isProtectedTaskRow(queuedRow)) {
+            await publishQueuedRow();
+            return;
+          }
+          // A host-local (shared) task row is protected: structural mutators scan task rows and
+          // rename/remove under the registration lock. Published outside that lock, the row could
+          // land between another backend's scan and its rename, leaving it pointing at the old
+          // path (PREP_SHARED_BROKEN). Publish it under the same empty-target lock hold as the
+          // unqueued shared path (no checkout, no prune): the scan sees every task row or none.
+          const registration = await this.workspaceService.prepareTaskCheckouts(
+            () => Promise.resolve([]),
+            publishQueuedRow
+          );
+          if (!registration.success) throw new Error(registration.error);
         });
       } catch (error) {
         return Err(getErrorMessage(error));
@@ -7423,6 +7440,8 @@ export class TaskService implements AgentTaskIntegration {
             taskDesktopOwnerWorkspaceId,
             projects: inheritedProjects,
           });
+          const stale = sharedTaskRowPublicationRefusal(config, taskId);
+          if (stale != null) throw new Error(`Task.create: ${stale}`);
           this.desktopInputCoordinator.assertAdmission(config, taskId);
           // Past the last pre-write refusal: from here the save may land whatever is thrown next.
           configWriteAttempted = true;
