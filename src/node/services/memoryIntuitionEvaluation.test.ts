@@ -6,7 +6,7 @@ import {
 import { chunkMemoryText, pickChunks } from "./memoryIntuitionEvaluation";
 
 describe("chunkMemoryText", () => {
-  it("splits paragraphs and top-level bullets, carrying lone headings into the next block", () => {
+  it("splits paragraphs and top-level bullets, keeping nested bullets and dropping bare headings", () => {
     const text = [
       "# Title",
       "",
@@ -18,28 +18,18 @@ describe("chunkMemoryText", () => {
       "- second bullet",
       "1. numbered item",
       "",
-      "## Alice",
-      "",
-      "### Contact",
-      "- Lives in Paris",
+      "## Only a heading",
       "",
       "## Heading with text",
       "Body under heading.",
-      "",
-      "## Trailing heading",
     ].join("\n");
-    const chunks = chunkMemoryText(text);
-    expect(chunks).toEqual([
-      "# Title\n\nFirst paragraph\ncontinues here.",
+    expect(chunkMemoryText(text)).toEqual([
+      "First paragraph\ncontinues here.",
       "- top bullet\n  - nested detail",
       "- second bullet",
       "1. numbered item",
-      "## Alice\n\n### Contact\n\n- Lives in Paris",
       "## Heading with text\nBody under heading.",
     ]);
-    // Joined headings still match the source up to whitespace, so excerpt checks accept them.
-    const normalize = (value: string) => value.replace(/\s+/gu, " ").trim();
-    for (const chunk of chunks) expect(normalize(text)).toContain(normalize(chunk));
   });
 
   it("windows long blocks at whitespace so text past the excerpt cap stays reachable", () => {
