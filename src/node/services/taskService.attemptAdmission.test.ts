@@ -3607,4 +3607,67 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       20_000
     );
   });
+  test("a terminal stream error is settled only for the failing attempt: a row another backend re-admitted during the handler's awaits is left untouched", async () => {
+    const taskId = "stale-stream-error";
+    const foreign = "att_00000000000000c3";
+    const { config } = await setupTree([
+      {
+        id: taskId,
+        overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000a9" },
+      },
+    ]);
+    const otherBackend = await createTestConfig(rootDir);
+    const { workspaceService, clearQueue } = createWorkspaceServiceMocks();
+    const { aiService, stopStream } = createAIServiceMocks(config);
+    const { taskService } = createHarness(config, { aiService, workspaceService });
+    const svc = internals(taskService);
+    expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+    const attemptA = entryOf(config, taskId)!.taskAttemptId!;
+    expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(attemptA);
+    // Backend B re-admits the row while this backend's handler awaits its owned-work probe.
+    spyOn(
+      svc as unknown as { hasActiveTaskOwnedWork: () => Promise<boolean> },
+      "hasActiveTaskOwnedWork"
+    ).mockImplementation(async () => {
+      await otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === taskId);
+          if (ws) {
+            ws.taskStatus = "running";
+            ws.taskAttemptId = foreign;
+            ws.taskAttemptUnproven = true;
+          }
+        }
+        return cfg;
+      });
+      return false;
+    });
+    await (
+      taskService as unknown as {
+        handleTaskStreamError: (event: unknown, attemptId?: string) => Promise<void>;
+      }
+    ).handleTaskStreamError(
+      {
+        type: "error",
+        workspaceId: taskId,
+        messageId: "assistant-refused",
+        error: "The model refused.",
+        errorType: "model_refusal",
+      },
+      attemptA
+    );
+    expect(entryOf(config, taskId)).toMatchObject({
+      taskStatus: "running",
+      taskAttemptId: foreign,
+      taskAttemptUnproven: true,
+    });
+    expect(entryOf(config, taskId)?.taskLaunchError).toBeUndefined();
+    expect(
+      await readSubagentFailureArtifact(path.join(config.sessionsDir, rootId), taskId)
+    ).toBeNull();
+    expect(clearQueue).not.toHaveBeenCalled();
+    expect(stopStream).not.toHaveBeenCalled();
+    expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+    expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(foreign);
+  });
 });

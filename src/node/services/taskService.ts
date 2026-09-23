@@ -2807,6 +2807,15 @@ export class TaskService implements AgentTaskIntegration {
     return this.currentTaskAttemptId(taskId);
   }
 
+  /**
+   * The attempt a stream event belongs to, read in the event's own tick: this process's owned
+   * attempt, else the attempt the live turn was admitted under (streamAttemptIdWithoutOwner).
+   */
+  private streamAttemptIdAtEvent(taskId: string): string | undefined {
+    const owned = this.ownedAttemptByTaskId.get(taskId);
+    return owned != null ? owned.attemptId : this.streamAttemptIdWithoutOwner(taskId);
+  }
+
   /** Sends admitted against the task's current attempt that have not claimed a turn yet. */
   private hasPendingAdmissions(taskId: string): boolean {
     const current = this.currentTaskAttemptId(taskId);
@@ -3648,9 +3657,12 @@ export class TaskService implements AgentTaskIntegration {
     this.aiService.on("error", (payload: unknown) => {
       if (!isErrorEvent(payload)) return;
 
+      // The failing stream's attempt, captured in the event's own tick (before the lock wait lets
+      // another writer re-admit the row): the error settles that attempt only.
+      const errorAttemptId = this.streamAttemptIdAtEvent(payload.workspaceId);
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
-          await this.handleTaskStreamError(payload);
+          await this.handleTaskStreamError(payload, errorAttemptId);
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleTaskStreamError failed", { error });
@@ -15201,7 +15213,12 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleMaybeStartQueuedTasks();
   }
 
-  private async handleTaskStreamError(event: ErrorEvent): Promise<void> {
+  private async handleTaskStreamError(
+    event: ErrorEvent,
+    /** Captured by the production listener at event time; the entry-time read is for tests. */
+    eventAttemptId?: string
+  ): Promise<void> {
+    const errorAttemptId = eventAttemptId ?? this.streamAttemptIdAtEvent(event.workspaceId);
     if (await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamError(event)) {
       return;
     }
@@ -15209,6 +15226,19 @@ export class TaskService implements AgentTaskIntegration {
     const cfg = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(cfg, workspaceId);
     if (!entry?.workspace.parentWorkspaceId) {
+      return;
+    }
+    // Another writer re-admitted the row since the failing stream's attempt: the error is that
+    // attempt's alone (every write below is also CAS'd on it — see rowSupersedes).
+    if (rowSupersedes(entry.workspace, errorAttemptId)) {
+      log.info(
+        "[task-attempt] stream error ignored: its attempt was superseded by another writer",
+        {
+          workspaceId,
+          attemptId: errorAttemptId,
+          errorType: event.errorType,
+        }
+      );
       return;
     }
 
@@ -15256,10 +15286,15 @@ export class TaskService implements AgentTaskIntegration {
         errorType: event.errorType,
         error: event.error,
       });
-      await this.failAgentTaskTerminally(workspaceId, entry, {
-        errorType: event.errorType ?? "unknown",
-        errorMessage: event.error,
-      });
+      await this.failAgentTaskTerminally(
+        workspaceId,
+        entry,
+        {
+          errorType: event.errorType ?? "unknown",
+          errorMessage: event.error,
+        },
+        errorAttemptId != null ? { expectedAttemptId: errorAttemptId } : undefined
+      );
       return;
     }
 
@@ -15297,10 +15332,15 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
         error: event.error,
       });
-      await this.failAgentTaskTerminally(workspaceId, entry, {
-        errorType: event.errorType,
-        errorMessage: event.error,
-      });
+      await this.failAgentTaskTerminally(
+        workspaceId,
+        entry,
+        {
+          errorType: event.errorType,
+          errorMessage: event.error,
+        },
+        errorAttemptId != null ? { expectedAttemptId: errorAttemptId } : undefined
+      );
       return;
     }
 
@@ -15324,6 +15364,7 @@ export class TaskService implements AgentTaskIntegration {
     );
 
     await this.promptTaskForRequiredCompletionTool(workspaceId, {
+      expectedAttemptId: errorAttemptId,
       reason: "error",
       error: event,
     });
