@@ -95,6 +95,54 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
     ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: gitAdminDir });
   });
 
+  test("a v2 proof's secondary checkout paths (a list of identities) protect a root that aliases them", async () => {
+    const projectPath = path.join(tempDir, "repo");
+    const secondaryProjectPath = path.join(tempDir, "repo2");
+    const rootCheckout = path.join(tempDir, "src", "repo2", "root");
+    await fsPromises.mkdir(rootCheckout, { recursive: true });
+    const elsewhere = path.join(tempDir, "elsewhere");
+    const identity = (checkout: string, pointer: string) => ({
+      path: checkout,
+      realpath: checkout,
+      root: { dev: "1", ino: "2" },
+      gitdir: { pointer, dev: "1", ino: "3" },
+    });
+    // Only the SECONDARY identity names the root's checkout and the second repository's admin
+    // dir; the row and its primary identity point elsewhere.
+    const task = withProof(
+      { path: elsewhere, id: "task", parentWorkspaceId: "root" },
+      {
+        v: 2,
+        ...identity(elsewhere, path.join(projectPath, ".git", "worktrees", "task")),
+        secondaries: [
+          {
+            projectPath: secondaryProjectPath,
+            ...identity(rootCheckout, path.join(secondaryProjectPath, ".git", "worktrees", "task")),
+          },
+        ],
+      }
+    );
+    const root: Workspace = { path: rootCheckout, id: "root", name: "root" };
+    expect(
+      await findProtectedFootprintOverlap(
+        { projects: new Map([[projectPath, { workspaces: [root, task] }]]) },
+        { row: root, bucketProjectPath: projectPath }
+      )
+    ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: rootCheckout });
+    // A project-dir root of the second repository holds the secondary's admin dir.
+    const repoRoot: Workspace = { path: secondaryProjectPath, id: "repo2-root", name: "repo2" };
+    expect(
+      await findProtectedFootprintOverlap(
+        { projects: new Map([[secondaryProjectPath, { workspaces: [repoRoot, task] }]]) },
+        { row: repoRoot, bucketProjectPath: secondaryProjectPath }
+      )
+    ).toMatchObject({
+      kind: "overlap",
+      taskWorkspaceId: "task",
+      taskPath: path.join(secondaryProjectPath, ".git", "worktrees", "task"),
+    });
+  });
+
   test("a protected row sharing the target's id (malformed duplicate) makes the target ambiguous, and the scan still excludes only the exact target entry", async () => {
     const projectPath = path.join(tempDir, "repo");
     const rootCheckout = path.join(tempDir, "src", "repo", "root");

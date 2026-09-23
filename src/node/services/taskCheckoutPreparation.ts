@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
@@ -24,9 +25,12 @@ import assert from "@/common/utils/assert";
  * BEFORE its row is first published; the same config write carries this proof. The proof binds
  * the row to the physical directory that was sanitized — root and git-admin device/inode, the
  * `.git` pointer and a producer nonce inside the git admin dir — plus the canonical runtime and
- * the published path. It is immutable: admissions never rotate it and nothing rebinds it. Every
- * execution/MCP consumer authorizes only a `ready` derivation; everything else refuses without
- * deleting or pruning anything (files stay inspectable; recovery is an ordinary fresh task).
+ * the published path. A multi-project task executes in one checkout per project: its proof (v2)
+ * binds every secondary project's checkout the same way, with the same nonce in each one's own
+ * git admin dir, so no checkout the task runs in is unproven. It is immutable: admissions never
+ * rotate it and nothing rebinds it. Every execution/MCP consumer authorizes only a `ready`
+ * derivation; everything else refuses without deleting or pruning anything (files stay
+ * inspectable; recovery is an ordinary fresh task).
  *
  * Shared tasks (isolation "none", or LocalRuntime conversation forks that share the project
  * directory) carry NO proof of their own: their authority is derived, on every authorization,
@@ -60,7 +64,11 @@ export type TaskCheckoutMismatchDimension =
   | "git-special-file"
   | "gitdir-pointer"
   | "gitdir"
-  | "nonce";
+  | "nonce"
+  /** A secondary checkout and its admin dir are both gone (the primary reports `missing`). */
+  | "missing"
+  /** The proof's secondary projects are not exactly the row's `projects[1..]`, in order. */
+  | "projects";
 
 export type TaskCheckoutPreparationState =
   | { kind: "excluded-root" }
@@ -69,7 +77,8 @@ export type TaskCheckoutPreparationState =
   | { kind: "unsupported"; detail: string }
   | { kind: "runtime-mismatch"; detail: string }
   | { kind: "missing" }
-  | { kind: "mismatch"; dimension: TaskCheckoutMismatchDimension }
+  /** `checkout`: the secondary checkout that mismatched (absent for the row's own checkout). */
+  | { kind: "mismatch"; dimension: TaskCheckoutMismatchDimension; checkout?: string }
   | { kind: "unreadable"; detail: string }
   | { kind: "shared-broken"; detail: string }
   | { kind: "ready"; authority: TaskCheckoutAuthority };
@@ -101,12 +110,24 @@ export interface TaskCheckoutAuthority {
   signature: string;
 }
 
-/** Physical identity of a checkout, captured (and claimed) BEFORE the prune under its locks. */
-export interface CapturedTaskCheckoutIdentity {
+/** Physical identity of one checkout. */
+interface CheckoutIdentity {
   path: string;
   realpath: string;
   root: { dev: string; ino: string };
   gitdir: { pointer: string; dev: string; ino: string };
+}
+
+/** A secondary project's checkout of a multi-project task (the fork orchestrator created it). */
+export interface TaskCheckoutSecondaryTarget {
+  projectPath: string;
+  workspacePath: string;
+}
+
+/** Physical identity of a checkout, captured (and claimed) BEFORE the prune under its locks. */
+export interface CapturedTaskCheckoutIdentity extends CheckoutIdentity {
+  /** Multi-project tasks: every secondary checkout, claimed with the primary (proof v2). */
+  secondaries?: Array<CheckoutIdentity & { projectPath: string }>;
 }
 
 /** The claimed identity, re-verified after the prune together with the nonce it carries. */
@@ -280,10 +301,7 @@ async function captureIdentity(
   };
 }
 
-function sameCheckoutIdentity(
-  a: CapturedTaskCheckoutIdentity,
-  b: CapturedTaskCheckoutIdentity
-): boolean {
+function sameCheckoutIdentity(a: CheckoutIdentity, b: CheckoutIdentity): boolean {
   return (
     a.path === b.path &&
     a.realpath === b.realpath &&
@@ -309,39 +327,33 @@ function sameCheckoutIdentity(
  * so device/inode identity alone cannot tell the pruned directory from a replacement, while a
  * replacement never carries a nonce only this process knows. A claimed checkout whose
  * preparation then fails is retained unpublished and refused by every later claim.
+ *
+ * `secondaries` (multi-project tasks): every secondary checkout is claimed right after the
+ * primary, with the SAME nonce in its own git admin dir. They carry no consent state (a
+ * multi-project workspace loads no agent plugins and reads overrides from its container path),
+ * so nothing prunes them, but the same claim-then-bind brackets prove each one bound is the
+ * directory that was claimed. One nonce per generation suffices: each admin dir is a different
+ * directory, and the per-checkout root/admin identities already tell the checkouts apart.
  */
 export async function claimTaskCheckoutIdentity(
-  target: { workspacePath: string },
+  target: { workspacePath: string; secondaries?: readonly TaskCheckoutSecondaryTarget[] },
   materializationId: string
 ): Promise<CapturedTaskCheckoutIdentity | Error> {
   assert(target.workspacePath.length > 0, "claimTaskCheckoutIdentity: workspacePath required");
   assert(/^mat_[0-9a-f]{16}$/.test(materializationId), "claimTaskCheckoutIdentity: bad id");
+  assertDistinctCheckouts(target);
   try {
-    const captured = await captureIdentity(target.workspacePath);
-    if (captured instanceof Error) return captured;
-    const { identity, nonce } = captured;
-    const nonceFile = path.join(identity.gitdir.pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE);
-    if (nonce !== null) {
-      return new Error(`${nonceFile} already exists: this checkout carries another preparation`);
-    }
-    const tmp = `${nonceFile}.tmp-${process.pid}-${hex16()}`;
-    const handle = await fsPromises.open(tmp, "wx", 0o600);
-    try {
-      await handle.writeFile(`${materializationId}\n`, "utf-8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fsPromises.rename(tmp, nonceFile);
-    // Directory fsync makes the rename durable. Windows exposes no directory handle to sync
-    // (same policy as historyAppendProvenance / HistoryService: file fsync + rename only there).
-    if (process.platform !== "win32") {
-      const dir = await fsPromises.open(identity.gitdir.pointer, fsConstants.O_RDONLY);
-      try {
-        await dir.sync();
-      } finally {
-        await dir.close();
-      }
+    const identity: CapturedTaskCheckoutIdentity = await claimCheckout(
+      target.workspacePath,
+      materializationId
+    );
+    if (target.secondaries === undefined || target.secondaries.length === 0) return identity;
+    identity.secondaries = [];
+    for (const secondary of target.secondaries) {
+      const claimed = await namingSecondary(secondary.workspacePath, () =>
+        claimCheckout(secondary.workspacePath, materializationId)
+      );
+      identity.secondaries.push({ projectPath: secondary.projectPath, ...claimed });
     }
     return identity;
   } catch (error) {
@@ -349,29 +361,95 @@ export async function claimTaskCheckoutIdentity(
   }
 }
 
+/** One checkout's claim (see claimTaskCheckoutIdentity). Throws on refusal. */
+async function claimCheckout(
+  workspacePath: string,
+  materializationId: string
+): Promise<CheckoutIdentity> {
+  const captured = await captureIdentity(workspacePath);
+  if (captured instanceof Error) throw captured;
+  const { identity, nonce } = captured;
+  const nonceFile = path.join(identity.gitdir.pointer, TASK_CHECKOUT_PREPARATION_NONCE_FILE);
+  if (nonce !== null) {
+    throw new Error(`${nonceFile} already exists: this checkout carries another preparation`);
+  }
+  const tmp = `${nonceFile}.tmp-${process.pid}-${hex16()}`;
+  const handle = await fsPromises.open(tmp, "wx", 0o600);
+  try {
+    await handle.writeFile(`${materializationId}\n`, "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fsPromises.rename(tmp, nonceFile);
+  // Directory fsync makes the rename durable. Windows exposes no directory handle to sync
+  // (same policy as historyAppendProvenance / HistoryService: file fsync + rename only there).
+  if (process.platform !== "win32") {
+    const dir = await fsPromises.open(identity.gitdir.pointer, fsConstants.O_RDONLY);
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  }
+  return identity;
+}
+
+/** A secondary checkout's refusal, naming that checkout (the primary's errors name their paths). */
+async function namingSecondary<T>(workspacePath: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    throw new Error(`secondary checkout ${workspacePath}: ${getErrorMessage(error)}`);
+  }
+}
+
+/** A multi-project target names each checkout once (the fork orchestrator made them distinct). */
+function assertDistinctCheckouts(target: {
+  workspacePath: string;
+  secondaries?: readonly TaskCheckoutSecondaryTarget[];
+}): void {
+  const secondaries = target.secondaries ?? [];
+  for (const secondary of secondaries) {
+    assert(secondary.projectPath.length > 0, "task checkout secondary: projectPath required");
+    assert(secondary.workspacePath.length > 0, "task checkout secondary: workspacePath required");
+  }
+  const paths = new Set([target.workspacePath, ...secondaries.map((s) => s.workspacePath)]);
+  assert(paths.size === secondaries.length + 1, "task checkout targets must be distinct paths");
+}
+
 /**
  * Step 2, AFTER the prune's writes settled and still inside the same held checkout locks: the
  * directory must be exactly the one claimed before the prune — same path, realpath, root and
  * admin device/inode AND carrying this materialization's nonce — only then is the identity bound
  * (the proof is built from it). Anything else refuses: nothing is written here, so a replacement
- * is never stamped and never published.
+ * is never stamped and never published. Every secondary claimed with it is bound the same way.
  */
 export async function bindTaskCheckoutIdentity(
-  target: { workspacePath: string },
+  target: { workspacePath: string; secondaries?: readonly TaskCheckoutSecondaryTarget[] },
   materializationId: string,
   expected: CapturedTaskCheckoutIdentity
 ): Promise<BoundTaskCheckoutIdentity | Error> {
   assert(target.workspacePath.length > 0, "bindTaskCheckoutIdentity: workspacePath required");
   assert(/^mat_[0-9a-f]{16}$/.test(materializationId), "bindTaskCheckoutIdentity: bad id");
   assert(expected.path === target.workspacePath, "bindTaskCheckoutIdentity: expected other path");
+  const secondaries = target.secondaries ?? [];
+  const claimed = expected.secondaries ?? [];
+  assert(
+    secondaries.length === claimed.length &&
+      secondaries.every(
+        (secondary, index) =>
+          claimed[index].path === secondary.workspacePath &&
+          claimed[index].projectPath === secondary.projectPath
+      ),
+    "bindTaskCheckoutIdentity: expected other secondaries"
+  );
   try {
-    const captured = await captureIdentity(target.workspacePath);
-    if (captured instanceof Error) return captured;
-    if (!sameCheckoutIdentity(captured.identity, expected)) {
-      return new Error(`${target.workspacePath} changed identity between claim and bind`);
-    }
-    if (captured.nonce !== materializationId) {
-      return new Error(`${target.workspacePath} does not carry the claimed preparation nonce`);
+    await bindCheckout(target.workspacePath, materializationId, expected);
+    for (const [index, secondary] of secondaries.entries()) {
+      await namingSecondary(secondary.workspacePath, () =>
+        bindCheckout(secondary.workspacePath, materializationId, claimed[index])
+      );
     }
     return { ...expected, materializationId };
   } catch (error) {
@@ -379,11 +457,27 @@ export async function bindTaskCheckoutIdentity(
   }
 }
 
+/** One checkout's bind (see bindTaskCheckoutIdentity). Throws on refusal. */
+async function bindCheckout(
+  workspacePath: string,
+  materializationId: string,
+  expected: CheckoutIdentity
+): Promise<void> {
+  const captured = await captureIdentity(workspacePath);
+  if (captured instanceof Error) throw captured;
+  if (!sameCheckoutIdentity(captured.identity, expected)) {
+    throw new Error(`${workspacePath} changed identity between claim and bind`);
+  }
+  if (captured.nonce !== materializationId) {
+    throw new Error(`${workspacePath} does not carry the claimed preparation nonce`);
+  }
+}
+
 type TaskCheckoutIdentityCheck = { ok: true } | { ok: false; state: TaskCheckoutPreparationState };
 type TaskCheckoutIdentityInput = Pick<
   TaskCheckoutPreparation,
   "path" | "realpath" | "root" | "gitdir" | "materializationId"
->;
+> & { secondaries?: readonly CheckoutIdentity[] };
 
 /**
  * Read-only comparison of a proof (or bound identity) against the host filesystem, with a
@@ -409,9 +503,36 @@ export async function revalidateTaskCheckoutIdentity(
       };
 }
 
-/** The unbounded comparison behind `revalidateTaskCheckoutIdentity`. Never rejects. */
+/**
+ * The unbounded comparison behind `revalidateTaskCheckoutIdentity`: the primary checkout, then
+ * every secondary checkout of a multi-project proof (all under the caller's one deadline). A
+ * secondary's refusal names that checkout; a gone secondary is a `missing` MISMATCH of the task,
+ * not the task's `missing` state (its own checkout is intact). Never rejects.
+ */
 async function compareTaskCheckoutIdentity(
   proof: TaskCheckoutIdentityInput
+): Promise<TaskCheckoutIdentityCheck> {
+  const primary = await compareCheckoutIdentity(proof, proof.materializationId);
+  if (!primary.ok) return primary;
+  for (const secondary of proof.secondaries ?? []) {
+    const check = await compareCheckoutIdentity(secondary, proof.materializationId);
+    if (check.ok) continue;
+    const { state } = check;
+    const checkout = secondary.path;
+    if (state.kind === "missing") {
+      return { ok: false, state: { kind: "mismatch", dimension: "missing", checkout } };
+    }
+    if (state.kind === "mismatch") return { ok: false, state: { ...state, checkout } };
+    assert(state.kind === "unreadable", "compareCheckoutIdentity: unexpected refusal state");
+    return { ok: false, state: { kind: "unreadable", detail: `${checkout}: ${state.detail}` } };
+  }
+  return { ok: true };
+}
+
+/** One checkout against the filesystem. Never rejects. */
+async function compareCheckoutIdentity(
+  proof: CheckoutIdentity,
+  materializationId: string
 ): Promise<TaskCheckoutIdentityCheck> {
   const mismatch = (dimension: TaskCheckoutMismatchDimension) =>
     ({ ok: false, state: { kind: "mismatch", dimension } }) as const;
@@ -457,19 +578,22 @@ async function compareTaskCheckoutIdentity(
       if (error instanceof SpecialFileError || isEnoent(error)) return mismatch("nonce");
       throw error;
     }
-    if (nonce.trim() !== proof.materializationId) return mismatch("nonce");
+    if (nonce.trim() !== materializationId) return mismatch("nonce");
     return { ok: true };
   } catch (error) {
     return { ok: false, state: { kind: "unreadable", detail: getErrorMessage(error) } };
   }
 }
 
+/**
+ * v1 for a single-project checkout (unchanged, so builds that only know v1 keep validating it);
+ * v2 when secondary checkouts were bound (builds that only know v1 refuse it as unsupported).
+ */
 export function buildTaskCheckoutPreparation(
   identity: BoundTaskCheckoutIdentity,
   runtimeConfig: RuntimeConfig | undefined
 ): TaskCheckoutPreparation {
-  const proof: TaskCheckoutPreparation = {
-    v: 1,
+  const primary = {
     materializationId: identity.materializationId,
     authorizationRevision: newAuthorizationRevision(),
     runtimeConfigJson: canonicalRuntimeConfigJson(runtimeConfig),
@@ -478,8 +602,34 @@ export function buildTaskCheckoutPreparation(
     root: identity.root,
     gitdir: identity.gitdir,
   };
+  const secondaries = identity.secondaries ?? [];
+  const proof: TaskCheckoutPreparation =
+    secondaries.length === 0
+      ? { v: 1, ...primary }
+      : {
+          v: 2,
+          ...primary,
+          secondaries: secondaries.map((secondary) => ({
+            projectPath: secondary.projectPath,
+            path: secondary.path,
+            realpath: secondary.realpath,
+            root: secondary.root,
+            gitdir: secondary.gitdir,
+          })),
+        };
   assert(TaskCheckoutPreparationSchema.safeParse(proof).success, "built proof must be well-formed");
+  // The producer verifies publication by comparing the persisted (JSON round-tripped) proof with
+  // this one (isDeepStrictEqual): an `undefined`-valued key would make it never verify.
+  assert(
+    isDeepStrictEqual(JSON.parse(JSON.stringify(proof)), proof),
+    "built proof must survive a JSON round trip unchanged"
+  );
   return proof;
+}
+
+/** Every checkout a proof binds: the row's own, then (v2) each secondary project's. */
+export function taskCheckoutProofPaths(proof: TaskCheckoutPreparation): string[] {
+  return [proof.path, ...(proof.v === 2 ? proof.secondaries.map((s) => s.path) : [])];
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -560,6 +710,24 @@ function deriveDedicatedRow(
     return { kind: "runtime-mismatch", detail: "row runtime config differs from the prepared one" };
   }
   if (row.path !== proof.path) return { kind: "mismatch", dimension: "path" };
+  // A multi-project task also executes in one checkout per secondary project: a v1 proof
+  // predates binding them, and a v2 proof must bind exactly the row's `projects[1..]`, in order.
+  // (The row's projects need not be signed separately: the only lists that derive are the ones
+  // the signed proof fixes.)
+  const secondaryProjects = (row.projects ?? []).slice(1).map((project) => project.projectPath);
+  if (proof.v === 1) {
+    if (secondaryProjects.length > 0) {
+      return {
+        kind: "unsupported",
+        detail: "a v1 proof binds only the primary checkout of a multi-project task",
+      };
+    }
+  } else if (
+    proof.secondaries.length !== secondaryProjects.length ||
+    proof.secondaries.some((secondary, index) => secondary.projectPath !== secondaryProjects[index])
+  ) {
+    return { kind: "mismatch", dimension: "projects" };
+  }
   return { kind: "proof", proof };
 }
 
@@ -801,12 +969,23 @@ export function sharedTaskRowPublicationRefusal(
   return `the parent workspace changed while this task was being created (${derived.kind}${detail}); nothing was published. Retry the task.`;
 }
 
+/** The mismatch dimension, naming the secondary checkout it concerns (if any). */
+export function taskCheckoutMismatchLabel(
+  state: Extract<TaskCheckoutPreparationState, { kind: "mismatch" }>
+): string {
+  return state.checkout === undefined ? state.dimension : `${state.dimension} of ${state.checkout}`;
+}
+
 /** User-facing refusal text shared by every producer/consumer gate (one wording, one place). */
 export function taskCheckoutNotPreparedMessage(
   state: Exclude<TaskCheckoutPreparationState, { kind: "ready" }>
 ): string {
   const detail =
-    "detail" in state ? `: ${state.detail}` : "dimension" in state ? ` (${state.dimension})` : "";
+    "detail" in state
+      ? `: ${state.detail}`
+      : state.kind === "mismatch"
+        ? ` (${taskCheckoutMismatchLabel(state)})`
+        : "";
   return `Task checkout is not prepared (${state.kind}${detail}). The task record and its files are retained for inspection and are not modified; start a fresh task to continue.`;
 }
 

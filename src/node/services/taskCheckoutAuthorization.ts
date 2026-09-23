@@ -19,6 +19,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import {
   assertCurrentTaskCheckoutAuthority,
   classifyTaskCheckoutKind,
+  taskCheckoutMismatchLabel,
   validateTaskCheckoutPreparation,
   type TaskCheckoutAuthority,
   type TaskCheckoutPreparationState,
@@ -55,7 +56,7 @@ export function taskCheckoutRefusalMessage(
       : state.kind === "missing"
         ? "its prepared checkout no longer exists"
         : state.kind === "mismatch"
-          ? `its checkout identity no longer matches its preparation proof (${state.dimension})`
+          ? `its checkout identity no longer matches its preparation proof (${taskCheckoutMismatchLabel(state)})`
           : state.detail;
   return `Task workspace ${workspaceId} cannot run: ${detail} (${taskCheckoutRefusalCode(state)}). The workspace stays inspectable; create a fresh task to continue the work.`;
 }

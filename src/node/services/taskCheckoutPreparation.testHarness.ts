@@ -7,6 +7,7 @@ import {
   claimTaskCheckoutIdentity,
   newMaterializationId,
   type TaskCheckoutPreparation,
+  type TaskCheckoutSecondaryTarget,
 } from "@/node/services/taskCheckoutPreparation";
 
 /**
@@ -16,20 +17,31 @@ import {
  * proof is valid only on the row that publishes `path: checkout` with this `runtimeConfig`
  * (`canonicalRuntimeConfigJson` is signed) — the validator refuses anything else by design, so
  * consumer suites model prepared rows with this instead of bypassing the validator.
+ *
+ * `secondaries` (a multi-project task): the same branch is added as a worktree of each secondary
+ * project at its `checkout`, and all checkouts are bound together (a v2 proof, valid on a row
+ * whose `projects[1..]` are exactly these projects, in order).
  */
 export async function prepareDedicatedTaskCheckout(args: {
   projectPath: string;
   checkout: string;
   branch: string;
   runtimeConfig: RuntimeConfig | undefined;
+  secondaries?: Array<{ projectPath: string; checkout: string }>;
 }): Promise<TaskCheckoutPreparation> {
-  execSync(`git worktree add -q -b "${args.branch}" "${args.checkout}" main`, {
-    cwd: args.projectPath,
-    stdio: "ignore",
-  });
+  for (const { projectPath, checkout } of [args, ...(args.secondaries ?? [])]) {
+    execSync(`git worktree add -q -b "${args.branch}" "${checkout}" main`, {
+      cwd: projectPath,
+      stdio: "ignore",
+    });
+  }
   return await prepareExistingTaskCheckout({
     workspacePath: args.checkout,
     runtimeConfig: args.runtimeConfig,
+    secondaries: args.secondaries?.map((secondary) => ({
+      projectPath: secondary.projectPath,
+      workspacePath: secondary.checkout,
+    })),
   });
 }
 
@@ -44,18 +56,13 @@ export async function prepareDedicatedTaskCheckout(args: {
 export async function prepareExistingTaskCheckout(args: {
   workspacePath: string;
   runtimeConfig: RuntimeConfig | undefined;
+  secondaries?: TaskCheckoutSecondaryTarget[];
 }): Promise<TaskCheckoutPreparation> {
   const materializationId = newMaterializationId();
-  const claimed = await claimTaskCheckoutIdentity(
-    { workspacePath: args.workspacePath },
-    materializationId
-  );
+  const target = { workspacePath: args.workspacePath, secondaries: args.secondaries };
+  const claimed = await claimTaskCheckoutIdentity(target, materializationId);
   if (claimed instanceof Error) throw claimed;
-  const bound = await bindTaskCheckoutIdentity(
-    { workspacePath: args.workspacePath },
-    materializationId,
-    claimed
-  );
+  const bound = await bindTaskCheckoutIdentity(target, materializationId, claimed);
   if (bound instanceof Error) throw bound;
   return buildTaskCheckoutPreparation(bound, args.runtimeConfig);
 }

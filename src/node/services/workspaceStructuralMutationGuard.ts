@@ -97,14 +97,16 @@ export function isHostLocalRuntimeConfig(runtimeConfig: RuntimeConfig | undefine
  * module has not been taught — still counts as PRESENT: a present proof keeps
  * the row protected even when its runtime later flips off-host, and its saved
  * paths join the protected footprint. Any `path`/`realpath` string fields, at
- * any nesting, are treated as footprint paths (root, gitdir pointer, ...).
+ * any nesting — lists included (a v2 proof lists every secondary checkout of a
+ * multi-project task) — are treated as footprint paths (root, gitdir pointer, ...).
  */
 function readTaskCheckoutPreparation(row: Workspace): unknown {
   return (row as Workspace & { taskCheckoutPreparation?: unknown }).taskCheckoutPreparation;
 }
 
 function collectProofPaths(value: unknown, out: string[], depth = 0): void {
-  if (depth > 4 || value === null || typeof value !== "object" || Array.isArray(value)) return;
+  if (depth > 4 || value === null || typeof value !== "object") return;
+  // Arrays descend through their (numeric) entries: their keys never name a path themselves.
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
     if ((key === "path" || key === "realpath" || key === "pointer") && typeof nested === "string") {
       if (nested.length > 0) out.push(nested);
