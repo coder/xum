@@ -2155,6 +2155,7 @@ export class Config {
         }),
         taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
       };
+      deriveSharedTaskCheckouts(new Map(data.projects));
 
       const muxGatewayEnabled = parseOptionalBoolean(config.muxGatewayEnabled);
       if (muxGatewayEnabled !== undefined) {

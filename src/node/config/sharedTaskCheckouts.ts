@@ -4,8 +4,8 @@ import type { ProjectConfig, Workspace } from "@/common/types/project";
  * Shared-checkout (isolation: "none") task workspaces do not own a checkout: they run in their
  * nearest non-shared ancestor's. Deriving path and trunk branch on read keeps them on the owner's
  * current checkout after an owner rename, and heals entries persisted before such a rename
- * without a migration. An editConfig transform that moves an owner sees the pre-change derived
- * child values until the next read, which re-derives them.
+ * without a migration. Saves derive again, so the write that moves an owner also persists its
+ * children's new values for older builds and external readers of config.json.
  */
 export function deriveSharedTaskCheckouts(projects: Map<string, ProjectConfig>): void {
   const workspacesById = new Map<string, Workspace>();

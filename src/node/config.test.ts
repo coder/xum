@@ -3131,6 +3131,28 @@ describe("Config", () => {
       expect(metadataById.get("forked")?.taskTrunkBranch).toBe("original");
     });
 
+    it("persist the owner's new checkout for shared children when a write moves the owner", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "original", path: staleOwnerPath },
+        sharedTask("child", "owner"),
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      await freshConfig.editConfig((cfg) => {
+        const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === "owner");
+        if (!owner) throw new Error("owner missing");
+        owner.name = "renamed";
+        owner.path = ownerPath;
+        return cfg;
+      });
+
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+      };
+      const child = persisted.projects[0]?.[1].workspaces.find((ws) => ws.id === "child");
+      expect(child).toMatchObject({ path: ownerPath, taskTrunkBranch: "renamed" });
+    });
+
     it("keep persisted values when the owner chain is broken or cyclic", () => {
       writeWorkspaces([
         sharedTask("orphan", "missing-owner"),
