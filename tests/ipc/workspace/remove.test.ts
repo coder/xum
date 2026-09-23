@@ -373,18 +373,38 @@ describeIntegration("Workspace deletion integration tests", () => {
       );
 
       runTest(
-        "should handle deletion of non-existent workspace gracefully",
+        "refuses to remove an unregistered workspace and changes nothing",
         async () => {
           const env = await createTestEnvironment();
 
           try {
-            // Try to delete a workspace that doesn't exist
-            const deleteResult = await env.orpc.workspace.remove({
-              workspaceId: "non-existent-workspace-id",
-            });
+            // An id with no registered row cannot be proven to lie outside a protected sub-agent
+            // task footprint (e.g. a cooperating backend's task whose session exists before its
+            // row is published), so removal refuses instead of doing a phantom session cleanup.
+            // Cover both a bare unknown id and one whose session directory already exists.
+            const bareId = "non-existent-workspace-id";
+            const withSessionId = "unregistered-with-session";
+            const sessionDir = path.join(env.config.sessionsDir, withSessionId);
+            const sentinel = path.join(sessionDir, "chat.jsonl");
+            const sentinelBytes = '{"id":"sentinel","role":"user","parts":[]}\n';
+            await fs.mkdir(sessionDir, { recursive: true });
+            await fs.writeFile(sentinel, sentinelBytes);
+            const configBefore = JSON.stringify([...env.config.loadConfigOrDefault().projects]);
 
-            // Should succeed (idempotent operation)
-            expect(deleteResult.success).toBe(true);
+            for (const workspaceId of [bareId, withSessionId]) {
+              const deleteResult = await env.orpc.workspace.remove({ workspaceId });
+              expect(deleteResult.success).toBe(false);
+              if (!deleteResult.success) {
+                expect(deleteResult.error).toContain(`"${workspaceId}"`);
+                expect(deleteResult.error).toContain("not registered");
+              }
+            }
+
+            expect(JSON.stringify([...env.config.loadConfigOrDefault().projects])).toBe(
+              configBefore
+            );
+            expect(await fs.readFile(sentinel, "utf-8")).toBe(sentinelBytes);
+            await expect(fs.access(path.join(env.config.sessionsDir, bareId))).rejects.toThrow();
           } finally {
             await cleanupTestEnvironment(env);
           }

@@ -8,6 +8,7 @@ import {
   sendMessageWithModel,
 } from "../helpers";
 import type { TestEnvironment } from "../setup";
+import { prepareExistingTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 const MCP_SERVER_COMMAND = `node "${path.join(__dirname, "..", "fixtures", "mcp-screenshot-server.js")}"`;
@@ -89,13 +90,24 @@ describeIntegration("workspace MCP overrides in derived workspaces", () => {
       };
       expect(await captureMcpToolSurface(env, workspaceId)).toEqual(expectedSurface);
 
-      // Sub-agent child: a fresh checkout linked to the parent via parentWorkspaceId.
+      // Sub-agent child: a fresh checkout linked to the parent via parentWorkspaceId. It carries
+      // the preparation proof a producer would publish for a dedicated task checkout; without it
+      // the child reads as a pre-preparation task and its override reads are withheld by design.
       const child = await createWorkspace(env, tempGitRepo, generateBranchName("mcp-child"));
       if (!child.success) throw new Error(child.error);
+      const childPath = child.metadata.namedWorkspacePath;
+      if (childPath == null) throw new Error("child workspace has no checkout path");
+      const childProof = await prepareExistingTaskCheckout({
+        workspacePath: childPath,
+        runtimeConfig: child.metadata.runtimeConfig,
+      });
       await env.config.editConfig((cfg) => {
         for (const project of cfg.projects.values()) {
           const entry = project.workspaces.find((w) => w.id === child.metadata.id);
-          if (entry) entry.parentWorkspaceId = workspaceId;
+          if (entry) {
+            entry.parentWorkspaceId = workspaceId;
+            entry.taskCheckoutPreparation = childProof;
+          }
         }
         return cfg;
       });
