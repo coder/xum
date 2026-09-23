@@ -1124,6 +1124,92 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       }
     );
 
+    test.each(["send failed", "sanitize failed"] as const)(
+      "a reserved launch whose %s after its row was published: the checkout and session dir are retained unless the checkout is unsanitized",
+      async (failure) => {
+        const taskId = failure === "send failed" ? "publishedkeep1" : "publishedkeep2";
+        const foreign = "att_00000000000000a8";
+        const { config, projectPath } = await setupTree([]);
+        stubStableIds(config, [taskId]);
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+          sendMessage: mock(
+            (): Promise<Result<void>> => Promise.resolve(Err("provider exploded before streaming"))
+          ),
+        });
+        const { taskService } = createHarness(config, { workspaceService });
+        const svc = internals(taskService);
+        const sessionMarker = path.join(config.sessionsDir, taskId, "marker");
+        await fsPromises.mkdir(path.dirname(sessionMarker), { recursive: true });
+        await fsPromises.writeFile(sessionMarker, "keep", "utf-8");
+        // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) re-reserves the published row while this
+        // launch's cleanup is inside the destructive call, AFTER its ownership check passed: the
+        // session dir removed next would be the successor's.
+        let superseded = false;
+        const deleteWorkspace = mock(async () => {
+          await config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              const ws = project.workspaces.find((w) => w.id === taskId);
+              if (ws) ws.taskAttemptId = foreign;
+            }
+            return cfg;
+          });
+          superseded = true;
+          return Ok(undefined);
+        });
+        spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
+          Promise.resolve({
+            workspacePath: projectPath,
+            trunkBranch: "main",
+            forkedRuntimeConfig: { type: "local" as const },
+            runtimeForTaskWorkspace: {
+              deleteWorkspace,
+              getWorkspacePath: () => "/tmp/published-keep",
+            },
+            inheritedProjects: undefined,
+          })
+        );
+        spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
+          Promise.resolve(failure === "sanitize failed" ? "sanitize failed" : undefined)
+        );
+
+        const created = await taskService.createMany([
+          {
+            parentWorkspaceId: rootId,
+            kind: "agent",
+            agentId: "explore",
+            prompt: "go",
+            title: "T",
+          },
+        ]);
+        expect(created.success).toBe(true);
+        const reserved = svc.ownedAttemptByTaskId.get(taskId)!.attemptId!;
+        const deadline = Date.now() + 2_000;
+        while (!superseded && entryOf(config, taskId)?.taskStatus !== "interrupted") {
+          if (Date.now() > deadline) throw new Error("the launch never failed");
+          await settle();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        if (failure === "sanitize failed") {
+          // The one reclaim that stays: a checkout whose stale plugin enables could not be pruned
+          // must not survive under a resumable row (nothing re-sanitizes it before a later send).
+          expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(0);
+          expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+          return;
+        }
+        expect(sendMessage.mock.calls.filter((call) => call[0] === taskId)).toHaveLength(1);
+        // A published reservation's artifacts are never deleted by the failed launch: nothing
+        // destructive runs, so no successor can be admitted in the middle of it.
+        expect(deleteWorkspace).not.toHaveBeenCalled();
+        expect(await fsPromises.readFile(sessionMarker, "utf-8")).toBe("keep");
+        // The failure is still recorded on this launch's own (still owned) attempt.
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskAttemptId: reserved,
+          taskStatus: "interrupted",
+          taskLaunchError: "provider exploded before streaming",
+        });
+      }
+    );
+
     test.each(["admitted-after-sample", "pending-before-decision"] as const)(
       "terminal failure closes the attempt before sampling activity: a send %s is refused or drained, never run under a settled attempt",
       async (race) => {

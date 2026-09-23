@@ -5456,8 +5456,9 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * A reservation canceled before its send was admitted: reclaim whatever was materialized and
-   * persist the owned settlement (`interrupted`, "Reservation canceled") instead of launching.
+   * A reservation canceled before its send was admitted: persist the owned settlement
+   * (`interrupted`, "Reservation canceled") instead of launching. Whatever was materialized stays
+   * with the published row (see cleanupMaterializedTaskWorkspace).
    */
   private async cancelReservedLaunch(
     plan: TaskLaunchPlan,
@@ -5515,18 +5516,32 @@ export class TaskService implements AgentTaskIntegration {
        * working tree. Session/config cleanup still runs.
        */
       preservePhysicalWorkspace?: boolean;
+      /**
+       * The launch failed because this checkout's stale plugin overrides could not be sanitized.
+       * Nothing re-sanitizes a retained checkout before a later resume sends into it, so it is
+       * reclaimed even while its row is published (see the retention rule below).
+       */
+      reclaimUnsanitizedCheckout?: boolean;
     }
   ): Promise<void> {
     assert(projectPath.length > 0, "cleanupMaterializedTaskWorkspace requires projectPath");
     assert(workspaceName.length > 0, "cleanupMaterializedTaskWorkspace requires workspaceName");
     assert(taskId.length > 0, "cleanupMaterializedTaskWorkspace requires taskId");
-    if (
-      this.ownedAttemptSuperseded(
-        taskId,
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace
-      )
-    ) {
+    const row = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
+    if (this.ownedAttemptSuperseded(taskId, row)) {
       log.info("Task launch cleanup skipped: the record was re-admitted by another writer", {
+        taskId,
+      });
+      return;
+    }
+    // A published row keeps its checkout and session dir: the ownership check above is one-shot,
+    // and another backend (XUM_ALLOW_MULTIPLE_INSTANCES) can re-admit the row while the
+    // destructive awaits below run, so deleting would destroy the successor's artifacts. Nothing
+    // in-process can serialize with that writer, so a failed launch retains them instead — the
+    // row is marked interrupted (launch error recorded) and stays inspectable and resumable;
+    // removing the task deletes them through the ordinary workspace removal.
+    if (row != null && options?.reclaimUnsanitizedCheckout !== true) {
+      log.info("Task launch cleanup: retaining the published task's checkout and session", {
         taskId,
       });
       return;
@@ -6003,7 +6018,7 @@ export class TaskService implements AgentTaskIntegration {
           plan.parentMeta.projectPath,
           plan.workspaceName,
           plan.taskId,
-          { preservePhysicalWorkspace: false }
+          { preservePhysicalWorkspace: false, reclaimUnsanitizedCheckout: true }
         );
         throw new Error(sanitizeError);
       }
