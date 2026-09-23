@@ -6879,7 +6879,9 @@ describe("TaskService", () => {
     }
   }, 20_000);
 
-  async function setUpInactiveSharedChild(): Promise<{
+  async function setUpSharedChild(
+    childFields: Partial<WorkspaceConfigEntry> = { taskStatus: "reported" }
+  ): Promise<{
     config: Config;
     projectPath: string;
     runtime: ReturnType<typeof createRuntime>;
@@ -6914,8 +6916,8 @@ describe("TaskService", () => {
           parentWorkspaceId: parentId,
           agentId: "explore",
           taskIsolation: "none",
-          taskStatus: "reported",
           taskTrunkBranch: "parent",
+          ...childFields,
         },
       ],
       testTaskSettings()
@@ -6923,10 +6925,13 @@ describe("TaskService", () => {
     return { config, projectPath, runtime, parentId, childTaskId, parentPath };
   }
 
-  test("isolation: none child reawakens in its owner's checkout after the owner is renamed", async () => {
-    const { config, projectPath, runtime, parentId, childTaskId, parentPath } =
-      await setUpInactiveSharedChild();
-    // Same checkout move and config write as WorkspaceService.rename.
+  // Same checkout move and config write as WorkspaceService.rename.
+  async function renameSharedOwner(
+    config: Config,
+    runtime: ReturnType<typeof createRuntime>,
+    projectPath: string,
+    ownerId: string
+  ): Promise<string> {
     const renamed = await runtime.renameWorkspace(
       projectPath,
       "parent",
@@ -6935,14 +6940,21 @@ describe("TaskService", () => {
       true
     );
     assert(renamed.success, "Expected owner checkout rename to succeed");
-    expect(renamed.newPath).not.toBe(parentPath);
     await config.editConfig((cfg) => {
-      const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === parentId);
+      const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === ownerId);
       assert(owner, "Expected owner entry");
       owner.name = "renamed";
       owner.path = renamed.newPath;
       return cfg;
     });
+    return renamed.newPath;
+  }
+
+  test("isolation: none child reawakens in its owner's checkout after the owner is renamed", async () => {
+    const { config, projectPath, runtime, parentId, childTaskId, parentPath } =
+      await setUpSharedChild();
+    const renamedPath = await renameSharedOwner(config, runtime, projectPath, parentId);
+    expect(renamedPath).not.toBe(parentPath);
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
@@ -6955,7 +6967,7 @@ describe("TaskService", () => {
 
     expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
     expect(sendMessage).toHaveBeenCalled();
-    expect(config.findWorkspace(childTaskId)?.workspacePath).toBe(renamed.newPath);
+    expect(config.findWorkspace(childTaskId)?.workspacePath).toBe(renamedPath);
     const metadata = await config.getWorkspaceMetadataById(childTaskId);
     assert(metadata, "Expected child metadata");
     expect(metadata.taskTrunkBranch).toBe("renamed");
@@ -6967,7 +6979,7 @@ describe("TaskService", () => {
   }, 20_000);
 
   test("reawakening a child whose host-local checkout is gone fails without starting a turn", async () => {
-    const { config, parentId, childTaskId, parentPath } = await setUpInactiveSharedChild();
+    const { config, parentId, childTaskId, parentPath } = await setUpSharedChild();
     await fsPromises.rm(parentPath, { recursive: true, force: true });
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
@@ -7082,43 +7094,11 @@ describe("TaskService", () => {
   }, 20_000);
 
   test("dequeued isolation: none task stays shared when its owner is renamed mid-launch", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = await createTestProject(rootDir);
-    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
-    const runtime = createRuntime(runtimeConfig, { projectPath });
-    await runtime.createWorkspace({
-      projectPath,
-      branchName: "parent",
-      trunkBranch: "main",
-      directoryName: "parent",
-      initLogger: createNullInitLogger(),
+    const { config, projectPath, runtime, parentId, childTaskId } = await setUpSharedChild({
+      taskStatus: "queued",
+      taskPrompt: "queued shared analysis",
+      taskModelString: defaultModel,
     });
-    const parentPath = runtime.getWorkspacePath(projectPath, "parent");
-    const parentId = "1111111111";
-    const queuedTaskId = "task-shared-queued";
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        { path: parentPath, id: parentId, name: "parent", runtimeConfig },
-        {
-          path: parentPath,
-          id: queuedTaskId,
-          name: "agent_explore_task-shared-queued",
-          createdAt: new Date().toISOString(),
-          runtimeConfig,
-          parentWorkspaceId: parentId,
-          agentId: "explore",
-          agentType: "explore",
-          taskStatus: "queued",
-          taskPrompt: "queued shared analysis",
-          taskModelString: defaultModel,
-          taskTrunkBranch: "parent",
-          taskIsolation: "none",
-        },
-      ],
-      testTaskSettings()
-    );
 
     // The launch admits the task after reading its entry and before materializing its checkout.
     const desktop = new DesktopInputCoordinator(config);
@@ -7128,27 +7108,10 @@ describe("TaskService", () => {
       async (workspaceId, fn) => {
         if (
           renamedPath == null &&
-          workspaceId === queuedTaskId &&
-          findWorkspaceInConfig(config, queuedTaskId)?.taskStatus === "starting"
+          workspaceId === childTaskId &&
+          findWorkspaceInConfig(config, childTaskId)?.taskStatus === "starting"
         ) {
-          const renamed = await runtime.renameWorkspace(
-            projectPath,
-            "parent",
-            "renamed",
-            undefined,
-            true
-          );
-          assert(renamed.success, "Expected owner checkout rename to succeed");
-          renamedPath = renamed.newPath;
-          await config.editConfig((cfg) => {
-            const owner = cfg.projects
-              .get(projectPath)
-              ?.workspaces.find((ws) => ws.id === parentId);
-            assert(owner, "Expected owner entry");
-            owner.name = "renamed";
-            owner.path = renamed.newPath;
-            return cfg;
-          });
+          renamedPath = await renameSharedOwner(config, runtime, projectPath, parentId);
         }
         return admit(workspaceId, fn);
       }
@@ -7162,11 +7125,11 @@ describe("TaskService", () => {
       });
 
       await taskService.initialize();
-      await waitForWorkspaceTaskStatus(config, queuedTaskId, "running");
+      await waitForWorkspaceTaskStatus(config, childTaskId, "running");
 
       assert(renamedPath, "Expected the owner to be renamed during the launch");
       expect(forkSpy).not.toHaveBeenCalled();
-      const entry = findWorkspaceInConfig(config, queuedTaskId);
+      const entry = findWorkspaceInConfig(config, childTaskId);
       // A cleared flag would let removal or delete-on-archive treat the owner's checkout as the task's own.
       expect(entry?.taskIsolation).toBe("none");
       expect(entry?.path).toBe(renamedPath);
