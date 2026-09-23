@@ -5404,12 +5404,13 @@ export class TaskService implements AgentTaskIntegration {
       for (const plan of plans) {
         const ownedAttempt = this.ownedAttemptByTaskId.get(plan.taskId);
         let transitioned = canceledInsideCommit;
+        let superseded = false;
         if (!canceledInsideCommit) {
           await this.editWorkspaceEntry(
             plan.taskId,
             (ws) => {
-              if (ws.taskStatus !== plan.status) return;
-              if (rowSupersedes(ws, plan.attemptId)) return;
+              superseded = rowSupersedes(ws, plan.attemptId);
+              if (ws.taskStatus !== plan.status || superseded) return;
               ws.taskStatus = "interrupted";
               ws.taskLaunchError = TASK_RESERVATION_CANCELED_MESSAGE;
               transitioned = true;
@@ -5419,7 +5420,11 @@ export class TaskService implements AgentTaskIntegration {
         }
         if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
         this.settleOwnedTaskAttempt(plan.taskId, ownedAttempt, "reservation-canceled");
-        this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
+        // Waiters are keyed by the stable task id: once another writer re-admitted the row under
+        // its own attempt they are that attempt's (its task_await must not read this cancel).
+        if (!superseded) {
+          this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
+        }
         await this.emitWorkspaceMetadata(plan.taskId);
       }
       return interrupted();
@@ -5547,11 +5552,12 @@ export class TaskService implements AgentTaskIntegration {
       if (committed) {
         try {
           let transitioned = false;
+          let superseded = false;
           await this.editWorkspaceEntry(
             plan.taskId,
             (ws) => {
-              if (ws.taskStatus !== plan.status) return;
-              if (rowSupersedes(ws, plan.attemptId)) return;
+              superseded = rowSupersedes(ws, plan.attemptId);
+              if (ws.taskStatus !== plan.status || superseded) return;
               ws.taskStatus = "interrupted";
               ws.taskLaunchError = message;
               transitioned = true;
@@ -5559,7 +5565,8 @@ export class TaskService implements AgentTaskIntegration {
             { allowMissing: true }
           );
           if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
-          this.rejectWaiters(plan.taskId, new Error(message));
+          // A row another writer re-admitted: its waiters belong to that attempt (see above).
+          if (!superseded) this.rejectWaiters(plan.taskId, new Error(message));
           await this.emitWorkspaceMetadata(plan.taskId);
         } catch (fenceError: unknown) {
           log.warn("Task reservation failed and its committed record could not be fenced", {
@@ -15741,13 +15748,15 @@ export class TaskService implements AgentTaskIntegration {
       const error = new Error(
         "Workflow plan agents return { reportMarkdown, planFilePath }; do not provide schema/outputSchema."
       );
+      let planFailureSuperseded = false;
       let transitionedToInterrupted = false;
       let parentWorkspaceId = args.entry.workspace.parentWorkspaceId;
       await this.editWorkspaceEntry(
         args.workspaceId,
         (workspace) => {
           transitionedToInterrupted = false;
-          if (rowSupersedes(workspace, args.streamAttemptId)) return;
+          planFailureSuperseded = rowSupersedes(workspace, args.streamAttemptId);
+          if (planFailureSuperseded) return;
           transitionedToInterrupted = workspace.taskStatus !== "interrupted";
           parentWorkspaceId = workspace.parentWorkspaceId;
           workspace.taskStatus = "interrupted";
@@ -15758,7 +15767,8 @@ export class TaskService implements AgentTaskIntegration {
       if (transitionedToInterrupted) {
         this.recordTaskInterrupted(args.workspaceId, parentWorkspaceId);
       }
-      this.rejectWaiters(args.workspaceId, error);
+      // Waiters of a row another writer re-admitted belong to that attempt, not this failure.
+      if (!planFailureSuperseded) this.rejectWaiters(args.workspaceId, error);
       await this.emitWorkspaceMetadata(args.workspaceId);
       return;
     }

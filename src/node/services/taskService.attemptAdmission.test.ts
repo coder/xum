@@ -3715,4 +3715,61 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     await taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptA);
     expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
   });
+  test("a failed reservation whose row another backend re-admitted leaves the successor's waiters alone", async () => {
+    const taskId = "stale-reservation-settle";
+    const attemptA = "att_00000000000000ab";
+    const foreign = "att_00000000000000c6";
+    const { config } = await setupTree([
+      { id: taskId, overrides: { taskStatus: "starting", taskAttemptId: attemptA } },
+    ]);
+    const otherBackend = await createTestConfig(rootDir);
+    const { taskService } = createHarness(config);
+    // Backend B re-admits the reserved row under its own attempt before this settle runs.
+    await otherBackend.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === taskId);
+        if (ws) {
+          ws.taskStatus = "running";
+          ws.taskAttemptId = foreign;
+          ws.taskAttemptUnproven = true;
+        }
+      }
+      return cfg;
+    });
+    // A parent awaits the task (now B's) by its stable id.
+    let settled: string | undefined;
+    const waiting = taskService
+      .waitForAgentReport(taskId, { timeoutMs: 1_500, requestingWorkspaceId: rootId })
+      .then(
+        () => "resolved",
+        (error: unknown) => (error instanceof Error ? error.message : String(error))
+      )
+      .then((outcome) => {
+        settled = outcome;
+      });
+    await (
+      taskService as unknown as {
+        settleFailedReservations: (
+          plans: unknown[],
+          ownedAttempts: ReadonlyMap<string, unknown>,
+          signal: AbortSignal | undefined,
+          error: unknown
+        ) => Promise<void>;
+      }
+    ).settleFailedReservations(
+      [{ taskId, status: "starting", attemptId: attemptA, parentWorkspaceId: rootId }],
+      new Map(),
+      undefined,
+      new Error("boom")
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // B's row and B's waiter are untouched by A's failed reservation.
+    expect(settled).toBeUndefined();
+    expect(entryOf(config, taskId)).toMatchObject({
+      taskStatus: "running",
+      taskAttemptId: foreign,
+    });
+    await waiting;
+    expect(settled).not.toContain("Reservation failed");
+  });
 });
