@@ -1476,6 +1476,35 @@ describe("MessageQueue", () => {
       expect(queue.getDisplayText()).toBe("First message\nSecond message\nThird message");
     });
 
+    it("restores each batched add's authored text while dispatching the provider-facing text", () => {
+      const review = {
+        filePath: "src/a.ts",
+        lineRange: "1",
+        selectedCode: "a()",
+        userNote: "note",
+      };
+      const options = { model: "claude-3-5-sonnet-20241022", agentId: "exec" };
+      queue.add("<review>note</review>\n\nFirst authored", {
+        ...options,
+        muxMetadata: { type: "normal", reviews: [review] },
+        authoredText: "First authored",
+      });
+      // A review-only add has no authored text; a plain add's authored text is the message.
+      queue.add("<review>only</review>", { ...options, authoredText: "" });
+      queue.add("Plain follow-up", options);
+
+      expect(queue.getInputForRestore()).toEqual({
+        text: "First authored\nPlain follow-up",
+        fileParts: [],
+        reviews: [review],
+      });
+      const dispatched = queue.dequeueNext();
+      expect(dispatched.message).toBe(
+        "<review>note</review>\n\nFirst authored\n<review>only</review>\nPlain follow-up"
+      );
+      expect(dispatched.options != null && "authoredText" in dispatched.options).toBe(false);
+    });
+
     it("should preserve compaction metadata when follow-up is added", () => {
       const metadata: MuxMessageMetadata = {
         type: "compaction-request",

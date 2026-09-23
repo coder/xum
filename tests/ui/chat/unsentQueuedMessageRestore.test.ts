@@ -7,10 +7,12 @@ import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { getInputAttachmentsKey, getInputKey } from "@/common/constants/storage";
+import { getInputAttachmentsKey, getInputKey, getReviewsKey } from "@/common/constants/storage";
 import { prepareUserMessageForSend } from "@/common/types/message";
+import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { HistoryService } from "@/node/services/historyService";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
@@ -29,6 +31,118 @@ const queuedFilePart = {
   mediaType: "text/plain",
   filename: "queued-file.txt",
 };
+
+/** What TaskService's dequeue gate decides for a queued send whose task already reported. */
+const refusingAdmission: TurnAdmissionToken = {
+  admissionStale: () => false,
+  onEnqueued: () => undefined,
+  onAdmitted: () => undefined,
+  onDisposed: () => undefined,
+  resolveDispatch: () => ({ refuse: "the task already reported" }),
+};
+const RESTORED_AUTHORED_TEXT = "first authored\n\nsecond authored";
+const composerReview = (note: string): ReviewNoteData => ({
+  filePath: "src/file.ts",
+  lineRange: "1",
+  selectedCode: "call()",
+  userNote: note,
+});
+const composerAttachmentNames = (app: AppHarness) =>
+  readPersistedState<Array<{ filename?: string }>>(getInputAttachmentsKey(app.workspaceId), []).map(
+    (attachment) => attachment.filename
+  );
+const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
+
+/**
+ * The real composer path: while a held turn keeps the workspace busy, the user sends two rich
+ * messages (text + file + review) from the composer, so both queue. Their dispatch is refused (the
+ * sub-agent reported first), which hands both back to the composer once the held turn ends.
+ */
+async function queueTwoRefusedComposerMessages(app: AppHarness): Promise<ReviewNoteData[]> {
+  const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+  // Held outside the composer: a composer send stays in flight until its stream starts, which
+  // would keep the composer's review panel hidden.
+  const holding = app.env.orpc.workspace.sendMessage({
+    workspaceId: app.workspaceId,
+    message: "[mock:wait-start] hold the workspace busy",
+    options: { model: "openai:gpt-5.2", agentId: "exec" },
+  });
+  await waitFor(() => expect(session.isBusy()).toBe(true));
+  // Stand-in for TaskService's admission token on a sub-agent workspace's manual sends.
+  const queueMessage = session.queueMessage.bind(session);
+  const queueSpy = jest
+    .spyOn(session, "queueMessage")
+    .mockImplementation((message, options, internal) =>
+      queueMessage(message, options, { ...internal, turnAdmission: refusingAdmission })
+    );
+  const reviews = [composerReview("first note"), composerReview("second note")];
+  try {
+    for (const [index, name] of ["first", "second"].entries()) {
+      act(() => {
+        updatePersistedState(getReviewsKey(app.workspaceId), {
+          workspaceId: app.workspaceId,
+          reviews: {
+            [`review-${name}`]: {
+              id: `review-${name}`,
+              data: reviews[index],
+              status: "attached",
+              createdAt: Date.now(),
+            },
+          },
+          lastUpdated: Date.now(),
+        });
+        updatePersistedState(getInputAttachmentsKey(app.workspaceId), [
+          {
+            kind: "provider",
+            id: `file-${name}`,
+            url: queuedFilePart.url,
+            mediaType: queuedFilePart.mediaType,
+            filename: `${name}.txt`,
+          },
+        ]);
+      });
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain(`${name} note`);
+        expect(app.view.container.textContent).toContain(`${name}.txt`);
+      });
+      await app.chat.send(`${name} authored`);
+      await waitFor(() => expect(queueSpy).toHaveBeenCalledTimes(index + 1));
+      await app.chat.expectInputValue("");
+    }
+  } finally {
+    queueSpy.mockRestore();
+  }
+  expect(session.hasQueuedMessages()).toBe(true);
+  app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+  expect((await holding).success).toBe(true);
+  return reviews;
+}
+
+/** The newest persisted user row (the provider-facing text) once it contains `needle`. */
+async function waitForLastUserRow(
+  app: AppHarness,
+  needle: string
+): Promise<{ text: string; reviews: unknown }> {
+  return waitFor(
+    async () => {
+      const history = await new HistoryService(app.env.config).getHistoryFromLatestBoundary(
+        app.workspaceId
+      );
+      if (!history.success) throw new Error("history not readable yet");
+      const row = history.data.filter((message) => message.role === "user").at(-1);
+      const text = (row?.parts ?? [])
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("");
+      if (!text.includes(needle)) throw new Error("the retried message is not persisted yet");
+      const muxMetadata = row?.metadata?.muxMetadata;
+      return {
+        text,
+        reviews: muxMetadata != null && "reviews" in muxMetadata ? muxMetadata.reviews : undefined,
+      };
+    },
+    { timeout: 30_000 }
+  );
+}
 
 /**
  * A queued message refused at dispatch (its sub-agent completed its report first) is handed back
@@ -259,13 +373,6 @@ describe("Unsent queued message restored to the composer", () => {
       // While the other workspace is shown, the first workspace's dequeue gate refuses its two
       // queued manual messages in one drain (their task attempt completed): the real refusal path
       // hands both back.
-      const refusing: TurnAdmissionToken = {
-        admissionStale: () => false,
-        onEnqueued: () => undefined,
-        onAdmitted: () => undefined,
-        onDisposed: () => undefined,
-        resolveDispatch: () => ({ refuse: "the task already reported" }),
-      };
       const { finalText, metadata } = prepareUserMessageForSend({
         text: "queued follow-up",
         reviews: [
@@ -284,20 +391,22 @@ describe("Unsent queued message restored to the composer", () => {
           ...queueOptions,
           fileParts: [queuedFilePart],
           ...(metadata ? { muxMetadata: metadata } : {}),
+          // As the composer sends it (prepareMessagePayload): the text before review formatting.
+          authoredText: "queued follow-up",
         },
-        { acceptanceOrigin: "manual", turnAdmission: refusing }
+        { acceptanceOrigin: "manual", turnAdmission: refusingAdmission }
       );
       session.queueMessage(
         "second follow-up",
         { ...queueOptions, fileParts: [{ ...queuedFilePart, filename: "second.txt" }] },
-        { acceptanceOrigin: "manual", turnAdmission: refusing }
+        { acceptanceOrigin: "manual", turnAdmission: refusingAdmission }
       );
       session.drainQueuedMessagesIfIdle();
       stopCapturing();
       expect(session.hasQueuedMessages()).toBe(false);
       expect(handedBack).toHaveLength(2);
-      // The queued text is what the composer sent (reviews formatted into it, as a real send).
-      const restoredDraft = `draft kept\n\n${finalText}\n\nsecond follow-up`;
+      // The authored text comes back; the review formatted into the sent text comes back as a review.
+      const restoredDraft = "draft kept\n\nqueued follow-up\n\nsecond follow-up";
       // Nothing can reach the first workspace's composer while it is not shown.
       expect(draftOf(app.workspaceId)).toBe("draft kept");
 
@@ -351,6 +460,36 @@ describe("Unsent queued message restored to the composer", () => {
           .remove({ workspaceId: otherWorkspaceId, options: { force: true } })
           .catch(() => undefined);
       }
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("a refused composer message restores its authored text and reviews once, and the retry sends each review once", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-authored" });
+    try {
+      const reviews = await queueTwoRefusedComposerMessages(app);
+      // The authored text comes back, never the provider-facing text with the review blocks
+      // formatted into it: the reviews come back as review chips instead.
+      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, 10_000);
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("2 reviews attached");
+      });
+      expect(composerAttachmentNames(app)).toEqual(["first.txt", "second.txt"]);
+
+      // Retry: the composer sends the restored draft as one new message.
+      await app.chat.send(RESTORED_AUTHORED_TEXT);
+      const sent = await waitForLastUserRow(app, "second authored");
+      expect(countOccurrences(sent.text, "first authored")).toBe(1);
+      expect(countOccurrences(sent.text, "second authored")).toBe(1);
+      for (const review of reviews) {
+        expect(countOccurrences(sent.text, formatReviewForModel(review))).toBe(1);
+      }
+      expect(sent.reviews).toEqual(reviews);
+      await app.chat.expectStreamComplete();
+      // The sent draft does not come back.
+      await app.chat.expectInputValue("");
+      expect(app.view.container.textContent).not.toContain("reviews attached");
+    } finally {
       await app.dispose();
     }
   }, 90_000);

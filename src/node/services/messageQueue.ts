@@ -217,6 +217,12 @@ interface QueueEntry {
   goalKind?: GoalSyntheticMessageKind;
   goalId?: string;
   messages: string[];
+  /**
+   * Same index as `messages`: the text the user authored for that message (its
+   * SendMessageOptions.authoredText, else the message itself). Composer restores take this, so
+   * review notes formatted into the message are restored only as structured reviews.
+   */
+  authoredMessages: string[];
   /** First muxMetadata added to this entry (never overwritten by later batched adds). */
   muxMetadata?: unknown;
   latestOptions?: SendMessageOptions;
@@ -701,6 +707,7 @@ export class MessageQueue {
       entry = {
         entryId: randomUUID(),
         messages: [],
+        authoredMessages: [],
         fileParts: [],
         dedupeKeys: new Set<string>(),
         dispatchMode: incomingMode,
@@ -736,10 +743,12 @@ export class MessageQueue {
     // Add text message if non-empty
     if (trimmedMessage.length > 0) {
       entry.messages.push(trimmedMessage);
+      entry.authoredMessages.push((options?.authoredText ?? trimmedMessage).trim());
     }
 
     if (options) {
-      const { fileParts, ...restOptions } = options;
+      // authoredText describes this add only: it must not ride along as the entry's options.
+      const { fileParts, authoredText, ...restOptions } = options;
 
       // Preserve first muxMetadata per entry (see class docblock for rationale)
       if (options.muxMetadata !== undefined && entry.muxMetadata === undefined) {
@@ -860,7 +869,10 @@ export class MessageQueue {
     return entries.flatMap((entry) => entry.messages);
   }
 
-  private getDisplayTextForEntries(entries: readonly QueueEntry[]): string {
+  private getDisplayTextForEntries(
+    entries: readonly QueueEntry[],
+    textsOf: (entry: QueueEntry) => readonly string[] = (entry) => entry.messages
+  ): string {
     return entries
       .map((entry) => {
         if (
@@ -869,7 +881,9 @@ export class MessageQueue {
         ) {
           return entry.muxMetadata.rawCommand;
         }
-        return entry.messages.join("\n");
+        return textsOf(entry)
+          .filter((text) => text.length > 0)
+          .join("\n");
       })
       .filter((text) => text.length > 0)
       .join("\n");
@@ -948,9 +962,17 @@ export class MessageQueue {
         !entry.cancelSignal?.aborted &&
         (options?.includeStale === true || entry.admissionStale?.() !== true)
     );
+    for (const entry of restorable) {
+      assert(
+        entry.authoredMessages.length === entry.messages.length,
+        "every queued message keeps its authored text at the same index"
+      );
+    }
     return restorable.length > 0
       ? {
-          text: this.getDisplayTextForEntries(restorable),
+          // Authored text, not the provider-facing message: reviews formatted into a message
+          // come back as `reviews` below, so the composer would otherwise hold them twice.
+          text: this.getDisplayTextForEntries(restorable, (entry) => entry.authoredMessages),
           fileParts: this.getFilePartsForEntries(restorable),
           reviews: this.getReviewsForEntries(restorable),
         }
@@ -1029,12 +1051,14 @@ export class MessageQueue {
       // but multiple progress sends can still batch together. Remove only the matched messages and
       // preserve unrelated keys/messages that share the same entry.
       const matchingKeySet = new Set(matchingKeys);
-      const keptMessages = entry.messages.filter((_message, index) => {
+      const isKept = (_message: string, index: number) => {
         const key = [...entry.dedupeKeys][index];
         return key == null || !matchingKeySet.has(key);
-      });
+      };
+      const keptMessages = entry.messages.filter(isKept);
       if (keptMessages.length > 0) {
         entry.messages = keptMessages;
+        entry.authoredMessages = entry.authoredMessages.filter(isKept);
         for (const key of matchingKeys) {
           entry.dedupeKeys.delete(key);
         }

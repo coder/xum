@@ -147,6 +147,9 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
         : {}),
       fileParts: sendFileParts,
       muxMetadata: metadata,
+      // Reviews were formatted into `message`; keep the authored text (with any staged-file
+      // notice, which a restore parses back into attachments) for an unsent-input handback.
+      ...(input.reviews?.length ? { authoredText: userMessageText } : {}),
     },
   };
 }

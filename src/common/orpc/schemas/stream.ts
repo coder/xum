@@ -1028,4 +1028,12 @@ export const SendMessageOptionsSchema = z.object({
   allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
+  /**
+   * The user's authored text when the message text is not it: the composer formats attached
+   * review notes into the provider-facing message (prepareUserMessageForSend) and also carries
+   * them as structured reviews. A queued message handed back to the composer unsent restores
+   * this text next to the reviews, so a retry does not send every review twice. Transient: the
+   * queue keeps it per add and never forwards it.
+   */
+  authoredText: z.string().optional(),
 });
