@@ -748,9 +748,15 @@ export interface AgentTaskIntegration {
       expectedAttemptId?: string;
     }
   ): TaskTurnAdmission;
+  /**
+   * Roll back a failed resume's status flip. `expectedAttemptId`: the attempt the resume's own
+   * reawaken won; the rollback is a CAS on it (a row another writer re-admitted since is left
+   * alone). Omitted when the resume reawakened nothing (today's unconditional rollback).
+   */
   restoreInterruptedTaskAfterResumeFailure(
     workspaceId: string,
-    previousStatus?: AgentTaskStatus | null
+    previousStatus?: AgentTaskStatus | null,
+    expectedAttemptId?: string
   ): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;

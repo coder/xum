@@ -3670,4 +3670,49 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
     expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(foreign);
   });
+  test("a resume-failure rollback restores only the reawakened attempt: a row another backend re-admitted meanwhile keeps its running status", async () => {
+    const taskId = "stale-resume-rollback";
+    const foreign = "att_00000000000000c4";
+    const { config } = await setupTree([
+      {
+        id: taskId,
+        overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000aa" },
+      },
+    ]);
+    const otherBackend = await createTestConfig(rootDir);
+    const { taskService } = createHarness(config);
+    // This backend reawakens the task as attempt A for a resume...
+    const reawaken = await taskService.reawakenInterruptedTask(taskId);
+    expect(reawaken.kind).toBe("reawakened");
+    const attemptA = reawaken.kind === "reawakened" ? reawaken.attemptId : undefined;
+    // ...while it awaits session admission, backend B stops and reawakens the row as B.
+    await otherBackend.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === taskId);
+        if (ws) {
+          ws.taskStatus = "running";
+          ws.taskAttemptId = foreign;
+          ws.taskAttemptUnproven = true;
+        }
+      }
+      return cfg;
+    });
+    // A's now-stale send fails: its rollback must not flip B to interrupted.
+    await taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptA);
+    expect(entryOf(config, taskId)).toMatchObject({
+      taskStatus: "running",
+      taskAttemptId: foreign,
+      taskAttemptUnproven: true,
+    });
+    // Control: with the row still naming A, the rollback restores it.
+    await otherBackend.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === taskId);
+        if (ws) ws.taskAttemptId = attemptA;
+      }
+      return cfg;
+    });
+    await taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptA);
+    expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
+  });
 });

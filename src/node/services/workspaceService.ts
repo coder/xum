@@ -11780,6 +11780,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const authoredAtMs = Date.now();
 
     let resumedInterruptedTask = false;
+    // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
+    let resumedAttemptId: string | undefined;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     let claimedAutoTitle = false;
     // Task-attempt admission (see TurnAdmissionToken): a send into an agent-task workspace
@@ -12367,6 +12369,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
         if (reawaken?.kind === "reawakened") {
           reawakenedAttemptId = reawaken.attemptId;
+          resumedAttemptId = reawaken.attemptId;
           resumedInterruptedTask = reawaken.statusChanged;
         }
       }
@@ -12385,7 +12388,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (restoreError: unknown) {
             log.error(
@@ -12473,7 +12477,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
@@ -12511,7 +12516,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         try {
           await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
             workspaceId,
-            previousTaskStatus
+            previousTaskStatus,
+            resumedAttemptId
           );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
@@ -12552,6 +12558,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
+    // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
+    let resumedAttemptId: string | undefined;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     // Task-attempt obligation (see sendMessage): a caller-supplied token is this method's from
     // entry, so EVERY exit before the session handoff — each preflight return below, a throw —
@@ -12727,6 +12735,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Same as sendMessage: a lost reawaken refuses, a won one binds to exactly its attempt.
       if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
       resumedInterruptedTask = reawaken?.kind === "reawakened" && reawaken.statusChanged;
+      resumedAttemptId = reawaken?.kind === "reawakened" ? reawaken.attemptId : undefined;
 
       // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
       // carries the same obligation, bound after the rescue above (disposal: method entry).
@@ -12772,7 +12781,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
@@ -12791,7 +12801,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
@@ -12809,7 +12820,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         try {
           await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
             workspaceId,
-            previousTaskStatus
+            previousTaskStatus,
+            resumedAttemptId
           );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {

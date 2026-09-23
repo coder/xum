@@ -14139,7 +14139,8 @@ export class TaskService implements AgentTaskIntegration {
    */
   async restoreInterruptedTaskAfterResumeFailure(
     workspaceId: string,
-    previousStatus?: AgentTaskStatus | null
+    previousStatus?: AgentTaskStatus | null,
+    expectedAttemptId?: string
   ): Promise<void> {
     assert(
       workspaceId.length > 0,
@@ -14155,6 +14156,10 @@ export class TaskService implements AgentTaskIntegration {
           return;
         }
         if (ws.taskStatus !== "running") {
+          return;
+        }
+        // A stale resume's rollback never flips a successor another writer admitted since.
+        if (rowSupersedes(ws, expectedAttemptId)) {
           return;
         }
 

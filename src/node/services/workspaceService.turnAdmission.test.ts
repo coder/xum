@@ -356,4 +356,33 @@ describe("WorkspaceService task-attempt admission fence", () => {
       expect(minted.events).toEqual(["disposed:refused"]);
     }
   );
+  test("resumeStream's failure rollback is bound to the attempt its reawaken won", async () => {
+    const { service, session } = await createFixture();
+    const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
+    service.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "interrupted" as const),
+        reawakenInterruptedTask: mock(() =>
+          Promise.resolve({
+            kind: "reawakened" as const,
+            attemptId: "att_00000000000000e7",
+            statusChanged: true,
+          })
+        ),
+        admitTaskWorkspaceTurn: mock(() => ({ kind: "not-a-task" }) as const),
+        restoreInterruptedTaskAfterResumeFailure,
+      })
+    );
+    spyOn(session, "resumeStream").mockResolvedValue({
+      success: false,
+      error: { type: "unknown", raw: "session refused" },
+    });
+    const result = await service.resumeStream(workspaceId, { model, agentId: "exec" });
+    expect(result.success).toBe(false);
+    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+      workspaceId,
+      "interrupted",
+      "att_00000000000000e7"
+    );
+  });
 });
