@@ -456,6 +456,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                     itemId,
                     windowId,
                     role: message.role,
+                    // The actual start after clamping, pair rounding and lead-in: consumers
+                    // cannot derive it from offset_chars or the match position. Staged with
+                    // the row so the payload budget counts it; shrinking only moves `end`.
+                    startCharOffset: start,
                     text: text.slice(start, end),
                     nextCharOffset: undefined as number | undefined,
                   };
@@ -473,6 +477,10 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
                   assert(
                     end > start || start === text.length,
                     "history character pages must make progress"
+                  );
+                  assert(
+                    item.startCharOffset + item.text.length === end,
+                    "history character pages must report their exact start"
                   );
                   if (end < text.length) item.nextCharOffset = end;
                   if (args.action === "read_item") {

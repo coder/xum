@@ -2500,7 +2500,8 @@ export const TOOL_DEFINITIONS = {
       "list_windows, list_items and search default to oldest-first; pass recent_first: true to walk newest-first (window IDs stay exact). " +
       "task_id (a task ID returned by task/task_list) reads the retained history of a descendant sub-agent this workspace spawned since its latest manual reset (the spawn must be in an already settled turn: a child created in the current turn becomes readable once the turn ends); unknown, unauthorized or pre-reset IDs return task_not_found, and a descendant whose session files were removed returns session_unavailable. " +
       "Pass a returned itemId as item_id and windowId as window_id; read_item accepts offset_chars (zero-based UTF-16 units) and limit_chars. " +
-      "Offsets inside a surrogate pair round back; pages preserve whole pairs, so a one-unit limit may return two units. Continue character paging with nextCharOffset as offset_chars. " +
+      "Offsets inside a surrogate pair round back; pages preserve whole pairs, so a one-unit limit may return two units. " +
+      "Each item's startCharOffset is where its text starts in the row after clamping and rounding (search snippets may start before the match). Continue character paging with nextCharOffset as offset_chars. " +
       "Every call returns one complete bounded result. has_more: true means at least one further matching window or row exists beyond this response (limit reached or the response filled); narrow the query instead of paging: window_id, role, tool_name, recent_first, a smaller limit or max_chars_per_item, or read_item for one row. " +
       "list_windows returns itemCount per window: the number of visible rows an unfiltered list_items would return for it; a window ID that recurs in repaired history is listed once per contiguous run. " +
       "warnings lists rows the read had to skip (oversized_rows_skipped, malformed_rows_skipped). history_timeout means the read could not finish in time: narrow the query and retry. history_changed means history changed underneath the read (or a recovery is pending): retry the query. " +
@@ -2545,6 +2546,9 @@ export const TOOL_DEFINITIONS = {
             itemId: z.string(),
             windowId: z.string(),
             role: z.string(),
+            // Where `text` starts in its row (UTF-16 units), after clamping and surrogate-pair
+            // rounding. Optional: results persisted before it was reported lack it.
+            startCharOffset: z.number().int().nonnegative().optional(),
             text: z.string(),
             nextCharOffset: z.number().optional(),
           })
