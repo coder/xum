@@ -32,6 +32,7 @@ import {
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
+  Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
   History,
@@ -60,6 +61,7 @@ import {
   type CoreTags,
   type StoreTags,
 } from "@/node/services/di/tags";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { HistoryService } from "@/node/services/historyService";
 import { IdleDispatcher } from "@/node/services/idleDispatcher";
@@ -205,6 +207,10 @@ export const BackgroundProcessManagerLive = Layer.sync(
   BackgroundProcessManagerTag,
   () => new BackgroundProcessManager(path.join(os.tmpdir(), "mux-bashes"))
 );
+
+// Headless evaluation (workflow `evaluate()`): no dependencies — the caller
+// supplies the resolved evaluation model per call (see evaluationService.ts).
+export const EvaluationLive = Layer.sync(Evaluation, () => makeEvaluationService());
 
 export const ExtensionMetadataLive = Layer.effect(
   ExtensionMetadata,
@@ -713,6 +719,7 @@ const S1 = Layer.mergeAll(
   ProviderLive,
   AutoModelRouterLive,
   BackgroundProcessManagerLive,
+  EvaluationLive,
   ExtensionMetadataLive,
   MemoryLive,
   TerminalAttentionStoreLive,
@@ -755,6 +762,7 @@ export function coreServicesFromContext(context: Context.Context<CoreTags>): Cor
     workspaceGoalService: Context.get(context, WorkspaceGoal),
     idleDispatcher: Context.get(context, IdleDispatcherTag),
     aiService: Context.get(context, AI),
+    evaluationService: Context.get(context, Evaluation),
     streamManager: Context.get(context, StreamManagerTag),
     mcpConfigService: Context.get(context, MCPConfig),
     mcpServerManager: Context.get(context, MCPServerManagerTag),

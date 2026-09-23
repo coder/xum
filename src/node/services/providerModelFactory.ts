@@ -12,8 +12,15 @@ import type { SendMessageError } from "@/common/types/errors";
 import {
   PROVIDER_REGISTRY,
   PROVIDER_DEFINITIONS,
+  isValidProvider,
   type ProviderName,
 } from "@/common/constants/providers";
+import {
+  isEvaluationProvider,
+  type EvaluationProviderName,
+} from "@/common/utils/ai/evaluationModels";
+import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
+import type { EvaluationModelInstance } from "@/node/services/evaluation/evaluationService";
 import {
   CODEX_ENDPOINT,
   CODEX_OAUTH_ROUTED_HEADER,
@@ -1177,6 +1184,33 @@ export interface PinnedModelOptions extends Pick<
   optionsRouteProvider?: ProviderName;
 }
 
+/**
+ * Creation-time receipt of an evaluation model for the workflow `evaluate()`
+ * primitive. `configFingerprint` is the non-secret endpoint identity (provider,
+ * base URL, wire provider, effective model) so a later re-resolution can detect
+ * a changed endpoint without persisting keys or headers.
+ */
+export interface PinnedEvaluationModel {
+  model: EvaluationModelInstance;
+  modelString: string;
+  effectiveModelString: string;
+  wireProviderName: EvaluationProviderName;
+  metadataModel: string;
+  routeKind: "direct";
+  configFingerprint: string;
+}
+
+/**
+ * Typed rejection of `createEvaluationModel`. Identifier fields only (no free
+ * text): `routeKind` names the unsupported route class, `providerName` the
+ * built-in provider involved.
+ */
+export interface EvaluationResolveError {
+  reason: "unsupported-provider" | "unsupported-route" | "unauthorized" | "unknown-model";
+  routeKind?: "gateway" | "local" | "custom" | "codex-oauth";
+  providerName?: ProviderName;
+}
+
 interface CreateModelOptions {
   agentInitiated?: boolean;
   workspaceId?: string;
@@ -1624,6 +1658,8 @@ export class ProviderModelFactory {
         }
 
         // Handle Anthropic provider
+        // (mirrored by the Anthropic branch of createEvaluationModelEffect —
+        // keep credential/base-URL handling in sync)
         if (providerName === "anthropic") {
           // Resolve credentials from config + env (single source of truth)
           const creds = resolveProviderCredentials("anthropic", providerConfig);
@@ -1669,6 +1705,8 @@ export class ProviderModelFactory {
         }
 
         // Handle OpenAI provider (using Responses API)
+        // (the API-key path and the Codex OAuth decision are mirrored by the
+        // OpenAI branch of createEvaluationModelEffect — keep them in sync)
         if (providerName === "openai") {
           const fullModelId = `${providerName}:${modelId}`;
 
@@ -2595,6 +2633,8 @@ export class ProviderModelFactory {
         }
 
         // Generic handler for simple providers (standard API key + factory pattern)
+        // (mirrored for Google by createEvaluationModelEffect — keep credential
+        // merging in sync)
         // Providers with custom logic (anthropic, openai, xai, ollama, openrouter, bedrock, mux-gateway,
         // github-copilot) are handled explicitly above. New providers using the standard pattern need
         // only be added to PROVIDER_DEFINITIONS - no code changes required here.
@@ -2723,6 +2763,258 @@ export class ProviderModelFactory {
       optionsProvidersConfig,
       optionsMuxProviderOptions,
       optionsRouteProvider: result.data.routeProvider,
+    });
+  }
+
+  /**
+   * Resolve a model string to an AI SDK evaluation model instance for the
+   * workflow `evaluate()` primitive.
+   *
+   * A narrow sibling of createModelCoreEffect, NOT a refactor of it: only direct
+   * API-key routes of EVALUATION_PROVIDERS are supported; Codex OAuth, every
+   * gateway (Coder, Copilot, Xum Gateway, OpenRouter, Bedrock), custom providers
+   * and providers without an evaluation factory are intentional typed
+   * rejections (EvaluationResolveError) so the caller can name the fix instead
+   * of silently re-routing a billable call. Each provider branch mirrors ~20
+   * lines of the chat path (cross-referenced at both sites) rather than
+   * threading evaluation through the 1.3k-line chat switch.
+   *
+   * Never performs network I/O: this proves configuration validity only, not
+   * that the remote model supports evaluation. Evaluation models are not
+   * LanguageModels, so DevTools middleware, wrapLanguageModel and
+   * injectProviderOptionsDefaults deliberately do not apply.
+   */
+  createEvaluationModel(
+    modelString: string
+  ): Promise<Result<PinnedEvaluationModel, EvaluationResolveError>> {
+    return Effect.runPromise(this.createEvaluationModelEffect(modelString));
+  }
+
+  private createEvaluationModelEffect(
+    modelString: string
+  ): Effect.Effect<Result<PinnedEvaluationModel, EvaluationResolveError>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      // ONE providers.jsonc read for the shadow check, routing, credentials and
+      // construction (same single-snapshot rule as resolveAndCreateModelEffect).
+      const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
+
+      const [rawProviderName, rawModelId] = parseModelString(modelString);
+      if (!rawProviderName || !rawModelId) {
+        return Err<EvaluationResolveError>({ reason: "unknown-model" });
+      }
+
+      // Shadow check on the RAW prefix, BEFORE normalization (mirrors
+      // resolveAndCreateModelEffect): a custom provider owning a built-in id is
+      // a direct custom endpoint, which the evaluation path does not construct.
+      if (isCustomProviderConfig(providersConfig[rawProviderName])) {
+        return Err<EvaluationResolveError>({ reason: "unsupported-route", routeKind: "custom" });
+      }
+
+      // An explicit gateway prefix is a deliberate gateway selection: reject it
+      // instead of rewriting it to the direct route the chat path may fall back to.
+      const explicitGateway = getExplicitGatewayProvider(modelString);
+      if (explicitGateway != null) {
+        return Err<EvaluationResolveError>({
+          reason: "unsupported-route",
+          routeKind: "gateway",
+          providerName: explicitGateway,
+        });
+      }
+
+      const canonicalModelString = normalizeToCanonical(modelString);
+      const [providerName, modelId] = parseModelString(canonicalModelString);
+      if (!providerName || !modelId) {
+        return Err<EvaluationResolveError>({ reason: "unknown-model" });
+      }
+      if (!isEvaluationProvider(providerName)) {
+        return Err<EvaluationResolveError>({
+          reason: "unsupported-provider",
+          ...(isValidProvider(providerName) ? { providerName } : {}),
+        });
+      }
+
+      // Enterprise policy applies to headless evaluation exactly as to chat.
+      if (
+        self.policyService?.isEnforced() &&
+        (!self.policyService.isProviderAllowed(providerName) ||
+          !self.policyService.isModelAllowed(providerName, modelId))
+      ) {
+        return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
+      }
+
+      // routePriority/routeOverrides may prefer a configured gateway for this
+      // origin; evaluation only runs on the origin's own direct route.
+      const routeContext = self.resolveModelRoute(canonicalModelString, providersConfig);
+      if (routeContext.routeProvider !== providerName) {
+        const routeKind = PROVIDER_DEFINITIONS[routeContext.routeProvider].kind;
+        // resolveRoute only ever moves an origin onto a gateway that routes it;
+        // a different DIRECT provider would be a routing bug, not a route class.
+        assert(
+          routeKind !== "direct",
+          `resolveRoute moved ${providerName} onto direct provider ${routeContext.routeProvider}`
+        );
+        return Err<EvaluationResolveError>({
+          reason: "unsupported-route",
+          routeKind,
+          providerName: routeContext.routeProvider,
+        });
+      }
+
+      let providerConfig: ProviderConfig = providersConfig[providerName] ?? {};
+      if (isProviderDisabledInConfig(providerConfig as { enabled?: unknown })) {
+        return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
+      }
+
+      // baseUrl → baseURL, policy-forced base URL and attribution headers,
+      // exactly as createModelCoreEffect prepares the provider config.
+      const { baseUrl, ...configWithoutBaseUrl } = providerConfig;
+      providerConfig = baseUrl
+        ? { ...configWithoutBaseUrl, baseURL: baseUrl }
+        : configWithoutBaseUrl;
+      const forcedBaseUrl = self.policyService?.isEnforced()
+        ? self.policyService.getForcedBaseUrl(providerName)
+        : undefined;
+      if (forcedBaseUrl) {
+        providerConfig = { ...providerConfig, baseURL: forcedBaseUrl };
+      }
+      providerConfig = {
+        ...providerConfig,
+        headers: buildAppAttributionHeaders(providerConfig.headers),
+      };
+      // A blank configured base URL counts as unset (same as
+      // resolveConfigBaseUrl in the credential resolver), so it never shadows a
+      // proxy supplied via *_BASE_URL for any of the three providers below.
+      const configuredBaseURL =
+        typeof providerConfig.baseURL === "string" && providerConfig.baseURL.trim() !== ""
+          ? providerConfig.baseURL
+          : undefined;
+      if (configuredBaseURL === undefined && providerConfig.baseURL !== undefined) {
+        // Drop the blank property itself: every provider branch below spreads
+        // `providerConfig` into the SDK settings, and with no env fallback the
+        // blank string would otherwise reach the SDK as the endpoint.
+        const { baseURL: _blankBaseURL, ...withoutBaseURL } = providerConfig;
+        providerConfig = withoutBaseURL;
+      }
+
+      const creds = resolveProviderCredentials(providerName, providerConfig);
+
+      if (providerName === "openai") {
+        // Codex OAuth is an auth mode inside OpenAI construction, not a route.
+        // Mirror the chat path's shouldRouteThroughCodexOauth decision
+        // (createModelCoreEffect, OpenAI branch) so a model the chat path would
+        // send through ChatGPT OAuth is rejected here rather than silently
+        // switched to the API key.
+        const fullModelId = `${providerName}:${modelId}`;
+        const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
+        const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
+        const storedCodexOauth = parseCodexOauthAuth(providerConfig.codexOauth);
+        const codexOauthDefaultAuth =
+          providerConfig.codexOauthDefaultAuth === "apiKey" ? "apiKey" : "oauth";
+        const configWireFormat = providerConfig.wireFormat;
+        const shouldRouteThroughCodexOauth = (() => {
+          if (!codexOauthAllowed || !storedCodexOauth) {
+            return false;
+          }
+          if (configWireFormat === "chatCompletions" && creds.isConfigured) {
+            return false;
+          }
+          if (codexOauthRequired) {
+            return true;
+          }
+          if (!creds.isConfigured) {
+            return true;
+          }
+          return codexOauthDefaultAuth === "oauth";
+        })();
+        if (shouldRouteThroughCodexOauth) {
+          return Err<EvaluationResolveError>({
+            reason: "unsupported-route",
+            routeKind: "codex-oauth",
+            providerName,
+          });
+        }
+      }
+
+      if (!creds.isConfigured || !creds.apiKey) {
+        return Err<EvaluationResolveError>({ reason: "unauthorized", providerName });
+      }
+
+      const providerFetch = getProviderFetch(providerConfig);
+      let model: EvaluationModelInstance;
+      let effectiveBaseURL: string | undefined;
+      switch (providerName) {
+        case "anthropic": {
+          // Mirrors the Anthropic branch of createModelCoreEffect (credential
+          // merge + /v1 base URL normalization); no cache_control fetch wrapper
+          // because evaluation requests carry no message cache breakpoints.
+          const configWithApiKey = { ...providerConfig, apiKey: creds.apiKey };
+          const rawBaseURL = configuredBaseURL ?? creds.baseUrl?.trim();
+          effectiveBaseURL = rawBaseURL ? normalizeAnthropicBaseURL(rawBaseURL) : undefined;
+          const normalizedConfig = effectiveBaseURL
+            ? { ...configWithApiKey, baseURL: effectiveBaseURL }
+            : configWithApiKey;
+          const { createAnthropic } = yield* Effect.promise(async () =>
+            PROVIDER_REGISTRY.anthropic()
+          );
+          model = createAnthropic({ ...normalizedConfig, fetch: providerFetch }).evaluationModel(
+            modelId
+          );
+          break;
+        }
+        case "openai": {
+          // Mirrors the API-key path of the OpenAI branch of createModelCoreEffect
+          // (credential merge, /v1 base URL normalization, organization); no
+          // Codex/WebSocket fetch wrappers and no service-tier injection.
+          const rawBaseURL = configuredBaseURL ?? creds.baseUrl;
+          effectiveBaseURL = rawBaseURL ? normalizeOpenAICompatibleBaseURL(rawBaseURL) : undefined;
+          const configWithCreds = {
+            ...providerConfig,
+            apiKey: creds.apiKey,
+            ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
+            ...(creds.organization && { organization: creds.organization }),
+          };
+          const { createOpenAI } = yield* Effect.promise(async () => PROVIDER_REGISTRY.openai());
+          model = createOpenAI({ ...configWithCreds, fetch: providerFetch }).evaluationModel(
+            modelId
+          );
+          break;
+        }
+        case "google": {
+          // Mirrors the generic provider branch of createModelCoreEffect
+          // (credential merge; env base URL when config sets no usable one).
+          effectiveBaseURL = configuredBaseURL ?? creds.baseUrl;
+          const configWithCreds = {
+            ...providerConfig,
+            apiKey: creds.apiKey,
+            ...(effectiveBaseURL && { baseURL: effectiveBaseURL }),
+          };
+          const { createGoogleGenerativeAI } = yield* Effect.promise(async () =>
+            PROVIDER_REGISTRY.google()
+          );
+          model = createGoogleGenerativeAI({
+            ...configWithCreds,
+            fetch: providerFetch,
+          }).evaluationModel(modelId);
+          break;
+        }
+      }
+
+      return Ok<PinnedEvaluationModel>({
+        model,
+        modelString,
+        effectiveModelString: canonicalModelString,
+        wireProviderName: providerName,
+        metadataModel: resolveModelForMetadata(canonicalModelString, providersConfig),
+        routeKind: "direct",
+        configFingerprint: computeConfigFingerprint({
+          providerName,
+          baseURL: effectiveBaseURL,
+          wireProviderName: providerName,
+          effectiveModelString: canonicalModelString,
+        }),
+      });
     });
   }
 
