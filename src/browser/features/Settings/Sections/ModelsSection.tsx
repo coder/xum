@@ -156,6 +156,7 @@ export function ModelsSection() {
   } | null>(null);
   const [highlightedModel, setHighlightedModel] = useState<{
     modelId: string;
+    api: object | null;
     provider: string;
     config: ProvidersConfigMap | null;
     policy: EffectivePolicy | null;
@@ -321,6 +322,7 @@ export function ModelsSection() {
   const showSuggestions = suggestionsSession !== null && suggestions.length > 0;
   const highlightedIndex =
     showSuggestions &&
+    highlightedModel?.api === api &&
     highlightedModel?.config === config &&
     highlightedModel?.provider === lastProvider &&
     highlightedModel?.policy === effectivePolicy
@@ -604,7 +606,7 @@ export function ModelsSection() {
                     const modelId = suggestions[next];
                     setHighlightedModel(
                       modelId
-                        ? { modelId, provider: lastProvider, config, policy: effectivePolicy }
+                        ? { modelId, api, provider: lastProvider, config, policy: effectivePolicy }
                         : null
                     );
                   } else if (e.key === "Enter") {

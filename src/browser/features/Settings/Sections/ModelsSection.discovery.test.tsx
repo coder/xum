@@ -3,6 +3,8 @@ import { act, cleanup, fireEvent, render, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { wrapAsyncIterator } from "@orpc/shared";
+import { useImperativeHandle, useState, type ReactNode, type RefObject } from "react";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
@@ -22,6 +24,17 @@ interface DiscoveryRequest {
   signal: AbortSignal;
   resolve: (result: ProviderModelDiscoveryResult) => void;
   reject: (error: Error) => void;
+}
+
+// A reconnect hands the settings tree a new API client while config and policy stay put.
+function SwappableAPI(props: {
+  initial: APIClient;
+  handle: RefObject<((client: APIClient) => void) | null>;
+  children: ReactNode;
+}) {
+  const [client, setClient] = useState(props.initial);
+  useImperativeHandle(props.handle, () => setClient, []);
+  return <APIProvider client={client}>{props.children}</APIProvider>;
 }
 
 // Use the real component/store/context stack; only the RPC boundary is controlled.
@@ -69,6 +82,7 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
   };
   const save = mock(client.providers.setModels);
   client.providers.setModels = save;
+  const swapHandle: RefObject<((client: APIClient) => void) | null> = { current: null };
   const view = render(
     <SettingsSectionStory
       setup={() => {
@@ -77,7 +91,9 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
       }}
     >
       <TooltipProvider>
-        <ModelsSection />
+        <SwappableAPI initial={client} handle={swapHandle}>
+          <ModelsSection />
+        </SwappableAPI>
       </TooltipProvider>
     </SettingsSectionStory>
   );
@@ -94,7 +110,28 @@ async function setup(provider = "anthropic", initialPolicy: EffectivePolicy | nu
   const key = (key: string, isComposing = false) => fireEvent.keyDown(input, { key, isComposing });
   const reply = (index: number, result: ProviderModelDiscoveryResult) =>
     act(() => Promise.resolve(requests[index].resolve(result)));
-  return { view, input, add, requests, save, open, type, key, reply, user, replacePolicy };
+  // Same methods, new identity: only the client object changes, as after a reconnect.
+  const reconnect = () =>
+    act(() => {
+      const swap = swapHandle.current;
+      if (!swap) throw new Error("SwappableAPI is not mounted");
+      swap({ ...client });
+      return Promise.resolve();
+    });
+  return {
+    view,
+    input,
+    add,
+    requests,
+    save,
+    open,
+    type,
+    key,
+    reply,
+    user,
+    replacePolicy,
+    reconnect,
+  };
 }
 
 describe("ModelsSection asynchronous discovery", () => {
@@ -195,6 +232,27 @@ describe("ModelsSection asynchronous discovery", () => {
     await ui.reply(1, { status: "ok", modelIds: ["model-old"] });
     expect(ui.view.getByRole("option")).toBeTruthy();
     expect(ui.input.getAttribute("aria-activedescendant")).toBeNull();
+  });
+
+  test("a reconnected API client revokes the old keyboard choice", async () => {
+    const ui = await setup();
+    ui.open();
+    await ui.type("model");
+    await ui.reply(0, { status: "ok", modelIds: ["model-a"] });
+    ui.key("ArrowDown");
+    expect(ui.input.getAttribute("aria-activedescendant")).not.toBeNull();
+    const config = getProvidersConfigStore().getConfig();
+    await ui.reconnect();
+    expect(getProvidersConfigStore().getConfig()).toBe(config);
+    expect(ui.requests[0].signal.aborted).toBe(true);
+    expect(ui.requests).toHaveLength(2);
+    expect(ui.view.queryByRole("listbox")).toBeNull();
+    await ui.reply(1, { status: "ok", modelIds: ["model-a"] });
+    expect(ui.view.getByRole("option", { name: "model-a" })).toBeTruthy();
+    // The same ID from the new client must not restore the old keyboard choice.
+    expect(ui.input.getAttribute("aria-activedescendant")).toBeNull();
+    ui.key("Enter");
+    expect(ui.save.mock.calls[0][0]).toEqual({ provider: "anthropic", models: ["model"] });
   });
 
   test.each([false, true])(
