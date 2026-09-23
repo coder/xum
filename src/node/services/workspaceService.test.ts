@@ -71,7 +71,10 @@ import type {
   WorkspaceActivitySnapshot,
   WorkspaceMetadata,
 } from "@/common/types/workspace";
-import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
+import {
+  FAKE_REAWAKENED_ATTEMPT_ID,
+  makeAgentTaskIntegrationFake,
+} from "./taskWorkspaceSeam.testUtils";
 import type { WorkspaceTurnHost } from "./taskWorkspaceSeam";
 import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
 import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
@@ -12503,7 +12506,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
     } else {
       expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
         "test-workspace",
-        undefined
+        undefined,
+        // The rollback is bound to the attempt the resume's own reawaken won.
+        FAKE_REAWAKENED_ATTEMPT_ID
       );
     }
   });
@@ -12593,7 +12598,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
     await startupFailureHandled.promise;
     expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
       "test-workspace",
-      undefined
+      undefined,
+      // The rollback is bound to the attempt the resume's own reawaken won.
+      FAKE_REAWAKENED_ATTEMPT_ID
     );
   });
 
@@ -12634,7 +12641,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
     } else {
       expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
         "test-workspace",
-        undefined
+        undefined,
+        // The rollback is bound to the attempt the resume's own reawaken won.
+        FAKE_REAWAKENED_ATTEMPT_ID
       );
     }
   });
