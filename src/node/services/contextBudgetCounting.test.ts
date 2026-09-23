@@ -137,6 +137,126 @@ describe("real-encoding budget guards", () => {
     ).toBeLessThan(getContextBudgetHardCeiling(4096));
   });
 
+  test("encrypted OpenAI reasoning does not inflate either count or mutate the request", async () => {
+    const payload = (encrypted: string) => ({
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "Check the result.",
+              providerOptions: { openai: { reasoningEncryptedContent: encrypted } },
+            },
+          ],
+        },
+      ],
+    });
+    const encrypted = "a0b1c2d3e4f5".repeat(4000);
+    const request = payload(encrypted);
+    expect(estimateAssembledRequestTokens(request)).toBe(
+      estimateAssembledRequestTokens(payload("short"))
+    );
+    expect(
+      await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 })
+    ).toBeUndefined();
+    expect(request.messages[0].content[0].providerOptions.openai.reasoningEncryptedContent).toBe(
+      encrypted
+    );
+  });
+
+  test.each([
+    "text",
+    "other-openai-field",
+    "other-provider",
+    "nested-field",
+    "non-string",
+  ] as const)("reasoning still counts %s beside encrypted OpenAI metadata", async (kind) => {
+    const large = "a0b1c2d3e4f5".repeat(4000);
+    const request = {
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: kind === "text" ? large : "Check the result.",
+              providerOptions: {
+                openai: {
+                  reasoningEncryptedContent: kind === "non-string" ? { text: large } : large,
+                  ...(kind === "other-openai-field" ? { extra: large } : {}),
+                  ...(kind === "nested-field"
+                    ? { extra: { reasoningEncryptedContent: large } }
+                    : {}),
+                },
+                ...(kind === "other-provider" ? { xai: { reasoningEncryptedContent: large } } : {}),
+              },
+            },
+          ],
+        },
+      ],
+    };
+    expect(estimateAssembledRequestTokens(request)).toBeGreaterThan(
+      getContextBudgetHardCeiling(10000)
+    );
+    expect(
+      (await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 }))
+        ?.type
+    ).toBe("context_budget_exceeded");
+  });
+
+  test.each(["tool-json", "tool-content", "tool-input", "user-text"] as const)(
+    "reasoning metadata lookalikes remain counted in %s",
+    async (kind) => {
+      const reasoning = {
+        type: "reasoning",
+        text: "Check the result.",
+        providerOptions: { openai: { reasoningEncryptedContent: "a0b1c2d3e4f5".repeat(4000) } },
+      };
+      const value = { role: "assistant", content: [reasoning] };
+      const request = {
+        messages:
+          kind === "user-text"
+            ? [{ role: "user", content: JSON.stringify(value) }]
+            : kind === "tool-input"
+              ? [
+                  {
+                    role: "assistant",
+                    content: [
+                      { type: "tool-call", toolName: "read", toolCallId: "call", input: value },
+                    ],
+                  },
+                ]
+              : [
+                  {
+                    role: "tool",
+                    content: [
+                      {
+                        type: "tool-result",
+                        toolCallId: "call",
+                        toolName: "read",
+                        output:
+                          kind === "tool-json"
+                            ? { type: "json", value }
+                            : { type: "content", value: [reasoning] },
+                      },
+                    ],
+                  },
+                ],
+      };
+      expect(estimateAssembledRequestTokens(request)).toBeGreaterThan(
+        getContextBudgetHardCeiling(10000)
+      );
+      expect(
+        (await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 }))
+          ?.type
+      ).toBe("context_budget_exceeded");
+      expect(await estimateToolResultTokensForModel(value, { model })).toBeGreaterThan(
+        getContextBudgetHardCeiling(10000)
+      );
+    }
+  );
+
   test("counts system/schema text but excludes nested media bytes", async () => {
     const count = (bytes: string) =>
       estimateToolResultTokensForModel(

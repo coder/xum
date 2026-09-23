@@ -2921,7 +2921,7 @@ export class StreamManager {
           // preserves settled results; it must not reset/replay the activated catalog.
           if (exceeded)
             throw new ContextBudgetBlockedError(
-              `The next request exceeds the safe context budget for ${exceeded.model} (${exceeded.estimate} > ${exceeded.hardCeiling}). Use /compact or reduce the active tool/context payload.`
+              `The estimated next request exceeds the safe context budget for ${exceeded.model} (${exceeded.hardCeiling} tokens). Use /compact or reduce the active tool/context payload.`
             );
         }
         if (
