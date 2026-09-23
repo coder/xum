@@ -18,6 +18,7 @@
  * Keeping this pure (no React, no IPC) makes the non-trivial folding logic unit
  * testable and keeps the components dumb.
  */
+import { EvaluationStepResultSchema } from "@/common/types/evaluation";
 import {
   isActiveWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
@@ -27,6 +28,7 @@ import {
   type WorkflowRunEvent,
   type WorkflowRunRecord,
   type WorkflowRunStatus,
+  type WorkflowStepRecord,
   type WorkflowStepStatus,
 } from "@/common/types/workflow";
 
@@ -36,6 +38,20 @@ export type WorkflowStepDisplayStatus = "running" | "completed" | "failed" | "in
 export interface WorkflowStepUsage {
   tokens?: number;
   costUsd?: number;
+}
+
+/**
+ * Display facts for an `evaluate()` step: the admitted selection and attempt
+ * (from the step record), the provider's response model id and token usage
+ * (from the committed result) and whether this run replayed a stored result.
+ * `modelString`/`responseModelId` are untrusted display text (React escaping only).
+ */
+export interface WorkflowStepEvaluationView {
+  modelString: string;
+  attempt: number;
+  responseModelId?: string;
+  usage?: { inputTokens: number | null; outputTokens: number | null; totalTokens: number | null };
+  cached: boolean;
 }
 
 export interface WorkflowStepView {
@@ -57,6 +73,8 @@ export interface WorkflowStepView {
   error?: string;
   /** Optional usage overlay resolved from the step's task workspace. */
   usage?: WorkflowStepUsage;
+  /** Present for `evaluate()` steps; such steps never have a task or workspace. */
+  evaluation?: WorkflowStepEvaluationView;
   /** Nested workflow run spawned by this step, when the step delegates to another workflow. */
   nestedWorkflowRunId?: string;
   nestedWorkflowName?: string;
@@ -159,6 +177,25 @@ export interface WorkflowRunView {
   /** Last `error` event message — surfaces a run-level failure with no step error. */
   errorMessage: string | null;
   stats: WorkflowRunStats;
+}
+
+function projectStepEvaluation(
+  step: WorkflowStepRecord,
+  cached: boolean
+): WorkflowStepEvaluationView | undefined {
+  if (step.evaluation == null) {
+    return undefined;
+  }
+  // The committed result is authoritative for what the provider answered with;
+  // the admission only knows what was requested.
+  const result = EvaluationStepResultSchema.safeParse(step.result?.structuredOutput);
+  return {
+    modelString: step.evaluation.selection.modelString,
+    attempt: step.evaluation.attempt,
+    ...(result.success ? { responseModelId: result.data.model.responseModelId } : {}),
+    ...(result.success ? { usage: result.data.usage } : {}),
+    cached,
+  };
 }
 
 export interface ProjectWorkflowRunOptions {
@@ -494,6 +531,10 @@ export function projectWorkflowRun(
   // the ungrouped bucket even when a phase was active.
   const stepFirstEventSeq = new Map<string, number>();
   const stepTitle = new Map<string, string>();
+  // Keyed by (stepId, inputHash) like the run store's step records: the same
+  // step id may be evaluated with different inputs, and only the replayed
+  // input's record is "cached".
+  const cachedEvaluationStepKeys = new Set<string>();
   const stepTaskEventIds = new Map<string, Set<string>>();
   const nestedWorkflowAttempts = getWorkflowChildAttempts(events);
   for (const event of events) {
@@ -511,6 +552,9 @@ export function projectWorkflowRun(
       } else {
         stepTaskEventIds.set(stepId, new Set([event.taskId]));
       }
+    }
+    if (event.type === "evaluation" && event.status === "cached") {
+      cachedEvaluationStepKeys.add(`${event.stepId}\0${event.inputHash}`);
     }
     if (!stepTitle.has(stepId)) {
       if (
@@ -570,6 +614,10 @@ export function projectWorkflowRun(
       result: step.result,
       error: step.error,
       usage,
+      evaluation: projectStepEvaluation(
+        step,
+        cachedEvaluationStepKeys.has(`${step.stepId}\0${step.inputHash}`)
+      ),
       nestedWorkflowRunId: nestedWorkflowEvent?.runId,
       nestedWorkflowName: nestedWorkflowEvent?.name,
       nestedWorkflowStatus: nestedWorkflowEvent?.status,

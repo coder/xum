@@ -190,6 +190,44 @@ function makeCompletedStepView(taskId: string): WorkflowRunView {
   };
 }
 
+function makeCompletedEvaluationStepView(evaluation: {
+  modelString: string;
+  responseModelId: string;
+}): WorkflowRunView {
+  const startedAt = "2026-06-25T12:00:00.000Z";
+  const completedAt = "2026-06-25T12:00:02.000Z";
+  return {
+    ...makeCompletedView(),
+    phases: [
+      {
+        name: "screen",
+        label: "Screen",
+        steps: [
+          {
+            stepId: "screen-issue",
+            status: "completed",
+            title: "Screen issue",
+            phaseName: "screen",
+            startedAt,
+            completedAt,
+            durationMs: 2000,
+            evaluation: { ...evaluation, attempt: 1, cached: false },
+          },
+        ],
+        done: 1,
+        total: 1,
+        running: false,
+        failed: false,
+        lifecycle: "completed",
+        latest: true,
+      },
+    ],
+    steps: [],
+    result: null,
+    stats: { total: 1, done: 1, running: 0, failed: 0, elapsedMs: 2000 },
+  };
+}
+
 function makeNestedWorkflowParentView(): WorkflowRunView {
   const timestamp = "2026-06-25T12:00:00.000Z";
   return {
@@ -382,6 +420,29 @@ describe("WorkflowTimeline", () => {
     fireEvent.click(view.getByRole("button", { name: "Review implementation 2s" }));
 
     expect(view.getByText("Completed step report body.")).toBeDefined();
+  });
+
+  test("shows the response model only when it differs from the requested model id", () => {
+    // Providers report bare ids (and the service falls back to the requested
+    // bare id), while the admitted model string carries the provider prefix.
+    const renderExpanded = (responseModelId: string) => {
+      const view = render(
+        <WorkflowTimeline
+          view={makeCompletedEvaluationStepView({ modelString: "openai:gpt-5", responseModelId })}
+        />
+      );
+      fireEvent.click(view.getByRole("button", { name: "Screen 1/1" }));
+      fireEvent.click(view.getByRole("button", { name: /^Screen issue/ }));
+      return view;
+    };
+
+    const same = renderExpanded("gpt-5");
+    expect(same.getByText("openai:gpt-5")).toBeDefined();
+    expect(same.queryByText(/^↳/)).toBeNull();
+    same.unmount();
+
+    const snapshot = renderExpanded("gpt-5-2026-03-01");
+    expect(snapshot.getByText("↳ gpt-5-2026-03-01")).toBeDefined();
   });
 
   test("inlines a nested workflow run under its parent step", async () => {
