@@ -2962,7 +2962,7 @@ export const TOOL_DEFINITIONS = {
   file_edit_replace_string: {
     resultSchema: FileEditReplaceStringToolResultSchema,
     description:
-      "⚠️ CRITICAL: Always check tool results - edits WILL fail if old_string is not found or unique. Do not proceed with dependent operations (commits, pushes, builds) until confirming success.\n\n" +
+      "Edits fail if old_string is not found or is not unique. Check the tool result before dependent operations such as commits, pushes, or builds.\n\n" +
       "Apply one or more edits to a file by replacing exact text matches. All edits are applied sequentially. Each old_string must be unique in the file unless replace_count > 1 or replace_count is -1.",
     schema: z.preprocess(
       normalizeFilePath,
@@ -2986,7 +2986,7 @@ export const TOOL_DEFINITIONS = {
   },
   file_edit_replace_lines: {
     description:
-      "⚠️ CRITICAL: Always check tool results - edits WILL fail if line numbers are invalid or file content has changed. Do not proceed with dependent operations (commits, pushes, builds) until confirming success.\n\n" +
+      "Edits fail if line numbers are invalid or the file content has changed. Check the tool result before dependent operations such as commits, pushes, or builds.\n\n" +
       "Replace a range of lines in a file. Use this for line-based edits when you know the exact line numbers to modify.",
     schema: z.preprocess(
       normalizeFilePath,
