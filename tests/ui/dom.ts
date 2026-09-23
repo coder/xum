@@ -1,5 +1,4 @@
 import { GlobalWindow } from "happy-dom";
-import { mock } from "bun:test";
 import * as React from "react";
 
 /**
@@ -13,11 +12,17 @@ import * as React from "react";
  * already imported the noop and pre-registers the export when Radix has not loaded yet, so
  * this is order-independent. Scoped to that single module; only DOM-installing suites reach
  * here, and no test renders through react-dom/server, so the noop is never the correct value.
+ *
+ * This harness is shared with the Jest integration suites (tests/ui/**), where `bun:test` does
+ * not exist. Jest gives each test file its own module registry, so an earlier file cannot pin
+ * the noop there; load `bun:test` only under Bun instead of importing it statically.
  */
 let radixLayoutEffectRebound = false;
 function rebindRadixLayoutEffect(): void {
-  if (radixLayoutEffectRebound) return;
+  if (radixLayoutEffectRebound || process.versions.bun == null) return;
   radixLayoutEffectRebound = true;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { mock } = require("bun:test") as typeof import("bun:test");
   mock.module("@radix-ui/react-use-layout-effect", () => ({
     useLayoutEffect: React.useLayoutEffect,
   }));
