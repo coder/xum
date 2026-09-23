@@ -88,19 +88,41 @@ describe("attachReasoningReplayMetadata", () => {
     );
   }
 
-  test("mirrors providerOptions into providerMetadata", () => {
+  test("replays complete OpenAI reasoning by encrypted content only, never by itemId", () => {
+    // With the SDK's default store=true, an itemId becomes a server-side
+    // `item_reference` that is unresolvable after a route/credential change and
+    // fails every later request. The encrypted blob is self-contained.
+    const part: MuxReasoningPart = {
+      type: "reasoning",
+      text: "thinking",
+      providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+    };
+    const input = assistantMessage([part]);
+
+    const [output] = attachReasoningReplayMetadata([input]);
+
+    expect(reasoningParts(output)[0].providerMetadata).toEqual({
+      openai: { reasoningEncryptedContent: "enc" },
+    });
+    // Request-only: the persisted part keeps its itemId for debugging/downgrade.
+    expect(part.providerOptions).toEqual({
+      openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" },
+    });
+  });
+
+  test("keeps the xAI itemId alongside encrypted content (scope pin)", () => {
     const input = assistantMessage([
       {
         type: "reasoning",
         text: "thinking",
-        providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        providerOptions: { xai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
       },
     ]);
 
     const [output] = attachReasoningReplayMetadata([input]);
 
     expect(reasoningParts(output)[0].providerMetadata).toEqual({
-      openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" },
+      xai: { itemId: "rs_1", reasoningEncryptedContent: "enc" },
     });
   });
 
