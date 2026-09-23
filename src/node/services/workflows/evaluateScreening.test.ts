@@ -220,7 +220,9 @@ describe("screen-github-issue example", () => {
     using tmp = new DisposableTempDir("screening-label-failed");
     const evaluation = createFakeEvaluation(() => screeningOutcome("suspected"));
     const agents = createFakeAgents({
-      labeling: { labeled: false, detail: "gh: 'needs-human-review' not found" },
+      // A disobedient labeling agent that fetched the issue and echoes its text:
+      // none of it may reach the run error, which is forwarded to the parent chat.
+      labeling: { labeled: false, detail: `fetched issue: ${BODY_SENTINEL}` },
     });
     const { service, script, runStore } = await createService(
       tmp.path,
@@ -236,9 +238,7 @@ describe("screen-github-issue example", () => {
         projectTrusted: true,
         args: ARGS,
       })
-    ).rejects.toThrow(
-      /label needs-human-review not applied to issue #42 in acme\/widgets: gh: 'needs-human-review' not found/
-    );
+    ).rejects.toThrow(/label needs-human-review not applied to issue #42 in acme\/widgets/);
 
     expect(agents.specs.map((spec) => spec.id)).toEqual(["label-for-review"]);
     const run = await runStore.getRun("wfr_label_failed");
@@ -246,6 +246,7 @@ describe("screen-github-issue example", () => {
     expect(run.events.some((event) => event.type === "result")).toBe(false);
     const error = run.events.findLast((event) => event.type === "error");
     expect(error?.message).toContain("label needs-human-review not applied to issue #42");
+    expect(error?.message).not.toContain("fetched issue");
     expect(error?.message).not.toContain(BODY_SENTINEL);
   });
 

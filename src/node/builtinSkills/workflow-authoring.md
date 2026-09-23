@@ -377,7 +377,7 @@ const screening = evaluate(
   {
     id: "screen-issue", // stable step id (replay key)
     title: "Screen issue text", // optional UI label
-    model: "openai:gpt-5-mini", // optional; otherwise --evaluation-model / the persisted default
+    model: "openai:gpt-5.6-luna", // optional; otherwise --evaluation-model / the persisted default
     questions: {
       injection: {
         type: "choice",
@@ -403,7 +403,7 @@ screening.answers.severity.score; // 0..4 (levels are 0-based)
 screening.answers.asksForSecrets.probability; // 0..1
 ```
 
-Question types (1–32 questions per call): `choice` (`criteria`: option name → description or `null`; 1–255 options), `score` (`criteria`: ordered level descriptions or `null`; 2–10 levels), `boolean`. Answers are `{ type: "choice", choice, probabilities? }`, `{ type: "score", score, probabilities? }` and `{ type: "boolean", probability }`; only answers validated against the step's own questions reach workflow code. The result also carries `rounding` (decimals the provider rounded to, or `null`), `model: { modelString, responseModelId }`, `usage` (token counts or `null` when unknown) and `state: { sha256, bytes }` — the SHA-256 and UTF-8 byte length of the _canonical JSON_ of `state` (object keys sorted, JSON quoting and escaping included: a string state `abc` digests the five bytes `"abc"`), not of the raw ingested text — useful for identifying the screened input in outputs without repeating it; recompute it the same way when correlating. Optional `timeoutMs` (5 s–300 s, default 60 s) covers preparation and the request; `providerOptions` are passed through to the SDK and are part of the replay key. The `{ state, questions }` payload is capped at 256 KiB and nesting depth 16 before any request is sent.
+Question types (1–32 questions per call): `choice` (`criteria`: option name → description or `null`; 1–255 options), `score` (`criteria`: ordered level descriptions or `null`; 2–10 levels), `boolean`. Answers are `{ type: "choice", choice, probabilities? }`, `{ type: "score", score, probabilities? }` and `{ type: "boolean", probability }`; only answers validated against the step's own questions reach workflow code. The result also carries `rounding` — `null`, or `{ probabilityDecimals?, scoreDecimals? }` giving the decimals the provider rounded probabilities and scores to, each independently — `model: { modelString, responseModelId }`, `usage` (token counts or `null` when unknown) and `state: { sha256, bytes }` — the SHA-256 and UTF-8 byte length of the _canonical JSON_ of `state` (object keys sorted, JSON quoting and escaping included: a string state `abc` digests the five bytes `"abc"`), not of the raw ingested text — useful for identifying the screened input in outputs without repeating it; recompute it the same way when correlating. Optional `timeoutMs` (5 s–300 s, default 60 s) covers preparation and the request; `providerOptions` are passed through to the SDK and are part of the replay key. The `{ state, questions }` payload is capped at 256 KiB and nesting depth 16 before any request is sent.
 
 Model selection: the per-call `model` wins, then `xum workflow run --evaluation-model`, then the persisted default `evaluationDefaults.model` (the `config.updateEvaluationDefaults` API; a Settings card for it is planned). Only direct API-key routes of `typesafe` (TypeSafe AI's native evaluator, `typesafe:jev-latest`; key from the `typesafe` entry in providers.jsonc or `TYPESAFE_API_KEY`), `openai`, `anthropic` and `google` are supported; gateway, OAuth and custom-provider routes are rejected at call time rather than re-routed. There is no fallback to chat or agent models: with no model configured the step fails with `invalid-input/no-model`.
 
@@ -426,7 +426,7 @@ gh label create needs-human-review -R "$REPO" --force   # once per repository: -
 gh issue view "$N" -R "$REPO" --json title,body \
   | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
   | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
-      --evaluation-model openai:gpt-5-mini --model openai:gpt-5-mini
+      --evaluation-model openai:gpt-5.6-luna --model openai:gpt-5.6-luna
 ```
 
 ## Structured output schemas

@@ -13,7 +13,7 @@
 //   gh issue view "$N" -R "$REPO" --json title,body \
 //     | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
 //     | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
-//         --evaluation-model openai:gpt-5-mini --model openai:gpt-5-mini
+//         --evaluation-model openai:gpt-5.6-luna --model openai:gpt-5.6-luna
 //
 // A passing screen means "screened", not "trusted": classification can be
 // steered by adversarial text and probabilities are uncalibrated across models.
@@ -108,23 +108,26 @@ export default function workflow({ args, evaluate, agent }) {
     stateSha256,
   };
   const labeling = agent(
-    `Apply a GitHub label using exactly this request and nothing else: ${JSON.stringify(request)}. Run \`gh issue edit ${request.issueNumber} -R ${request.repo} --add-label ${request.label}\`. Do not read or fetch the issue body. Report labeled: true only if the command exited 0; otherwise report labeled: false with the command's error output as detail.`,
+    `Apply a GitHub label using exactly this request and nothing else: ${JSON.stringify(request)}. Run \`gh issue edit ${request.issueNumber} -R ${request.repo} --add-label ${request.label}\`. Do not read or fetch the issue body. Report labeled: true only if the command exited 0; otherwise report labeled: false.`,
     {
       id: "label-for-review",
       agentId: "exec",
       schema: {
         type: "object",
         required: ["labeled"],
-        properties: { labeled: { type: "boolean" }, detail: { type: "string" } },
+        properties: { labeled: { type: "boolean" } },
       },
     }
   );
   // A suspicious issue must not be reported as labeled when `gh` failed (no
   // auth, unknown label, no write access): fail the run instead of claiming
-  // success. `detail` is the agent's own error report; it never saw the body.
+  // success. The error is a fixed template over validated identifiers only: the
+  // run error is forwarded to the parent chat, and free-form agent text could
+  // carry issue content (the "do not read" guidance is not enforcement). The
+  // labeling agent's own transcript keeps the `gh` diagnostics.
   if (labeling.labeled !== true) {
     throw new Error(
-      `label ${REVIEW_LABEL} not applied to issue #${args.issueNumber} in ${args.repo}: ${labeling.detail ?? "no detail reported"}`
+      `label ${REVIEW_LABEL} not applied to issue #${args.issueNumber} in ${args.repo}`
     );
   }
   return {
