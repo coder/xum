@@ -720,6 +720,12 @@ export const HeldInputsChangedEventSchema = z.object({
   heldInputs: z.array(
     z.object({
       id: z.string(),
+      /**
+       * Why it was refused. `reported`: the turn before it was the task's terminal report.
+       * `indeterminate`: it could not run and no report was confirmed (the report's outcome could
+       * not be established, or the attempt was otherwise closed/superseded).
+       */
+      reason: z.enum(["reported", "indeterminate"]),
       /** The user's authored text (or slash command); empty for attachment/review-only input. */
       displayText: z.string(),
       attachmentCount: z.number().int().nonnegative(),

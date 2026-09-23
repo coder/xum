@@ -18,6 +18,12 @@ interface HeldInputProps {
 const SHORTCUT_HINT_CLASS =
   "bg-background-secondary text-muted border-border-medium rounded border px-1 py-px font-mono text-[10px] whitespace-nowrap [@media(max-width:768px)]:hidden";
 
+/** Banner wording per refusal reason: only `reported` may say a report happened. */
+const HELD_INPUT_REASON_LABELS: Record<HeldInputData["reason"], string> = {
+  reported: "Not sent — the task reported before this ran",
+  indeterminate: "Not sent — the task's outcome was not confirmed before this ran",
+};
+
 function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
@@ -100,7 +106,7 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
               className="text-secondary border-warning/20 flex items-center gap-1.5 border-b px-3 py-1.5 text-[11px]"
             >
               <CircleSlash className="text-warning size-3 shrink-0" />
-              <span className="min-w-0">Not sent — the task reported before this ran</span>
+              <span className="min-w-0">{HELD_INPUT_REASON_LABELS[props.heldInput.reason]}</span>
             </div>
             <div className="max-h-[20vh] overflow-y-auto px-3 py-2">
               <p

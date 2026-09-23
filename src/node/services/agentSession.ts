@@ -88,6 +88,7 @@ import type {
 } from "./taskWorkspaceSeam";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
+  TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
 } from "@/constants/agentMessaging";
 import {
@@ -108,6 +109,7 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
 import type {
+  HeldInput,
   WorkspaceChatMessage,
   SendMessageOptions,
   FilePart,
@@ -211,6 +213,13 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
+
+/** A held input (see AgentSession.heldInputs): the refused send and why it was refused. */
+interface HeldInputEntry {
+  id: string;
+  send: RefusedManualSend;
+  reason: HeldInput["reason"];
+}
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -1248,7 +1257,7 @@ export class AgentSession {
    * renderer only subscribes to the workspace it shows). In memory only: like a queued message, a
    * held input does not survive a backend restart.
    */
-  private heldInputs: Array<{ id: string; send: RefusedManualSend }> = [];
+  private heldInputs: HeldInputEntry[] = [];
   /** Held inputs whose re-send is in flight (a second Send must not send them twice). */
   private readonly sendingHeldInputIds = new Set<string>();
 
@@ -10800,8 +10809,9 @@ export class AgentSession {
     return {
       type: "held-inputs-changed",
       workspaceId: this.workspaceId,
-      heldInputs: this.heldInputs.map(({ id, send }) => ({
+      heldInputs: this.heldInputs.map(({ id, send, reason }) => ({
         id,
+        reason,
         displayText: send.displayText,
         attachmentCount: send.attachmentCount,
         reviewCount: send.reviewCount,
@@ -10810,7 +10820,7 @@ export class AgentSession {
   }
 
   /** Held inputs, oldest first (see heldInputs). */
-  getHeldInputs(): ReadonlyArray<{ id: string; send: RefusedManualSend }> {
+  getHeldInputs(): readonly HeldInputEntry[] {
     return this.heldInputs;
   }
 
@@ -10950,7 +10960,11 @@ export class AgentSession {
       if (removed != null) {
         if (refusedSend != null) {
           // Held before the queue change is published, so no observer sees the input in neither.
-          this.heldInputs = [...this.heldInputs, { id: randomUUID(), send: refusedSend }];
+          // Only the dequeue gate's report refusal proves a report happened; every other refusal
+          // (indeterminate report outcome, closed/superseded attempt) must not claim one.
+          const reason =
+            refusal === TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE ? "reported" : "indeterminate";
+          this.heldInputs = [...this.heldInputs, { id: randomUUID(), send: refusedSend, reason }];
           this.emitChatEvent(this.heldInputsChangedEvent());
         }
         this.emitQueuedMessageChanged();

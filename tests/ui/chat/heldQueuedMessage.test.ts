@@ -13,11 +13,13 @@ import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review
 import { Err } from "@/common/types/result";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
+import { TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE } from "@/constants/agentMessaging";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness, type AppHarness } from "../harness";
 
 const NOT_SENT_LABEL = "Not sent — the task reported before this ran";
+const NOT_CONFIRMED_LABEL = "Not sent — the task's outcome was not confirmed before this ran";
 const draftAttachment = {
   kind: "staged" as const,
   id: "s1",
@@ -38,7 +40,14 @@ const refusingAdmission: TurnAdmissionToken = {
   onEnqueued: () => undefined,
   onAdmitted: () => undefined,
   onDisposed: () => undefined,
-  resolveDispatch: () => ({ refuse: "the task already reported" }),
+  resolveDispatch: () => ({ refuse: TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE }),
+};
+/** A queued send whose attempt closed without a confirmed report (stale token). */
+const staleAdmission: TurnAdmissionToken = {
+  admissionStale: () => true,
+  onEnqueued: () => undefined,
+  onAdmitted: () => undefined,
+  onDisposed: () => undefined,
 };
 const composerReview = (note: string): ReviewNoteData => ({
   filePath: "src/file.ts",
@@ -230,13 +239,18 @@ describe("Held (refused) queued messages", () => {
       session.queueMessage(
         "second follow-up",
         { ...queueOptions, fileParts: [{ ...queuedFilePart, filename: "second.txt" }] },
-        { acceptanceOrigin: "manual", turnAdmission: refusingAdmission }
+        // Refused without a confirmed report: its banner must not claim one.
+        { acceptanceOrigin: "manual", turnAdmission: staleAdmission }
       );
       session.drainQueuedMessagesIfIdle();
       expect(session.hasQueuedMessages()).toBe(false);
       expect(session.getHeldInputs().map((held) => held.send.displayText)).toEqual([
         "queued follow-up",
         "second follow-up",
+      ]);
+      expect(session.getHeldInputs().map((held) => held.reason)).toEqual([
+        "reported",
+        "indeterminate",
       ]);
 
       // Switching back shows both, in order, with their counts; the composer is not involved.
@@ -247,6 +261,8 @@ describe("Held (refused) queued messages", () => {
       expect(bannerTexts()[0]).toContain("queued follow-up");
       expect(bannerTexts()[0]).toContain("1 attachment · 1 review");
       expect(bannerTexts()[1]).toContain("second follow-up");
+      expect(bannerTexts()[1]).toContain(NOT_CONFIRMED_LABEL);
+      expect(bannerTexts()[1]).not.toContain("reported");
       expect(bannerTexts()[1]).toContain("1 attachment");
       expect(bannerTexts()[1]).not.toContain("review");
       expect(draftOf(app.workspaceId)).toBe("draft kept");

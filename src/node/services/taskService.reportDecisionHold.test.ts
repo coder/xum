@@ -368,8 +368,16 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         // The follow-up's obligation was discharged exactly once and the decision pruned.
         expect(outstanding(svc, childId)).toHaveLength(0);
         expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
-        // The follow-up is held by the session (nothing is pushed into the composer).
+        // The follow-up is held by the session (nothing is pushed into the composer), refused
+        // because the task reported — and published with that reason.
         expect(stack.heldTexts()).toEqual(["follow-up text"]);
+        expect(stack.heldInputs().map((held) => held.reason)).toEqual(["reported"]);
+        const lastHeldEvent = stack.sessionHarness.events.findLast(
+          (event) => event.type === "held-inputs-changed"
+        );
+        expect(lastHeldEvent).toMatchObject({
+          heldInputs: [{ reason: "reported", displayText: "follow-up text" }],
+        });
         expect(stack.restoreEvents()).toHaveLength(0);
         // A later manual send is a new admission that mints a fresh attempt (released shape).
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(false);
@@ -701,9 +709,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
       await yieldMacrotasks(5);
       expect(completions).toHaveLength(1);
-      // Not released (no durable report), not continued: fail closed, the follow-up held.
+      // Not released (no durable report), not continued: fail closed, the follow-up held — as
+      // indeterminate, never as if a report had been confirmed.
       expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
       // Refused as indeterminate — not as a completed report and not as a plain stale attempt.
       expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
       expect(outstanding(svc, childId)).toHaveLength(0);
