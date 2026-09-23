@@ -5921,6 +5921,7 @@ export class TaskService implements AgentTaskIntegration {
     if (refreshedEntry == null) {
       return Err({ code: "not_found" as const });
     }
+    // Check after unarchiving: unarchive can restore a checkout that archiving deleted.
     const checkoutError = await getMissingHostLocalCheckoutError(refreshedEntry);
     if (checkoutError != null) {
       return Err({

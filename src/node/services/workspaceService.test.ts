@@ -16892,6 +16892,13 @@ describe("WorkspaceService shared-checkout tasks and owner renames", () => {
     expect(config.findWorkspace(ownerId)?.workspacePath).toBe(ownerPath);
   });
 
+  test("accepts renaming a shared child to its current name as a no-op", async () => {
+    const result = await workspaceService.rename(childId, "agent_explore_child");
+
+    expect(result.success).toBe(true);
+    expect(config.findWorkspace(childId)?.workspacePath).toBe(ownerPath);
+  });
+
   test("shared children follow an owner rename and removing one keeps the renamed checkout", async () => {
     const emittedChildPaths: Array<string | undefined> = [];
     workspaceService.on(

@@ -7871,15 +7871,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const oldMetadata = metadataResult.data;
       const oldName = oldMetadata.name;
+      if (newName === oldName) {
+        return Ok({ newWorkspaceId: workspaceId });
+      }
+
       // Shared tasks do not own their checkout; runtime rename could move the owner's workspace.
       if (oldMetadata.taskIsolation === "none") {
         return Err(
           "Cannot rename a sub-agent that shares its parent's checkout. Rename the parent workspace instead."
         );
-      }
-
-      if (newName === oldName) {
-        return Ok({ newWorkspaceId: workspaceId });
       }
 
       const allWorkspaces = await this.config.getAllWorkspaceMetadata();
@@ -8177,7 +8177,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         )
         .map((metadata) => metadata.id);
       if (sharedDescendantIds.length > 0) {
-        await this.emitCurrentWorkspaceMetadataBatch(sharedDescendantIds);
+        await this.emitCurrentWorkspaceMetadataBatch(sharedDescendantIds, allMetadataUpdated);
       }
 
       await this.syncCodeWorkspaceFiles(updatedMetadata);
@@ -8204,9 +8204,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     await this.emitCurrentWorkspaceMetadataBatch([workspaceId]);
   }
 
-  /** Emit fresh metadata for several workspaces with a single config reload. */
-  private async emitCurrentWorkspaceMetadataBatch(workspaceIds: string[]): Promise<void> {
-    const allMetadata = await this.config.getAllWorkspaceMetadata();
+  /** Emit fresh metadata for several workspaces, reusing post-write metadata when given. */
+  private async emitCurrentWorkspaceMetadataBatch(
+    workspaceIds: string[],
+    loadedMetadata?: FrontendWorkspaceMetadata[]
+  ): Promise<void> {
+    const allMetadata = loadedMetadata ?? (await this.config.getAllWorkspaceMetadata());
     const metadataById = new Map(allMetadata.map((metadata) => [metadata.id, metadata]));
     for (const workspaceId of workspaceIds) {
       const enrichedMetadata = this.enrichMaybeFrontendMetadata(
