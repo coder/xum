@@ -264,6 +264,7 @@ import {
   buildTaskCheckoutPreparation,
   claimTaskCheckoutIdentity,
   isWorktreeSemanticsRuntime,
+  materializedCheckoutPublicationRefusal,
   revalidateTaskCheckoutIdentity,
   taskCheckoutMismatchLabel,
   taskCheckoutProofPaths,
@@ -3247,7 +3248,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * worktree is structurally protected (isProtectedTaskRow), so its row is
    * published under the lock like every protected row — a structural
    * mutator's scan sees every task row or none — but with nothing to prune
-   * (plugin servers are never offered there).
+   * (plugin servers are never offered there). Its fork ran BEFORE this hold
+   * (holding the lock across container exec would block every registration),
+   * so the checkout and its Git backing are revalidated under the lock first
+   * (materializedCheckoutPublicationRefusal): a refusal publishes nothing.
    *
    * Returns `Err` when sanitization refused (NOTHING was published; the
    * caller decides the fate of its unregistered files) and `Ok` with
@@ -3259,7 +3263,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ): Promise<Result<T, string>> {
     assert(target.workspacePath.length > 0, "registerSanitizedTaskCheckout: path is required");
     if (target.runtimeConfig.type === "devcontainer") {
-      return await this.prepareTaskCheckouts(() => Promise.resolve([]), publish);
+      return await this.prepareTaskCheckouts(async () => {
+        const refusal = await materializedCheckoutPublicationRefusal(target.workspacePath);
+        if (refusal != null) throw new Error(refusal);
+        return [];
+      }, publish);
     }
     const hostLocal =
       target.runtimeConfig.type === "local" || target.runtimeConfig.type === "worktree";
