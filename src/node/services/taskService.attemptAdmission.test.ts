@@ -2407,7 +2407,11 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         });
         expect(created.success).toBe(false);
         expect(stopStream).toHaveBeenCalledTimes(1);
-        await raceWithTimeout(rotation.promise, 5_000);
+        // Keep this bound outside shortenTerminationTimers' fast-forward window around
+        // ATTEMPT_CLOSURE_SETTLE_WAIT_MS: a 5 s bound fired at 0 ms and failed on slow runners
+        // before the other writer's config write landed.
+        assert(ATTEMPT_CLOSURE_SETTLE_WAIT_MS < 10_000, "the rotation bound must not be shortened");
+        await raceWithTimeout(rotation.promise, 10_000);
         const mintedAttemptId = svc.ownedAttemptByTaskId.get(spawnedId)?.attemptId;
         expect(mintedAttemptId).toMatch(ATTEMPT_ID);
         // The captured owner outlived the bound: the latch holds for A's turn, and B's row —
