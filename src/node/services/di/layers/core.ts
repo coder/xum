@@ -637,6 +637,13 @@ export const CoreWiringLive: Layer.Layer<
     turnRequestBuilderBindings.onWorkflowRunStatusChanged = (event) =>
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
+    // Tool-started workflows resolve/dispatch `evaluate()` through the same
+    // service as ORPC-started ones; the ingest hook mirrors the headless usage
+    // sidecar wiring in the desktop layer.
+    turnRequestBuilderBindings.evaluationService = yield* Evaluation;
+    turnRequestBuilderBindings.requestAnalyticsIngest = (workspaceId) => {
+      workspaceService.emit("analyticsIngest", { workspaceId });
+    };
     workspaceService.setMemoryConsolidationService(memoryConsolidationService);
     workspaceService.setSharedWorkspaceMemoryStore(memoryService);
     // Workspace-scope change events carry the memory OWNER (task-tree root);

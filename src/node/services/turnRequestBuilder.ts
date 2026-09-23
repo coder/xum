@@ -95,6 +95,7 @@ import {
 } from "./additionalSystemContext";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
+import type { EvaluationService } from "./evaluation/evaluationService";
 import { readToolInstructions } from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
@@ -188,6 +189,7 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
 import { getAnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
@@ -577,6 +579,10 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
+  /** Workflow `evaluate()` support for tool-started runs; absent ⇒ the step fails closed. */
+  evaluationService?: EvaluationService;
+  /** Wakes the analytics sidecar after a headless usage row (workflow evaluation) lands. */
+  requestAnalyticsIngest?: (workspaceId: string) => void;
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
@@ -2079,6 +2085,18 @@ export class TurnRequestBuilder {
               await this.dependencies.bindings.onWorkflowRunStatusChanged?.(event);
             },
             runtimeFactory: new QuickJSRuntimeFactory(),
+            evaluationAdapter:
+              this.dependencies.bindings.evaluationService != null &&
+              this.dependencies.sessionUsageService != null
+                ? new WorkflowEvaluationAdapter({
+                    evaluationService: this.dependencies.bindings.evaluationService,
+                    aiService: this.dependencies.providerModelFactory,
+                    sessionUsageService: this.dependencies.sessionUsageService,
+                    config: this.dependencies.config,
+                    workspaceId,
+                    requestAnalyticsIngest: this.dependencies.bindings.requestAnalyticsIngest,
+                  })
+                : undefined,
             taskAdapterFactory: (runId, workflowName) =>
               new WorkflowTaskServiceAdapter({
                 taskService: this.dependencies.bindings.taskService!,

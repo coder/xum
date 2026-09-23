@@ -19,6 +19,8 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -65,6 +67,8 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
+import { WorkflowEvaluationAdapter } from "./WorkflowEvaluationAdapter";
+import type { WorkflowEvaluationPort } from "./workflowEvaluationStep";
 
 export interface WorkflowBackgroundRunTerminalEvent {
   runId: string;
@@ -85,6 +89,12 @@ export interface WorkflowServiceOptions {
   taskAdapter?: WorkflowTaskAdapter;
   /** workflowName is the human-readable display name, used to label spawned tasks. */
   taskAdapterFactory?: (runId: string, workflowName?: string) => WorkflowTaskAdapter;
+  /**
+   * Shared by every run (including nested ones) of this service; the adapter
+   * holds no run state. Absent ⇒ `evaluate()` fails closed as
+   * `unsupported/runtime-unavailable`.
+   */
+  evaluationAdapter?: WorkflowEvaluationPort;
   resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
@@ -152,6 +162,7 @@ export class WorkflowService {
     runId: string,
     workflowName?: string
   ) => WorkflowTaskAdapter;
+  private readonly evaluationAdapter?: WorkflowEvaluationPort;
   private readonly resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   private readonly onBackgroundRunTerminal?: (
     event: WorkflowBackgroundRunTerminalEvent
@@ -177,6 +188,7 @@ export class WorkflowService {
     );
     this.taskAdapter = options.taskAdapter;
     this.taskAdapterFactory = options.taskAdapterFactory;
+    this.evaluationAdapter = options.evaluationAdapter;
     this.resolveWorkflowScript = options.resolveWorkflowScript;
     this.onBackgroundRunTerminal = options.onBackgroundRunTerminal;
     this.onRunStatusChanged = options.onRunStatusChanged;
@@ -941,6 +953,7 @@ export class WorkflowService {
       runStore: this.runStore,
       runtimeFactory: this.runtimeFactory,
       taskAdapter: this.taskAdapterFactory?.(runId, workflowName) ?? this.requireTaskAdapter(),
+      evaluationAdapter: this.evaluationAdapter,
       nestedWorkflowAdapter: {
         createRun: async (input) => {
           const run = await this.createNestedWorkflowRun(input);
@@ -980,6 +993,8 @@ export const DYNAMIC_WORKFLOWS_DISABLED_ERROR_MESSAGE = "Dynamic workflows are d
 export interface WorkflowServiceContext {
   config: Config;
   aiService: AIService;
+  evaluationService: EvaluationService;
+  sessionUsageService: SessionUsageService;
   initStateManager: InitStateManager;
   workspaceService: WorkspaceService;
   taskService: TaskService;
@@ -1061,6 +1076,16 @@ export async function resolveWorkflowContext(
         sessionDir: path.join(context.config.sessionsDir, workspaceId),
       }),
       runtimeFactory: context.workflowRuntimeFactory,
+      evaluationAdapter: new WorkflowEvaluationAdapter({
+        evaluationService: context.evaluationService,
+        aiService: context.aiService,
+        sessionUsageService: context.sessionUsageService,
+        config: context.config,
+        workspaceId,
+        requestAnalyticsIngest: (usageWorkspaceId) => {
+          context.workspaceService.emit("analyticsIngest", { workspaceId: usageWorkspaceId });
+        },
+      }),
       taskAdapterFactory: (runId, workflowName) =>
         new WorkflowTaskServiceAdapter({
           taskService: context.taskService,

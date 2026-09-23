@@ -30,6 +30,7 @@ import type {
   WorkflowCancellationSettlement,
   WorkflowRunStore,
 } from "./WorkflowRunStore";
+import { runWorkflowEvaluationStep, type WorkflowEvaluationPort } from "./workflowEvaluationStep";
 import { assertWorkflowStepId, hashWorkflowStepInput } from "./workflowReplayKey";
 
 export class WorkflowRunBackgroundedError extends Error {
@@ -351,6 +352,12 @@ export interface WorkflowRunnerOptions {
   runtimeFactory: IJSRuntimeFactory;
   taskAdapter: WorkflowTaskAdapter;
   nestedWorkflowAdapter?: WorkflowNestedWorkflowAdapter;
+  /**
+   * Model selection/dispatch/accounting for `evaluate()` steps. Absent when the
+   * host has no evaluation services; scripts then fail closed with
+   * `unsupported/runtime-unavailable` instead of silently skipping the step.
+   */
+  evaluationAdapter?: WorkflowEvaluationPort;
   runnerId: string;
   clock?: WorkflowRunnerClock;
   /** Reservation liveness backstop; defaults to WORKFLOW_AGENT_RESERVATION_TIMEOUT_MS (tests shorten it). */
@@ -498,6 +505,7 @@ export class WorkflowRunner {
   private readonly runtimeFactory: IJSRuntimeFactory;
   private readonly taskAdapter: WorkflowTaskAdapter;
   private readonly nestedWorkflowAdapter?: WorkflowNestedWorkflowAdapter;
+  private readonly evaluationAdapter?: WorkflowEvaluationPort;
   private readonly runnerId: string;
   private readonly clock: WorkflowRunnerClock;
   private readonly reservationTimeoutMs: number;
@@ -515,6 +523,7 @@ export class WorkflowRunner {
     this.runtimeFactory = options.runtimeFactory;
     this.taskAdapter = options.taskAdapter;
     this.nestedWorkflowAdapter = options.nestedWorkflowAdapter;
+    this.evaluationAdapter = options.evaluationAdapter;
     this.runnerId = options.runnerId;
     this.clock = options.clock ?? DEFAULT_CLOCK;
     this.reservationTimeoutMs =
@@ -725,6 +734,40 @@ export class WorkflowRunner {
             }
             throw error;
           }
+        });
+        setupRuntime.registerFunction("__workflowEvaluate", async (rawState, rawSpec) => {
+          // Lifecycle lives in workflowEvaluationStep.ts; the runner only lends
+          // its lease-scoped journal wrappers. Interruption surfaces as the
+          // "Task interrupted" message the terminal-status classifier already
+          // maps to `interrupted`.
+          const abortSignal = setupRuntime.getAbortSignal();
+          // Host functions only run while the runtime executes, which is when
+          // the controller exists; a missing signal would silently make the
+          // step uninterruptible.
+          assert(
+            abortSignal !== undefined,
+            "evaluate() requires the executing runtime's abort signal"
+          );
+          return await runWorkflowEvaluationStep(
+            {
+              runId,
+              adapter: this.evaluationAdapter,
+              journal: {
+                getStep: (id, stepId, inputHash) => this.runStore.getStep(id, stepId, inputHash),
+                recordStepStarted: (input) => this.recordStepStarted(runId, input),
+                recordStepCompleted: (input) => this.recordStepCompleted(runId, input),
+                recordStepFailed: (input) => this.recordStepFailed(runId, input),
+                appendEvent: async (event) => {
+                  await this.appendEvent(runId, { ...event, sequence: sequence.next() });
+                },
+              },
+              clock: this.clock,
+              leaseGuard,
+              abortSignal,
+            },
+            rawState,
+            rawSpec
+          );
         });
         setupRuntime.registerFunction("__workflowParallelAgents", async (rawSpecs, rawOptions) => {
           try {
@@ -4099,6 +4142,15 @@ function __muxApplyPatch(spec) {
   }
   return __workflowApplyPatch(spec);
 }
+function __muxEvaluate(state, options) {
+  if (__muxParallelCollectingAgents !== null || __muxPipelineCollectingAgents !== null) {
+    throw new Error("evaluate() cannot run inside parallel()/pipeline() yet; call it sequentially");
+  }
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("evaluate requires an options object");
+  }
+  return __workflowEvaluate(state, options);
+}
 function __muxNestedWorkflow(scriptPathOrSpec, options) {
   let spec;
   if (typeof scriptPathOrSpec === "string") {
@@ -4196,6 +4248,7 @@ return (async () => await __muxWorkflow({
   parallel: __muxParallel,
   pipeline: __muxPipeline,
   applyPatch: __muxApplyPatch,
+  evaluate: __muxEvaluate,
   workflow: __muxNestedWorkflow,
 }))();
 `;

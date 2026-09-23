@@ -277,6 +277,29 @@ export type EvaluationErrorCode = z.infer<typeof EvaluationErrorCodeSchema>;
  * interpolated into the fixed failure template, so the set stays finite and
  * free of provider or author text.
  */
+/**
+ * `name` of the error the runner throws into the sandbox for a failed
+ * evaluate() step; the sandbox rethrow prefixes run-level error text with it.
+ */
+export const WORKFLOW_EVALUATION_STEP_ERROR_NAME = "WorkflowEvaluationStepError";
+
+/**
+ * Exact message of that error, built only from enum/number/digest fields (plan
+ * §"Security model": no author text). Lives next to the error name because the
+ * checkpoint-retry gate compares a run's error against the text a failed
+ * evaluate step recorded (bare or prefixed with the name).
+ */
+export function formatWorkflowEvaluationStepError(input: {
+  reason: EvaluationStepFailureReason;
+  code: EvaluationStepFailureCode;
+  statusCode?: number;
+  stepDigest: string;
+  attempt: number;
+}): string {
+  const status = input.statusCode !== undefined ? ` status ${input.statusCode}` : "";
+  return `evaluation failed: ${input.reason}/${input.code}${status} (step ${input.stepDigest}, attempt ${input.attempt})`;
+}
+
 export const EvaluationStepFailureReasonSchema = z.enum([
   ...EvaluationErrorReasonSchema.options,
   "deadline",
@@ -295,8 +318,16 @@ export const EvaluationStepFailureCodeSchema = z.enum([
   "admission-mismatch",
   "admission-missing",
   "attempts-exhausted",
-  // `invalid-input`: neither the call, the CLI, nor Settings named a model.
+  // `invalid-input`: neither the call, the CLI, nor Settings named a model, or
+  // the state/spec failed the bounded request checks.
   "no-model",
+  "request-too-large",
+  "request-too-deep",
+  "forbidden-key",
+  "invalid-spec",
+  "invalid-state",
+  // `unsupported`: this runtime was built without an evaluation adapter.
+  "runtime-unavailable",
   // `unsupported`: `createEvaluationModel` rejections.
   "unsupported-provider",
   "unsupported-route",
