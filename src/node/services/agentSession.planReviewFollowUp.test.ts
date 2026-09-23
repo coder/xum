@@ -107,3 +107,43 @@ describe("compaction follow-up dispatch with hidden plan-review rows", () => {
     await expectFollowUpDispatched(h);
   });
 });
+
+describe("manual resume with a hidden plan-review row at the tail", () => {
+  test("resumes from the newest visible row instead of silently returning", async () => {
+    const h = await fixture();
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("user-work", "user", "Refactor the scheduler", {
+            timestamp: Date.now() - 1_000,
+          })
+        )
+      ).success
+    ).toBe(true);
+    // Resolving a review thread appends a hidden user row as the raw tail; provider-visible
+    // history is unchanged, so an explicit resume must still start a stream.
+    const resolve = {
+      v: 1 as const,
+      kind: "resolve" as const,
+      recordId: "rec_r",
+      threadId: "thr_r",
+    };
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("plan-review-resolve-tail", "user", formatPlanReviewEnvelope(resolve), {
+            timestamp: Date.now(),
+            synthetic: true,
+            muxMetadata: buildPlanReviewMetadata(resolve),
+          })
+        )
+      ).success
+    ).toBe(true);
+    const resumed = await h.session.resumeStream(options);
+    expect(resumed.success).toBe(true);
+    await h.session.waitForIdle();
+    expect(h.stream).toHaveBeenCalledTimes(1);
+  });
+});
