@@ -11,6 +11,8 @@ import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { readSmallRegularFile } from "@/node/services/taskCheckoutPreparation";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { getProjectName } from "@/node/utils/runtime/helpers";
 
 /**
@@ -113,8 +115,10 @@ function collectProofPaths(value: unknown, out: string[], depth = 0): void {
  */
 export function isProtectedTaskRow(row: Workspace): boolean {
   if (readTaskCheckoutPreparation(row) !== undefined) return true;
-  const parentWorkspaceId = row.parentWorkspaceId;
-  if (typeof parentWorkspaceId !== "string" || parentWorkspaceId.length === 0) return false;
+  // Parent PRESENCE decides, exactly as classifyTaskCheckoutKind does: a malformed persisted
+  // value (an empty string) is still a task row the validator refuses, so it must stay protected
+  // here too (fail closed) rather than read as an ordinary root.
+  if (row.parentWorkspaceId == null) return false;
   return isHostLocalRuntimeConfig(row.runtimeConfig);
 }
 
@@ -326,7 +330,8 @@ async function identitiesForPath(
 export type FootprintOverlap =
   | { kind: "none" }
   | { kind: "overlap"; taskWorkspaceId: string; targetPath: string; taskPath: string }
-  | { kind: "unknown"; taskWorkspaceId: string; reason: string };
+  /** `taskWorkspaceId` is absent when the scan as a whole expired before naming a row. */
+  | { kind: "unknown"; taskWorkspaceId?: string; reason: string };
 
 /**
  * Whether any protected task row's footprint overlaps the target's. Compares
@@ -334,8 +339,30 @@ export type FootprintOverlap =
  * symlinked or differently-nested alias is caught. An identity that cannot be
  * established (permission error, dangling loop, timeout) is reported as
  * unknown — callers refuse: ambiguity is not permission.
+ *
+ * The whole scan has one deadline: callers hold the registration lock across
+ * it, and the Git-backing probes (`lstat` + bounded read) have no timer of
+ * their own, so a stalled FUSE/NFS mount under ANY row would otherwise hang the
+ * mutation and every publication waiting on that lock. On expiry the stalled
+ * read-only probes are abandoned (they never reject; their late verdict is
+ * discarded) and the overlap is unknown, so the mutation is refused.
  */
 export async function findProtectedFootprintOverlap(
+  snapshot: ProjectsConfig,
+  target: { row: Workspace; bucketProjectPath: string; extraPaths?: string[] },
+  options: { timeoutMs?: number } = {}
+): Promise<FootprintOverlap> {
+  const timeoutMs = options.timeoutMs ?? STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS;
+  assert(timeoutMs > 0, "findProtectedFootprintOverlap: timeoutMs must be positive");
+  const scan = await raceWithAbortAndTimeout(scanProtectedFootprintOverlap(snapshot, target), {
+    timeoutMs,
+  });
+  return scan.kind === "ok"
+    ? scan.value
+    : { kind: "unknown", reason: `the footprint scan timed out after ${timeoutMs}ms` };
+}
+
+async function scanProtectedFootprintOverlap(
   snapshot: ProjectsConfig,
   target: { row: Workspace; bucketProjectPath: string; extraPaths?: string[] }
 ): Promise<FootprintOverlap> {
@@ -399,7 +426,9 @@ export function structuralRefusalForOverlap(
   const detail =
     overlap.kind === "overlap"
       ? `its checkout (${overlap.targetPath}) is shared with sub-agent task workspace "${overlap.taskWorkspaceId}" (${overlap.taskPath})`
-      : `it cannot be verified whether its checkout overlaps sub-agent task workspace "${overlap.taskWorkspaceId}" (${overlap.reason})`;
+      : overlap.taskWorkspaceId === undefined
+        ? `it cannot be verified whether its checkout overlaps a sub-agent task checkout (${overlap.reason})`
+        : `it cannot be verified whether its checkout overlaps sub-agent task workspace "${overlap.taskWorkspaceId}" (${overlap.reason})`;
   return `Refusing to ${MUTATION_VERBS[mutation]} workspace "${workspaceId}": ${detail}. ${AVAILABILITY_LIMIT}`;
 }
 

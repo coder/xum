@@ -5506,6 +5506,13 @@ export class TaskService implements AgentTaskIntegration {
                 ];
               })
             );
+            // Multi-project forks: this is the PRIMARY checkout only, so the one proof binds it
+            // alone (the proof schema holds one checkout identity). The secondary checkouts carry
+            // no consent state preparation could protect: multi-project workspaces load no agent
+            // plugins and read overrides from the runtime's container path, not from any project
+            // checkout. They are in the structural guard's footprint, so cooperating mutations
+            // are refused. Binding their identities needs a proof schema extension (a tracked
+            // follow-up).
             return preparedPlans().map((plan) => ({
               workspacePath: plan.prepared!.materialized.workspacePath,
               runtimeConfig: plan.prepared!.materialized.forkedRuntimeConfig,

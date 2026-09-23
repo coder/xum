@@ -374,13 +374,40 @@ export async function bindTaskCheckoutIdentity(
   }
 }
 
-/** Read-only comparison of a proof (or bound identity) against the host filesystem. */
+type TaskCheckoutIdentityCheck = { ok: true } | { ok: false; state: TaskCheckoutPreparationState };
+type TaskCheckoutIdentityInput = Pick<
+  TaskCheckoutPreparation,
+  "path" | "realpath" | "root" | "gitdir" | "materializationId"
+>;
+
+/**
+ * Read-only comparison of a proof (or bound identity) against the host filesystem, with a
+ * deadline that fails closed as `unreadable`. The producer's final pre-publication check runs
+ * it while holding the registration lock, where a stalled FUSE/NFS mount must not hang every
+ * publication; the stalled read-only calls are abandoned and their late result discarded.
+ */
 export async function revalidateTaskCheckoutIdentity(
-  proof: Pick<
-    TaskCheckoutPreparation,
-    "path" | "realpath" | "root" | "gitdir" | "materializationId"
-  >
-): Promise<{ ok: true } | { ok: false; state: TaskCheckoutPreparationState }> {
+  proof: TaskCheckoutIdentityInput,
+  options: { timeoutMs?: number } = {}
+): Promise<TaskCheckoutIdentityCheck> {
+  const timeoutMs = options.timeoutMs ?? TASK_CHECKOUT_VALIDATION_TIMEOUT_MS;
+  assert(timeoutMs > 0, "revalidateTaskCheckoutIdentity: timeoutMs must be positive");
+  const compared = await raceWithAbortAndTimeout(compareTaskCheckoutIdentity(proof), { timeoutMs });
+  return compared.kind === "ok"
+    ? compared.value
+    : {
+        ok: false,
+        state: {
+          kind: "unreadable",
+          detail: `checkout identity check timed out after ${timeoutMs}ms`,
+        },
+      };
+}
+
+/** The unbounded comparison behind `revalidateTaskCheckoutIdentity`. Never rejects. */
+async function compareTaskCheckoutIdentity(
+  proof: TaskCheckoutIdentityInput
+): Promise<TaskCheckoutIdentityCheck> {
   const mismatch = (dimension: TaskCheckoutMismatchDimension) =>
     ({ ok: false, state: { kind: "mismatch", dimension } }) as const;
   try {
@@ -483,8 +510,12 @@ function executionDirectory(entry: ConfigEntry): string {
   // A scratch row's metadata projectPath IS its path (Config resolves it so; the `_scratch`
   // bucket key is not a directory), so its LocalRuntime runs in the row's own path.
   if (entry.workspace.kind === "scratch") return entry.workspace.path;
+  // A project-dir LocalRuntime runs in the metadata projectPath, which Config resolves to the
+  // row's primary project when it lists projects and to its bucket key otherwise
+  // (Config.buildWorkspaceMetadata): a multi-project row lives in the `_multi` bucket, whose key
+  // is not a directory.
   return isProjectDirLocalRuntime(entry.workspace.runtimeConfig)
-    ? entry.projectPath
+    ? (entry.workspace.projects?.[0]?.projectPath ?? entry.projectPath)
     : entry.workspace.path;
 }
 
@@ -494,6 +525,9 @@ function rowSignatureInputs(entry: ConfigEntry): Record<string, unknown> {
   return {
     id: row.id ?? null,
     projectPath: entry.projectPath,
+    // Every input the derivation consults (a local row's primary project included), so the
+    // synchronous fence notices any change to the directory a shared row anchors on.
+    executionDirectory: executionDirectory(entry),
     kind: classifyTaskCheckoutKind(row),
     parentWorkspaceId: row.parentWorkspaceId ?? null,
     path: row.path,
@@ -713,7 +747,8 @@ async function validatePhysicalCheckout(derived: {
   anchorProof: TaskCheckoutPreparation | null;
 }): Promise<TaskCheckoutPreparationState> {
   if (derived.anchorProof !== null) {
-    const physical = await revalidateTaskCheckoutIdentity(derived.anchorProof);
+    // Unbounded here: validateTaskCheckoutPreparation's single deadline covers this half.
+    const physical = await compareTaskCheckoutIdentity(derived.anchorProof);
     if (!physical.ok) {
       return derived.authority.kind === "dedicated"
         ? physical.state

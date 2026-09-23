@@ -32,6 +32,14 @@ export const WORKTREE_CREATE_FETCH_TIMEOUT_MS = 15 * 1000;
 export const TASK_CHECKOUT_VALIDATION_TIMEOUT_MS = 10 * 1000;
 
 /**
+ * Bounds a structural mutation's protected-footprint scan (Git-backing probes and realpaths of
+ * every protected task row), which runs while holding the workspace registration lock. A stalled
+ * FUSE/NFS mount under any row would otherwise hang the mutation and every task publication
+ * behind that lock. On expiry the mutation is refused (the overlap is unknown).
+ */
+export const STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS = 20 * 1000;
+
+/**
  * Bounds backup Git calls that can hang on a blackholed remote, while leaving room for a
  * slow initial clone.
  */
