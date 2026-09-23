@@ -3243,7 +3243,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * (both released by the prune) → the config write's own project
    * registration lock inside `publish`; nothing acquires the registration lock
    * while holding any of the others. Off-host runtimes publish without the
-   * lock (plugin servers never spawn there).
+   * lock (plugin servers never spawn there), except devcontainer: its host
+   * worktree is structurally protected (isProtectedTaskRow), so its row is
+   * published under the lock like every protected row — a structural
+   * mutator's scan sees every task row or none — but with nothing to prune
+   * (plugin servers are never offered there).
    *
    * Returns `Err` when sanitization refused (NOTHING was published; the
    * caller decides the fate of its unregistered files) and `Ok` with
@@ -3254,6 +3258,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     publish: () => Promise<T>
   ): Promise<Result<T, string>> {
     assert(target.workspacePath.length > 0, "registerSanitizedTaskCheckout: path is required");
+    if (target.runtimeConfig.type === "devcontainer") {
+      return await this.prepareTaskCheckouts(() => Promise.resolve([]), publish);
+    }
     const hostLocal =
       target.runtimeConfig.type === "local" || target.runtimeConfig.type === "worktree";
     if (!hostLocal || !this.workspaceMcpOverridesService) {

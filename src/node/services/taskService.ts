@@ -7144,11 +7144,12 @@ export class TaskService implements AgentTaskIntegration {
             await publishQueuedRow();
             return;
           }
-          // A host-local (shared) task row is protected: structural mutators scan task rows and
-          // rename/remove under the registration lock. Published outside that lock, the row could
-          // land between another backend's scan and its rename, leaving it pointing at the old
-          // path (PREP_SHARED_BROKEN). Publish it under the same empty-target lock hold as the
-          // unqueued shared path (no checkout, no prune): the scan sees every task row or none.
+          // A host-local (shared) or devcontainer task row is protected: structural mutators scan
+          // task rows and rename/remove under the registration lock. Published outside that lock,
+          // the row could land between another backend's scan and its rename, leaving it pointing
+          // at the old path (PREP_SHARED_BROKEN). Publish it under the same empty-target lock hold
+          // as the unqueued shared path (no checkout, no prune): the scan sees every task row or
+          // none.
           const registration = await this.workspaceService.prepareTaskCheckouts(
             () => Promise.resolve([]),
             publishQueuedRow
@@ -7705,7 +7706,9 @@ export class TaskService implements AgentTaskIntegration {
       } else {
         // A local-runtime fork shares the project directory (shared by construction) and an
         // off-host fork is outside the protocol: both register without a proof as before, the
-        // host-local one sanitized under the registration lock (see registerSanitizedTaskCheckout).
+        // host-local one sanitized under the registration lock and a devcontainer one (a
+        // structurally protected host worktree) published under it (see
+        // registerSanitizedTaskCheckout).
         const forked = await materializeCheckout();
         if (!forked.success) return forked;
         assert(checkout != null, "Task.create: fork materialized no checkout");

@@ -81,12 +81,20 @@ export type StructuralMutationTarget =
 
 export type StructuralMutationVerdict = { allowed: true } | { allowed: false; error: string };
 
-/** Project-dir local, managed worktree, or a legacy entry without a runtimeConfig. */
+/**
+ * Runtimes whose checkout lives on this host: project-dir local, managed worktree, a legacy
+ * entry without a runtimeConfig, and devcontainer — DevcontainerRuntime keeps its checkout as
+ * a host worktree (WorktreeManager) that the container only bind-mounts, and its remove/rename
+ * delete/move that worktree. Wider than checkout preparation's set on purpose: devcontainer
+ * tasks stay exempt from preparation (no plugin consent to protect, see isHostLocalRuntime in
+ * taskCheckoutPreparation.ts) but their checkouts are structurally protected like any other.
+ */
 export function isHostLocalRuntimeConfig(runtimeConfig: RuntimeConfig | undefined): boolean {
   return (
     runtimeConfig === undefined ||
     runtimeConfig.type === "local" ||
-    runtimeConfig.type === "worktree"
+    runtimeConfig.type === "worktree" ||
+    runtimeConfig.type === "devcontainer"
   );
 }
 
@@ -142,6 +150,19 @@ function effectiveRuntimeConfig(runtimeConfig: RuntimeConfig | undefined): Runti
 }
 
 /**
+ * The srcBaseDir a worktree-backed runtime derives its checkouts under, or undefined for a
+ * project-dir local runtime. A devcontainer runtimeConfig carries none: runtimeFactory roots
+ * its WorktreeManager at `new Config().srcDir`, i.e. `<getXumHome()>/src` — exactly what the
+ * default worktree config's `~/.xum/src` expands to (XUM_ROOT and dev suffixes included).
+ */
+function worktreeSrcBaseDir(runtime: RuntimeConfig): string | undefined {
+  if (hasSrcBaseDir(runtime)) return runtime.srcBaseDir;
+  if (runtime.type !== "devcontainer") return undefined;
+  assert(hasSrcBaseDir(DEFAULT_RUNTIME_CONFIG), "the default runtime is a worktree runtime");
+  return DEFAULT_RUNTIME_CONFIG.srcBaseDir;
+}
+
+/**
  * Name-derived checkout path, mirroring WorktreeManager.getWorkspacePath for
  * worktree-style runtimes (`<srcBaseDir>/<projectName>/<name>`, with the
  * srcBaseDir tilde expanded exactly as the WorktreeManager constructor does)
@@ -155,9 +176,9 @@ export function deriveHostLocalCheckoutPath(
   workspaceName: string
 ): string {
   assert(projectPath.length > 0, "deriveHostLocalCheckoutPath: projectPath is required");
-  const runtime = effectiveRuntimeConfig(runtimeConfig);
-  if (hasSrcBaseDir(runtime)) {
-    return path.join(expandTilde(runtime.srcBaseDir), getProjectName(projectPath), workspaceName);
+  const srcBaseDir = worktreeSrcBaseDir(effectiveRuntimeConfig(runtimeConfig));
+  if (srcBaseDir !== undefined) {
+    return path.join(expandTilde(srcBaseDir), getProjectName(projectPath), workspaceName);
   }
   return projectPath;
 }
@@ -174,7 +195,8 @@ const CANONICALIZE_TIMEOUT_MS = 2_000;
 /**
  * Persisted + runtime-derived + proof paths a row's physical footprint consists of.
  *
- * The runtime-derived paths are REQUIRED, not a fallback: WorktreeRuntime's
+ * The runtime-derived paths are REQUIRED, not a fallback: WorktreeRuntime's (and
+ * DevcontainerRuntime's, through the same WorktreeManager)
  * deleteWorkspace/renameWorkspace act on `<srcBaseDir>/<project>/<name>` for
  * every project of the row (WorktreeManager derives by name), not on the
  * persisted `path`. A stale or re-pointed stored path must never let an
@@ -195,7 +217,11 @@ function footprintPathsForRow(row: Workspace, bucketProjectPath: string): string
     row.projects !== undefined && row.projects.length > 0
       ? row.projects.map((project) => project.projectPath)
       : [bucketProjectPath];
-  if (hasSrcBaseDir(runtime) && typeof row.name === "string" && row.name.length > 0) {
+  if (
+    worktreeSrcBaseDir(runtime) !== undefined &&
+    typeof row.name === "string" &&
+    row.name.length > 0
+  ) {
     for (const projectPath of projectPaths) {
       paths.push(deriveHostLocalCheckoutPath(runtime, projectPath, row.name));
     }
