@@ -14,6 +14,7 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 
 // Test helper: create aggregator with default createdAt for tests
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -3621,6 +3622,48 @@ describe("StreamingMessageAggregator", () => {
       });
 
       expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+    });
+
+    test("marks only authentic feedback as not generically editable, live and on reload", () => {
+      const feedbackRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec-f",
+        feedbackId: "f1",
+        snapshotId: "s1",
+        contentHash: "a".repeat(64),
+        comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+        replies: [],
+      };
+      const envelope = formatPlanReviewEnvelope(feedbackRecord);
+      const feedback = createMuxMessage("plan-feedback", "user", envelope, {
+        historySequence: 1,
+        timestamp: 1,
+        muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+      });
+      // The same text without authentic metadata is an ordinary (neutralized) user message.
+      const lookalike = createMuxMessage("pasted-lookalike", "user", envelope, {
+        historySequence: 2,
+        timestamp: 2,
+      });
+      const editability = (aggregator: StreamingMessageAggregator) =>
+        aggregator
+          .getDisplayedMessages()
+          .filter((message) => message.type === "user")
+          .map((message) => [message.historyId, canEditDisplayedUserMessage(message)]);
+
+      const live = new StreamingMessageAggregator(TEST_CREATED_AT);
+      live.handleMessage({ ...feedback, type: "message" });
+      live.handleMessage({ ...lookalike, type: "message" });
+      const reloaded = new StreamingMessageAggregator(TEST_CREATED_AT);
+      reloaded.loadHistoricalMessages([feedback, lookalike], false);
+
+      for (const aggregator of [live, reloaded]) {
+        expect(editability(aggregator)).toEqual([
+          ["plan-feedback", false],
+          ["pasted-lookalike", true],
+        ]);
+      }
     });
 
     test("replay settles a pending turn when a hidden record trails the assistant response", () => {

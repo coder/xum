@@ -14,6 +14,7 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
@@ -604,6 +605,9 @@ export async function clearProviderConfigFixableAbandonMarkers(
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
+/** Refusal for a direct edit of authentic plan-review feedback (see isPlanReviewFeedbackEditTarget). */
+export const PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE =
+  "Plan-review feedback cannot be edited as a message. Send new review comments instead.";
 const EMPTY_RESUME_HISTORY_ERROR =
   "Cannot resume stream: workspace history is empty. Send a new message instead.";
 
@@ -2169,6 +2173,27 @@ export class AgentSession {
       message.metadata?.synthetic === true &&
       message.metadata.muxMetadata?.type === "goal-pause-boundary"
     );
+  }
+
+  /**
+   * Whether an edit targets authentic plan-review feedback, judged from the persisted row (never
+   * from client flags or envelope-looking text), in getEditTruncateTargetId's lookup order. An
+   * ordinary edit resends only the envelope text, which is neutralized as an untrusted lookalike,
+   * so the threads that feedback opened would silently vanish from review state.
+   */
+  private async isPlanReviewFeedbackEditTarget(editMessageId: string): Promise<boolean> {
+    const isFeedback = (message: MuxMessage | undefined) =>
+      message !== undefined && getAuthenticPlanReviewRecord(message)?.kind === "feedback";
+    const latest = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    const inLatest = latest.success
+      ? latest.data.find((message) => message.id === editMessageId)
+      : undefined;
+    if (inLatest) return isFeedback(inLatest);
+    let target: MuxMessage | undefined;
+    await this.historyService.iterateFullHistory(this.workspaceId, "forward", (messages) => {
+      target ??= messages.find((message) => message.id === editMessageId);
+    });
+    return isFeedback(target);
   }
 
   private async getEditTruncateTargetId(editMessageId: string): Promise<string> {
@@ -4026,6 +4051,12 @@ export class AgentSession {
       if (this.coordinator.editBlocked())
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+        );
+      // The UI hides Edit for feedback rows; refuse direct API edits too, before the context
+      // reset, the interruption and the truncation can touch anything.
+      if (await this.isPlanReviewFeedbackEditTarget(editMessageId))
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE)
         );
       // Reserve before interrupting: terminal policy can otherwise start queued work
       // while stopStream settles, leaving this edit waiting on the wrong turn.

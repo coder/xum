@@ -1262,6 +1262,12 @@ export type DisplayedMessage =
       isGoalContinuation?: boolean;
       /** True for the one-shot wrap-up turn after a goal continuation exhausts its budget. */
       isBudgetLimitWrapup?: boolean;
+      /**
+       * True for an authentic plan-review feedback row. Generic editing is disabled for it: an edit
+       * resends only the envelope text, which is neutralized as an untrusted lookalike, so the
+       * threads this feedback opened would silently vanish from review state.
+       */
+      isPlanReviewFeedback?: true;
       /** True when this row is loaded above the latest Context Boundary and must not mutate active context. */
       isBeforeLatestContextBoundary?: boolean;
       /** Present when this message invoked an agent skill or MCP prompt via slash command. */

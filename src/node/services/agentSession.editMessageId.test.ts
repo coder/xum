@@ -3,6 +3,12 @@ import type { AIService, StreamMessageOptions } from "@/node/services/aiService"
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import { PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE } from "./agentSession";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
@@ -133,6 +139,73 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
         "assistant-original",
       ]);
     }
+  });
+
+  it("refuses a direct edit of authentic plan-review feedback before touching history", async () => {
+    // An ordinary edit would resend only the envelope text, which is neutralized as an untrusted
+    // lookalike, so the threads this feedback opened would silently vanish from review state.
+    const workspaceId = "ws-edit-plan-feedback";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const envelope = formatPlanReviewEnvelope(feedbackRecord);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("plan-feedback", "user", envelope, {
+        historySequence: 0,
+        muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+      })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-reply", "assistant", "Revised the plan", { historySequence: 1 })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-ordinary", "user", "Also cover rollback", { historySequence: 2 })
+    );
+    const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
+    const ids = async () => {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      return history.success ? history.data.map((message) => message.id) : [];
+    };
+
+    const refused = await session.sendMessage("edited feedback", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "plan-feedback",
+    });
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toMatchObject({
+        type: "unknown",
+        raw: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+      });
+    }
+    expect(truncateAfterMessage).not.toHaveBeenCalled();
+    expect(streamMessage).not.toHaveBeenCalled();
+    expect(await ids()).toEqual(["plan-feedback", "assistant-reply", "user-ordinary"]);
+
+    // Control: ordinary messages after the feedback stay editable.
+    const edited = await session.sendMessage("Also cover rollback and retries", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "user-ordinary",
+    });
+    expect(edited.success).toBe(true);
+    await session.waitForIdle();
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    expect((await ids()).slice(0, 2)).toEqual(["plan-feedback", "assistant-reply"]);
   });
 
   it("clears image parts when editing with explicit empty fileParts", async () => {
