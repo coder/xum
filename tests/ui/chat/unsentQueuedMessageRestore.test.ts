@@ -56,6 +56,13 @@ const composerAttachmentNames = (app: AppHarness) =>
     (attachment) => attachment.filename
   );
 const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
+/**
+ * Bound for waits on work behind a composer send or a restore (the send's async preflight, the
+ * in-process IPC hop, the backend queue, the re-render). waitFor's 1 s default passed isolated
+ * but not when these app suites share the host with others (a combined jest run timed out
+ * waiting for the second send to reach the queue).
+ */
+const LOAD_TOLERANT_WAIT = { timeout: 30_000 };
 
 /**
  * The real composer path: while a held turn keeps the workspace busy, the user sends two rich
@@ -71,7 +78,7 @@ async function queueTwoRefusedComposerMessages(app: AppHarness): Promise<ReviewN
     message: "[mock:wait-start] hold the workspace busy",
     options: { model: "openai:gpt-5.2", agentId: "exec" },
   });
-  await waitFor(() => expect(session.isBusy()).toBe(true));
+  await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
   // Stand-in for TaskService's admission token on a sub-agent workspace's manual sends.
   const queueMessage = session.queueMessage.bind(session);
   const queueSpy = jest
@@ -108,10 +115,10 @@ async function queueTwoRefusedComposerMessages(app: AppHarness): Promise<ReviewN
       await waitFor(() => {
         expect(app.view.container.textContent).toContain(`${name} note`);
         expect(app.view.container.textContent).toContain(`${name}.txt`);
-      });
+      }, LOAD_TOLERANT_WAIT);
       await app.chat.send(`${name} authored`);
-      await waitFor(() => expect(queueSpy).toHaveBeenCalledTimes(index + 1));
-      await app.chat.expectInputValue("");
+      await waitFor(() => expect(queueSpy).toHaveBeenCalledTimes(index + 1), LOAD_TOLERANT_WAIT);
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
     }
   } finally {
     queueSpy.mockRestore();
@@ -211,7 +218,7 @@ describe("Unsent queued message restored to the composer", () => {
       });
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("notes.md");
-      });
+      }, LOAD_TOLERANT_WAIT);
       const workspaceService = app.env.services.workspaceService;
       workspaceService.getOrCreateSession(app.workspaceId);
       workspaceService.emitChatEvent(app.workspaceId, {
@@ -221,11 +228,14 @@ describe("Unsent queued message restored to the composer", () => {
         fileParts: [queuedFilePart],
         mode: "append",
       });
-      await app.chat.expectInputValue("draft with a file\n\nqueued text with a file");
+      await app.chat.expectInputValue(
+        "draft with a file\n\nqueued text with a file",
+        LOAD_TOLERANT_WAIT.timeout
+      );
       // Both attachments are in the composer, draft first: the user's draft data is not replaced.
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("queued-file.txt");
-      });
+      }, LOAD_TOLERANT_WAIT);
       expect(app.view.container.textContent).toContain("notes.md");
       const persisted = readPersistedState<Array<{ kind: string; filename?: string }>>(
         getInputAttachmentsKey(app.workspaceId),
@@ -249,7 +259,7 @@ describe("Unsent queued message restored to the composer", () => {
       });
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("notes.md");
-      });
+      }, LOAD_TOLERANT_WAIT);
       const workspaceService = app.env.services.workspaceService;
       workspaceService.getOrCreateSession(app.workspaceId);
       workspaceService.emitChatEvent(app.workspaceId, {
@@ -258,7 +268,10 @@ describe("Unsent queued message restored to the composer", () => {
         text: "queued text only",
         mode: "append",
       });
-      await app.chat.expectInputValue("draft with a file\n\nqueued text only");
+      await app.chat.expectInputValue(
+        "draft with a file\n\nqueued text only",
+        LOAD_TOLERANT_WAIT.timeout
+      );
       expect(app.view.container.textContent).toContain("notes.md");
       expect(
         readPersistedState<Array<{ id: string }>>(getInputAttachmentsKey(app.workspaceId), []).map(
@@ -290,7 +303,7 @@ describe("Unsent queued message restored to the composer", () => {
       });
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("first note");
-      });
+      }, LOAD_TOLERANT_WAIT);
       workspaceService.emitChatEvent(app.workspaceId, {
         type: "restore-to-input",
         workspaceId: app.workspaceId,
@@ -298,10 +311,13 @@ describe("Unsent queued message restored to the composer", () => {
         reviews: [review("second note")],
         mode: "append",
       });
-      await app.chat.expectInputValue("first refused\n\nsecond refused");
+      await app.chat.expectInputValue(
+        "first refused\n\nsecond refused",
+        LOAD_TOLERANT_WAIT.timeout
+      );
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("second note");
-      });
+      }, LOAD_TOLERANT_WAIT);
       expect(app.view.container.textContent).toContain("first note");
       expect(app.view.container.textContent).toContain("2 reviews attached");
     } finally {
@@ -333,10 +349,13 @@ describe("Unsent queued message restored to the composer", () => {
           mode: "append",
         });
       }
-      await app.chat.expectInputValue("draft\n\nfirst refused\n\nsecond refused");
+      await app.chat.expectInputValue(
+        "draft\n\nfirst refused\n\nsecond refused",
+        LOAD_TOLERANT_WAIT.timeout
+      );
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("2 reviews attached");
-      });
+      }, LOAD_TOLERANT_WAIT);
       expect(app.view.container.textContent).toContain("first note");
       expect(app.view.container.textContent).toContain("second note");
       const persisted = readPersistedState<Array<{ id: string; filename?: string }>>(
@@ -475,10 +494,10 @@ describe("Unsent queued message restored to the composer", () => {
       const reviews = await queueTwoRefusedComposerMessages(app);
       // The authored text comes back, never the provider-facing text with the review blocks
       // formatted into it: the reviews come back as review chips instead.
-      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, 10_000);
+      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, LOAD_TOLERANT_WAIT.timeout);
       await waitFor(() => {
         expect(app.view.container.textContent).toContain("2 reviews attached");
-      });
+      }, LOAD_TOLERANT_WAIT);
       expect(composerAttachmentNames(app)).toEqual(["first.txt", "second.txt"]);
 
       // Retry: the composer sends the restored draft as one new message.
@@ -492,7 +511,7 @@ describe("Unsent queued message restored to the composer", () => {
       expect(sent.reviews).toEqual(reviews);
       await app.chat.expectStreamComplete();
       // The sent draft does not come back.
-      await app.chat.expectInputValue("");
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       expect(app.view.container.textContent).not.toContain("reviews attached");
     } finally {
       await app.dispose();
@@ -513,8 +532,11 @@ describe("Unsent queued message restored to the composer", () => {
     };
     try {
       const [, secondReview] = await queueTwoRefusedComposerMessages(app);
-      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, 10_000);
-      await waitFor(() => expect(composerText()).toContain("2 reviews attached"));
+      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, LOAD_TOLERANT_WAIT.timeout);
+      await waitFor(
+        () => expect(composerText()).toContain("2 reviews attached"),
+        LOAD_TOLERANT_WAIT
+      );
       // Applied and acknowledged: the backend no longer holds a copy to re-send.
       const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
       await waitFor(async () => {
@@ -523,7 +545,7 @@ describe("Unsent queued message restored to the composer", () => {
           if ("type" in message && message.type === "restore-to-input") replayed.push(message);
         });
         expect(replayed).toEqual([]);
-      });
+      }, LOAD_TOLERANT_WAIT);
 
       const created = await app.env.orpc.workspace.create({
         projectPath: app.repoPath,
@@ -540,15 +562,21 @@ describe("Unsent queued message restored to the composer", () => {
 
       // The composer remounts: the whole restoration is still there.
       await switchAwayAndBack();
-      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT);
-      await waitFor(() => expect(composerText()).toContain("2 reviews attached"));
+      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, LOAD_TOLERANT_WAIT.timeout);
+      await waitFor(
+        () => expect(composerText()).toContain("2 reviews attached"),
+        LOAD_TOLERANT_WAIT
+      );
       expect(composerAttachmentNames(app)).toEqual(["first.txt", "second.txt"]);
 
       // The user discards one review and edits the other; both choices survive a remount.
       fireEvent.click(
         composerReviewBlock("first note").querySelector('[aria-label="Delete review"]')!
       );
-      await waitFor(() => expect(composerText()).toContain("1 review attached"));
+      await waitFor(
+        () => expect(composerText()).toContain("1 review attached"),
+        LOAD_TOLERANT_WAIT
+      );
       fireEvent.click(
         composerReviewBlock("second note").querySelector('[aria-label="Edit comment"]')!
       );
@@ -556,12 +584,18 @@ describe("Unsent queued message restored to the composer", () => {
         const textarea = composerReviewBlock("second note").querySelector("textarea");
         if (!textarea) throw new Error("note editor not open yet");
         return textarea;
-      });
+      }, LOAD_TOLERANT_WAIT);
       fireEvent.change(noteEditor, { target: { value: "second note, edited" } });
       fireEvent.keyDown(noteEditor, { key: "Enter", ctrlKey: true });
-      await waitFor(() => expect(composerReviewBlock("second note, edited")).toBeTruthy());
+      await waitFor(
+        () => expect(composerReviewBlock("second note, edited")).toBeTruthy(),
+        LOAD_TOLERANT_WAIT
+      );
       await switchAwayAndBack();
-      await waitFor(() => expect(composerText()).toContain("1 review attached"));
+      await waitFor(
+        () => expect(composerText()).toContain("1 review attached"),
+        LOAD_TOLERANT_WAIT
+      );
       expect(composerReviewBlock("second note, edited")).toBeTruthy();
       expect(composerText()).not.toContain("first note");
 
@@ -577,7 +611,7 @@ describe("Unsent queued message restored to the composer", () => {
 
       // Neither the sent draft nor the discarded review comes back after another remount.
       await switchAwayAndBack();
-      await app.chat.expectInputValue("");
+      await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       expect(composerText()).not.toContain("review attached");
       expect(composerText()).not.toContain("reviews attached");
       expect(composerAttachmentNames(app)).toEqual([]);
@@ -607,7 +641,7 @@ describe("Unsent queued message restored to the composer", () => {
         const el = app.view.container.querySelector(`[data-workspace-id="${otherWorkspaceId}"]`);
         if (!el || el.getAttribute("aria-disabled") === "true") throw new Error("not selectable");
         return el as HTMLElement;
-      });
+      }, LOAD_TOLERANT_WAIT);
       // The composer applies the restoration (and the store acknowledges it) in the same React
       // batch that unmounts it: every part must already be stored when the ack goes out.
       act(() => {
@@ -628,11 +662,17 @@ describe("Unsent queued message restored to the composer", () => {
         fireEvent.click(otherRow);
         workspaceStore.setActiveWorkspaceId(created.metadata.id);
       });
-      await waitFor(() => expect(document.title.startsWith(created.metadata.name)).toBe(true));
+      await waitFor(
+        () => expect(document.title.startsWith(created.metadata.name)).toBe(true),
+        LOAD_TOLERANT_WAIT
+      );
       await showWorkspace(app, app.workspaceId, app.metadata.name);
-      await app.chat.expectInputValue("same-batch text");
+      await app.chat.expectInputValue("same-batch text", LOAD_TOLERANT_WAIT.timeout);
       expect(composerAttachmentNames(app)).toEqual(["same-batch.txt"]);
-      await waitFor(() => expect(app.view.container.textContent).toContain("same-batch note"));
+      await waitFor(
+        () => expect(app.view.container.textContent).toContain("same-batch note"),
+        LOAD_TOLERANT_WAIT
+      );
     } finally {
       if (otherWorkspaceId != null) {
         await app.env.orpc.workspace
