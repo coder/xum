@@ -12,7 +12,6 @@ import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { Err } from "@/common/types/result";
 import { detectDefaultTrunkBranch } from "@/node/git";
-import { HistoryService } from "@/node/services/historyService";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import { generateBranchName } from "../../ipc/helpers";
 import { preloadTestModules } from "../../ipc/setup";
@@ -166,9 +165,11 @@ async function showWorkspace(harness: AppHarness, workspaceId: string, name: str
 
 /** Persisted user rows whose provider-facing text contains `needle`. */
 async function userRowsContaining(app: AppHarness, needle: string): Promise<string[]> {
-  const history = await new HistoryService(app.env.config).getHistoryFromLatestBoundary(
-    app.workspaceId
-  );
+  // The app's own HistoryService (AGENTS.md "Testing: HistoryService"): same session dirs and
+  // lifecycle as the backend that persisted the rows.
+  const history = await app.env.services
+    .toORPCContext()
+    .historyService.getHistoryFromLatestBoundary(app.workspaceId);
   if (!history.success) return [];
   return history.data
     .filter((message) => message.role === "user")
