@@ -13354,8 +13354,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   discardHeldInput(workspaceId: string, heldInputId: string): Result<void> {
     assert(heldInputId.length > 0, "discardHeldInput requires a heldInputId");
-    // Idempotent: a missing session or id means there is nothing left to discard.
-    this.sessions.get(workspaceId.trim())?.removeHeldInput(heldInputId);
+    // Idempotent: a missing session or id means there is nothing left to discard. A send of it
+    // in flight owns it until that send settles (a failed send keeps it held).
+    const outcome = this.sessions.get(workspaceId.trim())?.discardHeldInput(heldInputId);
+    if (outcome === "busy") {
+      return Err("This unsent message is being sent; discard it after the send finishes.");
+    }
     return Ok(undefined);
   }
 

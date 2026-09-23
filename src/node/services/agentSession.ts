@@ -10832,6 +10832,15 @@ export class AgentSession {
     this.sendingHeldInputIds.delete(id);
   }
 
+  /**
+   * The user discards a held input. `busy` while a re-send of it is in flight: that send may still
+   * fail and keep it, so discarding now could remove the only copy of an unsent message.
+   */
+  discardHeldInput(id: string): "discarded" | "missing" | "busy" {
+    if (this.sendingHeldInputIds.has(id)) return "busy";
+    return this.removeHeldInput(id) ? "discarded" : "missing";
+  }
+
   /** Drop a held input (re-sent and accepted, or discarded). Returns whether it was held. */
   removeHeldInput(id: string): boolean {
     const remaining = this.heldInputs.filter((input) => input.id !== id);

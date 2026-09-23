@@ -565,6 +565,48 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
+  test("Discard while a Send of the same held input is in flight is refused as busy, so a failed send keeps the only copy", async () => {
+    const childId = "holddiscardrace1";
+    const stack = await createStack(childId);
+    const { config, taskService, workspaceService, sendOptions } = stack;
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      stack.endStream(0, { report: "done" }, true);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      await until(() => stack.heldInputs().length === 1, "follow-up held");
+      const [held] = stack.heldInputs();
+
+      // The send stays in flight until the test settles it, then fails.
+      const sendSettles = Promise.withResolvers<void>();
+      const refusal = { type: "unknown" as const, raw: "send failed for the test" };
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementationOnce(async () => {
+        await sendSettles.promise;
+        return Err(refusal);
+      });
+      const sending = workspaceService.sendHeldInput(childId, held.id);
+      await until(() => sendSpy.mock.calls.length === 1, "send in flight");
+      const discarded = workspaceService.discardHeldInput(childId, held.id);
+      expect(discarded.success).toBe(false);
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+
+      sendSettles.resolve();
+      expect(await sending).toEqual(Err(refusal));
+      sendSpy.mockRestore();
+      // The failed send kept it; with no send in flight, Discard removes it.
+      expect(stack.heldTexts()).toEqual(["follow-up text"]);
+      expect(workspaceService.discardHeldInput(childId, held.id)).toEqual(Ok(undefined));
+      expect(stack.heldInputs()).toHaveLength(0);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
   test("an attachment-only manual follow-up refused after the report is held with its file parts (empty text is not a drop)", async () => {
     const childId = "holdattachment01";
     const stack = await createStack(childId);
