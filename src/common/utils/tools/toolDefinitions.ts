@@ -391,7 +391,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     : "";
   return (
     "Spawn a sub-agent task (child workspace). " +
-    "\n\nIMPORTANT: Whether a sub-agent can see uncommitted changes depends on the runtime. " +
+    "\n\nWhether a sub-agent can see uncommitted changes depends on the runtime. " +
     `${getTaskRuntimeVisibilityGuidance(runtimeMode)} ` +
     "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background, and optional n. For sub-agents, use title as a short, friendly reusable role name (for example, Reviewer or Simplicity Auditor), not a task summary. For kind=workspace, use a normal work-specific chat title. " +
     'For kind=workspace, agentId optionally selects the agent mode for the launched turn (for example "plan"); it defaults to exec, and internal agents are not eligible. ' +
@@ -3125,21 +3125,20 @@ export const TOOL_DEFINITIONS = {
     resultSchema: TaskAwaitToolResultSchema,
     description:
       "Wait for one or more tasks or workflow runs to produce output. " +
-      "\n\nWHEN TO USE: only call task_await when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
+      "\n\nCall task_await only when the current user request depends on a task's output, or when synthesis/integration of a previously-spawned task is the next logical step. " +
       "Do not call task_await solely because active tasks exist; for unrelated user messages, respond directly and let tasks continue in the background. " +
       "If a synthetic/system follow-up explicitly says active background tasks or workflow runs block your turn, treat that as a dependency and await the listed IDs. " +
-      "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly — do NOT call task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
-      "\n\nIMPORTANT: Do not call task_await in the same parallel tool-call batch as task, bash, or workflow_run — " +
-      "the taskId/runId is not available until the spawning tool returns. " +
-      "Always wait for the task/bash/workflow_run tool result first, then call task_await in a subsequent step. " +
+      "When a terminal wake-up says a sub-agent report or failure is already injected into context, integrate it directly instead of calling task_await for it. When a wake-up asks you to retrieve a workspace turn's terminal output, call task_await with the listed IDs and timeout_secs: 0 (a one-shot retrieval, not a wait). " +
+      "\n\nDo not call task_await in the same parallel tool-call batch as task, bash, or workflow_run: " +
+      "the taskId/runId is not available until the spawning tool returns, so call task_await in a later step. " +
       "When omitting task_ids to await active tasks/workflows, ensure at least one background task or workflow was already spawned in a prior step. Omitted task_ids discover top-level workflow runs only and exclude workflow-owned sub-agents/background bash tasks because those results are consumed through parent workflow runs. " +
       "\n\nAgent tasks and workflow runs return reports when completed. " +
       "Completed reports are persisted on disk and survive context compaction: calling task_await on an already-completed task/workflow run ID (timeout_secs: 0 for non-blocking) re-fetches the full report instead of re-running the work. " +
       "Bash tasks return incremental output while running and a final reportMarkdown when they exit. " +
       "For bash tasks, you may optionally pass filter/filter_exclude to include/exclude output lines by regex. " +
-      "WARNING: when using filter, non-matching lines are permanently discarded. " +
-      "Use this tool to WAIT; do not poll task_list in a loop to wait for task completion (that is misuse and wastes tool calls). " +
-      "\n\nBy default (min_completed=1) this returns as soon as the FIRST awaited task completes, so you can begin dependent work on that result while the rest keep running — then call task_await again for the remainder. " +
+      "When using filter, non-matching lines are permanently discarded. " +
+      "Use this tool to wait; do not poll task_list in a loop for completion, which wastes tool calls. " +
+      "\n\nBy default (min_completed=1) this returns as soon as the first awaited task completes, so you can begin dependent work on that result while the rest keep running, then call task_await again for the remainder. " +
       "This is ideal for independent tasks or any case where per-result work exists. " +
       "Set min_completed higher (up to the number of awaited tasks) when you genuinely need more before proceeding — e.g. best-of-N synthesis that must compare every candidate should pass min_completed equal to the batch size. " +
       "The result always includes every task complete at the moment it returns, plus current status for the rest; not-yet-completed tasks keep running and stay re-awaitable on a later call. " +

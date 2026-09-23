@@ -19,7 +19,7 @@ make benchmark-terminal
 make benchmark-terminal TB_TASK_NAMES="hello-world chess-best-move"
 
 # Run with specific model and xhigh thinking
-MUX_RUN_ARGS="--thinking xhigh" make benchmark-terminal TB_ARGS="--agent-kwarg model_name=anthropic/claude-opus-5"
+MUX_RUN_ARGS="--thinking xhigh" make benchmark-terminal TB_ARGS="--agent-kwarg model_name=anthropic/claude-opus-5-5"
 
 # Run on Daytona cloud (high parallelism)
 TB_ENV=daytona TB_CONCURRENCY=48 make benchmark-terminal
@@ -91,7 +91,7 @@ TB_TIMEOUT=600 make benchmark-terminal TB_SAMPLE_SIZE=5
 
 The agent adapter accepts a few Harbor kwargs (passed via `--agent-kwarg`):
 
-- `model_name`: Model to use (e.g., `anthropic/claude-opus-5`, `openai/gpt-5.6-sol`)
+- `model_name`: Model to use (e.g., `anthropic/claude-opus-5-5`, `openai/gpt-5.6-sol`)
 - `experiments`: Experiments to enable, comma-separated (e.g., `programmatic-tool-calling`)
 
 All other `mux run` CLI flags (thinking level, mode, runtime, budget, etc.) are passed via `MUX_RUN_ARGS` — no per-flag plumbing needed.
@@ -101,7 +101,7 @@ All other `mux run` CLI flags (thinking level, mode, runtime, budget, etc.) are 
 ```bash
 # Run with model, thinking, and 1M context
 gh workflow run terminal-bench.yml \
-  -f model_name=anthropic/claude-opus-5 \
+  -f model_name=anthropic/claude-opus-5-5 \
   -f mux_run_args="--thinking high --use-1m"
 
 # Run GPT-5.6 Sol with budget cap and high thinking
@@ -120,7 +120,7 @@ make benchmark-terminal TB_TASK_NAMES="chess-best-move"
 
 # CI dispatch
 gh workflow run terminal-bench.yml \
-  -f model_name=anthropic/claude-opus-5 \
+  -f model_name=anthropic/claude-opus-5-5 \
   -f task_names=chess-best-move \
   -f mux_run_as_goal=true \
   -f mux_run_args="--thinking high --goal-turns 30 --goal-budget 10.00"
@@ -207,7 +207,7 @@ python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py --artifacts-
 python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py
 
 # Only prepare specific models
-python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py --n-runs 5 --models anthropic/claude-opus-5
+python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py --n-runs 5 --models anthropic/claude-opus-5-5
 ```
 
 This creates a properly structured submission folder at `leaderboard_submission/` containing:
