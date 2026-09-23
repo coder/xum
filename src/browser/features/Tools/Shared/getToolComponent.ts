@@ -59,6 +59,7 @@ import { SetGoalToolCall } from "../SetGoalToolCall";
 import { GetGoalToolCall } from "../GetGoalToolCall";
 import { HeartbeatToolCall } from "../HeartbeatToolCall";
 import { TimelineEventToolCall } from "../TimelineEventToolCall";
+import { SessionHistoryToolCall } from "../SessionHistoryToolCall";
 import { WorkflowResumeToolCall, WorkflowRunToolCall } from "../WorkflowRunToolCall";
 import { CompleteGoalToolCall } from "../CompleteGoalToolCall";
 
@@ -124,6 +125,7 @@ const TOOL_REGISTRY: Record<string, AnyToolComponent> = {
   complete_goal: CompleteGoalToolCall,
   heartbeat: HeartbeatToolCall,
   timeline_event: TimelineEventToolCall,
+  session_history: SessionHistoryToolCall,
   review_pane_update: ReviewPaneUpdateToolCall,
   review_pane_get: ReviewPaneGetToolCall,
   web_search: WebSearchToolCall,

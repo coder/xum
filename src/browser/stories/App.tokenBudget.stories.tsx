@@ -195,10 +195,10 @@ export const Rollover: AppStory = {
     await userEvent.click(finalFlush);
     await waitFor(() => expect(canvas.getByText(FINAL_FLUSH)).toBeVisible());
     await userEvent.click(finalFlush);
-    const tool = await canvas.findByText("session_history", { exact: true });
+    const tool = await canvas.findByText("List windows", { exact: true });
     await userEvent.click(tool);
-    await expect(await canvas.findByText("Arguments", { exact: true })).toBeVisible();
-    await expect(await canvas.findByText("Result", { exact: true })).toBeVisible();
+    await expect(await canvas.findByText("Context windows · oldest first")).toBeVisible();
+    await expect(await canvas.findByText("3 items", { exact: true })).toBeVisible();
     await userEvent.click(tool);
     await waitForScrollStabilization(canvasElement);
 
