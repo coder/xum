@@ -6,7 +6,11 @@ import { createTypeSafeAi } from "@ai-sdk/typesafe-ai";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { wrapLanguageModel, type LanguageModel } from "ai";
-import { isGrokFrontierModel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  isGpt6SolOrLunaModel,
+  isGrokFrontierModel,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 import { Ok, Err } from "@/common/types/result";
 import type { Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
@@ -305,8 +309,15 @@ function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string)
   if (serviceTier == null) {
     return baseFetch;
   }
+  return wrapFetchWithJsonBodyPatch(baseFetch, (body) => ({ ...body, service_tier: serviceTier }));
+}
 
-  const tieredFetch = async (
+/** Rewrite JSON POST bodies after the provider SDK has serialized them. */
+function wrapFetchWithJsonBodyPatch(
+  baseFetch: typeof fetch,
+  patchBody: (body: Record<string, unknown>) => Record<string, unknown>
+): typeof fetch {
+  const patchedFetch = async (
     input: Parameters<typeof fetch>[0],
     init?: Parameters<typeof fetch>[1]
   ): Promise<Response> => {
@@ -321,38 +332,72 @@ function wrapFetchWithServiceTier(baseFetch: typeof fetch, serviceTier?: string)
       return baseFetch(input, {
         ...init,
         headers,
-        body: JSON.stringify({ ...body, service_tier: serviceTier }),
+        body: JSON.stringify(patchBody(body)),
       });
     } catch {
       return baseFetch(input, init);
     }
   };
 
-  return Object.assign(tieredFetch, baseFetch) as typeof fetch;
+  return Object.assign(patchedFetch, baseFetch) as typeof fetch;
 }
 
-/** Preserve tiers for OpenAI-wire aliases without rewriting their routing identity. */
-function createOpenAIModelWithServiceTier(
+/** Set reasoning effort "none" on either OpenAI wire format's request body. */
+function withOpenAINoneReasoningEffort(body: Record<string, unknown>): Record<string, unknown> {
+  if ("messages" in body) {
+    return { ...body, reasoning_effort: "none" };
+  }
+  const reasoning =
+    typeof body.reasoning === "object" && body.reasoning !== null ? body.reasoning : {};
+  return { ...body, reasoning: { ...reasoning, effort: "none" } };
+}
+
+/**
+ * Preserve OpenAI request options that @ai-sdk/openai drops by model-name capability
+ * checks, without rewriting the raw model/endpoint routing identity.
+ */
+function createOpenAIModelWithPreservedOptions(
   createModel: (fetch: typeof globalThis.fetch) => LanguageModelV4,
   baseFetch: typeof fetch,
-  serviceTierAvailable: boolean
+  options: { serviceTierAvailable: boolean; wireModelId: string }
 ): LanguageModelV4 {
   const model = createModel(baseFetch);
-  if (!serviceTierAvailable) return model;
+  // @ai-sdk/openai (through at least 4.0.72) allowlists GPT-6 reasoning efforts
+  // without "none" and silently strips it, but Sol/Luna accept "none" and OpenAI
+  // requires it for Chat Completions function calling (Astra genuinely rejects it,
+  // and Xum never requests it there). Without this, Chat agent turns fail and
+  // Responses "off" silently runs at the API default effort. This lives in Xum
+  // runtime code rather than a bun patch because npm installs of the published
+  // package would not apply a bun patch.
+  const preserveNoneEffort = isGpt6SolOrLunaModel(options.wireModelId);
+  if (!options.serviceTierAvailable && !preserveNoneEffort) return model;
 
-  const createTieredCall = (params: LanguageModelV4CallOptions) => {
-    const tier = ServiceTierSchema.optional().parse(params.providerOptions?.openai?.serviceTier);
-    if (tier == null) return undefined;
-    // The SDK drops tiers for opaque gateway aliases. Preserve the raw
-    // model/endpoint and serialize the tier after SDK capability checks.
-    // Per-call adapters keep concurrent requests' overrides independent.
+  const createPreservingCall = (params: LanguageModelV4CallOptions) => {
+    const openaiOptions = params.providerOptions?.openai;
+    const tier = options.serviceTierAvailable
+      ? ServiceTierSchema.optional().parse(openaiOptions?.serviceTier)
+      : undefined;
+    const noneEffort = preserveNoneEffort && openaiOptions?.reasoningEffort === "none";
+    if (tier == null && !noneEffort) return undefined;
+    // The SDK drops tiers for opaque gateway aliases and "none" for GPT-6 IDs.
+    // Serialize them after SDK capability checks instead. Per-call adapters keep
+    // concurrent requests' overrides independent.
+    let callFetch = wrapFetchWithServiceTier(baseFetch, tier);
+    if (noneEffort) {
+      callFetch = wrapFetchWithJsonBodyPatch(callFetch, withOpenAINoneReasoningEffort);
+    }
     return {
-      model: createModel(wrapFetchWithServiceTier(baseFetch, tier)),
+      model: createModel(callFetch),
       params: {
         ...params,
         providerOptions: {
           ...params.providerOptions,
-          openai: { ...params.providerOptions?.openai, serviceTier: undefined },
+          openai: {
+            ...openaiOptions,
+            ...(tier != null && { serviceTier: undefined }),
+            // Omit it from SDK options so the SDK does not emit an unsupported warning.
+            ...(noneEffort && { reasoningEffort: undefined }),
+          },
         },
       },
     };
@@ -362,11 +407,11 @@ function createOpenAIModelWithServiceTier(
     middleware: {
       specificationVersion: "v4",
       wrapGenerate: ({ params, doGenerate }) => {
-        const call = createTieredCall(params);
+        const call = createPreservingCall(params);
         return call ? call.model.doGenerate(call.params) : doGenerate();
       },
       wrapStream: ({ params, doStream }) => {
-        const call = createTieredCall(params);
+        const call = createPreservingCall(params);
         return call ? call.model.doStream(call.params) : doStream();
       },
     },
@@ -1651,11 +1696,10 @@ export class ProviderModelFactory {
                 return provider.responses(modelId);
               };
               return Ok(
-                createOpenAIModelWithServiceTier(
-                  createCustomModel,
-                  customAdapterFetch,
-                  serviceTierAvailable
-                )
+                createOpenAIModelWithPreservedOptions(createCustomModel, customAdapterFetch, {
+                  serviceTierAvailable,
+                  wireModelId: modelId,
+                })
               );
             }
             case "anthropic-messages": {
@@ -1971,13 +2015,16 @@ export class ProviderModelFactory {
           // only unmapped native IDs retain the SDK's name-based restrictions.
           const isMappedAlias =
             resolveModelForMetadata(fullModelId, providersConfig) !== fullModelId;
-          const model = shouldRouteThroughCodexOauth
-            ? createNativeModel(webSocketTransport.fetch)
-            : createOpenAIModelWithServiceTier(
-                createNativeModel,
-                webSocketTransport.fetch,
-                serviceTierAvailable && isMappedAlias
-              );
+          const model = createOpenAIModelWithPreservedOptions(
+            createNativeModel,
+            webSocketTransport.fetch,
+            {
+              // Codex OAuth keeps its existing tier behavior; only effort is preserved.
+              serviceTierAvailable:
+                !shouldRouteThroughCodexOauth && serviceTierAvailable && isMappedAlias,
+              wireModelId: modelId,
+            }
+          );
           if (webSocketTransport.active) {
             attachLanguageModelCleanup(model, webSocketTransport.close);
           }
@@ -2651,7 +2698,10 @@ export class ProviderModelFactory {
               : provider.chat(originModelId);
           };
           return Ok(
-            createOpenAIModelWithServiceTier(createCoderModel, coderFetch, serviceTierAvailable)
+            createOpenAIModelWithPreservedOptions(createCoderModel, coderFetch, {
+              serviceTierAvailable,
+              wireModelId: originModelId,
+            })
           );
         }
 
