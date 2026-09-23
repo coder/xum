@@ -6,7 +6,11 @@ jest.mock("lottie-react", () => ({
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import {
+  useWorkspaceStoreRaw,
+  workspaceStore,
+  type InputRestore,
+} from "@/browser/stores/WorkspaceStore";
 import { getInputAttachmentsKey, getInputKey, getReviewsKey } from "@/common/constants/storage";
 import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
@@ -142,6 +146,29 @@ async function waitForLastUserRow(
     },
     { timeout: 30_000 }
   );
+}
+
+/**
+ * Show a workspace the way the sidebar does (the store then moves its single onChat
+ * subscription there) and wait until its composer is the mounted one.
+ */
+async function showWorkspace(harness: AppHarness, workspaceId: string, name: string) {
+  const row = await waitFor(
+    () => {
+      const el = harness.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
+      if (!el || el.getAttribute("aria-disabled") === "true") {
+        throw new Error("Workspace row not selectable yet");
+      }
+      return el as HTMLElement;
+    },
+    { timeout: 10_000 }
+  );
+  fireEvent.click(row);
+  workspaceStore.setActiveWorkspaceId(workspaceId);
+  await waitFor(() => {
+    expect(document.title.startsWith(name)).toBe(true);
+    expect(harness.view.container.querySelector('[data-testid="message-window"]')).not.toBe(null);
+  });
 }
 
 /**
@@ -330,28 +357,6 @@ describe("Unsent queued message restored to the composer", () => {
   test("a refusal that lands while another workspace is shown is restored exactly once when its composer is shown again", async () => {
     const app = await createAppHarness({ branchPrefix: "unsent-away" });
     let otherWorkspaceId: string | undefined;
-    // Show a workspace the way the sidebar does (the store then moves its single onChat
-    // subscription there) and wait until its composer is the mounted one.
-    const showWorkspace = async (harness: AppHarness, workspaceId: string, name: string) => {
-      const row = await waitFor(
-        () => {
-          const el = harness.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
-          if (!el || el.getAttribute("aria-disabled") === "true") {
-            throw new Error("Workspace row not selectable yet");
-          }
-          return el as HTMLElement;
-        },
-        { timeout: 10_000 }
-      );
-      fireEvent.click(row);
-      workspaceStore.setActiveWorkspaceId(workspaceId);
-      await waitFor(() => {
-        expect(document.title.startsWith(name)).toBe(true);
-        expect(harness.view.container.querySelector('[data-testid="message-window"]')).not.toBe(
-          null
-        );
-      });
-    };
     const draftOf = (workspaceId: string) => readPersistedState(getInputKey(workspaceId), "");
     const attachmentNames = (workspaceId: string) =>
       readPersistedState<Array<{ filename?: string }>>(getInputAttachmentsKey(workspaceId), []).map(
@@ -490,6 +495,150 @@ describe("Unsent queued message restored to the composer", () => {
       await app.chat.expectInputValue("");
       expect(app.view.container.textContent).not.toContain("reviews attached");
     } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("restored reviews survive switching away and back; the retry sends only the kept, edited review, once", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-remount" });
+    let otherWorkspaceId: string | undefined;
+    const composerText = () => app.view.container.textContent ?? "";
+    // The composer's own review block holding `note` (transcript review blocks have no actions).
+    const composerReviewBlock = (note: string) => {
+      const block = Array.from(app.view.container.querySelectorAll('[aria-label="Delete review"]'))
+        .map((button) => button.closest('[class*="group/review"]'))
+        .find((candidate) => candidate?.textContent?.includes(note));
+      if (!(block instanceof HTMLElement)) throw new Error(`no composer review for ${note}`);
+      return block;
+    };
+    try {
+      const [, secondReview] = await queueTwoRefusedComposerMessages(app);
+      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT, 10_000);
+      await waitFor(() => expect(composerText()).toContain("2 reviews attached"));
+      // Applied and acknowledged: the backend no longer holds a copy to re-send.
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      await waitFor(async () => {
+        const replayed: unknown[] = [];
+        await session.replayHistory(({ message }) => {
+          if ("type" in message && message.type === "restore-to-input") replayed.push(message);
+        });
+        expect(replayed).toEqual([]);
+      });
+
+      const created = await app.env.orpc.workspace.create({
+        projectPath: app.repoPath,
+        branchName: generateBranchName("unsent-remount-other"),
+        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+      });
+      if (!created.success) throw new Error(created.error);
+      otherWorkspaceId = created.metadata.id;
+      workspaceStore.addWorkspace(created.metadata);
+      const switchAwayAndBack = async () => {
+        await showWorkspace(app, created.metadata.id, created.metadata.name);
+        await showWorkspace(app, app.workspaceId, app.metadata.name);
+      };
+
+      // The composer remounts: the whole restoration is still there.
+      await switchAwayAndBack();
+      await app.chat.expectInputValue(RESTORED_AUTHORED_TEXT);
+      await waitFor(() => expect(composerText()).toContain("2 reviews attached"));
+      expect(composerAttachmentNames(app)).toEqual(["first.txt", "second.txt"]);
+
+      // The user discards one review and edits the other; both choices survive a remount.
+      fireEvent.click(
+        composerReviewBlock("first note").querySelector('[aria-label="Delete review"]')!
+      );
+      await waitFor(() => expect(composerText()).toContain("1 review attached"));
+      fireEvent.click(
+        composerReviewBlock("second note").querySelector('[aria-label="Edit comment"]')!
+      );
+      const noteEditor = await waitFor(() => {
+        const textarea = composerReviewBlock("second note").querySelector("textarea");
+        if (!textarea) throw new Error("note editor not open yet");
+        return textarea;
+      });
+      fireEvent.change(noteEditor, { target: { value: "second note, edited" } });
+      fireEvent.keyDown(noteEditor, { key: "Enter", ctrlKey: true });
+      await waitFor(() => expect(composerReviewBlock("second note, edited")).toBeTruthy());
+      await switchAwayAndBack();
+      await waitFor(() => expect(composerText()).toContain("1 review attached"));
+      expect(composerReviewBlock("second note, edited")).toBeTruthy();
+      expect(composerText()).not.toContain("first note");
+
+      await app.chat.send(RESTORED_AUTHORED_TEXT);
+      const sent = await waitForLastUserRow(app, "second authored");
+      const editedReview = { ...secondReview, userNote: "second note, edited" };
+      expect(countOccurrences(sent.text, formatReviewForModel(editedReview))).toBe(1);
+      expect(sent.text).not.toContain("first note");
+      expect(countOccurrences(sent.text, "first authored")).toBe(1);
+      expect(countOccurrences(sent.text, "second authored")).toBe(1);
+      expect(sent.reviews).toEqual([editedReview]);
+      await app.chat.expectStreamComplete();
+
+      // Neither the sent draft nor the discarded review comes back after another remount.
+      await switchAwayAndBack();
+      await app.chat.expectInputValue("");
+      expect(composerText()).not.toContain("review attached");
+      expect(composerText()).not.toContain("reviews attached");
+      expect(composerAttachmentNames(app)).toEqual([]);
+    } finally {
+      if (otherWorkspaceId != null) {
+        await app.env.orpc.workspace
+          .remove({ workspaceId: otherWorkspaceId, options: { force: true } })
+          .catch(() => undefined);
+      }
+      await app.dispose();
+    }
+  }, 120_000);
+
+  test("a restoration applied in the same update that switches workspaces keeps its text, attachment and review", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-same-batch" });
+    let otherWorkspaceId: string | undefined;
+    try {
+      const created = await app.env.orpc.workspace.create({
+        projectPath: app.repoPath,
+        branchName: generateBranchName("unsent-same-batch-other"),
+        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+      });
+      if (!created.success) throw new Error(created.error);
+      otherWorkspaceId = created.metadata.id;
+      workspaceStore.addWorkspace(created.metadata);
+      const otherRow = await waitFor(() => {
+        const el = app.view.container.querySelector(`[data-workspace-id="${otherWorkspaceId}"]`);
+        if (!el || el.getAttribute("aria-disabled") === "true") throw new Error("not selectable");
+        return el as HTMLElement;
+      });
+      // The composer applies the restoration (and the store acknowledges it) in the same React
+      // batch that unmounts it: every part must already be stored when the ack goes out.
+      act(() => {
+        // eslint-disable-next-line react-hooks/rules-of-hooks -- plain singleton accessor, no React state.
+        (
+          useWorkspaceStoreRaw() as unknown as {
+            receiveInputRestore: (restore: InputRestore) => void;
+          }
+        ).receiveInputRestore({
+          type: "restore-to-input",
+          workspaceId: app.workspaceId,
+          text: "same-batch text",
+          fileParts: [{ ...queuedFilePart, filename: "same-batch.txt" }],
+          reviews: [composerReview("same-batch note")],
+          mode: "append",
+          restoreId: "same-batch-restore",
+        });
+        fireEvent.click(otherRow);
+        workspaceStore.setActiveWorkspaceId(created.metadata.id);
+      });
+      await waitFor(() => expect(document.title.startsWith(created.metadata.name)).toBe(true));
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+      await app.chat.expectInputValue("same-batch text");
+      expect(composerAttachmentNames(app)).toEqual(["same-batch.txt"]);
+      await waitFor(() => expect(app.view.container.textContent).toContain("same-batch note"));
+    } finally {
+      if (otherWorkspaceId != null) {
+        await app.env.orpc.workspace
+          .remove({ workspaceId: otherWorkspaceId, options: { force: true } })
+          .catch(() => undefined);
+      }
       await app.dispose();
     }
   }, 90_000);

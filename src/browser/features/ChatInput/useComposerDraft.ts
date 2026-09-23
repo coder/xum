@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type SetStateAction } from "react";
 import {
   subscribePersistedStateWrites,
   updatePersistedState,
@@ -8,6 +8,7 @@ import {
   getDraftScopeId,
   getInputAttachmentsKey,
   getInputKey,
+  getInputReviewsKey,
   getPendingScopeId,
 } from "@/common/constants/storage";
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
@@ -48,81 +49,100 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(attachmentsKey)
   );
+  // The latest attachments, including writes React has not rendered yet (see setAttachments).
+  const latestAttachmentsRef = useRef(attachments);
   const setAttachments = (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
-  ) =>
-    setAttachmentsState((previous) => {
-      const next = value instanceof Function ? value(previous) : value;
-      const persists =
-        next.length > 0 &&
-        estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
-      selfWriteRef.current = true;
-      try {
-        updatePersistedState<ChatAttachment[] | undefined>(
-          attachmentsKey,
-          persists ? next : undefined
-        );
-      } finally {
-        selfWriteRef.current = false;
-      }
-      if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-      else if (tooLargeToastKeyRef.current !== attachmentsKey) {
-        tooLargeToastKeyRef.current = attachmentsKey;
-        pushToast({
-          type: "error",
-          message:
-            "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-          duration: 5000,
-        });
-      }
-      return next;
-    });
+  ) => {
+    // Computed and stored now, not in a React state updater: an updater runs only when this
+    // composer next renders, so a composer unmounted first (a workspace switch in the same batch
+    // as an unsent-input restoration, which is acknowledged as soon as it is applied) would never
+    // store the restored attachments.
+    const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
+    latestAttachmentsRef.current = next;
+    const persists =
+      next.length > 0 &&
+      estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+    selfWriteRef.current = true;
+    try {
+      updatePersistedState<ChatAttachment[] | undefined>(
+        attachmentsKey,
+        persists ? next : undefined
+      );
+    } finally {
+      selfWriteRef.current = false;
+    }
+    if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
+    else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+      tooLargeToastKeyRef.current = attachmentsKey;
+      pushToast({
+        type: "error",
+        message:
+          "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
+        duration: 5000,
+      });
+    }
+    setAttachmentsState(next);
+  };
   useEffect(() => {
+    const loadAttachments = () => {
+      latestAttachmentsRef.current = readPersistedChatAttachments(attachmentsKey);
+      setAttachmentsState(latestAttachmentsRef.current);
+    };
     tooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+    loadAttachments();
     return subscribePersistedStateWrites((event) => {
       if (event.key === attachmentsKey && !selfWriteRef.current) {
-        setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+        loadAttachments();
       }
     });
   }, [attachmentsKey]);
-  const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
-  const draftReviewIdsRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
-  const nextDraftReviewIdRef = useRef(0);
+  // The review-note override is draft state like the text: a restored unsent message's reviews
+  // must survive the composer remounting (switching workspaces away and back), because the
+  // restoration is acknowledged — and the backend copy dropped — as soon as it is applied. The
+  // persisted setter writes storage synchronously, so the override is remount-safe before that
+  // acknowledgement. null (key absent) = no override; [] = the user cleared the restored notes.
+  const [storedDraftReviews, setStoredDraftReviews] = usePersistedState<
+    ReviewNoteDataForDisplay[] | null
+  >(getInputReviewsKey(scopeId), null, { listener: true });
   const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
     typeof value === "object" && value !== null;
-  const idForReview = (review: ReviewNoteDataForDisplay) => {
-    const existingId = draftReviewIdsRef.current.get(review);
-    if (existingId) return existingId;
-    const newId = "draft-review-" + nextDraftReviewIdRef.current++;
-    draftReviewIdsRef.current.set(review, newId);
-    return newId;
+  // Self-heal a malformed stored value instead of bricking the composer: a non-array reads as no
+  // override and non-object items are dropped. A valid value keeps its reference.
+  const asDraftReviews = (value: unknown): ReviewNoteDataForDisplay[] | null => {
+    if (!Array.isArray(value)) return null;
+    return value.every(isDraftReviewData) ? value : value.filter(isDraftReviewData);
   };
+  const draftReviews = asDraftReviews(storedDraftReviews);
+  const setDraftReviews = (value: SetStateAction<ReviewNoteDataForDisplay[] | null>) =>
+    setStoredDraftReviews((previous) =>
+      value instanceof Function ? value(asDraftReviews(previous)) : value
+    );
+  // Each write re-parses the stored notes, so object identity does not survive it: a draft
+  // note's id is its position.
+  const idForIndex = (index: number) => "draft-review-" + index;
   const mutateDraftReview = (reviewId: string, userNote?: string) =>
     setDraftReviews((previous) => {
       if (previous === null) return previous;
-      const index = previous.findIndex(
-        (review) => isDraftReviewData(review) && idForReview(review) === reviewId
-      );
+      const index = previous.findIndex((_, itemIndex) => idForIndex(itemIndex) === reviewId);
       if (index === -1) return previous;
       if (userNote === undefined) return previous.filter((_, itemIndex) => itemIndex !== index);
       const review = previous[index];
       if (!review || review.userNote === userNote) return previous;
       const next = [...previous];
       next[index] = { ...review, userNote };
-      draftReviewIdsRef.current.set(next[index], reviewId);
       return next;
     });
   const reviewOverrideActive = draftReviews !== null;
-  const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
+  const draftReviewItems = draftReviews ?? [];
   const reviews = reviewOverrideActive
     ? draftReviewItems
     : attachedReviews.map((review) => review.data);
   const reviewData = reviews.length > 0 ? reviews : undefined;
   const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map(({ id }) => id);
   const reviewPanelItems = reviewOverrideActive
-    ? draftReviewItems.map((data) => ({
-        id: idForReview(data),
+    ? draftReviewItems.map((data, index) => ({
+        id: idForIndex(index),
         data,
         status: "attached" as const,
         createdAt: 0,
