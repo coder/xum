@@ -200,15 +200,19 @@ const SectionLabel: React.FC<{ children: React.ReactNode }> = (props) => (
   <div className="text-muted mb-1.5 text-[10px] tracking-wide uppercase">{props.children}</div>
 );
 
-/** Header summary: what the call looked for. */
-const HeaderSummary: React.FC<{ args: SessionHistoryToolArgs }> = (props) => {
+/** Header summary: what the call looked for. `fill` gives the target the leftover width. */
+const HeaderSummary: React.FC<{ args: SessionHistoryToolArgs; fill: boolean }> = (props) => {
   const { action, query, item_id: itemId, window_id: windowId } = props.args;
   if (action === "search" && query) {
     return <span className="text-foreground min-w-0 truncate">“{query}”</span>;
   }
   const target = action === "read_item" ? itemId : action === "list_items" ? windowId : null;
   if (!target) return null;
-  return <span className="text-muted min-w-0 truncate text-[10px]">{target}</span>;
+  return (
+    <span className={cn("text-muted min-w-0 truncate text-[10px]", props.fill && "flex-1")}>
+      {target}
+    </span>
+  );
 };
 
 /** The request as readable filter chips instead of a JSON blob. */
@@ -567,15 +571,27 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
   const args = props.args;
   const result = parseResult(props.result);
   const count = countLabel(args, result);
+  const readItem = args.action === "read_item" && result?.success ? result.items?.at(0) : undefined;
+  // An exact range can be wide (seven-digit offsets). Rather than truncating an endpoint or
+  // overflowing a narrow card, the header wraps: the item ID fills leftover space (zero flex
+  // basis) and the range moves to a second line together with the status. Other headers,
+  // including legacy read_item results, keep their single-line layout.
+  const wideCount = readItem != null && startOf(readItem) != null;
+  const countNode = count != null && (
+    <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
+  );
   // A completed call whose output is present but fails the result schema is not a success:
   // show it as failed in the header while the body keeps the "Result unavailable" diagnostic.
   // Absent output (null) keeps its transport status.
   const headerStatus: ToolStatus =
     status === "completed" && props.result != null && result == null ? "failed" : status;
+  const statusNode = (
+    <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
+  );
 
   return (
     <ToolContainer expanded={expanded}>
-      <ToolHeader onClick={toggleExpanded}>
+      <ToolHeader onClick={toggleExpanded} className={wideCount ? "flex-wrap" : undefined}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName="session_history" />
         <span className="text-secondary shrink-0 font-medium whitespace-nowrap">
@@ -586,11 +602,18 @@ export const SessionHistoryToolCall: React.FC<SessionHistoryToolCallProps> = (pr
             sub-agent
           </Chip>
         )}
-        <HeaderSummary args={args} />
-        {count != null && (
-          <span className="text-muted shrink-0 text-[10px] whitespace-nowrap">{count}</span>
+        <HeaderSummary args={args} fill={wideCount} />
+        {wideCount ? (
+          <span className="ml-auto flex shrink-0 items-center gap-2">
+            {countNode}
+            {statusNode}
+          </span>
+        ) : (
+          <>
+            {countNode}
+            {statusNode}
+          </>
         )}
-        <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
       </ToolHeader>
 
       {expanded && (
