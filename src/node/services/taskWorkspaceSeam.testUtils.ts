@@ -75,10 +75,13 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
   };
 }
 
+/** Attempt id the fake's derived reawakenInterruptedTask reports for a successful rescue. */
+export const FAKE_REAWAKENED_ATTEMPT_ID = "att_00000000000000fa";
+
 export function makeAgentTaskIntegrationFake(
   overrides: Partial<AgentTaskIntegration> = {}
 ): AgentTaskIntegration {
-  return {
+  const fake: AgentTaskIntegration = {
     withTaskTreeLifecycleLock: <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> =>
       operation(),
     hasDescendantAgentTasks: () => false,
@@ -100,6 +103,13 @@ export function makeAgentTaskIntegrationFake(
     isWorkspaceStopInProgress: () => false,
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
+    // Derived from the (possibly overridden) boolean rescue, so suites that script only
+    // markInterruptedTaskRunning keep driving the outcome WorkspaceService consumes.
+    reawakenInterruptedTask: async (workspaceId) =>
+      (await fake.markInterruptedTaskRunning(workspaceId))
+        ? { kind: "reawakened", attemptId: FAKE_REAWAKENED_ATTEMPT_ID, statusChanged: true }
+        : { kind: "not-applicable" },
     ...overrides,
   };
+  return fake;
 }

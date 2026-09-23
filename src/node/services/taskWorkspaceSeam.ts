@@ -569,6 +569,12 @@ export interface TurnAdmissionToken {
 /** Outcome of {@link TurnAdmissionToken.resolveDispatch}. */
 export type QueuedDispatchDecision = "hold" | "proceed" | { refuse: string };
 
+/** Outcome of AgentTaskIntegration.reawakenInterruptedTask. */
+export type TaskReawakenOutcome =
+  | { kind: "not-applicable" }
+  | { kind: "reawakened"; attemptId: string; statusChanged: boolean }
+  | { kind: "refused"; message: string };
+
 /** Result of asking TaskService to admit a send into a workspace (see admitTaskWorkspaceTurn). */
 export type TaskTurnAdmission =
   | { kind: "not-a-task" }
@@ -711,6 +717,19 @@ export interface AgentTaskIntegration {
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
+  /**
+   * The user-resume rescue a manual send/resume runs before binding its obligation, with its
+   * outcome made explicit (markInterruptedTaskRunning reports only a status change):
+   *  - `not-applicable`: nothing to reawaken (an active task, a stop in progress, a retired
+   *    attempt, not a task); the send binds through the ordinary fence, which refuses what the
+   *    fence refuses.
+   *  - `reawakened`: this call committed a fresh owned attempt; the send must bind to exactly
+   *    `attemptId` (`statusChanged`: the row moved to running and needs restoring on failure).
+   *  - `refused`: this call decided to reawaken and lost — another writer (another backend's
+   *    resume) moved the row first, or a Stop overtook it. The send must be refused: binding it
+   *    generically would adopt the winner's attempt and stream it twice.
+   */
+  reawakenInterruptedTask(workspaceId: string): Promise<TaskReawakenOutcome>;
   /**
    * Synchronous admission fence for a send into a workspace, evaluated at the session handoff
    * (right before the queue insertion or the session's own admission awaits). Non-task workspaces

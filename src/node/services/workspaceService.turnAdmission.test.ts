@@ -243,6 +243,41 @@ describe("WorkspaceService task-attempt admission fence", () => {
     expect(tokens[1].events).toEqual(["enqueued", "disposed:canceled-before-admission"]);
   });
 
+  test.each(["sendMessage", "resumeStream"] as const)(
+    "%s refuses when its reawaken lost the race and binds a won reawaken to exactly its attempt",
+    async (operation) => {
+      const { service } = await createFixture();
+      const admitTaskWorkspaceTurn = mock(
+        (_workspaceId: string, _options: { expectedAttemptId?: string }) =>
+          ({ kind: "admitted", token: recordingToken() }) as const
+      );
+      const outcomes = [
+        { kind: "refused", message: "lost the reawaken" } as const,
+        { kind: "reawakened", attemptId: "att_00000000000000e1", statusChanged: true } as const,
+      ];
+      service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          reawakenInterruptedTask: mock(() => Promise.resolve(outcomes.shift()!)),
+          admitTaskWorkspaceTurn,
+        })
+      );
+      const run = () =>
+        operation === "sendMessage"
+          ? service.sendMessage(workspaceId, "hello", { model, agentId: "exec" })
+          : service.resumeStream(workspaceId, { model, agentId: "exec" });
+      const lost = await run();
+      expect(lost.success).toBe(false);
+      if (!lost.success) expect(lost.error).toEqual({ type: "unknown", raw: "lost the reawaken" });
+      // The losing caller never reaches the fence: it cannot adopt the winner's attempt.
+      expect(admitTaskWorkspaceTurn).not.toHaveBeenCalled();
+      await run();
+      expect(admitTaskWorkspaceTurn).toHaveBeenCalledTimes(1);
+      expect(admitTaskWorkspaceTurn.mock.calls[0]?.[1]).toMatchObject({
+        expectedAttemptId: "att_00000000000000e1",
+      });
+    }
+  );
+
   test("workspaces the integration does not recognize carry no obligation", async () => {
     const { service } = await createFixture();
     const { admitTaskWorkspaceTurn, fake } = integration(() => ({ kind: "not-a-task" }));

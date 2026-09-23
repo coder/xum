@@ -45,6 +45,7 @@ import {
   type ResolvedWorkspaceAiSettings,
   type TaskCreateArgs,
   type TaskKind,
+  type TaskReawakenOutcome,
   type TaskTurnAdmission,
   type TurnAcceptanceOrigin,
   type TurnAdmissionToken,
@@ -79,6 +80,7 @@ import {
   SEND_ADMISSION_STALE_MESSAGE,
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
   TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE,
+  TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
   TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   retiredAttemptMessage,
@@ -13784,17 +13786,28 @@ export class TaskService implements AgentTaskIntegration {
    * Returns true only when taskStatus changed to running (and needs restoring on send failure).
    */
   async markInterruptedTaskRunning(workspaceId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "markInterruptedTaskRunning: workspaceId must be non-empty");
+    const outcome = await this.reawakenInterruptedTask(workspaceId);
+    return outcome.kind === "reawakened" && outcome.statusChanged;
+  }
+
+  /**
+   * markInterruptedTaskRunning with its outcome made explicit (see
+   * AgentTaskIntegration.reawakenInterruptedTask): a manual send must tell "nothing to reawaken"
+   * from "decided to reawaken and lost the race", and bind to exactly the attempt it committed.
+   */
+  async reawakenInterruptedTask(workspaceId: string): Promise<TaskReawakenOutcome> {
+    assert(workspaceId.length > 0, "reawakenInterruptedTask: workspaceId must be non-empty");
+    const notApplicable = { kind: "not-applicable" } as const;
     // Stop-cascade barrier: a resume must not resurrect a task whose stop is still settling.
     if (this.isWorkspaceStopInProgress(workspaceId)) {
       log.debug("markInterruptedTaskRunning refused: a stop is in progress", { workspaceId });
-      return false;
+      return notApplicable;
     }
 
     const configAtStart = this.config.loadConfigOrDefault();
     const entryAtStart = findWorkspaceEntry(configAtStart, workspaceId);
     if (!entryAtStart?.workspace.parentWorkspaceId) {
-      return false;
+      return notApplicable;
     }
     const settledPredecessor = this.attemptSettlementByTaskId.get(workspaceId);
     // A parent continuation preserves `reported`; Stop then closes its attempt without changing
@@ -13824,15 +13837,18 @@ export class TaskService implements AgentTaskIntegration {
         entryAtStart.workspace.taskDesktopOwnerWorkspaceId != null
       )
     ) {
-      return false;
+      return notApplicable;
     }
 
     if (entryAtStart.workspace.taskAttemptRetiredBy != null) {
       log.info("markInterruptedTaskRunning refused: attempt retired by a workflow claim", {
         workspaceId,
       });
-      return false;
+      return notApplicable;
     }
+    // From here on this call has decided to reawaken: losing any race below refuses the caller's
+    // send instead of letting it bind to whatever attempt the winner published.
+    const lost = (message: string): TaskReawakenOutcome => ({ kind: "refused", message });
 
     // Admission classification: reawaken = new OWNED attempt. Lineage is proven only when the
     // predecessor is settled by this process or by a receipt; the CAS below publishes the fresh
@@ -13872,7 +13888,7 @@ export class TaskService implements AgentTaskIntegration {
             (releasedReportedAttempt && this.ownedAttemptByTaskId.has(workspaceId))))
       ) {
         log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
-        return false;
+        return lost(SEND_ADMISSION_STALE_MESSAGE);
       }
       await this.editActiveWorkspaceEntry(
         workspaceId,
@@ -13911,8 +13927,9 @@ export class TaskService implements AgentTaskIntegration {
       );
 
       if (!published) {
-        // Nothing was published: the previous attempt (owned or not) stays exactly as it was.
-        return false;
+        // Nothing was published: the previous attempt (owned or not) stays exactly as it was,
+        // and the row moved under this decision (another writer's resume, a stop, a claim).
+        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
       // Writers outside this mutex (a reactivation under its own locks, another backend) may have
       // rotated the row again during the commit's own awaits: never publish or own an identity
@@ -13924,7 +13941,7 @@ export class TaskService implements AgentTaskIntegration {
           attemptId,
           current: committedRow?.workspace.taskAttemptId,
         });
-        return false;
+        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
       this.publishAttemptRotation(workspaceId, attemptId);
       if (!committedProven) {
@@ -13941,7 +13958,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     await this.emitWorkspaceMetadata(workspaceId);
-    return !resumeSettledReportedTask;
+    return { kind: "reawakened", attemptId, statusChanged: !resumeSettledReportedTask };
   }
 
   /**

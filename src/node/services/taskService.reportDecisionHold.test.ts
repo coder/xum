@@ -787,4 +787,50 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  test.each(["interrupted", "reported"] as const)(
+    "a manual send whose reawaken of a %s child loses the identity CAS to another backend is refused, never admitted under the winner's attempt",
+    async (status) => {
+      const childId = status === "interrupted" ? "holdcasloss01" : "holdcasloss02";
+      const stack = await createStack(childId, { taskStatus: status });
+      const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+      const otherBackend = await createTestConfig(rootDir);
+      const winner = "att_00000000000000f9";
+      // XUM_ALLOW_MULTIPLE_INSTANCES: another backend's manual resume commits its reawaken
+      // between this backend's decision (the lineage read) and its identity CAS.
+      const lineage = taskService as unknown as {
+        evaluateAttemptLineage: (id: string, entry: unknown) => Promise<unknown>;
+      };
+      const evaluate = lineage.evaluateAttemptLineage.bind(taskService);
+      spyOn(lineage, "evaluateAttemptLineage").mockImplementation(async (id, entry) => {
+        await otherBackend.editConfig((cfg) => {
+          for (const project of cfg.projects.values()) {
+            const ws = project.workspaces.find((w) => w.id === childId);
+            if (ws == null) continue;
+            if (status === "interrupted") ws.taskStatus = "running";
+            ws.taskAttemptId = winner;
+          }
+          return cfg;
+        });
+        return evaluate(id, entry);
+      });
+      try {
+        if (status === "reported") {
+          // The released shape of an ordinary reported child (no owner, no settlement entry).
+          expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+        }
+        const result = await workspaceService.sendMessage(childId, "manual follow-up", sendOptions);
+        expect(result.success).toBe(false);
+        // Nothing streams under the winner's attempt here and no obligation is left bound to it.
+        await yieldMacrotasks(3);
+        expect(completions).toHaveLength(0);
+        expect(outstanding(svc, childId)).toHaveLength(0);
+        expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).not.toBe(winner);
+        expect(entryOf(config, childId)?.taskAttemptId).toBe(winner);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
 });

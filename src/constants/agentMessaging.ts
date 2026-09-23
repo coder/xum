@@ -110,6 +110,13 @@ export const SEND_ADMISSION_STALE_MESSAGE =
   "Send refused: the target was stopped or interrupted while the message was being admitted.";
 
 /**
+ * A manual send whose reawaken of a stopped or reported sub-agent lost its identity CAS: another
+ * send (another backend's resume) reawakened it first. Nothing was sent.
+ */
+export const TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE =
+  "Send refused: this sub-agent was resumed by another send at the same time; nothing was sent. Try again.";
+
+/**
  * A message queued into a sub-agent while its last turn streamed, refused at dispatch because
  * that turn turned out to be the task's terminal report. The text is handed back to the composer
  * as unsent input; sending it again is a new, normally admitted send that starts a fresh attempt.

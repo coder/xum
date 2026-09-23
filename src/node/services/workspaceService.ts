@@ -11795,11 +11795,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
     };
     let taskTurnAdmissionComposed = false;
-    const admitTaskTurn = (): Result<void, SendMessageError> => {
+    // `expectedAttemptId`: the attempt this send's own reawaken committed (see below).
+    const admitTaskTurn = (expectedAttemptId?: string): Result<void, SendMessageError> => {
       if (taskTurnAdmissionComposed) return Ok(undefined);
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(expectedAttemptId != null ? { expectedAttemptId } : {}),
         });
         if (admission == null || admission.kind === "not-a-task") return Ok(undefined);
         if (admission.kind === "refused") {
@@ -12353,18 +12355,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // WTM-correlated sends already own their attempt and execution mirror. A second manual
       // rescue would replace that ownership, defeating rollback when admission is refused.
       // Use the dispatched correlation: a downgraded continuation still needs ordinary rescue.
+      let reawakenedAttemptId: string | undefined;
       if (
         internal?.admissionStale == null &&
         parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
       ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+        const reawaken = await this.agentTaskIntegration?.reawakenInterruptedTask(workspaceId);
+        // A rescue that lost its identity CAS (another backend resumed the task first) refuses:
+        // binding generically would adopt the winner's attempt and stream it from two sessions.
+        if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
+        if (reawaken?.kind === "reawakened") {
+          reawakenedAttemptId = reawaken.attemptId;
+          resumedInterruptedTask = reawaken.statusChanged;
+        }
       }
       // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
-      // send must be admitted under) and before the session's own admission awaits.
+      // send must be admitted under — exactly that one) and before the session's admission awaits.
       {
-        const admitted = admitTaskTurn();
+        const admitted = admitTaskTurn(reawakenedAttemptId);
         if (!admitted.success) return admitted;
         if (taskTurnAdmission?.admissionStale() === true) {
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
@@ -12700,8 +12709,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       }
       previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-      resumedInterruptedTask =
-        (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+      const reawaken = await this.agentTaskIntegration?.reawakenInterruptedTask(workspaceId);
+      // Same as sendMessage: a lost reawaken refuses, a won one binds to exactly its attempt.
+      if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
+      resumedInterruptedTask = reawaken?.kind === "reawakened" && reawaken.statusChanged;
 
       // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
       // carries the same obligation, bound after the rescue above. Disposed as no-work when the
@@ -12710,6 +12721,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(reawaken?.kind === "reawakened" ? { expectedAttemptId: reawaken.attemptId } : {}),
         });
         if (admission?.kind === "refused") {
           return Err({ type: "unknown", raw: admission.message });
