@@ -4,9 +4,15 @@ import { cleanup, render } from "@testing-library/react";
 import type { MuxMessage } from "@/common/types/message";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealChatHostContextModule from "@/browser/contexts/ChatHostContext";
 import * as RealTooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { MessageWindow } from "./MessageWindow";
 
+// The ChatHostContext stub is process-wide too; restore the real exports so
+// later suites keep their host UI support.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/ChatHostContext", { ...RealChatHostContextModule }],
+]);
 void mock.module("@/browser/contexts/ChatHostContext", () => ({
   useChatHostContext: () => ({
     uiSupport: { jsonRawView: "unsupported" as const },

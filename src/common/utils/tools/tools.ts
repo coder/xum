@@ -13,6 +13,7 @@ import {
 } from "@/common/types/thinking";
 import type { ProviderName } from "@/common/constants/providers";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
+import type { AvailableModel } from "@/common/utils/ai/selectableModels";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { createFileReadTool } from "@/node/services/tools/file_read";
 import { createAttachFileTool } from "@/node/services/tools/attach_file";
@@ -57,6 +58,7 @@ import { createTaskListTool } from "@/node/services/tools/task_list";
 import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read";
 import { createAgentSkillReadFileTool } from "@/node/services/tools/agent_skill_read_file";
 import { createAgentSkillListTool } from "@/node/services/tools/agent_skill_list";
+import { createModelsListTool } from "@/node/services/tools/models_list";
 import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_write";
 import { createAgentSkillDeleteTool } from "@/node/services/tools/agent_skill_delete";
 import { createSkillsCatalogSearchTool } from "@/node/services/tools/skills_catalog_search";
@@ -222,6 +224,13 @@ export interface ToolConfiguration {
   /** Task orchestration for sub-agent tasks */
   taskService?: TaskService;
   workspaceTurnManager?: WorkspaceTurnManager;
+  /**
+   * Catalog for the models_list tool: the models selectable under the current
+   * configuration (same pipeline as the composer picker), in task.model form.
+   * Re-reads live config on every call — no cache. Absent in contexts without a
+   * backend config (tests, refinement), where the tool reports unavailability.
+   */
+  listAvailableModels?: () => AvailableModel[];
   /** Durable workflow lifecycle service for dynamic workflow tools. */
   workflowService?: {
     getRun?(input: { workspaceId: string; runId: string }): Promise<unknown>;
@@ -869,6 +878,7 @@ export async function getToolsForModel(
     mux_agents_read: createXumAgentsReadTool(config),
     mux_agents_write: createXumAgentsWriteTool(config),
     agent_skill_list: createAgentSkillListTool(config),
+    models_list: createModelsListTool(config),
     agent_skill_write: createAgentSkillWriteTool(config),
     agent_skill_delete: createAgentSkillDeleteTool(config),
     mux_config_read: createXumConfigReadTool(config),

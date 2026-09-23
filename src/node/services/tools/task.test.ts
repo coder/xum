@@ -656,6 +656,73 @@ describe("task tool", () => {
     });
   });
 
+  it("forwards a models_list entry (canonical ID or alias + level) to both task kinds", async () => {
+    using tempDir = new TestTempDir("test-task-tool-models-list-entry");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    // Shape of one models_list entry for a built-in; the handler must accept the
+    // canonical ID and every alias and forward the normalized pair unchanged.
+    const entry = { model: "anthropic:claude-sonnet-5", aliases: ["sonnet"], thinking: "low" };
+
+    for (const model of [entry.model, ...entry.aliases]) {
+      const create = mock((_: { modelString?: unknown; thinkingLevel?: unknown }) =>
+        Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
+      );
+      const createWorkspaceTurn = mock((_: { modelString?: unknown; thinkingLevel?: unknown }) =>
+        Ok({
+          taskId: "wst_child-turn",
+          kind: "workspace_turn" as const,
+          status: "queued" as const,
+          workspaceId: "child-workspace",
+        })
+      );
+      const tool = createTaskTool({
+        ...baseConfig,
+        taskService: { create, createWorkspaceTurn } as unknown as TaskService,
+      });
+
+      await Promise.resolve(
+        tool.execute!(
+          {
+            agentId: "explore",
+            prompt: "reply ok",
+            title: "Echo",
+            run_in_background: true,
+            model,
+            thinking: entry.thinking,
+          },
+          mockToolCallOptions
+        )
+      );
+      await Promise.resolve(
+        tool.execute!(
+          {
+            kind: "workspace",
+            agentId: "explore",
+            prompt: "reply ok",
+            title: "Echo",
+            run_in_background: true,
+            workspace: { mode: "new" },
+            model,
+            thinking: entry.thinking,
+          },
+          mockToolCallOptions
+        )
+      );
+
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(create.mock.calls[0]?.[0]).toMatchObject({
+        modelString: entry.model,
+        thinkingLevel: entry.thinking,
+      });
+      expect(createWorkspaceTurn).toHaveBeenCalledTimes(1);
+      expect(createWorkspaceTurn.mock.calls[0]?.[0]).toMatchObject({
+        modelString: entry.model,
+        thinkingLevel: entry.thinking,
+        workspace: { mode: "new" },
+      });
+    }
+  });
+
   it("forwards a numeric thinking override as a deferred index", async () => {
     using tempDir = new TestTempDir("test-task-tool-numeric-thinking");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });

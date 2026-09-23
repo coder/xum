@@ -70,7 +70,8 @@ import {
   ConfigOperationsSchema,
 } from "@/common/config/schemas/configOperations";
 import { TOOL_EDIT_WARNING } from "@/common/types/tools";
-import { THINKING_LEVELS } from "@/common/types/thinking";
+import { THINKING_LEVELS, ThinkingLevelSchema } from "@/common/types/thinking";
+import type { AvailableModel } from "@/common/utils/ai/selectableModels";
 
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
@@ -560,7 +561,7 @@ const taskToolBaseShape = {
     'Workspace target for kind="workspace". Omit for a new full workspace; use mode="existing" with workspaceId only for a workspace previously created by this caller.'
   ),
   model: TaskToolModelSchema.nullish().describe(
-    "Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. Do not assume any particular model is available."
+    "Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. Do not assume any particular model is available. Use `models_list` to see valid values."
   ),
   thinking: TaskToolThinkingSchema.nullish().describe(
     "Optional thinking/reasoning-level override for the sub-agent. Accepts a level name (off, low, medium, high, xhigh, max) or a numeric index (resolved against the chosen model). Omit this unless the user explicitly instructed a specific thinking level — by default the sub-agent inherits the parent's thinking level."
@@ -2238,6 +2239,24 @@ export const AgentSkillReadToolResultSchema = z.union([
 export const AgentSkillReadFileToolResultSchema = FileReadToolResultSchema;
 
 /**
+ * models_list tool result. Mirrors the shared `AvailableModel` domain type
+ * (type-only dependency, no runtime cycle). Strict shapes bound the output to
+ * model IDs, aliases and level names — never credentials or provider config.
+ */
+export const AvailableModelSchema = z
+  .object({
+    model: z.string(),
+    aliases: z.array(z.string()),
+    thinkingLevels: z.array(ThinkingLevelSchema),
+  })
+  .strict() satisfies z.ZodType<AvailableModel>;
+
+export const ModelsListToolResultSchema = z.discriminatedUnion("success", [
+  z.object({ success: z.literal(true), models: z.array(AvailableModelSchema) }).strict(),
+  z.object({ success: z.literal(false), error: z.string() }).strict(),
+]);
+
+/**
  * MCP prompt get tool result - flattened prompt text or error.
  */
 export const MCPPromptGetToolResultSchema = z.union([
@@ -2853,6 +2872,12 @@ export const TOOL_DEFINITIONS = {
           ),
       })
       .strict(),
+  },
+  models_list: {
+    description:
+      "List models selectable under the current configuration, with aliases and thinking levels. Hidden models are omitted. This is a configuration snapshot, not a provider availability probe. Use returned IDs when a model override is requested; otherwise leave `task.model` unset.",
+    schema: z.object({}).strict(),
+    resultSchema: ModelsListToolResultSchema,
   },
   agent_skill_write: {
     description:
@@ -3771,6 +3796,7 @@ export function getAvailableTools(
     "mux_agents_read",
     "mux_agents_write",
     "agent_skill_list",
+    "models_list",
     "agent_skill_write",
     "agent_skill_delete",
     "skills_catalog_search",
