@@ -14277,6 +14277,70 @@ describe("WorkspaceService streaming generation guard", () => {
       expect.objectContaining({ generation: 7, hasTodos: false })
     );
   });
+
+  test.each([true, false])(
+    "stream-end recency follows the hidden token-budget flush flag (flush=%s)",
+    async (flush) => {
+      const workspaceId = "ws-flush-stream-completion";
+      const stopped = createDeferred<void>();
+      const setStreaming = mock(
+        (
+          _workspaceId: string,
+          streaming: boolean,
+          update: ExtensionMetadataStreamingUpdate = {}
+        ) => {
+          if (!streaming) stopped.resolve();
+          return Promise.resolve({
+            recency: Date.now(),
+            streaming,
+            lastModel: update.model ?? null,
+            lastThinkingLevel: update.thinkingLevel ?? null,
+            hasTodos: update.hasTodos,
+            agentStatus: null,
+          });
+        }
+      );
+
+      readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
+
+      const internals = workspaceService as unknown as {
+        aiService: AIService;
+        extensionMetadata: ExtensionMetadataService;
+        streamingGenerations: Map<string, number>;
+        updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
+      };
+      internals.extensionMetadata = { setStreaming } as unknown as ExtensionMetadataService;
+      internals.updateRecencyTimestamp = mock(() => Promise.resolve());
+      internals.streamingGenerations.set(workspaceId, 4);
+
+      // Drive the real stream-end listener registered on the AI service.
+      const onCalls = (internals.aiService.on as unknown as ReturnType<typeof mock>).mock.calls;
+      const streamEndListener = onCalls.find((call) => call[0] === "stream-end")?.[1] as
+        | ((data: unknown) => void)
+        | undefined;
+      if (!streamEndListener) throw new Error("Expected a stream-end listener");
+      streamEndListener({
+        type: "stream-end",
+        workspaceId,
+        messageId: "flush-answer",
+        parts: [],
+        metadata: {
+          model: "anthropic:claude-opus-5",
+          muxMetadata: flush ? { type: "normal", contextBudgetFlush: true } : { type: "normal" },
+        },
+      });
+      await stopped.promise;
+
+      // A hidden flush is maintenance: streaming still stops, but recency (which drives
+      // unread state and background completion notifications) must not advance.
+      expect(internals.updateRecencyTimestamp).toHaveBeenCalledTimes(flush ? 0 : 1);
+      expect(setStreaming).toHaveBeenCalledWith(
+        workspaceId,
+        false,
+        expect.objectContaining({ generation: 4 })
+      );
+    }
+  );
 });
 
 describe("WorkspaceService executeBash archive guards", () => {
