@@ -697,6 +697,9 @@ export class ProviderService {
       const enforced = this.policyService?.isEnforced() ?? false;
       if (
         isProviderDisabledInConfig(config) ||
+        // Gateway enablement lives in config.json (see getConfig), not providers.jsonc.
+        (provider === "mux-gateway" &&
+          this.config.loadConfigOrDefault().muxGatewayEnabled === false) ||
         (enforced && !this.policyService?.isProviderAllowed(provider))
       )
         return { status: "not-configured" };

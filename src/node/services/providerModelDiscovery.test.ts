@@ -765,6 +765,36 @@ it.each(specializedProviders)(
   }
 );
 
+it("honors the Gateway's global enabled state before and during discovery", async () => {
+  saveSpecialized("mux-gateway");
+  // Like getConfig's tests: the flag is read from the loaded main config.
+  const loadMainConfig = config.loadConfigOrDefault.bind(config);
+  let gatewayEnabled = false;
+  const mainConfigSpy = spyOn(config, "loadConfigOrDefault").mockImplementation(() => ({
+    ...loadMainConfig(),
+    muxGatewayEnabled: gatewayEnabled,
+  }));
+  try {
+    expect(await service.discoverModels("mux-gateway")).toEqual({ status: "not-configured" });
+    expect(requests).toHaveLength(0);
+
+    gatewayEnabled = true;
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<Response>();
+    respond = () => {
+      started.resolve();
+      return release.promise;
+    };
+    const pending = service.discoverModels("mux-gateway");
+    await started.promise;
+    gatewayEnabled = false;
+    release.resolve(Response.json({ models: [{ id: "old-model" }] }));
+    expect(await pending).toEqual({ status: "error", reason: "stale-config" });
+  } finally {
+    mainConfigSpy.mockRestore();
+  }
+});
+
 it.each(["copilot-config", "copilot-file", "copilot-env", "gateway-coupon", "gateway-voucher"])(
   "specialized %s uses only the existing credential resolver",
   async (source) => {
