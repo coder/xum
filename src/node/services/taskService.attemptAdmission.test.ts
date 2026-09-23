@@ -776,6 +776,40 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
     });
 
+    test("a pre-upgrade reported child (no attempt id, no ledgers) gets a fresh unproven first attempt before a manual follow-up", async () => {
+      // Written by a version without attempt identities: reported, released (nothing owns or
+      // settles it in this process), and no taskAttemptId at all.
+      const taskId = "reported-pre-upgrade";
+      const { config } = await setupTree([{ id: taskId, overrides: { taskStatus: "reported" } }]);
+      expect(entryOf(config, taskId)?.taskAttemptId).toBeUndefined();
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+
+      const outcome = await taskService.reawakenInterruptedTask(taskId);
+      expect(outcome).toMatchObject({ kind: "reawakened", statusChanged: false });
+      const row = entryOf(config, taskId);
+      expect(row?.taskStatus).toBe("reported");
+      expect(row?.taskAttemptId).toMatch(ATTEMPT_ID);
+      expect(outcome.kind === "reawakened" && outcome.attemptId).toBe(row?.taskAttemptId);
+      // Lineage unproven: no settlement, no receipt can vouch for the id-less predecessor.
+      expect(row?.taskAttemptUnproven).toBe(true);
+      expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+        source: "reawaken",
+        attemptId: row?.taskAttemptId,
+        receiptEligible: false,
+      });
+      expect(svc.attemptSettlementByTaskId.has(taskId)).toBe(false);
+      // The manual follow-up is fenced under that attempt, not admitted as a pre-identity send.
+      const sendToken = admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      );
+      expect(svc.admittedSendsByTaskId.get(taskId)?.size).toBe(1);
+      for (const send of svc.admittedSendsByTaskId.get(taskId) ?? []) {
+        expect(send.attemptId).toBe(row?.taskAttemptId);
+      }
+      sendToken.onDisposed("no-work");
+    });
+
     test.each(["missing-id", "owned-unsettled", "closing", "stale", "retired"] as const)(
       "manual recovery of a reported child refuses %s settlement evidence",
       async (evidence) => {

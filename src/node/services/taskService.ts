@@ -13901,13 +13901,16 @@ export class TaskService implements AgentTaskIntegration {
     // have its entry (refused below and at the fence) — so a manual follow-up mints a fresh
     // attempt for it exactly as the parent's reactivation does (lineage unproven: no settlement,
     // no receipt), instead of the fence admitting the continuation under the completed id.
+    // A reported row written before attempt identities existed (no taskAttemptId) is released
+    // the same way — nothing in this process can own or settle an id it never had — so it gets
+    // its first, unproven attempt here rather than running as an unfenced pre-identity send.
     const releasedReportedAttempt =
       settledPredecessor == null && !this.ownedAttemptByTaskId.has(workspaceId);
     const resumeSettledReportedTask =
       entryAtStart.workspace.taskStatus === "reported" &&
       entryAtStart.workspace.taskDesktopOwnerWorkspaceId == null &&
-      entryAtStart.workspace.taskAttemptId != null &&
-      ((settledPredecessor?.attemptId === entryAtStart.workspace.taskAttemptId &&
+      ((entryAtStart.workspace.taskAttemptId != null &&
+        settledPredecessor?.attemptId === entryAtStart.workspace.taskAttemptId &&
         settledPredecessor.phase === "settled") ||
         releasedReportedAttempt);
     if (
