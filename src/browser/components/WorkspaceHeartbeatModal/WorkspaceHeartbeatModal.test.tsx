@@ -4,6 +4,8 @@ import type { ReactNode } from "react";
 import { afterEach, afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient, UseAPIResult } from "@/browser/contexts/API";
 import * as WorkspaceHeartbeatHookModule from "@/browser/hooks/useWorkspaceHeartbeat";
@@ -28,6 +30,9 @@ async function restoreWorkspaceHeartbeatModalMocks() {
   await mock.module("@/browser/contexts/WorkspaceContext", () => actualWorkspaceContextModule);
 }
 
+// Bun module mocks are process-wide; this controlled-only stub would hide
+// uncontrolled dialogs in later suites unless the real exports are restored.
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
     props.open ? <div>{props.children}</div> : null,
