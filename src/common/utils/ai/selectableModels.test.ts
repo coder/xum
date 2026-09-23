@@ -29,7 +29,7 @@ const ANTHROPIC = ids("FABLE", "MYTHOS", "OPUS", "SONNET", "HAIKU");
 const OPENAI = ids(
   "GPT",
   "GPT_56_TERRA",
-  "GPT_56_LUNA",
+  "GPT_6_LUNA",
   "GPT_6_ASTRA",
   "GPT_PRO",
   "GPT_54_MINI",
@@ -198,7 +198,9 @@ describe("computeSelectableModels", () => {
 
   describe("authoritative catalogs", () => {
     test("coder gates gateway routing on discoveredModels and honors removedModels", () => {
-      const catalog = ["openai/gpt-5.6-sol", "openai/gpt-6-astra"];
+      // Follow the moving `gpt` alias so the catalog keeps listing the routed built-in.
+      const gptSlug = `openai/${KNOWN_MODELS.GPT.providerModelId}`;
+      const catalog = [gptSlug, "openai/gpt-6-astra"];
       const base = { apiKeySet: false, isEnabled: true, isConfigured: true };
 
       // Unknown catalog (discovery pending): permissive, every routable openai built-in shows.
@@ -207,7 +209,7 @@ describe("computeSelectableModels", () => {
           providersConfig: { coder: { ...base, models: catalog } },
           routePriority: ["coder"],
         })
-      ).toEqual(["coder:openai/gpt-5.6-sol", "coder:openai/gpt-6-astra", ...ANTHROPIC, ...OPENAI]);
+      ).toEqual([`coder:${gptSlug}`, "coder:openai/gpt-6-astra", ...ANTHROPIC, ...OPENAI]);
 
       // Known catalog: only listed models route through coder.
       expect(
@@ -216,7 +218,7 @@ describe("computeSelectableModels", () => {
           routePriority: ["coder"],
         })
       ).toEqual([
-        "coder:openai/gpt-5.6-sol",
+        `coder:${gptSlug}`,
         "coder:openai/gpt-6-astra",
         KNOWN_MODELS.GPT.id,
         KNOWN_MODELS.GPT_6_ASTRA.id,
@@ -235,13 +237,15 @@ describe("computeSelectableModels", () => {
           },
           routePriority: ["coder"],
         })
-      ).toEqual(["coder:openai/gpt-5.6-sol", KNOWN_MODELS.GPT.id]);
+      ).toEqual([`coder:${gptSlug}`, KNOWN_MODELS.GPT.id]);
     });
 
     test("github-copilot's persisted catalog gates the built-ins it can route", () => {
       expect(
         select({
-          providersConfig: { "github-copilot": provider({ models: ["gpt-5.6-sol"] }) },
+          providersConfig: {
+            "github-copilot": provider({ models: [KNOWN_MODELS.GPT.providerModelId] }),
+          },
           routePriority: ["github-copilot"],
         })
       ).toEqual([KNOWN_MODELS.GPT.id]);
@@ -255,7 +259,7 @@ describe("computeSelectableModels", () => {
     const CODEX_ALLOWED_BUILT_INS = ids(
       "GPT",
       "GPT_56_TERRA",
-      "GPT_56_LUNA",
+      "GPT_6_LUNA",
       "GPT_6_ASTRA",
       "GPT_54_MINI",
       "GPT_53_CODEX",
