@@ -61,6 +61,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
+    registerSanitizedTaskCheckout: async (_target, publish) => Ok(await publish()),
     discardExtensionMetadataEntry: () => Promise.resolve(),
     registerExternalBackgroundInit: () => undefined,
     getInfo: () => Promise.resolve(null),

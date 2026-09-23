@@ -19196,7 +19196,7 @@ describe("TaskService", () => {
     await fsPromises.access(workspacePath);
   }, 20_000);
 
-  test("rolls back a forked checkout when persistence throws after the fork", async () => {
+  test("retains a forked checkout, unregistered, when persistence throws after its transform ran", async () => {
     const config = await createTestConfig(rootDir);
     const childTaskId = "cccccccccc";
     stubStableIds(config, [childTaskId, "dddddddddd"], childTaskId);
@@ -19232,8 +19232,11 @@ describe("TaskService", () => {
       createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    // Deterministic post-fork failure: the transform that registers the child entry throws, so
-    // the checkout already exists on disk while nothing was persisted.
+    // Deterministic post-fork failure: the write that registers the child entry throws AFTER
+    // its transform ran. From outside Config that is indistinguishable from a write that
+    // committed and then threw, so the create verifies the registry instead of inferring a
+    // rollback: no row carries this launch, so nothing is marked — and nothing is deleted
+    // either (the checkout is retained, unregistered, and named in the error).
     const editConfig = config.editConfig.bind(config);
     const persistSpy = spyOn(config, "editConfig").mockImplementation((transform) =>
       editConfig((cfg) => {
@@ -19245,18 +19248,22 @@ describe("TaskService", () => {
         return next;
       })
     );
+    const forkedPath = runtime.getWorkspacePath(projectPath, `agent_explore_${childTaskId}`);
     try {
       const failed = await createAgentTask(taskService, parentId, "Inspect", { desktop: "shared" });
-      expect(failed).toEqual(Err("config persistence failed after fork"));
+      expect(failed.success).toBe(false);
+      if (failed.success) throw new Error("unreachable");
+      expect(failed.error).toContain("config persistence failed after fork");
+      expect(failed.error).toContain(`created at ${forkedPath} but not registered`);
     } finally {
       persistSpy.mockRestore();
     }
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
-    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith(childTaskId);
-    const forkedPath = runtime.getWorkspacePath(projectPath, `agent_explore_${childTaskId}`);
-    expect(existsSync(forkedPath)).toBe(false);
+    // Nothing was registered, so no extension metadata is tombstoned for the id.
+    expect(discardExtensionMetadataEntry).not.toHaveBeenCalled();
+    expect(existsSync(forkedPath)).toBe(true);
 
     // The owner's desktop is free again: the reservation never outlived the failed callback.
     const next = await createAgentTask(taskService, parentId, "Inspect again", {
