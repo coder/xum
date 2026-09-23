@@ -95,7 +95,7 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
     ).toMatchObject({ kind: "overlap", taskWorkspaceId: "task", taskPath: gitAdminDir });
   });
 
-  test("a protected row sharing the target's id (malformed duplicate) is still scanned: only the exact target entry is excluded", async () => {
+  test("a protected row sharing the target's id (malformed duplicate) makes the target ambiguous, and the scan still excludes only the exact target entry", async () => {
     const projectPath = path.join(tempDir, "repo");
     const rootCheckout = path.join(tempDir, "src", "repo", "root");
     await fsPromises.mkdir(rootCheckout, { recursive: true });
@@ -107,12 +107,33 @@ describe("workspaceStructuralMutationGuard proof-bearing rows", () => {
       parentWorkspaceId: "other",
       taskIsolation: "none",
     };
+    // Off-host first row in another bucket: classifying by the first row alone would skip
+    // the footprint scan entirely.
+    const offHost: Workspace = {
+      path: "/srv/dup",
+      id: "dup",
+      name: "dup",
+      runtimeConfig: { type: "ssh", host: "box.invalid", srcBaseDir: "/srv" },
+    };
     const snapshot: ProjectsConfig = {
       projects: new Map([[projectPath, { workspaces: [root, task] }]]),
     };
 
-    const target = classifyStructuralMutationTarget(snapshot, "dup");
-    expect(target).toMatchObject({ kind: "host-local-root", row: root });
+    expect(classifyStructuralMutationTarget(snapshot, "dup")).toEqual({
+      kind: "ambiguous",
+      count: 2,
+    });
+    expect(
+      classifyStructuralMutationTarget(
+        {
+          projects: new Map([
+            ["/srv/other", { workspaces: [offHost] }],
+            [projectPath, { workspaces: [task] }],
+          ]),
+        },
+        "dup"
+      )
+    ).toEqual({ kind: "ambiguous", count: 2 });
     expect(
       await findProtectedFootprintOverlap(snapshot, { row: root, bucketProjectPath: projectPath })
     ).toMatchObject({ kind: "overlap", taskPath: rootCheckout });

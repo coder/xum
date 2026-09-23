@@ -7296,13 +7296,16 @@ export class TaskService implements AgentTaskIntegration {
     /**
      * Launch failure after the config write was attempted but before this process took
      * ownership (launchAttempt unset): editConfig threw, or the write committed and a later step
-     * threw. Whether the row is durable is unknown, so nothing is inferred from in-memory state:
-     * the registry is re-read authoritatively and only a row carrying exactly this launch's
-     * attempt, checkout path and runtime is claimed and ended through failLaunch — the
-     * published-failure shape (interrupted marker on the row this launch owns; no deletion).
+     * threw — or after it, when the write returned but did not persist (launchAttempt set; see
+     * prepareTaskCheckouts). Whether the row is durable is unknown, so nothing is inferred from
+     * in-memory state: the registry is re-read authoritatively and only a row carrying exactly
+     * this launch's attempt, checkout path and runtime is claimed and ended through failLaunch —
+     * the published-failure shape (interrupted marker on the row this launch owns; no deletion).
      * Every other outcome — absent row, a row another writer re-admitted, an unreadable
      * registry — leaves rows and files untouched: the checkout is at worst an unregistered
-     * directory (unreachable, named for this task alone), and a foreign row is not ours to end.
+     * directory (unreachable, named for this task alone), and a foreign row is not ours to end
+     * (an attempt already begun is closed either way, and settled unless the registry is
+     * unreadable).
      * Returns whether the row was claimed and ended as this launch's.
      */
     const failPotentiallyPublishedLaunch = async (
@@ -7323,6 +7326,11 @@ export class TaskService implements AgentTaskIntegration {
           message,
           error: getErrorMessage(error),
         });
+        // An attempt `publish` already began stays closed and unsettled: no row is known, so
+        // nothing may bind to it and nothing proves it ended (failLaunch's fail-closed shape).
+        if (launchAttempt != null) {
+          this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
+        }
         return false;
       }
       const ours =
@@ -7336,9 +7344,13 @@ export class TaskService implements AgentTaskIntegration {
           workspacePath: checkout.workspacePath,
           rowPresent: committed != null,
         });
+        // `publish` returned (its save swallowed: see prepareTaskCheckouts) after beginning the
+        // launch's owned attempt, which no row of ours names: failLaunch closes it and settles it
+        // once nothing runs under it, so no Stop or reawaken meets an unsettled orphan.
+        if (launchAttempt != null) await failLaunch(message, runtimeForRollback, {});
         return false;
       }
-      launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
+      launchAttempt ??= this.beginOwnedTaskAttempt(taskId, "launch", {
         attemptId,
         receiptEligible: true,
       });
@@ -7623,8 +7635,14 @@ export class TaskService implements AgentTaskIntegration {
         );
         if (forkRefusal != null) return forkRefusal;
         if (!registration.success) {
-          // The lock itself (nothing forked) or a refused preparation (the fork retained).
-          return checkout == null ? Err(registration.error) : retainedRefusal(registration.error);
+          // The lock itself (nothing forked) or a refused preparation (the fork retained). A
+          // publication that did not persist (`publish` ran, its save swallowed) is a failure of
+          // an ATTEMPTED write instead: the failure path below re-reads the registry and ends
+          // the launch attempt `publish` began (see failPotentiallyPublishedLaunch).
+          if (checkout == null) return Err(registration.error);
+          return configWriteAttempted
+            ? Err(registration.error)
+            : retainedRefusal(registration.error);
         }
       } else {
         // A local-runtime fork shares the project directory (shared by construction) and an
