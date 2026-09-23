@@ -95,6 +95,7 @@ import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isProviderAutoRouteEligible } from "@/node/utils/providerRequirements";
 import { getContainerName as getDockerContainerName } from "@/node/runtime/DockerRuntime";
 import { deriveProjectHierarchy } from "@/common/utils/subProjects";
+import { deriveSharedTaskCheckouts } from "./sharedTaskCheckouts";
 import {
   type ProjectRegistrationLockHandle,
   tryProjectRegistrationFileLock,
@@ -1831,6 +1832,10 @@ export class Config {
       configModified = true;
     }
 
+    if (deriveSharedTaskCheckouts(projectsMap)) {
+      configModified = true;
+    }
+
     // Persistent sub-agents must survive a downgrade too. On first load of this behavior,
     // rewrite the previous false/missing default before TaskService startup can create durable
     // children; older builds will then keep their reported histories. The migration marker
@@ -2152,6 +2157,7 @@ export class Config {
         }),
         taskSettings: config.taskSettings ?? DEFAULT_TASK_SETTINGS,
       };
+      deriveSharedTaskCheckouts(new Map(data.projects));
 
       const muxGatewayEnabled = parseOptionalBoolean(config.muxGatewayEnabled);
       if (muxGatewayEnabled !== undefined) {

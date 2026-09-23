@@ -606,6 +606,7 @@ interface MaterializedTaskLaunch {
   runtimeForTaskWorkspace: Runtime;
   inheritedProjects: WorkspaceMetadata["projects"];
   sourceRuntimeConfigUpdate?: RuntimeConfig;
+  reusedExistingCheckout: boolean;
 }
 
 export type TaskMessageQueueDispatchMode = "tool-end" | "turn-end";
@@ -1537,6 +1538,31 @@ function buildWorkflowTimeoutFinalizationPrompt(
     return base;
   }
   return `${base}\n\nAdditional workflow-specific finalization instructions:\n${finalInstructions}`;
+}
+
+/**
+ * Fail host-local worktree reactivation before reporting success; otherwise a missing checkout
+ * surfaces only after the asynchronous turn starts. Remote readiness can start or provision
+ * runtimes.
+ */
+async function getMissingHostLocalCheckoutError(entry: {
+  projectPath: string;
+  workspace: WorkspaceConfigEntry;
+}): Promise<string | null> {
+  const { workspace } = entry;
+  const name = coerceNonEmptyString(workspace.name);
+  const runtimeConfig = workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+  if (name == null || !isWorktreeRuntime(runtimeConfig) || (workspace.projects?.length ?? 0) > 1) {
+    return null;
+  }
+  const runtime = createRuntimeForWorkspace({
+    runtimeConfig,
+    projectPath: entry.projectPath,
+    name,
+    namedWorkspacePath: coerceNonEmptyString(workspace.path),
+  });
+  const readiness = await runtime.ensureReady();
+  return readiness.ready ? null : readiness.error;
 }
 
 export class TaskService implements AgentTaskIntegration {
@@ -4653,6 +4679,7 @@ export class TaskService implements AgentTaskIntegration {
       forkedRuntimeConfig,
       runtimeForTaskWorkspace,
       inheritedProjects: workspace.projects ?? plan.parentMeta.projects,
+      reusedExistingCheckout: true,
     };
   }
 
@@ -4740,6 +4767,7 @@ export class TaskService implements AgentTaskIntegration {
         ...(forkResult.data.sourceRuntimeConfigUpdate != null
           ? { sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate }
           : {}),
+        reusedExistingCheckout: false,
       };
     });
   }
@@ -4844,9 +4872,6 @@ export class TaskService implements AgentTaskIntegration {
     // still exists, materialization reuses it (no fork); if it disappeared, materialization falls
     // back to forking a real workspace and the shared flag must be cleared below.
     const taskWasShared = entryAtStart.workspace.taskIsolation === "none";
-    const persistedSharedPath = taskWasShared
-      ? coerceNonEmptyString(entryAtStart.workspace.path)
-      : undefined;
 
     const initLogger = this.startWorkspaceInit(plan.taskId, plan.parentMeta.projectPath);
     // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) fork from the
@@ -4874,10 +4899,8 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // Reuse of the persisted shared path means the task still runs in the parent's checkout;
-    // any other materialized path means the fork fallback created a real (deletable) workspace.
-    const sharesParentCheckout =
-      taskWasShared && materialized.workspacePath === persistedSharedPath;
+    // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
+    const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
         runtime: materialized.runtimeForTaskWorkspace,
@@ -5897,6 +5920,14 @@ export class TaskService implements AgentTaskIntegration {
     const refreshedEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (refreshedEntry == null) {
       return Err({ code: "not_found" as const });
+    }
+    // Check after unarchiving: unarchive can restore a checkout that archiving deleted.
+    const checkoutError = await getMissingHostLocalCheckoutError(refreshedEntry);
+    if (checkoutError != null) {
+      return Err({
+        code: "send_failed" as const,
+        message: `Cannot reawaken sub-agent ${taskId}: its checkout is unavailable (${checkoutError}). Spawn a fresh sub-agent instead.`,
+      });
     }
     // Verified by the caller: not streaming and no active continuation, and
     // concurrent task-machinery sends serialize on the lifecycle + event

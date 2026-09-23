@@ -3081,6 +3081,124 @@ describe("Config", () => {
     });
   });
 
+  describe("shared-checkout task workspaces", () => {
+    const projectPath = "/fake/project";
+    const staleOwnerPath = "/fake/src/project/original";
+    const ownerPath = "/fake/src/project/renamed";
+
+    function writeWorkspaces(workspaces: Array<Record<string, unknown>>): void {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces }]],
+          // Other load-time migrations are done, so only the shared-checkout repair can write.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: {
+            persistentSubagentsDefaulted: true,
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+            daybreakModelsHidden: true,
+          },
+        })
+      );
+    }
+
+    function readPersistedWorkspace(id: string): Record<string, unknown> | undefined {
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+      };
+      return persisted.projects[0]?.[1].workspaces.find((ws) => ws.id === id);
+    }
+
+    function sharedTask(id: string, parentWorkspaceId: string): Record<string, unknown> {
+      return {
+        id,
+        name: `${id}-name`,
+        path: staleOwnerPath,
+        parentWorkspaceId,
+        taskIsolation: "none",
+        taskTrunkBranch: "original",
+      };
+    }
+
+    it("resolve nested shared children to the owner's current checkout", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "renamed", path: ownerPath },
+        sharedTask("child", "owner"),
+        sharedTask("grandchild", "child"),
+        {
+          id: "forked",
+          name: "forked-name",
+          path: "/fake/src/project/forked",
+          parentWorkspaceId: "owner",
+          taskTrunkBranch: "original",
+        },
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      const metadataById = new Map(
+        (await freshConfig.getAllWorkspaceMetadata()).map((metadata) => [metadata.id, metadata])
+      );
+      for (const id of ["child", "grandchild"]) {
+        expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(ownerPath);
+        expect(metadataById.get(id)?.namedWorkspacePath).toBe(ownerPath);
+        expect(metadataById.get(id)?.taskTrunkBranch).toBe("original");
+      }
+      expect(freshConfig.findWorkspace("forked")?.workspacePath).toBe("/fake/src/project/forked");
+    });
+
+    it("persist healed shared-child paths on load without another write", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "renamed", path: ownerPath },
+        sharedTask("child", "owner"),
+      ]);
+      const freshConfig = new Config(tempDir);
+      freshConfig.loadConfigOrDefault();
+
+      let childOnDisk: Record<string, unknown> | undefined;
+      // Edits run in order: this sees disk after load's queued repair, before this edit writes.
+      await freshConfig.editConfig((cfg) => {
+        childOnDisk = readPersistedWorkspace("child");
+        return cfg;
+      });
+      expect(childOnDisk?.path).toBe(ownerPath);
+    });
+
+    it("persist the owner's new checkout for shared children when a write moves the owner", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "original", path: staleOwnerPath },
+        sharedTask("child", "owner"),
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      await freshConfig.editConfig((cfg) => {
+        const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === "owner");
+        if (!owner) throw new Error("owner missing");
+        owner.name = "renamed";
+        owner.path = ownerPath;
+        return cfg;
+      });
+
+      expect(readPersistedWorkspace("child")).toMatchObject({
+        path: ownerPath,
+        taskTrunkBranch: "original",
+      });
+    });
+
+    it("keep persisted values when the owner chain is broken or cyclic", () => {
+      writeWorkspaces([
+        sharedTask("orphan", "missing-owner"),
+        sharedTask("cycle-a", "cycle-b"),
+        sharedTask("cycle-b", "cycle-a"),
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      for (const id of ["orphan", "cycle-a", "cycle-b"]) {
+        expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(staleOwnerPath);
+      }
+    });
+  });
+
   describe("getAllWorkspaceMetadata with migration", () => {
     it.each([false, true])(
       "derives task-family roots through archived rows and cycles (reversed=%s)",
