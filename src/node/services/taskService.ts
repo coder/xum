@@ -103,7 +103,7 @@ import {
   isProjectDirLocalRuntime,
   isWorktreeSemanticsRuntime,
   newMaterializationId,
-  sharedTaskRowPublicationRefusal,
+  taskRowPublicationRefusal,
   type TaskCheckoutPreparation,
   type TaskCheckoutSecondaryTarget,
 } from "@/node/services/taskCheckoutPreparation";
@@ -5849,7 +5849,7 @@ export class TaskService implements AgentTaskIntegration {
       // since. Re-derive each shared row in this locked write and refuse the batch (nothing is
       // written) instead of persisting ancestry that is already broken.
       for (const plan of plans) {
-        const stale = sharedTaskRowPublicationRefusal(config, plan.taskId);
+        const stale = taskRowPublicationRefusal(config, plan.taskId);
         if (stale != null) throw new Error(`Task.createMany: ${stale}`);
       }
       return config;
@@ -7133,7 +7133,7 @@ export class TaskService implements AgentTaskIntegration {
             config.projects.set(configProjectPath, projectConfig);
           }
           projectConfig.workspaces.push(queuedRow);
-          const stale = sharedTaskRowPublicationRefusal(config, taskId);
+          const stale = taskRowPublicationRefusal(config, taskId);
           if (stale != null) throw new Error(`Task.create: ${stale}`);
           this.desktopInputCoordinator.assertAdmission(config, taskId);
           return config;
@@ -7609,7 +7609,7 @@ export class TaskService implements AgentTaskIntegration {
             taskDesktopOwnerWorkspaceId,
             projects: inheritedProjects,
           });
-          const stale = sharedTaskRowPublicationRefusal(config, taskId);
+          const stale = taskRowPublicationRefusal(config, taskId);
           if (stale != null) throw new Error(`Task.create: ${stale}`);
           this.desktopInputCoordinator.assertAdmission(config, taskId);
           // Past the last pre-write refusal: from here the save may land whatever is thrown next.
