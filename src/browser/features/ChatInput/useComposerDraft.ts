@@ -138,7 +138,9 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         createdAt: 0,
       }))
     : attachedReviews;
-  const getDraft = () => ({ text: input, attachments });
+  // The latest attachments, not this render's: an edit opened in the same batch as a restore
+  // saves the pre-edit draft before the restore's attachment update has rendered.
+  const getDraft = () => ({ text: input, attachments: latestAttachmentsRef.current });
   const setDraft = (draft: { text: string; attachments: ChatAttachment[] }) => {
     setInput(draft.text);
     setAttachments(draft.attachments);

@@ -869,7 +869,7 @@ export class WorkspaceStore {
   // acknowledged. Consumed ids stay known so a re-delivery racing the acknowledgement is dropped.
   private pendingInputRestores = new Map<string, InputRestore[]>();
   private consumedInputRestoreIds = new Set<string>();
-  private inputRestoreConsumers = new Map<string, (restore: InputRestore) => void>();
+  private inputRestoreConsumers = new Map<string, (restore: InputRestore) => boolean>();
 
   // Lightweight activity snapshots from workspace.activity.list/subscribe.
   private workspaceActivity = new Map<string, WorkspaceActivitySnapshot>();
@@ -1614,12 +1614,14 @@ export class WorkspaceStore {
   /**
    * The workspace's composer takes retained unsent input (see pendingInputRestores): called now
    * for whatever arrived while it was not mounted, then for each later arrival. `consume` must
-   * apply the restoration synchronously; it is then acknowledged to the backend. Returns the
-   * unregister function (the last registration for a workspace wins).
+   * apply the restoration synchronously and return true; it is then acknowledged to the backend.
+   * Returning false declines it for now (a history edit owns the composer): it and every later
+   * arrival stay pending, in order, until the composer registers again. Returns the unregister
+   * function (the last registration for a workspace wins).
    */
   registerInputRestoreConsumer(
     workspaceId: string,
-    consume: (restore: InputRestore) => void
+    consume: (restore: InputRestore) => boolean
   ): () => void {
     assert(workspaceId.length > 0, "registerInputRestoreConsumer requires a workspaceId");
     this.inputRestoreConsumers.set(workspaceId, consume);
@@ -1649,12 +1651,15 @@ export class WorkspaceStore {
     const consume = this.inputRestoreConsumers.get(workspaceId);
     const pending = this.pendingInputRestores.get(workspaceId);
     if (consume == null || pending == null) return;
-    this.pendingInputRestores.delete(workspaceId);
-    for (const restore of pending) {
-      consume(restore);
+    while (pending.length > 0) {
+      const restore = pending[0];
+      // Declined: keep it (unacknowledged, so the backend keeps its copy) and everything after it.
+      if (!consume(restore)) return;
+      pending.shift();
       this.consumedInputRestoreIds.add(restore.restoreId);
       this.acknowledgeInputRestore(restore);
     }
+    this.pendingInputRestores.delete(workspaceId);
   }
 
   private acknowledgeInputRestore(restore: InputRestore): void {

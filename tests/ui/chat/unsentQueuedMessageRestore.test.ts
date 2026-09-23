@@ -155,6 +155,49 @@ async function waitForLastUserRow(
   );
 }
 
+/** The store's private retained-restore state (see WorkspaceStore.pendingInputRestores). */
+function restoreStore() {
+  // eslint-disable-next-line react-hooks/rules-of-hooks -- plain singleton accessor, no React state.
+  return useWorkspaceStoreRaw() as unknown as {
+    receiveInputRestore: (restore: InputRestore) => void;
+    pendingInputRestores: Map<string, InputRestore[]>;
+    consumedInputRestoreIds: Set<string>;
+  };
+}
+
+/** A retained (acknowledged-once) unsent-input restoration carrying text, a file and a review. */
+const retainedRestore = (app: AppHarness, name: string): InputRestore => ({
+  type: "restore-to-input",
+  workspaceId: app.workspaceId,
+  text: `${name} text`,
+  fileParts: [{ ...queuedFilePart, filename: `${name}.txt` }],
+  reviews: [composerReview(`${name} note`)],
+  mode: "append",
+  restoreId: `${name}-restore`,
+});
+
+const editTextarea = (app: AppHarness) =>
+  waitFor(() => {
+    const textarea = app.view.container.querySelector(
+      'textarea[aria-label="Edit your last message"]'
+    );
+    if (textarea == null) throw new Error("not editing yet");
+    return textarea as HTMLTextAreaElement;
+  }, LOAD_TOLERANT_WAIT);
+
+/** Send one plain message and return its transcript Edit button. */
+async function sendMessageAndFindEdit(app: AppHarness, messageText: string) {
+  await app.chat.send(messageText);
+  await app.chat.expectTranscriptContains(`Mock response: ${messageText}`);
+  await app.chat.expectStreamComplete();
+  const editButton = await waitFor(() => {
+    const button = app.view.container.querySelector('button[aria-label="Edit"]');
+    if (!(button instanceof HTMLElement)) throw new Error("no Edit button yet");
+    return button;
+  }, LOAD_TOLERANT_WAIT);
+  return editButton;
+}
+
 /**
  * Show a workspace the way the sidebar does (the store then moves its single onChat
  * subscription there) and wait until its composer is the mounted one.
@@ -679,6 +722,110 @@ describe("Unsent queued message restored to the composer", () => {
           .remove({ workspaceId: otherWorkspaceId, options: { force: true } })
           .catch(() => undefined);
       }
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("a restore retained while a history edit is open waits until the edit is cancelled", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-edit-cancel" });
+    try {
+      const editButton = await sendMessageAndFindEdit(app, "original message");
+      await app.chat.typeWithoutSending("draft before edit");
+      fireEvent.click(editButton);
+      const editor = await editTextarea(app);
+      await waitFor(() => expect(editor.value).toBe("original message"), LOAD_TOLERANT_WAIT);
+
+      act(() => restoreStore().receiveInputRestore(retainedRestore(app, "during-edit")));
+      // Kept for the composer (not applied to the edit, not acknowledged).
+      expect(
+        restoreStore()
+          .pendingInputRestores.get(app.workspaceId)
+          ?.map((restore) => restore.restoreId)
+      ).toEqual(["during-edit-restore"]);
+      expect(editor.value).toBe("original message");
+
+      fireEvent.keyDown(editor, { key: "Escape" });
+      await app.chat.expectInputValue(
+        "draft before edit\n\nduring-edit text",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      expect(composerAttachmentNames(app)).toEqual(["during-edit.txt"]);
+      await waitFor(
+        () => expect(app.view.container.textContent).toContain("during-edit note"),
+        LOAD_TOLERANT_WAIT
+      );
+      expect(restoreStore().pendingInputRestores.has(app.workspaceId)).toBe(false);
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("a restore retained while a history edit is open is applied after the edit is submitted", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-edit-submit" });
+    try {
+      const editButton = await sendMessageAndFindEdit(app, "original message");
+      fireEvent.click(editButton);
+      const editor = await editTextarea(app);
+      act(() => restoreStore().receiveInputRestore(retainedRestore(app, "during-submit")));
+      expect(restoreStore().pendingInputRestores.get(app.workspaceId)).toHaveLength(1);
+
+      act(() => updatePersistedState(getInputKey(app.workspaceId), "edited message"));
+      await waitFor(() => expect(editor.value).toBe("edited message"), LOAD_TOLERANT_WAIT);
+      const sendButton = await waitFor(() => {
+        const button = editor
+          .closest('[data-component="ChatInputSection"]')
+          ?.querySelector('button[aria-label="Send message"]');
+        if (button == null || (button as HTMLButtonElement).disabled) {
+          throw new Error("edit send not ready");
+        }
+        return button as HTMLButtonElement;
+      }, LOAD_TOLERANT_WAIT);
+      fireEvent.click(sendButton);
+
+      await app.chat.expectTranscriptContains("Mock response: edited message");
+      // The edit went out on its own; the restored input then lands in the emptied composer.
+      const sent = await waitForLastUserRow(app, "edited message");
+      expect(sent.text).not.toContain("during-submit");
+      await app.chat.expectInputValue("during-submit text", LOAD_TOLERANT_WAIT.timeout);
+      expect(composerAttachmentNames(app)).toEqual(["during-submit.txt"]);
+      await waitFor(
+        () => expect(app.view.container.textContent).toContain("during-submit note"),
+        LOAD_TOLERANT_WAIT
+      );
+      expect(restoreStore().pendingInputRestores.has(app.workspaceId)).toBe(false);
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("restores delivered in the same batch that opens or closes a history edit are kept", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-edit-boundary" });
+    try {
+      const editButton = await sendMessageAndFindEdit(app, "original message");
+      await app.chat.typeWithoutSending("draft before edit");
+      // Applied just before the edit takes over: part of the draft the edit saves and restores.
+      act(() => {
+        fireEvent.click(editButton);
+        restoreStore().receiveInputRestore(retainedRestore(app, "opening"));
+      });
+      const editor = await editTextarea(app);
+      await waitFor(() => expect(editor.value).toBe("original message"), LOAD_TOLERANT_WAIT);
+      // Arrives while the edit is still open: held until the pre-edit draft is back.
+      act(() => {
+        fireEvent.keyDown(editor, { key: "Escape" });
+        restoreStore().receiveInputRestore(retainedRestore(app, "closing"));
+      });
+      await app.chat.expectInputValue(
+        "draft before edit\n\nopening text\n\nclosing text",
+        LOAD_TOLERANT_WAIT.timeout
+      );
+      expect(composerAttachmentNames(app)).toEqual(["opening.txt", "closing.txt"]);
+      await waitFor(
+        () => expect(app.view.container.textContent).toContain("2 reviews attached"),
+        LOAD_TOLERANT_WAIT
+      );
+      expect(restoreStore().pendingInputRestores.has(app.workspaceId)).toBe(false);
+    } finally {
       await app.dispose();
     }
   }, 90_000);

@@ -1477,10 +1477,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Unsent input the backend handed back for this workspace (a refused queued message) can arrive
   // while another workspace's composer is shown; the store keeps it until this composer takes it.
+  // A history edit owns the composer: the restore is not taken while one is open (cancelling the
+  // edit would put the pre-edit draft back over it after the store had acknowledged it). The
+  // consumer also declines while the edit is current (editingMessageIdRef is assigned during
+  // render), covering deliveries between the render that opens an edit and this effect's cleanup.
+  // Keyed on the prop, not editingMessageForUi: a submitted edit stays open until it succeeds.
+  const historyEditOpen = editingMessage != null;
   useEffect(() => {
-    if (workspaceIdForComposerClear == null) return;
-    return store.registerInputRestoreConsumer(workspaceIdForComposerClear, applyInputUpdate);
-  }, [applyInputUpdate, store, workspaceIdForComposerClear]);
+    if (workspaceIdForComposerClear == null || historyEditOpen) return;
+    return store.registerInputRestoreConsumer(workspaceIdForComposerClear, (restore) => {
+      if (editingMessageIdRef.current != null) return false;
+      applyInputUpdate(restore);
+      return true;
+    });
+  }, [applyInputUpdate, historyEditOpen, store, workspaceIdForComposerClear]);
 
   useEffect(() => {
     const handler = (event: CustomEvent<{ workspaceId: string }>) => {
