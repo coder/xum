@@ -12553,6 +12553,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
+    // Task-attempt obligation (see sendMessage): a caller-supplied token is this method's from
+    // entry, so EVERY exit before the session handoff — each preflight return below, a throw —
+    // disposes it; a pending obligation nobody holds would keep a later Stop's latch waiting on
+    // it for good. Disposed as refused on error and as no-work when the resume returned without
+    // starting a turn; an admitted one belongs to its turn and ignores this disposal. A token the
+    // fence mints further down is assigned here and covered the same way.
+    let taskTurnAdmission: TurnAdmissionToken | undefined = internal?.turnAdmission;
+    let resumeRefused = true;
+    using _taskTurnAdmissionScope = {
+      [Symbol.dispose]: () => taskTurnAdmission?.onDisposed(resumeRefused ? "refused" : "no-work"),
+    };
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -12695,7 +12706,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
-      if (resumeStale() || resumeIntent?.signal.aborted) return Ok({ started: false });
+      if (resumeStale() || resumeIntent?.signal.aborted) {
+        resumeRefused = false;
+        return Ok({ started: false });
+      }
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
@@ -12715,9 +12729,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       resumedInterruptedTask = reawaken?.kind === "reawakened" && reawaken.statusChanged;
 
       // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
-      // carries the same obligation, bound after the rescue above. Disposed as no-work when the
-      // session did not start a turn, refused on error; an admitted one belongs to its turn.
-      let taskTurnAdmission: TurnAdmissionToken | undefined = internal?.turnAdmission;
+      // carries the same obligation, bound after the rescue above (disposal: method entry).
       if (taskTurnAdmission == null) {
         const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
           acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
@@ -12728,11 +12740,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         if (admission?.kind === "admitted") taskTurnAdmission = admission.token;
       }
-      let resumeRefused = true;
-      using _taskTurnAdmissionScope = {
-        [Symbol.dispose]: () =>
-          taskTurnAdmission?.onDisposed(resumeRefused ? "refused" : "no-work"),
-      };
       if (taskTurnAdmission?.admissionStale() === true) {
         return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
       }

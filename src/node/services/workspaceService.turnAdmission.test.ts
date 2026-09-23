@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import path from "path";
 
@@ -131,7 +131,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
       workspaceId,
       harness.session
     );
-    return { service, session: harness.session, aiService };
+    return { service, session: harness.session, aiService, historyService };
   }
 
   function integration(
@@ -311,4 +311,49 @@ describe("WorkspaceService task-attempt admission fence", () => {
     expect(order).toEqual(["rescue", "fence"]);
     expect(token.events).toEqual(["admitted"]);
   });
+  test.each([
+    "workspace being renamed",
+    "compaction capture failed",
+    "reawaken lost the race",
+  ] as const)(
+    "resumeStream owns a caller-minted token from entry: an early return before the handoff (%s) disposes it as refused",
+    async (exit) => {
+      const { service, aiService, historyService } = await createFixture();
+      const minted = recordingToken();
+      service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          admitTaskWorkspaceTurn: mock(() => {
+            throw new Error("the fence must not mint a second obligation");
+          }),
+          ...(exit === "reawaken lost the race"
+            ? {
+                reawakenInterruptedTask: mock(() =>
+                  Promise.resolve({ kind: "refused" as const, message: "lost the reawaken" })
+                ),
+              }
+            : {}),
+        })
+      );
+      if (exit === "workspace being renamed") {
+        (service as unknown as { renamingWorkspaces: Set<string> }).renamingWorkspaces.add(
+          workspaceId
+        );
+      }
+      if (exit === "compaction capture failed") {
+        spyOn(historyService, "captureCompactionReplacement").mockResolvedValue({
+          success: false,
+          error: "history unreadable",
+        });
+      }
+      const result = await service.resumeStream(
+        workspaceId,
+        { model, agentId: "exec" },
+        { acceptanceOrigin: "automatic", allowQueuedAgentTask: true, turnAdmission: minted }
+      );
+      expect(result.success).toBe(false);
+      expect(streamCalls(aiService)).toBe(0);
+      // Neither left pending (a later Stop would wait on it forever) nor handed to a turn.
+      expect(minted.events).toEqual(["disposed:refused"]);
+    }
+  );
 });
