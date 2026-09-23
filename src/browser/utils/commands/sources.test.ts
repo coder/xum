@@ -1216,6 +1216,32 @@ test("buildCoreSources includes rebuild analytics database action with discovera
   expect(rebuildAction?.keywords).toContain("stats");
 });
 
+test("toggle keep screen awake command inverts the persisted config flag", async () => {
+  let keepScreenAwake = false;
+  const updateKeepScreenAwake = mock((input: { enabled: boolean }) => {
+    keepScreenAwake = input.enabled;
+    return Promise.resolve();
+  });
+  const actions = getActions({
+    api: {
+      config: {
+        getConfig: () => Promise.resolve({ keepScreenAwake }),
+        updateKeepScreenAwake,
+      },
+    } as unknown as APIClient,
+  });
+  const toggleAction = actions.find((a) => a.id === "settings:toggle-keep-screen-awake");
+
+  expect(toggleAction).toBeDefined();
+  await toggleAction!.run();
+  expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: true });
+
+  // Reads the current backend value each time instead of tracking local state.
+  await toggleAction!.run();
+  expect(updateKeepScreenAwake).toHaveBeenLastCalledWith({ enabled: false });
+  expect(keepScreenAwake).toBe(false);
+});
+
 test("analytics rebuild command calls route and dispatches toast feedback", async () => {
   const rebuildDatabase = mock(() => Promise.resolve({ success: true, workspacesIngested: 4 }));
 

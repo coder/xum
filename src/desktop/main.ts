@@ -43,6 +43,7 @@ if (process.platform === "darwin") {
 }
 
 import { DesktopWindowManager } from "./desktopWindowManager";
+import { KeepAwakeController } from "./keepAwake";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
 import {
   REMOTE_CONNECTION_CHANNELS,
@@ -75,6 +76,7 @@ import {
   dialog,
   nativeImage,
   nativeTheme,
+  powerSaveBlocker,
   screen,
   shell,
 } from "electron";
@@ -216,6 +218,8 @@ import { log } from "@/node/services/log";
 let config: Config | null = null;
 let services: ServiceContainer | null = null;
 let remoteConnectionManager: RemoteConnectionManager | null = null;
+// Holds the display-sleep blocker while local agents work (opt-in via config.keepScreenAwake).
+let keepAwake: KeepAwakeController | null = null;
 const localIpcWindows = new Map<WebContents, URL>();
 
 function isTrustedLocalUrl(target: string, expected: URL): boolean {
@@ -770,6 +774,23 @@ async function loadServices(): Promise<void> {
   // Keep the latest update status in main so close-to-tray can prompt for installs.
   services.updateService.onStatus((status) => {
     latestUpdateStatus = status;
+  });
+
+  // Backend services run in-process here, so main can observe workspace activity directly.
+  // Only local activity is tracked: remote-backend windows run their agents elsewhere.
+  keepAwake = new KeepAwakeController({
+    blocker: powerSaveBlocker,
+    isEnabled: () => stores.config.getKeepScreenAwakeEnabled(),
+    onEnabledChanged: (callback) => stores.config.onConfigChanged(callback),
+    activity: services.workspaceService,
+  });
+  // Do not await: the initial activity seed enumerates config and probes workspace state on
+  // disk, which can be slow on large stores and must not keep the window behind the splash
+  // screen. start() subscribes synchronously, so live events already reconcile while the
+  // seed is in flight, and dispose() on quit is safe mid-seed.
+  keepAwake.start().catch((error: unknown) => {
+    // Startup must never fail over an optional convenience; live events still reconcile.
+    log.error("keep-awake: failed to start controller", { error });
   });
 
   // Generate auth token (use env var or random per-session)
@@ -1404,6 +1425,10 @@ async function startDesktopAfterStorage(): Promise<void> {
     // IMPORTANT: must be set before any early returns.
     isQuitting = true;
     remoteConnectionManager?.dispose();
+    // Release the display-sleep blocker before services tear down; Electron would drop it on
+    // exit anyway, but a slow dispose must not keep the screen awake meanwhile.
+    keepAwake?.dispose();
+    keepAwake = null;
     if (isUpdateInstallInProgress()) {
       // Don't block updater-driven quitAndInstall() — let Electron quit immediately
       // so the platform installer can take over. Best-effort cleanup only.

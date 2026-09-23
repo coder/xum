@@ -472,6 +472,14 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateLlmDebugLogs(input.enabled));
           })
         ),
+      updateKeepScreenAwake: t
+        .input(schemas.config.updateKeepScreenAwake.input)
+        .output(schemas.config.updateKeepScreenAwake.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateKeepScreenAwake(input.enabled));
+          })
+        ),
       updateHeartbeatDefaultPrompt: t
         .input(schemas.config.updateHeartbeatDefaultPrompt.input)
         .output(schemas.config.updateHeartbeatDefaultPrompt.output)
