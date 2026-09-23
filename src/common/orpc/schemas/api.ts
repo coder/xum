@@ -147,6 +147,7 @@ import {
 import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
+  EvaluationDefaultsSchema,
   ModelFallbacksSchema,
   UpdateChannelSchema,
 } from "../../config/schemas/appConfigOnDisk";
@@ -2644,6 +2645,7 @@ export const config = {
       heartbeatDefaultPrompt: z.string().optional(),
       heartbeatDefaultIntervalMs: z.number().optional(),
       goalDefaults: GoalDefaultsConfigSchema,
+      evaluationDefaults: EvaluationDefaultsSchema.optional(),
     }),
   },
   saveConfig: {
@@ -2801,6 +2803,15 @@ export const config = {
     input: z
       .object({
         goalDefaults: GoalDefaultsConfigSchema,
+      })
+      .strict(),
+    output: z.void(),
+  },
+  updateEvaluationDefaults: {
+    input: z
+      .object({
+        // Blank or null clears the default.
+        model: z.string().nullish(),
       })
       .strict(),
     output: z.void(),

@@ -7,6 +7,7 @@ import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchive
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type {
   AppConfigMigrations,
+  EvaluationDefaults,
   ModelFallbacks,
   UpdateChannel,
 } from "@/common/config/schemas/appConfigOnDisk";
@@ -104,6 +105,8 @@ export interface ProjectsConfig {
   heartbeatDefaultIntervalMs?: number;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
+  /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
+  evaluationDefaults?: EvaluationDefaults;
   muxGatewayModels?: string[];
   routePriority?: string[];
   routeOverrides?: Record<string, string>;

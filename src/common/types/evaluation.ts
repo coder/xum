@@ -127,8 +127,18 @@ export const WorkflowEvaluateSpecSchema = z.strictObject({
     .string()
     .min(1)
     .refine((id) => id.trim().length > 0, "id must be a non-blank step id"),
-  title: z.string().optional(),
-  model: z.string().optional(),
+  // Optional UI label. Blank is rejected rather than normalized because the
+  // `evaluation` run event requires a non-empty title when present.
+  title: z
+    .string()
+    .refine((title) => title.trim().length > 0, "title must be a non-blank string")
+    .optional(),
+  // A blank model must not silently shadow the CLI/Settings default, so it is
+  // rejected up front instead of reaching the resolver as an unknown model.
+  model: z
+    .string()
+    .refine((model) => model.trim().length > 0, "model must be a non-blank model string")
+    .optional(),
   timeoutMs: z.number().int().positive().optional(),
   questions: EvaluationQuestionsSchema,
   providerOptions: EvaluationProviderOptionsSchema.optional(),
@@ -259,6 +269,40 @@ export const EvaluationErrorCodeSchema = z.enum([
   "unknown",
 ]);
 export type EvaluationErrorCode = z.infer<typeof EvaluationErrorCodeSchema>;
+
+/**
+ * Failure identity of a workflow `evaluate()` step: the service reasons above
+ * plus the runner's own lifecycle outcomes (attempt budget, model selection,
+ * persisted-admission checks). Persisted on `evaluation` run events and
+ * interpolated into the fixed failure template, so the set stays finite and
+ * free of provider or author text.
+ */
+export const EvaluationStepFailureReasonSchema = z.enum([
+  ...EvaluationErrorReasonSchema.options,
+  "deadline",
+  "unauthorized",
+  "admission-mismatch",
+  "admission-missing",
+  "attempts-exhausted",
+]);
+export type EvaluationStepFailureReason = z.infer<typeof EvaluationStepFailureReasonSchema>;
+
+export const EvaluationStepFailureCodeSchema = z.enum([
+  ...EvaluationErrorCodeSchema.options,
+  // Runner lifecycle outcomes mirror their reason (like `deadline/deadline`).
+  "deadline",
+  "unauthorized",
+  "admission-mismatch",
+  "admission-missing",
+  "attempts-exhausted",
+  // `invalid-input`: neither the call, the CLI, nor Settings named a model.
+  "no-model",
+  // `unsupported`: `createEvaluationModel` rejections.
+  "unsupported-provider",
+  "unsupported-route",
+  "unknown-model",
+]);
+export type EvaluationStepFailureCode = z.infer<typeof EvaluationStepFailureCodeSchema>;
 
 // ---------------------------------------------------------------------------
 // Question-aware answer validation

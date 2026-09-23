@@ -388,7 +388,8 @@ function derivePhaseLifecycle(input: {
 }
 
 // Events that belong to a step. Steps are recorded via task events (agent steps) and also via
-// patch (apply-patch), workflow (nested-workflow), and legacy action/validation events. Phase
+// patch (apply-patch), workflow (nested-workflow), evaluation (`evaluate()`), and legacy
+// action/validation events. Phase
 // assignment keys off the first of ANY of these per stepId so every step lands in its phase.
 function stepBearingEventStepId(event: WorkflowRunEvent): string | null {
   switch (event.type) {
@@ -398,6 +399,7 @@ function stepBearingEventStepId(event: WorkflowRunEvent): string | null {
     case "patch":
     case "action":
     case "validation":
+    case "evaluation":
       return event.stepId;
     default:
       return null;
@@ -512,7 +514,7 @@ export function projectWorkflowRun(
     }
     if (!stepTitle.has(stepId)) {
       if (
-        (event.type === "agent-step" || event.type === "task") &&
+        (event.type === "agent-step" || event.type === "task" || event.type === "evaluation") &&
         event.title != null &&
         event.title.length > 0
       ) {

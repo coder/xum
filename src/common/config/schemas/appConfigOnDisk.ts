@@ -106,6 +106,22 @@ export const ModelFallbackEntrySchema = z.object({
 /** Per-model fallback chains, keyed by canonical source model. */
 export const ModelFallbacksSchema = z.record(z.string(), ModelFallbackEntrySchema);
 
+/**
+ * Settings → Tasks & Workflows → Evaluation model: the default for workflow
+ * `evaluate()` steps that do not pass `model` themselves (a `provider:model`
+ * string). Absent means "no default" — the step fails with
+ * `invalid-input/no-model`; it is never inferred from the chat model.
+ *
+ * Deliberately separate from `autoModelRouting.evaluationModel` below: that one
+ * selects the prompt-difficulty classifier for automatic chat model routing
+ * (defaulting to TypeSafe's Jev), whereas this one selects an explicit,
+ * author-invoked workflow evaluator with its own admission and billing
+ * semantics. Neither falls back to the other.
+ */
+export const EvaluationDefaultsSchema = z.object({
+  model: z.string().min(1).optional(),
+});
+
 export const AppConfigMigrationsSchema = z
   .object({
     /**
@@ -164,6 +180,7 @@ export const AppConfigOnDiskSchema = z
       .max(HEARTBEAT_MAX_INTERVAL_MS)
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
+    evaluationDefaults: EvaluationDefaultsSchema.optional(),
     muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
@@ -239,6 +256,7 @@ export type AgentAiDefaultsEntry = z.infer<typeof AgentAiDefaultsEntrySchema>;
 export type AgentAiDefaults = z.infer<typeof AgentAiDefaultsSchema>;
 export type SubagentAiDefaults = z.infer<typeof SubagentAiDefaultsSchema>;
 export type ModelFallbacks = z.infer<typeof ModelFallbacksSchema>;
+export type EvaluationDefaults = z.infer<typeof EvaluationDefaultsSchema>;
 export type UpdateChannel = z.infer<typeof UpdateChannelSchema>;
 
 export type AppConfigOnDisk = z.infer<typeof AppConfigOnDiskSchema>;

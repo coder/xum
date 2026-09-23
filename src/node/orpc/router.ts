@@ -508,6 +508,14 @@ export const router = (authToken?: string) => {
             yield* atomicPromise(async () => context.config.updateGoalDefaults(input.goalDefaults));
           })
         ),
+      updateEvaluationDefaults: t
+        .input(schemas.config.updateEvaluationDefaults.input)
+        .output(schemas.config.updateEvaluationDefaults.output)
+        .handler(
+          handlerGen(function* ({ context }, input) {
+            yield* atomicPromise(async () => context.config.updateEvaluationDefaults(input));
+          })
+        ),
       unenrollMuxGovernor: t
         .input(schemas.config.unenrollMuxGovernor.input)
         .output(schemas.config.unenrollMuxGovernor.output)

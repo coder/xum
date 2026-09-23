@@ -468,6 +468,63 @@ describe("projectWorkflowRun — non-task step events", () => {
     expect(view.phases.some((phase) => phase.name === "")).toBe(false);
   });
 
+  test("assigns evaluation steps to the active phase and titles them from the event", () => {
+    const events: WorkflowRunEvent[] = [
+      { sequence: 1, type: "phase", at: at(1), name: "screen" },
+      {
+        sequence: 2,
+        type: "evaluation",
+        at: at(1),
+        stepId: "screen-issue",
+        inputHash: "h",
+        attempt: 1,
+        status: "started",
+        title: "Screen issue text",
+        modelString: "anthropic:claude-haiku-4-5",
+      },
+      {
+        sequence: 3,
+        type: "evaluation",
+        at: at(3),
+        stepId: "screen-issue",
+        inputHash: "h",
+        attempt: 1,
+        status: "completed",
+        responseModelId: "claude-haiku-4-5-20251001",
+      },
+      {
+        sequence: 4,
+        type: "evaluation",
+        at: at(4),
+        stepId: "untitled-eval",
+        inputHash: "h",
+        attempt: 1,
+        status: "started",
+      },
+    ];
+    const steps: WorkflowStepRecord[] = [
+      {
+        stepId: "screen-issue",
+        inputHash: "h",
+        status: "completed",
+        startedAt: at(1),
+        completedAt: at(3),
+      },
+      { stepId: "untitled-eval", inputHash: "h", status: "started", startedAt: at(4) },
+    ];
+    const view = projectWorkflowRun(makeRun({ events, steps }));
+
+    const screened = view.steps.find((step) => step.stepId === "screen-issue");
+    expect(screened?.phaseName).toBe("screen");
+    expect(screened?.title).toBe("Screen issue text");
+    // Evaluation steps never spawn a child workspace.
+    expect(screened?.taskId).toBeUndefined();
+    expect(screened?.taskWorkspaceId).toBeUndefined();
+    // Without an author title the step id remains the label.
+    expect(view.steps.find((step) => step.stepId === "untitled-eval")?.title).toBe("untitled-eval");
+    expect(view.phases.some((phase) => phase.name === "")).toBe(false);
+  });
+
   test("synthesizes a running step for reservation-only agent-step events", () => {
     const events: WorkflowRunEvent[] = [
       { sequence: 1, type: "phase", at: at(1), name: "branch-recon" },

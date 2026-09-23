@@ -1,6 +1,12 @@
 import { z } from "zod";
 
 import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
+import {
+  EvaluationAdmissionSchema,
+  EvaluationStepFailureCodeSchema,
+  EvaluationStepFailureReasonSchema,
+  EvaluationStepResultSchema,
+} from "@/common/types/evaluation";
 
 export const WorkflowNameSchema = z
   .string()
@@ -219,6 +225,30 @@ export const WorkflowRunEventSchema = z.discriminatedUnion("type", [
     success: z.boolean(),
     message: z.string().min(1).optional(),
   }),
+  // Progress of a workflow `evaluate()` step. Display data only: the admission
+  // on the step record is the source of truth for resume/replay. `title`,
+  // `modelString` and `responseModelId` are untrusted display metadata (author
+  // or provider text) and must only ever be rendered through React escaping,
+  // never interpolated into anything a model reads automatically.
+  z.object({
+    sequence: z.number().int().positive(),
+    type: z.literal("evaluation"),
+    at: IsoDateTimeSchema,
+    stepId: z.string().min(1),
+    inputHash: z.string().min(1),
+    attempt: z.number().int().positive(),
+    status: z.enum(["started", "completed", "failed", "cached"]),
+    title: z.string().min(1).optional(),
+    modelString: z.string().min(1).optional(),
+    responseModelId: z.string().min(1).optional(),
+    usage: EvaluationStepResultSchema.shape.usage.optional(),
+    stateBytes: z.number().int().nonnegative().optional(),
+    questionCount: z.number().int().positive().optional(),
+    reason: EvaluationStepFailureReasonSchema.optional(),
+    code: EvaluationStepFailureCodeSchema.optional(),
+    statusCode: z.number().int().optional(),
+    defect: z.boolean().optional(),
+  }),
   z.object({
     sequence: z.number().int().positive(),
     type: z.literal("result"),
@@ -273,6 +303,12 @@ export const WorkflowStepRecordSchema = z.object({
   result: StructuredTaskOutputSchema.optional(),
   timeout: WorkflowStepTimeoutMetadataSchema.optional(),
   error: z.string().min(1).optional(),
+  // Present on every record of an `evaluate()` step (absent on agent/patch
+  // records). Written atomically with the `started` record and carried on the
+  // later `completed`/`failed` record so the latest-wins merge always retains
+  // the admitted selection; resume re-validates against it instead of the
+  // current Settings default.
+  evaluation: EvaluationAdmissionSchema.optional(),
 });
 
 const WorkflowRunStatusTransitions: Record<
