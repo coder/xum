@@ -162,6 +162,47 @@ describe("Unsent queued message restored to the composer", () => {
     }
   }, 60_000);
 
+  test("two refusals restored in the same drain both land: their text, attachments and reviews compose", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-same-drain" });
+    const review = (note: string) => ({
+      filePath: "src/file.ts",
+      lineRange: "1",
+      selectedCode: "call()",
+      userNote: note,
+    });
+    try {
+      await app.chat.typeWithoutSending("draft");
+      const workspaceService = app.env.services.workspaceService;
+      workspaceService.getOrCreateSession(app.workspaceId);
+      // One drain refuses two token-sealed entries back to back: both restores reach the composer
+      // before React re-renders, so neither may read the other's render-time snapshot.
+      for (const name of ["first", "second"]) {
+        workspaceService.emitChatEvent(app.workspaceId, {
+          type: "restore-to-input",
+          workspaceId: app.workspaceId,
+          text: `${name} refused`,
+          fileParts: [{ ...queuedFilePart, filename: `${name}.txt` }],
+          reviews: [review(`${name} note`)],
+          mode: "append",
+        });
+      }
+      await app.chat.expectInputValue("draft\n\nfirst refused\n\nsecond refused");
+      await waitFor(() => {
+        expect(app.view.container.textContent).toContain("2 reviews attached");
+      });
+      expect(app.view.container.textContent).toContain("first note");
+      expect(app.view.container.textContent).toContain("second note");
+      expect(
+        readPersistedState<Array<{ filename?: string }>>(
+          getInputAttachmentsKey(app.workspaceId),
+          []
+        ).map((attachment) => attachment.filename)
+      ).toEqual(["first.txt", "second.txt"]);
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
   test("the default restore (a Stop's queued input) still replaces the draft", async () => {
     const app = await createAppHarness({ branchPrefix: "unsent-replace" });
     try {
