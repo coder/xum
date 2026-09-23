@@ -99,7 +99,11 @@ import {
   type LiveBashOutputView,
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
+import {
+  getAppliedInputRestoresKey,
+  getAutoRetryKey,
+  getPinnedTodoExpandedKey,
+} from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
@@ -299,6 +303,18 @@ export interface WorkspaceSidebarState {
  * Currently only recency timestamps for workspace sorting.
  */
 type DerivedState = Record<string, number>;
+
+/**
+ * Restore ids applied to `workspaceId`'s composer whose acknowledgement has not succeeded (see
+ * getAppliedInputRestoresKey). `stored` is an already-read value; a malformed one reads as empty.
+ */
+function readAppliedInputRestoreIds(workspaceId: string, stored?: unknown): string[] {
+  const value =
+    stored !== undefined
+      ? stored
+      : readPersistedState<unknown>(getAppliedInputRestoresKey(workspaceId), []);
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
+}
 
 /** A backend-retained restore-to-input (see WorkspaceStore.pendingInputRestores). */
 export type InputRestore = Extract<WorkspaceChatMessage, { type: "restore-to-input" }> & {
@@ -1635,8 +1651,13 @@ export class WorkspaceStore {
 
   private receiveInputRestore(restore: InputRestore): void {
     assert(restore.restoreId.length > 0, "a retained input restore needs a restoreId");
-    if (this.consumedInputRestoreIds.has(restore.restoreId)) {
-      // Re-delivered by a replay that raced (or outlived a lost) acknowledgement: already applied.
+    if (
+      this.consumedInputRestoreIds.has(restore.restoreId) ||
+      readAppliedInputRestoreIds(restore.workspaceId).includes(restore.restoreId)
+    ) {
+      // Re-delivered by a replay that raced (or outlived a lost) acknowledgement — possibly
+      // after a renderer reload, which only the persisted record survives: already applied.
+      this.consumedInputRestoreIds.add(restore.restoreId);
       this.acknowledgeInputRestore(restore);
       return;
     }
@@ -1657,6 +1678,12 @@ export class WorkspaceStore {
       if (!consume(restore)) return;
       pending.shift();
       this.consumedInputRestoreIds.add(restore.restoreId);
+      // Recorded durably in the same task, after consume's synchronous draft/attachment/review
+      // writes: a crash before this line re-applies (duplicates) rather than loses the input.
+      updatePersistedState<string[] | undefined>(
+        getAppliedInputRestoresKey(workspaceId),
+        (previous) => [...readAppliedInputRestoreIds(workspaceId, previous), restore.restoreId]
+      );
       this.acknowledgeInputRestore(restore);
     }
     this.pendingInputRestores.delete(workspaceId);
@@ -1670,7 +1697,19 @@ export class WorkspaceStore {
       .then((result) => {
         if (!result.success) {
           console.warn(`Failed to acknowledge restored input for ${restore.workspaceId}:`, result);
+          return;
         }
+        // The backend dropped its copy and will not replay it: the record may forget the id.
+        // (A failed acknowledgement keeps it, so a later replay is dropped and re-acknowledged.)
+        updatePersistedState<string[] | undefined>(
+          getAppliedInputRestoresKey(restore.workspaceId),
+          (previous) => {
+            const remaining = readAppliedInputRestoreIds(restore.workspaceId, previous).filter(
+              (id) => id !== restore.restoreId
+            );
+            return remaining.length > 0 ? remaining : undefined;
+          }
+        );
       })
       .catch((error) => {
         console.warn(`Failed to acknowledge restored input for ${restore.workspaceId}:`, error);

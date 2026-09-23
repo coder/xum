@@ -16,6 +16,7 @@ import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
 import { HistoryService } from "@/node/services/historyService";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import { generateBranchName } from "../../ipc/helpers";
@@ -842,6 +843,84 @@ describe("Unsent queued message restored to the composer", () => {
       );
       expect(restoreStore().pendingInputRestores.has(app.workspaceId)).toBe(false);
     } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
+  test("a restore applied just before a renderer reload, whose acknowledgement never arrived, is not applied again", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-reload" });
+    let otherWorkspaceId: string | undefined;
+    try {
+      const workspaceService = app.env.services.workspaceService;
+      const session = workspaceService.getOrCreateSession(app.workspaceId);
+      // Acknowledgements never reach the session before the renderer reloads, so the session
+      // keeps retaining the restoration and replays it on the next subscription.
+      let acksLost = true;
+      const acknowledge = workspaceService.acknowledgeInputRestore.bind(workspaceService);
+      const ackSpy = jest
+        .spyOn(workspaceService, "acknowledgeInputRestore")
+        .mockImplementation((workspaceId, restoreId) =>
+          acksLost
+            ? (new Promise(() => undefined) as unknown as Result<void>)
+            : acknowledge(workspaceId, restoreId)
+        );
+      const { finalText, metadata } = prepareUserMessageForSend({
+        text: "reload follow-up",
+        reviews: [composerReview("reload note")],
+      });
+      session.queueMessage(
+        finalText,
+        {
+          model: "openai:gpt-5.2",
+          agentId: "exec",
+          fileParts: [{ ...queuedFilePart, filename: "reload.txt" }],
+          ...(metadata ? { muxMetadata: metadata } : {}),
+          authoredText: "reload follow-up",
+        },
+        { acceptanceOrigin: "manual", turnAdmission: refusingAdmission }
+      );
+      session.drainQueuedMessagesIfIdle();
+      await app.chat.expectInputValue("reload follow-up", LOAD_TOLERANT_WAIT.timeout);
+      await waitFor(() => expect(ackSpy).toHaveBeenCalled(), LOAD_TOLERANT_WAIT);
+
+      // The reload: the renderer's in-memory record of applied restorations is gone (the draft,
+      // its attachment and its review were stored when it was applied).
+      restoreStore().consumedInputRestoreIds.clear();
+      acksLost = false;
+      const acksBeforeReload = ackSpy.mock.calls.length;
+      const created = await app.env.orpc.workspace.create({
+        projectPath: app.repoPath,
+        branchName: generateBranchName("unsent-reload-other"),
+        trunkBranch: await detectDefaultTrunkBranch(app.repoPath),
+      });
+      if (!created.success) throw new Error(created.error);
+      otherWorkspaceId = created.metadata.id;
+      workspaceStore.addWorkspace(created.metadata);
+      await showWorkspace(app, created.metadata.id, created.metadata.name);
+      await showWorkspace(app, app.workspaceId, app.metadata.name);
+
+      // The replayed restoration is dropped and acknowledged again, which the session now takes.
+      await waitFor(
+        () => expect(ackSpy.mock.calls.length).toBeGreaterThan(acksBeforeReload),
+        LOAD_TOLERANT_WAIT
+      );
+      await waitFor(async () => {
+        const replayed: unknown[] = [];
+        await session.replayHistory(({ message }) => {
+          if ("type" in message && message.type === "restore-to-input") replayed.push(message);
+        });
+        expect(replayed).toEqual([]);
+      }, LOAD_TOLERANT_WAIT);
+      await app.chat.expectInputValue("reload follow-up", LOAD_TOLERANT_WAIT.timeout);
+      expect(composerAttachmentNames(app)).toEqual(["reload.txt"]);
+      expect(attachedStoreReviewNotes(app)).toEqual(["reload note"]);
+      ackSpy.mockRestore();
+    } finally {
+      if (otherWorkspaceId != null) {
+        await app.env.orpc.workspace
+          .remove({ workspaceId: otherWorkspaceId, options: { force: true } })
+          .catch(() => undefined);
+      }
       await app.dispose();
     }
   }, 90_000);

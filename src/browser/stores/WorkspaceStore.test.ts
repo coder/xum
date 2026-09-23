@@ -6,7 +6,7 @@ import { createAgentSessionHarness } from "@/node/services/agentSession.testHarn
 import { subscribeWorkspaceChat } from "@/node/orpc/routerSubscriptions";
 import type { ORPCContext } from "@/node/orpc/context";
 import type { TurnCoordinator, OperationId } from "@/node/services/turnCoordinator";
-import { Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { GlobalWindow } from "happy-dom";
 import {
   describe,
@@ -33,16 +33,19 @@ import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream
 import type { WorkspaceActivitySnapshot, WorkspaceChatMessage } from "@/common/orpc/types";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
+  getAppliedInputRestoresKey,
   getAutoRetryKey,
   getPinnedTodoExpandedKey,
   getStatusStateKey,
 } from "@/common/constants/storage";
+import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import type { TodoItem } from "@/common/types/tools";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
   findRenderedRefineProposalHash,
   mergeTimelineEvents,
   WorkspaceStore,
+  type InputRestore,
   type TranscriptRefreshOutcome,
   type WorkspaceStoreOptions,
 } from "./WorkspaceStore";
@@ -129,6 +132,10 @@ let providerConfigChanges = createControllableAsyncIterable<void>();
 const mockGetProvidersConfig = mock(() => Promise.resolve({}));
 const mockResumeStream = mock(() => Promise.resolve({ success: true, data: { started: true } }));
 const mockSendMessage = mock(() => Promise.resolve({ success: true, data: undefined }));
+const mockAcknowledgeInputRestore = mock(
+  (_input: { workspaceId: string; restoreId: string }): Promise<Result<void, string>> =>
+    Promise.resolve(Ok(undefined))
+);
 const mockOnProvidersConfigChanged = mock((_input?: void, options?: { signal?: AbortSignal }) => {
   const subscription = providerConfigChanges;
   options?.signal?.addEventListener("abort", () => subscription.close(), { once: true });
@@ -148,6 +155,7 @@ const mockClient = {
     },
     resumeStream: mockResumeStream,
     sendMessage: mockSendMessage,
+    acknowledgeInputRestore: mockAcknowledgeInputRestore,
   },
   terminal: {
     activity: {
@@ -795,6 +803,8 @@ describe("WorkspaceStore", () => {
     mockOnProvidersConfigChanged.mockClear();
     mockResumeStream.mockClear();
     mockSendMessage.mockClear();
+    mockAcknowledgeInputRestore.mockReset();
+    mockAcknowledgeInputRestore.mockImplementation(() => Promise.resolve(Ok(undefined)));
     providerConfigChanges = createControllableAsyncIterable<void>();
     global.window.localStorage?.clear?.();
     mockHistoryLoadMore.mockResolvedValue({
@@ -6595,6 +6605,86 @@ describe("WorkspaceStore", () => {
       await tick(10);
 
       expect(store.getWorkflowToolLiveRun(workspaceId, "call-workflow-3")).toBeNull();
+    });
+  });
+
+  describe("retained unsent-input restores across a renderer reload", () => {
+    const workspaceId = "ws-restore";
+    const restore = (restoreId: string): InputRestore => ({
+      type: "restore-to-input",
+      workspaceId,
+      text: "unsent follow-up",
+      mode: "append",
+      restoreId,
+    });
+    const receive = (restoreToReceive: InputRestore) =>
+      getInternal<{ receiveInputRestore: (restore: InputRestore) => void }>(
+        store
+      ).receiveInputRestore(restoreToReceive);
+    const recordedIds = () =>
+      readPersistedState<string[]>(getAppliedInputRestoresKey(workspaceId), []);
+    const settleAcks = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it("does not re-apply a restore whose acknowledgement never reached the backend", async () => {
+      // The acknowledgement is still in flight when the renderer reloads.
+      mockAcknowledgeInputRestore.mockImplementationOnce(() => new Promise(() => undefined));
+      const applied: string[] = [];
+      store.registerInputRestoreConsumer(workspaceId, (received) => {
+        applied.push(received.restoreId);
+        return true;
+      });
+      receive(restore("restore-1"));
+      expect(applied).toEqual(["restore-1"]);
+
+      // Reload: a fresh store over the same persisted storage. The backend still retains the
+      // restoration (it never saw the acknowledgement) and replays it.
+      recreateStore();
+      mockAcknowledgeInputRestore.mockClear();
+      const reapplied: string[] = [];
+      store.registerInputRestoreConsumer(workspaceId, (received) => {
+        reapplied.push(received.restoreId);
+        return true;
+      });
+      receive(restore("restore-1"));
+      expect(reapplied).toEqual([]);
+      expect(mockAcknowledgeInputRestore).toHaveBeenCalledWith({
+        workspaceId,
+        restoreId: "restore-1",
+      });
+      // That acknowledgement succeeded: the backend no longer re-sends it, so the id is forgotten.
+      await settleAcks();
+      expect(recordedIds()).toEqual([]);
+    });
+
+    it("forgets an applied id once its acknowledgement succeeds", async () => {
+      store.registerInputRestoreConsumer(workspaceId, () => true);
+      receive(restore("restore-2"));
+      expect(recordedIds()).toEqual(["restore-2"]);
+      await settleAcks();
+      expect(recordedIds()).toEqual([]);
+    });
+
+    it.each(["an error result", "a rejection"] as const)(
+      "keeps an applied id when its acknowledgement fails with %s",
+      async (failure) => {
+        mockAcknowledgeInputRestore.mockImplementationOnce(() =>
+          failure === "a rejection"
+            ? Promise.reject(new Error("offline"))
+            : Promise.resolve(Err("session gone"))
+        );
+        store.registerInputRestoreConsumer(workspaceId, () => true);
+        receive(restore("restore-3"));
+        await settleAcks();
+        expect(recordedIds()).toEqual(["restore-3"]);
+      }
+    );
+
+    it("records nothing for a restore the composer declined", async () => {
+      store.registerInputRestoreConsumer(workspaceId, () => false);
+      receive(restore("restore-4"));
+      await settleAcks();
+      expect(recordedIds()).toEqual([]);
+      expect(mockAcknowledgeInputRestore).not.toHaveBeenCalled();
     });
   });
 

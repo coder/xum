@@ -296,6 +296,17 @@ export function getInputAttachmentsKey(scopeId: string): string {
 }
 
 /**
+ * Get the localStorage key for the retained unsent-input restores (restoreIds) this renderer
+ * applied to the workspace's composer but whose acknowledgement has not yet succeeded. A reload
+ * in that window loses WorkspaceStore's in-memory record while the backend still retains and
+ * replays the restoration; this record makes the replay a no-op (dropped and re-acknowledged).
+ * Format: "appliedInputRestores:{workspaceId}"
+ */
+export function getAppliedInputRestoresKey(workspaceId: string): string {
+  return `appliedInputRestores:${workspaceId}`;
+}
+
+/**
  * Get the localStorage key for pending initial send errors after workspace creation.
  * Stored so the workspace view can surface a toast after navigation.
  * Format: "pendingSendError:{workspaceId}"
@@ -927,6 +938,8 @@ const EPHEMERAL_WORKSPACE_KEY_FUNCTIONS: Array<(workspaceId: string) => string> 
   getNotifyOnResponseKey,
   getPlanContentKey, // Cache only, no need to preserve on fork
   getPostCompactionStateKey, // Cache only, no need to preserve on fork
+  // Names this workspace's backend-retained restores; a fork's backend never retains them.
+  getAppliedInputRestoresKey,
 ];
 
 function isStagedPersistedAttachment(value: unknown): boolean {
