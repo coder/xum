@@ -26,6 +26,7 @@ function renderWithProviders(ui: ReactElement) {
 
 const WINDOW_ROW = '[data-testid="session-history-window"]';
 const ITEM_ROW = '[data-testid="session-history-item"]';
+const ERROR_BOX = '[data-testid="session-history-error"]';
 const EXCERPT = '[data-testid="session-history-excerpt"]';
 const PAGE = '[data-testid="session-history-page"]';
 const SCOPE = '[data-testid="session-history-scope"]';
@@ -257,6 +258,97 @@ describe("SessionHistoryToolCall", () => {
       />
     );
     expect(unknown.getByText("brand_new_code")).toBeTruthy();
+  });
+
+  test("a wrapped failure arriving as completed shows failed in the header", () => {
+    // hasFailureResult checks only the outer SDK wrapper, so these arrive as "completed".
+    const wrapped = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "token" }}
+        status="completed"
+        defaultExpanded
+        result={{ type: "json", value: { success: false, error: "history_timeout" } }}
+      />
+    );
+    expect(wrapped.container.querySelector(".status-text")?.textContent).toBe("failed");
+    const error = wrapped.container.querySelector(ERROR_BOX);
+    expect(error?.textContent).toBeTruthy();
+    expect(error?.textContent).not.toContain("history_timeout");
+    cleanup();
+
+    // A nested bare `{ error }` (blocking pre-hook) normalizes to success: false.
+    const bare = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "token" }}
+        status="completed"
+        defaultExpanded
+        result={{ type: "json", value: { error: "blocked by hook" } }}
+      />
+    );
+    expect(bare.container.querySelector(".status-text")?.textContent).toBe("failed");
+    expect(bare.getByText("blocked by hook")).toBeTruthy();
+  });
+
+  test("filters_unsupported names only the filters the action rejects", () => {
+    const windows = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "list_windows" }}
+        status="failed"
+        defaultExpanded
+        result={{ success: false, error: "filters_unsupported" }}
+      />
+    );
+    const windowsError = windows.container.querySelector(ERROR_BOX)?.textContent ?? "";
+    // list_windows accepts recent_first; only read_item rejects it.
+    expect(windowsError).toContain("role");
+    expect(windowsError).not.toContain("recent_first");
+    cleanup();
+
+    const read = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "read_item", item_id: "7" }}
+        status="failed"
+        defaultExpanded
+        result={{ success: false, error: "filters_unsupported" }}
+      />
+    );
+    expect(read.container.querySelector(ERROR_BOX)?.textContent).toContain("recent_first");
+  });
+
+  test("unknown or malformed warnings keep the rows; unknown codes render verbatim", () => {
+    const rows = [{ itemId: "1", windowId: "w:0", role: "user", text: "needle" }];
+    const view = renderWithProviders(
+      <SessionHistoryToolCall
+        args={{ action: "search", query: "needle" }}
+        status="completed"
+        defaultExpanded
+        result={{
+          success: true,
+          warnings: ["oversized_rows_skipped", "brand_new_warning"],
+          items: rows,
+        }}
+      />
+    );
+    expect(view.container.querySelectorAll(ITEM_ROW).length).toBe(1);
+    expect(view.container.querySelector(".status-text")?.textContent).toBe("completed");
+    expect(view.container.textContent).not.toContain("oversized_rows_skipped");
+    expect(view.getByText("brand_new_warning")).toBeTruthy();
+    cleanup();
+
+    // Warnings are advisory: malformed entries or a non-array value never hide the rows.
+    for (const warnings of [[42, "brand_new_warning"], "oops"]) {
+      const malformed = renderWithProviders(
+        <SessionHistoryToolCall
+          args={{ action: "search", query: "needle" }}
+          status="completed"
+          defaultExpanded
+          result={{ success: true, warnings, items: rows }}
+        />
+      );
+      expect(malformed.container.querySelectorAll(ITEM_ROW).length).toBe(1);
+      expect(malformed.container.querySelector(".status-text")?.textContent).toBe("completed");
+      cleanup();
+    }
   });
 
   test("unwraps the SDK JSON container and tolerates omitted result arrays", () => {
