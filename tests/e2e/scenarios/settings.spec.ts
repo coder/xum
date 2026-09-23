@@ -108,8 +108,9 @@ test.describe("Settings", () => {
       .filter({ has: page.getByPlaceholder(/model-id/i) })
       .filter({ has: page.getByRole("button", { name: /^Add$/i }) })
       .last();
-    await expect(addForm.getByRole("combobox")).toBeVisible(); // Provider dropdown
-    await expect(page.getByPlaceholder(/model-id/i)).toBeVisible();
+    // The add row has two comboboxes: the provider dropdown and the editable Model ID field.
+    await expect(addForm.getByRole("combobox", { name: "Provider" })).toBeVisible();
+    await expect(addForm.getByRole("combobox", { name: "Model ID" })).toBeVisible();
     await expect(page.getByRole("button", { name: /^Add$/i })).toBeVisible();
   });
 
