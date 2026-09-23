@@ -28,16 +28,61 @@ const TOKENS_PER_CHAR = 0.25; // conservative estimate
 const TARGET_TOKENS = 260_000;
 const CHARS_NEEDED = Math.ceil(TARGET_TOKENS / TOKENS_PER_CHAR);
 
-/** Build a filler message that is roughly `charCount` characters long. */
-function buildFillerText(charCount: number): string {
-  // Use varied text to avoid aggressive tokenizer compression
-  const base =
-    "The quick brown fox jumps over the lazy dog. " +
-    "Pack my box with five dozen liquor jugs. " +
-    "How vexingly quick daft zebras jump. " +
-    "Sphinx of black quartz, judge my vow. ";
-  const repeats = Math.ceil(charCount / base.length);
-  return base.repeat(repeats).slice(0, charCount);
+const FILLER_FILES = [
+  "src/config.ts",
+  "src/node/services/historyService.ts",
+  "src/browser/components/ChatInput.tsx",
+  "src/common/utils/tokens.ts",
+  "src/node/runtime/LocalRuntime.ts",
+  "docs/workspaces.mdx",
+  "tests/ipc/setup.ts",
+  "Makefile",
+];
+const FILLER_ACTIONS = [
+  "Reviewed the error handling in",
+  "Added a unit test covering an empty input for",
+  "Renamed a local variable for clarity in",
+  "Documented the default timeout in",
+  "Simplified a nested conditional in",
+  "Fixed a typo in a log message in",
+  "Moved a shared constant out of",
+  "Checked the null handling in",
+];
+const FILLER_OUTCOMES = [
+  "the type checker reported no errors",
+  "all unit tests passed",
+  "the linter reported no warnings",
+  "the reviewer approved the change",
+  "the build finished without warnings",
+  "no behavior changed",
+];
+
+/**
+ * Build deterministic, non-repetitive filler that reads like an ordinary coding-session log.
+ *
+ * Repeating one pangram paragraph ~20k times started ending the stream with a provider
+ * content-filter refusal (issue #4398). Varied, benign engineering notes keep the request
+ * realistic for a /compact summary while still exceeding the 200k default context window.
+ */
+function buildFillerText(charCount: number, seed: number): string {
+  // Small LCG so every run sends identical bytes (reproducible failures) without repetition.
+  let state = (seed + 1) >>> 0;
+  const pick = <T>(items: readonly T[]): T => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    // High bits: the low bits of a power-of-two LCG cycle with a tiny period.
+    return items[(state >>> 16) % items.length];
+  };
+  const sentences: string[] = [];
+  let length = 0;
+  for (let step = 1; length < charCount; step += 1) {
+    const line = 1 + ((state >>> 8) % 900);
+    const sentence =
+      `Note ${seed}.${step}: ${pick(FILLER_ACTIONS)} ${pick(FILLER_FILES)} near line ${line}; ` +
+      `afterwards ${pick(FILLER_OUTCOMES)}.\n`;
+    sentences.push(sentence);
+    length += sentence.length;
+  }
+  return sentences.join("").slice(0, charCount);
 }
 
 const COMPACTION_1M_RETRY_MODEL = "anthropic:claude-sonnet-4-6";
@@ -78,13 +123,13 @@ describeIntegration("compaction 1M context retry", () => {
           const userMsg = createMuxMessage(
             `filler-user-${i}`,
             "user",
-            buildFillerText(charsPerMessage),
+            buildFillerText(charsPerMessage, 2 * i),
             {}
           );
           const assistantMsg = createMuxMessage(
             `filler-asst-${i}`,
             "assistant",
-            buildFillerText(charsPerMessage),
+            buildFillerText(charsPerMessage, 2 * i + 1),
             {}
           );
           const r1 = await historyService.appendToHistory(workspaceId, userMsg);
@@ -161,6 +206,17 @@ describeIntegration("compaction 1M context retry", () => {
               console.warn(
                 `[tests] Treating repeated Anthropic overload as inconclusive after ` +
                   `${MAX_PROVIDER_OVERLOAD_ATTEMPTS} CI attempts.`
+              );
+              return;
+            }
+
+            // A content-filter refusal is a provider classifier verdict on the padding, not a
+            // compaction/context-window failure, and the error itself says retrying is unlikely
+            // to help. The benign filler above makes this rare; in CI, report it instead of
+            // failing unrelated PRs (issue #4398). Locally it still fails so it stays visible.
+            if (errorType === "model_refusal" && process.env.CI) {
+              console.warn(
+                `[tests] Treating provider content-filter refusal as inconclusive in CI: ${errorMsg}`
               );
               return;
             }
