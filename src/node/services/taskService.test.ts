@@ -6925,7 +6925,6 @@ describe("TaskService", () => {
     return { config, projectPath, runtime, parentId, childTaskId, parentPath };
   }
 
-  // Same checkout move and config write as WorkspaceService.rename.
   async function renameSharedOwner(
     config: Config,
     runtime: ReturnType<typeof createRuntime>,
@@ -7100,7 +7099,7 @@ describe("TaskService", () => {
       taskModelString: defaultModel,
     });
 
-    // The launch admits the task after reading its entry and before materializing its checkout.
+    // Rename during admission to exercise the gap between config read and checkout reuse.
     const desktop = new DesktopInputCoordinator(config);
     const admit = desktop.withAdmission.bind(desktop);
     let renamedPath: string | undefined;
@@ -7130,7 +7129,7 @@ describe("TaskService", () => {
       assert(renamedPath, "Expected the owner to be renamed during the launch");
       expect(forkSpy).not.toHaveBeenCalled();
       const entry = findWorkspaceInConfig(config, childTaskId);
-      // A cleared flag would let removal or delete-on-archive treat the owner's checkout as the task's own.
+      // Clearing isolation here would make cleanup treat the owner's checkout as task-owned.
       expect(entry?.taskIsolation).toBe("none");
       expect(entry?.path).toBe(renamedPath);
     } finally {

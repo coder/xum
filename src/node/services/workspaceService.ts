@@ -7871,8 +7871,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const oldMetadata = metadataResult.data;
       const oldName = oldMetadata.name;
-      // A shared-checkout task runs in its owning ancestor's checkout; renaming it would move
-      // (or, through override-aware runtimes, rename) a checkout it does not own.
+      // Shared tasks do not own their checkout; runtime rename could move the owner's workspace.
       if (oldMetadata.taskIsolation === "none") {
         return Err(
           "Cannot rename a sub-agent that shares its parent's checkout. Rename the parent workspace instead."

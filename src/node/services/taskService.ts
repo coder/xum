@@ -1541,10 +1541,9 @@ function buildWorkflowTimeoutFinalizationPrompt(
 }
 
 /**
- * Reawakening reports success before the child's stream starts, so a missing checkout would
- * otherwise only surface later as an async turn failure. Only host-local worktrees are checked:
- * remote ensureReady can provision for minutes (Coder/Docker/devcontainer) or always reports
- * ready (SSH).
+ * Fail host-local worktree reactivation before reporting success; otherwise a missing checkout
+ * surfaces only after the asynchronous turn starts. Remote readiness can start or provision
+ * runtimes.
  */
 async function getMissingHostLocalCheckoutError(entry: {
   projectPath: string;
@@ -4903,8 +4902,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    // Reuse keeps the task in its owner's checkout; a fork fallback made a real (deletable) one.
-    // Not a path comparison: shared paths derive from the owner, so a mid-launch rename moves them.
+    // Track reuse explicitly: owner-derived paths can change during launch, so equality is unsafe.
     const sharesParentCheckout = taskWasShared && materialized.reusedExistingCheckout;
     const cancelMaterializedLaunch = () =>
       this.cancelReservedLaunch(plan, initLogger, {
