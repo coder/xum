@@ -127,7 +127,14 @@ export async function discoverProviderModels(
     url.pathname = `${url.pathname.replace(/\/+$/, "")}/${request.format === "ollama" ? "tags" : "models"}`;
     // A cursor carried in the configured base would skip catalog pages and still
     // look complete; start from the first page and set cursors only from replies.
-    if (anthropic) for (const key of ["after_id", "before_id"]) url.searchParams.delete(key);
+    const inheritedCursors = anthropic
+      ? ["after_id", "before_id"]
+      : request.format === "google"
+        ? ["pageToken"]
+        : request.format === "openrouter"
+          ? ["offset"]
+          : [];
+    for (const key of inheritedCursors) url.searchParams.delete(key);
     const endpoint = new URL(url);
     const headers = new Headers();
     if (anthropic) headers.set("anthropic-version", "2023-06-01");

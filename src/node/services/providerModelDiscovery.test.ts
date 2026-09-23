@@ -479,6 +479,18 @@ it.each(["google", "openrouter", "anthropic-messages"])(
   }
 );
 
+it.each([
+  ["google", "pageToken"],
+  ["openrouter", "offset"],
+] as const)("%s ignores a %s cursor carried in the configured base URL", async (provider, key) => {
+  const id = saveAdapter(provider, { baseUrl: `${server.url}proxy/api?tenant=one&${key}=zzz` });
+  respond = () => Response.json(catalog(provider));
+  expect((await service.discoverModels(id)).status).toBe("ok");
+  const first = new URL(requests[0].url);
+  expect(first.searchParams.has(key)).toBe(false);
+  expect(first.searchParams.get("tenant")).toBe("one");
+});
+
 it.each(["zai", ...CUSTOM_PROVIDER_TYPES])(
   "conditional %s probes distinguish missing endpoints from upstream errors",
   async (provider) => {
