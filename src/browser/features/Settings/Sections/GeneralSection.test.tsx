@@ -48,6 +48,10 @@ interface MockAPIClient {
     updateChatTranscriptFullWidth: (input: { enabled: boolean }) => Promise<void>;
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
     updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
+    onConfigChanged: (
+      input: undefined,
+      options?: { signal?: AbortSignal }
+    ) => Promise<AsyncIterator<void>>;
   };
   server: {
     getSshHost: () => Promise<string | null>;
@@ -262,6 +266,10 @@ interface MockAPISetup {
   updateKeepScreenAwakeMock: ReturnType<
     typeof mock<(input: { enabled: boolean }) => Promise<void>>
   >;
+  /** Mutable backing config, so tests can simulate edits made outside this section. */
+  config: MockConfig;
+  /** Notifies every live `config.onConfigChanged` subscriber, like the backend does. */
+  emitConfigChanged: () => void;
 }
 
 function createMockAPI(
@@ -310,6 +318,43 @@ function createMockAPI(
     return Promise.resolve();
   });
 
+  // Minimal stand-in for the backend's config-change event stream: each subscriber
+  // counts its own pending notifications.
+  const configChangeNotifiers = new Set<() => void>();
+  const emitConfigChanged = () => {
+    for (const notify of Array.from(configChangeNotifiers)) notify();
+  };
+  const onConfigChanged = (_input: undefined, options?: { signal?: AbortSignal }) => {
+    let pending = 0;
+    let wake: (() => void) | null = null;
+    const notify = () => {
+      pending += 1;
+      wake?.();
+    };
+    configChangeNotifiers.add(notify);
+    const done = () => {
+      configChangeNotifiers.delete(notify);
+      wake?.();
+    };
+    options?.signal?.addEventListener("abort", done, { once: true });
+    const iterator: AsyncIterator<void> = {
+      next: async () => {
+        while (pending === 0 && !options?.signal?.aborted) {
+          await new Promise<void>((resolve) => (wake = resolve));
+          wake = null;
+        }
+        if (options?.signal?.aborted) return { done: true, value: undefined };
+        pending -= 1;
+        return { done: false, value: undefined };
+      },
+      return: () => {
+        done();
+        return Promise.resolve({ done: true, value: undefined });
+      },
+    };
+    return Promise.resolve(iterator);
+  };
+
   return {
     api: {
       experiments: { getOverrides: getOverridesMock, setOverride: setOverrideMock },
@@ -323,6 +368,7 @@ function createMockAPI(
           return Promise.resolve();
         }),
         updateKeepScreenAwake: updateKeepScreenAwakeMock,
+        onConfigChanged,
       },
       server: {
         getSshHost: mock(() => Promise.resolve(null)),
@@ -340,6 +386,8 @@ function createMockAPI(
     updateCoderPrefsMock,
     updateChatTranscriptFullWidthMock,
     updateKeepScreenAwakeMock,
+    config,
+    emitConfigChanged,
   };
 }
 
@@ -711,6 +759,54 @@ describe("GeneralSection", () => {
       await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe(String(!firstSucceeds)));
     }
   );
+
+  test("follows keep-awake changes made outside the mounted section", async () => {
+    // e.g. the "Toggle Keep Screen Awake" palette command runs while Settings is open.
+    const { config, emitConfigChanged, view } = renderGeneralSection({ keepScreenAwake: false });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+
+    config.keepScreenAwake = true;
+    act(() => emitConfigChanged());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+
+    config.keepScreenAwake = false;
+    act(() => emitConfigChanged());
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  test("an external config change does not override an in-flight keep-awake save", async () => {
+    const { config, emitConfigChanged, updateKeepScreenAwakeMock, view } = renderGeneralSection({
+      keepScreenAwake: false,
+    });
+    const toggle = view.getByRole("switch", {
+      name: "Toggle keep screen awake while agents are working",
+    });
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    let finishWrite: (() => void) | null = null;
+    updateKeepScreenAwakeMock.mockImplementation(({ enabled }) => {
+      return new Promise<void>((resolve) => {
+        finishWrite = () => {
+          config.keepScreenAwake = enabled;
+          resolve();
+        };
+      });
+    });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(finishWrite).not.toBeNull());
+    // An unrelated config edit lands while our write is still pending (disk still says false).
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    act(() => finishWrite?.());
+    act(() => emitConfigChanged());
+    await act(() => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+  });
 
   test("renders the worktree archive behavior copy and loads the saved value", async () => {
     const { view } = renderGeneralSection({

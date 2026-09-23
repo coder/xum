@@ -227,6 +227,58 @@ describe("KeepAwakeController", () => {
     expect(h.controller.isHoldingBlocker).toBe(false);
   });
 
+  // Desktop startup does not wait for the seed read (it can be slow on large workspace
+  // stores), so live events and quit can both arrive while it is still in flight.
+  test("live events acquire and release before the seed read settles", async () => {
+    let resolveList: (value: Record<string, WorkspaceActivitySnapshot>) => void = () => {
+      throw new Error("activity list resolver not initialised");
+    };
+    const h = createHarness({
+      enabled: true,
+      activityList: () =>
+        new Promise((resolve) => {
+          resolveList = resolve;
+        }),
+    });
+
+    const started = h.controller.start();
+    h.emit("a", snapshot({ streaming: true }));
+    expect(h.controller.isHoldingBlocker).toBe(true);
+    h.emit("a", snapshot({ streaming: false }));
+    expect(h.controller.isHoldingBlocker).toBe(false);
+
+    resolveList({});
+    await started;
+    expect(h.blocker.startCalls).toHaveLength(1);
+    expect(h.controller.isHoldingBlocker).toBe(false);
+  });
+
+  test("dispose during the seed read releases and ignores the late snapshot", async () => {
+    let resolveList: (value: Record<string, WorkspaceActivitySnapshot>) => void = () => {
+      throw new Error("activity list resolver not initialised");
+    };
+    const h = createHarness({
+      enabled: true,
+      activityList: () =>
+        new Promise((resolve) => {
+          resolveList = resolve;
+        }),
+    });
+
+    const started = h.controller.start();
+    h.emit("a", snapshot({ streaming: true }));
+    expect(h.controller.isHoldingBlocker).toBe(true);
+
+    h.controller.dispose();
+    expect(h.blocker.runningCount).toBe(0);
+    expect(h.activityListenerCount()).toBe(0);
+
+    resolveList({ b: snapshot({ streaming: true }) });
+    await started;
+    expect(h.blocker.startCalls).toHaveLength(1);
+    expect(h.controller.isHoldingBlocker).toBe(false);
+  });
+
   test("dispose releases the blocker and stops reacting to later events", async () => {
     const h = createHarness({ enabled: true });
     await h.controller.start();

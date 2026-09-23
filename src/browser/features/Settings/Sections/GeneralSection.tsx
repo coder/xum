@@ -312,6 +312,8 @@ export function GeneralSection() {
   const llmDebugLogsLoadNonceRef = useRef(0);
   const keepScreenAwakeLoadNonceRef = useRef(0);
   const keepScreenAwakeSavedRef = useRef(false);
+  // Local saves still in flight; an external refresh must not replace the user's newest choice.
+  const keepScreenAwakePendingWritesRef = useRef(0);
 
   // updateCoderPrefs writes config.json on the backend. Serialize (and coalesce) updates so rapid
   // selections can't race and persist a stale value via out-of-order writes.
@@ -519,6 +521,7 @@ export function GeneralSection() {
     setKeepScreenAwake(checked);
 
     // Serialize writes, but only roll back the latest selection when persistence fails.
+    keepScreenAwakePendingWritesRef.current++;
     keepScreenAwakeUpdateChainRef.current = keepScreenAwakeUpdateChainRef.current
       .then(async () => {
         await api.config.updateKeepScreenAwake({ enabled: checked });
@@ -528,8 +531,75 @@ export function GeneralSection() {
         if (nonce === keepScreenAwakeLoadNonceRef.current) {
           setKeepScreenAwake(keepScreenAwakeSavedRef.current);
         }
+      })
+      .finally(() => {
+        keepScreenAwakePendingWritesRef.current--;
+        assert(
+          keepScreenAwakePendingWritesRef.current >= 0,
+          "keep-awake pending write count went negative"
+        );
       });
   };
+
+  // The setting can also change outside this section (the "Toggle Keep Screen Awake" palette
+  // command runs while Settings is open), so follow config changes instead of showing a stale
+  // switch whose next click would rewrite the current value rather than toggle it.
+  useEffect(() => {
+    const onConfigChanged = api?.config?.onConfigChanged;
+    if (!api || onConfigChanged == null) {
+      return;
+    }
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+
+    const refresh = async () => {
+      // Skip while our own saves are in flight: disk may still hold an older value, and the
+      // save's completion (or rollback) already settles the switch.
+      if (keepScreenAwakePendingWritesRef.current > 0) {
+        return;
+      }
+      const nonce = keepScreenAwakeLoadNonceRef.current;
+      const cfg = await api.config.getConfig();
+      if (
+        signal.aborted ||
+        nonce !== keepScreenAwakeLoadNonceRef.current ||
+        keepScreenAwakePendingWritesRef.current > 0
+      ) {
+        return;
+      }
+      keepScreenAwakeSavedRef.current = cfg.keepScreenAwake === true;
+      setKeepScreenAwake(keepScreenAwakeSavedRef.current);
+    };
+
+    let iterator: AsyncIterator<unknown> | null = null;
+    const listen = async () => {
+      try {
+        iterator = await onConfigChanged(undefined, { signal });
+        if (signal.aborted) {
+          await iterator.return?.();
+          return;
+        }
+        for (;;) {
+          const event = await iterator.next();
+          if (event.done || signal.aborted) {
+            return;
+          }
+          await refresh().catch(() => {
+            // Best-effort: keep the last known value and wait for the next change.
+          });
+        }
+      } catch {
+        // Subscription cancellation is expected during unmount/API reconnects.
+      }
+    };
+    // Settles on its own once aborted; errors are handled inside listen().
+    void listen();
+
+    return () => {
+      abortController.abort();
+      void iterator?.return?.();
+    };
+  }, [api]);
 
   // Load SSH host from server on mount (browser mode only)
   useEffect(() => {
@@ -1027,9 +1097,11 @@ export function GeneralSection() {
                 Keep screen awake while agents are working
               </div>
               <div className="text-muted mt-0.5 text-xs">
-                Prevents display sleep and the idle screen lock while any chat is streaming or
-                waiting on background bash or workflow activity. Released as soon as all agents are
-                idle. Desktop app only.
+                {/* Electron's display-sleep blocker does not guarantee the OS lock policy is
+                    suppressed, so only promise display/system sleep. */}
+                Prevents display and system sleep while any chat is streaming or waiting on
+                background bash or workflow activity. Released as soon as all agents are idle.
+                Desktop app only.
               </div>
             </div>
             <Switch

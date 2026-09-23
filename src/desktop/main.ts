@@ -784,12 +784,14 @@ async function loadServices(): Promise<void> {
     onEnabledChanged: (callback) => stores.config.onConfigChanged(callback),
     activity: services.workspaceService,
   });
-  try {
-    await keepAwake.start();
-  } catch (error) {
+  // Do not await: the initial activity seed enumerates config and probes workspace state on
+  // disk, which can be slow on large stores and must not keep the window behind the splash
+  // screen. start() subscribes synchronously, so live events already reconcile while the
+  // seed is in flight, and dispose() on quit is safe mid-seed.
+  keepAwake.start().catch((error: unknown) => {
     // Startup must never fail over an optional convenience; live events still reconcile.
     log.error("keep-awake: failed to start controller", { error });
-  }
+  });
 
   // Generate auth token (use env var or random per-session)
   const authToken = getXumEnv("SERVER_AUTH_TOKEN") ?? randomBytes(32).toString("hex");
