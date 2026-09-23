@@ -10431,10 +10431,15 @@ export class AgentSession {
       // writers (family-message and refine-summary rows) can append between
       // the compaction boundary committing and this stream-end dispatch. Any
       // non-copy row after the targeted summary means the follow-up would
-      // continue after unrelated content — do not fire.
+      // continue after unrelated content — do not fire. Model-hidden records
+      // (plan-review resolve/reopen/snapshot rows) are UI state, not content:
+      // resolving a thread in that window must not strand the follow-up.
       const onlyTailCopiesAfterSummary = historyResult.data
         .slice(summaryIndex + 1)
-        .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+        .every(
+          (message) =>
+            message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message)
+        );
       summaryMessage = historyResult.data[summaryIndex];
       const pending = pendingCompactionSummary(summaryMessage);
       if (
@@ -10445,9 +10450,23 @@ export class AgentSession {
         return false;
       }
     } else {
-      // Read the last message from history — only need 1 message, avoid full-file read.
+      // Read the newest row that is not a model-hidden record (plan-review rows appended
+      // after the summary are UI state and must not hide it) — a newest-first scan that
+      // stops at the first such row, avoiding a full-file read in the common case.
       // Startup recovery must retry on transient read failures, so bubble errors.
-      const historyResult = await this.historyService.getLastMessages(this.workspaceId, 1);
+      let newestVisible: MuxMessage | undefined;
+      const historyResult = await this.historyService.iterateFullHistory(
+        this.workspaceId,
+        "backward",
+        (chunk) => {
+          for (const message of chunk) {
+            if (isModelHiddenMessage(message)) continue;
+            newestVisible = message;
+            return false;
+          }
+          return true;
+        }
+      );
       if (!historyResult.success) {
         const historyError =
           typeof historyResult.error === "string"
@@ -10456,10 +10475,10 @@ export class AgentSession {
         throw new Error(`Failed to read history for startup follow-up recovery: ${historyError}`);
       }
 
-      if (historyResult.data.length === 0) {
+      if (newestVisible === undefined) {
         return false;
       }
-      summaryMessage = historyResult.data[0];
+      summaryMessage = newestVisible;
 
       // RLM keep-recent floor: preserved-tail copies sit after the boundary,
       // so "compaction just completed" means the epoch is exactly
@@ -10479,7 +10498,10 @@ export class AgentSession {
         const boundary = epoch[0];
         const onlyTailCopiesAfterBoundary = epoch
           .slice(1)
-          .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+          .every(
+            (message) =>
+              message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message)
+          );
         if (boundary === undefined || !onlyTailCopiesAfterBoundary) {
           return false;
         }

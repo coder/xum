@@ -535,7 +535,9 @@ export class CompactionHandler {
     const messages = historyResult.data;
     const compactionRequestMessage = compactionRequestMessageId
       ? messages.find((message) => message.id === compactionRequestMessageId)
-      : [...messages].reverse().find((message) => message.role === "user");
+      : [...messages]
+          .reverse()
+          .find((message) => message.role === "user" && !isModelHiddenMessage(message));
     const muxMeta = compactionRequestMessage?.metadata?.muxMetadata;
     const isCompaction =
       compactionRequestMessage?.role === "user" && muxMeta?.type === "compaction-request";

@@ -388,11 +388,18 @@ export async function preparePlanReviewFeedback(
     }),
     workspaceId
   );
+  // When the send trips on-send auto-compaction, the persisted row is the compaction REQUEST,
+  // which carries the envelope twice (prompt text and metadata.parsed.followUpContent.text), and
+  // the later summary boundary carries it again beside the model's summary. Budget that larger
+  // derived shape — the ordinary row plus a second escaped copy of the envelope — so no row the
+  // feedback can produce exceeds the history line limit (an oversized boundary row would make
+  // provider-history boundary detection fall back to the previous boundary).
+  const derivedRowBytes = rowBytes + Buffer.byteLength(JSON.stringify(text), "utf8");
   const maxRowBytes = SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES;
-  if (rowBytes > maxRowBytes) {
+  if (derivedRowBytes > maxRowBytes) {
     return Err({
       type: "feedback_too_large",
-      message: `Feedback row would be ${rowBytes} bytes; plan review feedback is capped at ${maxRowBytes} bytes per submission`,
+      message: `Feedback would persist rows of up to ${derivedRowBytes} bytes; plan review feedback is capped at ${maxRowBytes} bytes per submission`,
     });
   }
   return Ok({

@@ -1,6 +1,7 @@
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
@@ -2959,7 +2960,9 @@ export class WorkspaceTurnManager {
           consumingWorkspaceId: options.consumingWorkspaceId,
         });
       }
-      if (message.role !== "user") {
+      // Model-hidden user rows (plan-review snapshot/resolve/reopen records) are UI state, not
+      // prompts: they must not read as a newer, superseding prompt that disables revival.
+      if (message.role !== "user" || isModelHiddenMessage(message)) {
         continue;
       }
       const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);

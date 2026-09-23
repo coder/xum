@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import { PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES } from "@/constants/planReview";
@@ -15,6 +16,7 @@ import {
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
+import { preparePlanReviewFeedback } from "./planReviewService";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "plan-review-compaction-row";
@@ -49,14 +51,14 @@ function persistedRowBytes(message: MuxMessage): number {
 }
 
 /**
- * preparePlanReviewFeedback caps the ORDINARY user-row shape of a feedback envelope at
- * SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES. When that send trips
- * on-send auto-compaction instead, the persisted row is the compaction REQUEST, which carries the
- * envelope twice (prompt text + metadata.parsed.followUpContent.text). This measures that shape
- * with the real builder and records which readers still see the row.
+ * When a feedback send trips on-send auto-compaction, the persisted row is the compaction REQUEST,
+ * which carries the envelope twice (prompt text + metadata.parsed.followUpContent.text), and the
+ * summary boundary carries it again beside the model's summary. preparePlanReviewFeedback must
+ * budget that derived shape: the largest feedback it accepts must still produce a request row within
+ * the history line limit, measured with the real builder.
  */
 describe("on-send auto-compaction request row for plan-review feedback", () => {
-  test("a feedback just under the ordinary-row cap yields a compaction request row above the line limit", async () => {
+  test("the largest accepted feedback produces a compaction request row within the line limit", async () => {
     const h = await createAgentSessionHarness({ workspaceId });
     fixtures.push(h);
     const options: SendMessageOptions = {
@@ -64,43 +66,63 @@ describe("on-send auto-compaction request row for plan-review feedback", () => {
       agentId: "plan",
       toolPolicy: [{ regex_match: ".*", action: "disable" }],
     };
-    const maxRowBytes = SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES;
-    const feedbackRow = (body: string) => {
-      const record: PlanReviewRecord = {
-        v: 1,
-        kind: "feedback",
-        recordId: "rec_feedback",
-        feedbackId: "fb_1",
-        snapshotId: "snap_1",
-        contentHash: "a".repeat(64),
-        comments: [
-          { threadId: "thr_1", anchor: { startLine: 1, endLine: 1 }, quote: "# Plan", body },
-        ],
-        replies: [],
-      };
-      const text = formatPlanReviewEnvelope(record);
-      return {
-        text,
-        muxMetadata: buildPlanReviewMetadata(record),
-        message: createMuxMessage("user-feedback", "user", text, {
-          timestamp: Date.now(),
-          toolPolicy: options.toolPolicy,
-          retrySendOptions: pickStartupRetrySendOptions(options),
-          muxMetadata: buildPlanReviewMetadata(record),
-        }),
-      };
+    const content = "# Plan\n";
+    const snapshot: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec_snapshot",
+      snapshotId: "snap_1",
+      planPath: "/plans/p.md",
+      contentHash: createHash("sha256").update(content).digest("hex"),
+      content,
     };
-    // Plain ASCII body sized so the ordinary user row sits just under the prepare-time cap.
-    const overhead = persistedRowBytes(feedbackRow("").message);
-    const feedback = feedbackRow("a".repeat(maxRowBytes - overhead));
-    const ordinaryRowBytes = persistedRowBytes(feedback.message);
-    expect(ordinaryRowBytes).toBeLessThanOrEqual(maxRowBytes);
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("snapshot-row", "user", formatPlanReviewEnvelope(snapshot), {
+            synthetic: true,
+            muxMetadata: buildPlanReviewMetadata(snapshot),
+          })
+        )
+      ).success
+    ).toBe(true);
+    const prepare = (bodyLength: number) =>
+      preparePlanReviewFeedback(
+        h.historyService,
+        workspaceId,
+        {
+          snapshotId: "snap_1",
+          comments: [
+            { anchor: { startLine: 1, endLine: 1 }, quote: "# Plan", body: "a".repeat(bodyLength) },
+          ],
+          replies: [],
+        },
+        options
+      );
 
+    // A body that fits the ORDINARY row cap on its own is refused: its compaction request would not.
+    const ordinaryCapBody =
+      SESSION_HISTORY_MAX_LINE_BYTES - PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES - 4096;
+    const refused = await prepare(ordinaryCapBody);
+    expect(!refused.success && refused.error.type).toBe("feedback_too_large");
+
+    // Largest accepted body (binary search), then the real request row for it.
+    let low = 1;
+    let high = ordinaryCapBody;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if ((await prepare(mid)).success) low = mid;
+      else high = mid - 1;
+    }
+    const accepted = await prepare(low);
+    expect(accepted.success).toBe(true);
+    if (!accepted.success) return;
     const followUpContent = buildAutoCompactionFollowUp({
-      messageText: feedback.text,
+      messageText: accepted.data.text,
       options,
       modelForStream: options.model,
-      muxMetadata: feedback.muxMetadata,
+      muxMetadata: accepted.data.muxMetadata,
     });
     const request = (h.session as unknown as Internals).buildAutoCompactionRequest({
       followUpContent,
@@ -114,45 +136,14 @@ describe("on-send auto-compaction request row for plan-review feedback", () => {
       retrySendOptions: pickStartupRetrySendOptions(request.sendOptions),
       muxMetadata: request.metadata,
     });
-    const requestRowBytes = persistedRowBytes(requestRow);
-    // The summary row that follows carries the follow-up once more (pendingFollowUp) plus the
-    // model's summary text; DEFAULT_COMPACTION_WORD_TARGET words ≈ 2000 × 6 chars.
+    expect(persistedRowBytes(requestRow)).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES);
+    // The summary boundary carries the follow-up once plus a default-length summary.
     const summaryRow = createMuxMessage("summary", "assistant", "word ".repeat(2000), {
       timestamp: Date.now(),
       compactionBoundary: true,
       compacted: "user",
       muxMetadata: { type: "compaction-summary", pendingFollowUp: followUpContent },
     });
-    const summaryRowBytes = persistedRowBytes(summaryRow);
-    console.log(
-      `[plan-review compaction row] ordinary feedback row ${ordinaryRowBytes} B (cap ${maxRowBytes}); ` +
-        `on-send compaction request row ${requestRowBytes} B; summary row ${summaryRowBytes} B; ` +
-        `line limit ${SESSION_HISTORY_MAX_LINE_BYTES} B`
-    );
-    expect(requestRowBytes).toBeGreaterThan(SESSION_HISTORY_MAX_LINE_BYTES);
-
-    // Which readers still see the oversized request row once persisted.
-    expect((await h.historyService.appendToHistory(workspaceId, requestRow)).success).toBe(true);
-    const provider = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
-    expect(provider.success).toBe(true);
-    if (!provider.success) return;
-    expect(provider.data.map((m) => m.id)).toEqual(["compaction-request"]);
-    const replayed: string[] = [];
-    await h.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
-      for (const m of chunk) replayed.push(m.id);
-    });
-    expect(replayed).toEqual(["compaction-request"]);
-    // The bounded scanner (session_history tool) is the reader that skips oversized rows.
-    const visited: string[] = [];
-    const bounded = await h.historyService.scanHistoryBounded(workspaceId, {
-      recentFirst: true,
-      visit: (row) => {
-        visited.push(row.message.id);
-        return true;
-      },
-    });
-    console.log(
-      `[plan-review compaction row] bounded scan visited ${JSON.stringify(visited)}, oversizedLines=${bounded.oversizedLines}`
-    );
+    expect(persistedRowBytes(summaryRow)).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES);
   });
 });
