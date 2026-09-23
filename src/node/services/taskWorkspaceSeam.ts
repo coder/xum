@@ -20,6 +20,7 @@ import type { TaskCheckoutPreparation } from "@/common/schemas/project";
 import type { TaskCheckoutSecondaryTarget } from "@/node/services/taskCheckoutPreparation";
 import type {
   FrontendWorkspaceMetadata,
+  ProjectRef,
   WorkspaceMetadata,
   WorkspaceRemovalDescendant,
 } from "@/common/types/workspace";
@@ -693,6 +694,7 @@ export interface WorkspaceProvisioningHost {
         runtimeConfig: RuntimeConfig;
         materializationId: string;
         secondaries?: readonly TaskCheckoutSecondaryTarget[];
+        projects?: readonly ProjectRef[];
       }>
     >,
     publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>

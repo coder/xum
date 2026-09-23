@@ -3342,6 +3342,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         runtimeConfig: RuntimeConfig;
         materializationId: string;
         secondaries?: readonly TaskCheckoutSecondaryTarget[];
+        /** With `secondaries`: the row's full project list, bound by the v2 proof. */
+        projects?: readonly ProjectRef[];
       }>
     >,
     publish: (proofs: readonly TaskCheckoutPreparation[]) => Promise<T>

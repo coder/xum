@@ -82,7 +82,8 @@ const TaskCheckoutPreparationV1Schema = TaskCheckoutIdentitySchema.extend({
  * BigInt decimal strings (inode/device numbers can exceed 2^53).
  *
  * v1 binds the row's own (primary) checkout. v2 additionally binds the checkout of every
- * secondary project of a multi-project task, in the row's `projects` order. Single-project
+ * secondary project of a multi-project task, in the row's `projects` order, and that whole
+ * project list (paths and names, primary first) as the runtime consumes it. Single-project
  * proofs stay v1, so builds that only know v1 keep validating them; a v2 value fails their
  * `v: 1` literal and reads as unsupported (refused), never as a proof of the primary alone.
  */
@@ -93,6 +94,9 @@ export const TaskCheckoutPreparationSchema = z.discriminatedUnion("v", [
     secondaries: z
       .array(TaskCheckoutIdentitySchema.extend({ projectPath: z.string().min(1) }))
       .min(1),
+    projects: z
+      .array(z.object({ projectPath: z.string().min(1), projectName: z.string().min(1) }))
+      .min(2),
   }),
 ]);
 export type TaskCheckoutPreparation = z.infer<typeof TaskCheckoutPreparationSchema>;

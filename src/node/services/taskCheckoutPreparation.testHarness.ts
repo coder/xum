@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 
 import type { RuntimeConfig } from "@/common/types/runtime";
+import type { ProjectRef } from "@/common/types/workspace";
 import {
   bindTaskCheckoutIdentity,
   buildTaskCheckoutPreparation,
@@ -19,8 +20,8 @@ import {
  * consumer suites model prepared rows with this instead of bypassing the validator.
  *
  * `secondaries` (a multi-project task): the same branch is added as a worktree of each secondary
- * project at its `checkout`, and all checkouts are bound together (a v2 proof, valid on a row
- * whose `projects[1..]` are exactly these projects, in order).
+ * project at its `checkout`, and all checkouts are bound together with `projects` (a v2 proof,
+ * valid on a row whose `projects` list is exactly that one: paths, names and order).
  */
 export async function prepareDedicatedTaskCheckout(args: {
   projectPath: string;
@@ -28,6 +29,7 @@ export async function prepareDedicatedTaskCheckout(args: {
   branch: string;
   runtimeConfig: RuntimeConfig | undefined;
   secondaries?: Array<{ projectPath: string; checkout: string }>;
+  projects?: ProjectRef[];
 }): Promise<TaskCheckoutPreparation> {
   for (const { projectPath, checkout } of [args, ...(args.secondaries ?? [])]) {
     execSync(`git worktree add -q -b "${args.branch}" "${checkout}" main`, {
@@ -42,6 +44,7 @@ export async function prepareDedicatedTaskCheckout(args: {
       projectPath: secondary.projectPath,
       workspacePath: secondary.checkout,
     })),
+    projects: args.projects,
   });
 }
 
@@ -57,9 +60,14 @@ export async function prepareExistingTaskCheckout(args: {
   workspacePath: string;
   runtimeConfig: RuntimeConfig | undefined;
   secondaries?: TaskCheckoutSecondaryTarget[];
+  projects?: ProjectRef[];
 }): Promise<TaskCheckoutPreparation> {
   const materializationId = newMaterializationId();
-  const target = { workspacePath: args.workspacePath, secondaries: args.secondaries };
+  const target = {
+    workspacePath: args.workspacePath,
+    secondaries: args.secondaries,
+    projects: args.projects,
+  };
   const claimed = await claimTaskCheckoutIdentity(target, materializationId);
   if (claimed instanceof Error) throw claimed;
   const bound = await bindTaskCheckoutIdentity(target, materializationId, claimed);

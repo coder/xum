@@ -763,7 +763,7 @@ function secondaryPreparationTargets(
     "forkedRuntimeConfig" | "inheritedProjects" | "secondaryCheckouts"
   >,
   workspaceName: string
-): { secondaries?: TaskCheckoutSecondaryTarget[] } {
+): { secondaries?: TaskCheckoutSecondaryTarget[]; projects?: ProjectRef[] } {
   const secondaries = fork.secondaryCheckouts ?? [];
   const secondaryProjects = (fork.inheritedProjects ?? []).slice(1);
   assert(
@@ -784,7 +784,8 @@ function secondaryPreparationTargets(
       `Task preparation: secondary checkout ${secondary.workspacePath} is not the name-derived ${derived}`
     );
   }
-  return secondaries.length > 0 ? { secondaries } : {};
+  // The v2 proof binds the whole list the row publishes (paths and names, primary first).
+  return secondaries.length > 0 ? { secondaries, projects: fork.inheritedProjects } : {};
 }
 
 /** Every checkout a prepared fork materialized: the primary, then its secondaries. */

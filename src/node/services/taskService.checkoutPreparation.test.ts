@@ -634,6 +634,11 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
           secondaries: [{ projectPath: secondaryProjectPath, path: secondaryPath }],
         },
       });
+      // The proof binds the exact project list the row publishes (paths and names, in order).
+      expect((row?.taskCheckoutPreparation as { projects?: unknown }).projects).toEqual(
+        row?.projects
+      );
+      expect(row?.projects).toHaveLength(2);
       const proof = row?.taskCheckoutPreparation as TaskCheckoutPreparation;
       if (proof.v !== 2) throw new Error("unreachable");
       // The generation's nonce is claimed in the secondary's OWN git admin dir too.

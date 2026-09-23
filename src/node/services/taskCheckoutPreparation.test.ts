@@ -85,9 +85,14 @@ describe("taskCheckoutPreparation", () => {
     const secondaryCheckout = path.join(config.srcDir, "repo2", name);
     git(projectPath, `worktree add -q -b ${id} "${checkout}" main`);
     git(secondaryProjectPath, `worktree add -q -b ${id} "${secondaryCheckout}" main`);
+    const projects = [
+      { projectPath, projectName: "repo" },
+      { projectPath: secondaryProjectPath, projectName: "repo2" },
+    ];
     const target = {
       workspacePath: checkout,
       secondaries: [{ projectPath: secondaryProjectPath, workspacePath: secondaryCheckout }],
+      projects,
     };
     const materializationId = newMaterializationId();
     const claimed = await claimTaskCheckoutIdentity(target, materializationId);
@@ -95,10 +100,6 @@ describe("taskCheckoutPreparation", () => {
     const identity = await bindTaskCheckoutIdentity(target, materializationId, claimed);
     if (identity instanceof Error) throw identity;
     const proof = buildTaskCheckoutPreparation(identity, worktree);
-    const projects = [
-      { projectPath, projectName: "repo" },
-      { projectPath: secondaryProjectPath, projectName: "repo2" },
-    ];
     return {
       checkout,
       secondaryCheckout,
@@ -685,6 +686,56 @@ describe("taskCheckoutPreparation", () => {
     });
   }, 20_000);
 
+  test("a v2 proof binds the full project list the runtime consumes: a changed primary project or project name refuses (mismatch projects); the unchanged list is ready", async () => {
+    const { proof, projects, row } = await prepareMultiProject("mp07");
+    if (proof.v !== 2) throw new Error("unreachable");
+    // The proof carries exactly the row's list (paths AND names, primary first), and it
+    // survives a JSON round trip unchanged (the producer's persistence check compares so).
+    expect(proof.projects).toEqual(projects);
+    expect(JSON.parse(JSON.stringify(proof))).toEqual(proof);
+    const [primary, secondary] = projects;
+    const variants: Array<[string, Workspace["projects"]]> = [
+      [
+        "another primary repository",
+        [{ ...primary, projectPath: path.join(rootDir, "other") }, secondary],
+      ],
+      ["a renamed primary project", [{ ...primary, projectName: "renamed" }, secondary]],
+      ["a renamed secondary project", [primary, { ...secondary, projectName: "renamed" }]],
+    ];
+    for (const [label, changed] of variants) {
+      await publish([rootRow("root1", projectPath), { ...row, projects: changed }]);
+      expect({ label, state: await validateTaskCheckoutPreparation(config, "mp07") }).toEqual({
+        label,
+        state: { kind: "mismatch", dimension: "projects" },
+      });
+    }
+    // A proof whose secondaries disagree with its own project list is refused too, and a v2
+    // value without the list (an earlier development shape) is unsupported.
+    await publish([
+      rootRow("root1", projectPath),
+      {
+        ...row,
+        taskCheckoutPreparation: {
+          ...proof,
+          projects: [primary, { ...secondary, projectPath: path.join(rootDir, "other") }],
+        },
+        projects: [primary, { ...secondary, projectPath: path.join(rootDir, "other") }],
+      },
+    ]);
+    expect(await validateTaskCheckoutPreparation(config, "mp07")).toEqual({
+      kind: "mismatch",
+      dimension: "projects",
+    });
+    const { projects: _dropped, ...withoutList } = proof;
+    await publish([
+      rootRow("root1", projectPath),
+      { ...row, taskCheckoutPreparation: withoutList },
+    ]);
+    expect(await state(config, "mp07")).toBe("unsupported");
+    await publish([rootRow("root1", projectPath), row]);
+    expect(await state(config, "mp07")).toBe("ready");
+  }, 20_000);
+
   test("a v1 proof cannot prove a multi-project task's secondary checkouts (unsupported); single-project v1 stays ready; a v2 proof on a single-project row and unknown or malformed versions refuse", async () => {
     const { proof, row } = await prepareDedicated("mp03");
     expect(proof.v).toBe(1);
@@ -736,6 +787,10 @@ describe("taskCheckoutPreparation", () => {
         target: {
           workspacePath: checkout,
           secondaries: [{ projectPath: repo2, workspacePath: secondaryCheckout }],
+          projects: [
+            { projectPath, projectName: "repo" },
+            { projectPath: repo2, projectName: "repo2" },
+          ],
         },
       };
     };
