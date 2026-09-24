@@ -1159,4 +1159,32 @@ describeIntegration("workspace.planReview", () => {
       tail.success && tail.data.some((m) => m.metadata?.muxMetadata?.type === "plan-review")
     ).toBe(false);
   }, 60_000);
+
+  // Runs after the full clear above; clears (the now tiny) history again.
+  test("an on-demand snapshot read before a full clear is not appended after it", async () => {
+    await writePlan(PLAN_B);
+    // Interleave a full clear (another window) after the plan read but before the locked
+    // append admission: bytes read before the clear must not land in the emptied history.
+    const historyService = env.services.toORPCContext().historyService;
+    const original = historyService.appendDerivedFromFullHistory.bind(historyService);
+    let cleared = false;
+    const spy = jest
+      .spyOn(historyService, "appendDerivedFromFullHistory")
+      .mockImplementation(async (id, derive) => {
+        if (!cleared && id === workspaceId) {
+          cleared = true;
+          const clear = await client().workspace.truncateHistory({ workspaceId, percentage: 1 });
+          expect(clear.success).toBe(true);
+        }
+        return original(id, derive);
+      });
+    try {
+      const captured = await planReview().ensureSnapshot({ workspaceId });
+      expect(cleared).toBe(true);
+      expect(!captured.success && captured.error.type).toBe("capture_aborted");
+    } finally {
+      spy.mockRestore();
+    }
+    expect((await getState()).snapshots).toHaveLength(0);
+  }, 60_000);
 });

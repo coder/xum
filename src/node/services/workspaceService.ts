@@ -2259,6 +2259,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // so planReviewSubmitFeedback compares this generation too.
   private readonly historyTruncationGenerations = new Map<string, number>();
 
+  // On-demand plan-review snapshot captures in flight, per workspace. A context mutation
+  // aborts them when it acquires its admission guard: the capture's append-admission check
+  // runs under the history write lock, and the guard is armed before the mutation takes that
+  // lock, so either the snapshot row lands first (and a clear deletes it) or the append sees
+  // the abort. Without this, bytes read before a full clear could be appended into the
+  // emptied history and resurface plan content the clear was meant to discard.
+  private readonly onDemandPlanSnapshotCaptures = new Map<string, Set<AbortController>>();
+
   // r41: sends currently between the entry check and their settled outcome
   // (queued, refused, or admitted — PREPARING is set before any early
   // background-start return). Refine publication must not interleave with a
@@ -3560,6 +3568,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
       guard[Symbol.dispose]();
       return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
+    }
+    // Only once the mutation is certain to proceed (see onDemandPlanSnapshotCaptures).
+    for (const capture of this.onDemandPlanSnapshotCaptures.get(workspaceId) ?? []) {
+      capture.abort();
     }
     return Ok(guard);
   }
@@ -11719,11 +11731,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (!metadata) {
       return Err({ type: "plan_missing", message: `Workspace not found: ${workspaceId}` });
     }
-    return ensurePlanSnapshot(this.planReviewHistoryDeps, {
-      workspaceId,
-      metadata,
-      ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
-    });
+    const capture = new AbortController();
+    // A mutation already holding its guard never aborts later registrations; refuse up front.
+    if (this.contextMutationWorkspaces.has(workspaceId)) capture.abort();
+    let captures = this.onDemandPlanSnapshotCaptures.get(workspaceId);
+    if (captures === undefined) {
+      captures = new Set();
+      this.onDemandPlanSnapshotCaptures.set(workspaceId, captures);
+    }
+    captures.add(capture);
+    try {
+      return await ensurePlanSnapshot(this.planReviewHistoryDeps, {
+        workspaceId,
+        metadata,
+        signal: capture.signal,
+        ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
+      });
+    } finally {
+      captures.delete(capture);
+      if (captures.size === 0) this.onDemandPlanSnapshotCaptures.delete(workspaceId);
+    }
   }
 
   planReviewSetThreadResolved(
