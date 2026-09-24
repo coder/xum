@@ -1283,7 +1283,16 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
       await clearer.disposeSession(workspaceId);
       await harness.cleanup();
     };
-    return { clearer, internals, planPath, asideFiles, snapshotCount, capture, teardown };
+    return {
+      clearer,
+      internals,
+      planPath,
+      asideFiles,
+      snapshotCount,
+      capture,
+      teardown,
+      other: () => other,
+    };
   }
 
   for (const location of ["canonical", "legacy"] as const) {
@@ -1346,6 +1355,37 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
         "# Plan\n\nWritten during the clear.\n"
       );
       expect(await t.asideFiles()).toEqual([]);
+    } finally {
+      await t.teardown();
+    }
+  });
+
+  test("a clear that fails after its history commit does not bring the plan back", async () => {
+    const t = await setup("plan-clear-post-commit-failure");
+    try {
+      // Bookkeeping after the deletion receipt can still throw; the clear has committed, so the
+      // moved-aside plan must be removed, not restored for a later capture to read.
+      const reconciler = (
+        t.clearer as unknown as {
+          bashMonitorWakeReconciler: { finishFullHistoryClear: (token: unknown) => Promise<void> };
+        }
+      ).bashMonitorWakeReconciler;
+      spyOn(reconciler, "finishFullHistoryClear").mockRejectedValueOnce(
+        new Error("monitor bookkeeping failed")
+      );
+      let thrown: unknown;
+      try {
+        await t.clearer.truncateHistory("plan-clear-post-commit-failure", 1.0);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      const history = await t.other().getLastMessages("plan-clear-post-commit-failure", 5);
+      expect(history.success && history.data).toEqual([]);
+      expect(existsSync(t.planPath)).toBe(false);
+      expect(await t.asideFiles()).toEqual([]);
+      const captured = await t.capture();
+      expect(captured.success === false && captured.error.type).toBe("plan_missing");
     } finally {
       await t.teardown();
     }

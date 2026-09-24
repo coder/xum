@@ -14433,25 +14433,35 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // becoming a real cut skips reference retirement; a full clear leaving survivors would
     // apply full-clear-only discards while rows remain).
     let cancellationError: string | undefined;
-    const truncate = () =>
-      isFullClear
-        ? this.clearHistoryThroughCompactionCancellation(
-            workspaceId,
-            effectivePercentage,
-            (error) => {
-              cancellationError = error;
-            }
-          )
-        : this.historyService.truncateHistory(workspaceId, effectivePercentage, {
-            refuseFullDelete: truncationScope === "partial",
-            refuseRowRemoval: truncationScope === "none",
-          });
+    // Set only from the deletion receipt: clearHistoryThroughCompactionCancellation returns Ok
+    // exactly when the history deletion committed.
+    const fullClear = { committed: false };
+    const truncate = async () => {
+      if (!isFullClear) {
+        return this.historyService.truncateHistory(workspaceId, effectivePercentage, {
+          refuseFullDelete: truncationScope === "partial",
+          refuseRowRemoval: truncationScope === "none",
+        });
+      }
+      const cleared = await this.clearHistoryThroughCompactionCancellation(
+        workspaceId,
+        effectivePercentage,
+        (error) => {
+          cancellationError = error;
+        }
+      );
+      fullClear.committed = cleared.success;
+      return cleared;
+    };
     // A full clear deletes the plan file only after its history commit. Another backend on this
     // workspace (#4420) could start a snapshot capture in between, read the discarded plan with
     // a post-clear generation, and append it. Moving the plan aside BEFORE the commit closes that
     // gap: a capture reads either before the move (its pre-commit generation refuses the append
-    // afterwards) or finds no plan. A clear that does not commit puts the plan back.
+    // afterwards) or finds no plan. Only a clear without a deletion receipt puts the plan back;
+    // bookkeeping that fails after the commit must not resurrect it.
     const planStaging = isFullClear ? await this.stagePlanFilesForClear(workspaceId) : null;
+    const settlePlanStaging = () =>
+      fullClear.committed ? planStaging?.discard() : planStaging?.restore();
     let truncateResult: Result<number[]>;
     try {
       truncateResult =
@@ -14461,11 +14471,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             })
           : await truncate();
     } catch (error) {
-      await planStaging?.restore();
+      await settlePlanStaging();
       throw error;
     }
     if (!truncateResult.success) {
-      await planStaging?.restore();
+      await settlePlanStaging();
       return Err(truncateResult.error);
     }
 
