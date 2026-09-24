@@ -3272,6 +3272,64 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.isCompacting()).toBe(true);
     });
 
+    test("reconnect recovery looks past hidden plan-review records to the compaction request, not past user rows", () => {
+      const compactionRequest = {
+        id: "compact-req",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "/compact" }],
+        metadata: {
+          historySequence: 1,
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-request" as const,
+            rawCommand: "/compact",
+            parsed: { model: "anthropic:claude-3-5-haiku-20241022" },
+          },
+        },
+      };
+      const resolveRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "resolve",
+        recordId: "rec_res",
+        threadId: "thr_1",
+      };
+      const hiddenRecord = createMuxMessage(
+        "plan-review-resolve",
+        "user",
+        formatPlanReviewEnvelope(resolveRecord),
+        {
+          historySequence: 2,
+          timestamp: Date.now(),
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(resolveRecord),
+        }
+      );
+      const ordinaryUser = createMuxMessage("user-2", "user", "hello", {
+        historySequence: 2,
+        timestamp: Date.now(),
+      });
+      // Replayed stream-start without agentId, as older/legacy streams report it.
+      const streamStart = {
+        type: "stream-start" as const,
+        workspaceId: "test-workspace",
+        messageId: "active-stream",
+        historySequence: 3,
+        model: "anthropic:claude-3-5-haiku-20241022",
+        startTime: Date.now(),
+        mode: "exec" as const,
+      };
+
+      const behindHidden = new StreamingMessageAggregator(TEST_CREATED_AT);
+      behindHidden.loadHistoricalMessages([compactionRequest, hiddenRecord], true);
+      behindHidden.handleStreamStart(streamStart);
+      expect(behindHidden.isCompacting()).toBe(true);
+
+      const behindUser = new StreamingMessageAggregator(TEST_CREATED_AT);
+      behindUser.loadHistoricalMessages([compactionRequest, ordinaryUser], true);
+      behindUser.handleStreamStart(streamStart);
+      expect(behindUser.isCompacting()).toBe(false);
+    });
+
     test("treats mode=compact as authoritative", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
