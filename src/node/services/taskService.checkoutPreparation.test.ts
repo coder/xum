@@ -465,6 +465,112 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
     );
   }, 30_000);
 
+  // Integration with main #4387 (MaterializedTaskLaunch.reusedExistingCheckout): the launch's
+  // "a shared task must reuse its published checkout" check is a boolean, so prove identity by
+  // behavior. The row is persisted at a STALE path of an existing directory (what a pre-#4387
+  // build could leave behind); Config normalization re-derives it to the owner's live checkout,
+  // and the launch must be authorized against, and run in, that checkout, never the stale one.
+  test("a shared task persisted at a stale path launches authorized against, and running in, its owner's live checkout (no fork)", async () => {
+    const sharedId = "prepsharedlive";
+    const projectPath = await createRepoWithTrackedEnable();
+    const srcDir = history.config.srcDir;
+    const worktree: RuntimeConfig = { type: "worktree", srcBaseDir: srcDir };
+    const stalePath = path.join(srcDir, "repo", "stale-parent");
+    await fsPromises.mkdir(stalePath, { recursive: true });
+    const { config, taskService, workspaceService, parentPath, sends } = await createRealStack(
+      projectPath,
+      [
+        {
+          id: sharedId,
+          name: `agent_explore_${sharedId}`,
+          // Save-time normalization (#4387) re-derives this to the owner's checkout.
+          path: stalePath,
+          createdAt: new Date().toISOString(),
+          runtimeConfig: worktree,
+          parentWorkspaceId: rootId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "queued",
+          taskPrompt: "go",
+          taskModelString: "openai:gpt-5.2",
+          taskIsolation: "none",
+        },
+      ]
+    );
+    // Rewrite the persisted row as an older build would have left it (the save path itself
+    // normalizes, so write the file directly).
+    const configFile = path.join(config.rootDir, "config.json");
+    const raw = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as {
+      projects: Array<[string, { workspaces: Array<{ id?: string; path: string }> }]>;
+    };
+    const persisted = raw.projects
+      .flatMap(([, project]) => project.workspaces)
+      .find((row) => row.id === sharedId);
+    if (persisted == null) throw new Error("shared row missing from config.json");
+    persisted.path = stalePath;
+    await fsPromises.writeFile(configFile, JSON.stringify(raw), "utf-8");
+    expect(findWorkspaceInConfig(config, sharedId)?.path).toBe(parentPath);
+    // The load re-read the stale file and persists its repair (asynchronously, via the edit
+    // queue).
+    await waitUntil(async () => {
+      const onDisk = JSON.parse(await fsPromises.readFile(configFile, "utf-8")) as typeof raw;
+      return (
+        onDisk.projects
+          .flatMap(([, project]) => project.workspaces)
+          .find((row) => row.id === sharedId)?.path === parentPath
+      );
+    }, "the load-time repair of the stale shared path");
+
+    const preflights: Array<Awaited<ReturnType<TaskService["preflightTaskWorkspacePreparation"]>>> =
+      [];
+    const realPreflight = taskService.preflightTaskWorkspacePreparation.bind(taskService);
+    const preflightSpy = spyOn(taskService, "preflightTaskWorkspacePreparation").mockImplementation(
+      async (workspaceId) => {
+        const result = await realPreflight(workspaceId);
+        if (workspaceId === sharedId) preflights.push(result);
+        return result;
+      }
+    );
+    restores.push(() => preflightSpy.mockRestore());
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    restores.push(() => forkSpy.mockRestore());
+
+    await taskService.maybeStartQueuedTasks();
+    await waitUntil(
+      () =>
+        sends.includes(sharedId) &&
+        findWorkspaceInConfig(config, sharedId)?.taskStatus === "running",
+      "the shared launch's send"
+    );
+
+    // Authorized against the owner's live checkout.
+    expect(preflights.length).toBeGreaterThan(0);
+    for (const preflight of preflights) {
+      expect(preflight).toMatchObject({
+        success: true,
+        data: {
+          kind: "authority",
+          authority: { kind: "shared", anchorWorkspaceId: rootId, anchorPath: parentPath },
+        },
+      });
+    }
+    // Runs there: the row and the metadata the session executes in name the owner's checkout.
+    expect(findWorkspaceInConfig(config, sharedId)).toMatchObject({
+      path: parentPath,
+      taskIsolation: "none",
+    });
+    expect((await config.getWorkspaceMetadataById(sharedId))?.namedWorkspacePath).toBe(parentPath);
+    expect(await workspaceService.getInfo(sharedId)).toMatchObject({
+      namedWorkspacePath: parentPath,
+    });
+    // Nothing forked; the stale directory is neither used nor removed.
+    expect(forkSpy).not.toHaveBeenCalled();
+    expect((await fsPromises.readdir(path.join(srcDir, "repo"))).sort()).toEqual([
+      "parent",
+      "stale-parent",
+    ]);
+  }, 30_000);
+
   test("Task.create publishes the proof of a directly created dedicated fork in its first write", async () => {
     const taskId = "prepdirect01";
     const projectPath = await createRepoWithTrackedEnable();
