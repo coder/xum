@@ -16961,14 +16961,12 @@ describe("WorkspaceService shared-checkout tasks and owner renames", () => {
     expect(created.success).toBe(true);
     const unrelatedPath = runtime.getWorkspacePath(projectPath, "unrelated");
     await config.editConfig((cfg) => {
-      cfg.projects
-        .get(projectPath)
-        ?.workspaces.push({
-          id: "unrelated-ws",
-          name: "unrelated",
-          path: unrelatedPath,
-          runtimeConfig,
-        });
+      cfg.projects.get(projectPath)?.workspaces.push({
+        id: "unrelated-ws",
+        name: "unrelated",
+        path: unrelatedPath,
+        runtimeConfig,
+      });
       return cfg;
     });
 
