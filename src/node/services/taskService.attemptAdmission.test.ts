@@ -3783,9 +3783,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       { id: taskId, overrides: { taskStatus: "running", taskAttemptId: "att_00000000000000ac" } },
     ]);
     const otherBackend = await createTestConfig(rootDir);
-    let activeTurn: symbol | undefined;
+    const session: { activeTurn?: symbol } = {};
     const host = hostWithTurnEvents({
-      getActiveTurnGeneration: mock(() => activeTurn),
+      getActiveTurnGeneration: mock(() => session.activeTurn),
     });
     const { taskService } = createHarness(config, { workspaceService: host.workspaceService });
     const svc = internals(taskService);
@@ -3809,7 +3809,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).onAdmitted(
       turn2
     );
-    activeTurn = turn2;
+    session.activeTurn = turn2;
     const sends = [...(svc.admittedSendsByTaskId.get(taskId) ?? [])];
     expect(sends.map((send) => send.attemptId)).toEqual([attemptA, foreign]);
     // Turn 2's stream belongs to B (its direct admission), not to A's inherited obligation.
