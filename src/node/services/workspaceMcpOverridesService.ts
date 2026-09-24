@@ -4535,6 +4535,14 @@ export class WorkspaceMcpOverridesService {
               // Write-join: a claim the deadline abandoned must land (or fail) before
               // the locks release (see the option's contract). Its own failure, if
               // any, is the error already propagating from the await above.
+              // WHY UNBOUNDED (lXKmY, deliberate): releasing these fences with a nonce
+              // write still pending breaks "cancellation joins outstanding filesystem
+              // writes before releasing fences" — the late write could stamp a
+              // directory a successor owns by then. The cost: a claim stalled on a hung
+              // mount (FUSE/NFS) keeps this checkout's and the global override locks,
+              // and the caller's registration lock, held until the kernel returns. That
+              // is an unbounded availability limit, not a bounded operation; bounding it
+              // needs a writer that can be killed (e.g. a helper process).
               await claim.then(
                 () => undefined,
                 () => undefined
@@ -4574,7 +4582,10 @@ export class WorkspaceMcpOverridesService {
           } finally {
             // A rewrite the deadline abandoned must land (or fail) before the
             // locks release: a late write could otherwise overwrite a save made
-            // by the registration that follows.
+            // by the registration that follows (a later consent save). Joined
+            // without a bound for the same reason as the claim above (lXKmY): a
+            // stalled mount holds these locks and the registration lock — an
+            // availability limit, not a bounded operation.
             await snapshot.settleSideEffects();
           }
           if (options?.afterPruneUnderLock !== undefined) {
