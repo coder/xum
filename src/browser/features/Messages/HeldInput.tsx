@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
@@ -28,6 +28,56 @@ function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
+type HeldInputAction = "send" | "discard";
+
+/**
+ * Run Send or Discard for one held input. Module scope, with the banner's state passed in, so
+ * the button handlers and the shortcut listener share one implementation without a per-render
+ * function in the listener effect's dependencies (and without suppressing the hooks lint rule,
+ * which would make React Compiler skip the whole component).
+ */
+function runHeldInputAction(
+  action: HeldInputAction,
+  context: {
+    api: APIClient | null;
+    workspaceId: string;
+    heldInputId: string;
+    actionInFlightRef: React.MutableRefObject<boolean>;
+    setActionError: (error: string | null) => void;
+    setPendingAction: (action: HeldInputAction | null) => void;
+  }
+): void {
+  const { api, actionInFlightRef, setActionError, setPendingAction } = context;
+  // One action at a time: a double-click must not send the held input twice (the backend also
+  // refuses a second concurrent send of the same held input).
+  if (actionInFlightRef.current || !api) return;
+  actionInFlightRef.current = true;
+  setActionError(null);
+  setPendingAction(action);
+  const request = { workspaceId: context.workspaceId, heldInputId: context.heldInputId };
+  const run = async (): Promise<string | null> => {
+    if (action === "send") {
+      const result = await api.workspace.sendHeldInput(request);
+      return result.success ? null : formatSendMessageError(result.error).message;
+    }
+    const result = await api.workspace.discardHeldInput(request);
+    return result.success ? null : result.error;
+  };
+  run().then(
+    // On success the backend's held-inputs-changed event unmounts this banner.
+    (error) => {
+      actionInFlightRef.current = false;
+      setActionError(error);
+      setPendingAction(null);
+    },
+    (error: unknown) => {
+      actionInFlightRef.current = false;
+      setActionError(error instanceof Error ? error.message : String(error));
+      setPendingAction(null);
+    }
+  );
+}
+
 /**
  * A manual queued message the backend refused to dispatch because the task reported before it
  * ran. The backend keeps the full send; this banner only offers the two explicit outcomes. There
@@ -36,7 +86,7 @@ function pluralize(count: number, noun: string): string {
  */
 export const HeldInput: React.FC<HeldInputProps> = (props) => {
   const { api } = useAPI();
-  const [pendingAction, setPendingAction] = useState<"send" | "discard" | null>(null);
+  const [pendingAction, setPendingAction] = useState<HeldInputAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   // Synchronous guard: a second click can land before the disabled state renders.
   const actionInFlightRef = useRef(false);
@@ -47,39 +97,15 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     props.heldInput.reviewCount > 0 ? pluralize(props.heldInput.reviewCount, "review") : null,
   ].filter((count): count is string => count != null);
 
-  // The shortcut listener below depends on runAction. React Compiler memoizes it (AGENTS.md: no
-  // manual useCallback), so its identity only changes with its inputs; the lint rule cannot see it.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const runAction = (action: "send" | "discard") => {
-    // One action at a time: a double-click must not send the held input twice (the backend also
-    // refuses a second concurrent send of the same held input).
-    if (actionInFlightRef.current || !api) return;
-    actionInFlightRef.current = true;
-    setActionError(null);
-    setPendingAction(action);
-    const request = { workspaceId: props.workspaceId, heldInputId: props.heldInput.id };
-    const run = async (): Promise<string | null> => {
-      if (action === "send") {
-        const result = await api.workspace.sendHeldInput(request);
-        return result.success ? null : formatSendMessageError(result.error).message;
-      }
-      const result = await api.workspace.discardHeldInput(request);
-      return result.success ? null : result.error;
-    };
-    run().then(
-      // On success the backend's held-inputs-changed event unmounts this banner.
-      (error) => {
-        actionInFlightRef.current = false;
-        setActionError(error);
-        setPendingAction(null);
-      },
-      (error: unknown) => {
-        actionInFlightRef.current = false;
-        setActionError(error instanceof Error ? error.message : String(error));
-        setPendingAction(null);
-      }
-    );
-  };
+  const runAction = (action: HeldInputAction) =>
+    runHeldInputAction(action, {
+      api,
+      workspaceId: props.workspaceId,
+      heldInputId: props.heldInput.id,
+      actionInFlightRef,
+      setActionError,
+      setPendingAction,
+    });
 
   // The composer's shortcuts (see ChatInput) arrive as an event so they share this banner's
   // in-flight guard and error display with the buttons.
@@ -89,11 +115,18 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
       if (detail.workspaceId !== props.workspaceId || detail.heldInputId !== props.heldInput.id) {
         return;
       }
-      runAction(detail.action);
+      runHeldInputAction(detail.action, {
+        api,
+        workspaceId: props.workspaceId,
+        heldInputId: props.heldInput.id,
+        actionInFlightRef,
+        setActionError,
+        setPendingAction,
+      });
     };
     window.addEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
     return () => window.removeEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
-  }, [props.workspaceId, props.heldInput.id, runAction]);
+  }, [api, props.workspaceId, props.heldInput.id]);
 
   return (
     <ChatDockSurface>
