@@ -13,7 +13,7 @@ const MAX_SNAPSHOT_ENABLED_FILES = 115;
 // Exact count on the current main: upstream story edits (ChatInput, MessageRenderer,
 // ExperimentsSection) added seven stories to existing files, and App.subagentTasks
 // added two stories with inline two-theme matrices (four snapshots). Main has since
-// grown to 606; the ModelsSection discovery stories (desktop + pinned phone) add two.
+// grown, and the ModelsSection discovery stories (desktop and pinned phone) add theirs.
 const MAX_ESTIMATED_SNAPSHOTS = 608;
 const STORY_EXPORT_PATTERN = /^export const \w+/gm;
 const DUAL_THEME_PATTERN = /matrix:\s*PIXEL_DUAL_THEME/g;
