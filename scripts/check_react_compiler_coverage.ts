@@ -191,7 +191,8 @@ function main(): void {
       failures.push(
         reasons
           ? `${key} is skipped by React Compiler:\n    ${[...new Set(reasons)].join("\n    ")}`
-          : `${key} was not found. If it was renamed or moved, update HOT_COMPONENTS.`
+          : `${key} was not compiled and reported no error. If it was renamed or moved, ` +
+            `update HOT_COMPONENTS; a hook that calls no other hooks needs a "use memo" directive.`
       );
     }
   }
