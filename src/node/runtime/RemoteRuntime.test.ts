@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { spawn } from "node:child_process";
+import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
 import type { ExecOptions, ExecStream } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { TestRemoteRuntime } from "./testRemoteRuntime";
@@ -142,6 +144,47 @@ describe("RemoteRuntime file operation aborts", () => {
     );
     expect(rejected).toBe(true);
     expect(resolverSettled).toBe(false);
+  });
+});
+
+/** Spawns a real long-running local process so abort handling can be observed end to end. */
+class SleepingRemoteRuntime extends TestRemoteRuntime {
+  spawned: ReturnType<typeof spawn> | undefined;
+
+  protected override spawnRemoteProcess(): Promise<SpawnResult> {
+    this.spawned = spawn("sleep", ["30"], { stdio: ["pipe", "pipe", "pipe"] });
+    return Promise.resolve({ process: this.spawned });
+  }
+}
+
+describe("RemoteRuntime abort cancels the underlying command", () => {
+  // Reawakened sub-agents bound definition reads with an abort signal; the timeout only
+  // bounds remote work if an aborted stat/readFile really ends its command.
+  it("a caller abort forwards into the stat exec", async () => {
+    const runtime = new ReadFileRemoteRuntime();
+    const abort = new AbortController();
+    const pending = runtime.stat("/workspace/agent.md", abort.signal).catch(() => undefined);
+    await Bun.sleep(0);
+    expect(runtime.capturedSignal).toBeDefined();
+    expect(runtime.capturedSignal?.aborted).toBe(false);
+
+    abort.abort();
+    expect(runtime.capturedSignal?.aborted).toBe(true);
+    void pending;
+  });
+
+  it("aborting exec terminates the spawned process", async () => {
+    const runtime = new SleepingRemoteRuntime();
+    const abort = new AbortController();
+    const stream = await runtime.exec("sleep 30", {
+      cwd: "/workspace",
+      abortSignal: abort.signal,
+    });
+    expect(runtime.spawned?.exitCode).toBeNull();
+
+    abort.abort();
+    expect(await stream.exitCode).toBe(EXIT_CODE_ABORTED);
+    expect(runtime.spawned?.signalCode).toBe("SIGTERM");
   });
 });
 

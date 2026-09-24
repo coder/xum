@@ -79,6 +79,7 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import * as resolveNodeAgentAiSettingsModule from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -8759,7 +8760,7 @@ describe("TaskService", () => {
     );
   });
 
-  test("grouped Exec children keep creation-time settings through queueing, reload, and reactivation", async () => {
+  test("grouped Exec children keep creation-time settings through queueing and reload; reactivation re-resolves", async () => {
     const config = await createTestConfig(rootDir);
     const model = "openai:gpt-5.2";
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
@@ -8830,14 +8831,618 @@ describe("TaskService", () => {
       "tool-end"
     );
     expect(reactivated).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+    // An ancestor reawakening re-resolves from current settings: the parent chat's Exec
+    // selection now outranks the base Exec default and the child's creation-time value.
     expect(sendMessage).toHaveBeenLastCalledWith(
       first.taskId,
       expect.any(String),
-      expect.objectContaining({ model, thinkingLevel: "high" }),
+      expect.objectContaining({
+        model: "openai:gpt-5.3-codex",
+        thinkingLevel: "medium",
+        skipAiSettingsPersistence: true,
+      }),
       expect.anything()
     );
+    // This mock never accepts the turn, so nothing was committed.
     expect(findWorkspaceInConfig(config, first.taskId)?.aiSettings?.model).toBe(model);
+    expect(findWorkspaceInConfig(config, first.taskId)?.taskModelString).toBe(model);
   }, 20_000);
+
+  describe("reawakened sub-agents follow current AI settings", () => {
+    const SPAWN_MODEL = "openai:gpt-5.2";
+    const MODEL_B = "openai:gpt-5.3-codex";
+    const MODEL_C = "anthropic:claude-haiku-4-5";
+
+    type AcceptingSend = ReturnType<typeof createAcceptingSendMessage>;
+
+    /** Accepts the turn like a real send: runs onAccepted, converting its throw to Err. */
+    function createAcceptingSendMessage(beforeAccept?: () => Promise<void>) {
+      return mock(async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await beforeAccept?.();
+        try {
+          await internal?.onAccepted?.();
+        } catch (error) {
+          return Err({
+            type: "unknown",
+            raw: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return Ok(undefined);
+      });
+    }
+
+    function lastSendOptions(sendMessage: ReturnType<typeof mock>): Record<string, unknown> {
+      const options: unknown = sendMessage.mock.calls.at(-1)?.[2];
+      assert(options != null && typeof options === "object", "expected a dispatched send");
+      return options as Record<string, unknown>;
+    }
+
+    async function editEntry(
+      config: Config,
+      workspaceId: string,
+      mutate: (workspace: WorkspaceConfigEntry, cfg: ProjectsConfig) => void
+    ): Promise<void> {
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((entry) => entry.id === workspaceId);
+          if (workspace) mutate(workspace, cfg);
+        }
+        return cfg;
+      });
+    }
+
+    async function setDelegatedExec(
+      config: Config,
+      subagent: { modelString?: string; thinkingLevel?: ThinkingLevel }
+    ): Promise<void> {
+      await config.editConfig((cfg) => {
+        const exec = cfg.agentAiDefaults?.exec ?? {};
+        cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { ...exec, subagent } };
+        return cfg;
+      });
+    }
+
+    async function spawnReportedChild(
+      options: {
+        spawn?: Partial<Parameters<TaskService["create"]>[0]>;
+        sendMessage?: AcceptingSend;
+        beforeSpawn?: (projectPath: string) => Promise<void>;
+      } = {}
+    ) {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+        agentAiDefaults: { exec: { modelString: SPAWN_MODEL, thinkingLevel: "high" } },
+      });
+      await options.beforeSpawn?.(projectPath);
+      const sendMessage = options.sendMessage ?? createAcceptingSendMessage();
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const initStateManager = new RealInitStateManager(config);
+      const harness = createTaskServiceHarness(config, { workspaceService, initStateManager });
+      const created = await createAgentTask(harness.taskService, parentId, "child", {
+        agentType: "exec",
+        ...options.spawn,
+      });
+      assert(created.success, created.success ? "" : created.error);
+      const childId = created.data.taskId;
+      await initStateManager.waitForInit(childId);
+      await editEntry(config, childId, (workspace) => {
+        workspace.taskStatus = "reported";
+      });
+      sendMessage.mockClear();
+      return {
+        ...harness,
+        config,
+        parentId,
+        projectPath,
+        childId,
+        sendMessage,
+        workspaceService,
+        initStateManager,
+      };
+    }
+
+    function reawaken(taskService: TaskService, parentId: string, childId: string) {
+      return taskService.sendMessageToDescendantAgentTask(
+        parentId,
+        childId,
+        "continue",
+        "tool-end"
+      );
+    }
+
+    test("creation stores explicit task arguments as pins (always an object)", async () => {
+      const { config, taskService, parentId, childId, initStateManager } =
+        await spawnReportedChild();
+      expect(findWorkspaceInConfig(config, childId)?.taskAiPins).toEqual({});
+
+      const explicit = await createAgentTask(taskService, parentId, "pinned", {
+        agentType: "exec",
+        modelString: MODEL_B,
+        thinkingLevel: "low",
+      });
+      assert(explicit.success);
+      await initStateManager.waitForInit(explicit.data.taskId);
+      expect(findWorkspaceInConfig(config, explicit.data.taskId)?.taskAiPins).toEqual({
+        model: MODEL_B,
+        thinkingLevel: "low",
+      });
+
+      const many = await taskService.createMany([
+        {
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentId: "exec",
+          prompt: "workflow step",
+          title: "step",
+          modelString: MODEL_C,
+        },
+      ]);
+      assert(many.success);
+      expect(findWorkspaceInConfig(config, many.data[0].taskId)?.taskAiPins).toEqual({
+        model: MODEL_C,
+      });
+    }, 20_000);
+
+    test.each([
+      {
+        name: "Delegated override",
+        apply: (config: Config) => setDelegatedExec(config, { modelString: MODEL_B }),
+        expected: MODEL_B,
+      },
+      {
+        name: "direct parent's Exec selection",
+        apply: (config: Config, parentId: string) =>
+          editEntry(config, parentId, (workspace) => {
+            workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "high" } };
+          }),
+        expected: MODEL_C,
+      },
+      {
+        name: "base Exec default (masked by the parent's Exec selection)",
+        apply: async (config: Config, parentId: string) => {
+          await config.editConfig((cfg) => {
+            cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { modelString: MODEL_B } };
+            return cfg;
+          });
+          await editEntry(config, parentId, (workspace) => {
+            workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "high" } };
+          });
+        },
+        expected: MODEL_C,
+      },
+    ])(
+      "an ancestor reawakening follows the current $name",
+      async (row) => {
+        const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+        expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(SPAWN_MODEL);
+        await row.apply(config, parentId);
+
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+        expect(lastSendOptions(sendMessage)).toMatchObject({
+          model: row.expected,
+          skipAiSettingsPersistence: true,
+        });
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(row.expected);
+        expect(child?.aiSettings?.model).toBe(row.expected);
+        expect(child?.aiSettingsByAgent?.exec?.model).toBe(row.expected);
+        expect(child?.taskExecutionStatus).toBe("running");
+      },
+      20_000
+    );
+
+    test("a declared definition ancestor's Settings reach an Exec-derived child", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild({
+        spawn: { agentType: "custom", agentId: "custom" },
+        beforeSpawn: (projectPath) => writeCustomAgentDefinition(projectPath),
+      });
+      await config.editConfig((cfg) => {
+        cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { modelString: MODEL_B } };
+        return cfg;
+      });
+
+      const result = await reawaken(taskService, parentId, childId);
+      expect(result.success).toBe(true);
+      // Only the definition chain (custom -> exec) makes Exec's base model apply here.
+      expect(lastSendOptions(sendMessage)).toMatchObject({ model: MODEL_B });
+      expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(MODEL_B);
+    }, 20_000);
+
+    test("explicit task arguments stay pinned per field", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild({
+        spawn: { modelString: SPAWN_MODEL },
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
+
+      expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+      expect(lastSendOptions(sendMessage)).toMatchObject({
+        model: SPAWN_MODEL,
+        thinkingLevel: "xhigh",
+      });
+      expect(findWorkspaceInConfig(config, childId)?.taskAiPins).toEqual({ model: SPAWN_MODEL });
+    }, 20_000);
+
+    test("legacy children without taskAiPins keep creation-time settings", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      await editEntry(config, childId, (workspace) => {
+        delete workspace.taskAiPins;
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+
+      expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+      const options = lastSendOptions(sendMessage);
+      expect(options.model).toBe(SPAWN_MODEL);
+      expect(options.skipAiSettingsPersistence).toBeUndefined();
+      expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(SPAWN_MODEL);
+    }, 20_000);
+
+    test("bash-monitor wakes stay frozen and read no definitions", async () => {
+      const { config, taskService, childId } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const loader = spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers");
+      const wakeSend = createAcceptingSendMessage();
+      try {
+        const result = await taskService.reactivateInactiveAgentTaskFromBashMonitorWake(
+          childId,
+          "background process finished",
+          wakeSend as unknown as Parameters<
+            TaskService["reactivateInactiveAgentTaskFromBashMonitorWake"]
+          >[2]
+        );
+        expect(result).toEqual(Ok(undefined));
+        expect(lastSendOptions(wakeSend).model).toBe(SPAWN_MODEL);
+        expect(loader).not.toHaveBeenCalled();
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(SPAWN_MODEL);
+        // The normal reactivation lifecycle still ran.
+        expect(child?.taskExecutionStatus).toBe("running");
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+
+    test("guidance to a live child reads no definitions and keeps its model", async () => {
+      const { config, taskService, parentId, childId } = await spawnReportedChild();
+      await editEntry(config, childId, (workspace) => {
+        workspace.taskStatus = "running";
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const loader = spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers");
+      try {
+        await reawaken(taskService, parentId, childId);
+        expect(loader).not.toHaveBeenCalled();
+        expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(SPAWN_MODEL);
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+
+    test("changes landing while definitions load are planned from fresh config", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      let signalLoadStarted!: () => void;
+      const loadStarted = new Promise<void>((resolve) => (signalLoadStarted = resolve));
+      let releaseLoad!: () => void;
+      const loadReleased = new Promise<void>((resolve) => (releaseLoad = resolve));
+      const loader = spyOn(
+        resolveNodeAgentAiSettingsModule,
+        "loadAgentDefinitionAiLayers"
+      ).mockImplementation(async () => {
+        signalLoadStarted();
+        await loadReleased;
+        return { ancestors: [] };
+      });
+      try {
+        const pending = reawaken(taskService, parentId, childId);
+        await loadStarted;
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        await editEntry(config, childId, (workspace) => {
+          workspace.taskAiPins = { thinkingLevel: "xhigh" };
+        });
+        releaseLoad();
+        expect((await pending).success).toBe(true);
+        expect(lastSendOptions(sendMessage)).toMatchObject({
+          model: MODEL_B,
+          thinkingLevel: "xhigh",
+        });
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+
+    test.each(["unavailable", "timeout", "not-prepared"] as const)(
+      "definition layers %s: still follows Settings and pins",
+      async (mode) => {
+        const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        await editEntry(config, childId, (workspace) => {
+          workspace.taskAiPins = { thinkingLevel: "xhigh" };
+        });
+        const originalLoader = resolveNodeAgentAiSettingsModule.loadAgentDefinitionAiLayers;
+        const seenSignals: Array<AbortSignal | undefined> = [];
+        const restores: Array<() => void> = [];
+        if (mode === "unavailable") {
+          const loader = spyOn(
+            resolveNodeAgentAiSettingsModule,
+            "loadAgentDefinitionAiLayers"
+          ).mockResolvedValue(null);
+          restores.push(() => loader.mockRestore());
+        } else if (mode === "timeout") {
+          // An already-expired timeout: the real loader must settle to null promptly.
+          const timeout = spyOn(AbortSignal, "timeout").mockImplementation(() =>
+            AbortSignal.abort(new Error("timed out"))
+          );
+          const loader = spyOn(
+            resolveNodeAgentAiSettingsModule,
+            "loadAgentDefinitionAiLayers"
+          ).mockImplementation(async (agentId, context, options) => {
+            seenSignals.push(options?.abortSignal);
+            const layers = await originalLoader(agentId, context, options);
+            expect(layers).toBeNull();
+            return layers;
+          });
+          restores.push(
+            () => timeout.mockRestore(),
+            () => loader.mockRestore()
+          );
+        } else {
+          const prepare = spyOn(
+            taskService as unknown as { prepareReawakenAi(taskId: string): Promise<unknown> },
+            "prepareReawakenAi"
+          ).mockResolvedValue(undefined);
+          restores.push(() => prepare.mockRestore());
+        }
+        try {
+          expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+          expect(lastSendOptions(sendMessage)).toMatchObject({
+            model: MODEL_B,
+            thinkingLevel: "xhigh",
+          });
+          if (mode === "timeout") {
+            expect(seenSignals).toHaveLength(1);
+            expect(seenSignals[0]?.aborted).toBe(true);
+          }
+        } finally {
+          for (const restore of restores) restore();
+        }
+      },
+      20_000
+    );
+
+    test("a reload between spawn and reawakening still re-resolves and keeps pins", async () => {
+      const { config, parentId, childId, sendMessage, workspaceService, initStateManager } =
+        await spawnReportedChild({ spawn: { thinkingLevel: "xhigh" } });
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "high" });
+      const reloaded = createTaskServiceHarness(config, { workspaceService, initStateManager });
+
+      expect((await reawaken(reloaded.taskService, parentId, childId)).success).toBe(true);
+      expect(lastSendOptions(sendMessage)).toMatchObject({
+        model: MODEL_B,
+        thinkingLevel: "xhigh",
+      });
+      expect(findWorkspaceInConfig(config, childId)?.taskAiPins).toEqual({
+        thinkingLevel: "xhigh",
+      });
+    }, 20_000);
+
+    test("a stale prepared context refuses retryably without any writes", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const before = JSON.stringify(findWorkspaceInConfig(config, childId));
+      const prepare = spyOn(
+        taskService as unknown as { prepareReawakenAi(taskId: string): Promise<unknown> },
+        "prepareReawakenAi"
+      ).mockResolvedValue({ taskId: childId, agentId: "exec", contextKey: "moved", layers: null });
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error.code).toBe("send_failed");
+        expect("message" in result.error ? result.error.message : "").toContain(
+          "changed while it was being reawakened"
+        );
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(JSON.stringify(findWorkspaceInConfig(config, childId))).toBe(before);
+      } finally {
+        prepare.mockRestore();
+      }
+    }, 20_000);
+
+    test("a change between resolution and acceptance refuses with no claim or settings", async () => {
+      const target: { config?: Config; childId?: string; armed: boolean } = { armed: false };
+      const sendMessage = createAcceptingSendMessage(async () => {
+        if (!target.armed || target.config == null || target.childId == null) return;
+        // Lands after TaskService planned the snapshot, before acceptance commits it.
+        await editEntry(target.config, target.childId, (workspace) => {
+          workspace.taskAiPins = { model: MODEL_C };
+        });
+      });
+      const fixture = await spawnReportedChild({ sendMessage });
+      const { config, childId } = fixture;
+      target.config = config;
+      target.childId = childId;
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      target.armed = true;
+
+      const result = await reawaken(fixture.taskService, fixture.parentId, childId);
+      expect(result.success).toBe(false);
+      const child = findWorkspaceInConfig(config, childId);
+      expect(child?.taskAiPins).toEqual({ model: MODEL_C });
+      expect(child?.taskModelString).toBe(SPAWN_MODEL);
+      expect(child?.aiSettingsByAgent?.exec).toBeUndefined();
+      expect(child?.taskExecutionStatus).not.toBe("running");
+    }, 20_000);
+
+    test("a send refused before acceptance leaves the AI-settings snapshot unchanged", async () => {
+      let refuse = false;
+      const refusingSend = mock(
+        (): Promise<Result<void, SendMessageError>> =>
+          Promise.resolve(
+            refuse ? Err({ type: "unknown", raw: "requireIdle: busy" }) : Ok(undefined)
+          )
+      );
+      const { config, taskService, parentId, childId } = await spawnReportedChild({
+        sendMessage: refusingSend as unknown as AcceptingSend,
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      refuse = true;
+      const result = await reawaken(taskService, parentId, childId);
+      expect(result.success).toBe(false);
+      const child = findWorkspaceInConfig(config, childId);
+      expect(child?.taskModelString).toBe(SPAWN_MODEL);
+      expect(child?.aiSettings?.model).toBe(SPAWN_MODEL);
+    }, 20_000);
+
+    test("a post-commit failure keeps the snapshot and settles the claimed mirror", async () => {
+      const { config, taskService, parentId, childId } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const host = taskService as unknown as {
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+      };
+      const originalEdit = host.editWorkspaceEntry.bind(taskService);
+      let committed = false;
+      let failedAfterCommit = false;
+      const edit = spyOn(host, "editWorkspaceEntry").mockImplementation(async (...args) => {
+        if (committed && !failedAfterCommit) {
+          // The taskPrompt cleanup right after the claim-and-settings write.
+          failedAfterCommit = true;
+          throw new Error("disk full");
+        }
+        const updated = await originalEdit(...args);
+        const child = findWorkspaceInConfig(config, childId);
+        committed ||= child?.taskModelString === MODEL_B && child.taskExecutionStatus === "running";
+        return updated;
+      });
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(failedAfterCommit).toBe(true);
+        expect(result.success).toBe(false);
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(MODEL_B);
+        expect(child?.taskExecutionStatus).not.toBe("running");
+      } finally {
+        edit.mockRestore();
+      }
+    }, 20_000);
+
+    test("a snapshot for another agent identity is refused before any write", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      const before = JSON.stringify(findWorkspaceInConfig(config, childId));
+      const result = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "continue",
+        title: "Sub-agent",
+        workspace: { mode: "existing", workspaceId: childId },
+        allowAgentWorkspace: true,
+        agentTaskAi: {
+          snapshot: {
+            agentId: "plan",
+            taskModelString: MODEL_B,
+            canonicalModel: MODEL_B,
+            thinkingLevel: "high",
+            reasoningMode: "standard",
+          },
+          inputsKey: "inputs",
+          contextKey: "context",
+        },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("changed while it was being reawakened");
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(JSON.stringify(findWorkspaceInConfig(config, childId))).toBe(before);
+    }, 20_000);
+
+    test("a metadata publication failure after the commit does not fail the turn", async () => {
+      const { config, taskService, parentId, childId } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const host = taskService as unknown as {
+        emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+      };
+      const originalEmit = host.emitWorkspaceMetadata.bind(taskService);
+      let rejectedAfterCommit = false;
+      const emit = spyOn(host, "emitWorkspaceMetadata").mockImplementation(async (workspaceId) => {
+        const child = findWorkspaceInConfig(config, childId);
+        if (workspaceId === childId && child?.taskModelString === MODEL_B) {
+          rejectedAfterCommit = true;
+          throw new Error("metadata bus closed");
+        }
+        return originalEmit(workspaceId);
+      });
+      const warn = spyOn(log, "warn");
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result.success).toBe(true);
+        expect(rejectedAfterCommit).toBe(true);
+        expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("running");
+        expect(warn.mock.calls.some((call) => String(call[0]).includes("publish reawakened"))).toBe(
+          true
+        );
+      } finally {
+        emit.mockRestore();
+        warn.mockRestore();
+      }
+    }, 20_000);
+
+    test("a crash cut after the commit recovers the claimed execution on the new model", async () => {
+      let armed = false;
+      let signalCut!: () => void;
+      const cutReached = new Promise<void>((resolve) => (signalCut = resolve));
+      const fixture = await spawnReportedChild();
+      const { config, childId } = fixture;
+      const host = fixture.taskService as unknown as {
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+      };
+      const originalEdit = host.editWorkspaceEntry.bind(fixture.taskService);
+      const edit = spyOn(host, "editWorkspaceEntry").mockImplementation(async (...args) => {
+        const child = findWorkspaceInConfig(config, childId);
+        if (armed && child?.taskModelString === MODEL_B) {
+          // The claim-and-settings write is durable: freeze here, before any later step.
+          signalCut();
+          await new Promise(() => undefined);
+        }
+        return originalEdit(...args);
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      armed = true;
+      void reawaken(fixture.taskService, fixture.parentId, childId);
+      await cutReached;
+
+      const crashRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-cut-"));
+      try {
+        await fsPromises.cp(rootDir, crashRoot, { recursive: true });
+        edit.mockRestore();
+        const restartedConfig = new Config(crashRoot);
+        const restartedChild = findWorkspaceInConfig(restartedConfig, childId);
+        expect(restartedChild?.taskModelString).toBe(MODEL_B);
+        expect(restartedChild?.aiSettings?.model).toBe(MODEL_B);
+        expect(restartedChild?.taskExecutionStatus).toBe("running");
+        expect(restartedChild?.taskExecutionId).toBeDefined();
+
+        const recoverySend = createAcceptingSendMessage();
+        const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: recoverySend });
+        const restarted = createTaskServiceHarness(restartedConfig, { workspaceService });
+        await restarted.taskService.initialize();
+        // Restart recovery may settle the interrupted continuation (notifying the parent on
+        // the parent's own model) instead of re-dispatching; any child dispatch it makes, and
+        // the child's persisted restart-safe fields, must carry the committed settings.
+        const childModels = [
+          ...recoverySend.mock.calls
+            .filter((call) => call[0] === childId)
+            .map((call) => (call[2] as { model?: string }).model),
+          ...(workspaceService.resumeStream as unknown as ReturnType<typeof mock>).mock.calls
+            .filter((call) => call[0] === childId)
+            .map((call) => (call[1] as { model?: string } | undefined)?.model),
+        ].filter((model) => model != null);
+        expect(childModels.every((model) => model === MODEL_B)).toBe(true);
+        const recoveredChild = findWorkspaceInConfig(restartedConfig, childId);
+        expect(recoveredChild?.taskModelString).toBe(MODEL_B);
+        expect(recoveredChild?.aiSettingsByAgent?.exec?.model).toBe(MODEL_B);
+      } finally {
+        await fsPromises.rm(crashRoot, { recursive: true, force: true });
+      }
+    }, 20_000);
+  });
 
   test("nested Exec delegation inherits the immediate child rather than the root chat", async () => {
     const config = await createTestConfig(rootDir);
@@ -25404,6 +26009,31 @@ describe("TaskService", () => {
       .find((workspace) => workspace.id === childId);
     expect(updatedTask?.agentId).toBe("exec");
     expect(updatedTask?.taskRecoveryAttempts).toBeUndefined();
+  });
+
+  test.each([
+    { name: "new-style", pins: { model: "openai:gpt-5.2", thinkingLevel: "high" as const } },
+    { name: "legacy", pins: undefined },
+  ])("plan-to-exec auto-handoff clears plan-phase pins ($name)", async (row) => {
+    const { config, childId, internal } = await setupPlanModeStreamEndHarness();
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((ws) => ws.id === childId);
+        if (workspace) {
+          workspace.taskAiPins = row.pins;
+        }
+      }
+      return cfg;
+    });
+
+    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+
+    const updatedTask = Array.from(config.loadConfigOrDefault().projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(updatedTask?.agentId).toBe("exec");
+    // The Exec phase starts unpinned but stays refreshable; legacy tasks stay legacy.
+    expect(updatedTask?.taskAiPins).toEqual(row.pins == null ? undefined : {});
   });
 
   test("plan task stream-end with final assistant text still requires propose_plan", async () => {

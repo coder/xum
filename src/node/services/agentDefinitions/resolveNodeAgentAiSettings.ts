@@ -20,6 +20,7 @@ import type {
   ThinkingLevel,
 } from "@/common/types/thinking";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
+import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
@@ -122,23 +123,37 @@ export function collectDefinitionLayers(
   return { targetDefinitionAiDefaults, ancestors: [...ancestorsById.values()] };
 }
 
-async function loadDefinitionLayers(
-  agentId: string,
-  context: NodeAgentDefinitionContext | undefined
-): Promise<{
+/** Definition-derived resolver layers for one agent (target defaults + declared ancestors). */
+export interface AgentDefinitionAiLayers {
   targetDefinitionAiDefaults?: AgentAiDefinitionDefaults;
   ancestors: AgentAiAncestorLayer[];
-}> {
-  if (!context) {
-    return { ancestors: [] };
-  }
+}
 
-  try {
+/**
+ * Reads the target definition and its declared base chain. Returns null when the
+ * chain is unavailable (missing/unreadable definition) or the read was aborted;
+ * callers decide the fallback. The abort signal is forwarded to the runtime
+ * reads so a timeout cancels underlying (e.g. SSH) work for runtimes that honor
+ * it, and settles this promise promptly even while a runtime call is still pending.
+ */
+export async function loadAgentDefinitionAiLayers(
+  agentId: string,
+  context: NodeAgentDefinitionContext,
+  options?: { abortSignal?: AbortSignal }
+): Promise<AgentDefinitionAiLayers | null> {
+  assert(agentId.length > 0, "loadAgentDefinitionAiLayers: agentId must be non-empty");
+  const abortSignal = options?.abortSignal;
+  if (abortSignal?.aborted) return null;
+
+  const load = async (): Promise<AgentDefinitionAiLayers> => {
     const agentDefinition = await readAgentDefinition(
       context.runtime,
       context.workspacePath,
       agentId,
-      { includeAgentPlugins: context.includeAgentPlugins }
+      {
+        includeAgentPlugins: context.includeAgentPlugins,
+        ...(abortSignal != null ? { abortSignal } : {}),
+      }
     );
     const chain = await resolveAgentInheritanceChain({
       runtime: context.runtime,
@@ -147,37 +162,53 @@ async function loadDefinitionLayers(
       agentDefinition,
       workspaceId: context.workspaceId,
       includeAgentPlugins: context.includeAgentPlugins,
+      ...(abortSignal != null ? { abortSignal } : {}),
     });
-
     return collectDefinitionLayers(agentId, chain);
+  };
+
+  let removeAbortListener: (() => void) | undefined;
+  try {
+    const work = load();
+    if (abortSignal == null) return await work;
+    // Some discovery steps (path resolution, candidate scans) take no signal; race
+    // them so an abort still settles this call. The loser's rejection is observed.
+    work.catch(() => undefined);
+    const aborted = new Promise<never>((_resolve, reject) => {
+      const onAbort = () => {
+        const reason: unknown = abortSignal.reason;
+        reject(reason instanceof Error ? reason : new Error("aborted"));
+      };
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => abortSignal.removeEventListener("abort", onAbort);
+    });
+    return await Promise.race([work, aborted]);
   } catch (error) {
-    // A missing or unreadable definition must not break resolution: fall back
-    // to the implicit base the resolver appends on its own.
     log.debug("resolveNodeAgentAiSettings: definition chain unavailable", {
       agentId,
       workspaceId: context.workspaceId,
+      aborted: abortSignal?.aborted === true,
       error: getErrorMessage(error),
     });
-    return { ancestors: [] };
+    return null;
+  } finally {
+    removeAbortListener?.();
   }
 }
 
-export async function resolveNodeAgentAiSettings(
-  params: ResolveNodeAgentAiSettingsParams
-): Promise<ResolvedAgentAiSettings> {
-  const { targetDefinitionAiDefaults, ancestors } = await loadDefinitionLayers(
-    params.agentId,
-    params.definitionContext
-  );
-
+/** Synchronous resolution over already-loaded definition layers. */
+export function resolveNodeAgentAiSettingsWithLayers(
+  params: Omit<ResolveNodeAgentAiSettingsParams, "definitionContext">,
+  layers: AgentDefinitionAiLayers
+): ResolvedAgentAiSettings {
   const result = resolveAgentAiSettings({
     targetAgentId: params.agentId,
     profile: params.profile,
     explicit: params.explicit,
     targetWorkspaceSettings: params.targetWorkspaceSettings,
     agentAiDefaults: params.cfg.agentAiDefaults,
-    targetDefinitionAiDefaults,
-    ancestors,
+    targetDefinitionAiDefaults: layers.targetDefinitionAiDefaults,
+    ancestors: layers.ancestors,
     parentWorkspaceExecSettings: params.parentWorkspaceExecSettings,
     parentRuntime: params.parentRuntime,
     fallbacks: params.fallbacks,
@@ -191,4 +222,16 @@ export async function resolveNodeAgentAiSettings(
   }
 
   return result;
+}
+
+export async function resolveNodeAgentAiSettings(
+  params: ResolveNodeAgentAiSettingsParams
+): Promise<ResolvedAgentAiSettings> {
+  // A missing or unreadable definition must not break resolution: fall back
+  // to the implicit base the resolver appends on its own.
+  const layers =
+    params.definitionContext != null
+      ? await loadAgentDefinitionAiLayers(params.agentId, params.definitionContext)
+      : null;
+  return resolveNodeAgentAiSettingsWithLayers(params, layers ?? { ancestors: [] });
 }

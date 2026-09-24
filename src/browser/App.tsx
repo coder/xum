@@ -125,6 +125,7 @@ import assert from "@/common/utils/assert";
 import { createProjectRefs } from "@/common/utils/multiProject";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
@@ -574,6 +575,7 @@ function AppInner() {
       // Use the utility function which handles localStorage and event dispatch
       // ThinkingProvider will pick this up via its listener
       updatePersistedState(key, normalized);
+      markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
       // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
       updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
 
@@ -633,6 +635,7 @@ function AppInner() {
       const thinkingLevel = getThinkingLevelForWorkspace(workspaceId);
 
       updatePersistedState(getReasoningModeKey(workspaceId), next);
+      markAiSelectionIntent(workspaceId, "reasoningMode", next);
 
       type WorkspaceAISettingsByAgentCache = Partial<
         Record<

@@ -201,6 +201,11 @@ import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  markAiSelectionIntent,
+} from "@/browser/utils/aiSelectionIntent";
+import {
   COMPOSER_CONTROL_HEIGHT_CLASS,
   COMPOSER_ICON_ONLY_HIDE_CLASS,
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
@@ -689,6 +694,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ensureModelInSettings(selectedModel); // Ensure model exists in Settings
       // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
       setAutoModelRoutingActive(false);
+      // Deliberate pick: pins the model on a sub-agent once a message sends it.
+      if (variant === "workspace" && workspaceId) {
+        markAiSelectionIntent(workspaceId, "model", selectedModel);
+      }
 
       if (onModelChange) {
         // Notify parent of model change (for context switch warning + persisted model metadata).
@@ -2343,8 +2352,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           queueDispatchMode: overrides?.queueDispatchMode,
         });
         const finalMessageText = preparedMessage.message;
-        const sendOptions = preparedMessage.options;
         const effectiveModel = preparedMessage.effectiveModel;
+        // Attach deliberate picks only while the sent values still equal them; the backend
+        // pins those fields on sub-agents so later reawakenings keep the user's choice.
+        const intentAgentId =
+          preparedMessage.options.agentId ?? agentId ?? WORKSPACE_DEFAULTS.agentId;
+        const aiSelection = getAiSelectionIntentForSendOptions(
+          props.workspaceId,
+          intentAgentId,
+          preparedMessage.options
+        );
+        const sendOptions = aiSelection.intent
+          ? { ...preparedMessage.options, aiSelectionIntent: aiSelection.intent }
+          : preparedMessage.options;
         const sentReviewIds = preparedMessage.sentReviewIds;
 
         // The backend reads this model's auto-compaction threshold from persisted user
@@ -2423,6 +2443,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
           }
         } else {
+          if (aiSelection.intent) {
+            consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection.attachedTokens);
+          }
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,

@@ -12,7 +12,7 @@ import {
   WorkspaceAISettingsByAgentSchema,
   WorkspaceAISettingsSchema,
 } from "@/common/orpc/schemas/workspaceAiSettings";
-import { ThinkingLevelSchema } from "@/common/types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "@/common/types/thinking";
 import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
 import { z } from "zod";
 
@@ -174,6 +174,17 @@ export const WorkspaceConfigSchema = z.object({
   taskThinkingLevel: ThinkingLevelSchema.optional().meta({
     description: "Thinking level used for this agent task (used for restart-safe resumptions).",
   }),
+  taskAiPins: z
+    .object({
+      model: z.string().optional(),
+      thinkingLevel: ThinkingLevelSchema.optional(),
+      reasoningMode: OpenAIReasoningModeSchema.optional(),
+    })
+    .optional()
+    .meta({
+      description:
+        "Agent-task AI fields pinned by explicit task arguments or by deliberate user picks sent from the task's chat; cleared at plan-to-exec handoff. Unpinned fields re-resolve from current defaults when an ancestor reawakens the task. Absent on legacy tasks, which keep creation-time settings.",
+    }),
   taskOnRefusal: z.enum(["fail", "fallback"]).optional().meta({
     description:
       "Model-refusal policy for this agent task: 'fail' opts out of configured model-fallback chains so refusals settle terminally (e.g. workflow verifier steps). Default behavior is 'fallback'.",

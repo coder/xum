@@ -32,6 +32,8 @@ interface ResolveAgentInheritanceChainOptions {
   maxDepth?: number;
   /** agent-plugins experiment: also resolve base agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
+  /** Cancels base-definition reads; traversal then rejects instead of issuing further reads. */
+  abortSignal?: AbortSignal;
 }
 
 /**
@@ -86,12 +88,16 @@ export async function resolveAgentInheritanceChain(
     const skipScopesAbove = computeBaseSkipScope(baseId, currentAgentId, currentDefinition.scope);
     currentAgentId = baseId;
 
+    options.abortSignal?.throwIfAborted();
     try {
       currentDefinition = await readAgentDefinition(runtime, workspacePath, baseId, {
         includeAgentPlugins: options.includeAgentPlugins,
         skipScopesAbove,
+        ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),
       });
     } catch (error) {
+      // Cancellation is the caller's decision, not a missing base: surface it.
+      if (options.abortSignal?.aborted) throw error;
       log.warn("Failed to load base agent definition; stopping inheritance resolution", {
         workspaceId,
         agentId,

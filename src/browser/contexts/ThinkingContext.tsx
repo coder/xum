@@ -33,6 +33,7 @@ import { getWorkspaceAiSettingsFromMetadata } from "@/browser/utils/workspaceAiS
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
 
 interface ThinkingContextType {
   thinkingLevel: ThinkingLevel;
@@ -196,6 +197,10 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
 
       setThinkingLevelInternal(level);
+      // Deliberate pick: pins thinking on a sub-agent once a message sends it.
+      if (props.workspaceId) {
+        markAiSelectionIntent(props.workspaceId, "thinkingLevel", level);
+      }
       // A concrete pick (selector row or keybind step) leaves thinking Auto,
       // mirroring setWorkspaceModelWithOrigin for the model dimension.
       updatePersistedState(getAutoThinkingLevelKey(scopeId), false);
@@ -228,6 +233,9 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       const model = getModelForThinkingUpdate(scopeId, metadataSettings.model, defaultModel);
 
       setReasoningModeInternal(mode);
+      if (props.workspaceId) {
+        markAiSelectionIntent(props.workspaceId, "reasoningMode", mode);
+      }
       persistAgentAiSettings({
         model,
         thinkingLevel: getCurrentThinkingLevel(),
@@ -239,6 +247,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       getCurrentThinkingLevel,
       metadataSettings.model,
       persistAgentAiSettings,
+      props.workspaceId,
       scopeId,
       setReasoningModeInternal,
     ]

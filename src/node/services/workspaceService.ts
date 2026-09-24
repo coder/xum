@@ -90,7 +90,12 @@ import {
   resolveNodeAgentAiSettings,
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
-import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
+import {
+  applyAiSelectionIntentToPins,
+  targetWorkspaceBucketToLayer,
+  type AiSelectionIntent,
+  type TaskAiPins,
+} from "@/common/types/agentAiSettings";
 import { lookupMinThinkingLevelOverride } from "@/common/utils/thinking/policy";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
@@ -358,6 +363,7 @@ import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycle
 import {
   areArchiveUntrackedPathListsEqual,
   normalizeArchiveUntrackedPaths,
+  resolveTaskAgentIdForResume,
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
@@ -10572,7 +10578,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private async maybePersistAISettingsFromOptions(
     workspaceId: string,
-    options: SendMessageOptions | undefined
+    options: SendMessageOptions | undefined,
+    pinIntent?: AiSelectionIntent
   ): Promise<void> {
     if (options?.skipAiSettingsPersistence) {
       // One-shot/compaction sends shouldn't overwrite workspace defaults.
@@ -10591,6 +10598,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // Save the selected agent so heartbeats can reuse it after reloads and reconnects.
         persistSelectedAgentId: true,
         ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
+        ...(pinIntent != null ? { pinIntent } : {}),
       }
     );
     if (!persistResult.success) {
@@ -10609,6 +10617,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       emitMetadata?: boolean;
       disableWorkspaceAgents?: boolean;
       persistSelectedAgentId?: boolean;
+      /** Deliberate user picks sent with this message: pin them on new-style agent tasks. */
+      pinIntent?: AiSelectionIntent;
     }
   ): Promise<Result<boolean, string>> {
     const found = this.config.findWorkspace(workspaceId);
@@ -10626,6 +10636,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // Removing the built-in Ask agent should not force writes into Auto's
     // settings bucket. Persist whatever agent ID the caller chose so legacy Ask
     // settings can fade out naturally instead of being mixed into Auto.
+
+    // Pins apply only to new-style agent tasks (taskAiPins present; legacy tasks stay
+    // frozen) and only for the task's own agent. Same reference = nothing to pin.
+    const computeNextPins = (entry: Workspace): TaskAiPins | undefined => {
+      const pinIntent = options?.pinIntent;
+      if (
+        pinIntent == null ||
+        aiSettings == null ||
+        entry.taskAiPins == null ||
+        normalizedAgentId !== resolveTaskAgentIdForResume(entry)
+      ) {
+        return entry.taskAiPins;
+      }
+      return applyAiSelectionIntentToPins(entry.taskAiPins, pinIntent, aiSettings);
+    };
 
     // Hot path: this runs on every message send, so skip the queued write when a
     // snapshot read already shows no change. Skipping is race-safe — it is equivalent
@@ -10650,7 +10675,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
       const selectedAgentChanged =
         options?.persistSelectedAgentId === true && snapshotEntry.agentId !== normalizedAgentId;
-      if (!aiSettingsChanged && !selectedAgentChanged) {
+      const pinsChanged = computeNextPins(snapshotEntry) !== snapshotEntry.taskAiPins;
+      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
         return Ok(false);
       }
     }
@@ -10678,9 +10704,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
       const selectedAgentChanged =
         options?.persistSelectedAgentId === true && workspaceEntry.agentId !== normalizedAgentId;
-      if (!aiSettingsChanged && !selectedAgentChanged) {
+      const nextPins = computeNextPins(workspaceEntry);
+      const pinsChanged = nextPins !== workspaceEntry.taskAiPins;
+      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
         writeResult = Ok(false);
         return freshConfig;
+      }
+
+      if (pinsChanged) {
+        workspaceEntry.taskAiPins = nextPins;
       }
 
       if (aiSettings != null) {
@@ -11798,6 +11830,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // the user authored before a goal became visible as an intervention
     // against it, pausing the fresh goal.
     const authoredAtMs = Date.now();
+    // Deliberate picker intent pins agent-task AI fields; only a person's own send may carry
+    // it. Strip it here so it never reaches the queue, AgentSession, or persisted options.
+    const { aiSelectionIntent, ...optionsWithoutAiSelectionIntent } = options;
+    options = optionsWithoutAiSelectionIntent;
+    const pinIntent =
+      (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.agentInitiated !== true
+        ? aiSelectionIntent
+        : undefined;
 
     let resumedInterruptedTask = false;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
@@ -12084,7 +12124,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Synthetic turns must not replace the user's remembered model and mode.
       if (internal?.synthetic !== true) {
-        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
+        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, pinIntent);
       }
 
       // Decide queue-or-direct in arrival order: a later send whose awaits above finished

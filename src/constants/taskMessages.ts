@@ -45,3 +45,11 @@ export const TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS = 1024 * 1024;
  * complete rendered payload length, so accounting stays exact regardless.
  */
 export const TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS = 256;
+
+/**
+ * Upper bound for reading a sub-agent's definition chain before an ancestor
+ * reawakens it. The read runs outside the task locks; on timeout the read is
+ * aborted (cancelling runtime work where supported) and the reawakening
+ * resolves AI settings without definition layers (best effort).
+ */
+export const REAWAKEN_DEFINITION_READ_TIMEOUT_MS = 5_000;
