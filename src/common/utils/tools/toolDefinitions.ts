@@ -381,8 +381,17 @@ function getTaskRuntimeVisibilityGuidance(runtimeMode: RuntimeMode | undefined):
   }
 }
 
-export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): string {
-  const isolationGuidance = runtimeModeSupportsSharedTaskWorkspace(runtimeMode)
+/**
+ * `options.sharedIsolation` overrides the runtime-mode default for workspaces whose runtime supports
+ * sharing but that TaskService still refuses (multi-project workspaces; see tools/task.ts).
+ */
+export function buildTaskToolDescription(
+  runtimeMode: RuntimeMode | undefined,
+  options?: { sharedIsolation?: boolean }
+): string {
+  const sharedIsolation =
+    options?.sharedIsolation ?? runtimeModeSupportsSharedTaskWorkspace(runtimeMode);
+  const isolationGuidance = sharedIsolation
     ? "\n\nWorkspace isolation: by default each sub-agent runs in a forked copy of this workspace. " +
       'On this runtime you may pass isolation: "none" to run the sub-agent directly in this workspace\'s ' +
       "checkout (shared working tree, including uncommitted changes), skipping the fork + init overhead. " +
