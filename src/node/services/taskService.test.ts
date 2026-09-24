@@ -9688,6 +9688,67 @@ describe("TaskService", () => {
       }
     }, 20_000);
 
+    test("the commit lands claim and settings in one write and publishes metadata once after it", async () => {
+      const { sendMessage, deferred } = createDeferredAcceptSendMessage();
+      const { config, taskService, parentId, childId, workspaceService } =
+        await spawnReportedChild({ sendMessage });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const busy = admitQueued(workspaceService, childId);
+      deferred.armed = true;
+      const host = taskService as unknown as {
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+        emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+      };
+      const originalEdit = host.editWorkspaceEntry.bind(taskService);
+      const originalEmit = host.emitWorkspaceMetadata.bind(taskService);
+      const events: Array<{ kind: "edit" | "emit"; model?: string; status?: string }> = [];
+      const observe = (kind: "edit" | "emit") => {
+        const child = findWorkspaceInConfig(config, childId);
+        events.push({ kind, model: child?.taskModelString, status: child?.taskExecutionStatus });
+      };
+      try {
+        expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+        assert(deferred.accept != null, "the queued send must defer its acceptance");
+        observe("edit");
+        const edit = spyOn(host, "editWorkspaceEntry").mockImplementation(async (...args) => {
+          const updated = await originalEdit(...args);
+          if (args[0] === childId) observe("edit");
+          return updated;
+        });
+        const emit = spyOn(host, "emitWorkspaceMetadata").mockImplementation(
+          async (workspaceId) => {
+            if (workspaceId === childId) observe("emit");
+            return originalEmit(workspaceId);
+          }
+        );
+        try {
+          await deferred.accept();
+        } finally {
+          edit.mockRestore();
+          emit.mockRestore();
+        }
+      } finally {
+        busy.mockRestore();
+      }
+      // Queued on the old model until acceptance.
+      expect(events[0]).toEqual({ kind: "edit", model: SPAWN_MODEL, status: "queued" });
+      // The first write showing the new settings also shows the running claim: one write.
+      const commitIndex = events.findIndex(
+        (event) => event.kind === "edit" && event.model === MODEL_B
+      );
+      expect(commitIndex).toBeGreaterThan(0);
+      expect(events[commitIndex].status).toBe("running");
+      expect(
+        events
+          .slice(0, commitIndex)
+          .every((event) => event.model === SPAWN_MODEL && event.status === "queued")
+      ).toBe(true);
+      // Published exactly once for this acceptance, after the commit.
+      const emits = events.filter((event) => event.kind === "emit");
+      expect(emits).toEqual([{ kind: "emit", model: MODEL_B, status: "running" }]);
+      expect(events.indexOf(emits[0])).toBeGreaterThan(commitIndex);
+    }, 20_000);
+
     test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
       const { config, taskService, parentId, childId, sendMessage, initStateManager } =
         await spawnReportedChild();
