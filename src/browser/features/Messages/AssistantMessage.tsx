@@ -31,6 +31,7 @@ import { ModelDisplay } from "./ModelDisplay";
 import { ModelFallbackBadge } from "./ModelFallbackBadge";
 import { AutoModelRoutingBadge } from "./AutoModelRoutingBadge";
 import { TypewriterMarkdown } from "./TypewriterMarkdown";
+import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
 
 interface AssistantMessageProps {
   message: DisplayedMessage & { type: "assistant" };
@@ -100,22 +101,25 @@ export const AssistantMessage: React.FC<AssistantMessageProps> = ({
       return;
     }
 
-    try {
-      // Response-level forks branch from this assistant turn instead of cloning the entire
-      // transcript, so users can explore alternatives without carrying over later replies.
-      const result = await forkWorkspace({
-        client: api,
-        sourceWorkspaceId: workspaceId,
-        sourceMessageId: message.historyId,
-      });
+    await runWithCatch(
+      async () => {
+        // Response-level forks branch from this assistant turn instead of cloning the entire
+        // transcript, so users can explore alternatives without carrying over later replies.
+        const result = await forkWorkspace({
+          client: api,
+          sourceWorkspaceId: workspaceId,
+          sourceMessageId: message.historyId,
+        });
 
-      if (!result.success) {
-        forkError.showError(message.historyId, result.error ?? "Failed to fork chat");
+        if (!result.success) {
+          forkError.showError(message.historyId, result.error ?? "Failed to fork chat");
+        }
+      },
+      (error) => {
+        const messageText = error instanceof Error ? error.message : "Failed to fork chat";
+        forkError.showError(message.historyId, messageText);
       }
-    } catch (error) {
-      const messageText = error instanceof Error ? error.message : "Failed to fork chat";
-      forkError.showError(message.historyId, messageText);
-    }
+    );
   };
 
   // Scratch chats cannot be forked (the backend rejects it), so hide the
