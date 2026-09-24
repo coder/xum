@@ -181,7 +181,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { ensurePlanSnapshot } from "./planReviewService";
+import { createPlanReviewFeedbackPrecondition, ensurePlanSnapshot } from "./planReviewService";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
 
@@ -609,6 +609,9 @@ const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message
 /** Refusal for a direct edit of authentic plan-review feedback (see isPlanReviewFeedbackEditTarget). */
 export const PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE =
   "Plan-review feedback cannot be edited as a message. Send new review comments instead.";
+/** Refusal when plan-review feedback's snapshot or threads left history before its append. */
+export const PLAN_REVIEW_FEEDBACK_STALE_MESSAGE =
+  "Plan review feedback was not sent: the plan snapshot or review threads it refers to were removed from the conversation. Review the current plan and send again.";
 const EMPTY_RESUME_HISTORY_ERROR =
   "Cannot resume stream: workspace history is empty. Send a new message instead.";
 
@@ -3671,6 +3674,12 @@ export class AgentSession {
       const batch = [...stagedPrefixes, ...messages];
       attempt.inputPublication = messages.at(-1);
       assert(replacementCapture, "Publication requires its admission capture");
+      // Plan-review feedback (direct, or nested in an on-send compaction request) is admitted
+      // only while its snapshot and threads are still in history, checked under the history
+      // write lock at this append (see createPlanReviewFeedbackPrecondition). The flag is set
+      // only by that check, so a refusal is told apart from any other skipped publication.
+      const feedbackPrecondition = createPlanReviewFeedbackPrecondition(batch);
+      let feedbackDependenciesMissing = false;
       const publishing = this.historyService.acceptCompactionReplacement(
         this.workspaceId,
         replacementCapture,
@@ -3682,6 +3691,14 @@ export class AgentSession {
         {
           isCurrent: () =>
             !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
+          ...(feedbackPrecondition !== undefined
+            ? {
+                admitsFullHistory: (history: MuxMessage[]) => {
+                  feedbackDependenciesMissing = !feedbackPrecondition(history);
+                  return !feedbackDependenciesMissing;
+                },
+              }
+            : {}),
           onContextResetCommitted: (predecessor, successor) => {
             this.advanceOwnedCompactionAdmission(predecessor, successor, attempt.admissionCapture);
           },
@@ -3710,7 +3727,11 @@ export class AgentSession {
         // A canceled ordinary append can now refuse under the publication lock before writing.
         // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
-        return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+        return Err(
+          feedbackDependenciesMissing
+            ? PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+            : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+        );
       }
       if (replacesCancellation) {
         // Retirement takes the same lock; join it only after publication releases that lock.
@@ -9908,6 +9929,11 @@ export class AgentSession {
     signal: AbortSignal
   ): Promise<void> {
     const captureSignal = AbortSignal.any([signal, this.closingSignal]);
+    // The capture belongs to this turn, so it is admitted under the turn's own frontier: a clear
+    // committed since the turn was admitted (a sibling backend's too; its busy guards cannot see
+    // this turn) refuses it, while the turn's own rollovers advance this live capture in place
+    // (advanceOwnedCompactionAdmission) and compaction leaves it alone.
+    const frontier = this.activeStreamContext?.admissionCapture;
     try {
       // Guard for test mocks that may not implement getWorkspaceMetadata.
       if (typeof this.aiService.getWorkspaceMetadata !== "function") return;
@@ -9937,6 +9963,7 @@ export class AgentSession {
           metadata: metadata.data,
           proposalToolCallId,
           signal: captureSignal,
+          ...(frontier !== undefined ? { frontier } : {}),
         }
       );
       if (!result.success) {
@@ -10886,6 +10913,16 @@ export class AgentSession {
         return false;
       }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
+      // Deferred plan-review feedback whose snapshot or threads were removed while compaction
+      // ran was refused under the history lock. Removed record ids never come back, so leaving
+      // the handoff on the summary would only fail again on every startup: drop it, then report
+      // the failure like any other dispatch failure.
+      if (
+        sendResult.error.type === "unknown" &&
+        sendResult.error.raw === PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+      ) {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+      }
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
     }
 

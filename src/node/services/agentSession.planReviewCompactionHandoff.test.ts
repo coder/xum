@@ -3,7 +3,7 @@ import assert from "@/common/utils/assert";
 import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Err } from "@/common/types/result";
-import type { AgentSession } from "./agentSession";
+import { PLAN_REVIEW_FEEDBACK_STALE_MESSAGE, type AgentSession } from "./agentSession";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -342,5 +342,186 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
       (await h.allRows()).filter((row) => row.metadata?.muxMetadata?.type === "compaction-request")
     ).toHaveLength(1);
     expect(authenticFeedbackRows(await h.allRows())).toHaveLength(0);
+  });
+});
+
+/**
+ * A sibling backend (XUM_ALLOW_MULTIPLE_INSTANCES, or the desktop app beside `xum server`) can
+ * truncate history between feedback preparation and the row's append, and while a diverted
+ * compaction runs; WorkspaceService's in-memory epochs never see it. It is modelled as a second
+ * HistoryService over the same config, which shares the cross-process history write lock.
+ */
+describe("plan-review feedback whose snapshot or threads leave history before its append", () => {
+  function setMonitor(h: Awaited<ReturnType<typeof fixture>>, divert: boolean) {
+    (
+      h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
+    ).contextController.compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: divert,
+        shouldForceCompact: divert,
+        usagePercentage: divert ? 99 : 10,
+        thresholdPercentage: 85,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+    } as unknown as CompactionMonitor;
+  }
+
+  /** Rows after the snapshot, each larger than it, so a small token cut removes only the snapshot. */
+  async function seedFillers(h: Awaited<ReturnType<typeof fixture>>) {
+    for (const id of ["filler-1", "filler-2", "filler-3"]) {
+      const appended = await h.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(id, "user", `${id} ${"context ".repeat(400)}`, { timestamp: Date.now() })
+      );
+      expect(appended.success).toBe(true);
+    }
+  }
+
+  /** The sibling's partial truncation; asserts it removed the snapshot and kept the fillers. */
+  async function siblingTruncateSnapshot(h: Awaited<ReturnType<typeof fixture>>) {
+    const cut = await new HistoryService(h.config).truncateHistory(workspaceId, 0.05, {
+      refuseFullDelete: true,
+    });
+    expect(cut.success).toBe(true);
+    const ids = (await h.allRows()).map((row) => row.id);
+    expect(ids).not.toContain("pr-snapshot");
+    expect(ids).toContain("filler-3");
+  }
+
+  test("(5) feedback sent after a sibling truncation removed its snapshot is refused at the append", async () => {
+    const h = await fixture();
+    setMonitor(h, false);
+    await seedSnapshot(h);
+    await seedFillers(h);
+    await siblingTruncateSnapshot(h);
+
+    const sent = await h.session.sendMessage(feedbackText, {
+      ...options,
+      muxMetadata: feedbackMeta,
+    });
+    expect(!sent.success && sent.error.type === "unknown" && sent.error.raw).toBe(
+      PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+    );
+    expect(h.stream).not.toHaveBeenCalled();
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(0);
+  });
+
+  test("(6) the diverting compaction request is refused when its nested feedback's snapshot is gone", async () => {
+    const h = await fixture();
+    await seedSnapshot(h);
+    await seedFillers(h);
+    await siblingTruncateSnapshot(h);
+
+    const sent = await h.session.sendMessage(feedbackText, {
+      ...options,
+      muxMetadata: feedbackMeta,
+    });
+    expect(!sent.success && sent.error.type === "unknown" && sent.error.raw).toBe(
+      PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+    );
+    expect(h.stream).not.toHaveBeenCalled();
+    expect(
+      (await h.allRows()).filter((row) => row.metadata?.muxMetadata?.type === "compaction-request")
+    ).toHaveLength(0);
+  });
+
+  test("(7) a sibling truncation after the diverted compaction lands refuses the follow-up and drops the handoff", async () => {
+    const h = await fixture();
+    await seedSnapshot(h);
+    await seedFillers(h);
+    await sendDivertedFeedback(h);
+    setMonitor(h, false);
+    // The sibling cuts right after the summary lands, before the follow-up dispatch appends
+    // (a cut while the compaction still streams fails that compaction instead). The snapshot now
+    // sits before the boundary, so this cut does not touch the active context at all.
+    const internals = h.session as unknown as { sendMessage: AgentSession["sendMessage"] };
+    const originalSend = h.session.sendMessage.bind(h.session);
+    let sends = 0;
+    internals.sendMessage = (async (...args: Parameters<AgentSession["sendMessage"]>) => {
+      sends += 1;
+      if (sends === 1) await siblingTruncateSnapshot(h);
+      return originalSend(...args);
+    }) as AgentSession["sendMessage"];
+
+    await runSessionTerminalPolicy(h.session, h.aiEmitter, {
+      type: "stream-end",
+      workspaceId,
+      messageId: "compaction-summary",
+      parts: [{ type: "text", text: "Summary of the plan discussion." }],
+      metadata: { model: options.model, agentId: "compact", finishReason: "stop" },
+    });
+
+    expect(sends).toBe(1);
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(0);
+    const summaryMeta = (await h.rows())[0]?.metadata?.muxMetadata;
+    assert(summaryMeta?.type === "compaction-summary");
+    // Dropped: the refusal is permanent, so no startup would ever dispatch it successfully.
+    expect(summaryMeta.pendingFollowUp).toBeUndefined();
+    await h.session.dispose();
+    const restarted = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    fixtures.push(restarted);
+    expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(false);
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(0);
+  });
+
+  test("(8) a reply to a thread whose feedback row a sibling removed is refused", async () => {
+    const h = await fixture();
+    setMonitor(h, false);
+    await seedSnapshot(h);
+    const opened = await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-feedback", "user", feedbackText, {
+        timestamp: Date.now(),
+        muxMetadata: feedbackMeta,
+      })
+    );
+    expect(opened.success).toBe(true);
+    const deleted = await new HistoryService(h.config).deleteMessages(workspaceId, ["pr-feedback"]);
+    expect(deleted.success).toBe(true);
+
+    const reply: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec_reply",
+      feedbackId: "fb_2",
+      snapshotId: snapshot.snapshotId,
+      contentHash: snapshot.contentHash,
+      comments: [],
+      replies: [{ replyId: "rpl_1", threadId: "thr_1", body: "Still unclear" }],
+    };
+    const sent = await h.session.sendMessage(formatPlanReviewEnvelope(reply), {
+      ...options,
+      muxMetadata: buildPlanReviewMetadata(reply),
+    });
+    expect(!sent.success && sent.error.type === "unknown" && sent.error.raw).toBe(
+      PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+    );
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(0);
+  });
+
+  test("(9) sibling appends before the send do not refuse feedback", async () => {
+    const h = await fixture();
+    setMonitor(h, false);
+    await seedSnapshot(h);
+    const appended = await new HistoryService(h.config).appendToHistory(
+      workspaceId,
+      createMuxMessage("sibling-row", "user", "unrelated", { timestamp: Date.now() })
+    );
+    expect(appended.success).toBe(true);
+
+    const sent = await h.session.sendMessage(feedbackText, {
+      ...options,
+      muxMetadata: feedbackMeta,
+    });
+    expect(sent.success).toBe(true);
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(1);
+    expect(planReviewThreads(await getPlanReviewState(h.historyService, workspaceId))).toEqual([
+      "thr_1",
+    ]);
   });
 });

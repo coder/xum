@@ -2252,19 +2252,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // pre-admission awaits (e.g. branch-summary generation).
   private readonly contextMutationEpochs = new Map<string, number>();
 
-  // Count of committed truncations that could remove rows (partial prefix cuts as well as
-  // full clears). Plan-review feedback binds snapshot/thread ids read before its send enters
-  // admission; a partial cut does not advance contextMutationEpochs (it is not a
-  // context-discarding mutation for ordinary sends) but can delete the referenced snapshot,
-  // so planReviewSubmitFeedback compares this generation too.
-  private readonly historyTruncationGenerations = new Map<string, number>();
-
   // On-demand plan-review snapshot captures in flight, per workspace. A context mutation
-  // aborts them when it acquires its admission guard: the capture's append-admission check
-  // runs under the history write lock, and the guard is armed before the mutation takes that
-  // lock, so either the snapshot row lands first (and a clear deletes it) or the append sees
-  // the abort. Without this, bytes read before a full clear could be appended into the
-  // emptied history and resurface plan content the clear was meant to discard.
+  // aborts them when it acquires its admission guard, and a capture that starts while a
+  // mutation holds the guard is refused up front. ensurePlanSnapshot's generation frontier
+  // already refuses bytes read before a clear commits; this also covers a capture that starts
+  // after the clear's history commit but before the clear deletes the plan file, which would
+  // otherwise read and append the discarded plan. Process-local, so it cannot close that
+  // window for a sibling backend's clear.
   private readonly onDemandPlanSnapshotCaptures = new Map<string, Set<AbortController>>();
 
   // r41: sends currently between the entry check and their settled outcome
@@ -11745,8 +11739,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspaceId,
         metadata,
         signal: capture.signal,
-        // The signal is process-local; this also fences sibling backends (see the arg's doc).
-        refuseAfterHistoryRemoval: true,
         ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
       });
     } finally {
@@ -11802,11 +11794,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         input.options.unfencedEdit === undefined,
       "plan review feedback cannot carry edit semantics"
     );
-    // A partial truncation (another window) can also delete the referenced snapshot without
-    // advancing the epoch, so its generation is compared the same way; truncation holds the
-    // admission guard for its whole run, so it cannot commit after this check either.
+    // Whether the referenced snapshot and threads still exist is checked where it can be
+    // decided: under the history write lock at the row's actual append (sendMessage's
+    // publication, see createPlanReviewFeedbackPrecondition), which also covers partial
+    // truncations, sibling backends and feedback deferred behind on-send compaction.
     const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
-    const truncationsAtPrepare = this.historyTruncationGenerations.get(workspaceId) ?? 0;
     const prepared = await preparePlanReviewFeedback(
       this.historyService,
       workspaceId,
@@ -11814,15 +11806,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       input.options
     );
     if (!prepared.success) return prepared;
-    if (
-      (this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare ||
-      (this.historyTruncationGenerations.get(workspaceId) ?? 0) !== truncationsAtPrepare
-    ) {
+    if ((this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare) {
       return Err({
         type: "send_failed",
         error: {
           type: "unknown",
-          raw: "Plan review feedback was not sent: the workspace history was cleared, truncated or reset while it was being prepared. Review the current plan and send again.",
+          raw: "Plan review feedback was not sent: the workspace context was cleared or reset while it was being prepared. Review the current plan and send again.",
         },
       });
     }
@@ -14377,12 +14366,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
-    }
-    if (truncationScope !== "none") {
-      this.historyTruncationGenerations.set(
-        workspaceId,
-        (this.historyTruncationGenerations.get(workspaceId) ?? 0) + 1
-      );
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the

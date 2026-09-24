@@ -4,13 +4,14 @@ import * as path from "node:path";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import { isMuxMessage } from "@/common/orpc/types";
-import type { MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok, type Result } from "@/common/types/result";
 import type { StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
+import { HistoryService } from "./historyService";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import type { TurnCompletion } from "./streamManager";
 import { createTestHistoryService } from "./testHistoryService";
@@ -295,6 +296,84 @@ describe("AgentSession plan-review snapshot capture", () => {
       await h.session.dispose();
       await h.cleanup();
     }
+  });
+
+  /**
+   * Run `mutate` between a turn-owned capture's plan read and its locked append, then finish the
+   * turn. A sibling backend is modelled over the same config: it shares the session directory
+   * and the cross-process history write lock but cannot see this session's busy/abort guards.
+   */
+  async function proposeWithMutationBeforeAppend(
+    workspaceId: string,
+    mutate: (h: AgentSessionHarness) => Promise<void>
+  ) {
+    await writePlan(workspaceId, "# Plan\n\nStep one.\n");
+    const t = await startGatedProposal(workspaceId);
+    const original = t.h.historyService.appendDerivedFromFullHistory.bind(t.h.historyService);
+    let mutated = false;
+    const append = spyOn(t.h.historyService, "appendDerivedFromFullHistory").mockImplementation(
+      (async (...args: Parameters<typeof original>) => {
+        if (!mutated) {
+          mutated = true;
+          await mutate(t.h);
+        }
+        return original(...args);
+      }) as typeof original
+    );
+    try {
+      t.metadataGate.resolve();
+      t.completions[0].resolve({ status: "completed", streamEnd: t.end });
+      await t.settled.promise;
+      expect(mutated).toBe(true);
+      return await planReviewRows(t.h, workspaceId);
+    } finally {
+      append.mockRestore();
+      await t.cleanup();
+    }
+  }
+
+  test("a sibling backend's full clear refuses a turn-owned capture read before it", async () => {
+    const workspaceId = "session-plan-capture-sibling-clear";
+    const rows = await proposeWithMutationBeforeAppend(workspaceId, async (h) => {
+      // The same call WorkspaceService.truncateHistory makes for a full clear, then its plan
+      // file deletion; the sibling's busy check cannot see this session's turn.
+      const sibling = await createAgentSessionHarness({
+        workspaceId,
+        config: h.config,
+        historyService: new HistoryService(h.config),
+      });
+      try {
+        const cleared = await sibling.session.cancelCompaction(true, undefined, {
+          fullHistoryDeletion: { percentage: 1 },
+        });
+        expect(cleared.success).toBe(true);
+        await fs.rm(expandTilde(getPlanFilePath(workspaceId, projectName)), { force: true });
+      } finally {
+        await sibling.session.dispose();
+        await sibling.cleanup();
+      }
+    });
+    // The pre-clear plan bytes never land in the cleared history.
+    expect(rows).toHaveLength(0);
+  });
+
+  test("legitimate compaction during a turn-owned capture does not refuse it", async () => {
+    const workspaceId = "session-plan-capture-compaction";
+    const rows = await proposeWithMutationBeforeAppend(workspaceId, async (h) => {
+      // Compaction appends a boundary (older rows move to the archive); it removes nothing.
+      const compacted = await h.historyService.persistBoundaryWithTailCopies(
+        workspaceId,
+        createMuxMessage("summary-1", "assistant", "summary", {
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }),
+        [],
+        false
+      );
+      expect(compacted.success).toBe(true);
+    });
+    expect(rows).toHaveLength(1);
   });
 
   test("ensurePlanSnapshot refuses an aborted capture at append admission, after the read", async () => {

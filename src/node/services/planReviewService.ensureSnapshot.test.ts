@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { HistoryService } from "./historyService";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -22,12 +23,18 @@ const metadata = {
   runtimeConfig: { type: "local" as const },
 };
 
+type Derive<T> = (
+  messages: MuxMessage[],
+  lockState: { generation: string | undefined }
+) => { message: MuxMessage | null; value: T };
+
 /**
- * A sibling backend (XUM_ALLOW_MULTIPLE_INSTANCES) shares the session directory and the
- * cross-process history write lock but none of WorkspaceService's in-memory mutation fencing,
- * so it is modelled as a second HistoryService over the same config.
+ * A sibling backend (XUM_ALLOW_MULTIPLE_INSTANCES, or the desktop app beside `xum server`)
+ * shares the session directory and the cross-process history write lock but none of
+ * WorkspaceService's in-memory mutation fencing, so it is modelled as a second HistoryService
+ * (and, for a full clear, a second AgentSession) over the same config.
  */
-describe("ensurePlanSnapshot against a sibling backend's history mutation", () => {
+describe("on-demand ensurePlanSnapshot against a sibling backend's history mutation", () => {
   let handle: Awaited<ReturnType<typeof createTestHistoryService>>;
   let sibling: HistoryService;
   const emitted: MuxMessage[] = [];
@@ -36,11 +43,6 @@ describe("ensurePlanSnapshot against a sibling backend's history mutation", () =
     handle = await createTestHistoryService();
     sibling = new HistoryService(handle.config);
     emitted.length = 0;
-    const seeded = await handle.historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "please plan", {})
-    );
-    expect(seeded.success).toBe(true);
     const planPath = expandTilde(getPlanFilePath(workspaceId, projectName));
     await fs.mkdir(path.dirname(planPath), { recursive: true });
     await fs.writeFile(planPath, "# Plan\n\nStep one\n");
@@ -51,17 +53,49 @@ describe("ensurePlanSnapshot against a sibling backend's history mutation", () =
     await fs.rm(planDir, { recursive: true, force: true });
   });
 
+  async function seedRow() {
+    const seeded = await handle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "please plan", {})
+    );
+    expect(seeded.success).toBe(true);
+  }
+
+  /**
+   * The sibling's full clear, through the same call WorkspaceService.truncateHistory makes for a
+   * full clear (clearHistoryThroughCompactionCancellation). It deletes the plan file as well.
+   */
+  async function siblingFullClear() {
+    const other = await createAgentSessionHarness({
+      workspaceId,
+      config: handle.config,
+      historyService: sibling,
+    });
+    try {
+      let deleted: number[] | undefined;
+      const cleared = await other.session.cancelCompaction(true, undefined, {
+        fullHistoryDeletion: {
+          percentage: 1,
+          onCommitted: (sequences) => {
+            deleted = sequences;
+            return undefined;
+          },
+        },
+      });
+      expect(cleared.success).toBe(true);
+      expect(deleted).toBeDefined();
+      await fs.rm(expandTilde(getPlanFilePath(workspaceId, projectName)), { force: true });
+    } finally {
+      await other.session.dispose();
+      await other.cleanup();
+    }
+  }
+
   /** Run `mutate` in the sibling after the plan read, right before the locked append. */
-  async function captureWithSiblingMutation(
-    mutate: () => Promise<unknown>,
-    refuseAfterHistoryRemoval: boolean
-  ) {
+  async function captureWithSiblingMutation(mutate: () => Promise<unknown>) {
     const original = handle.historyService.appendDerivedFromFullHistory.bind(handle.historyService);
     const spy = spyOn(handle.historyService, "appendDerivedFromFullHistory").mockImplementation(
-      async <T>(
-        id: string,
-        derive: (messages: MuxMessage[]) => { message: MuxMessage | null; value: T }
-      ) => {
+      async <T>(id: string, derive: Derive<T>) => {
         await mutate();
         return original(id, derive);
       }
@@ -72,7 +106,7 @@ describe("ensurePlanSnapshot against a sibling backend's history mutation", () =
           historyService: handle.historyService,
           emitChatEvent: (_id, message) => emitted.push(message),
         },
-        { workspaceId, metadata, refuseAfterHistoryRemoval }
+        { workspaceId, metadata }
       );
     } finally {
       spy.mockRestore();
@@ -85,31 +119,51 @@ describe("ensurePlanSnapshot against a sibling backend's history mutation", () =
     return state.success ? state.data.snapshots.length : -1;
   }
 
-  test("an on-demand capture refuses to append into history a sibling cleared after the read", async () => {
-    const captured = await captureWithSiblingMutation(
-      () => sibling.truncateHistory(workspaceId, 1),
-      true
-    );
+  test("a capture refuses to append into history a sibling fully cleared after the read", async () => {
+    await seedRow();
+    const captured = await captureWithSiblingMutation(siblingFullClear);
     expect(!captured.success && captured.error.type).toBe("capture_aborted");
     expect(emitted).toHaveLength(0);
     expect(await snapshotCount()).toBe(0);
   });
 
-  test("sibling appends alone do not refuse an on-demand capture", async () => {
-    const captured = await captureWithSiblingMutation(
-      () => sibling.appendToHistory(workspaceId, createMuxMessage("user-2", "user", "more", {})),
-      true
+  test("a capture over empty history refuses to append after a sibling's full clear", async () => {
+    // No row exists to anchor on: a clear of empty history still deletes the plan file, so the
+    // pre-clear bytes must not land either.
+    const captured = await captureWithSiblingMutation(siblingFullClear);
+    expect(!captured.success && captured.error.type).toBe("capture_aborted");
+    expect(emitted).toHaveLength(0);
+    expect(await snapshotCount()).toBe(0);
+  });
+
+  test("a capture over empty history with no concurrent mutation still appends", async () => {
+    const captured = await captureWithSiblingMutation(() => Promise.resolve());
+    expect(captured.success && captured.data.created).toBe(true);
+    expect(await snapshotCount()).toBe(1);
+  });
+
+  test("sibling appends alone do not refuse a capture", async () => {
+    await seedRow();
+    const captured = await captureWithSiblingMutation(() =>
+      sibling.appendToHistory(workspaceId, createMuxMessage("user-2", "user", "more", {}))
     );
     expect(captured.success && captured.data.created).toBe(true);
     expect(await snapshotCount()).toBe(1);
   });
 
-  test("turn-owned captures (no anchor check) still append after rows were replaced", async () => {
-    // Mid-turn compaction can legitimately replace rows under a turn-owned capture; its fencing
-    // is the turn's abort signal, so the anchor check is opt-in for on-demand captures only.
-    const captured = await captureWithSiblingMutation(
-      () => sibling.truncateHistory(workspaceId, 1),
-      false
+  test("a sibling's compaction boundary does not refuse a capture", async () => {
+    await seedRow();
+    const captured = await captureWithSiblingMutation(() =>
+      sibling.persistBoundaryWithTailCopies(
+        workspaceId,
+        createMuxMessage("summary-1", "assistant", "summary", {
+          compacted: "user",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        }),
+        [],
+        false
+      )
     );
     expect(captured.success && captured.data.created).toBe(true);
     expect(await snapshotCount()).toBe(1);

@@ -6,6 +6,7 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   pickPreservedSendOptions,
   pickStartupRetrySendOptions,
 } from "@/common/types/message";
@@ -13,6 +14,7 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
+  getAuthenticPlanReviewRecord,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import {
   PLAN_REVIEW_RECORD_VERSION,
@@ -51,7 +53,7 @@ import { createPlanReviewRecordMessageId, createUserMessageId } from "./utils/me
 
 type PlanReviewHistory = Pick<
   HistoryService,
-  "iterateFullHistory" | "appendDerivedFromFullHistory" | "getLastMessages"
+  "iterateFullHistory" | "appendDerivedFromFullHistory" | "captureCompactionReplacement"
 >;
 
 export interface PlanReviewHistoryDeps {
@@ -72,14 +74,11 @@ export interface EnsurePlanSnapshotArgs {
    */
   signal?: AbortSignal;
   /**
-   * Refuse the append when rows present before the plan read were removed by admission time.
-   * WorkspaceService's context-mutation fencing (the `signal` for on-demand captures) is
-   * process-local, but the history write lock is cross-process: a full clear committed by a
-   * sibling backend (XUM_ALLOW_MULTIPLE_INSTANCES) between the read and the append would
-   * otherwise land pre-clear plan bytes in the emptied history. Only for on-demand captures:
-   * a turn-owned capture can legitimately see mid-turn compaction replace rows.
+   * Context generation the capture is admitted under, read again at append time. A turn-owned
+   * capture passes its turn's live admission capture, which follows the turn's own context
+   * rollovers. When omitted (on-demand), the generation is read before the plan read.
    */
-  refuseAfterHistoryRemoval?: boolean;
+  frontier?: { readonly generation: string | undefined };
 }
 
 export interface EnsurePlanSnapshotResult {
@@ -187,13 +186,21 @@ export async function ensurePlanSnapshot(
   args: EnsurePlanSnapshotArgs
 ): Promise<Result<EnsurePlanSnapshotResult, PlanReviewError>> {
   if (args.signal?.aborted) return Err(captureAborted());
-  // Anchor for refuseAfterHistoryRemoval: row ids are unique and appends never remove rows, so
-  // the newest pre-read row missing under the lock means rows were removed since the read.
-  let anchorRowId: string | undefined;
-  if (args.refuseAfterHistoryRemoval === true) {
-    const last = await deps.historyService.getLastMessages(args.workspaceId, 1);
-    if (!last.success) return Err(historyFailed(last.error));
-    anchorRowId = last.data.at(-1)?.id;
+  // Admission contract: the plan bytes read below may only land if no destructive history
+  // mutation committed since the capture's frontier. The frontier is the context generation that
+  // every full clear (empty history included, via the Stop publication it runs through), reset
+  // and destructive replace advances under the cross-process history write lock, while ordinary
+  // appends and compaction leave it alone (a Stop or an active-context cut also advances it,
+  // which only refuses conservatively). Comparing it again under that lock at the append fences
+  // sibling backends too (XUM_ALLOW_MULTIPLE_INSTANCES), whose in-memory fencing this process
+  // cannot see. Never hold the lock across the (possibly remote) plan read itself.
+  let frontier: { readonly generation: string | undefined };
+  if (args.frontier !== undefined) {
+    frontier = args.frontier;
+  } else {
+    const captured = await deps.historyService.captureCompactionReplacement(args.workspaceId);
+    if (!captured.success) return Err(historyFailed(captured.error));
+    frontier = { generation: captured.data.generation };
   }
   const runtime = createRuntimeForWorkspace(args.metadata);
   const plan = await readPlanFile(
@@ -243,7 +250,8 @@ export async function ensurePlanSnapshot(
   const appended = await deps.historyService.appendDerivedFromFullHistory(
     args.workspaceId,
     (
-      messages
+      messages,
+      lockState
     ): {
       message: MuxMessage | null;
       value: { snapshotId: string; message: MuxMessage | null } | "aborted";
@@ -251,7 +259,7 @@ export async function ensurePlanSnapshot(
       // Admission check under the lock: the read above may have taken long enough for the
       // owning turn to settle or stop, and a late row must not be published after that.
       if (args.signal?.aborted) return { message: null, value: "aborted" };
-      if (anchorRowId !== undefined && !messages.some((row) => row.id === anchorRowId)) {
+      if (lockState.generation !== frontier.generation) {
         return { message: null, value: "aborted" };
       }
       priorRows = messages.filter(isPlanReviewRow);
@@ -430,4 +438,58 @@ export async function preparePlanReviewFeedback(
     text,
     muxMetadata,
   });
+}
+
+/**
+ * The authentic feedback row `message` would put into review state: the row itself, or the
+ * nested follow-up of an on-send compaction request, which dispatches as that row later.
+ */
+function carriedPlanReviewFeedback(message: MuxMessage): MuxMessage | null {
+  if (getAuthenticPlanReviewRecord(message)?.kind === "feedback") return message;
+  const followUp = getCompactionFollowUpContent(message.metadata?.muxMetadata);
+  if (followUp?.muxMetadata?.type !== PLAN_REVIEW_METADATA_TYPE) return null;
+  const nested = createMuxMessage(message.id, "user", followUp.text, {
+    muxMetadata: followUp.muxMetadata,
+  });
+  return getAuthenticPlanReviewRecord(nested)?.kind === "feedback" ? nested : null;
+}
+
+/**
+ * Append precondition for rows that carry plan-review feedback (see
+ * HistoryService.acceptCompactionReplacement's `admitsFullHistory`), or undefined when `batch`
+ * carries none.
+ *
+ * Feedback binds snapshot and thread ids read before the send, and a clear or truncation (this
+ * window, another window, or a sibling backend) can remove them before the row is written. The
+ * projection would then skip the row as dangling while the transcript shows it as sent. The
+ * precondition is the projection's own acceptance rule, evaluated under the history write lock
+ * at the actual append: the feedback must be accepted with every comment thread and every reply.
+ * It runs for the compaction request that defers feedback and again when the follow-up lands.
+ */
+export function createPlanReviewFeedbackPrecondition(
+  batch: readonly MuxMessage[]
+): ((history: MuxMessage[]) => boolean) | undefined {
+  const carried = batch.flatMap((message) => carriedPlanReviewFeedback(message) ?? []);
+  if (carried.length === 0) return undefined;
+  return (history) => {
+    const prior = history.filter(isPlanReviewRow);
+    return carried.every((candidate) => {
+      const record = getAuthenticPlanReviewRecord(candidate);
+      assert(record?.kind === "feedback", "carried plan-review feedback must stay authentic");
+      const state = derivePlanReviewState([...prior, candidate], {
+        hashContent: hashPlanSnapshotContent,
+      });
+      const feedback = state.feedbacks.find((entry) => entry.feedbackId === record.feedbackId);
+      if (feedback === undefined || feedback.threadIds.length !== record.comments.length) {
+        return false;
+      }
+      return record.replies.every((reply) =>
+        state.threads.some(
+          (thread) =>
+            thread.threadId === reply.threadId &&
+            thread.replies.some((entry) => entry.replyId === reply.replyId)
+        )
+      );
+    });
+  };
 }
