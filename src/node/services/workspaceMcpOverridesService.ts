@@ -1475,11 +1475,27 @@ export class WorkspaceMcpOverridesService {
     // SECURITY: `rm -f` follows a symlinked parent directory; a repo-tracked
     // `.xum`/`.mux` symlink would make clearing this workspace delete a
     // sibling checkout's document.
-    await assertOverrideSegmentsNotSymlinked(
-      runtime,
-      workspacePath,
-      overridesOnHostFilesystem(runtimeConfig)
-    );
+    const hostFilesystem = overridesOnHostFilesystem(runtimeConfig);
+    await assertOverrideSegmentsNotSymlinked(runtime, workspacePath, hostFilesystem);
+    if (hostFilesystem) {
+      // In-process, not `rm -f`: this runs under the override write locks,
+      // and a host runtime's exec child is a DETACHED shell that can outlive
+      // this process — after a crash it could still delete a document a
+      // successor saved under the lock it took over (#4415). fs calls end
+      // with the process. ENOENT/ENOTDIR are the "nothing there" cases
+      // `rm -f` ignores too.
+      for (const relative of MCP_OVERRIDES_GITIGNORE_PATTERNS) {
+        try {
+          await fsPromises.unlink(path.join(workspacePath, relative));
+        } catch (error) {
+          if (hasFsCode(error, "ENOENT") || hasFsCode(error, "ENOTDIR")) continue;
+          throw new Error(
+            `Failed to remove workspace MCP overrides file: ${getErrorMessage(error)}`
+          );
+        }
+      }
+      return;
+    }
     const paths = MCP_OVERRIDES_GITIGNORE_PATTERNS.map((filePath) => `"${filePath}"`).join(" ");
     const result = await execBuffered(runtime, `rm -f ${paths}`, {
       cwd: workspacePath,
@@ -1499,13 +1515,15 @@ export class WorkspaceMcpOverridesService {
    * replacement lands as a new file that is never touched), then inspected;
    * ours is deleted, anyone else's is moved back without clobbering a newer
    * one. The symlink guard ran before the write; paths are relative to the
-   * checkout for the shell like removeOverridesFile.
+   * checkout for the shell like removeOverridesFile. Host checkouts use
+   * in-process fs calls instead (see removeOverridesFile for why).
    */
   private async removeExactDocument(
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string,
     filePath: string,
-    expectedContent: string
+    expectedContent: string,
+    hostFilesystem: boolean
   ): Promise<void> {
     // Host paths are joined with the platform separator (backslashes on
     // Windows) while the candidates are spelled with `/`.
@@ -1516,6 +1534,37 @@ export class WorkspaceMcpOverridesService {
     assert(relative !== undefined, "migrated document must be a known override path");
     const suffix = `${process.pid}-${Date.now()}`;
     const aside = `${relative}.rollback-${suffix}`;
+    const asidePath = `${filePath}.rollback-${suffix}`;
+    if (hostFilesystem) {
+      // In-process like removeOverridesFile: a detached `mv`/`rm` child could
+      // outlive this process and move aside or delete a document a successor
+      // saved after taking over the lock (#4415).
+      const fail = (error: unknown): never => {
+        throw new Error(
+          `Failed to roll back the migrated override document: ${getErrorMessage(error)}`
+        );
+      };
+      const dropAside = () =>
+        fsPromises.unlink(asidePath).catch((error: unknown) => {
+          if (!hasFsCode(error, "ENOENT")) fail(error);
+        });
+      await fsPromises.rename(filePath, asidePath).catch(fail);
+      if ((await readFileString(runtime, asidePath)) === expectedContent) {
+        await dropAside();
+        return;
+      }
+      log.warn("[MCP] Not rolling back a migrated override document that changed meanwhile", {
+        filePath,
+      });
+      // `mv -n` equivalent: link() never replaces an existing target, so a
+      // newer document that appeared meanwhile wins (EEXIST) and the older
+      // one we hold is dropped, exactly like the shell branch below.
+      await fsPromises.link(asidePath, filePath).catch((error: unknown) => {
+        if (!hasFsCode(error, "EEXIST")) fail(error);
+      });
+      await dropAside();
+      return;
+    }
     const run = async (command: string): Promise<void> => {
       const result = await execBuffered(runtime, command, { cwd: workspacePath, timeout: 10 });
       if (result.exitCode !== 0) {
@@ -1525,7 +1574,7 @@ export class WorkspaceMcpOverridesService {
       }
     };
     await run(`mv "${relative}" "${aside}"`);
-    const current = await readFileString(runtime, `${filePath}.rollback-${suffix}`);
+    const current = await readFileString(runtime, asidePath);
     if (current === expectedContent) {
       await run(`rm -f "${aside}"`);
       return;
@@ -1992,12 +2041,17 @@ export class WorkspaceMcpOverridesService {
             // Compare-and-delete of exactly the document this migration wrote:
             // never the compatibility paths, and never a canonical document an
             // older process or a direct edit replaced meanwhile.
-            await this.removeExactDocument(runtime, workspacePath, canonicalPath, content).catch(
-              (rollbackError: unknown) =>
-                log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
-                  workspaceId,
-                  error: getErrorMessage(rollbackError),
-                })
+            await this.removeExactDocument(
+              runtime,
+              workspacePath,
+              canonicalPath,
+              content,
+              hostFilesystem
+            ).catch((rollbackError: unknown) =>
+              log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
+                workspaceId,
+                error: getErrorMessage(rollbackError),
+              })
             );
             throw error;
           }
