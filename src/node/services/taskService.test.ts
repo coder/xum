@@ -9655,6 +9655,39 @@ describe("TaskService", () => {
       20_000
     );
 
+    test("a queued acceptance commits only when its deferred onAccepted runs", async () => {
+      const { sendMessage, deferred } = createDeferredAcceptSendMessage();
+      const { config, taskService, parentId, childId, workspaceService } =
+        await spawnReportedChild({ sendMessage });
+      const before = findWorkspaceInConfig(config, childId);
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
+      const busy = admitQueued(workspaceService, childId);
+      deferred.armed = true;
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+        assert(deferred.accept != null, "the queued send must defer its acceptance");
+        const queued = findWorkspaceInConfig(config, childId);
+        expect(queued?.taskExecutionStatus).toBe("queued");
+        expect(queued?.taskModelString).toBe(before?.taskModelString);
+        expect(queued?.taskThinkingLevel).toBe(before?.taskThinkingLevel);
+        expect(queued?.aiSettings).toEqual(before?.aiSettings);
+        expect(queued?.aiSettingsByAgent).toEqual(before?.aiSettingsByAgent);
+
+        await deferred.accept();
+        const accepted = findWorkspaceInConfig(config, childId);
+        expect(accepted?.taskExecutionStatus).toBe("running");
+        expect(accepted?.taskModelString).toBe(MODEL_B);
+        expect(accepted?.taskThinkingLevel).toBe("xhigh");
+        expect(accepted?.aiSettingsByAgent?.exec).toMatchObject({
+          model: MODEL_B,
+          thinkingLevel: "xhigh",
+        });
+      } finally {
+        busy.mockRestore();
+      }
+    }, 20_000);
+
     test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
       const { config, taskService, parentId, childId, sendMessage, initStateManager } =
         await spawnReportedChild();
