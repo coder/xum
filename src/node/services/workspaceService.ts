@@ -2257,10 +2257,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // On-demand plan-review snapshot captures in flight, per workspace. A context mutation
   // aborts them when it acquires its admission guard, and a capture that starts while a
   // mutation holds the guard is refused up front. ensurePlanSnapshot's generation frontier
-  // already refuses bytes read before a clear commits; this also covers a capture that starts
-  // after the clear's history commit but before the clear deletes the plan file, which would
-  // otherwise read and append the discarded plan. Process-local, so it cannot close that
-  // window for a sibling backend's clear.
+  // already refuses bytes read before a clear commits, and a full clear moves the plan aside
+  // before its commit (stagePlanFilesForClear), which closes its commit-to-plan-deletion window
+  // for every backend. This registry still covers that window, in this process only, for a
+  // destructive replaceHistory with deletePlanFile, which deletes the plan after its commit (no
+  // in-app caller sets that flag).
   private readonly onDemandPlanSnapshotCaptures = new Map<string, Set<AbortController>>();
 
   // r41: sends currently between the entry check and their settled outcome
@@ -14174,6 +14175,78 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     ]);
   }
 
+  /**
+   * Move a full clear's plan files (current and legacy path) aside to a unique name in the same
+   * directory, before its history commit (see the call site in truncateHistory). `restore`
+   * puts them back when the clear does not commit, unless a plan was written in the meantime
+   * (that newer plan wins); `discard` removes them after the commit.
+   *
+   * Best effort, like deletePlanFilesForWorkspace: a failed move only leaves the old window
+   * open, and the post-commit deletion still removes the plan. A crash between the move and the
+   * commit leaves the plan under the aside name with history intact. The user asked to clear,
+   * which deletes the plan anyway, and the bytes stay recoverable, so nothing sweeps them back.
+   */
+  private async stagePlanFilesForClear(
+    workspaceId: string
+  ): Promise<{ restore: () => Promise<void>; discard: () => Promise<void> } | null> {
+    const metadata = await this.getInfo(workspaceId).catch((error: unknown) => {
+      log.warn("Plan files not moved aside for a full clear: metadata unavailable", {
+        workspaceId,
+        error,
+      });
+      return null;
+    });
+    if (!metadata) return null;
+    const runtime = createRuntimeForWorkspace(metadata);
+    const xumHome = runtime.getXumHome();
+    const plan = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
+    const legacy = getLegacyPlanFilePath(workspaceId, xumHome);
+    // Not ending in ".md", so it can never be read as any workspace's plan.
+    const suffix = `.clearing-${crypto.randomUUID()}`;
+    // pathEnv canonicalizes per runtime (tilde, SSH home, container paths), as readPlanFile does.
+    const pathEnv = {
+      XUM_PLAN: plan,
+      XUM_PLAN_ASIDE: `${plan}${suffix}`,
+      XUM_LEGACY_PLAN: legacy,
+      XUM_LEGACY_PLAN_ASIDE: `${legacy}${suffix}`,
+    };
+    const run = async (step: string, script: string) => {
+      try {
+        const result = await execBuffered(runtime, script, { cwd: "/tmp", pathEnv, timeout: 10 });
+        if (result.exitCode !== 0) {
+          log.warn(`Plan file ${step} for a full clear failed`, {
+            workspaceId,
+            exitCode: result.exitCode,
+            stderr: result.stderr,
+          });
+        }
+      } catch (error) {
+        log.warn(`Plan file ${step} for a full clear failed`, { workspaceId, error });
+      }
+    };
+    const exists = 'exists() { [ -e "$1" ] || [ -L "$1" ]; }';
+    // Legacy first: readPlanFile migrates a legacy plan to the current path when the current
+    // path is missing, so moving the current path first could let that migration recreate it.
+    await run(
+      "move-aside",
+      `${exists}; aside() { if exists "$1"; then mv -f "$1" "$2"; fi; }; s=0; ` +
+        'aside "$XUM_LEGACY_PLAN" "$XUM_LEGACY_PLAN_ASIDE" || s=1; ' +
+        'aside "$XUM_PLAN" "$XUM_PLAN_ASIDE" || s=1; exit $s'
+    );
+    return {
+      // mv -n never replaces a plan written meanwhile; that newer plan wins and the older copy
+      // is dropped. If the move back fails for another reason, the copy stays for recovery.
+      restore: () =>
+        run(
+          "restore",
+          `${exists}; back() { if exists "$2"; then mv -n "$2" "$1"; ` +
+            'if exists "$2" && exists "$1"; then rm -f "$2"; fi; fi; }; ' +
+            'back "$XUM_PLAN" "$XUM_PLAN_ASIDE"; back "$XUM_LEGACY_PLAN" "$XUM_LEGACY_PLAN_ASIDE"'
+        ),
+      discard: () => run("cleanup", 'rm -f "$XUM_PLAN_ASIDE" "$XUM_LEGACY_PLAN_ASIDE"'),
+    };
+  }
+
   private async clearHistoryThroughCompactionCancellation(
     workspaceId: string,
     percentage: number,
@@ -14373,13 +14446,26 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             refuseFullDelete: truncationScope === "partial",
             refuseRowRemoval: truncationScope === "none",
           });
-    const truncateResult =
-      effectivePercentage > 0
-        ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
-            discardUnacceptedOnSuccess: isFullClear,
-          })
-        : await truncate();
+    // A full clear deletes the plan file only after its history commit. Another backend on this
+    // workspace (#4420) could start a snapshot capture in between, read the discarded plan with
+    // a post-clear generation, and append it. Moving the plan aside BEFORE the commit closes that
+    // gap: a capture reads either before the move (its pre-commit generation refuses the append
+    // afterwards) or finds no plan. A clear that does not commit puts the plan back.
+    const planStaging = isFullClear ? await this.stagePlanFilesForClear(workspaceId) : null;
+    let truncateResult: Result<number[]>;
+    try {
+      truncateResult =
+        effectivePercentage > 0
+          ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
+              discardUnacceptedOnSuccess: isFullClear,
+            })
+          : await truncate();
+    } catch (error) {
+      await planStaging?.restore();
+      throw error;
+    }
     if (!truncateResult.success) {
+      await planStaging?.restore();
       return Err(truncateResult.error);
     }
 
@@ -14424,6 +14510,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (metadata) {
         await this.deletePlanFilesForWorkspace(workspaceId, metadata);
       }
+      await planStaging?.discard();
       // A full chat clear removes the context the goal loop was using; require
       // one user re-engagement before later continuation slices resume it.
       try {
