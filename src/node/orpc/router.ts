@@ -687,6 +687,12 @@ export const router = (authToken?: string) => {
         ),
     },
     providers: {
+      discoverModels: t
+        .input(schemas.providers.discoverModels.input)
+        .output(schemas.providers.discoverModels.output)
+        .handler(({ context, input, signal }) =>
+          context.providerService.discoverModels(input.provider, signal)
+        ),
       list: t
         .input(schemas.providers.list.input)
         .output(schemas.providers.list.output)

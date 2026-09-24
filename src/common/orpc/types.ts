@@ -35,6 +35,9 @@ export type HistoryEditPrecondition = z.infer<typeof schemas.HistoryEditPrecondi
 // Provider types (single source of truth - derived from schemas)
 export type AWSCredentialStatus = z.infer<typeof schemas.AWSCredentialStatusSchema>;
 export type ProviderModelEntry = z.infer<typeof schemas.ProviderModelEntrySchema>;
+export type ProviderModelDiscoveryResult = z.infer<
+  typeof schemas.ProviderModelDiscoveryResultSchema
+>;
 export type ProviderConfigInfo = z.infer<typeof schemas.ProviderConfigInfoSchema>;
 export type ProvidersConfigMap = z.infer<typeof schemas.ProvidersConfigMapSchema>;
 export type CustomProviderMutationError = z.infer<typeof schemas.CustomProviderMutationErrorSchema>;

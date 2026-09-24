@@ -20,6 +20,7 @@
  * plain methods: they compose no async work, so an Effect conversion would
  * add fiber overhead without composition benefit.
  */
+import { discoverProviderModels } from "./providerModelDiscovery";
 import { EventEmitter } from "events";
 import { Effect, Schema } from "effect";
 import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
@@ -36,6 +37,7 @@ import type {
   CustomProviderMutationError,
   ProviderConfigInfo,
   ProviderModelEntry,
+  ProviderModelDiscoveryResult,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
@@ -674,6 +676,40 @@ export class ProviderService {
     }
 
     return result;
+  }
+
+  public discoverModels(
+    provider: string,
+    signal?: AbortSignal
+  ): Promise<ProviderModelDiscoveryResult> {
+    // Autocomplete must never persist a catalog or change routing/user-managed models.
+    return discoverProviderModels(() => {
+      if (provider !== "anthropic" && provider !== "openai") return { status: "unsupported" };
+      const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+      if (isCustomProviderConfig(config)) return { status: "unsupported" };
+      const enforced = this.policyService?.isEnforced() ?? false;
+      if (
+        isProviderDisabledInConfig(config) ||
+        (enforced && !this.policyService?.isProviderAllowed(provider))
+      )
+        return { status: "not-configured" };
+      const credentials = resolveProviderCredentials(provider, config);
+      // OAuth access tokens are not API keys and must never be sent to the vendor API.
+      if (!credentials.apiKey) return { status: "not-configured" };
+      const policy = this.getProviderPolicy(provider);
+      return Object.freeze({
+        provider,
+        baseUrl: policy.forcedBaseUrl ?? credentials.baseUrl,
+        apiKey: credentials.apiKey,
+        organization: credentials.organization,
+        headers: Object.freeze({ ...config.headers }),
+        policy: Object.freeze({
+          ...policy,
+          enforced,
+          ...(policy.allowedModels && { allowedModels: Object.freeze([...policy.allowedModels]) }),
+        }),
+      });
+    }, signal);
   }
 
   private getProviderPolicy(provider: string): ProviderPolicy {
