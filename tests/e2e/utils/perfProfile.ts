@@ -2,6 +2,7 @@ import fsPromises from "fs/promises";
 import path from "path";
 import { type Page, type TestInfo } from "@playwright/test";
 import type { CDPSession } from "playwright";
+import type { PageMilestones } from "./pageMilestones";
 
 const PERF_ARTIFACTS_ROOT = path.resolve(__dirname, "..", "..", "..", "artifacts", "perf");
 const DEFAULT_TRACE_CATEGORIES = [
@@ -277,6 +278,8 @@ export async function writePerfArtifacts(args: {
   chromeProfile: ChromeProfileCapture;
   reactProfile: unknown;
   historyProfile: unknown;
+  /** In-page milestone timings, for scenarios that record them (see pageMilestones.ts). */
+  milestones?: PageMilestones;
 }): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
   const runDirName = `${sanitizeForPath(args.runLabel)}-${timestamp}`;
@@ -308,6 +311,8 @@ export async function writePerfArtifacts(args: {
       retry: args.testInfo.retry,
     },
     historyProfile: args.historyProfile,
+    // Additive field: schemaVersion stays 1 because existing readers ignore unknown keys.
+    ...(args.milestones ? { milestones: args.milestones } : {}),
     chromeProfile: {
       label: args.chromeProfile.label,
       startedAt: args.chromeProfile.startedAt,
