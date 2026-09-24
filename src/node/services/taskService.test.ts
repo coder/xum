@@ -9788,6 +9788,49 @@ describe("TaskService", () => {
       expect(findWorkspaceInConfig(config, grandchildId)?.taskModelString).toBe(MODEL_C);
     }, 20_000);
 
+    test("recovery prompts and report metadata inside a reawakened execution use the committed values", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
+      expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+      expect(findWorkspaceInConfig(config, childId)).toMatchObject({
+        taskModelString: MODEL_B,
+        taskThinkingLevel: "xhigh",
+      });
+      // Settings drift after the commit must not reach this execution.
+      await setDelegatedExec(config, { modelString: MODEL_C, thinkingLevel: "medium" });
+      await editEntry(config, childId, (workspace) => {
+        workspace.taskStatus = "awaiting_report";
+      });
+      sendMessage.mockClear();
+      const internal = taskService as unknown as {
+        promptTaskForRequiredCompletionTool(workspaceId: string): Promise<boolean>;
+        finalizeAgentTaskReport(
+          childWorkspaceId: string,
+          childEntry: ReturnType<typeof findWorkspaceEntry>,
+          report: { reportMarkdown: string },
+          attempt: unknown
+        ): Promise<unknown>;
+        ownedAttemptByTaskId: Map<string, unknown>;
+      };
+
+      expect(await internal.promptTaskForRequiredCompletionTool(childId)).toBe(true);
+      const recovery = sendMessage.mock.calls.filter((call) => call[0] === childId);
+      expect(recovery).toHaveLength(1);
+      expect(recovery[0][2]).toMatchObject({ model: MODEL_B, thinkingLevel: "xhigh" });
+
+      await internal.finalizeAgentTaskReport(
+        childId,
+        findWorkspaceEntry(config.loadConfigOrDefault(), childId),
+        { reportMarkdown: "done" },
+        internal.ownedAttemptByTaskId.get(childId)
+      );
+      const report = await readSubagentReportArtifact(
+        path.join(config.sessionsDir, parentId),
+        childId
+      );
+      expect(report).toMatchObject({ model: MODEL_B, thinkingLevel: "xhigh" });
+    }, 20_000);
+
     test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
       const { config, taskService, parentId, childId, sendMessage, initStateManager } =
         await spawnReportedChild();
