@@ -1,10 +1,15 @@
 import * as path from "path";
+import fs from "fs";
 import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 
 import { Config } from "@/node/config";
-import { TaskHandleStore, WORKSPACE_TURN_TASK_ID_PREFIX } from "@/node/services/taskHandleStore";
+import {
+  TaskHandleStore,
+  WORKSPACE_TURN_TASK_ID_PREFIX,
+  type WorkspaceTurnTaskHandleRecord,
+} from "@/node/services/taskHandleStore";
 
 async function createTempConfig(testName: string): Promise<{ config: Config; rootDir: string }> {
   const rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), `${testName}-`));
@@ -14,6 +19,60 @@ async function createTempConfig(testName: string): Promise<{ config: Config; roo
 }
 
 describe("TaskHandleStore", () => {
+  it("keeps completed handles readable while recording parent delivery", async () => {
+    const { config, rootDir } = await createTempConfig("task-handle-store-publication");
+    const store = new TaskHandleStore(config);
+    const reader = new TaskHandleStore(config);
+    const record: WorkspaceTurnTaskHandleRecord = {
+      kind: "workspace_turn",
+      handleId: `${WORKSPACE_TURN_TASK_ID_PREFIX}publication`,
+      ownerWorkspaceId: "owner",
+      workspaceId: "child",
+      turnId: "turn-1",
+      status: "completed",
+      createdAt: "2026-06-19T00:00:00.000Z",
+      updatedAt: "2026-06-19T00:00:01.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+      reportMarkdown: "Review complete",
+      directParentResultDeliveryRequiredAt: "2026-06-19T00:00:01.000Z",
+    };
+    await store.upsertWorkspaceTurn(record);
+    const delivered = {
+      ...record,
+      directParentResultDeliveredAt: "2026-06-19T00:00:02.000Z",
+    };
+
+    // Read during publication, without a timing delay or a cached handle.
+    const observations: Array<
+      Promise<[WorkspaceTurnTaskHandleRecord | null, WorkspaceTurnTaskHandleRecord[]]>
+    > = [];
+    const originalRename = fs.rename;
+    const rename = spyOn(fs, "rename").mockImplementation(((source, destination, callback) => {
+      const observation = Promise.all([
+        reader.getWorkspaceTurn(record.ownerWorkspaceId, record.handleId),
+        reader.listWorkspaceTurns(record.ownerWorkspaceId),
+      ]);
+      observations.push(observation);
+      observation.then(
+        () => originalRename(source, destination, callback),
+        (error: unknown) => callback(error instanceof Error ? error : new Error(String(error)))
+      );
+    }) as typeof fs.rename);
+    try {
+      await store.upsertWorkspaceTurn(delivered);
+      expect(observations).toHaveLength(1);
+      expect(await observations[0]).toEqual([record, [record]]);
+      expect(await reader.getWorkspaceTurn(record.ownerWorkspaceId, record.handleId)).toEqual(
+        delivered
+      );
+      expect(await reader.listWorkspaceTurns(record.ownerWorkspaceId)).toEqual([delivered]);
+    } finally {
+      rename.mockRestore();
+      await fsPromises.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it("persists and lists owner-scoped workspace turn handles", async () => {
     const { config } = await createTempConfig("task-handle-store-persist");
     const store = new TaskHandleStore(config);
