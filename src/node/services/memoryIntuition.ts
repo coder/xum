@@ -533,6 +533,9 @@ export async function runMemoryIntuition(args: {
         entries: selection.entries,
         readFile: readMemoryView,
       });
+      // Verification reads turn an abort into failed reads (downgrading memories to
+      // leads), so a deadline hit here must still end as a timeout, not a report.
+      if (signal.aborted) return { kind: "no_report", stats };
       return { kind: "report", ...classified, stats };
     }
     const {

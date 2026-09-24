@@ -1802,6 +1802,59 @@ describe("runMemoryIntuition evaluation recall", () => {
     }
   });
 
+  it("reports a deadline that expires during final verification as a timeout", async () => {
+    using f = await fixture({ "a.md": "alpha" });
+    const judge = evaluator(() => 0.9);
+    let entered!: () => void;
+    const verifying = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let views = 0;
+    // Let the stage read through, then hold the post-stage-2 verification read.
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      if (judge.calls.length === 0 || ++views === 1) return next();
+      entered();
+      await new Promise<void>((resolve) =>
+        ctx.abortSignal?.addEventListener("abort", () => resolve())
+      );
+      await next();
+    });
+    const createModel = mock(() => Promise.resolve(pinned(scriptedModel([]))));
+    const recordUsage = mock((_usage: unknown) => Promise.resolve());
+    const timer = spyOn(globalThis, "setTimeout");
+    try {
+      const pending = runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "openai:evaluator",
+        createModel,
+        resolveAgentBody: body,
+        createEvaluationModel: judge.createEvaluationModel,
+        evaluationService: judge.evaluationService,
+        hooks: hookConfig(f),
+        recordUsage,
+      });
+      await verifying;
+      const expire = timer.mock.calls.find(
+        ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+      )?.[0];
+      if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+      expire();
+      expect(await pending).toMatchObject({
+        kind: "no_report",
+        stats: { timedOut: true, steps: 2 },
+      });
+      expect(judge.calls).toHaveLength(2);
+      expect(createModel).not.toHaveBeenCalled();
+      expect(recordUsage).toHaveBeenCalledTimes(1);
+      expect(recordUsage.mock.calls[0][0]).toMatchObject({ inputTokens: 200, outputTokens: 20 });
+    } finally {
+      timer.mockRestore();
+      unregister();
+    }
+  });
+
   it("times out a stalled evaluation that ignores abort", async () => {
     using f = await fixture({ "a.md": "alpha" });
     let started!: () => void;
