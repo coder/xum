@@ -65,6 +65,8 @@ function createRuntimeFileReader(runtime: Runtime): FileReader {
 }
 
 type ReadInstructionFileResult = { exists: false } | { exists: true; file: InstructionFile | null };
+/** A base instruction file and its optional `.local.md` companion. */
+type ReadInstructionFilePair = [base: ReadInstructionFileResult, local: ReadInstructionFileResult];
 
 /** Read a single instruction file via the given reader, returning structured info. */
 async function readSingleFile(
@@ -146,28 +148,36 @@ async function readInstructionSetWith(
   // are honored there and we must not look for a nested ~/.xum/.xum/AGENTS.md.
   const isGlobalScope = scope === INSTRUCTION_SCOPE.GLOBAL;
 
-  const base = await readBaseInstructionFile(reader, directory, scope, projectName, isGlobalScope);
-
-  const local = base.exists
-    ? await readSingleFile(
-        reader,
-        directory,
-        LOCAL_INSTRUCTION_FILENAME,
-        scope,
-        true,
-        projectName,
-        isGlobalScope
-      )
-    : ({ exists: false } satisfies ReadInstructionFileResult);
+  const readSharedPair = async (): Promise<ReadInstructionFilePair> => {
+    const base = await readBaseInstructionFile(
+      reader,
+      directory,
+      scope,
+      projectName,
+      isGlobalScope
+    );
+    const local = base.exists
+      ? await readSingleFile(
+          reader,
+          directory,
+          LOCAL_INSTRUCTION_FILENAME,
+          scope,
+          true,
+          projectName,
+          isGlobalScope
+        )
+      : ({ exists: false } satisfies ReadInstructionFileResult);
+    return [base, local];
+  };
 
   // Read one Xum-dedicated companion tree, preferring .xum and falling back
   // to the legacy .mux name. Never combine both trees.
-  let dedicatedBase: ReadInstructionFileResult = { exists: false };
-  let dedicatedLocal: ReadInstructionFileResult = { exists: false };
-  if (!isGlobalScope) {
+  const readDedicatedPair = async (): Promise<ReadInstructionFilePair> => {
+    const missing: ReadInstructionFilePair = [{ exists: false }, { exists: false }];
+    if (isGlobalScope) return missing;
     for (const relativeDirectory of listProjectMetadataRelativePaths("")) {
       const dedicatedDirectory = path.join(directory, relativeDirectory);
-      dedicatedBase = await readSingleFile(
+      const dedicatedBase = await readSingleFile(
         reader,
         dedicatedDirectory,
         XUM_INSTRUCTION_FILENAME,
@@ -177,7 +187,7 @@ async function readInstructionSetWith(
         true
       );
       if (!dedicatedBase.exists) continue;
-      dedicatedLocal = await readSingleFile(
+      const dedicatedLocal = await readSingleFile(
         reader,
         dedicatedDirectory,
         LOCAL_INSTRUCTION_FILENAME,
@@ -186,9 +196,17 @@ async function readInstructionSetWith(
         projectName,
         true
       );
-      break;
+      return [dedicatedBase, dedicatedLocal];
     }
-  }
+    return missing;
+  };
+
+  // The shared and dedicated trees are independent. Each probe is a remote
+  // round-trip on SSH runtimes, so overlap the two probe chains.
+  const [[base, local], [dedicatedBase, dedicatedLocal]] = await Promise.all([
+    readSharedPair(),
+    readDedicatedPair(),
+  ]);
 
   if (!base.exists && !dedicatedBase.exists) return null;
 

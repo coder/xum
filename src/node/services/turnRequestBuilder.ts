@@ -100,7 +100,8 @@ import {
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { EvaluationService } from "./evaluation/evaluationService";
-import { readToolInstructions } from "./systemMessage";
+import type { InstructionSources } from "@/common/types/instructions";
+import { extractToolInstructionsFromSources } from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -1761,6 +1762,9 @@ export class TurnRequestBuilder {
           intuitionDefinition.frontmatter.ai
         )
       : undefined;
+    // Filled by the first build: later rebuilds in this turn (tool policy,
+    // model fallback) reuse the same instruction snapshot instead of re-reading.
+    const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -1796,6 +1800,7 @@ export class TurnRequestBuilder {
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         agentPluginsEnabled: agentPluginsExperimentEnabled,
+        instructionSources: turnInstructionSources.current,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
@@ -1811,8 +1816,14 @@ export class TurnRequestBuilder {
     // rebuild from the validated serve makes that context stale.
     const mcpServersAtPrePolicy = mcpServers;
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
-    const { agentSystemPromptSections, agentDefinitions, availableSkills, ancestorPlanFilePaths } =
-      prePolicyStreamSystemContext;
+    const {
+      agentSystemPromptSections,
+      agentDefinitions,
+      availableSkills,
+      ancestorPlanFilePaths,
+      instructionSources,
+    } = prePolicyStreamSystemContext;
+    turnInstructionSources.current = instructionSources;
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
@@ -1944,14 +1955,13 @@ export class TurnRequestBuilder {
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
     const readToolInstructionsStartedAt = Date.now();
-    const toolInstructions = await readToolInstructions(
-      metadata,
-      runtime,
-      workspacePath,
+    // Same snapshot as the system message: no second AGENTS.md scan, and the
+    // prompt and tool descriptions cannot disagree about file contents.
+    const toolInstructions = extractToolInstructionsFromSources(
+      instructionSources,
       capabilityModelString,
-      agentSystemPromptSections,
-      cfg.projects,
-      claudeSkillsCompatExperimentEnabled
+      metadata,
+      agentSystemPromptSections
     );
     recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
