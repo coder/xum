@@ -33,7 +33,7 @@ import {
   stubStableIds,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import * as crossProcessLock from "@/node/utils/main/crossProcessLock";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -537,7 +537,7 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
       else expect(internals.attemptSettlementByTaskId.get(taskId)?.phase).toBe("settled");
       expect(internals.workspaceStopRecords.has(taskId)).toBe(false);
       expect(internals.admittedSendsByTaskId.get(taskId)?.size ?? 0).toBe(0);
-      const release = await acquireCrossProcessLock({
+      const release = await crossProcessLock.acquireCrossProcessLock({
         lockPath: path.join(config.rootDir, "workspace-registration.lock"),
         acquireTimeoutMs: 100,
         staleMs: 60_000,
@@ -605,6 +605,83 @@ describe("TaskService reserved launch: task checkout preparation (producer side)
         taskCheckoutPreparation: { v: 1, path: forkPathFor(config.srcDir, taskId) },
       });
       if (mode === "queued") expect(row?.taskStatus).toBe("queued");
+    },
+    30_000
+  );
+
+  // HOLDER RULE (see acquireRegistrationSanitizeLock): a failed registration-lock release never
+  // changes the outcome of the transaction it closed. A refusal turned into a throw would delete
+  // the checkout retained on purpose; a committed publication turned into a failure would fence
+  // rows whose ids a workflow already checkpointed.
+  function failRegistrationLockRelease(): () => number {
+    const realAcquire = crossProcessLock.acquireCrossProcessLock;
+    let failedReleases = 0;
+    const acquire = spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation(
+      async (options) => {
+        const release = await realAcquire(options);
+        if (path.basename(options.lockPath) !== "workspace-registration.lock") return release;
+        return async () => {
+          await release();
+          failedReleases++;
+          throw new Error("EIO: registration lock release failed");
+        };
+      }
+    );
+    restores.push(() => acquire.mockRestore());
+    return () => failedReleases;
+  }
+
+  test("a refused direct preparation keeps its refusal when the lock release fails: the claimed fork is retained and named, not rolled back", async () => {
+    const taskId = "preprelease01";
+    const projectPath = await createRepoWithTrackedEnable(
+      `{"enabledServers": ["${STALE_PLUGIN_KEY}"], "enabledServers": []}`
+    );
+    const { config, taskService, sends } = await createRealStack(projectPath);
+    stubStableIds(config, [taskId]);
+    const forkPath = forkPathFor(config.srcDir, taskId);
+    const failedReleases = failRegistrationLockRelease();
+
+    const created = await taskService.create(createArgs("Refused"));
+    expect(failedReleases()).toBeGreaterThan(0);
+    expect(created.success).toBe(false);
+    if (created.success) throw new Error("unreachable");
+    expect(created.error).toContain("could not be sanitized");
+    expect(created.error).toContain(forkPath);
+    expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    expect(sends).toEqual([]);
+    // Retained verbatim (never pruned, never deleted by a rollback).
+    expect(await fsPromises.readFile(path.join(forkPath, OVERRIDES_RELATIVE_PATH), "utf-8")).toBe(
+      `{"enabledServers": ["${STALE_PLUGIN_KEY}"], "enabledServers": []}`
+    );
+  }, 30_000);
+
+  test.each([
+    ["reserved", "preprelease02"],
+    ["direct", "preprelease03"],
+  ] as const)(
+    "a %s publication keeps its success when the lock release fails: the row is the task and it launches",
+    async (mode, taskId) => {
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, sends } = await createRealStack(projectPath);
+      stubStableIds(config, [taskId]);
+      const failedReleases = failRegistrationLockRelease();
+
+      const created =
+        mode === "reserved"
+          ? await taskService.createMany([createArgs("Released")])
+          : await taskService.create(createArgs("Released"));
+      expect(failedReleases()).toBeGreaterThan(0);
+      expect(created.success).toBe(true);
+      await waitUntil(
+        () =>
+          sends.includes(taskId) && findWorkspaceInConfig(config, taskId)?.taskStatus === "running",
+        "the task's launch send"
+      );
+      expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+        path: forkPathFor(config.srcDir, taskId),
+        taskCheckoutPreparation: { path: forkPathFor(config.srcDir, taskId) },
+      });
+      expect(findWorkspaceInConfig(config, taskId)?.taskLaunchError).toBeUndefined();
     },
     30_000
   );

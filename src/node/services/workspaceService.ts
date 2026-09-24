@@ -2991,9 +2991,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * default-disabled server. Under the lock the second registrant scans only
    * after the first's prune committed, so it correctly sees a completed live
    * sibling.
+   *
+   * HOLDER RULE: the returned release never throws. Every holder releases in a `finally` after
+   * its transaction's outcome is decided (a refusal that retains a checkout on purpose, a
+   * committed publication whose ids a workflow already checkpointed); a release error replacing
+   * that outcome would make callers act on a false failure — roll back the retained checkout,
+   * fence the committed rows. The failure is logged and the lease ages out for other holders.
    */
-  private acquireRegistrationSanitizeLock(): Promise<() => Promise<void>> {
-    return acquireCrossProcessLock({
+  private async acquireRegistrationSanitizeLock(): Promise<() => Promise<void>> {
+    const release = await acquireCrossProcessLock({
       lockPath: path.join(this.config.rootDir, "workspace-registration.lock"),
       // Persist + sibling scan + one override-file prune; canonicalization is
       // bounded per entry, so a minute outlasts any legitimate holder.
@@ -3002,6 +3008,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       timeoutMessage:
         "Another Mux process is currently registering a workspace. Wait for it to finish and try again.",
     });
+    return () =>
+      release().catch((error: unknown) => {
+        log.warn("Failed to release the registration lock; the transaction's outcome stands", {
+          error: getErrorMessage(error),
+        });
+      });
   }
 
   /**
