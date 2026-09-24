@@ -1475,9 +1475,14 @@ export class WorkspaceMcpOverridesService {
     // SECURITY: `rm -f` follows a symlinked parent directory; a repo-tracked
     // `.xum`/`.mux` symlink would make clearing this workspace delete a
     // sibling checkout's document.
-    const hostFilesystem = overridesOnHostFilesystem(runtimeConfig);
-    await assertOverrideSegmentsNotSymlinked(runtime, workspacePath, hostFilesystem);
-    if (hostFilesystem) {
+    await assertOverrideSegmentsNotSymlinked(
+      runtime,
+      workspacePath,
+      overridesOnHostFilesystem(runtimeConfig)
+    );
+    // Host-local only: a devcontainer's (name-derived) workspacePath may not
+    // be its persisted host checkout, so it stays on the exec path below.
+    if (runtimeConfig !== undefined && isHostLocalRuntimeConfig(runtimeConfig)) {
       // In-process, not `rm -f`: this runs under the override write locks,
       // and a host runtime's exec child is a DETACHED shell that can outlive
       // this process — after a crash it could still delete a document a
@@ -1516,15 +1521,16 @@ export class WorkspaceMcpOverridesService {
    * replacement lands as a new file that is never touched), then inspected;
    * ours is deleted, anyone else's is moved back without clobbering a newer
    * one. The symlink guard ran before the write; paths are relative to the
-   * checkout for the shell like removeOverridesFile. Host checkouts use
-   * in-process fs calls instead (see removeOverridesFile for why).
+   * checkout for the shell like removeOverridesFile. Host-local checkouts
+   * use in-process fs calls instead (see removeOverridesFile for why and why
+   * devcontainers stay on exec).
    */
   private async removeExactDocument(
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string,
     filePath: string,
     expectedContent: string,
-    hostFilesystem: boolean
+    hostLocal: boolean
   ): Promise<void> {
     // Host paths are joined with the platform separator (backslashes on
     // Windows) while the candidates are spelled with `/`.
@@ -1536,7 +1542,7 @@ export class WorkspaceMcpOverridesService {
     const suffix = `${process.pid}-${Date.now()}`;
     const aside = `${relative}.rollback-${suffix}`;
     const asidePath = `${filePath}.rollback-${suffix}`;
-    if (hostFilesystem) {
+    if (hostLocal) {
       // In-process like removeOverridesFile: a detached `mv`/`rm` child could
       // outlive this process and move aside or delete a document a successor
       // saved after taking over the lock (#4415).
@@ -2047,7 +2053,7 @@ export class WorkspaceMcpOverridesService {
               workspacePath,
               canonicalPath,
               content,
-              hostFilesystem
+              target.runtimeConfig !== undefined && isHostLocalRuntimeConfig(target.runtimeConfig)
             ).catch((rollbackError: unknown) =>
               log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
                 workspaceId,

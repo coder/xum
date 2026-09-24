@@ -2834,27 +2834,31 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   });
 
-  it("clears a devcontainer workspace's settings on the host without a running container", async () => {
+  it("clearing a devcontainer workspace keeps the exec path", async () => {
+    // A devcontainer's name-derived workspacePath may not be its persisted
+    // host checkout: an in-process unlink there would hit ENOENT and report a
+    // clear that left the real document behind.
     const service = new WorkspaceMcpOverridesService(config);
     const checkout = path.join(config.srcDir, "devcontainer-clear");
-    await fs.mkdir(checkout, { recursive: true });
-    const workspaceId = "ws-devcontainer-clear";
-    await config.editConfig((cfg) => {
-      cfg.projects.set(checkout, {
-        workspaces: [
-          {
-            path: checkout,
-            id: workspaceId,
-            name: checkout,
-            runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
-          },
-        ],
-      });
-      return cfg;
+    const filePath = path.join(checkout, ".xum", "mcp.local.jsonc");
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, JSON.stringify({ disabledServers: ["shots"] }));
+    const runtime = createRuntime({ type: "local" }, { projectPath: checkout });
+    const commands: string[] = [];
+    const recording = Object.create(runtime) as typeof runtime;
+    recording.exec = (command, options) => {
+      commands.push(command);
+      return runtime.exec(command, options);
+    };
+    const removeOverridesFile = (
+      service as unknown as { removeOverridesFile: (...args: unknown[]) => Promise<void> }
+    ).removeOverridesFile.bind(service);
+    await removeOverridesFile(recording, checkout, {
+      type: "devcontainer",
+      configPath: ".devcontainer/devcontainer.json",
     });
-    await service.setOverridesForWorkspace(workspaceId, { disabledServers: ["shots"] });
-    await service.setOverridesForWorkspace(workspaceId, {});
-    expect(await pathExists(path.join(checkout, ".xum", "mcp.local.jsonc"))).toBe(false);
+    expect(commands.filter((command) => command.startsWith("rm -f "))).toHaveLength(1);
+    expect(await pathExists(filePath)).toBe(false);
   });
 
   describe("migration rollback (removeExactDocument)", () => {
