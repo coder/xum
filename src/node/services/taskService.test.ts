@@ -63,6 +63,7 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { TaskService, ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import {
+  isActiveWorkspaceTurnTaskStatus,
   TaskHandleStore,
   type WorkspaceTurnTaskHandleRecord,
 } from "@/node/services/taskHandleStore";
@@ -9394,7 +9395,36 @@ describe("TaskService", () => {
       }
     }, 20_000);
 
-    test("a crash cut after the commit recovers the claimed execution on the new model", async () => {
+    /**
+     * Copies the durable state (config, sessions, handle store) of a frozen run into an
+     * isolated root and starts a fresh instance there WITHOUT cleanup, like a crash.
+     */
+    async function restartFromCrashCut(parentId: string, childId: string) {
+      const crashRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-cut-"));
+      await fsPromises.cp(rootDir, crashRoot, { recursive: true });
+      const restartedConfig = new Config(crashRoot);
+      const cutChild = findWorkspaceInConfig(restartedConfig, childId);
+      const recoverySend = createAcceptingSendMessage();
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: recoverySend });
+      const restarted = createTaskServiceHarness(restartedConfig, { workspaceService });
+      await restarted.taskService.initialize();
+      const resumeStream = workspaceService.resumeStream as unknown as ReturnType<typeof mock>;
+      const executionId = cutChild?.taskExecutionId;
+      assert(executionId != null, "the cut must leave an execution mirror behind");
+      const handle = await (
+        restarted.taskService as unknown as { taskHandleStore: TaskHandleStore }
+      ).taskHandleStore.getWorkspaceTurn(parentId, executionId);
+      return {
+        crashRoot,
+        cutChild,
+        handle,
+        recoveredChild: findWorkspaceInConfig(restartedConfig, childId),
+        childSends: recoverySend.mock.calls.filter((call) => call[0] === childId),
+        childResumes: resumeStream.mock.calls.filter((call) => call[0] === childId),
+      };
+    }
+
+    test("a crash cut after the commit settles the claimed execution with the new snapshot", async () => {
       let armed = false;
       let signalCut!: () => void;
       const cutReached = new Promise<void>((resolve) => (signalCut = resolve));
@@ -9417,39 +9447,71 @@ describe("TaskService", () => {
       armed = true;
       void reawaken(fixture.taskService, fixture.parentId, childId);
       await cutReached;
+      edit.mockRestore();
 
-      const crashRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-cut-"));
+      const cut = await restartFromCrashCut(fixture.parentId, childId);
       try {
-        await fsPromises.cp(rootDir, crashRoot, { recursive: true });
-        edit.mockRestore();
-        const restartedConfig = new Config(crashRoot);
-        const restartedChild = findWorkspaceInConfig(restartedConfig, childId);
-        expect(restartedChild?.taskModelString).toBe(MODEL_B);
-        expect(restartedChild?.aiSettings?.model).toBe(MODEL_B);
-        expect(restartedChild?.taskExecutionStatus).toBe("running");
-        expect(restartedChild?.taskExecutionId).toBeDefined();
-
-        const recoverySend = createAcceptingSendMessage();
-        const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: recoverySend });
-        const restarted = createTaskServiceHarness(restartedConfig, { workspaceService });
-        await restarted.taskService.initialize();
-        // Restart recovery may settle the interrupted continuation (notifying the parent on
-        // the parent's own model) instead of re-dispatching; any child dispatch it makes, and
-        // the child's persisted restart-safe fields, must carry the committed settings.
-        const childModels = [
-          ...recoverySend.mock.calls
-            .filter((call) => call[0] === childId)
-            .map((call) => (call[2] as { model?: string }).model),
-          ...(workspaceService.resumeStream as unknown as ReturnType<typeof mock>).mock.calls
-            .filter((call) => call[0] === childId)
-            .map((call) => (call[1] as { model?: string } | undefined)?.model),
-        ].filter((model) => model != null);
-        expect(childModels.every((model) => model === MODEL_B)).toBe(true);
-        const recoveredChild = findWorkspaceInConfig(restartedConfig, childId);
-        expect(recoveredChild?.taskModelString).toBe(MODEL_B);
-        expect(recoveredChild?.aiSettingsByAgent?.exec?.model).toBe(MODEL_B);
+        // The cut captured the committed claim and settings together.
+        expect(cut.cutChild?.taskModelString).toBe(MODEL_B);
+        expect(cut.cutChild?.aiSettings?.model).toBe(MODEL_B);
+        expect(cut.cutChild?.taskExecutionStatus).toBe("running");
+        // Startup settles the interrupted continuation instead of replaying it (child
+        // sessions skip startup auto-retry); the committed snapshot stays the new one.
+        expect(cut.handle).toMatchObject({
+          status: "interrupted",
+          error: "Workspace turn interrupted after restart",
+          modelString: MODEL_B,
+        });
+        expect(cut.childSends).toHaveLength(0);
+        expect(cut.childResumes).toHaveLength(0);
+        expect(cut.recoveredChild?.taskExecutionStatus).toBe("interrupted");
+        expect(cut.recoveredChild?.taskModelString).toBe(MODEL_B);
+        expect(cut.recoveredChild?.aiSettings?.model).toBe(MODEL_B);
+        expect(cut.recoveredChild?.aiSettingsByAgent?.exec?.model).toBe(MODEL_B);
       } finally {
-        await fsPromises.rm(crashRoot, { recursive: true, force: true });
+        await fsPromises.rm(cut.crashRoot, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    test("a crash cut before the commit settles interrupted with the old snapshot and no replay", async () => {
+      let armed = false;
+      let signalCut!: () => void;
+      const cutReached = new Promise<void>((resolve) => (signalCut = resolve));
+      // Freezes inside the send before onAccepted: the reservation already wrote an
+      // active mirror, but the claim-and-settings commit never ran.
+      const sendMessage = createAcceptingSendMessage(async () => {
+        if (!armed) return;
+        signalCut();
+        await new Promise(() => undefined);
+      });
+      const fixture = await spawnReportedChild({ sendMessage });
+      const { config, childId } = fixture;
+      const before = findWorkspaceInConfig(config, childId);
+      assert(before != null, "spawned child must exist");
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "low" });
+      armed = true;
+      void reawaken(fixture.taskService, fixture.parentId, childId);
+      await cutReached;
+
+      const cut = await restartFromCrashCut(fixture.parentId, childId);
+      try {
+        expect(isActiveWorkspaceTurnTaskStatus(cut.cutChild?.taskExecutionStatus)).toBe(true);
+        expect(cut.cutChild?.taskModelString).toBe(SPAWN_MODEL);
+        expect(cut.handle).toMatchObject({
+          status: "interrupted",
+          error: "Workspace turn interrupted after restart",
+        });
+        expect(cut.childSends).toHaveLength(0);
+        expect(cut.childResumes).toHaveLength(0);
+        expect(isActiveWorkspaceTurnTaskStatus(cut.recoveredChild?.taskExecutionStatus)).toBe(
+          false
+        );
+        expect(cut.recoveredChild?.taskModelString).toBe(before.taskModelString);
+        expect(cut.recoveredChild?.taskThinkingLevel).toBe(before.taskThinkingLevel);
+        expect(cut.recoveredChild?.aiSettings).toEqual(before.aiSettings);
+        expect(cut.recoveredChild?.aiSettingsByAgent).toEqual(before.aiSettingsByAgent);
+      } finally {
+        await fsPromises.rm(cut.crashRoot, { recursive: true, force: true });
       }
     }, 20_000);
 
