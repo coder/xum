@@ -1,3 +1,4 @@
+import type { ProviderModelEntry } from "@/common/orpc/types";
 import { describe, expect, test } from "bun:test";
 
 import {
@@ -90,9 +91,9 @@ describe("gatewayModelCatalog", () => {
   });
 
   test("rejects Coder models absent from the discovered bridge catalog", () => {
-    // The AI Bridge only serves models its upstreams expose: an anthropic
-    // model missing from coder.models must not be routed through Coder (it
-    // should fall back to a configured direct provider instead).
+    // The AI Bridge only serves models its upstreams expose: a model missing
+    // from the catalog (and not explicitly configured) must not be routed
+    // through Coder — it should fall back to a configured direct provider.
     expect(
       isProviderModelAccessibleFromAuthoritativeCatalog(
         "coder",
@@ -101,6 +102,15 @@ describe("gatewayModelCatalog", () => {
         ["openai/gpt-5"]
       )
     ).toBe(false);
+    // A catalog ID is routable without a configured `models` row.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "anthropic/claude-opus-4-1",
+        ["openai/gpt-5"],
+        ["anthropic/claude-opus-4-1"]
+      )
+    ).toBe(true);
   });
 
   test("accepts manually added Coder models alongside a discovered catalog", () => {
@@ -111,6 +121,14 @@ describe("gatewayModelCatalog", () => {
         "coder",
         "anthropic/my-manual-model",
         ["anthropic/my-manual-model", "openai/gpt-5"],
+        ["openai/gpt-5"]
+      )
+    ).toBe(true);
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "anthropic/my-manual-model",
+        [{ id: "anthropic/my-manual-model", contextWindowTokens: 200000 }],
         ["openai/gpt-5"]
       )
     ).toBe(true);
@@ -194,6 +212,16 @@ describe("gatewayModelCatalog", () => {
         ["openai/other-model"]
       )
     ).toBe(true);
+    // A removal wins even over a catalog listing and a `models` row.
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog(
+        "coder",
+        "anthropic/claude-sonnet-4-5",
+        ["anthropic/claude-sonnet-4-5"],
+        ["anthropic/claude-sonnet-4-5"],
+        ["anthropic/claude-sonnet-4-5"]
+      )
+    ).toBe(false);
     // The gateway-form wrapper passes the exclusions through.
     expect(
       isGatewayModelAccessibleFromAuthoritativeCatalog(
@@ -206,22 +234,42 @@ describe("gatewayModelCatalog", () => {
     ).toBe(false);
   });
 
-  test("falls back to the Coder catalog when models is missing but the marker exists", () => {
-    // Hand-edited configs may drop `models` while keeping discoveredModels;
-    // gate on the catalog itself rather than blanket-blocking every model.
-    expect(
-      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "openai/gpt-5", undefined, [
-        "openai/gpt-5",
-      ])
-    ).toBe(true);
+  test("gates Coder routing on the catalog whether models is missing, empty, or manual-only", () => {
+    // The catalog verdict must not depend on the shape of `models`: missing
+    // (hand-edited config), empty, or holding only unrelated manual entries.
+    for (const models of [undefined, [], ["anthropic/my-manual-model"]]) {
+      expect(
+        isProviderModelAccessibleFromAuthoritativeCatalog("coder", "openai/gpt-5", models, [
+          "openai/gpt-5",
+        ])
+      ).toBe(true);
+      expect(
+        isProviderModelAccessibleFromAuthoritativeCatalog(
+          "coder",
+          "anthropic/claude-sonnet-4-5",
+          models,
+          ["openai/gpt-5"]
+        )
+      ).toBe(false);
+    }
+  });
+
+  test("treats a malformed Coder models value as no explicit additions", () => {
+    // Hand-edited providers.jsonc can hold a non-array `models`; routing must not throw.
+    const malformed = { id: "anthropic/claude-x" } as unknown as ProviderModelEntry[];
     expect(
       isProviderModelAccessibleFromAuthoritativeCatalog(
         "coder",
-        "anthropic/claude-sonnet-4-5",
-        undefined,
-        ["openai/gpt-5"]
+        "anthropic/claude-x",
+        malformed,
+        []
       )
     ).toBe(false);
+    expect(
+      isProviderModelAccessibleFromAuthoritativeCatalog("coder", "anthropic/claude-x", malformed, [
+        "anthropic/claude-x",
+      ])
+    ).toBe(true);
   });
 
   test("accepts Codex models when the Copilot catalog includes them", () => {
