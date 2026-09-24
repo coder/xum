@@ -193,6 +193,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "isStopInProgress"
   | "getStopEpoch"
   | "onTurnSettled"
+  | "onTurnSuperseded"
   | "onBeforeTurnCompletion"
 > {
   workspaceId: string;
@@ -297,6 +298,7 @@ export async function createAgentSessionHarness(
     isStopInProgress: options.isStopInProgress,
     getStopEpoch: options.getStopEpoch,
     onTurnSettled: options.onTurnSettled,
+    onTurnSuperseded: options.onTurnSuperseded,
     onBeforeTurnCompletion: options.onBeforeTurnCompletion,
   });
 

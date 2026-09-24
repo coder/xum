@@ -14,6 +14,7 @@ import type {
 } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import type { StreamErrorRecoveryOutcome } from "@/node/services/agentSession";
+import type { TurnId } from "@/node/services/turnCoordinator";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type {
   FrontendWorkspaceMetadata,
@@ -357,6 +358,12 @@ export interface SendMessageInternalOptions {
    */
   admissionStale?: () => boolean;
   /**
+   * Obligation minted by TaskService for a send it fenced itself (task launch). When absent on a
+   * send into an agent-task workspace, WorkspaceService asks TaskService for one at the session
+   * handoff (admitTaskWorkspaceTurn) so every task-workspace send is accounted for.
+   */
+  turnAdmission?: TurnAdmissionToken;
+  /**
    * Synthetic assistant rows persisted just before the turn's user row
    * (family-message payloads). Delivered atomically with the message —
    * queued alongside it when the workspace is busy — so they never land
@@ -407,6 +414,8 @@ export interface WorkspaceTurnHost {
       acceptanceOrigin?: TurnAcceptanceOrigin;
       allowQueuedAgentTask?: boolean;
       agentInitiated?: boolean;
+      /** See SendMessageInternalOptions.turnAdmission. */
+      turnAdmission?: TurnAdmissionToken;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>>;
   clearQueue(workspaceId: string, options?: { cancelReason?: string }): Result<void>;
@@ -432,10 +441,30 @@ export interface WorkspaceTurnHost {
 export interface TurnAdmissionHost {
   acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
-  dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>>;
+  /**
+   * Startup re-drive of a pending compaction follow-up. `internal.turnAdmission` is the
+   * task-attempt obligation the caller bound for it (admitTaskWorkspaceTurn): carried to the
+   * session's send as its token and staleness probe, so the follow-up is admitted under exactly
+   * that attempt or refused. The caller disposes a token that produced no turn.
+   */
+  dispatchPendingCompactionFollowUp(
+    workspaceId: string,
+    internal?: { turnAdmission?: TurnAdmissionToken }
+  ): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
+  /**
+   * The user's manual input is queued or held (refused, unsent) in the workspace's session. Both
+   * live only in that session, so removing the workspace would silently lose them.
+   */
+  hasPendingUserInput(workspaceId: string): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
+  /**
+   * Re-run the workspace's idle queue drain. Called by the task layer when a stream-end decision
+   * that held a queued entry (see TurnAdmissionToken.resolveDispatch) resolves; a no-op while a
+   * turn is active or nothing is queued.
+   */
+  drainQueuedMessagesIfIdle(workspaceId: string): void;
   hasPendingAutoRetry(workspaceId: string): boolean;
   hasPendingBashMonitorWakeContinuation(workspaceId: string): boolean;
   hasPendingWorkspaceTurnContinuation(
@@ -491,7 +520,71 @@ export interface TurnAdmissionHost {
   onWorkspaceTurnSettled(
     listener: (workspaceId: string, turnGeneration: symbol) => void
   ): () => void;
+  /**
+   * Fires when the coordinator replaced a live turn generation with a successor WITHOUT the
+   * predecessor ever going idle (a queued entry dispatched at a step boundary, an auto-retry or
+   * rollover handoff). The predecessor will never emit onWorkspaceTurnSettled; whatever waited
+   * on it now waits on the successor.
+   */
+  onWorkspaceTurnSuperseded(
+    listener: (workspaceId: string, previous: symbol, next: symbol) => void
+  ): () => void;
 }
+
+/**
+ * Obligation handle for one send into an agent-task workspace, minted by TaskService when the
+ * send is admitted against the task's current attempt and carried with the send through
+ * WorkspaceService, AgentSession and the MessageQueue. It is the only evidence of what became of
+ * the send: the token's owner fires exactly one of the lifecycle events below at the seam where
+ * that outcome is decided, never inferred from a return value. A pending or enqueued obligation
+ * keeps the task's stop cascade from settling the attempt; an admitted one is discharged only when
+ * the turn it names settles.
+ */
+export interface TurnAdmissionToken {
+  /**
+   * Refusal authority, evaluated synchronously at every admission gate before the coordinator
+   * claims PREPARING: true once this send may no longer start work (its attempt was superseded,
+   * closed or stopped, or the token was disposed). Inert once admitted.
+   */
+  admissionStale(): boolean;
+  /** The send took a queue slot (actual insertion); the entry owns its disposition from here. */
+  onEnqueued(): void;
+  /**
+   * The coordinator admitted this send's turn. Fired inside the synchronous admission callback,
+   * before any observer can clear the queue; idempotent per turn (a dequeued entry is adopted by
+   * a second sendMessage with the same id).
+   */
+  onAdmitted(turnId: TurnId): void;
+  /**
+   * No turn will exist for this send. Ignored once admitted (cancellation requests termination,
+   * it does not prove settlement); terminal otherwise — a disposed token never admits.
+   */
+  onDisposed(kind: "no-work" | "refused" | "canceled-before-admission"): void;
+  /**
+   * Consulted by the queue's dequeue gate once per drain pass, BEFORE admissionStale and before
+   * the coordinator claims a turn. `hold` keeps the entry queued without dispatching it — the
+   * token's owner is still deciding whether the stream that just ended carried the task's
+   * terminal report, and wakes the drain again (drainQueuedMessagesIfIdle) once it knows;
+   * `proceed` continues to the ordinary gates; a refusal removes the entry with a recoverable
+   * message. Never blocks: the drain returns immediately on `hold`.
+   */
+  resolveDispatch?(): QueuedDispatchDecision;
+}
+
+/** Outcome of {@link TurnAdmissionToken.resolveDispatch}. */
+export type QueuedDispatchDecision = "hold" | "proceed" | { refuse: string };
+
+/** Outcome of AgentTaskIntegration.reawakenInterruptedTask. */
+export type TaskReawakenOutcome =
+  | { kind: "not-applicable" }
+  | { kind: "reawakened"; attemptId: string; statusChanged: boolean }
+  | { kind: "refused"; message: string };
+
+/** Result of asking TaskService to admit a send into a workspace (see admitTaskWorkspaceTurn). */
+export type TaskTurnAdmission =
+  | { kind: "not-a-task" }
+  | { kind: "admitted"; token: TurnAdmissionToken }
+  | { kind: "refused"; message: string };
 
 /**
  * Outcome of the queue entry selected to continue a turn the host cut at a step boundary
@@ -629,9 +722,46 @@ export interface AgentTaskIntegration {
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
+  /**
+   * The user-resume rescue a manual send/resume runs before binding its obligation, with its
+   * outcome made explicit (markInterruptedTaskRunning reports only a status change):
+   *  - `not-applicable`: nothing to reawaken (an active task, a stop in progress, a retired
+   *    attempt, not a task); the send binds through the ordinary fence, which refuses what the
+   *    fence refuses.
+   *  - `reawakened`: this call committed a fresh owned attempt; the send must bind to exactly
+   *    `attemptId` (`statusChanged`: the row moved to running and needs restoring on failure).
+   *  - `refused`: this call decided to reawaken and lost — another writer (another backend's
+   *    resume) moved the row first, or a Stop overtook it. The send must be refused: binding it
+   *    generically would adopt the winner's attempt and stream it twice.
+   */
+  reawakenInterruptedTask(workspaceId: string): Promise<TaskReawakenOutcome>;
+  /**
+   * Synchronous admission fence for a send into a workspace, evaluated at the session handoff
+   * (right before the queue insertion or the session's own admission awaits). Non-task workspaces
+   * and pre-identity task entries carry no obligation; a task whose current attempt is closed,
+   * stopping or retired refuses; otherwise the returned token must ride with the send.
+   */
+  admitTaskWorkspaceTurn(
+    workspaceId: string,
+    options: {
+      acceptanceOrigin: TurnAcceptanceOrigin;
+      /**
+       * The attempt this send was decided for (a reservation's id, a startup rotation): refused
+       * when the row names another attempt, so a decision never adopts a successor admitted by
+       * another writer between its own admission and this handoff.
+       */
+      expectedAttemptId?: string;
+    }
+  ): TaskTurnAdmission;
+  /**
+   * Roll back a failed resume's status flip. `expectedAttemptId`: the attempt the resume's own
+   * reawaken won; the rollback is a CAS on it (a row another writer re-admitted since is left
+   * alone). Omitted when the resume reawakened nothing (today's unconditional rollback).
+   */
   restoreInterruptedTaskAfterResumeFailure(
     workspaceId: string,
-    previousStatus?: AgentTaskStatus | null
+    previousStatus?: AgentTaskStatus | null,
+    expectedAttemptId?: string
   ): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;

@@ -5,6 +5,7 @@ import type { MuxMessage, DisplayedMessage, QueuedMessage } from "@/common/types
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isGoalPendingPersistence, type GoalSnapshot } from "@/common/types/goal";
 import type {
+  HeldInput,
   HistoryEditPrecondition,
   WorkspaceActivitySnapshot,
   WorkspaceChatMessage,
@@ -63,6 +64,7 @@ import {
   isTaskCreatedEvent,
   isWorkflowRunAttachedEvent,
   isMuxMessage,
+  isHeldInputsChanged,
   isQueuedMessageChanged,
   isRestoreToInput,
   isRuntimeStatus,
@@ -198,6 +200,8 @@ export interface WorkspaceState {
   name: string; // User-facing workspace name (e.g., "feature-branch")
   messages: DisplayedMessage[];
   queuedMessage: QueuedMessage | null;
+  /** Manual queued messages refused at dispatch, kept by the backend until sent or discarded. */
+  heldInputs: readonly HeldInput[];
   canInterrupt: boolean;
   isCompacting: boolean;
   isStreamStarting: boolean;
@@ -299,6 +303,9 @@ export interface WorkspaceSidebarState {
  * Currently only recency timestamps for workspace sorting.
  */
 type DerivedState = Record<string, number>;
+
+/** Stable empty held-input list, so an unchanged empty list keeps its identity across renders. */
+const NO_HELD_INPUTS: readonly HeldInput[] = [];
 
 /**
  * Per-attempt context for an onChat subscription. Carries the since-mode anchor the
@@ -440,6 +447,7 @@ interface WorkspaceChatTransientState {
   pendingStreamEvents: WorkspaceChatMessage[];
   replayingHistory: boolean;
   queuedMessage: QueuedMessage | null;
+  heldInputs: readonly HeldInput[];
   liveBashOutput: Map<string, LiveBashOutputInternal>;
   liveAdvisorOutput: Map<string, AdvisorLiveOutputState>;
   liveAdvisorReasoning: Map<string, AdvisorLiveReasoningState>;
@@ -568,6 +576,7 @@ function createInitialChatTransientState(): WorkspaceChatTransientState {
     pendingStreamEvents: [],
     replayingHistory: false,
     queuedMessage: null,
+    heldInputs: NO_HELD_INPUTS,
     liveBashOutput: new Map(),
     liveAdvisorOutput: new Map(),
     liveAdvisorReasoning: new Map(),
@@ -1263,6 +1272,12 @@ export class WorkspaceStore {
       // user-visible terminal turns instead of every intermediate handoff.
       aggregator.setActiveQueuedFollowUp(data.hasQueuedMessages ?? queuedMessage !== null);
       this.assertChatTransientState(workspaceId).queuedMessage = queuedMessage;
+      this.states.bump(workspaceId);
+    },
+    "held-inputs-changed": (workspaceId, _aggregator, data) => {
+      if (!isHeldInputsChanged(data)) return;
+      this.assertChatTransientState(workspaceId).heldInputs =
+        data.heldInputs.length > 0 ? data.heldInputs : NO_HELD_INPUTS;
       this.states.bump(workspaceId);
     },
     "restore-to-input": (_workspaceId, _aggregator, data) => {
@@ -2497,6 +2512,7 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
+        heldInputs: transient.heldInputs,
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
@@ -4800,8 +4816,14 @@ export class WorkspaceStore {
         // authoritative: a retry that resolved while disconnected must not keep its banner
         // (and Stop) alive through the outage.
         transient.autoRetryStatus = null;
+        // Held inputs are replayed only while non-empty (like the retry snapshot).
+        transient.heldInputs = NO_HELD_INPUTS;
         for (const event of transient.pendingStreamEvents) {
-          if (isQueuedMessageChanged(event) || isAutoRetryStatusEvent(event)) {
+          if (
+            isQueuedMessageChanged(event) ||
+            isHeldInputsChanged(event) ||
+            isAutoRetryStatusEvent(event)
+          ) {
             this.processStreamEvent(workspaceId, aggregator, event);
           }
         }
@@ -4877,6 +4899,10 @@ export class WorkspaceStore {
       if (serverActiveStreamMessageId === undefined) {
         aggregator.clearPendingStreamStartIfNotOptimistic();
       }
+
+      // Every replay (full or since) re-sends the held-input list while it is non-empty, buffered
+      // until after this reset, so a list emptied while disconnected cannot linger.
+      transient.heldInputs = NO_HELD_INPUTS;
 
       if (replay === "full") {
         // Full replay replaces backend-derived history state. Reset transient UI-only

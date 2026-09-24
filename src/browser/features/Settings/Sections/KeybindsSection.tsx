@@ -11,6 +11,8 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   CYCLE_AGENT: "Cycle agent",
   SEND_MESSAGE: "Send message",
   SEND_QUEUED_MESSAGE_NOW: "Send queued message now",
+  SEND_HELD_INPUT: "Send oldest unsent message",
+  DISCARD_HELD_INPUT: "Discard oldest unsent message",
   SEND_MESSAGE_AFTER_TURN: "Send after turn",
   NEW_LINE: "Insert newline",
   CANCEL: "Cancel / Close modal",

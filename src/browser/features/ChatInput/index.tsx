@@ -81,7 +81,7 @@ import {
   getWorkflowRunCardProjection,
 } from "@/browser/utils/workflowRunMessages";
 import { Button } from "@/browser/components/Button/Button";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { useChatErrorToasts } from "@/browser/utils/chatErrorToasts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
@@ -2584,6 +2584,36 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       input.trim() === "" &&
       attachments.length === 0 &&
       reviewPanelItems.length === 0;
+
+    // Held-input shortcuts, like the queued ones, apply only from an empty composer (never while
+    // typing), and always to the oldest held input so the target is deterministic.
+    const heldInputId = variant === "workspace" ? props.heldInputId : undefined;
+    const heldAction = matchesKeybind(e, KEYBINDS.SEND_HELD_INPUT)
+      ? "send"
+      : matchesKeybind(e, KEYBINDS.DISCARD_HELD_INPUT)
+        ? "discard"
+        : null;
+    if (
+      heldAction != null &&
+      heldInputId != null &&
+      workspaceIdForComposerClear != null &&
+      !editingMessageForUi &&
+      input.trim() === "" &&
+      attachments.length === 0 &&
+      reviewPanelItems.length === 0
+    ) {
+      e.preventDefault();
+      stopKeyboardPropagation(e);
+      if (e.repeat) return;
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.HELD_INPUT_ACTION, {
+          workspaceId: workspaceIdForComposerClear,
+          heldInputId,
+          action: heldAction,
+        })
+      );
+      return;
+    }
 
     // Existing send keybinds edit the queued boundary when the composer itself is empty.
     if (hasOnlyQueuedMessage && matchesKeybind(e, KEYBINDS.SEND_QUEUED_MESSAGE_NOW)) {

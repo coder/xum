@@ -14,6 +14,7 @@ import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import type { MuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
+import { TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 
 function extractText(message: MuxMessage): string {
   return message.parts
@@ -63,7 +64,7 @@ describe("Persistent sub-agent compaction", () => {
   });
 
   test.each([false, true])(
-    "rejected reactivation preserves settlement (busy at creation: %s)",
+    "rejected reactivation keeps its published attempt until a Stop settles it (busy at creation: %s)",
     async (busyAtCreation) => {
       if (!env || !repoPath) throw new Error("Test environment not initialized");
       const parent = await createWorkspace(
@@ -94,9 +95,14 @@ describe("Persistent sub-agent compaction", () => {
       expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
+      const retiredAttemptId = findWorkspace(env, childId)?.taskAttemptId;
+      expect(retiredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
 
-      // Keep TaskService, WorkspaceTurnManager and WorkspaceService real. The latter used to
-      // create a second owned attempt before this refusal, defeating outer ownership rollback.
+      // Keep TaskService, WorkspaceTurnManager and WorkspaceService real: the refusal comes from
+      // the real createWorkspaceTurn path, which fails only AFTER the reactivation published its
+      // fresh attempt. A refusal there proves nothing about admission (the send may already have
+      // happened), so the fresh identity is never rolled back to the retired attempt: it reads as
+      // owned-but-unsettled until a Stop settles it.
       const session = workspaceService.getOrCreateSession(childId);
       // The WTM busy snapshot may become idle before WorkspaceService reaches admission.
       const busy = jest
@@ -115,9 +121,20 @@ describe("Persistent sub-agent compaction", () => {
           )
         ).toMatchObject({ success: false, error: { code: "send_failed" } });
         expect(send).toHaveBeenCalledTimes(1);
+        const published = findWorkspace(env, childId)?.taskAttemptId;
+        expect(published).toMatch(/^att_[0-9a-f]{16}$/);
+        expect(published).not.toBe(retiredAttemptId);
+        const outcome = await taskService.readAttemptOutcome(childId, requesting);
+        expect(outcome.kind).toBe("indeterminate");
+        if (outcome.kind === "indeterminate") {
+          expect(outcome.reason).toContain("without settlement evidence");
+        }
+        // Only a Stop settles the published attempt; its id stays exactly as published.
+        await taskService.terminateAllDescendantAgentTasks(parentId);
         expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
           kind: "terminal-no-report",
         });
+        expect(findWorkspace(env, childId)?.taskAttemptId).toBe(published);
       } finally {
         send.mockRestore();
         busy.mockRestore();
@@ -257,6 +274,120 @@ describe("Persistent sub-agent compaction", () => {
         )
       ).toBe(false);
     }
+  );
+
+  /**
+   * Remote UAT (round 5): the parent reawakens an inactive child through task_send_message
+   * (reactivation → WorkspaceTurnManager continuation), a parent Stop cascade settles that
+   * reactivation attempt, and the user then recovers the child manually. Both manual entry
+   * points must start a NEW attempt — the settled reactivation attempt stays closed.
+   */
+  async function recoverManuallyAfterCascade(
+    predecessorStatus: "reported" | "interrupted",
+    recovery: "sendMessage" | "resumeStream"
+  ): Promise<void> {
+    if (!env || !repoPath) throw new Error("Test environment not initialized");
+    const testEnv = env;
+    const parent = await createWorkspace(env, repoPath, generateBranchName("recovery-parent"));
+    if (!parent.success) throw new Error(parent.error);
+    const parentId = parent.metadata.id;
+    workspaceIds.push(parentId);
+    const child = await createWorkspace(env, repoPath, generateBranchName("recovery-child"));
+    if (!child.success) throw new Error(child.error);
+    const childId = child.metadata.id;
+    workspaceIds.push(childId);
+    const reportedAt = "2026-08-10T12:00:00.000Z";
+    await env.config.addWorkspace(repoPath, {
+      ...child.metadata,
+      parentWorkspaceId: parentId,
+      agentId: "explore",
+      agentType: "explore",
+      taskStatus: predecessorStatus,
+      ...(predecessorStatus === "reported" ? { reportedAt } : {}),
+      taskModelString: HAIKU_MODEL,
+      title: "Reviewer",
+    });
+    const { taskService, workspaceService, aiService } = env.services;
+
+    const reactivated = await taskService.sendMessageToDescendantAgentTask(
+      parentId,
+      childId,
+      buildMockStreamStartGateMessage("Continue the review."),
+      "tool-end"
+    );
+    if (!reactivated.success || reactivated.data.delivery !== "reactivated") {
+      throw new Error(`Expected a reactivated child execution: ${JSON.stringify(reactivated)}`);
+    }
+    const handleId = reactivated.data.executionTaskId;
+    if (!handleId) throw new Error("Expected a reactivated execution task ID");
+    const reactivationAttemptId = findWorkspace(env, childId)?.taskAttemptId;
+    expect(reactivationAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
+    // The continuation is live (held at the mock stream-start gate) when the cascade lands.
+    expect(
+      await waitFor(
+        () =>
+          aiService.isStreaming(childId) ||
+          workspaceService.getOrCreateSession(childId).isPreparingTurn(),
+        10_000
+      )
+    ).toBe(true);
+
+    await taskService.terminateAllDescendantAgentTasks(parentId);
+    aiService.releaseMockStreamStartGate(childId);
+    expect(await waitFor(() => !taskService.isWorkspaceStopInProgress(childId), 15_000)).toBe(true);
+    expect(findWorkspace(env, childId)).toMatchObject({
+      taskAttemptId: reactivationAttemptId,
+      taskExecutionId: handleId,
+      taskExecutionStatus: "interrupted",
+    });
+    expect(aiService.isStreaming(childId)).toBe(false);
+
+    // Manual recovery must start a NEW attempt: the settled reactivation attempt stays closed.
+    const result =
+      recovery === "sendMessage"
+        ? await sendMessageWithModel(env, childId, "Manual follow-up after the stop.", HAIKU_MODEL)
+        : await env.orpc.workspace.resumeStream({
+            workspaceId: childId,
+            options: { model: HAIKU_MODEL, agentId: "explore" },
+          });
+    expect(result).not.toMatchObject({
+      success: false,
+      error: { raw: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE },
+    });
+    expect(result.success).toBe(true);
+    const recoveredAttemptId = findWorkspace(env, childId)?.taskAttemptId;
+    expect(recoveredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
+    expect(recoveredAttemptId).not.toBe(reactivationAttemptId);
+    if (predecessorStatus === "reported") {
+      expect(findWorkspace(env, childId)).toMatchObject({ taskStatus: "reported", reportedAt });
+    }
+    // The recovered turn runs to completion under the fresh attempt.
+    expect(
+      await waitFor(
+        () =>
+          !testEnv.services.aiService.isStreaming(childId) &&
+          !testEnv.services.workspaceService.getOrCreateSession(childId).isBusy(),
+        15_000
+      )
+    ).toBe(true);
+  }
+
+  test.each([
+    ["interrupted", "sendMessage"],
+    ["interrupted", "resumeStream"],
+  ] as const)(
+    "a parent Stop cascade over a reactivated %s child leaves it manually recoverable via %s under a fresh attempt",
+    recoverManuallyAfterCascade,
+    40_000
+  );
+
+  test.each([
+    ["reported", "sendMessage"],
+    ["reported", "resumeStream"],
+  ] as const)(
+    "a parent Stop cascade over a reactivated %s child leaves it manually recoverable via %s under a fresh attempt",
+    recoverManuallyAfterCascade,
+    40_000
   );
 
   test("reawakens a compacted child in place and settles its continuation without a live LLM", async () => {
