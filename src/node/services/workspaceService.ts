@@ -2252,6 +2252,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // pre-admission awaits (e.g. branch-summary generation).
   private readonly contextMutationEpochs = new Map<string, number>();
 
+  // Count of committed truncations that could remove rows (partial prefix cuts as well as
+  // full clears). Plan-review feedback binds snapshot/thread ids read before its send enters
+  // admission; a partial cut does not advance contextMutationEpochs (it is not a
+  // context-discarding mutation for ordinary sends) but can delete the referenced snapshot,
+  // so planReviewSubmitFeedback compares this generation too.
+  private readonly historyTruncationGenerations = new Map<string, number>();
+
   // r41: sends currently between the entry check and their settled outcome
   // (queued, refused, or admitted — PREPARING is set before any early
   // background-start return). Refine publication must not interleave with a
@@ -11766,7 +11773,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         input.options.unfencedEdit === undefined,
       "plan review feedback cannot carry edit semantics"
     );
+    // A partial truncation (another window) can also delete the referenced snapshot without
+    // advancing the epoch, so its generation is compared the same way; truncation holds the
+    // admission guard for its whole run, so it cannot commit after this check either.
     const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
+    const truncationsAtPrepare = this.historyTruncationGenerations.get(workspaceId) ?? 0;
     const prepared = await preparePlanReviewFeedback(
       this.historyService,
       workspaceId,
@@ -11774,12 +11785,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       input.options
     );
     if (!prepared.success) return prepared;
-    if ((this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare) {
+    if (
+      (this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare ||
+      (this.historyTruncationGenerations.get(workspaceId) ?? 0) !== truncationsAtPrepare
+    ) {
       return Err({
         type: "send_failed",
         error: {
           type: "unknown",
-          raw: "Plan review feedback was not sent: the workspace context was cleared or reset while it was being prepared. Review the current plan and send again.",
+          raw: "Plan review feedback was not sent: the workspace history was cleared, truncated or reset while it was being prepared. Review the current plan and send again.",
         },
       });
     }
@@ -14334,6 +14348,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
+    }
+    if (truncationScope !== "none") {
+      this.historyTruncationGenerations.set(
+        workspaceId,
+        (this.historyTruncationGenerations.get(workspaceId) ?? 0) + 1
+      );
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the

@@ -54,6 +54,10 @@ const describeIntegration = shouldRunIntegrationTests() ? describe : describe.sk
 
 const MOCK_MODEL = "mock-model";
 const MODEL = `local-mock:${MOCK_MODEL}`;
+// Share of the (deterministic) transcript's tokens the partial-truncation test drops: enough to
+// remove the oldest snapshot row while the latest snapshot survives for the final test. The
+// test asserts both preconditions, so a transcript change that breaks them fails loudly.
+const PARTIAL_TRUNCATION = 0.5;
 const PROPOSE_MARKER = "[fixture:propose]";
 const READ_MARKER = "[fixture:read]";
 const ATTACH_MARKER = "[fixture:attach]";
@@ -1042,6 +1046,67 @@ describeIntegration("workspace.planReview", () => {
       before.data.map((m) => m.id)
     );
     expect((await getState()).snapshots.map((s) => s.snapshotId)).toContain(snapshot.snapshotId);
+  }, 60_000);
+
+  // Destructive (drops the oldest rows); runs just before the full-clear test below, which
+  // only needs the latest snapshot to survive.
+  test("feedback prepared against a snapshot that a partial truncation removes is refused", async () => {
+    const before = await getState();
+    const oldest = before.snapshots[0];
+    const latest = before.snapshots.at(-1);
+    expect(oldest).toBeDefined();
+    expect(latest?.snapshotId).not.toBe(oldest?.snapshotId);
+    if (!oldest || !latest) return;
+    const options = { model: MODEL, agentId: "plan" as const };
+    const comment = { anchor: { startLine: 1, endLine: 1 }, quote: "# Plan", body: "Gone?" };
+
+    // Interleave a partial truncation (another window) between the feedback's history read
+    // and its send. A partial cut is not a context-discarding mutation for ordinary sends, so
+    // only the truncation generation can tell the feedback its snapshot row is gone.
+    const historyService = env.services.toORPCContext().historyService;
+    const original = historyService.iterateFullHistory.bind(historyService);
+    let truncated = false;
+    const spy = jest
+      .spyOn(historyService, "iterateFullHistory")
+      .mockImplementation(async (id, direction, visitor) => {
+        const result = await original(id, direction, visitor);
+        if (!truncated && id === workspaceId && direction === "forward") {
+          truncated = true;
+          const cut = await client().workspace.truncateHistory({
+            workspaceId,
+            percentage: PARTIAL_TRUNCATION,
+          });
+          expect(cut.success).toBe(true);
+        }
+        return result;
+      });
+    const requestsBefore = fixture.requests.length;
+    const feedbacksBefore = before.feedbacks.length;
+    try {
+      const sent = await planReview().submitFeedback({
+        workspaceId,
+        snapshotId: oldest.snapshotId,
+        comments: [comment],
+        replies: [],
+        options,
+      });
+      expect(truncated).toBe(true);
+      expect(!sent.success && sent.error.type).toBe("send_failed");
+    } finally {
+      spy.mockRestore();
+    }
+    // Preconditions of the scenario: the cut removed the referenced snapshot but kept rows
+    // (a partial cut, not a full clear) including the latest snapshot.
+    const after = await getState();
+    const snapshotIds = after.snapshots.map((s) => s.snapshotId);
+    expect(snapshotIds).not.toContain(oldest.snapshotId);
+    expect(snapshotIds).toContain(latest.snapshotId);
+    expect(fixture.requests.length).toBe(requestsBefore);
+    expect(after.feedbacks.length).toBeLessThanOrEqual(feedbacksBefore);
+    // Earlier tests' feedback rows can survive the cut, so look for this comment's own text.
+    const tail = await new HistoryService(env.config).getLastMessages(workspaceId, 5);
+    expect(tail.success).toBe(true);
+    expect(tail.success && JSON.stringify(tail.data).includes(comment.body)).toBe(false);
   }, 60_000);
 
   // Last on purpose: it clears the workspace history.
