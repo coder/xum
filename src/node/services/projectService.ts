@@ -60,6 +60,7 @@ import {
   withProjectRegistrationLock,
 } from "@/node/config/projectRegistrationLock";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { isProtectedTaskRow } from "@/node/services/workspaceStructuralMutationGuard";
 
 function orderWorkspacesForCascadeRemoval(
   workspaces: ProjectConfig["workspaces"]
@@ -1414,13 +1415,15 @@ export class ProjectService {
       // Self-healing: purge workspace entries whose backing directories no longer exist.
       // This handles the case where a user manually deleted workspace dirs from ~/.xum/src/.
       // Only check local/worktree runtimes — remote runtimes (SSH, Docker, devcontainer)
-      // have paths on the remote host that won't exist locally.
+      // have paths on the remote host that won't exist locally. Protected task rows are never
+      // purged (see workspaceStructuralMutationGuard): a cooperating backend may still operate
+      // in that footprint, and a missing directory proves nothing about it — they block instead.
       const localRuntimeTypes = new Set(["local", "worktree"]);
       const survivingWorkspaces: ProjectConfig["workspaces"] = [];
       for (const ws of projectConfig.workspaces) {
         const runtimeType = ws.runtimeConfig?.type;
         const isLocal = runtimeType == null || localRuntimeTypes.has(runtimeType);
-        if (!isLocal) {
+        if (!isLocal || isProtectedTaskRow(ws)) {
           survivingWorkspaces.push(ws);
           continue;
         }
@@ -1453,8 +1456,9 @@ export class ProjectService {
         await this.config.editConfig((freshConfig) => {
           const freshProject = freshConfig.projects.get(normalizedPath);
           if (freshProject) {
+            // A protected row at a pruned path (published since the scan) stays too.
             freshProject.workspaces = freshProject.workspaces.filter(
-              (ws) => !prunedWorkspacePaths.has(ws.path)
+              (ws) => !prunedWorkspacePaths.has(ws.path) || isProtectedTaskRow(ws)
             );
           }
           return freshConfig;
@@ -1545,10 +1549,26 @@ export class ProjectService {
 
       // Delete inside the serialized editConfig transform, re-collecting sub-projects from
       // FRESH config: persisting the pre-read snapshot would clobber concurrent config
-      // edits (e.g. resurrect concurrently removed workspaces in other projects).
+      // edits (e.g. resurrect concurrently removed workspaces in other projects). The blocker
+      // count is repeated there too: a row registered between the count above and this write (a
+      // task publication takes no project-level lock) would otherwise be dropped with the bucket.
       const removedSubProjectPaths: string[] = [];
+      const commit: { blockedBy?: ProjectWorkspaceCounts } = {};
       await this.config.editConfig((freshConfig) => {
         removedSubProjectPaths.length = 0;
+        commit.blockedBy = undefined;
+        const freshOwn = getProjectWorkspaceCounts(
+          freshConfig.projects.get(normalizedPath)?.workspaces ?? []
+        );
+        const freshCross = this.countCrossProjectReferences(freshConfig, normalizedPath);
+        const freshCounts = {
+          activeCount: freshOwn.activeCount + freshCross.activeCount,
+          archivedCount: freshOwn.archivedCount + freshCross.archivedCount,
+        };
+        if (freshCounts.activeCount + freshCounts.archivedCount > 0) {
+          commit.blockedBy = freshCounts;
+          return freshConfig;
+        }
         for (const [candidatePath, candidateConfig] of Array.from(freshConfig.projects.entries())) {
           if (candidateConfig.parentProjectPath === normalizedPath) {
             removedSubProjectPaths.push(candidatePath);
@@ -1558,6 +1578,9 @@ export class ProjectService {
         freshConfig.projects.delete(normalizedPath);
         return freshConfig;
       });
+      if (commit.blockedBy !== undefined) {
+        return Err({ type: "workspace_blockers" as const, ...commit.blockedBy });
+      }
 
       for (const subProjectPath of removedSubProjectPaths) {
         try {

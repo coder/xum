@@ -3477,5 +3477,68 @@ exit 1
       expect(project!.workspaces).toHaveLength(1);
       expect(project!.workspaces[0]?.path).toBe(realDir);
     });
+
+    // A protected task row (see workspaceStructuralMutationGuard) is part of a footprint a
+    // cooperating backend may still operate in: a missing directory never licenses dropping its
+    // registration, so it blocks the removal instead of being purged.
+    it("never purges a protected task row whose directory is missing: it blocks the removal", async () => {
+      const projectPath = "/fake/project";
+      const taskPath = path.join(tempDir, "missing-task-checkout");
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            id: "task-missing",
+            path: taskPath,
+            parentWorkspaceId: "root-elsewhere",
+            runtimeConfig: { type: "worktree", srcBaseDir: tempDir },
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const result = await service.remove(projectPath);
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error.type).toBe("workspace_blockers");
+      const workspaces = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces;
+      expect(workspaces?.map((workspace) => workspace.id)).toEqual(["task-missing"]);
+    });
+
+    it("rechecks emptiness inside the deleting transaction: a row published after the count survives", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, { workspaces: [] });
+      await config.editConfig(() => cfg);
+      // A task registration lands between remove()'s count and its deleting write.
+      const realEdit = config.editConfig.bind(config);
+      let published = false;
+      const edit = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
+        if (!published) {
+          published = true;
+          await realEdit((fresh) => {
+            fresh.projects.get(projectPath)?.workspaces.push({
+              id: "task-late",
+              path: path.join(tempDir, "late-task"),
+              parentWorkspaceId: "root-elsewhere",
+            });
+            return fresh;
+          });
+        }
+        return realEdit(fn, options);
+      });
+      try {
+        const result = await service.remove(projectPath);
+        expect(result.success).toBe(false);
+        if (result.success) throw new Error("Expected failure");
+        expect(result.error.type).toBe("workspace_blockers");
+      } finally {
+        edit.mockRestore();
+      }
+      expect(published).toBe(true);
+      const workspaces = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces;
+      expect(workspaces?.map((workspace) => workspace.id)).toEqual(["task-late"]);
+    });
   });
 });
