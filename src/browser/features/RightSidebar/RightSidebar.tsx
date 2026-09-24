@@ -877,9 +877,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   const [layoutDraft, setLayoutDraft] = React.useState<RightSidebarLayoutState | null>(null);
   const layoutDraftRef = React.useRef<RightSidebarLayoutState | null>(null);
 
-  // Ref to access latest layoutRaw without causing callback recreation
+  // Ref to access latest layoutRaw without causing callback recreation. Synced in a
+  // layout effect (same task as the commit) because React Compiler rejects render-time ref writes.
   const layoutRawRef = React.useRef(layoutRaw);
-  layoutRawRef.current = layoutRaw;
+  React.useLayoutEffect(() => {
+    layoutRawRef.current = layoutRaw;
+  });
 
   const isSidebarTabDragInProgressRef = React.useRef(false);
 
@@ -1295,8 +1298,10 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
             _setFocusTrigger((prev) => prev + 1);
           }
 
+          // A per-iteration copy: React Compiler can't lower `i++` on a variable a closure captures.
+          const tabIndex = i;
           setLayout((prev) =>
-            selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), i)
+            selectTabByIndex(canReviewDiffs ? prev : removeTabEverywhere(prev, "review"), tabIndex)
           );
           setCollapsed(false);
           return;
@@ -1428,10 +1433,19 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Sync terminal tabs with backend sessions on workspace mount.
   // - Adds tabs for backend sessions that don't have tabs (restore after reload)
   // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
+  // Runs only on workspace change, not layout change (layout.root as a dependency would
+  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
+  // backend list with that snapshot (not the latest layout) keeps terminals created or
+  // closed while the request is in flight from being removed or re-added.
+  const layoutForSessionSyncRef = React.useRef(layout);
+  React.useLayoutEffect(() => {
+    layoutForSessionSyncRef.current = layout;
+  });
   React.useEffect(() => {
     if (!api) return;
 
     let cancelled = false;
+    const layoutAtRequestStart = layoutForSessionSyncRef.current;
 
     void api.terminal.listSessions({ workspaceId }).then((backendSessionIds) => {
       if (cancelled) return;
@@ -1439,7 +1453,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       const backendSessionSet = new Set(backendSessionIds);
 
       // Get current terminal tabs in layout
-      const currentTabs = collectAllTabs(layout.root);
+      const currentTabs = collectAllTabs(layoutAtRequestStart.root);
       const currentTerminalTabs = currentTabs.filter(isTerminalTab);
       const currentTerminalSessionIds = new Set(
         currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
@@ -1478,7 +1492,6 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Only run on workspace change, not layout change. layout.root would cause infinite loop.
   }, [api, workspaceId, setLayout]);
 
   // Handler to update a terminal's title (from OSC sequences)
