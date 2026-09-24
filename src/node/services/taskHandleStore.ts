@@ -17,6 +17,7 @@ import {
 } from "@/common/types/workspaceTurn";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 export type { WorkspaceTurnFinalMessageRef };
 
@@ -148,7 +149,9 @@ export class TaskHandleStore {
     this.assertValidRecord(record);
     const dir = this.getOwnerHandleDir(record.ownerWorkspaceId);
     await fsPromises.mkdir(dir, { recursive: true });
-    await fsPromises.writeFile(
+    // Settlement rewrites delivery markers while waiters read the same handle.
+    // Publish complete JSON so readers never mistake a partial write for a missing task.
+    await writeFileAtomic(
       this.getHandlePath(record.ownerWorkspaceId, record.handleId),
       JSON.stringify(record, null, 2)
     );
