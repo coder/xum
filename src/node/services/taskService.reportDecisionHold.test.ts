@@ -704,20 +704,68 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     20_000
   );
 
-  test("control: a workflow-owned leaf that reports with no pending user input is still auto-deleted", async () => {
+  // Prep-stack compatibility with #4308's control: a completed host-local task row is a protected
+  // agent-task footprint, so its auto-delete is refused by design. The control now proves the
+  // workflow still completes around that refusal (report delivered, holds and capacity released,
+  // lifecycle settled), that the refused cleanup is attempted once and never retried or left
+  // pending, and that the leaf is intentionally retained.
+  test("control: a workflow-owned leaf that reports with no pending user input completes; its refused auto-delete runs once and the leaf is retained", async () => {
     const childId = "holdwfleaf0003";
     const stack = await createStack(childId, {
       workflowTask: { runId: "wfr_held_cleanup", stepId: "step" },
     });
-    const { config, taskService, workspaceService, sendOptions } = stack;
+    const { config, taskService, svc, workspaceService, sendOptions, sessionHarness } = stack;
+    const removeSpy = spyOn(workspaceService, "remove");
+    const removalsOfLeaf = () =>
+      removeSpy.mock.results.filter((_, i) => removeSpy.mock.calls[i]?.[0] === childId);
     try {
       expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
       expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
         Ok(undefined)
       );
+      const reportWaiter = taskService.waitForAgentReport(childId, { timeoutMs: 5_000 });
       stack.endStream(0, { report: "done" }, true);
-      await until(() => entryOf(config, childId) == null, "leaf auto-deleted");
+
+      // The report is delivered: the waiter resolves, the row is reported, the artifact persists.
+      expect((await reportWaiter).reportMarkdown).toBe("done");
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      expect(
+        await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
+      ).toMatchObject({ reportMarkdown: "done" });
+
+      // The cleanup runs, is refused as a protected footprint, and settles (nothing left pending).
+      await until(() => removalsOfLeaf().length > 0, "auto-delete attempted");
+      const removal = (await removalsOfLeaf()[0]?.value) as Awaited<
+        ReturnType<WorkspaceService["remove"]>
+      >;
+      expect(removal.success).toBe(false);
+      if (!removal.success) expect(removal.error).toContain("sub-agent task workspace");
+      await until(() => !sessionHarness.session.isBusy(), "turn settled");
+      await yieldMacrotasks(40);
+      // Not retried.
+      expect(removalsOfLeaf()).toHaveLength(1);
+
+      // Decision holds, capacity and the lifecycle are released.
+      expect(outstanding(svc, childId)).toHaveLength(0);
+      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      expect(taskService.countActiveAgentTasks(config.loadConfigOrDefault())).toBe(0);
+      expect(taskService.listActiveDescendantAgentTaskIds(rootId)).toEqual([]);
+      expect(workspaceService.collectRestartBlockers()).toEqual([]);
+      // The report stays awaitable (monotonic) after the refused cleanup.
+      expect(
+        (await taskService.waitForAgentReport(childId, { timeoutMs: 1_000 })).reportMarkdown
+      ).toBe("done");
+
+      // Intentional retention: the row, its checkout (the project directory for a project-dir
+      // local runtime) and its session stay.
+      const retained = entryOf(config, childId);
+      expect(retained).toMatchObject({ taskStatus: "reported" });
+      expect(await fsPromises.stat(retained!.path).then((st) => st.isDirectory())).toBe(true);
+      expect(
+        await fsPromises.stat(path.join(config.sessionsDir, childId)).then((st) => st.isDirectory())
+      ).toBe(true);
     } finally {
+      removeSpy.mockRestore();
       await stack.cleanup();
     }
   }, 20_000);
