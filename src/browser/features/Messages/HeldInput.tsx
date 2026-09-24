@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
 import { useAPI } from "@/browser/contexts/API";
@@ -47,40 +47,39 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     props.heldInput.reviewCount > 0 ? pluralize(props.heldInput.reviewCount, "review") : null,
   ].filter((count): count is string => count != null);
 
-  // A stable callback (not for memoization): the shortcut listener below subscribes with it.
-  const runAction = useCallback(
-    (action: "send" | "discard") => {
-      // One action at a time: a double-click must not send the held input twice (the backend also
-      // refuses a second concurrent send of the same held input).
-      if (actionInFlightRef.current || !api) return;
-      actionInFlightRef.current = true;
-      setActionError(null);
-      setPendingAction(action);
-      const request = { workspaceId: props.workspaceId, heldInputId: props.heldInput.id };
-      const run = async (): Promise<string | null> => {
-        if (action === "send") {
-          const result = await api.workspace.sendHeldInput(request);
-          return result.success ? null : formatSendMessageError(result.error).message;
-        }
-        const result = await api.workspace.discardHeldInput(request);
-        return result.success ? null : result.error;
-      };
-      run().then(
-        // On success the backend's held-inputs-changed event unmounts this banner.
-        (error) => {
-          actionInFlightRef.current = false;
-          setActionError(error);
-          setPendingAction(null);
-        },
-        (error: unknown) => {
-          actionInFlightRef.current = false;
-          setActionError(error instanceof Error ? error.message : String(error));
-          setPendingAction(null);
-        }
-      );
-    },
-    [api, props.workspaceId, props.heldInput.id]
-  );
+  // The shortcut listener below depends on runAction. React Compiler memoizes it (AGENTS.md: no
+  // manual useCallback), so its identity only changes with its inputs; the lint rule cannot see it.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const runAction = (action: "send" | "discard") => {
+    // One action at a time: a double-click must not send the held input twice (the backend also
+    // refuses a second concurrent send of the same held input).
+    if (actionInFlightRef.current || !api) return;
+    actionInFlightRef.current = true;
+    setActionError(null);
+    setPendingAction(action);
+    const request = { workspaceId: props.workspaceId, heldInputId: props.heldInput.id };
+    const run = async (): Promise<string | null> => {
+      if (action === "send") {
+        const result = await api.workspace.sendHeldInput(request);
+        return result.success ? null : formatSendMessageError(result.error).message;
+      }
+      const result = await api.workspace.discardHeldInput(request);
+      return result.success ? null : result.error;
+    };
+    run().then(
+      // On success the backend's held-inputs-changed event unmounts this banner.
+      (error) => {
+        actionInFlightRef.current = false;
+        setActionError(error);
+        setPendingAction(null);
+      },
+      (error: unknown) => {
+        actionInFlightRef.current = false;
+        setActionError(error instanceof Error ? error.message : String(error));
+        setPendingAction(null);
+      }
+    );
+  };
 
   // The composer's shortcuts (see ChatInput) arrive as an event so they share this banner's
   // in-flight guard and error display with the buttons.
