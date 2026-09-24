@@ -4,6 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
+import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   TaskCheckoutPreparationSchema,
@@ -13,7 +14,9 @@ import type { Workspace } from "@/common/types/project";
 import type { ProjectRef } from "@/common/types/workspace";
 import { hasSrcBaseDir, isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
+import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { getProjectName } from "@/node/utils/runtime/helpers";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { TASK_CHECKOUT_VALIDATION_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -69,7 +72,9 @@ export type TaskCheckoutMismatchDimension =
   /** A secondary checkout and its admin dir are both gone (the primary reports `missing`). */
   | "missing"
   /** The proof's project list (paths, names, order) is not exactly the row's `projects`. */
-  | "projects";
+  | "projects"
+  /** Two identities of one proof are the same directory (each project needs its own checkout). */
+  | "duplicate";
 
 export type TaskCheckoutPreparationState =
   | { kind: "excluded-root" }
@@ -203,6 +208,40 @@ function isHostLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
  */
 export function isProjectDirLocalRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   return runtimeConfig?.type === "local" && !hasSrcBaseDir(runtimeConfig);
+}
+
+/**
+ * The srcBaseDir a worktree-backed runtime derives its checkouts under, or undefined for a
+ * project-dir local runtime. A devcontainer runtimeConfig carries none: runtimeFactory roots
+ * its WorktreeManager at `new Config().srcDir`, i.e. `<getXumHome()>/src` — exactly what the
+ * default worktree config's `~/.xum/src` expands to (XUM_ROOT and dev suffixes included).
+ */
+export function worktreeSrcBaseDir(runtime: RuntimeConfig): string | undefined {
+  if (hasSrcBaseDir(runtime)) return runtime.srcBaseDir;
+  if (runtime.type !== "devcontainer") return undefined;
+  assert(hasSrcBaseDir(DEFAULT_RUNTIME_CONFIG), "the default runtime is a worktree runtime");
+  return DEFAULT_RUNTIME_CONFIG.srcBaseDir;
+}
+
+/**
+ * Name-derived checkout path, mirroring WorktreeManager.getWorkspacePath for worktree-style
+ * runtimes (`<srcBaseDir>/<projectName>/<name>`, with the srcBaseDir tilde expanded exactly as the
+ * WorktreeManager constructor does) and the project directory for project-dir local runtimes. A
+ * missing runtimeConfig is the default worktree runtime (Config.getAllMetadata substitutes it).
+ * Multi-project rows persist only the primary path; execution derives EVERY project's checkout
+ * this way, so the validator and the structural guard share this one derivation.
+ */
+export function deriveHostLocalCheckoutPath(
+  runtimeConfig: RuntimeConfig | undefined,
+  projectPath: string,
+  workspaceName: string
+): string {
+  assert(projectPath.length > 0, "deriveHostLocalCheckoutPath: projectPath is required");
+  const srcBaseDir = worktreeSrcBaseDir(runtimeConfig ?? DEFAULT_RUNTIME_CONFIG);
+  if (srcBaseDir !== undefined) {
+    return path.join(expandTilde(srcBaseDir), getProjectName(projectPath), workspaceName);
+  }
+  return projectPath;
 }
 
 /** Worktree semantics — a fork gets a directory of its own: `worktree`, or legacy `local` + `srcBaseDir`. */
@@ -719,6 +758,8 @@ function rowSignatureInputs(entry: ConfigEntry): Record<string, unknown> {
     executionDirectory: executionDirectory(entry),
     kind: classifyTaskCheckoutKind(row),
     parentWorkspaceId: row.parentWorkspaceId ?? null,
+    // Multi-project execution derives every checkout and the container from the name.
+    name: row.name ?? null,
     path: row.path,
     runtimeConfigJson: canonicalRuntimeConfigJson(row.runtimeConfig),
     taskIsolation: row.taskIsolation ?? null,
@@ -772,7 +813,56 @@ function deriveDedicatedRow(
   ) {
     return { kind: "mismatch", dimension: "projects" };
   }
+  if (proof.v === 2) {
+    const refusal = multiProjectIdentityRefusal(row, proof);
+    if (refusal !== null) return refusal;
+  }
   return { kind: "proof", proof };
+}
+
+/**
+ * Multi-project execution builds every project's runtime from the runtime config, the project
+ * path and the row's NAME (no persisted path is consulted; the primary's included), so each v2
+ * identity must be exactly the checkout derived for its project. Identities must also be
+ * distinct directories: every checkout carries the same generation nonce, so an entry copying
+ * another's identity would pass the physical checks while its project's checkout goes unproven.
+ */
+function multiProjectIdentityRefusal(
+  row: Workspace,
+  proof: Extract<TaskCheckoutPreparation, { v: 2 }>
+): Exclude<TaskCheckoutPreparationState, { kind: "ready" }> | null {
+  // The producer forks multi-project checkouts only for worktree semantics (it asserts so).
+  if (!isWorktreeSemanticsRuntime(row.runtimeConfig)) {
+    return {
+      kind: "runtime-mismatch",
+      detail: "a multi-project proof requires a worktree runtime",
+    };
+  }
+  const name = row.name ?? "";
+  if (name.length === 0) return { kind: "mismatch", dimension: "path" };
+  const identities = [proof, ...proof.secondaries];
+  for (const [index, identity] of identities.entries()) {
+    const derived = deriveHostLocalCheckoutPath(
+      row.runtimeConfig,
+      proof.projects[index].projectPath,
+      name
+    );
+    if (identity.path !== derived) {
+      return index === 0
+        ? { kind: "mismatch", dimension: "path" }
+        : { kind: "mismatch", dimension: "path", checkout: derived };
+    }
+  }
+  const distinct = (key: (identity: (typeof identities)[number]) => string) =>
+    new Set(identities.map(key)).size === identities.length;
+  if (
+    !distinct((identity) => identity.realpath) ||
+    !distinct((identity) => `${identity.root.dev}:${identity.root.ino}`) ||
+    !distinct((identity) => `${identity.gitdir.dev}:${identity.gitdir.ino}`)
+  ) {
+    return { kind: "mismatch", dimension: "duplicate" };
+  }
+  return null;
 }
 
 /**

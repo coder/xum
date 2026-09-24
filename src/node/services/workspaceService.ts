@@ -18,7 +18,6 @@ import { EventEmitter } from "events";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
   classifyStructuralMutationTarget,
-  deriveHostLocalCheckoutPath,
   findProtectedFootprintOverlap,
   structuralRefusalForAmbiguous,
   structuralRefusalForOverlap,
@@ -262,6 +261,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import {
   bindTaskCheckoutIdentity,
   buildTaskCheckoutPreparation,
+  deriveHostLocalCheckoutPath,
   claimTaskCheckoutIdentity,
   isWorktreeSemanticsRuntime,
   revalidateTaskCheckoutIdentity,

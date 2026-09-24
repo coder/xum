@@ -736,6 +736,72 @@ describe("taskCheckoutPreparation", () => {
     expect(await state(config, "mp07")).toBe("ready");
   }, 20_000);
 
+  test("every v2 identity must be its project's name-derived checkout, and no two may be one directory: a copied-identity secondary, an aliased project and a renamed row refuse; the rename invalidates the authority", async () => {
+    const { proof, projects, row } = await prepareMultiProject("mp08");
+    if (proof.v !== 2) throw new Error("unreachable");
+    const root = rootRow("root1", projectPath);
+    await publish([root, row]);
+    const ready = await validateTaskCheckoutPreparation(config, "mp08");
+    if (ready.kind !== "ready") throw new Error(`expected ready, got ${ready.kind}`);
+    const primaryIdentity = {
+      path: proof.path,
+      realpath: proof.realpath,
+      root: proof.root,
+      gitdir: proof.gitdir,
+    };
+    const [secondary] = proof.secondaries;
+    // Every checkout shares the generation nonce, so a secondary entry copying the primary's
+    // identity passes the physical checks; the project's own derived checkout goes unproven.
+    await publish([
+      root,
+      {
+        ...row,
+        taskCheckoutPreparation: {
+          ...proof,
+          secondaries: [{ projectPath: secondary.projectPath, ...primaryIdentity }],
+        },
+      },
+    ]);
+    expect(await validateTaskCheckoutPreparation(config, "mp08")).toEqual({
+      kind: "mismatch",
+      dimension: "path",
+      checkout: secondary.path,
+    });
+    // Two projects whose checkouts derive to one directory (same basename) cannot share an
+    // identity either: each project needs a checkout of its own.
+    const aliasProject = {
+      projectPath: path.join(rootDir, "other", "repo"),
+      projectName: "repo-2",
+    };
+    await publish([
+      root,
+      {
+        ...row,
+        projects: [projects[0], aliasProject],
+        taskCheckoutPreparation: {
+          ...proof,
+          projects: [projects[0], aliasProject],
+          secondaries: [{ projectPath: aliasProject.projectPath, ...primaryIdentity }],
+        },
+      },
+    ]);
+    expect(await validateTaskCheckoutPreparation(config, "mp08")).toEqual({
+      kind: "mismatch",
+      dimension: "duplicate",
+    });
+    // Execution derives every checkout (and the container) from the row's name.
+    await publish([root, { ...row, name: "agent_explore_renamed" }]);
+    expect(await validateTaskCheckoutPreparation(config, "mp08")).toMatchObject({
+      kind: "mismatch",
+      dimension: "path",
+    });
+    expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toMatchObject({
+      current: false,
+    });
+    await publish([root, row]);
+    expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toEqual({ current: true });
+  }, 20_000);
+
   test("a v1 proof cannot prove a multi-project task's secondary checkouts (unsupported); single-project v1 stays ready; a v2 proof on a single-project row and unknown or malformed versions refuse", async () => {
     const { proof, row } = await prepareDedicated("mp03");
     expect(proof.v).toBe(1);

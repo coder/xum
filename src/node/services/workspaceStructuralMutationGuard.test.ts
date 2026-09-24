@@ -4,9 +4,9 @@ import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import * as path from "path";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
+import { deriveHostLocalCheckoutPath } from "./taskCheckoutPreparation";
 import {
   classifyStructuralMutationTarget,
-  deriveHostLocalCheckoutPath,
   findProtectedFootprintOverlap,
   isProtectedTaskRow,
 } from "./workspaceStructuralMutationGuard";

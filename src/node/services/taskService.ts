@@ -100,6 +100,7 @@ import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/r
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
+  deriveHostLocalCheckoutPath,
   isProjectDirLocalRuntime,
   isWorktreeSemanticsRuntime,
   materializedCheckoutPublicationRefusal,
@@ -109,7 +110,6 @@ import {
   type TaskCheckoutSecondaryTarget,
 } from "@/node/services/taskCheckoutPreparation";
 import {
-  deriveHostLocalCheckoutPath,
   isLazilyForkedTaskRow,
   isProtectedTaskRow,
 } from "@/node/services/workspaceStructuralMutationGuard";

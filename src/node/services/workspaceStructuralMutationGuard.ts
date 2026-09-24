@@ -7,13 +7,15 @@ import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type { ProjectsConfig, Workspace } from "@/common/types/project";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
-import { expandTilde } from "@/node/runtime/tildeExpansion";
-import { readSmallRegularFile } from "@/node/services/taskCheckoutPreparation";
+import {
+  deriveHostLocalCheckoutPath,
+  readSmallRegularFile,
+  worktreeSrcBaseDir,
+} from "@/node/services/taskCheckoutPreparation";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { STRUCTURAL_FOOTPRINT_SCAN_TIMEOUT_MS } from "@/constants/terminationTimeouts";
-import { getProjectName } from "@/node/utils/runtime/helpers";
 
 /**
  * Structural-mutation refusal for protected agent-task footprints.
@@ -183,40 +185,6 @@ function pendingForkSourcePaths(snapshot: ProjectsConfig, row: Workspace): strin
  */
 function effectiveRuntimeConfig(runtimeConfig: RuntimeConfig | undefined): RuntimeConfig {
   return runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-}
-
-/**
- * The srcBaseDir a worktree-backed runtime derives its checkouts under, or undefined for a
- * project-dir local runtime. A devcontainer runtimeConfig carries none: runtimeFactory roots
- * its WorktreeManager at `new Config().srcDir`, i.e. `<getXumHome()>/src` — exactly what the
- * default worktree config's `~/.xum/src` expands to (XUM_ROOT and dev suffixes included).
- */
-function worktreeSrcBaseDir(runtime: RuntimeConfig): string | undefined {
-  if (hasSrcBaseDir(runtime)) return runtime.srcBaseDir;
-  if (runtime.type !== "devcontainer") return undefined;
-  assert(hasSrcBaseDir(DEFAULT_RUNTIME_CONFIG), "the default runtime is a worktree runtime");
-  return DEFAULT_RUNTIME_CONFIG.srcBaseDir;
-}
-
-/**
- * Name-derived checkout path, mirroring WorktreeManager.getWorkspacePath for
- * worktree-style runtimes (`<srcBaseDir>/<projectName>/<name>`, with the
- * srcBaseDir tilde expanded exactly as the WorktreeManager constructor does)
- * and the project directory for project-dir local runtimes. Multi-project rows
- * persist only the primary path; the other projects' checkouts are derived
- * this way.
- */
-export function deriveHostLocalCheckoutPath(
-  runtimeConfig: RuntimeConfig | undefined,
-  projectPath: string,
-  workspaceName: string
-): string {
-  assert(projectPath.length > 0, "deriveHostLocalCheckoutPath: projectPath is required");
-  const srcBaseDir = worktreeSrcBaseDir(effectiveRuntimeConfig(runtimeConfig));
-  if (srcBaseDir !== undefined) {
-    return path.join(expandTilde(srcBaseDir), getProjectName(projectPath), workspaceName);
-  }
-  return projectPath;
 }
 
 /**
