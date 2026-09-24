@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import { runWithFinally } from "@/browser/utils/compilerSafeControlFlow";
 import { cn } from "@/common/lib/utils";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import XumLogoDark from "@/browser/assets/logos/xum-logo-dark.svg?react";
@@ -1404,21 +1405,23 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // Give immediate UI feedback (spinner / disabled row) while deletion is in-flight.
       setRemovingWorkspaceIds((prev) => new Set(prev).add(workspaceId));
 
-      try {
-        const result = await removeWorkspace(workspaceId, { force: true });
-        if (!result.success) {
-          workspaceRemoveError.showError(
-            workspaceId,
-            result.error ?? "Failed to cancel workspace creation"
-          );
-        }
-      } finally {
-        setRemovingWorkspaceIds((prev) => {
-          const next = new Set(prev);
-          next.delete(workspaceId);
-          return next;
-        });
-      }
+      await runWithFinally(
+        async () => {
+          const result = await removeWorkspace(workspaceId, { force: true });
+          if (!result.success) {
+            workspaceRemoveError.showError(
+              workspaceId,
+              result.error ?? "Failed to cancel workspace creation"
+            );
+          }
+        },
+        () =>
+          setRemovingWorkspaceIds((prev) => {
+            const next = new Set(prev);
+            next.delete(workspaceId);
+            return next;
+          })
+      );
     },
     [removeWorkspace, workspaceRemoveError]
   );
@@ -1741,13 +1744,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     return keys.join("\u0001"); // use non-printable separator
   }, [userProjects]);
 
-  // Normalize order when the set of projects changes (not on every parent render)
+  // Normalize order when the set of projects changes (not on every parent render).
+  // The ref records which project-key signature was last normalized, so order edits
+  // and Map identity churn alone don't re-run normalization.
+  const normalizedSignatureRef = useRef<string | null>(null);
   useEffect(() => {
     // Skip normalization if projects haven't loaded yet (empty Map on initial render)
     // This prevents clearing projectOrder before projects load from backend
     if (userProjects.size === 0) {
+      // The original keyed effect re-normalized after A -> empty -> A; keep that.
+      normalizedSignatureRef.current = null;
       return;
     }
+    if (normalizedSignatureRef.current === projectPathsSignature) {
+      return;
+    }
+    normalizedSignatureRef.current = projectPathsSignature;
 
     const normalized = normalizeOrder(projectOrder, userProjects);
     if (
@@ -1756,21 +1768,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     ) {
       setProjectOrder(normalized);
     }
-    // Only re-run when project keys change (projectPathsSignature captures projects Map keys)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectPathsSignature]);
+  }, [projectPathsSignature, projectOrder, userProjects, setProjectOrder]);
 
-  // Memoize sorted project PATHS (not entries) to avoid capturing stale config objects.
-  // Sorting depends only on keys + order; we read configs from the live Map during render.
-  const sortedProjectPaths = React.useMemo(
-    () =>
-      sortProjectsByOrder(userProjects, projectOrder)
-        .filter(([, config]) => !config.parentProjectPath)
-        .map(([p]) => p),
-    // projectPathsSignature captures projects Map keys
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [projectPathsSignature, projectOrder]
-  );
+  // Sorted project PATHS (not entries) to avoid capturing stale config objects;
+  // we read configs from the live Map during render.
+  const sortedProjectPaths = sortProjectsByOrder(userProjects, projectOrder)
+    .filter(([, config]) => !config.parentProjectPath)
+    .map(([p]) => p);
 
   const isWorkspaceLiveActive = (workspaceId: string): boolean => {
     const signal = getWorkspaceAttentionSignal(workspaceStore, workspaceId);
