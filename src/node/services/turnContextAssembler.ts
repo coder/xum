@@ -36,6 +36,7 @@ import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSu
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   readAgentDefinition,
+  type AgentDefinitionRequestCache,
   resolveAgentBody,
   resolveAgentFrontmatter,
   discoverAgentDefinitions,
@@ -216,6 +217,8 @@ export interface BuildPlanInstructionsOptions {
    * history (e.g., old Start Here summaries) suppressing required plan hints.
    */
   requestPayloadMessages: MuxMessage[];
+  /** Per-request definition reuse shared with agent resolution. */
+  agentDefinitionCache?: AgentDefinitionRequestCache;
 }
 
 /** Result of plan instructions assembly. */
@@ -332,7 +335,8 @@ export async function buildPlanInstructions(
             const lastDefinition = await readAgentDefinition(
               agentDiscoveryRuntime,
               agentDiscoveryPath,
-              lastAgentId
+              lastAgentId,
+              { cache: opts.agentDefinitionCache }
             );
             const lastChain = await resolveAgentInheritanceChain({
               runtime: agentDiscoveryRuntime,
@@ -340,6 +344,7 @@ export async function buildPlanInstructions(
               agentId: lastAgentId,
               agentDefinition: lastDefinition,
               workspaceId,
+              cache: opts.agentDefinitionCache,
             });
             lastAgentIsPlanLike = isPlanLikeInResolvedChain(lastChain);
           } catch (error) {
@@ -422,6 +427,8 @@ export interface BuildStreamSystemContextOptions {
    * and per-model rebuilds reuse it so one turn reads AGENTS.md files once.
    */
   instructionSources?: InstructionSources;
+  /** Per-request definition reuse shared with agent resolution. */
+  agentDefinitionCache?: AgentDefinitionRequestCache;
 }
 
 /** Result of system context assembly. */
@@ -755,6 +762,7 @@ export async function buildStreamSystemContext(
   const agentResolveOptions = {
     includeAgentPlugins: opts.agentPluginsEnabled,
     skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
+    cache: opts.agentDefinitionCache,
   };
   const skillCtx = resolveSkillStorageContext({
     runtime,
@@ -812,6 +820,7 @@ export async function buildStreamSystemContext(
           cfg,
           loadDesktopCapability,
           includeAgentPlugins: opts.agentPluginsEnabled,
+          cache: opts.agentDefinitionCache,
         }),
     // Discover available skills for tool description context
     discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
@@ -945,6 +954,8 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /** agent-plugins experiment: also discover agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
+  /** Per-request definition reuse shared with agent resolution. */
+  cache?: AgentDefinitionRequestCache;
 }): Promise<Awaited<ReturnType<typeof discoverAgentDefinitions>>> {
   assert(args, "discoverAvailableSubagentsForToolContext: args is required");
   assert(args.runtime, "discoverAvailableSubagentsForToolContext: runtime is required");
@@ -985,6 +996,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
             roots: args.roots,
             includeAgentPlugins: args.includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
+            cache: args.cache,
           }
         );
 

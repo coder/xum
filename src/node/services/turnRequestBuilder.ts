@@ -58,6 +58,7 @@ import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
+import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -1475,6 +1476,9 @@ export class TurnRequestBuilder {
           })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
+    // One cache per request: resolution, plan handoff, prompt body, and
+    // sub-agent discovery share definition reads; the next turn starts fresh.
+    const agentDefinitionCache = new AgentDefinitionRequestCache();
     const resolveAgentForStreamStartedAt = Date.now();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -1496,6 +1500,7 @@ export class TurnRequestBuilder {
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
+      agentDefinitionCache,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
     if (!agentResult.success) {
@@ -1700,6 +1705,7 @@ export class TurnRequestBuilder {
         taskDepth,
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
+        agentDefinitionCache,
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
@@ -1801,6 +1807,7 @@ export class TurnRequestBuilder {
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         agentPluginsEnabled: agentPluginsExperimentEnabled,
         instructionSources: turnInstructionSources.current,
+        agentDefinitionCache,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.

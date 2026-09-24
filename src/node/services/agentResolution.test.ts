@@ -8,7 +8,14 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import {
+  AgentDefinitionRequestCache,
+  readAgentDefinition,
+  resolveAgentBody,
+} from "./agentDefinitions/agentDefinitionsService";
+import { resolveAgentInheritanceChain } from "./agentDefinitions/resolveAgentInheritanceChain";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
+import { buildStreamSystemContext } from "./turnContextAssembler";
 
 const PARENT_WORKSPACE_ID = "parent-workspace";
 const CHILD_WORKSPACE_ID = "child-workspace";
@@ -806,5 +813,214 @@ describe("resolveAgentForStream advisor defaults", () => {
 
     expect(policy).toContainEqual({ regex_match: "advisor", action: "disable" });
     expect(policy).not.toContainEqual({ regex_match: "advisor", action: "enable" });
+  });
+});
+
+describe("resolveAgentForStream per-request agent definition cache", () => {
+  /** Counts agent definition file reads (`<root>/agents/<id>.md`) by path. */
+  class CountingRuntime extends LocalRuntime {
+    readonly definitionReads = new Map<string, number>();
+
+    override readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+      if (path.basename(path.dirname(filePath)) === "agents" && filePath.endsWith(".md")) {
+        this.definitionReads.set(filePath, (this.definitionReads.get(filePath) ?? 0) + 1);
+      }
+      return super.readFile(filePath, abortSignal);
+    }
+  }
+
+  async function writeAgent(root: string, id: string, lines: string[]): Promise<void> {
+    await fs.mkdir(root, { recursive: true });
+    await fs.writeFile(path.join(root, `${id}.md`), lines.join("\n"));
+  }
+
+  /**
+   * One stream turn as TurnRequestBuilder runs it: agent resolution, then
+   * system-context assembly (body, frontmatter, sub-agent discovery), both
+   * sharing the request's cache when one is given.
+   */
+  async function runTurn(params: {
+    projectPath: string;
+    cfg: ProjectsConfig;
+    cache: AgentDefinitionRequestCache | undefined;
+  }) {
+    const runtime = new CountingRuntime(params.projectPath);
+    const metadata: WorkspaceMetadata = {
+      id: "cache-ws",
+      name: "cache-ws",
+      projectName: "project",
+      projectPath: params.projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const resolved = await resolveAgentForStream({
+      workspaceId: metadata.id,
+      metadata,
+      runtime,
+      workspacePath: params.projectPath,
+      requestedAgentId: "reviewer",
+      disableWorkspaceAgents: false,
+      callerToolPolicy: undefined,
+      cfg: params.cfg,
+      emitError: () => undefined,
+      agentDefinitionCache: params.cache,
+    });
+    if (!resolved.success) throw new Error("Expected agent resolution to succeed");
+    const agent = resolved.data;
+    const context = await buildStreamSystemContext({
+      runtime,
+      metadata,
+      workspacePath: params.projectPath,
+      workspaceId: metadata.id,
+      agentDefinition: agent.agentDefinition,
+      effectiveMode: agent.effectiveMode,
+      agentDiscoveryRuntime: agent.agentDiscoveryRuntime,
+      agentDiscoveryPath: agent.agentDiscoveryPath,
+      isSubagentWorkspace: false,
+      effectiveAdditionalInstructions: undefined,
+      modelString: "openai:gpt-5.2",
+      cfg: params.cfg,
+      providersConfig: null,
+      mcpServers: {},
+      agentDefinitionCache: params.cache,
+    });
+    const totalReads = [...runtime.definitionReads.values()].reduce((sum, n) => sum + n, 0);
+    return { agent, context, metadata, reads: runtime.definitionReads, totalReads };
+  }
+
+  test("cuts per-turn definition reads, keeps precedence and inheritance, and re-reads next turn", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-request-cache");
+    const projectPath = path.join(tempDir.path, "project");
+    const xumHome = path.join(tempDir.path, "xum-home");
+    const projectAgents = path.join(projectPath, ".xum", "agents");
+    const globalAgents = path.join(xumHome, "agents");
+    // project reviewer → global exec → built-in exec; the global reviewer is shadowed.
+    await writeAgent(projectAgents, "reviewer", [
+      "---",
+      "name: Reviewer",
+      "base: exec",
+      "subagent:",
+      "  runnable: true",
+      "tools:",
+      "  remove:",
+      "    - file_edit_.*",
+      "---",
+      "Project reviewer v1.",
+    ]);
+    await writeAgent(globalAgents, "reviewer", [
+      "---",
+      "name: Shadowed",
+      "---",
+      "Global reviewer.",
+    ]);
+    await writeAgent(globalAgents, "exec", [
+      "---",
+      "name: Exec",
+      "base: exec",
+      "---",
+      "Global exec.",
+    ]);
+    const cfg: ProjectsConfig = {
+      projects: new Map([[projectPath, { trusted: true, workspaces: [] }]]),
+    };
+
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = xumHome;
+    try {
+      const uncached = await runTurn({ projectPath, cfg, cache: undefined });
+      const cached = await runTurn({ projectPath, cfg, cache: new AgentDefinitionRequestCache() });
+
+      // Same resolution with and without the cache.
+      for (const turn of [uncached, cached]) {
+        expect(turn.agent.agentDefinition.scope).toBe("project");
+        expect(turn.agent.agentInheritanceChain.map((hop) => hop.scope)).toEqual([
+          "project",
+          "global",
+          "built-in",
+        ]);
+        const body = turn.context.agentSystemPromptSections[0];
+        expect(body).toContain("Project reviewer v1.");
+        expect(body).not.toContain("Global reviewer.");
+        expect(body.indexOf("Global exec.")).toBeLessThan(body.indexOf("Project reviewer v1."));
+        expect(turn.context.agentDefinitions?.find((a) => a.id === "reviewer")?.scope).toBe(
+          "project"
+        );
+      }
+      expect(cached.agent.effectiveToolPolicy).toEqual(uncached.agent.effectiveToolPolicy);
+      expect(cached.context.systemMessage).toBe(uncached.context.systemMessage);
+
+      // Without the cache one turn re-reads the selected definition and its
+      // bases for every lookup; with it the per-turn read count must drop.
+      // (Sub-agent discovery still lists each file once to build descriptors.)
+      const reviewerPath = path.join(projectAgents, "reviewer.md");
+      const globalExecPath = path.join(globalAgents, "exec.md");
+      expect(cached.totalReads).toBeLessThan(uncached.totalReads);
+      expect(cached.reads.get(reviewerPath) ?? 0).toBeLessThan(
+        uncached.reads.get(reviewerPath) ?? 0
+      );
+      expect(cached.reads.get(globalExecPath) ?? 0).toBeLessThan(
+        uncached.reads.get(globalExecPath) ?? 0
+      );
+      // Repeating lookups later in the same request is served from the cache.
+      const cache = new AgentDefinitionRequestCache();
+      const again = await runTurn({ projectPath, cfg, cache });
+      const repeatRuntime = again.agent.agentDiscoveryRuntime as CountingRuntime;
+      const readsAfterTurn = new Map(repeatRuntime.definitionReads);
+      const repeatedBody = await resolveAgentBody(repeatRuntime, projectPath, "reviewer", {
+        cache,
+      });
+      await resolveAgentInheritanceChain({
+        runtime: repeatRuntime,
+        workspacePath: projectPath,
+        agentId: "reviewer",
+        agentDefinition: again.agent.agentDefinition,
+        workspaceId: again.metadata.id,
+        cache,
+      });
+      expect(repeatedBody).toBe(again.context.agentSystemPromptSections[0]);
+      expect(repeatRuntime.definitionReads).toEqual(readsAfterTurn);
+
+      // A new request gets a new cache: edits between turns are picked up.
+      await writeAgent(projectAgents, "reviewer", [
+        "---",
+        "name: Reviewer",
+        "base: exec",
+        "---",
+        "Project reviewer v2.",
+      ]);
+      const nextTurn = await runTurn({
+        projectPath,
+        cfg,
+        cache: new AgentDefinitionRequestCache(),
+      });
+      expect(nextTurn.context.agentSystemPromptSections[0]).toContain("Project reviewer v2.");
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  });
+
+  test("keys cached lookups by skipped scopes so base resolution still skips the override", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-request-cache-scopes");
+    const projectPath = path.join(tempDir.path, "project");
+    await writeAgent(path.join(projectPath, ".xum", "agents"), "exec", [
+      "---",
+      "name: Exec override",
+      "base: exec",
+      "---",
+      "Project exec.",
+    ]);
+    const runtime = new LocalRuntime(projectPath);
+    const cache = new AgentDefinitionRequestCache();
+
+    const override = await readAgentDefinition(runtime, projectPath, "exec", { cache });
+    const base = await readAgentDefinition(runtime, projectPath, "exec", {
+      cache,
+      skipScopesAbove: "project",
+    });
+
+    expect(override.scope).toBe("project");
+    expect(base.scope).not.toBe("project");
+    // Repeated lookups in the same request return the memoized winner.
+    expect(await readAgentDefinition(runtime, projectPath, "exec", { cache })).toBe(override);
   });
 });
