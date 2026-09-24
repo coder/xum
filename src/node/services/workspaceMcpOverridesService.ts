@@ -2077,6 +2077,16 @@ export class WorkspaceMcpOverridesService {
               if (selected.kind !== "absent") {
                 return false;
               }
+              // Never (re)create a checkout (the rule writeOverridesLocked enforces for saves): an
+              // off-host removal releases this lock once its remote checkout is deleted, before
+              // the row is deregistered, so an absent document may mean an absent checkout.
+              const checkoutExists = await target.runtime.stat(target.workspacePath).then(
+                (stat) => stat.isDirectory,
+                () => false
+              );
+              if (!checkoutExists) {
+                return false;
+              }
               return this.migrateLegacyOverrides(target, snapshot);
             },
             { timeoutMs: MIGRATION_LOCK_TIMEOUT_MS }

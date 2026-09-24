@@ -52,6 +52,7 @@ describe("WorkspaceService structural mutation guard", () => {
   let worktreeRuntime: RuntimeConfig;
   let physical: { deleted: string[]; renamed: Array<{ from: string; to: string }> };
   let deleteBarrier: (() => Promise<void>) | undefined;
+  let renameBarrier: (() => Promise<void>) | undefined;
   let createRuntimeSpy: Mock<typeof runtimeFactory.createRuntime>;
   let removeManagedGitWorktreeSpy: Mock<
     typeof removeManagedGitWorktreeModule.removeManagedGitWorktree
@@ -123,6 +124,7 @@ describe("WorkspaceService structural mutation guard", () => {
     await fsPromises.mkdir(projectPath, { recursive: true });
     physical = { deleted: [], renamed: [] };
     deleteBarrier = undefined;
+    renameBarrier = undefined;
 
     // Faked runtime: derives its operation target from the NAME like the real
     // WorktreeManager.deleteWorkspace/renameWorkspace do (the persisted row path is not what
@@ -156,6 +158,7 @@ describe("WorkspaceService structural mutation guard", () => {
             return { success: true as const, deletedPath: target };
           },
           renameWorkspace: async (targetProjectPath: string, oldName: string, newName: string) => {
+            await renameBarrier?.();
             const from = derive(targetProjectPath, oldName);
             const to = derive(targetProjectPath, newName);
             await fsPromises.rename(from, to);
@@ -922,6 +925,103 @@ describe("WorkspaceService structural mutation guard", () => {
         expect(persistedRow(ROOT_ID)).toMatchObject({ path: parentPath });
       }
     );
+  });
+
+  // lXKHj: an off-host root's effects act BY ID after the guard (session removal, deregistration,
+  // the config rewrite of a rename), so a publication landing a row with the same id meanwhile
+  // must not be taken down with it.
+  describe("off-host roots re-derive their target by id around their effects", () => {
+    const remoteRuntime = (): RuntimeConfig => ({
+      type: "ssh",
+      host: "box.invalid",
+      srcBaseDir,
+    });
+    const rowsWithId = (id: string) =>
+      [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
+        project.workspaces.filter((candidate) => candidate.id === id)
+      );
+    const publishSameIdTask = async (): Promise<Workspace> => {
+      const task = taskRow("agent_dup", ROOT_ID, { parentWorkspaceId: "root-ws-other" });
+      await fsPromises.mkdir(task.path, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(task);
+        return cfg;
+      });
+      return task;
+    };
+
+    test("a same-id row published after the guard refuses the removal before any effect", async () => {
+      const remote = row("remote", ROOT_ID, { runtimeConfig: remoteRuntime() });
+      await seed([row("other", "root-ws-other"), remote]);
+      const internals = service as unknown as {
+        guardStructuralMutation: (...args: unknown[]) => Promise<unknown>;
+      };
+      const realGuard = internals.guardStructuralMutation.bind(service);
+      let task: Workspace | undefined;
+      const guard = spyOn(internals, "guardStructuralMutation").mockImplementation(
+        async (...args: unknown[]) => {
+          const verdict = await realGuard(...args);
+          task = await publishSameIdTask();
+          return verdict;
+        }
+      );
+      try {
+        expectRefused(await service.remove(ROOT_ID, true), "share this id");
+      } finally {
+        guard.mockRestore();
+      }
+      expect(physical.deleted).toEqual([]);
+      expect(rowsWithId(ROOT_ID).map((entry) => entry.path)).toEqual([remote.path, task!.path]);
+      expect(await exists(path.join(remote.path, "WORK.md"))).toBe(true);
+      expect(await exists(path.join(sessionDir(ROOT_ID), "chat.jsonl"))).toBe(true);
+    });
+
+    test("the remote deletion runs without the registration lock; a same-id row published meanwhile refuses the id-keyed tail", async () => {
+      const remote = row("remote", ROOT_ID, { runtimeConfig: remoteRuntime() });
+      await seed([row("other", "root-ws-other"), remote]);
+      let task: Workspace | undefined;
+      let lockFreeDuringDeletion = false;
+      deleteBarrier = async () => {
+        // A producer takes the lock while the (slow) remote deletion runs and publishes.
+        const release = await acquireRegistrationLock(1_000);
+        lockFreeDuringDeletion = true;
+        task = await publishSameIdTask();
+        await release();
+      };
+
+      const refused = await service.remove(ROOT_ID, true);
+      expectRefused(refused, "share this id");
+      expectRefused(refused, "remote checkout was already deleted");
+      expect(lockFreeDuringDeletion).toBe(true);
+      // The remote checkout is gone, but nothing keyed by the id was touched.
+      expect(physical.deleted).toEqual([remote.path]);
+      expect(rowsWithId(ROOT_ID).map((entry) => entry.path)).toEqual([remote.path, task!.path]);
+      expect(await exists(path.join(sessionDir(ROOT_ID), "chat.jsonl"))).toBe(true);
+      // Released on refusal.
+      const release = await acquireRegistrationLock(1_000);
+      await release();
+    });
+
+    test("an off-host root rename holds the registration lock across its remote move and config rewrite", async () => {
+      const remote = row("remote", ROOT_ID, { runtimeConfig: remoteRuntime() });
+      await seed([row("other", "root-ws-other"), remote]);
+      let duringMove: string | undefined;
+      renameBarrier = async () => {
+        try {
+          const release = await acquireRegistrationLock(300);
+          await release();
+          duringMove = "acquired";
+        } catch (error) {
+          duringMove = error instanceof Error ? error.message : String(error);
+        }
+      };
+
+      expect(await service.rename(ROOT_ID, "remote-renamed")).toMatchObject({ success: true });
+      expect(duringMove).toBe("registration lock busy");
+      expect(rowsWithId(ROOT_ID)).toHaveLength(1);
+      const release = await acquireRegistrationLock(1_000);
+      await release();
+    });
   });
 
   describe("root mutation and task publication are fenced through the registration lock", () => {

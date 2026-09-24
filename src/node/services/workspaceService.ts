@@ -3025,7 +3025,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    *      several rows share (malformed config): the effects are keyed by id, not by row;
    *   3. an UNREGISTERED target refuses too: absent metadata or a cached record cannot
    *      prove it lies outside a protected footprint (the former phantom session-only
-   *      cleanup of remove is gone with it); an off-host root proceeds unlocked;
+   *      cleanup of remove is gone with it); an off-host root proceeds unlocked (rename
+   *      holds the lock, removal pins the row instead: see `options.offHost`);
    *   4. a host-local ordinary root takes the registration lock (BEFORE any checkout /
    *      overrides lock — the lock order registerSanitizedTaskCheckout documents),
    *      re-reads the config under it and scans every protected task row for aliases of
@@ -3041,7 +3042,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async guardStructuralMutation(
     mutation: StructuralMutation,
     workspaceId: string,
-    options?: { extraTargetPaths?: (row: Workspace) => string[] }
+    options?: {
+      extraTargetPaths?: (row: Workspace) => string[];
+      /**
+       * lXKHj, off-host roots (their effects act BY ID after the guard returns): `hold` keeps the
+       * registration lock through the whole operation like a host-local root (rename: its remote
+       * move and config rewrite happen under the overrides lock, which must come after this
+       * one); `pin` returns no lock but reports the classified row, so a removal whose remote
+       * deletion must not block publications can re-derive exactly it before its ID-keyed tail
+       * (see recheckPinnedOffHostTarget).
+       */
+      offHost?: { kind: "hold" } | { kind: "pin"; onPinned: (row: Workspace) => void };
+    }
   ): Promise<Result<() => Promise<void>>> {
     const noRelease = () => Promise.resolve();
     let preliminary: ReturnType<typeof classifyStructuralMutationTarget>;
@@ -3062,7 +3074,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (preliminary.kind === "unregistered") {
       return Err(structuralRefusalForUnregistered(mutation, workspaceId));
     }
-    if (preliminary.kind === "off-host-root") {
+    if (preliminary.kind === "off-host-root" && options?.offHost?.kind !== "hold") {
+      if (options?.offHost?.kind === "pin") options.offHost.onPinned(preliminary.row);
       return Ok(noRelease);
     }
     let release: () => Promise<void>;
@@ -3088,7 +3101,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(structuralRefusalForUnregistered(mutation, workspaceId));
       }
       if (target.kind === "off-host-root") {
+        if (options?.offHost?.kind === "hold") return Ok(release);
         await release();
+        if (options?.offHost?.kind === "pin") options.offHost.onPinned(target.row);
         return Ok(noRelease);
       }
       const overlap = await findProtectedFootprintOverlap(locked, {
@@ -3105,6 +3120,44 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       await release();
       return Err(structuralRefusalForUnreadableConfig(mutation, workspaceId, error));
     }
+  }
+
+  /**
+   * lXKHj: an off-host root removal holds no registration lock across its remote deletion (a slow
+   * SSH deletion must not block every task publication), so a publication can land a row with
+   * the same id meanwhile — and every later step acts BY ID (session removal, deregistration).
+   * Strict re-read: the id must still name exactly the row pinned at the guard (unique, still an
+   * unprotected off-host root, same path and runtime). Callers run it before their first effect
+   * and again under the registration lock before the ID-keyed tail.
+   */
+  private recheckPinnedOffHostTarget(
+    mutation: StructuralMutation,
+    workspaceId: string,
+    pinned: Workspace
+  ): Result<void> {
+    let snapshot: ProjectsConfig;
+    try {
+      snapshot = this.config.loadConfigOrDefault({ throwOnError: true });
+    } catch (error) {
+      return Err(structuralRefusalForUnreadableConfig(mutation, workspaceId, error));
+    }
+    const target = classifyStructuralMutationTarget(snapshot, workspaceId);
+    if (target.kind === "ambiguous") {
+      return Err(structuralRefusalForAmbiguous(mutation, workspaceId, target.count));
+    }
+    if (target.kind === "protected-task") {
+      return Err(structuralRefusalForTask(mutation, workspaceId));
+    }
+    if (
+      target.kind !== "off-host-root" ||
+      target.row.path !== pinned.path ||
+      JSON.stringify(target.row.runtimeConfig) !== JSON.stringify(pinned.runtimeConfig)
+    ) {
+      return Err(
+        `Refusing to ${mutation} workspace "${workspaceId}": its registration changed during the operation, so the id no longer names the workspace that was checked.`
+      );
+    }
+    return Ok(undefined);
   }
 
   /**
@@ -6727,12 +6780,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // root the returned release keeps the registration lock held across the checkout
     // deletion and deregistration below; it is released in the finally, after the
     // overrides lock (reverse acquisition order).
-    const structuralGuard = await this.guardStructuralMutation("remove", workspaceId);
+    // An off-host root holds no registration lock here (see recheckPinnedOffHostTarget): its row
+    // is pinned instead and re-derived before the first effect and before the ID-keyed tail.
+    const offHostTarget: { pinned?: Workspace } = {};
+    const structuralGuard = await this.guardStructuralMutation("remove", workspaceId, {
+      offHost: {
+        kind: "pin",
+        onPinned: (row) => {
+          offHostTarget.pinned = row;
+        },
+      },
+    });
     if (!structuralGuard.success) {
       this.removingWorkspaces.delete(workspaceId);
       return Err(structuralGuard.error);
     }
-    const releaseRegistrationLock = structuralGuard.data;
+    let releaseRegistrationLock = structuralGuard.data;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -6790,6 +6853,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.workspaceMcpOverridesService?.acquireWorkspaceLock(workspaceId);
       // Fresh under the lock (see above).
       persistedWorkspace = this.config.findWorkspace(workspaceId) ?? persistedWorkspace;
+      if (offHostTarget.pinned !== undefined) {
+        // Before any effect: a same-id row published since the guard refuses the removal here,
+        // with nothing changed (every lookup below, the runtime deletion's included, is by id).
+        const pinned = this.recheckPinnedOffHostTarget("remove", workspaceId, offHostTarget.pinned);
+        if (!pinned.success) return Err(pinned.error);
+      }
 
       // The captured engine stop joins partial finalization and raw terminal delivery.
       try {
@@ -7283,6 +7352,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
       } else {
         log.error(`Could not find metadata for workspace ${workspaceId}, creating phantom cleanup`);
+      }
+
+      if (offHostTarget.pinned !== undefined) {
+        // Off-host root (lXKHj): the remote deletion above ran without the registration lock; the
+        // tail below is ID-keyed (session removal, deregistration), so it runs under that lock
+        // after a strict re-derive of the pinned row. Lock order (registration before checkout
+        // and override locks): the overrides lock is released first. Its checkout is gone, and
+        // every override writer re-verifies the checkout under that lock and refuses instead of
+        // recreating it (saves: assertCheckoutExists; legacy migrations: the same probe).
+        const releaseOverridesNow = releaseOverridesLock;
+        releaseOverridesLock = undefined;
+        await releaseOverridesNow?.().catch((error: unknown) => {
+          log.debug("Failed to release the MCP overrides lock after the remote deletion", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
+        releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+        const pinned = this.recheckPinnedOffHostTarget("remove", workspaceId, offHostTarget.pinned);
+        if (!pinned.success) {
+          return Err(
+            `${pinned.error} Its remote checkout was already deleted; the registration and session were left in place.`
+          );
+        }
       }
 
       // Avoid leaking init waiters/logs after workspace deletion.
@@ -8387,6 +8480,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           ).map((targetProjectPath) =>
             deriveHostLocalCheckoutPath(row.runtimeConfig, targetProjectPath, newName)
           ),
+        // An off-host root's move and config rewrite act by id too (lXKHj): the lock is held
+        // through both, and taken before the overrides lock that must span them. A slow remote
+        // move therefore delays task registrations (accepted availability trade-off).
+        offHost: { kind: "hold" },
       });
       if (!structuralGuard.success) {
         return Err(structuralGuard.error);

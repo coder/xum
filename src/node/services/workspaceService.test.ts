@@ -11606,13 +11606,16 @@ describe("WorkspaceService rename lock", () => {
       },
     });
     const config = (workspaceService as unknown as { config: Record<string, unknown> }).config;
+    // A registered off-host root: the structural guard needs no alias scan, but it holds the
+    // registration lock through the rename (the config rewrite acts by id), taken before the
+    // overrides lock below.
+    const rootDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-ssh-rename-"));
+    config.rootDir = rootDir;
     config.getAllWorkspaceMetadata = mock(() => Promise.resolve([]));
     config.findWorkspace = mock(() => ({
       projectPath: "/tmp/project",
       workspacePath: "/srv/project/old-name",
     }));
-    // A registered off-host root: the structural guard needs no alias scan and no lock here,
-    // so the overrides lock below is the first lock the rename takes.
     config.loadConfigOrDefault = mock(() => ({
       projects: new Map([
         [
@@ -11653,6 +11656,15 @@ describe("WorkspaceService rename lock", () => {
     if (!result.success) {
       expect(result.error).toContain("updating workspace MCP settings");
     }
+    // ...and the registration lock is released with it.
+    const release = await acquireCrossProcessLock({
+      lockPath: path.join(rootDir, "workspace-registration.lock"),
+      acquireTimeoutMs: 1_000,
+      staleMs: 60_000,
+      timeoutMessage: "registration lock held",
+    });
+    await release();
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
 });
 

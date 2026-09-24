@@ -448,6 +448,31 @@ describe("WorkspaceMcpOverridesService", () => {
       expect(await pathExists(path.join(movedPath, ".xum", "mcp.local.jsonc"))).toBe(true);
     });
 
+    it("a read-path legacy migration never recreates a checkout that is gone while its row is still registered", async () => {
+      // An off-host removal releases this workspace's lock once its (remote) checkout is deleted,
+      // before the row is deregistered under the registration lock: an absent document can then
+      // mean an absent checkout, and the migration's `mkdir -p` must not recreate the path.
+      const service = new WorkspaceMcpOverridesService(config);
+      const { workspaceId, workspacePath } = await registerWorkspace("legacy-deleted");
+      const legacyValue = { enabledServers: ["shots"] };
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const entry = project.workspaces.find((w) => w.id === workspaceId);
+          if (entry) entry.mcp = legacyValue;
+        }
+        return cfg;
+      });
+      await fs.rm(workspacePath, { recursive: true, force: true });
+
+      await service.getOverridesForWorkspace(workspaceId);
+      expect(await pathExists(workspacePath)).toBe(false);
+      // The only legacy copy survives (nothing was migrated anywhere).
+      const storedLegacy = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((w) => w.id === workspaceId)?.mcp;
+      expect(storedLegacy).toEqual(legacyValue);
+    });
+
     it("an opaque legacy config value keeps the child detached and is preserved", async () => {
       const service = new WorkspaceMcpOverridesService(config);
       const parent = await registerWorkspace("legacy-opaque-parent");
