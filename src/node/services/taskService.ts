@@ -15144,6 +15144,19 @@ export class TaskService implements AgentTaskIntegration {
         });
         return;
       }
+      // A non-workflow plan task's propose_plan is no terminal report: the attempt continues in
+      // exec. Decide (and wake the held queue) before the handoff, as for any other non-report
+      // end above: the kickoff's admission reads a still-pending decision for its attempt as
+      // stale and would be refused, leaving the task running with no exec turn.
+      this.resolveStreamEndDecision(
+        workspaceId,
+        this.findPendingStreamEndDecision(
+          workspaceId,
+          taskOrigin.ownedAttempt,
+          taskOrigin.unownedAttemptId
+        ),
+        "nonreport"
+      );
       await this.handleSuccessfulProposePlanAutoHandoff({
         workspaceId,
         entry,

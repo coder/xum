@@ -1845,4 +1845,45 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     },
     20_000
   );
+
+  // #4414 on the real host: a plan task's successful propose_plan hands off to exec through the
+  // production stream-end listener (whose decision for the ended stream is still pending while
+  // the handoff runs). The kickoff, bound to the handoff's attempt, must still start A's exec turn.
+  test("plan-handoff kickoff on the real host starts the exec turn under the handoff's attempt", async () => {
+    const childId = "planhandoffreal";
+    const stack = await createStack(childId, { agentType: "plan", agentId: "plan" });
+    const { config, taskService, svc, workspaceService, completions, streamStarts } = stack;
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
+      expect(
+        await workspaceService.sendMessage(childId, "plan it", { model, agentId: "plan" })
+      ).toEqual(Ok(undefined));
+      expect(completions).toHaveLength(1);
+      const event = {
+        type: "stream-end",
+        workspaceId: childId,
+        messageId: "assistant-1",
+        metadata: { model, finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "propose-plan-1",
+            toolName: "propose_plan",
+            input: { plan: "the plan" },
+            state: "output-available",
+            output: { success: true, planPath: "/tmp/plan-handoff-real.md" },
+          },
+        ],
+      };
+      stack.aiEmitter.emit("stream-end", event);
+      stack.completeStream(0, event as ReturnType<typeof streamEndEvent>);
+      await until(() => completions.length === 2, "the exec kickoff turn started");
+      expect(streamStarts[1]).toMatchObject({ row: attemptA, owner: attemptA });
+      expect(entryOf(config, childId)).toMatchObject({ agentId: "exec", taskAttemptId: attemptA });
+      expect(outstanding(svc, childId)).toHaveLength(0);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 });
