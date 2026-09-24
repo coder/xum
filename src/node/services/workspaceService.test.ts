@@ -40,6 +40,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
@@ -20947,6 +20948,56 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
+  test("new scratch workspaces opt in with distinct generations and a later opt-out persists", async () => {
+    const {
+      config,
+      historyService: scratchHistoryService,
+      cleanup,
+    } = await createTestHistoryService();
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService: scratchHistoryService,
+        aiService,
+      });
+      const first = await workspaceService.createScratch("First scratch");
+      const second = await workspaceService.createScratch("Second scratch");
+      if (!first.success || !second.success) {
+        throw new Error("Expected both scratch workspaces to be created");
+      }
+      const firstId = first.data.metadata.id;
+      const secondId = second.data.metadata.id;
+      const consentOf = async (workspaceId: string) =>
+        (await config.getAllWorkspaceMetadata()).find((m) => m.id === workspaceId)
+          ?.unrelatedWorkspaceConsent;
+
+      const firstConsent = await consentOf(firstId);
+      const secondConsent = await consentOf(secondId);
+      // The returned metadata already carries the grant, so the UI switch starts on.
+      expect(first.data.metadata.unrelatedWorkspaceConsent).toBe(firstConsent);
+      expect(getValidUnrelatedWorkspaceConsent(firstConsent)).toBe(firstConsent);
+      expect(getValidUnrelatedWorkspaceConsent(secondConsent)).toBe(secondConsent);
+      // Each workspace owns its own revocation generation.
+      expect(firstConsent).not.toBe(secondConsent);
+
+      // Opting out deletes the field; nothing re-mints it on reload (no startup backfill).
+      expect((await workspaceService.setUnrelatedWorkspaceConsent(firstId, false)).success).toBe(
+        true
+      );
+      expect(await consentOf(firstId)).toBeUndefined();
+      expect(await consentOf(secondId)).toBe(secondConsent);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("scratch removal refuses to delete a workdir the workspace does not own", async () => {
     // A stale or hand-edited config entry can point at another chat's dir
     // under the scratch root; removal must not recursively delete it.
@@ -21603,6 +21654,11 @@ describe("WorkspaceService init cancellation", () => {
       const newEntry = persisted.find((entry) => entry.id === workspaceId);
       expect(newEntry?.name).toBe("workspace-3");
       expect(newEntry?.pendingAutoTitle).toBe(true);
+      // New root workspaces are opted in to unrelated messaging at creation.
+      expect(getValidUnrelatedWorkspaceConsent(newEntry?.unrelatedWorkspaceConsent)).toBe(
+        newEntry?.unrelatedWorkspaceConsent
+      );
+      expect(newEntry?.unrelatedWorkspaceConsent).toBeDefined();
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -22424,7 +22480,7 @@ describe("WorkspaceService fork", () => {
       getOrCreateSessionSpy.mockRestore();
     }
   });
-  test("fork inherits a paused goal with fresh accounting but not unrelated-message consent", async () => {
+  test("fork inherits a paused goal with fresh accounting and gets its own unrelated-message consent", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -22534,9 +22590,14 @@ describe("WorkspaceService fork", () => {
       expect(
         metadataAfterFork.find((entry) => entry.id === sourceWorkspaceId)?.unrelatedWorkspaceConsent
       ).toBe("source-consent");
-      expect(
-        metadataAfterFork.find((entry) => entry.id === newWorkspaceId)?.unrelatedWorkspaceConsent
-      ).toBeUndefined();
+      // New root workspaces are opted in by default, but with a fresh generation: sharing the
+      // source's value would let a revocation on one workspace be bypassed through the other.
+      const forkConsent = metadataAfterFork.find(
+        (entry) => entry.id === newWorkspaceId
+      )?.unrelatedWorkspaceConsent;
+      expect(forkConsent).toBeDefined();
+      expect(getValidUnrelatedWorkspaceConsent(forkConsent)).toBe(forkConsent);
+      expect(forkConsent).not.toBe("source-consent");
 
       const forkGoal = await goalService.getGoal(newWorkspaceId);
       expect(forkGoal).toMatchObject({

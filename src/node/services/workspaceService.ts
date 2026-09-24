@@ -1879,6 +1879,23 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
   allowAgentSetGoal: true,
 });
 
+/**
+ * Mints a fresh unrelated-messaging consent generation (see setUnrelatedWorkspaceConsent).
+ * New root workspaces (create, scratch, multi-project, fork) are opted in by default so an agent
+ * in another task tree can reach them without a manual toggle. Pre-existing workspaces are
+ * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
+ * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
+ * TaskService and stay off; their parent owns them.
+ */
+function mintUnrelatedWorkspaceConsent(): string {
+  const generation = crypto.randomUUID();
+  assert(
+    getValidUnrelatedWorkspaceConsent(generation) === generation,
+    "minted unrelated-workspace consent must satisfy the fail-closed reader"
+  );
+  return generation;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
@@ -5327,6 +5344,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           title,
           createdAt,
           runtimeConfig: { type: "local" },
+          unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
         });
         config.projects.set(SCRATCH_PROJECT_CONFIG_KEY, scratchProject);
         return config;
@@ -5650,6 +5668,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             createdAt: metadata.createdAt,
             runtimeConfig: finalRuntimeConfig,
             subProjectPath: effectiveSubProjectPath,
+            unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
             // Persist tags atomically with creation so orchestration loops that
             // look workspaces up by tag (e.g. workspace.ensure) never observe a
             // created-but-untagged window after a crash.
@@ -6074,6 +6093,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           createdAt,
           runtimeConfig: finalRuntimeConfig,
           projects: normalizedProjects,
+          unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
         });
         config.projects.set(MULTI_PROJECT_CONFIG_KEY, multiProjectConfig);
         return config;
@@ -7487,7 +7507,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         // Off (or malformed) → on: a NEW generation, so nothing admitted under an earlier
         // consent can be revived by re-enabling.
-        entry.unrelatedWorkspaceConsent = crypto.randomUUID();
+        entry.unrelatedWorkspaceConsent = mintUnrelatedWorkspaceConsent();
         return freshConfig;
       });
       if (!outcome.success) {
@@ -11239,6 +11259,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         namedWorkspacePath,
         // Preserve sub-project cwd/prompt context when forking via /fork.
         subProjectPath: sourceMetadata.subProjectPath,
+        // A fork is a new root workspace: opted in with its OWN generation, never the source's,
+        // so revoking one workspace's consent cannot be bypassed through the other.
+        unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
         // Forks with a continue message stay pending until the first accepted user send
         // can generate a more specific title, unless the user edits the title first.
         pendingAutoTitle: pendingAutoTitle === true ? true : undefined,
