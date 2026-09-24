@@ -8,6 +8,8 @@ import { fileURLToPath } from "url";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH } from "./src/node/orpc/wsPaths";
 import { novncCompatPlugin } from "./src/vite/novncCompatPlugin";
 import { resolveViteDevServerEnv } from "./src/vite/devServerEnv";
+// React Compiler automatically optimizes React components through memoization.
+import { reactCompilerConfig } from "./src/vite/reactCompilerConfig";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const disableMermaid = process.env.VITE_DISABLE_MERMAID === "1";
@@ -53,13 +55,6 @@ const alias: Record<string, string> = {
 if (disableMermaid) {
   alias["mermaid"] = path.resolve(__dirname, "./src/mocks/mermaidStub.ts");
 }
-
-// React Compiler configuration
-// Automatically optimizes React components through memoization
-// See: https://react.dev/learn/react-compiler
-const reactCompilerConfig = {
-  target: "18", // Target React 18 (requires react-compiler-runtime package)
-};
 
 // Babel plugins configuration (shared between dev and production)
 const babelPlugins = [["babel-plugin-react-compiler", reactCompilerConfig]];
