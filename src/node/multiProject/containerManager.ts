@@ -18,6 +18,11 @@ export class ContainerManager {
     return path.join(this.containerBase, workspaceName);
   }
 
+  /** The container entry (a symlink to the project's checkout) execution reaches a project by. */
+  getProjectEntryPath(workspaceName: string, projectName: string): string {
+    return path.join(this.getContainerPath(workspaceName), projectName);
+  }
+
   async createContainer(
     workspaceName: string,
     projectWorkspaces: ProjectWorkspaceEntry[]
@@ -51,7 +56,7 @@ export class ContainerManager {
     await fs.mkdir(containerPath);
 
     for (const projectWorkspace of projectWorkspaces) {
-      const linkPath = path.join(containerPath, projectWorkspace.projectName);
+      const linkPath = this.getProjectEntryPath(workspaceName, projectWorkspace.projectName);
       // Validate target exists before symlinking.
       await fs.access(projectWorkspace.workspacePath);
       await fs.symlink(projectWorkspace.workspacePath, linkPath);

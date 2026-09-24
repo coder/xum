@@ -81,6 +81,7 @@ import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { ContainerManager } from "@/node/multiProject/containerManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
@@ -6775,21 +6776,25 @@ describe("TaskService", () => {
       },
     ];
     const queuedCheckout = runtime.getWorkspacePath(primaryProjectPath, queuedWorkspaceName);
+    const secondaryCheckout = createRuntime(runtimeConfig, {
+      projectPath: secondaryProjectPath,
+    }).getWorkspacePath(secondaryProjectPath, queuedWorkspaceName);
     const queuedPreparation = await prepareDedicatedTaskCheckout({
       projectPath: primaryProjectPath,
       checkout: queuedCheckout,
       branch: queuedWorkspaceName,
       runtimeConfig,
-      secondaries: [
-        {
-          projectPath: secondaryProjectPath,
-          checkout: createRuntime(runtimeConfig, {
-            projectPath: secondaryProjectPath,
-          }).getWorkspacePath(secondaryProjectPath, queuedWorkspaceName),
-        },
-      ],
+      secondaries: [{ projectPath: secondaryProjectPath, checkout: secondaryCheckout }],
       projects,
     });
+    // The execution container the fork creates (validated before the launch).
+    await new ContainerManager(config.srcDir).createContainer(
+      queuedWorkspaceName,
+      projects.map((project, index) => ({
+        projectName: project.projectName,
+        workspacePath: index === 0 ? queuedCheckout : secondaryCheckout,
+      }))
+    );
 
     await config.editConfig(() => ({
       projects: new Map([

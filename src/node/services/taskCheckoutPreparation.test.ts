@@ -23,6 +23,7 @@ import { taskCheckoutRefusalMessage } from "@/node/services/taskCheckoutAuthoriz
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createTestProject, saveWorkspaces } from "@/node/services/taskService.testHarness";
+import { ContainerManager } from "@/node/multiProject/containerManager";
 
 /**
  * Core preparation proof: physical identity of a dedicated host-local task checkout (real git
@@ -100,10 +101,16 @@ describe("taskCheckoutPreparation", () => {
     const identity = await bindTaskCheckoutIdentity(target, materializationId, claimed);
     if (identity instanceof Error) throw identity;
     const proof = buildTaskCheckoutPreparation(identity, worktree);
+    // The execution container the fork creates (one symlink per project).
+    const container = await new ContainerManager(config.srcDir).createContainer(name, [
+      { projectName: "repo", workspacePath: checkout },
+      { projectName: "repo2", workspacePath: secondaryCheckout },
+    ]);
     return {
       checkout,
       secondaryCheckout,
       secondaryProjectPath,
+      container,
       proof,
       projects,
       row: taskRow(id, checkout, { projects, taskCheckoutPreparation: proof, ...extra }),
@@ -800,6 +807,52 @@ describe("taskCheckoutPreparation", () => {
     });
     await publish([root, row]);
     expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toEqual({ current: true });
+  }, 20_000);
+
+  test("the multi-project container must map every project to its proven checkout (validated, never rebuilt): a deleted, repointed or replaced link and a container that is a symlink or missing refuse; extra entries are ignored; intact is ready", async () => {
+    const { checkout, secondaryCheckout, container, projects, row } =
+      await prepareMultiProject("mp09");
+    const root = rootRow("root1", projectPath);
+    const shared = taskRow("mp09s", checkout, {
+      parentWorkspaceId: "mp09",
+      taskIsolation: "none",
+      projects,
+    });
+    await publish([root, row, shared]);
+    expect(await state(config, "mp09")).toBe("ready");
+    // An entry that maps no project does not change what execution reaches through the
+    // project entries (like an in-place edit inside a validated checkout).
+    await fsPromises.symlink(os.tmpdir(), path.join(container, "extra"));
+    expect(await state(config, "mp09")).toBe("ready");
+    const link = path.join(container, "repo2");
+    const linkRefusal = { kind: "mismatch", dimension: "container-link", checkout: link } as const;
+    await fsPromises.rm(link);
+    expect(await validateTaskCheckoutPreparation(config, "mp09")).toEqual(linkRefusal);
+    await fsPromises.symlink(checkout, link);
+    expect(await validateTaskCheckoutPreparation(config, "mp09")).toEqual(linkRefusal);
+    await fsPromises.rm(link);
+    await fsPromises.mkdir(link);
+    expect(await validateTaskCheckoutPreparation(config, "mp09")).toEqual(linkRefusal);
+    // The anchor is not ready, so a shared child anchored on it is not either.
+    expect(await state(config, "mp09s")).toBe("shared-broken");
+    await fsPromises.rm(link, { recursive: true });
+    await fsPromises.symlink(secondaryCheckout, link);
+    expect(await state(config, "mp09")).toBe("ready");
+    expect(await state(config, "mp09s")).toBe("ready");
+    // The container itself must be a real directory: a symlink to an identical tree refuses.
+    const moved = `${container}-moved`;
+    await fsPromises.rename(container, moved);
+    await fsPromises.symlink(moved, container);
+    const containerRefusal = {
+      kind: "mismatch",
+      dimension: "container",
+      checkout: container,
+    } as const;
+    expect(await validateTaskCheckoutPreparation(config, "mp09")).toEqual(containerRefusal);
+    await fsPromises.rm(container);
+    expect(await validateTaskCheckoutPreparation(config, "mp09")).toEqual(containerRefusal);
+    await fsPromises.rename(moved, container);
+    expect(await state(config, "mp09")).toBe("ready");
   }, 20_000);
 
   test("a v1 proof cannot prove a multi-project task's secondary checkouts (unsupported); single-project v1 stays ready; a v2 proof on a single-project row and unknown or malformed versions refuse", async () => {

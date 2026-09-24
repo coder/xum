@@ -12,8 +12,14 @@ import {
 } from "@/common/schemas/project";
 import type { Workspace } from "@/common/types/project";
 import type { ProjectRef } from "@/common/types/workspace";
-import { hasSrcBaseDir, isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  getSrcBaseDir,
+  hasSrcBaseDir,
+  isDevcontainerRuntime,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import type { Config } from "@/node/config";
+import { ContainerManager } from "@/node/multiProject/containerManager";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { getProjectName } from "@/node/utils/runtime/helpers";
@@ -74,7 +80,11 @@ export type TaskCheckoutMismatchDimension =
   /** The proof's project list (paths, names, order) is not exactly the row's `projects`. */
   | "projects"
   /** Two identities of one proof are the same directory (each project needs its own checkout). */
-  | "duplicate";
+  | "duplicate"
+  /** A multi-project task's execution container is missing or not a real directory. */
+  | "container"
+  /** A container project entry is missing, not a symlink, or points elsewhere than its checkout. */
+  | "container-link";
 
 export type TaskCheckoutPreparationState =
   | { kind: "excluded-root" }
@@ -83,7 +93,10 @@ export type TaskCheckoutPreparationState =
   | { kind: "unsupported"; detail: string }
   | { kind: "runtime-mismatch"; detail: string }
   | { kind: "missing" }
-  /** `checkout`: the secondary checkout that mismatched (absent for the row's own checkout). */
+  /**
+   * `checkout`: the secondary checkout or container path that mismatched (absent for the row's
+   * own checkout).
+   */
   | { kind: "mismatch"; dimension: TaskCheckoutMismatchDimension; checkout?: string }
   | { kind: "unreadable"; detail: string }
   | { kind: "shared-broken"; detail: string }
@@ -651,6 +664,52 @@ async function compareCheckoutIdentity(
 }
 
 /**
+ * A multi-project task executes with its container as cwd and reaches each project through
+ * `<container>/<projectName>`, a symlink ContainerManager creates at fork time. The mapping is
+ * VALIDATED, never rebuilt (no automatic restore): the container must be a real directory (lstat;
+ * a symlink could redirect the whole tree) and each project entry a symlink whose target is
+ * exactly the proven checkout. Other entries are ignored: they map no project, exactly like
+ * in-place edits inside a validated checkout (not detected by design), and multi-project
+ * workspaces are offered no plugin servers, so no consent state lives there. lstat/readlink never
+ * follow a link; the caller's deadline bounds the calls. Never rejects.
+ */
+async function compareTaskCheckoutContainer(
+  container: TaskCheckoutContainer
+): Promise<TaskCheckoutIdentityCheck> {
+  const mismatch = (dimension: "container" | "container-link", checkout: string) =>
+    ({ ok: false, state: { kind: "mismatch", dimension, checkout } }) as const;
+  try {
+    try {
+      if (!(await fsPromises.lstat(container.path)).isDirectory()) {
+        return mismatch("container", container.path);
+      }
+    } catch (error) {
+      if (isEnoent(error)) return mismatch("container", container.path);
+      throw error;
+    }
+    for (const entry of container.entries) {
+      try {
+        if (!(await fsPromises.lstat(entry.path)).isSymbolicLink()) {
+          return mismatch("container-link", entry.path);
+        }
+        if ((await fsPromises.readlink(entry.path)) !== entry.target) {
+          return mismatch("container-link", entry.path);
+        }
+      } catch (error) {
+        if (isEnoent(error)) return mismatch("container-link", entry.path);
+        throw error;
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return {
+      ok: false,
+      state: { kind: "unreadable", detail: `${container.path}: ${getErrorMessage(error)}` },
+    };
+  }
+}
+
+/**
  * v1 for a single-project checkout (unchanged, so builds that only know v1 keep validating it);
  * v2 when secondary checkouts were bound (builds that only know v1 refuse it as unsupported).
  */
@@ -772,7 +831,7 @@ function rowSignatureInputs(entry: ConfigEntry): Record<string, unknown> {
 function deriveDedicatedRow(
   row: Workspace
 ):
-  | { kind: "proof"; proof: TaskCheckoutPreparation }
+  | { kind: "proof"; proof: TaskCheckoutPreparation; container: TaskCheckoutContainer | null }
   | Exclude<TaskCheckoutPreparationState, { kind: "ready" }> {
   const read = readProof(row);
   if (read.kind === "absent") return { kind: "legacy" };
@@ -813,11 +872,10 @@ function deriveDedicatedRow(
   ) {
     return { kind: "mismatch", dimension: "projects" };
   }
-  if (proof.v === 2) {
-    const refusal = multiProjectIdentityRefusal(row, proof);
-    if (refusal !== null) return refusal;
-  }
-  return { kind: "proof", proof };
+  if (proof.v === 1) return { kind: "proof", proof, container: null };
+  const refusal = multiProjectIdentityRefusal(row, proof);
+  if (refusal !== null) return refusal;
+  return { kind: "proof", proof, container: multiProjectContainer(row, proof) };
 }
 
 /**
@@ -863,6 +921,35 @@ function multiProjectIdentityRefusal(
     return { kind: "mismatch", dimension: "duplicate" };
   }
   return null;
+}
+
+/**
+ * A multi-project task's execution container, derived exactly as execution does (ContainerManager
+ * over the runtime's raw srcBaseDir and the row's name): its path and, per project in order, the
+ * entry execution reaches the project by and the proven checkout it must point at.
+ */
+interface TaskCheckoutContainer {
+  path: string;
+  entries: ReadonlyArray<{ path: string; target: string }>;
+}
+
+function multiProjectContainer(
+  row: Workspace,
+  proof: Extract<TaskCheckoutPreparation, { v: 2 }>
+): TaskCheckoutContainer {
+  const srcBaseDir = getSrcBaseDir(row.runtimeConfig);
+  const name = row.name ?? "";
+  // multiProjectIdentityRefusal accepted this row: worktree semantics and a name.
+  assert(srcBaseDir !== undefined && name.length > 0, "multiProjectContainer: unchecked row");
+  const containers = new ContainerManager(srcBaseDir);
+  const identities = [proof, ...proof.secondaries];
+  return {
+    path: containers.getContainerPath(name),
+    entries: proof.projects.map((project, index) => ({
+      path: containers.getProjectEntryPath(name, project.projectName),
+      target: identities[index].path,
+    })),
+  };
 }
 
 /**
@@ -936,6 +1023,7 @@ function deriveTaskCheckoutAuthorization(
       kind: "derived";
       authority: TaskCheckoutAuthority;
       anchorProof: TaskCheckoutPreparation | null;
+      anchorContainer: TaskCheckoutContainer | null;
     }
   | Exclude<TaskCheckoutPreparationState, { kind: "ready" }> {
   const entry = findWorkspaceEntry(snapshot, workspaceId);
@@ -967,6 +1055,7 @@ function deriveTaskCheckoutAuthorization(
     return {
       kind: "derived",
       anchorProof: derived.proof,
+      anchorContainer: derived.container,
       authority: {
         workspaceId,
         kind: "dedicated",
@@ -986,6 +1075,7 @@ function deriveTaskCheckoutAuthorization(
   const walk = walkSharedAncestry(snapshot, entry);
   if (!walk.ok) return { kind: "shared-broken", detail: walk.detail };
   let anchorProof: TaskCheckoutPreparation | null = null;
+  let anchorContainer: TaskCheckoutContainer | null = null;
   if (walk.anchorKind === "dedicated") {
     const derived = deriveDedicatedRow(walk.anchor.workspace);
     if (derived.kind !== "proof") {
@@ -995,10 +1085,12 @@ function deriveTaskCheckoutAuthorization(
       };
     }
     anchorProof = derived.proof;
+    anchorContainer = derived.container;
   }
   return {
     kind: "derived",
     anchorProof,
+    anchorContainer,
     authority: {
       workspaceId,
       kind: "shared",
@@ -1052,10 +1144,14 @@ export async function validateTaskCheckoutPreparation(
 async function validatePhysicalCheckout(derived: {
   authority: TaskCheckoutAuthority;
   anchorProof: TaskCheckoutPreparation | null;
+  anchorContainer: TaskCheckoutContainer | null;
 }): Promise<TaskCheckoutPreparationState> {
   if (derived.anchorProof !== null) {
     // Unbounded here: validateTaskCheckoutPreparation's single deadline covers this half.
-    const physical = await compareTaskCheckoutIdentity(derived.anchorProof);
+    let physical = await compareTaskCheckoutIdentity(derived.anchorProof);
+    if (physical.ok && derived.anchorContainer !== null) {
+      physical = await compareTaskCheckoutContainer(derived.anchorContainer);
+    }
     if (!physical.ok) {
       return derived.authority.kind === "dedicated"
         ? physical.state
