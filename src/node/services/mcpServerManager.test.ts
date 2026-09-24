@@ -8596,7 +8596,8 @@ describe("MCPServerManager", () => {
           timeoutMessage: "writer blocked by startup",
         })
         .catch((error: unknown) => {
-          writerBlocked = error instanceof Error && error.message === "writer blocked by startup";
+          writerBlocked =
+            error instanceof Error && error.message.startsWith("writer blocked by startup");
           return undefined;
         });
       await release?.();

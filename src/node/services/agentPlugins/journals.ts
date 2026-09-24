@@ -24,7 +24,7 @@ export const STAGING_DIR_NAME = "plugin-staging";
 
 /** Shared by installer transactions and MCP's final component-policy admission. */
 export const MUTATION_LOCK_FILE = "mutation.lock";
-/** Pid-reuse guard; the shared lock renews the lease while a holder is alive. */
+/** Renewal cadence for pre-#4415 builds (they reclaim by age); never a takeover threshold. */
 const MUTATION_LOCK_STALE_MS = 30 * 60 * 1000;
 
 export function acquirePluginMutationLock(
