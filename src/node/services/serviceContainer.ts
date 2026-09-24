@@ -519,11 +519,27 @@ export class ServiceContainer {
     const signal = this.startupHousekeepingAbort.signal;
     // A task recovery that outlived its startup bound is still mutating task state: wait for it
     // (or for dispose) before the housekeeping passes and periodic services act on the same tasks.
-    await new Promise<void>((resolve) => {
-      if (signal.aborted) return resolve();
-      signal.addEventListener("abort", () => resolve(), { once: true });
-      void this.taskRecoverySettled.then(resolve);
+    // Bounded again on the runtime clock: a permanently hung recovery must not disable the
+    // periodic services for the server's lifetime, nor keep `initialize()` callers (ACP) waiting.
+    const recoveryWait = this.runtime.managed
+      .runPromise(
+        Effect.promise(() => this.taskRecoverySettled).pipe(
+          Effect.as(true),
+          Effect.timeoutOrElse({
+            duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
+            orElse: () => Effect.succeed(false),
+          })
+        )
+      )
+      .catch(() => true);
+    const recoverySettled = await new Promise<boolean>((resolve) => {
+      if (signal.aborted) return resolve(true);
+      signal.addEventListener("abort", () => resolve(true), { once: true });
+      void recoveryWait.then(resolve);
     });
+    if (!recoverySettled) {
+      log.warn("[startup] Task recovery still running; starting housekeeping without it");
+    }
     if (signal.aborted) {
       log.info("[startup] Startup housekeeping cancelled by dispose before it started");
       return;

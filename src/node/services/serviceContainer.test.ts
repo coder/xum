@@ -997,6 +997,49 @@ describe("ServiceContainer", () => {
     expect(workspaceInitialize).toHaveBeenCalledTimes(1);
   });
 
+  it("runStartupHousekeeping stops waiting for a permanently hung task recovery after the bound", async () => {
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    let recoveryCalled: (() => void) | undefined;
+    const recoveryCalledPromise = new Promise<void>((resolve) => {
+      recoveryCalled = resolve;
+    });
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() => {
+      recoveryCalled?.();
+      return new Promise<void>(() => {
+        // Never settles.
+      });
+    });
+    const workspaceInitialize = spyOn(services.workspaceService, "initialize").mockResolvedValue(
+      undefined
+    );
+    spyOn(services.taskService, "runStartupHousekeeping").mockResolvedValue(undefined);
+    const heartbeatStart = spyOn(services.heartbeatService, "start");
+
+    const core = services.initializeCore();
+    await recoveryCalledPromise;
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS)));
+    await core;
+    const housekeeping = services.runStartupHousekeeping();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS - 1)));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(workspaceInitialize).not.toHaveBeenCalled();
+    // At the bound housekeeping and the periodic services start without the recovery.
+    await runtime.runPromise(TestClock.adjust(Duration.millis(1)));
+    await housekeeping;
+    expect(workspaceInitialize).toHaveBeenCalledTimes(1);
+    expect(heartbeatStart).toHaveBeenCalledTimes(1);
+  });
+
   it("initializeCore continues past a rejected task recovery", async () => {
     services = new ServiceContainer(stores);
     spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
