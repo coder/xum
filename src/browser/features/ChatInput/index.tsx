@@ -815,18 +815,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const currentRuntime = creationState.selectedRuntime;
   const coderRuntimeHost = currentRuntime.mode === "ssh" ? currentRuntime.host : null;
   const setCreationSelectedRuntime = creationState.setSelectedRuntime;
-  // Plain function: React Compiler stabilizes this handler from its primitive host
-  // and compiler-stable runtime setter dependencies.
-  const handleCoderConfigChange = (config: CoderWorkspaceConfig | null) => {
-    if (coderRuntimeHost == null) return;
-    // Existing Coder workspaces name the SSH host; new ones derive it later.
-    const computedHost = config?.workspaceName ? `${config.workspaceName}.coder` : coderRuntimeHost;
-    setCreationSelectedRuntime({
-      mode: "ssh",
-      host: computedHost,
-      coder: config ?? undefined,
-    });
-  };
+  // Manual useCallback: the React Compiler skips ChatInput (it contains constructs the
+  // compiler cannot lower), so an inline handler gets a new identity every render. That
+  // identity flows into useCoderWorkspace's setters and the CreationControls coder props,
+  // which then re-render on every keystroke when the Coder CLI is installed.
+  const handleCoderConfigChange = useCallback(
+    (config: CoderWorkspaceConfig | null) => {
+      if (coderRuntimeHost == null) return;
+      // Existing Coder workspaces name the SSH host; new ones derive it later.
+      const computedHost = config?.workspaceName
+        ? `${config.workspaceName}.coder`
+        : coderRuntimeHost;
+      setCreationSelectedRuntime({
+        mode: "ssh",
+        host: computedHost,
+        coder: config ?? undefined,
+      });
+    },
+    [coderRuntimeHost, setCreationSelectedRuntime]
+  );
   const coderState = useCoderWorkspace({
     coderConfig: currentRuntime.mode === "ssh" ? (currentRuntime.coder ?? null) : null,
     onCoderConfigChange: handleCoderConfigChange,
