@@ -3772,4 +3772,47 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     await waiting;
     expect(settled).not.toContain("Reservation failed");
   });
+  test("a successor turn's own admission, not a predecessor obligation rebound to it, decides whose stream it is", async () => {
+    const taskId = "inherited-obligation";
+    const foreign = "att_00000000000000c7";
+    const { config } = await setupTree([
+      { id: taskId, overrides: { taskStatus: "running", taskAttemptId: "att_00000000000000ac" } },
+    ]);
+    const otherBackend = await createTestConfig(rootDir);
+    let activeTurn: symbol | undefined;
+    const host = hostWithTurnEvents({
+      getActiveTurnGeneration: mock(() => activeTurn),
+    });
+    const { taskService } = createHarness(config, { workspaceService: host.workspaceService });
+    const svc = internals(taskService);
+    const attemptA = entryOf(config, taskId)!.taskAttemptId!;
+    // A's send is admitted into turn 1; the coordinator supersedes turn 1 with turn 2 without
+    // going idle, so A's obligation is rebound to turn 2.
+    const turn1 = Symbol("turn-1");
+    const turn2 = Symbol("turn-2");
+    admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).onAdmitted(
+      turn1
+    );
+    host.supersedeTurn(taskId, turn1, turn2);
+    // Backend B re-admits the row; B's own send is admitted directly into turn 2.
+    await otherBackend.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === taskId);
+        if (ws) ws.taskAttemptId = foreign;
+      }
+      return cfg;
+    });
+    admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).onAdmitted(
+      turn2
+    );
+    activeTurn = turn2;
+    const sends = [...(svc.admittedSendsByTaskId.get(taskId) ?? [])];
+    expect(sends.map((send) => send.attemptId)).toEqual([attemptA, foreign]);
+    // Turn 2's stream belongs to B (its direct admission), not to A's inherited obligation.
+    expect(
+      (
+        taskService as unknown as { streamAttemptIdAtEvent: (id: string) => string | undefined }
+      ).streamAttemptIdAtEvent(taskId)
+    ).toBe(foreign);
+  });
 });

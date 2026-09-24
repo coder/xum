@@ -518,6 +518,12 @@ interface AdmittedSend {
   state: "pending" | "enqueued" | "admitted" | "discharged";
   /** The admitted turn generation; rebound to its successor on supersession. */
   turnId?: symbol;
+  /**
+   * Set when `turnId` was rebound from a superseded predecessor (recordWorkspaceTurnSuperseded):
+   * the obligation waits on that turn, but the turn was not admitted for it. Lookups that
+   * attribute a turn's stream to an attempt prefer the turn's direct admission.
+   */
+  inherited?: boolean;
   /** Stop records that captured this obligation while it was pending (by reference). */
   readonly capturedBy: Set<WorkspaceStopRecord>;
   readonly token: TurnAdmissionToken;
@@ -2470,7 +2476,10 @@ export class TaskService implements AgentTaskIntegration {
   private recordWorkspaceTurnSuperseded(workspaceId: string, previous: symbol, next: symbol): void {
     if (previous === next) return;
     for (const send of this.admittedSendsByTaskId.get(workspaceId) ?? []) {
-      if (send.state === "admitted" && send.turnId === previous) send.turnId = next;
+      if (send.state === "admitted" && send.turnId === previous) {
+        send.turnId = next;
+        send.inherited = true;
+      }
     }
     for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
       if (decision.turn === previous) decision.turn = next;
@@ -2813,15 +2822,22 @@ export class TaskService implements AgentTaskIntegration {
   } {
     const owned = this.ownedAttemptByTaskId.get(taskId);
     const turn = this.workspaceService.getActiveTurnGeneration(taskId);
+    // The turn's DIRECT admission decides; an obligation rebound from a superseded predecessor
+    // (inherited) shares the turn id but not its attempt, and counts only when the turn has no
+    // direct admission (a successor started without its own obligation).
     let admitted: string | undefined;
+    let inherited: string | undefined;
     if (turn != null) {
       for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-        if (send.state === "admitted" && send.turnId === turn) {
+        if (send.state !== "admitted" || send.turnId !== turn) continue;
+        if (send.inherited !== true) {
           admitted = send.attemptId;
           break;
         }
+        inherited ??= send.attemptId;
       }
     }
+    admitted ??= inherited;
     if (owned != null && (admitted == null || owned.attemptId === admitted)) {
       return { ownedAttempt: owned, unownedAttemptId: undefined };
     }
