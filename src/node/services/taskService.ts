@@ -7551,8 +7551,10 @@ export class TaskService implements AgentTaskIntegration {
   /**
    * Reads a reawakening candidate's definition layers before the task locks are taken.
    * The config snapshot is only a hint: planReawakenAi re-checks agent and checkout
-   * context under the locks. Live, legacy, archived and non-inactive children return
-   * undefined, so guidance to a running child does no definition reads. Never mutates.
+   * context under the locks. Live, legacy and non-inactive children return undefined, so
+   * guidance to a running child does no definition reads. Archived children are read too:
+   * reawakening restores them, and a missing checkout just fails the (bounded) read, which
+   * falls back to resolving without layers. Never mutates.
    */
   private async prepareReawakenAi(taskId: string): Promise<PreparedReawakenAi | undefined> {
     const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
@@ -7562,7 +7564,6 @@ export class TaskService implements AgentTaskIntegration {
       workspace.taskAiPins == null ||
       (workspace.taskStatus !== "reported" && workspace.taskStatus !== "interrupted") ||
       isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus) ||
-      isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
       this.aiService.isStreaming(taskId)
     ) {
       return undefined;

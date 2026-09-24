@@ -9090,22 +9090,41 @@ describe("TaskService", () => {
       20_000
     );
 
-    test("a declared definition ancestor's Settings reach an Exec-derived child", async () => {
-      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild({
-        spawn: { agentType: "custom", agentId: "custom" },
-        beforeSpawn: (projectPath) => writeCustomAgentDefinition(projectPath),
-      });
-      await config.editConfig((cfg) => {
-        cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { modelString: MODEL_B } };
-        return cfg;
-      });
+    test.each([false, true])(
+      "a declared definition ancestor's Settings reach an Exec-derived child (archived=%s)",
+      async (archived) => {
+        const { config, taskService, parentId, childId, sendMessage, workspaceService } =
+          await spawnReportedChild({
+            spawn: { agentType: "custom", agentId: "custom" },
+            beforeSpawn: (projectPath) => writeCustomAgentDefinition(projectPath),
+          });
+        if (archived) {
+          // Reawakening restores an archived child: its definition layers must still apply.
+          await editEntry(config, childId, (workspace) => {
+            workspace.archivedAt = new Date(Date.now() - 60_000).toISOString();
+          });
+          spyOn(workspaceService, "unarchiveWhileTaskTreeLocked").mockImplementation(
+            async (workspaceId: string) => {
+              await editEntry(config, workspaceId, (workspace) => {
+                workspace.unarchivedAt = new Date().toISOString();
+              });
+              return Ok(undefined);
+            }
+          );
+        }
+        await config.editConfig((cfg) => {
+          cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { modelString: MODEL_B } };
+          return cfg;
+        });
 
-      const result = await reawaken(taskService, parentId, childId);
-      expect(result.success).toBe(true);
-      // Only the definition chain (custom -> exec) makes Exec's base model apply here.
-      expect(lastSendOptions(sendMessage)).toMatchObject({ model: MODEL_B });
-      expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(MODEL_B);
-    }, 20_000);
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result.success).toBe(true);
+        // Only the definition chain (custom -> exec) makes Exec's base model apply here.
+        expect(lastSendOptions(sendMessage)).toMatchObject({ model: MODEL_B });
+        expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(MODEL_B);
+      },
+      20_000
+    );
 
     test("explicit task arguments stay pinned per field", async () => {
       const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild({

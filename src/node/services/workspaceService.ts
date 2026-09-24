@@ -10591,7 +10591,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async maybePersistAISettingsFromOptions(
     workspaceId: string,
     options: SendMessageOptions | undefined,
-    pinIntent?: AiSelectionIntent
+    pinIntent?: AiSelectionIntent,
+    pinsOnly?: boolean
   ): Promise<void> {
     if (options?.skipAiSettingsPersistence) {
       // One-shot/compaction sends shouldn't overwrite workspace defaults.
@@ -10611,6 +10612,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         persistSelectedAgentId: true,
         ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
         ...(pinIntent != null ? { pinIntent } : {}),
+        ...(pinsOnly === true ? { pinsOnly: true } : {}),
       }
     );
     if (!persistResult.success) {
@@ -10631,6 +10633,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       persistSelectedAgentId?: boolean;
       /** Deliberate user picks sent with this message: pin them on new-style agent tasks. */
       pinIntent?: AiSelectionIntent;
+      /**
+       * Write only the pins (at message acceptance): the bucket and selected agent were
+       * already persisted at send preflight and may have moved on since.
+       */
+      pinsOnly?: boolean;
     }
   ): Promise<Result<boolean, string>> {
     const found = this.config.findWorkspace(workspaceId);
@@ -10679,6 +10686,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const prev = snapshotEntry.aiSettingsByAgent?.[normalizedAgentId];
       const aiSettingsChanged =
+        options?.pinsOnly !== true &&
         aiSettings != null &&
         (prev?.model !== aiSettings.model ||
           prev?.thinkingLevel !== aiSettings.thinkingLevel ||
@@ -10686,7 +10694,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // so only an explicit different value counts as a change.
           (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
       const selectedAgentChanged =
-        options?.persistSelectedAgentId === true && snapshotEntry.agentId !== normalizedAgentId;
+        options?.pinsOnly !== true &&
+        options?.persistSelectedAgentId === true &&
+        snapshotEntry.agentId !== normalizedAgentId;
       const pinsChanged = computeNextPins(snapshotEntry) !== snapshotEntry.taskAiPins;
       if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
         return Ok(false);
@@ -10710,12 +10720,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       const prev = workspaceEntry.aiSettingsByAgent?.[normalizedAgentId];
       const aiSettingsChanged =
+        options?.pinsOnly !== true &&
         aiSettings != null &&
         (prev?.model !== aiSettings.model ||
           prev?.thinkingLevel !== aiSettings.thinkingLevel ||
           (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
       const selectedAgentChanged =
-        options?.persistSelectedAgentId === true && workspaceEntry.agentId !== normalizedAgentId;
+        options?.pinsOnly !== true &&
+        options?.persistSelectedAgentId === true &&
+        workspaceEntry.agentId !== normalizedAgentId;
       const nextPins = computeNextPins(workspaceEntry);
       const pinsChanged = nextPins !== workspaceEntry.taskAiPins;
       if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
@@ -10727,7 +10740,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspaceEntry.taskAiPins = nextPins;
       }
 
-      if (aiSettings != null) {
+      if (aiSettings != null && options?.pinsOnly !== true) {
         // Callers that omit reasoningMode (older clients, thinking-only updates)
         // must not wipe a previously persisted value — self-healing merge.
         const mergedReasoningMode = aiSettings.reasoningMode ?? prev?.reasoningMode;
@@ -10740,7 +10753,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         };
       }
 
-      if (options?.persistSelectedAgentId === true) {
+      if (options?.persistSelectedAgentId === true && options?.pinsOnly !== true) {
         workspaceEntry.agentId = normalizedAgentId;
       }
 
@@ -12087,6 +12100,38 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const normalizedOptions = this.normalizeSendMessageAgentId(options);
+      // Pins commit only once the session accepts this send: a manual send refused by a
+      // later admission check (stale epoch, a Stop winning admission) must not leave its
+      // picks pinned. A failed pin write is logged and never fails the accepted turn.
+      // Eligibility is decided NOW, before preflight persistence records this send's agent as
+      // the selected one: only a send for the task's own agent may pin (legacy tasks never).
+      const pinTaskEntry =
+        pinIntent != null
+          ? findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          : undefined;
+      const pinEligible =
+        pinTaskEntry?.taskAiPins != null &&
+        internal?.synthetic !== true &&
+        normalizeAgentId(normalizedOptions.agentId, WORKSPACE_DEFAULTS.agentId) ===
+          resolveTaskAgentIdForResume(pinTaskEntry);
+      const onAccepted = pinEligible
+        ? async () => {
+            try {
+              await this.maybePersistAISettingsFromOptions(
+                workspaceId,
+                normalizedOptions,
+                pinIntent,
+                true
+              );
+            } catch (error) {
+              log.warn("sendMessage: failed to persist AI selection pins at acceptance", {
+                workspaceId,
+                error: getErrorMessage(error),
+              });
+            }
+            await internal?.onAccepted?.();
+          }
+        : internal?.onAccepted;
       const normalizedMuxMetadata = normalizedOptions.muxMetadata as MuxMessageMetadata | undefined;
       const workspaceTurnContinuationMetadata =
         normalizedMuxMetadata?.type === "workspace-turn-task" ? normalizedMuxMetadata : undefined;
@@ -12168,7 +12213,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             cancelSignal: internal?.cancelSignal,
             withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
             onCanceled: internal?.onCanceled,
-            onAccepted: internal?.onAccepted,
+            onAccepted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
@@ -12185,7 +12230,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       // Synthetic turns must not replace the user's remembered model and mode.
       if (internal?.synthetic !== true) {
-        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, pinIntent);
+        await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions);
       }
 
       // Decide queue-or-direct in arrival order: a later send whose awaits above finished
@@ -12355,7 +12400,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: continuationSendState.onCanceled,
-            onAccepted: internal?.onAccepted,
+            onAccepted,
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
             preTurnMessages: internal?.preTurnMessages,
             onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
@@ -12518,7 +12563,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // goal visible after the user hit enter but before this dispatch.
         enqueuedAtMs: authoredAtMs,
         onCanceled: continuationSendState.onCanceled,
-        onAccepted: internal?.onAccepted,
+        onAccepted,
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,

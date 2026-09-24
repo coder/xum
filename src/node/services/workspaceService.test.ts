@@ -15487,6 +15487,8 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
     parentWorkspaceId?: string;
     taskAiPins?: { model?: string; thinkingLevel?: "high" | "medium" };
     busy?: boolean;
+    /** The session refuses the send before acceptance (onAccepted never runs). */
+    refuse?: boolean;
   }) {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "pin-child";
@@ -15521,7 +15523,16 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
       hasQueuedOrDispatchingEntry: mock(() => false),
       dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
-      sendMessage: mock(() => Promise.resolve(Ok(undefined))),
+      // Mirrors AgentSession: acceptance runs onAccepted; a refusal returns before it.
+      sendMessage: mock(
+        async (_message: string, _options: unknown, internal?: { onAccepted?: () => unknown }) => {
+          if (entry.refuse === true) {
+            return Err({ type: "unknown" as const, raw: "admission refused" });
+          }
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
       drainQueuedMessagesIfIdle: mock(() => undefined),
     };
     (
@@ -15558,6 +15569,44 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
         aiSelectionIntent: { model: true, thinkingLevel: true },
       });
       expect(fixture.readEntry()?.taskAiPins).toEqual({ model: GPT, thinkingLevel: "high" });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("a send refused before acceptance pins nothing", async () => {
+    const fixture = await setupPinFixture({ ...CHILD, refuse: true });
+    try {
+      const result = await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
+        agentId: "exec",
+        model: GPT,
+        thinkingLevel: "high",
+        aiSelectionIntent: { model: true },
+      });
+      expect(result.success).toBe(false);
+      expect(fixture.readEntry()?.taskAiPins).toEqual({});
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  test("a queued send pins only when its entry is accepted", async () => {
+    const fixture = await setupPinFixture({ ...CHILD, busy: true });
+    try {
+      await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
+        agentId: "exec",
+        model: GPT,
+        thinkingLevel: "high",
+        aiSelectionIntent: { model: true },
+      });
+      expect(fixture.readEntry()?.taskAiPins).toEqual({});
+      const queuedInternal = (
+        fixture.fakeSession.queueMessage.mock.calls.at(-1) as unknown[] | undefined
+      )?.[2] as { onAccepted?: () => Promise<void> } | undefined;
+      const commitPins = queuedInternal?.onAccepted;
+      expect(commitPins).toBeDefined();
+      await commitPins?.();
+      expect(fixture.readEntry()?.taskAiPins).toEqual({ model: GPT });
     } finally {
       await fixture.cleanup();
     }
