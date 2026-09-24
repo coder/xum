@@ -4,7 +4,7 @@ import type { ContextBudgetExceeded } from "@/common/utils/compaction/contextBud
 export class ContextBudgetExceededError extends Error {
   constructor(readonly details: ContextBudgetExceeded) {
     super(
-      `Assembled request for ${details.model} exceeds its context budget (${details.estimate} > ${details.hardCeiling})`
+      `Estimated request for ${details.model} exceeds its context budget of ${details.hardCeiling} tokens`
     );
     this.name = "ContextBudgetExceededError";
   }

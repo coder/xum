@@ -46,6 +46,7 @@ async function countBudgetInput(
     assert(Number.isSafeInteger(count) && count >= 0, "Invalid encoded budget count");
     encoded += count + (chunks > 0 ? BUDGET_TOKEN_CHUNK_SLACK : 0);
     chunks += 1;
+    // This early exit returns a lower bound, not an exact request size.
     if (ceiling != null && encoded + input.fixedTokens + framing > ceiling) return ceiling + 1;
     start = end;
   }

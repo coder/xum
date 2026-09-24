@@ -198,7 +198,17 @@ function measureBudgetContent(
   const stack: Array<{
     value: unknown;
     leave?: boolean;
-    kind?: "json" | "messages" | "message" | "parts" | "part" | "output";
+    kind?:
+      | "json"
+      | "messages"
+      | "message"
+      | "parts"
+      | "part"
+      | "assistant-parts"
+      | "assistant-part"
+      | "reasoning-options"
+      | "openai-reasoning-options"
+      | "output";
   }> = [{ value: result, kind }];
   while (stack.length > 0) {
     const entry = stack.pop()!;
@@ -238,7 +248,14 @@ function measureBudgetContent(
       for (const child of value)
         stack.push({
           value: child,
-          kind: entry.kind === "messages" ? "message" : entry.kind === "parts" ? "part" : "json",
+          kind:
+            entry.kind === "messages"
+              ? "message"
+              : entry.kind === "assistant-parts"
+                ? "assistant-part"
+                : entry.kind === "parts"
+                  ? "part"
+                  : "json",
         });
       toolResultChars += value.length;
       continue;
@@ -249,21 +266,17 @@ function measureBudgetContent(
     // Tool JSON can impersonate SDK part shapes. Only direct model-message/fresh
     // attachment parts get SDK media semantics; canonical tool wrappers are also
     // safe because the shared attachment sanitizer removes their data recursively.
-    const image = entry.kind === "part" && record.type === "image" && "image" in record;
+    const isPart = entry.kind === "part" || entry.kind === "assistant-part";
+    const image = isPart && record.type === "image" && "image" in record;
     const inlineText =
       typeof record.data === "object" &&
       record.data !== null &&
       "type" in record.data &&
       record.data.type === "text";
     const file =
-      entry.kind === "part" &&
-      record.type === "file" &&
-      !inlineText &&
-      ("data" in record || "url" in record);
-    const dataMedia =
-      entry.kind === "part" && (record.type === "image-data" || record.type === "file-data");
-    const urlMedia =
-      entry.kind === "part" && (record.type === "image-url" || record.type === "file-url");
+      isPart && record.type === "file" && !inlineText && ("data" in record || "url" in record);
+    const dataMedia = isPart && (record.type === "image-data" || record.type === "file-data");
+    const urlMedia = isPart && (record.type === "image-url" || record.type === "file-url");
     if (toolMedia || image || file || dataMedia || urlMedia) imageParts += 1;
     for (const [key, child] of Object.entries(record)) {
       if (
@@ -274,21 +287,34 @@ function measureBudgetContent(
         (urlMedia && key === "url")
       )
         continue;
+      // Ciphertext length does not measure reasoning tokens. Provider usage tracks the underlying reasoning.
+      // Exclude only the SDK replay field; identical keys in user/tool JSON must still count.
+      if (
+        entry.kind === "openai-reasoning-options" &&
+        key === "reasoningEncryptedContent" &&
+        typeof child === "string"
+      )
+        continue;
       toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
-      stack.push({
-        value: child,
-        kind:
-          entry.kind === "message" &&
-          key === "content" &&
-          (record.role === "user" || record.role === "assistant" || record.role === "tool")
-            ? "parts"
-            : entry.kind === "part" && record.type === "tool-result" && key === "output"
-              ? "output"
-              : entry.kind === "output" && record.type === "content" && key === "value"
-                ? "parts"
-                : "json",
-      });
+      let childKind: typeof entry.kind = "json";
+      if (entry.kind === "message" && key === "content") {
+        if (record.role === "assistant") childKind = "assistant-parts";
+        else if (record.role === "user" || record.role === "tool") childKind = "parts";
+      } else if (isPart && record.type === "tool-result" && key === "output") {
+        childKind = "output";
+      } else if (entry.kind === "output" && record.type === "content" && key === "value") {
+        childKind = "parts";
+      } else if (
+        entry.kind === "assistant-part" &&
+        record.type === "reasoning" &&
+        key === "providerOptions"
+      ) {
+        childKind = "reasoning-options";
+      } else if (entry.kind === "reasoning-options" && key === "openai") {
+        childKind = "openai-reasoning-options";
+      }
+      stack.push({ value: child, kind: childKind });
     }
   }
   return { toolResultChars, imageParts };
