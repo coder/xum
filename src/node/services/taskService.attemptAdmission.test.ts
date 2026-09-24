@@ -119,7 +119,8 @@ interface Internals {
   failAgentTaskTerminally: (
     workspaceId: string,
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
-    failure: { errorType: string; errorMessage: string }
+    failure: { errorType: string; errorMessage: string },
+    options: { expectedAttemptId: string | null }
   ) => Promise<void>;
   /** The production stream-end listener's handler (entry-time origin capture for direct callers). */
   handleStreamEnd: (event: unknown) => Promise<void>;
@@ -1310,10 +1311,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             return edit(id, updater, options);
           }
         );
-        const failure = svc.failAgentTaskTerminally(taskId, entry, {
-          errorType: "provider",
-          errorMessage: "boom",
-        });
+        const failure = svc.failAgentTaskTerminally(
+          taskId,
+          entry,
+          { errorType: "provider", errorMessage: "boom" },
+          // Unfenced terminal failure (no captured attempt): today's behavior.
+          { expectedAttemptId: null }
+        );
         if (race === "pending-before-decision") {
           // The pending obligation counted as live: a stop record captured it and cannot release
           // (nor settle) until it is dispositioned.

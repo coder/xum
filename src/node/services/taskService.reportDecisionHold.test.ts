@@ -1335,4 +1335,64 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+  test("the interrupted report path publishes only for the stream's attempt: a row re-admitted during the publication write is left to its writer", async () => {
+    const childId = "holdinterrupted1";
+    const foreign = "att_00000000000000c8";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    const otherBackend = await createTestConfig(rootDir);
+    const editRow = (edit: (ws: WorkspaceConfigEntry) => void) =>
+      otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === childId);
+          if (ws) edit(ws);
+        }
+        return cfg;
+      });
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(completions).toHaveLength(1);
+      // The row is interrupted (same attempt) before the stream ends: the stream end takes the
+      // interrupted settlement path with its final report.
+      await editRow((ws) => {
+        ws.taskStatus = "interrupted";
+      });
+      // Backend B re-admits the row right before that path's report publication write.
+      let rotated = false;
+      const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+      spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        const probe = structuredClone(entryOf(config, childId));
+        if (id === childId && !rotated && probe != null) {
+          updater(probe, config.loadConfigOrDefault());
+          if (probe.taskStatus === "reported") {
+            rotated = true;
+            await editRow((ws) => {
+              ws.taskStatus = "running";
+              ws.taskAttemptId = foreign;
+              ws.taskAttemptUnproven = true;
+            });
+          }
+        }
+        return editOriginal(id, updater, options);
+      });
+      stack.endStream(0, { report: "done by A" }, true);
+      await until(() => rotated, "the publication write");
+      await yieldMacrotasks(20);
+      expect(entryOf(config, childId)).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: foreign,
+        taskAttemptUnproven: true,
+      });
+      expect(entryOf(config, childId)?.reportedAt).toBeUndefined();
+      expect(
+        await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
+      ).toBeNull();
+      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).not.toBe(foreign);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 });

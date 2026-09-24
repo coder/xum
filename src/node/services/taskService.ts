@@ -987,10 +987,19 @@ interface WorkspaceStopRecord {
  */
 function rowSupersedes(
   row: Pick<WorkspaceConfigEntry, "taskAttemptId"> | undefined,
-  expectedAttemptId: string | undefined
+  expectedAttemptId: string | null | undefined
 ): boolean {
   return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
 }
+
+/**
+ * The attempt a settlement/finalization write acts for (see rowSupersedes). A REQUIRED parameter
+ * on every helper reachable from stream end, stream error, report publication and interrupted
+ * settlement, so the compiler makes each caller state it: the captured attempt id (the writes are
+ * a CAS on it), or `null` when the caller has no proven attempt (a legacy/pre-identity row, a
+ * parent- or timer-driven decision), which keeps today's unconditional writes.
+ */
+type AttemptFence = string | null;
 
 function toAgentTaskReport(source: AgentTaskReport): AgentTaskReport {
   return {
@@ -4336,6 +4345,8 @@ export class TaskService implements AgentTaskIntegration {
       const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
         reason: "startup",
         fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
+        // The fence carries the attempt (see the option's doc).
+        expectedAttemptId: null,
       });
       if (!resumed) {
         failedAwaitingReportCount += 1;
@@ -11704,10 +11715,13 @@ export class TaskService implements AgentTaskIntegration {
         log.debug("failAgentTaskForHardTimeout: stopStream threw", { taskId, error });
       }
       await this.terminateAllDescendantAgentTasks(taskId, { workflowRunId: options.workflowRunId });
-      await this.failAgentTaskTerminally(taskId, entry, {
-        errorType: "workflow_agent_timeout",
-        errorMessage: options.reason,
-      });
+      await this.failAgentTaskTerminally(
+        taskId,
+        entry,
+        { errorType: "workflow_agent_timeout", errorMessage: options.reason },
+        // Timer/parent-driven: ends whatever runs under the task now, not one captured attempt.
+        { expectedAttemptId: null }
+      );
     });
   }
 
@@ -12057,7 +12071,8 @@ export class TaskService implements AgentTaskIntegration {
           // separate waiter-only recovery mode and prompt string.
           void this.workspaceEventLocks
             .withLock(taskId, async () => {
-              await this.promptTaskForRequiredCompletionTool(taskId);
+              // A waiter attaching decides for whatever attempt runs now: no captured attempt.
+              await this.promptTaskForRequiredCompletionTool(taskId, { expectedAttemptId: null });
             })
             .catch((error: unknown) => {
               log.error("Failed to resume awaiting_report task for waiter", {
@@ -13901,7 +13916,7 @@ export class TaskService implements AgentTaskIntegration {
     options?: {
       onlyFromStatus?: AgentTaskStatus;
       /** Write only while the row still names this attempt (see rowSupersedes). */
-      expectedAttemptId?: string;
+      expectedAttemptId?: AttemptFence;
     }
   ): Promise<boolean> {
     assert(workspaceId.length > 0, "setTaskStatus: workspaceId must be non-empty");
@@ -14263,7 +14278,7 @@ export class TaskService implements AgentTaskIntegration {
 
   private async promptTaskForRequiredCompletionTool(
     workspaceId: string,
-    options?: {
+    options: {
       reason?: "startup" | "stream_end" | "error";
       error?: Pick<ErrorEvent, "error" | "errorType">;
       /** formatStructuredOutputValidationMessage output for an invalid agent_report. */
@@ -14277,11 +14292,12 @@ export class TaskService implements AgentTaskIntegration {
        */
       fence?: { turnAdmission: TurnAdmissionToken; attemptId: string };
       /**
-       * Unfenced: the attempt the caller decided this prompt for (a stream end's attempt). Its
-       * budget write and a recovery-limit failure are CAS'd on it (see rowSupersedes); a row
-       * another writer re-admitted meanwhile gets no write and no prompt.
+       * The attempt the caller decided this prompt for (a stream end's or error's attempt): its
+       * budget write and a recovery-limit failure are CAS'd on it; a row another writer
+       * re-admitted meanwhile gets no write and no prompt. Required (see AttemptFence): `null`
+       * for fenced prompts (the fence carries the attempt) and for callers with no proven one.
        */
-      expectedAttemptId?: string;
+      expectedAttemptId: AttemptFence;
     }
   ): Promise<boolean> {
     assert(
@@ -14365,9 +14381,7 @@ export class TaskService implements AgentTaskIntegration {
             errorType: "task_recovery_limit",
             errorMessage: `Task interrupted after ${MAX_TASK_RECOVERY_ATTEMPTS} recovery attempts without a successful ${completionKind === "propose_plan" ? "propose_plan" : "final assistant response"}.${lastError} The task model may be unable to complete this request; try a different model or a simpler prompt.`,
           },
-          (fence?.attemptId ?? options?.expectedAttemptId) != null
-            ? { expectedAttemptId: fence?.attemptId ?? options?.expectedAttemptId }
-            : undefined
+          { expectedAttemptId: fence?.attemptId ?? options.expectedAttemptId }
         );
         return withoutSend(false);
       }
@@ -14591,10 +14605,10 @@ export class TaskService implements AgentTaskIntegration {
     // decision resolves in the listener's finally (its held entries then meet the stale attempt
     // at their own gates). Ownership stays untouched. The check is repeated as a CAS by every
     // status write below (streamAttemptId), since this one precedes the handler's awaits.
-    const streamAttemptId =
-      taskOrigin.ownedAttempt != null
+    const streamAttemptId: AttemptFence =
+      (taskOrigin.ownedAttempt != null
         ? taskOrigin.ownedAttempt.attemptId
-        : taskOrigin.unownedAttemptId;
+        : taskOrigin.unownedAttemptId) ?? null;
     if (entry.workspace.parentWorkspaceId && rowSupersedes(entry.workspace, streamAttemptId)) {
       log.info("[task-attempt] stream end ignored: its attempt was superseded by another writer", {
         workspaceId,
@@ -14939,7 +14953,7 @@ export class TaskService implements AgentTaskIntegration {
         });
         return;
       }
-      await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, reportArgs, {
+      await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, reportArgs, streamAttemptId, {
         reportedAttempt: taskOrigin.ownedAttempt,
       });
       return;
@@ -15113,8 +15127,8 @@ export class TaskService implements AgentTaskIntegration {
   private async recoverTaskFromIncompleteStreamEnd(
     workspaceId: string,
     status: WorkspaceConfigEntry["taskStatus"],
-    /** The ended stream's attempt: recovery writes are CAS'd on it (see rowSupersedes). */
-    streamAttemptId?: string
+    /** The ended stream's attempt: recovery writes are CAS'd on it (see AttemptFence). */
+    streamAttemptId: AttemptFence
   ): Promise<void> {
     if (status !== "awaiting_report") {
       await this.setTaskStatus(workspaceId, "awaiting_report", {
@@ -15171,7 +15185,8 @@ export class TaskService implements AgentTaskIntegration {
       continuationEntryId: deferral.continuationEntryId,
       successor: receipt.successor,
     });
-    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, entry.workspace.taskStatus);
+    // The deferral records no attempt: its recovery keeps today's unconditional writes.
+    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, entry.workspace.taskStatus, null);
     return true;
   }
 
@@ -15332,7 +15347,7 @@ export class TaskService implements AgentTaskIntegration {
           errorType: event.errorType ?? "unknown",
           errorMessage: event.error,
         },
-        errorAttemptId != null ? { expectedAttemptId: errorAttemptId } : undefined
+        { expectedAttemptId: errorAttemptId ?? null }
       );
       return;
     }
@@ -15378,7 +15393,7 @@ export class TaskService implements AgentTaskIntegration {
           errorType: event.errorType,
           errorMessage: event.error,
         },
-        errorAttemptId != null ? { expectedAttemptId: errorAttemptId } : undefined
+        { expectedAttemptId: errorAttemptId ?? null }
       );
       return;
     }
@@ -15403,7 +15418,7 @@ export class TaskService implements AgentTaskIntegration {
     );
 
     await this.promptTaskForRequiredCompletionTool(workspaceId, {
-      expectedAttemptId: errorAttemptId,
+      expectedAttemptId: errorAttemptId ?? null,
       reason: "error",
       error: event,
     });
@@ -15426,14 +15441,15 @@ export class TaskService implements AgentTaskIntegration {
     workspaceId: string,
     entry: { projectPath: string; workspace: WorkspaceConfigEntry },
     failure: { errorType: string; errorMessage: string },
-    options?: { expectedAttemptId?: string }
+    options: { expectedAttemptId: AttemptFence }
   ): Promise<void> {
     assert(workspaceId.length > 0, "failAgentTaskTerminally: workspaceId must be non-empty");
     assert(
       failure.errorMessage.length > 0,
       "failAgentTaskTerminally: errorMessage must be non-empty"
     );
-    const expectedAttemptId = options?.expectedAttemptId;
+    assert(options != null, "failAgentTaskTerminally: options (attempt fence) are required");
+    const expectedAttemptId = options.expectedAttemptId ?? undefined;
     const logSuperseded = () =>
       log.info("[task-attempt] terminal failure abandoned: decided for a superseded attempt", {
         workspaceId,
@@ -15580,9 +15596,13 @@ export class TaskService implements AgentTaskIntegration {
     // that prove a parent turn is actively listening for this task.
     const hadForegroundWaiters = (this.pendingWaitersByTaskId.get(workspaceId)?.length ?? 0) > 0;
 
-    await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, null, {
-      rejectionError: new Error(failure.errorMessage),
-    });
+    await this.settleInterruptedTaskAtStreamEnd(
+      workspaceId,
+      entry,
+      null,
+      options.expectedAttemptId,
+      { rejectionError: new Error(failure.errorMessage) }
+    );
 
     // Free this task's concurrency slot for queued siblings.
     this.scheduleMaybeStartQueuedTasks();
@@ -15710,6 +15730,8 @@ export class TaskService implements AgentTaskIntegration {
       structuredOutput?: unknown;
       planFilePath?: string;
     } | null,
+    /** The ended stream's (or failure's) attempt; see AttemptFence. */
+    attemptFence: AttemptFence,
     options?: { rejectionError?: Error; reportedAttempt?: OwnedTaskAttempt }
   ): Promise<void> {
     if (reportArgs) {
@@ -15717,7 +15739,8 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId,
         entry,
         reportArgs,
-        options?.reportedAttempt
+        options?.reportedAttempt,
+        attemptFence
       );
       if (!finalization.finalized) {
         this.rejectWaiters(workspaceId, new Error(finalization.message));
@@ -15725,6 +15748,16 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
+    // Waiters are keyed by the stable task id: once another writer re-admitted the row under its
+    // own attempt they are that attempt's (checked synchronously with the rejection).
+    if (
+      rowSupersedes(
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace,
+        attemptFence
+      )
+    ) {
+      return;
+    }
     this.rejectWaiters(workspaceId, options?.rejectionError ?? new Error("Task interrupted"));
 
     const parentWorkspaceId = entry.workspace.parentWorkspaceId;
@@ -15748,8 +15781,8 @@ export class TaskService implements AgentTaskIntegration {
     entry: { projectPath: string; workspace: WorkspaceConfigEntry };
     proposePlanResult: { planPath: string };
     reportedAttempt: OwnedTaskAttempt | undefined;
-    /** The ended stream's attempt: every write below is CAS'd on it (see rowSupersedes). */
-    streamAttemptId?: string;
+    /** The ended stream's attempt: every write below is CAS'd on it (see AttemptFence). */
+    streamAttemptId: AttemptFence;
   }): Promise<void> {
     assert(
       args.workspaceId.length > 0,
@@ -15869,8 +15902,8 @@ export class TaskService implements AgentTaskIntegration {
     workspaceId: string;
     entry: { projectPath: string; workspace: WorkspaceConfigEntry };
     proposePlanResult: { planPath: string };
-    /** The ended stream's attempt: the handoff's writes are CAS'd on it (see rowSupersedes). */
-    streamAttemptId?: string;
+    /** The ended stream's attempt: the handoff's writes are CAS'd on it (see AttemptFence). */
+    streamAttemptId: AttemptFence;
   }): Promise<void> {
     assert(
       args.workspaceId.length > 0,
@@ -16478,9 +16511,9 @@ export class TaskService implements AgentTaskIntegration {
      * The attempt the reporting stream ran under (owned, or for an unowned stream the one it was
      * admitted under — resolveStreamAttemptAtEvent). The report's writes are CAS'd on it — a row
      * another writer re-admitted meanwhile is theirs, and this report is never published as
-     * theirs. Callers without a captured attempt keep today's unconditional writes.
+     * theirs. See AttemptFence (`null`: no proven attempt, today's unconditional writes).
      */
-    reportedAttemptId?: string
+    reportedAttemptId: AttemptFence
   ): Promise<AgentReportFinalizationResult> {
     this.markTaskForegroundRelevant(childWorkspaceId);
 
@@ -16729,7 +16762,7 @@ export class TaskService implements AgentTaskIntegration {
     },
     reportedAttempt: OwnedTaskAttempt | undefined,
     /** See finalizeAgentTaskReport: the reporting stream's attempt (CAS on the row). */
-    expectedAttemptId?: string
+    expectedAttemptId: AttemptFence
   ): Promise<
     | {
         parentWorkspaceId: string;

@@ -22819,10 +22819,15 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     const internal = taskService as unknown as {
-      promptTaskForRequiredCompletionTool: (workspaceId: string) => Promise<boolean>;
+      promptTaskForRequiredCompletionTool: (
+        workspaceId: string,
+        options: { expectedAttemptId: string | null }
+      ) => Promise<boolean>;
     };
 
-    expect(await internal.promptTaskForRequiredCompletionTool(childId)).toBe(true);
+    expect(
+      await internal.promptTaskForRequiredCompletionTool(childId, { expectedAttemptId: null })
+    ).toBe(true);
     expect(sendMessage).toHaveBeenCalledWith(
       childId,
       expect.stringContaining("respond with your final assistant message"),
@@ -33764,10 +33769,11 @@ describe("TaskService", () => {
       const internal = t.taskService as unknown as {
         promptTaskForRequiredCompletionTool: (
           workspaceId: string,
-          options?: {
+          options: {
             reason?: "startup" | "stream_end" | "error";
             error?: { error: string; errorType?: string };
             structuredOutputDiagnostic?: string;
+            expectedAttemptId: string | null;
           }
         ) => Promise<boolean>;
       };
@@ -33777,10 +33783,12 @@ describe("TaskService", () => {
         reason: "error",
         error: { error: "provider said: SECRET-PROVIDER-DETAIL", errorType: "unknown" },
         structuredOutputDiagnostic: diagnostic,
+        expectedAttemptId: null,
       });
       await internal.promptTaskForRequiredCompletionTool(t.childId, {
         reason: "error",
         error: { error: "provider said: SECRET-PROVIDER-DETAIL", errorType: "unknown" },
+        expectedAttemptId: null,
       });
 
       expect(t.sendMessage).toHaveBeenCalledTimes(2);
