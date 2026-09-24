@@ -1,0 +1,97 @@
+// Fixture tests for scripts/check-startup-imports.ts. Each test writes a tiny
+// project to a temp dir and runs the real analyzer on it. `make
+// check-startup-imports` runs this file before the real check (scripts/ tests
+// are not part of the `bun test src` lane).
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+import { analyzeStartupImports, isBannedPackage, packageNameOf } from "./check-startup-imports";
+
+let rootDir: string;
+
+beforeEach(async () => {
+  rootDir = await mkdtemp(path.join(tmpdir(), "startup-imports-"));
+  // Mirror the repo's `@/*` alias so alias edges are followed, not treated as packages.
+  await writeFile(
+    path.join(rootDir, "tsconfig.json"),
+    JSON.stringify({ compilerOptions: { paths: { "@/*": ["./src/*"] } } })
+  );
+});
+
+afterEach(async () => {
+  await rm(rootDir, { recursive: true, force: true });
+});
+
+async function writeFiles(files: Record<string, string>): Promise<void> {
+  for (const [relativePath, content] of Object.entries(files)) {
+    const filePath = path.join(rootDir, relativePath);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+  }
+}
+
+async function analyze(entry = "src/entry.ts") {
+  return analyzeStartupImports({ rootDir, entries: [entry], banned: ["ai", "@ai-sdk/*"] });
+}
+
+test("fails on a banned package reached through static imports, with the chain", async () => {
+  await writeFiles({
+    "src/entry.ts": 'import { a } from "./a";\nconsole.log(a);\n',
+    "src/a.ts": 'import { b } from "@/b";\nexport const a = b;\n',
+    "src/b.ts": 'import { streamText } from "ai";\nexport const b = streamText;\n',
+  });
+
+  const report = await analyze();
+
+  expect(report.violations).toEqual([
+    {
+      entry: "src/entry.ts",
+      packageName: "ai",
+      chain: ["src/entry.ts", "src/a.ts", "src/b.ts", "ai"],
+    },
+  ]);
+});
+
+test("fails on side-effect imports and re-exports of banned scoped packages", async () => {
+  await writeFiles({
+    "src/entry.ts": 'export * from "./reexport";\nimport "./sideEffect";\n',
+    "src/reexport.ts": 'export { createOpenAI } from "@ai-sdk/openai/internal";\n',
+    "src/sideEffect.ts": 'import "ai";\n',
+  });
+
+  const report = await analyze();
+
+  expect(report.violations.map((v) => v.packageName).sort()).toEqual(["@ai-sdk/openai", "ai"]);
+});
+
+test("passes when banned packages are only reached lazily or as types", async () => {
+  await writeFiles({
+    "src/entry.ts": [
+      'import type { LanguageModel } from "ai";',
+      'import { type Tool } from "@ai-sdk/openai";',
+      // A value import used only in type positions is elided by tsc and esbuild alike.
+      'import { streamText } from "ai";',
+      "export let model: LanguageModel | Tool | typeof streamText | undefined;",
+      'export const load = () => import("./lazy");',
+      'export const route = () => require("./routed");',
+      "",
+    ].join("\n"),
+    "src/lazy.ts": 'import { streamText } from "ai";\nexport const s = streamText;\n',
+    "src/routed.ts":
+      'import { createOpenAI } from "@ai-sdk/openai";\nexport const c = createOpenAI;\n',
+  });
+
+  const report = await analyze();
+
+  expect(report.violations).toEqual([]);
+  expect(report.eagerModuleCounts).toEqual({ "src/entry.ts": 1 });
+});
+
+test("package matching handles subpaths and scopes", () => {
+  expect(packageNameOf("@ai-sdk/openai/internal")).toBe("@ai-sdk/openai");
+  expect(packageNameOf("ai/rsc")).toBe("ai");
+  expect(isBannedPackage("@ai-sdk/openai", ["@ai-sdk/*"])).toBe(true);
+  expect(isBannedPackage("ai-tokenizer", ["ai"])).toBe(false);
+  expect(isBannedPackage("@ai-sdk-extra/x", ["@ai-sdk/*"])).toBe(false);
+});
