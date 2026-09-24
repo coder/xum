@@ -9749,6 +9749,45 @@ describe("TaskService", () => {
       expect(events.indexOf(emits[0])).toBeGreaterThan(commitIndex);
     }, 20_000);
 
+    test("a grandparent's reawakening resolves from the child's direct parent Exec bucket", async () => {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+        agentAiDefaults: { exec: { modelString: SPAWN_MODEL, thinkingLevel: "high" } },
+      });
+      const sendMessage = createAcceptingSendMessage();
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const initStateManager = new RealInitStateManager(config);
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService,
+        initStateManager,
+      });
+      const child = await createAgentTask(taskService, parentId, "child", { agentType: "exec" });
+      assert(child.success, child.success ? "" : child.error);
+      await initStateManager.waitForInit(child.data.taskId);
+      const grandchild = await createAgentTask(taskService, child.data.taskId, "grandchild", {
+        agentType: "exec",
+      });
+      assert(grandchild.success, grandchild.success ? "" : grandchild.error);
+      const grandchildId = grandchild.data.taskId;
+      await initStateManager.waitForInit(grandchildId);
+      await editEntry(config, grandchildId, (workspace) => {
+        workspace.taskStatus = "reported";
+      });
+      // The root (trigger) and the direct parent carry different Exec selections.
+      await editEntry(config, parentId, (workspace) => {
+        workspace.aiSettingsByAgent = { exec: { model: MODEL_B, thinkingLevel: "high" } };
+      });
+      await editEntry(config, child.data.taskId, (workspace) => {
+        workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "high" } };
+      });
+      sendMessage.mockClear();
+
+      const result = await reawaken(taskService, parentId, grandchildId);
+      expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+      expect(lastSendOptions(sendMessage)).toMatchObject({ model: MODEL_C });
+      expect(findWorkspaceInConfig(config, grandchildId)?.taskModelString).toBe(MODEL_C);
+    }, 20_000);
+
     test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
       const { config, taskService, parentId, childId, sendMessage, initStateManager } =
         await spawnReportedChild();
