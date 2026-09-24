@@ -964,7 +964,9 @@ export class MessageQueue {
         entry.userAuthored &&
         this.getAcceptanceOrigin(entry) === "manual" &&
         !entry.cancelSignal?.aborted &&
-        entry.admissionStale?.() !== true
+        entry.admissionStale?.() !== true &&
+        // A task-stale entry is kept as held input instead (getTaskStaleManualSends): never both.
+        entry.turnAdmission?.admissionStale() !== true
     );
     for (const entry of restorable) {
       assert(
@@ -1131,6 +1133,23 @@ export class MessageQueue {
           turnAdmission: entry.turnAdmission,
         }
       : undefined;
+  }
+
+  /**
+   * Manual user input whose task-attempt admission went stale while it waited (its attempt was
+   * released, closed or superseded). Stop's composer restore skips stale entries, because that
+   * staleness refuses their EXECUTION; the input still belongs to the user, so the session keeps
+   * it as held input (see AgentSession.restoreQueueToInput). Each comes with the dequeue gate's
+   * refusal for it when the token names one (read-only consultation).
+   */
+  getTaskStaleManualSends(): Array<{ send: RefusedManualSend; refusal: string | undefined }> {
+    return this.entries.flatMap((entry) => {
+      if (entry.turnAdmission?.admissionStale() !== true) return [];
+      const send = this.refusedManualSend(entry);
+      if (send == null) return [];
+      const decision = entry.turnAdmission.resolveDispatch?.();
+      return [{ send, refusal: typeof decision === "object" ? decision.refuse : undefined }];
+    });
   }
 
   private refusedManualSend(entry: QueueEntry): RefusedManualSend | undefined {

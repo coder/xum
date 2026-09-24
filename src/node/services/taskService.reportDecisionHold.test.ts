@@ -391,6 +391,82 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     20_000
   );
 
+  test("a Stop after the report released the attempt but before the queue drained keeps the stale-admission follow-up as held input (full payload, once), never executes it, and does not resurrect it after Discard", async () => {
+    // Codex PRRT_kwDOPxxmWM6liPhh: the entry's admission reads stale (its attempt was released by
+    // the published report), which must block its EXECUTION, not delete the user's input on Stop.
+    const childId = "holdstopstale01";
+    const stack = await createStack(childId);
+    const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+    const review = {
+      filePath: "src/a.ts",
+      lineRange: "1-2",
+      selectedCode: "const a = 1;",
+      userNote: "rename a",
+    };
+    const fileParts = [{ url: "data:image/png;base64,aGVsbG8=", mediaType: "image/png" }];
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      expect(
+        await workspaceService.sendMessage(childId, "<review>a</review>\nfollow-up", {
+          ...sendOptions,
+          fileParts,
+          muxMetadata: { type: "normal" as const, reviews: [review] },
+          authoredText: "follow-up",
+        })
+      ).toEqual(Ok(undefined));
+      // Barrier: the report is published and its attempt released while the reporting turn is
+      // still live, so the queued follow-up has not drained.
+      const event = stack.endStream(0, { report: "done" }, false);
+      await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+      await until(() => !svc.ownedAttemptByTaskId.has(childId), "attempt released");
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+      expect(stack.heldInputs()).toHaveLength(0);
+
+      // The user presses Stop.
+      expect(await workspaceService.interruptStream(childId)).toEqual(Ok(undefined));
+      stack.completeStream(0, event);
+      await until(() => !workspaceService.hasQueuedMessages(childId), "queue cleared");
+      await yieldMacrotasks(30);
+
+      // Kept once, as held input with its full original send; not pushed over the composer draft.
+      expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
+      const held = stack.heldInputs();
+      expect(held.map((input) => input.send.displayText)).toEqual(["follow-up"]);
+      expect(held[0].reason).toBe("reported");
+      expect(held[0].send).toMatchObject({
+        message: "<review>a</review>\nfollow-up",
+        attachmentCount: 1,
+        reviewCount: 1,
+      });
+      expect(held[0].send.options).toMatchObject({
+        fileParts,
+        muxMetadata: { reviews: [review] },
+        authoredText: "follow-up",
+      });
+      expect(
+        stack.restoreEvents().filter((restore) => restore.text.includes("follow-up"))
+      ).toHaveLength(0);
+      // Never executed automatically.
+      expect(completions).toHaveLength(1);
+      expect(outstanding(svc, childId)).toHaveLength(0);
+
+      // Discarded input is not resurrected by a later Stop.
+      expect(workspaceService.discardHeldInput(childId, held[0].id)).toEqual(Ok(undefined));
+      expect(await workspaceService.interruptStream(childId)).toEqual(Ok(undefined));
+      await yieldMacrotasks(5);
+      expect(stack.heldInputs()).toHaveLength(0);
+      expect(
+        stack.restoreEvents().filter((restore) => restore.text.includes("follow-up"))
+      ).toHaveLength(0);
+      expect(completions).toHaveLength(1);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
+
   test("a manual follow-up sent after the report decision resolved but before the reporting turn settles is refused, never queued or dispatched under the completed attempt; the decision drops when that turn settles", async () => {
     const childId = "holdlate001";
     const stack = await createStack(childId);

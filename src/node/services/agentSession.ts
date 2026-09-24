@@ -10791,6 +10791,16 @@ export class AgentSession {
     );
     if (this.messageQueue.isEmpty() && inputs.length === 0) return;
 
+    // Execution authority is not ownership of the user's input. A manual entry whose task-attempt
+    // admission went stale while queued (e.g. the report released its attempt before the queue
+    // drained) must never run and is skipped by the composer restore above, but it is still the
+    // user's unsent input: keep it as held input (a later Send is a fresh admission; the stale
+    // token is disposed with the queue below) instead of letting the clear delete it. Held before
+    // the clear is published, so no observer sees the input in neither.
+    for (const { send, refusal } of this.messageQueue.getTaskStaleManualSends()) {
+      this.holdRefusedSend(send, refusal);
+    }
+
     // Clear everything: synthetic wake callbacks need cancellation so their durable
     // records do not retry after the user explicitly interrupted the workspace.
     this.clearQueue();
@@ -10822,6 +10832,18 @@ export class AgentSession {
         reviewCount: send.reviewCount,
       })),
     };
+  }
+
+  /**
+   * Keep a refused manual send as held input. Only the dequeue gate's report refusal proves a
+   * report happened; every other refusal (indeterminate report outcome, closed/superseded
+   * attempt) must not claim one.
+   */
+  private holdRefusedSend(send: RefusedManualSend, refusal: string | undefined): void {
+    const reason =
+      refusal === TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE ? "reported" : "indeterminate";
+    this.heldInputs = [...this.heldInputs, { id: randomUUID(), send, reason }];
+    this.emitChatEvent(this.heldInputsChangedEvent());
   }
 
   /** Held inputs, oldest first (see heldInputs). */
@@ -10965,12 +10987,7 @@ export class AgentSession {
       if (removed != null) {
         if (refusedSend != null) {
           // Held before the queue change is published, so no observer sees the input in neither.
-          // Only the dequeue gate's report refusal proves a report happened; every other refusal
-          // (indeterminate report outcome, closed/superseded attempt) must not claim one.
-          const reason =
-            refusal === TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE ? "reported" : "indeterminate";
-          this.heldInputs = [...this.heldInputs, { id: randomUUID(), send: refusedSend, reason }];
-          this.emitChatEvent(this.heldInputsChangedEvent());
+          this.holdRefusedSend(refusedSend, refusal);
         }
         this.emitQueuedMessageChanged();
         this.notifyQueuedMessageCleared(removed, refusal);

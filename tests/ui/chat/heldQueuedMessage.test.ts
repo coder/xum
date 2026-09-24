@@ -408,6 +408,58 @@ describe("Held (refused) queued messages", () => {
     }
   }, 90_000);
 
+  test("a Stop while a queued message's admission is stale keeps it as held input (text, attachment and review once), leaves the newer draft alone, and never runs it", async () => {
+    // Codex PRRT_kwDOPxxmWM6liPhh: stale admission blocks execution, not the user's ownership.
+    const app = await createAppHarness({ branchPrefix: "held-stop-stale" });
+    try {
+      const workspaceService = app.env.services.workspaceService;
+      const session = workspaceService.getOrCreateSession(app.workspaceId);
+      const holding = app.env.orpc.workspace.sendMessage({
+        workspaceId: app.workspaceId,
+        message: "[mock:wait-start] hold the workspace busy",
+        options: { model: "openai:gpt-5.2", agentId: "exec" },
+      });
+      await waitFor(() => expect(session.isBusy()).toBe(true), LOAD_TOLERANT_WAIT);
+      const { finalText, metadata } = prepareUserMessageForSend({
+        text: "stale follow-up",
+        reviews: [composerReview("stale note")],
+      });
+      session.queueMessage(
+        finalText,
+        {
+          model: "openai:gpt-5.2",
+          agentId: "exec",
+          fileParts: [{ ...queuedFilePart, filename: "stale.txt" }],
+          ...(metadata ? { muxMetadata: metadata } : {}),
+          authoredText: "stale follow-up",
+        },
+        // Its attempt was released (e.g. by the published report) before the queue drained.
+        { acceptanceOrigin: "manual", turnAdmission: staleAdmission }
+      );
+      expect(session.hasQueuedMessages()).toBe(true);
+      await app.chat.typeWithoutSending("newer draft");
+
+      expect(
+        (await app.env.orpc.workspace.interruptStream({ workspaceId: app.workspaceId })).success
+      ).toBe(true);
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await holding;
+
+      await waitFor(() => expect(heldBanners(app)).toHaveLength(1), LOAD_TOLERANT_WAIT);
+      expect(heldBanners(app)[0].textContent).toContain("stale follow-up");
+      expect(heldBanners(app)[0].textContent).toContain("1 attachment · 1 review");
+      expect(session.hasQueuedMessages()).toBe(false);
+      expect(session.getHeldInputs()).toHaveLength(1);
+      // The newer draft is untouched: nothing was restored over it.
+      await app.chat.expectInputValue("newer draft");
+      expect(composerAttachmentNames(app)).toEqual([]);
+      // Never executed.
+      expect(await userRowsContaining(app, "stale follow-up")).toHaveLength(0);
+    } finally {
+      await app.dispose();
+    }
+  }, 90_000);
+
   test("the default restore (a Stop's queued input) still replaces the draft", async () => {
     const app = await createAppHarness({ branchPrefix: "unsent-replace" });
     try {
