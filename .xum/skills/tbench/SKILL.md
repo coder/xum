@@ -180,7 +180,7 @@ Mux Terminal-Bench results are uploaded to BigQuery after CI runs. Query via `bq
 
 **Table:** `mux-benchmarks.benchmarks.tbench_results`
 
-**Schema:** `run_id` (STRING), `task_id` (STRING), `model_name` (STRING), `thinking_level` (STRING: off/low/medium/high), `mode` (STRING: plan/exec), `dataset` (STRING), `experiments` (STRING), `passed` (BOOL), `score` (FLOAT), `n_input_tokens` (INT), `n_output_tokens` (INT), `github_run_id` (INT), `github_sha` (STRING), `ingested_at` (TIMESTAMP).
+**Schema:** one row per task trial, including `run_id`, `task_id`, `model_name`, `thinking_level`, `mode` (plan/exec), `dataset`, `experiments`, `passed` (BOOL), `score`, `n_input_tokens`, `n_output_tokens`, `github_workflow`, `github_run_id`, `github_sha`, and `ingested_at`. `scripts/upload-harbor-results.py` builds the rows and drops keys the table lacks, so list the live columns with `bq show --schema --format=prettyjson mux-benchmarks:benchmarks.tbench_results` before relying on others.
 
 ## Leaderboard Submission
 

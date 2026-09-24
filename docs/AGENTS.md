@@ -48,7 +48,7 @@ description: Agent instructions for AI assistants working on the Xum codebase
 - Package manager: bun only. Use `bun install`, `bun add`, `bun run` (which proxies to Make when relevant). Run `bun install` if modules/types go missing.
 - Makefile is source of truth (new commands land there, not `package.json`).
 - Primary targets: `make dev|start|build|lint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
-- `static-check-full` (what CI runs) adds docs link checking via `mintlify broken-links` to `static-check`.
+- CI runs `make static-check-full`, which adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to `static-check`.
 - Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
 - Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
@@ -87,7 +87,7 @@ When a PR exists, you MUST remain in this loop until the PR is fully ready or an
 2. Push your latest fixes.
 3. Request review with `@codex review`.
 4. Run `./scripts/wait_pr_ready.sh <pr_number>` (which must execute `./scripts/wait_pr_checks.sh <pr_number> --once` while checks are pending).
-5. If Codex leaves comments, address them, resolve threads with `./scripts/resolve_pr_comment.sh <thread_id>`, push, and repeat.
+5. If any reviewer leaves comments, address them (reply before resolving `coder-agents-review` findings, as above), resolve threads with `./scripts/resolve_pr_comment.sh <thread_id>`, push, and repeat.
 6. If checks/mergeability fail, fix issues locally, push, and repeat.
 
 Stop the loop early in four cases. In each case, leave a PR comment that states the reason, then pause for human direction:
@@ -132,7 +132,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 
 ## Command Palette & UI Access
 
-- Open palette with `Cmd+Shift+P` (mac) / `Ctrl+Shift+P` (win/linux) / `F4`; quick toggle via `Cmd+P` / `Ctrl+P`.
+- Palette shortcuts are `OPEN_COMMAND_PALETTE` and `OPEN_COMMAND_PALETTE_ACTIONS` (opens in `>` command mode) in `src/browser/utils/ui/keybinds.ts`.
 - Palette covers workspace mgmt, navigation, chat utils, mode/model switches, slash commands (`/` for suggestions, `>` for actions).
 
 ## Styling

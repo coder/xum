@@ -3,7 +3,6 @@ name: init
 description: Bootstrap an AGENTS.md file in a new or existing project
 ---
 
-<system>
 Use your tools to create or improve an AGENTS.md file in the root of the workspace which will serve as a contribution guide for AI agents.
 If an AGENTS.md file already exists, focus on additive improvement (preserve intent and useful information; refine, extend, and reorganize as needed) rather than replacing it wholesale.
 Inspect the workspace layout, code, documentation and git history to ensure correctness and accuracy.
@@ -46,7 +45,7 @@ Recommended sections:
   - Pull request description requirements.
 
 You can add other sections if they are necessary.
-If the information required for mandatory sections isn't available due to the workspace being empty or sparse, add TODO text in its place.
+If a mandatory section can't be filled because the workspace is empty or sparse, ask the user (see below) and put TODO text in place of anything still unanswered.
 Optional sections should be scrapped if the information is too thin.
 
 Some investigation tips:
@@ -64,7 +63,7 @@ Some writing tips:
 - Terms or phrases specific to this project should be explained on first use.
 - Anything that is against the norm should be explicitly highlighted and called out.
 
-Above all things:
+Requirements:
 
 - The document must be clear. Size it to the project: cover everything an agent needs to work here correctly, and leave out what it can infer from the code.
 - The document must be in Markdown format and use headings for structure.
@@ -80,9 +79,8 @@ If the workspace is empty or sparse, ask the user for more information. Avoid ha
 - Tools.
 - Any other questions as you deem necessary.
 
-For empty or sparse workspaces ONLY, when finished writing/updating AGENTS.md, ask the user if they would like you to do the following:
+For empty or sparse workspaces only, when finished writing/updating AGENTS.md, ask the user if they would like you to do the following:
 
-- initialize git IF it's not already set up (e.g., `git init`, `git remote add`, etc.)
+- initialize git if it's not already set up (e.g., `git init`, `git remote add`, etc.)
 - write a concise README.md file
 - generate the bare minimum project scaffolding (e.g., initializing the package manager, writing a minimal build tool config)
-  </system>

@@ -402,7 +402,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "Do not also do a full parallel analysis in the parent. Call task_await when you are ready to act on child output; do not await reflexively just because tasks are running. " +
     "task_await returns as soon as the first awaited task completes by default (min_completed), so you can start dependent work on each result as it lands instead of blocking on the whole batch; for best-of-N synthesis that must compare every candidate, pass min_completed equal to the batch size (or use a foreground grouped spawn, below). " +
     "\n\nWhen delegating, include a compact task brief (Task / Background / Scope / Starting points / Acceptance / Deliverables / Constraints). " +
-    "For now, persisted sub-agent goals are not supported; pass sub-agent objectives, success criteria, and deliverables directly in the prompt. " +
+    "Sub-agents cannot hold persisted goals; pass sub-agent objectives, success criteria, and deliverables directly in the prompt. " +
     "Sub-agents observe the same system instructions as the parent (project/global AGENTS.md and custom instructions), so do not restate that shared context in the prompt; spend the prompt on task-specific information the sub-agent cannot infer from those instructions. " +
     "Caveat: instruction files are read from the child's checkout, so uncommitted AGENTS.md edits in the parent follow the same runtime visibility rules above — commit them first or pass the relevant guidance in the prompt. " +
     "Avoid telling the sub-agent to read your plan file; child workspaces do not automatically have access to it. " +
@@ -2433,7 +2433,7 @@ export const TOOL_DEFINITIONS = {
             .describe(
               "Run this command in the background without blocking. " +
                 "Use for processes running >5s (dev servers, builds, file watchers). " +
-                "Do NOT use for quick commands (<5s), interactive processes (no stdin support), " +
+                "Do not use for quick commands (<5s), interactive processes (no stdin support), " +
                 "or processes requiring real-time output (use foreground with larger timeout instead). " +
                 "Returns immediately with a taskId (bash:<processId>) and backgroundProcessId. " +
                 "Read output with task_await (returns only new output since last check). " +
