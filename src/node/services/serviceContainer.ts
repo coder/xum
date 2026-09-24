@@ -140,12 +140,13 @@ import {
 } from "@/node/services/di/tags";
 
 /**
- * A hard startup step of `ServiceContainer.initializeCore()` did not settle
- * within `STARTUP_STEP_TIMEOUT_MS`. Rejects `initializeCore()` like any other
- * step failure, so the roots' existing startup-failure paths apply unchanged;
- * `name` is set explicitly so their default `Error` formatting (desktop
- * "Startup Failed" dialog, `Failed to initialize server:` line) shows the
- * class together with the step.
+ * A startup step of `ServiceContainer.initializeCore()` did not settle within
+ * `STARTUP_STEP_TIMEOUT_MS`. For a hard step this rejects `initializeCore()`
+ * like any other step failure, so the roots' existing startup-failure paths
+ * apply unchanged; `name` is set explicitly so their default `Error`
+ * formatting (desktop "Startup Failed" dialog, `Failed to initialize server:`
+ * line) shows the class together with the step. A best-effort step only logs
+ * it (see `StartupStep.bestEffort`).
  */
 export class StartupStepTimeoutError extends Error {
   constructor(
@@ -161,6 +162,14 @@ interface StartupStep {
   /** `stepDurationsMs` key of the startup completion log and `StartupStepTimeoutError.step`. */
   readonly name: string;
   readonly run: () => Promise<void>;
+  /**
+   * Log and continue with the next step instead of rejecting `initializeCore()` when this step
+   * fails or exceeds `STARTUP_STEP_TIMEOUT_MS`. For work that should land before IPC/HTTP mount
+   * but that request handling does not depend on (the one-shot providers.jsonc migration); the
+   * abandoned step keeps running as a plain promise exactly like a timed-out hard step. Absent
+   * means hard: the step is mandatory and a failure stops startup.
+   */
+  readonly bestEffort?: boolean;
 }
 
 /**
@@ -364,17 +373,27 @@ export class ServiceContainer {
   }
 
   /**
-   * The hard startup steps, in order: everything request handling depends on, plus agent-task
-   * restart recovery. All five are mandatory — a failure stops startup — and every name is a
-   * `stepDurationsMs` key of the `[startup] ServiceContainer.initialize completed` line (and the
-   * `step` of a `StartupStepTimeoutError`), so names and order are an observability contract.
-   * Downgrading a step to best-effort is runStartupHousekeeping()'s policy, not a change here.
+   * The startup steps that run before IPC/HTTP mount, in order: everything request handling
+   * depends on, plus agent-task restart recovery. Every step but the one marked `bestEffort` is
+   * mandatory — a failure stops startup — and every name is a `stepDurationsMs` key of the
+   * `[startup] ServiceContainer.initialize completed` line (and the `step` of a
+   * `StartupStepTimeoutError`), so names and order are an observability contract. Work that
+   * scales with deployment size belongs in runStartupHousekeeping(), not here.
    */
   private readonly startupCoreSteps: readonly StartupStep[] = [
     { name: "extensionMetadata.initialize", run: () => this.extensionMetadata.initialize() },
     { name: "telemetryService.initialize", run: () => this.telemetryService.initialize() },
     // Startup gating
     { name: "policyService.initialize", run: () => this.policyService.initialize() },
+    // One-shot providers.jsonc migration; ordered before IPC/HTTP mount so no client reads or
+    // edits the coder section's pre-migration model list. Best-effort: it is internally
+    // non-throwing and the OAuth writers finish a migration that did not land, so a stuck
+    // providers-file lock must delay startup by at most the step timeout, never fail it.
+    {
+      name: "coderOauthService.separateDiscoveredModels",
+      run: () => this.coderOauthService.separateDiscoveredModelsOnce(),
+      bestEffort: true,
+    },
     { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
     {
       name: "taskService.recoverInterruptedTasks",
@@ -391,7 +410,8 @@ export class ServiceContainer {
    *
    * Rejects with the failing step's own error (identity preserved — a synchronous throw included)
    * or with a `StartupStepTimeoutError` once a step exceeds `STARTUP_STEP_TIMEOUT_MS` on the
-   * runtime clock; later steps do not run. A timed-out step keeps running as a plain promise
+   * runtime clock; later steps do not run. A `bestEffort` step is the exception: its failure or
+   * timeout is logged and the next step runs. A timed-out step keeps running as a plain promise
    * (nothing here observes its result afterwards), which is why every root runs the bounded
    * `dispose()` before exiting on a rejected startup. Not re-entrancy guarded: a second call
    * re-runs the steps, as the plain promise chain did.
@@ -426,25 +446,37 @@ export class ServiceContainer {
   private timedStartupStep(step: StartupStep): Effect.Effect<void, unknown> {
     return Effect.suspend(() => {
       const stepStartedAt = Date.now();
-      return Effect.tryPromise({
+      const timed = Effect.tryPromise({
         try: async () => step.run(),
         catch: (error: unknown) => error,
       }).pipe(
         Effect.timeoutOrElse({
           duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
-          // Fatal on purpose — the same exit path a throwing step already takes on every root
-          // (desktop "Startup Failed" dialog, server/ACP log-and-exit). These are the hard steps
-          // request handling depends on (#4058): continuing past a timed-out step would, e.g., let
-          // the server accept task operations while task recovery is still running. The
-          // "startup must never crash the app" rule governs the best-effort work in
-          // runStartupHousekeeping(), which stays non-fatal; this bound only turns an indefinite
-          // hang (splash pinned, listener never bound, no dispose) into the existing failure path.
+          // Fatal on purpose for a hard step — the same exit path a throwing step already takes
+          // on every root (desktop "Startup Failed" dialog, server/ACP log-and-exit). These are
+          // the steps request handling depends on (#4058): continuing past a timed-out step
+          // would, e.g., let the server accept task operations while task recovery is still
+          // running. The "startup must never crash the app" rule governs the best-effort work
+          // (runStartupHousekeeping() and the `bestEffort` step below), which stays non-fatal;
+          // this bound only turns an indefinite hang (splash pinned, listener never bound, no
+          // dispose) into the existing failure path.
           orElse: () =>
             Effect.fail(new StartupStepTimeoutError(step.name, STARTUP_STEP_TIMEOUT_MS)),
         }),
         Effect.ensuring(
           Effect.sync(() => {
             this.startupStepDurationsMs[step.name] = Date.now() - stepStartedAt;
+          })
+        )
+      );
+      if (!step.bestEffort) {
+        return timed;
+      }
+      // Same bound, different outcome: the failure or timeout is logged and startup continues.
+      return timed.pipe(
+        Effect.catch((error) =>
+          Effect.sync(() => {
+            log.error(`[startup] best-effort step ${step.name} did not complete`, { error });
           })
         )
       );

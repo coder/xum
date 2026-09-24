@@ -55,6 +55,7 @@ import {
 import {
   getProviderModelEntryId,
   normalizeProviderModelEntries,
+  userManagedModelEntries,
 } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import {
@@ -406,7 +407,7 @@ export class ProviderService {
         coderOauth?: unknown;
         /** Coder-only: model IDs discovered from the deployment's AI Bridge. */
         discoveredModels?: unknown;
-        /** Coder-only: model IDs the user explicitly removed. */
+        /** Coder-only: legacy routing tombstones (see providersConfig.ts). */
         removedModels?: unknown;
         /** Coder-only: discovered AI Gateway provider instances ({name, type}). */
         discoveredProviders?: unknown;
@@ -579,10 +580,10 @@ export class ProviderService {
         if (additionalProviders.length > 0) {
           providerInfo.additionalProviders = additionalProviders;
         }
-        // Durable user removals gate accessibility even while the discovered
-        // catalog is unknown (see gatewayModelCatalog.ts); the frontend needs
-        // them to mirror the backend's routing decisions. No policy filter:
-        // removals are user intent, not catalog content.
+        // Legacy removal tombstones gate accessibility even while the
+        // discovered catalog is unknown (see gatewayModelCatalog.ts); the
+        // frontend needs them to mirror the backend's routing decisions. No
+        // policy filter: tombstones are user intent, not catalog content.
         if (Array.isArray(config.removedModels)) {
           const removed = config.removedModels.filter((id): id is string => typeof id === "string");
           if (removed.length > 0) {
@@ -1180,16 +1181,19 @@ export class ProviderService {
    *   entries the policy hides. Overwriting would carve those out of the
    *   policy-unfiltered persisted list until the next login even after the
    *   policy broadens (policy is applied at exposure/routing, not storage).
-   * - Every deleted entry is recorded in `removedModels` so catalog
-   *   refreshes and re-logins do not resurrect it. Tracking keys off the
-   *   PRIOR persisted list, not just the current `discoveredModels`:
-   *   provenance is lossy (a discovered model with a user-authored object
-   *   override survives a catalog that temporarily omits its ID, but only
-   *   `models` still knows it) — a deletion made in that state must still be
-   *   excluded when a later catalog lists the ID again. The set is
-   *   recomputed from the final list each edit, so re-adding a model clears
-   *   its exclusion; prior exclusions survive edits made while the catalog
-   *   is unknown (discoveredModels absent).
+   * - Legacy `removedModels` tombstones (written while discovery still merged
+   *   the catalog into `models`, when deleting a row was the only way to
+   *   route that model directly) are honored by routing, so re-adding a model
+   *   clears its tombstone. Nothing new is ever recorded: removing a row only
+   *   removes the row (the catalog keeps routing it; the per-model Route
+   *   override steers routing).
+   * - The edit stamps `discoveredModelsUnlisted`: `models` is user-managed
+   *   under the new contract, so an add made before the one-shot migration
+   *   ran must never be stripped by it later. If that migration has not run
+   *   yet (skipped, or failed at startup), Settings shows the legacy merged
+   *   list and the edit resubmits its catalog rows, so the rows the migration
+   *   would strip from the persisted list are separated first; otherwise the
+   *   stamp would keep them forever. Rows new in this edit are kept.
    *
    * Runs under the providers-file lock (called from setModels).
    */
@@ -1209,21 +1213,28 @@ export class ProviderService {
           return !allowedModels.includes(id) && !visibleIds.has(id);
         })
       : [];
-    const finalModels = [...normalizedModels, ...hiddenPreserved];
+    // Same eligibility as the migration: a catalog marker without the flag
+    // means old code merged the persisted list.
+    const legacyCatalogRows = new Set<string>();
+    if (
+      section.discoveredModelsUnlisted !== true &&
+      (Array.isArray(section.discoveredModels) || Array.isArray(section.staleDiscoveredModels))
+    ) {
+      const userManaged = new Set(userManagedModelEntries(section));
+      for (const entry of normalizeProviderModelEntries(section.models)) {
+        // Only plain strings are ever classified as catalog rows.
+        if (typeof entry === "string" && !userManaged.has(entry)) legacyCatalogRows.add(entry);
+      }
+    }
+    const finalModels = [...normalizedModels, ...hiddenPreserved].filter(
+      (entry) => typeof entry !== "string" || !legacyCatalogRows.has(entry)
+    );
     const finalIds = new Set(finalModels.map((entry) => getProviderModelEntryId(entry)));
 
-    const discovered = Array.isArray(section.discoveredModels)
-      ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-      : [];
     const priorRemoved = Array.isArray(section.removedModels)
       ? section.removedModels.filter((id): id is string => typeof id === "string")
       : [];
-    const priorModelIds = normalizeProviderModelEntries(section.models).map((entry) =>
-      getProviderModelEntryId(entry)
-    );
-    const removed = [...new Set([...priorRemoved, ...discovered, ...priorModelIds])].filter(
-      (id) => !finalIds.has(id)
-    );
+    const removed = priorRemoved.filter((id) => !finalIds.has(id));
 
     section.models = finalModels;
     if (removed.length > 0) {
@@ -1231,6 +1242,7 @@ export class ProviderService {
     } else {
       delete section.removedModels;
     }
+    section.discoveredModelsUnlisted = true;
   }
 
   /**

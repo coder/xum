@@ -224,7 +224,8 @@ async function mockUpdateConfigValue(
 /**
  * Mirrors ProviderService.updateProviderSection: applies the section update to
  * the in-memory config and records model-list changes in setModelsCalls so
- * tests can assert on catalog writes.
+ * tests can assert that catalog/credential writes never touch the
+ * user-managed `models` list.
  */
 function mockUpdateProviderSection(
   deps: MockDeps,
@@ -1010,16 +1011,17 @@ describe("CoderOauthService", () => {
 
       // Model list fetched from the reachable upstream only (openai 404 is a
       // conclusive "unavailable", not a transient error). The exchange resets
-      // the catalog to unknown atomically with the new auth (no models write
-      // recorded — there was no previous catalog), then discovery (after the
-      // flow resolves) persists the fresh one.
-      await waitUntil(() => deps.setModelsCalls.length >= 1);
-      const discoveryCall = deps.setModelsCalls[deps.setModelsCalls.length - 1];
-      expect(discoveryCall.provider).toBe("coder");
-      expect(discoveryCall.models).toEqual([
+      // the catalog to unknown atomically with the new auth, then discovery
+      // (after the flow resolves) persists the fresh catalog — into
+      // discoveredModels only, never into the user-managed `models` list.
+      const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
+      await waitUntil(() => Array.isArray(currentCoderSection().discoveredModels));
+      expect(currentCoderSection().discoveredModels).toEqual([
         "anthropic/claude-sonnet-4-5",
         "anthropic/claude-opus-4-1",
       ]);
+      expect(currentCoderSection().models).toBeUndefined();
+      expect(deps.setModelsCalls).toEqual([]);
 
       expect(deps.focusCalls).toBe(1);
     });
@@ -3403,14 +3405,18 @@ describe("CoderOauthService", () => {
         "anthropic/allowed-model",
         "anthropic/blocked-model",
       ]);
-      expect(coderSection.models).toEqual(["anthropic/allowed-model", "anthropic/blocked-model"]);
+      // The catalog lives in discoveredModels only; nothing is auto-listed.
+      expect(coderSection.models).toBeUndefined();
     });
 
-    it("does not resurrect user-removed discovered models on re-login", async () => {
-      // The user removed a discovered model in Models settings (recorded in
-      // removedModels by setModels). A re-login rebuilds the catalog from the
-      // deployment — which still serves that model — but the merge must honor
-      // the recorded exclusion instead of resurrecting the deleted entry.
+    it("re-login and refresh leave the user-managed models list untouched", async () => {
+      // `models` is user-managed: a re-login rebuilds the catalog from the
+      // deployment — which serves a model that is NOT in the list (and carries
+      // a legacy removal tombstone) — but neither the login commit nor the
+      // catalog write may add to or remove from `models`. The tombstone is
+      // legacy data: honored by routing, never rewritten here. The flag marks
+      // the list as written under the new contract (legacy merged lists are
+      // covered separately).
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
@@ -3418,6 +3424,7 @@ describe("CoderOauthService", () => {
           models: ["anthropic/kept-model"],
           discoveredModels: ["anthropic/kept-model", "anthropic/removed-model"],
           removedModels: ["anthropic/removed-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3476,21 +3483,23 @@ describe("CoderOauthService", () => {
         return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
       });
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // The removed model stays excluded from the visible list even though
-      // the fresh catalog still contains it; the exclusion itself persists.
+      // The list is byte-for-byte what the user had; the catalog is complete;
+      // the legacy tombstone is untouched; both writes flag the new contract.
       expect(coderSection.models).toEqual(["anthropic/kept-model"]);
       expect(coderSection.discoveredModels).toEqual([
         "anthropic/kept-model",
         "anthropic/removed-model",
       ]);
       expect(coderSection.removedModels).toEqual(["anthropic/removed-model"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
     });
 
     it("preserves user-edited settings on discovered models across a re-login", async () => {
-      // A discovered model the user edited in Models settings (context window
-      // override / model mapping) becomes an object entry while its ID stays
-      // recorded in discoveredModels. Re-login + catalog merge must keep the
-      // object (user-authored data), not collapse it back to a plain string.
+      // A configured model the user edited in Models settings (context window
+      // override / model mapping) is an object entry whose ID the catalog also
+      // lists. Re-login + catalog write must leave `models` byte-for-byte
+      // unchanged: neither collapse the object nor reorder/re-add entries.
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
@@ -3500,6 +3509,7 @@ describe("CoderOauthService", () => {
             "anthropic/plain-model",
           ],
           discoveredModels: ["anthropic/tuned-model", "anthropic/plain-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3558,12 +3568,12 @@ describe("CoderOauthService", () => {
         return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
       });
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // The edited entry survived (ahead of the fresh catalog, no duplicate);
-      // the unedited discovered entry was reset to the plain catalog string.
+      // `models` untouched (no write at all); only the catalog was refreshed.
       expect(coderSection.models).toEqual([
         { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
         "anthropic/plain-model",
       ]);
+      expect(deps.setModelsCalls).toEqual([]);
       expect(coderSection.discoveredModels).toEqual([
         "anthropic/tuned-model",
         "anthropic/plain-model",
@@ -3729,6 +3739,14 @@ describe("CoderOauthService", () => {
     });
 
     it("clears the persisted model catalog when the new deployment has no catalogs", async () => {
+      // A previous deployment's catalog plus one user-configured model.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          models: ["anthropic/manual-model"],
+          discoveredModels: ["anthropic/old-model"],
+        },
+      };
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3777,27 +3795,19 @@ describe("CoderOauthService", () => {
       expect(waitResult.success).toBe(true);
 
       // A previous deployment's catalog must not survive the re-login: the
-      // list is overwritten with the (empty) catalog of the new deployment.
-      await waitUntil(() => deps.setModelsCalls.length > 0);
-      expect(deps.setModelsCalls[0].provider).toBe("coder");
-      expect(deps.setModelsCalls[0].models).toEqual([]);
+      // catalog is overwritten with the (empty, but known) catalog of the new
+      // deployment, while the user-configured list is left alone.
+      const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
+      await waitUntil(() => {
+        const discovered = currentCoderSection().discoveredModels;
+        return Array.isArray(discovered) && discovered.length === 0;
+      });
+      expect(currentCoderSection().models).toEqual(["anthropic/manual-model"]);
+      expect(deps.setModelsCalls).toEqual([]);
     });
 
-    it("preserves manually added models across a re-login and catalog refresh", async () => {
-      // Users can append model IDs to the coder section's models list (see
-      // docs/config/providers.mdx). Those entries are user-managed data:
-      // a re-login resets only the DISCOVERED catalog (discoveredModels
-      // bookkeeping), and the post-login discovery merges manual entries
-      // ahead of the fresh catalog instead of overwriting the whole list.
-      deps.providersConfig = {
-        coder: {
-          deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth({ sessionId: "session_prior" }),
-          models: ["anthropic/my-manual-model", "anthropic/old-model"],
-          discoveredModels: ["anthropic/old-model"],
-        },
-      };
-
+    /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
+    function mockReLoginFetch(): void {
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3834,10 +3844,13 @@ describe("CoderOauthService", () => {
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
       });
+    }
 
+    /** Drive a desktop login to completion, then wait for the post-login discovery write. */
+    async function completeReLogin(): Promise<Record<string, unknown>> {
       const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
       expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
+      if (!startResult.success) throw new Error(startResult.error);
       const { flowId, authorizeUrl } = startResult.data;
 
       const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
@@ -3848,18 +3861,78 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      // The commit kept the manual entry (dropping only the old discovered
-      // one), then discovery merged it ahead of the fresh catalog.
       await waitUntil(() => {
         const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
         return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
       });
-      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      return deps.providersConfig.coder as Record<string, unknown>;
+    }
+
+    it("preserves manually added models across a re-login and catalog refresh", async () => {
+      // Users can append model IDs to the coder section's models list (see
+      // docs/config/providers.mdx). Those entries are user-managed data: a
+      // re-login resets only the DISCOVERED catalog (discoveredModels), and the
+      // post-login discovery rewrites only the catalog — the list stays
+      // byte-for-byte, including an entry the new catalog no longer lists.
+      // The flag marks the list as written under the new contract (an
+      // unflagged list next to a catalog marker is legacy merged data; see the
+      // test below).
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth({ sessionId: "session_prior" }),
+          models: ["anthropic/my-manual-model", "anthropic/old-model"],
+          discoveredModels: ["anthropic/old-model"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockReLoginFetch();
+
+      const coderSection = await completeReLogin();
+
+      // Neither the commit nor discovery touched `models`; only the catalog
+      // was replaced.
+      expect(coderSection.models).toEqual(["anthropic/my-manual-model", "anthropic/old-model"]);
+      expect(deps.setModelsCalls).toEqual([]);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration before resetting the catalog on re-login", async () => {
+      // The startup migration (separateDiscoveredModelsOnce) can be skipped
+      // or fail transiently, leaving old code's merged list without the flag.
+      // The login commit stamps the flag, so it must separate the list itself
+      // — otherwise the merged catalog entries would be frozen into `models`
+      // and every later startup would skip the migration. Only entries the
+      // OLD markers list are catalog data; the edited object and the manual
+      // ID survive, and the new catalog no longer lists the stripped IDs.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth({ sessionId: "session_prior" }),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/old-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/old-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+      mockReLoginFetch();
+
+      const coderSection = await completeReLogin();
+
       expect(coderSection.models).toEqual([
         "anthropic/my-manual-model",
-        "anthropic/claude-sonnet-4-5",
+        { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
       ]);
       expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
     });
 
     it("fetches origin catalogs concurrently so a stalled origin cannot starve a healthy one", async () => {
@@ -3933,10 +4006,15 @@ describe("CoderOauthService", () => {
       expect(waitResult.success).toBe(true);
 
       // Both catalogs land, in deterministic origin order, despite the stall.
-      // (The first models write is the login commit's atomic catalog clear.)
-      await waitUntil(() => deps.setModelsCalls.some((call) => call.models.length > 0));
-      const catalogWrite = deps.setModelsCalls.find((call) => call.models.length > 0)!;
-      expect(catalogWrite.models).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-5"]);
+      const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
+      await waitUntil(() => {
+        const discovered = currentCoderSection().discoveredModels;
+        return Array.isArray(discovered) && discovered.length > 0;
+      });
+      expect(currentCoderSection().discoveredModels).toEqual([
+        "anthropic/claude-sonnet-4-5",
+        "openai/gpt-5",
+      ]);
       // Every catalog request was time-bounded.
       expect(catalogSignals).toHaveLength(2);
       for (const signal of catalogSignals) {
@@ -3956,6 +4034,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth({ sessionId: "session_prior" }),
           models: ["anthropic/prior-model"],
           discoveredModels: ["anthropic/prior-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4013,8 +4092,9 @@ describe("CoderOauthService", () => {
       await waitUntil(() => catalogRequests >= 6, 5000);
       // The catalog stays UNKNOWN: the previous deployment's discovered list
       // is gone (reset by the commit) and no authoritative list was written.
+      // The user-managed list is not the commit's to reset.
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.models).toEqual(["anthropic/prior-model"]);
       expect(coderSection.discoveredModels).toBeUndefined();
       expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_relogin");
     });
@@ -4031,6 +4111,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth({ sessionId: "session_prior" }),
           models: ["anthropic/prior-model"],
           discoveredModels: ["anthropic/prior-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4086,10 +4167,10 @@ describe("CoderOauthService", () => {
       // Each origin was retried like other transient failures (2 x 3).
       await waitUntil(() => catalogRequests >= 6, 5000);
       // The catalog stays UNKNOWN (routing fails open): no authoritative
-      // list was persisted from the rejected requests.
+      // list was persisted from the rejected requests; `models` is untouched.
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toBeUndefined();
-      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.models).toEqual(["anthropic/prior-model"]);
       expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_unauth");
     });
 
@@ -4156,14 +4237,12 @@ describe("CoderOauthService", () => {
       };
       releaseCatalog();
 
-      // The stale discovery must not commit its catalog over the newer login's.
-      // (The exchange-time atomic clear writes [], but the stale-model list
-      // fetched by the superseded discovery must never land.)
+      // The stale discovery must not commit its catalog over the newer login's:
+      // the newer login's section (catalog unknown) stays as it was.
       await new Promise((resolve) => setTimeout(resolve, 100));
-      const staleWrite = deps.setModelsCalls.find((c) =>
-        (c.models as unknown as string[]).some((m) => String(m).includes("stale-model"))
-      );
-      expect(staleWrite).toBeUndefined();
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.discoveredModels).toBeUndefined();
+      expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_newer_login");
     });
   });
 
@@ -4646,12 +4725,12 @@ describe("CoderOauthService", () => {
       // Persisting the partial list as discoveredModels would read as an
       // authoritative catalog and block every model of the failed provider
       // until the next refresh; the authoritative marker must stay absent so
-      // routing stays fail-open. The healthy provider's fetched entries stay
-      // USER-VISIBLE in models (flagged via staleDiscoveredModels so they
-      // remain classified as catalog data). The authoritative provider
-      // LISTING is conclusive independently of the catalogs, so it is still
-      // persisted — custom-named instances must stay resolvable for manually
-      // added models.
+      // routing stays fail-open. The healthy provider's fetched entries are
+      // carried in staleDiscoveredModels (never in the user-managed models
+      // list) so a later inconclusive refresh can carry them forward. The
+      // authoritative provider LISTING is conclusive independently of the
+      // catalogs, so it is still persisted — custom-named instances must stay
+      // resolvable for manually added models.
       deps.providersConfig = {
         coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
       };
@@ -4680,8 +4759,9 @@ describe("CoderOauthService", () => {
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toBeUndefined();
-      expect(coderSection.models).toEqual(["prod-anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.models).toBeUndefined();
       expect(coderSection.staleDiscoveredModels).toEqual(["prod-anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
       expect(coderSection.discoveredProviders).toEqual([
         { name: "prod-anthropic", type: "anthropic" },
         { name: "openai", type: "openai" },
@@ -4738,6 +4818,7 @@ describe("CoderOauthService", () => {
           ],
           discoveredModels: ["anthropic/claude-old-2"],
           discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4766,14 +4847,15 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       // Catalog unknown: vertex models stay reachable through fail-open routing.
       expect(coderSection.discoveredModels).toBeUndefined();
-      // Manual (user-edited) entries survive, and the healthy provider's
-      // fresh catalog stays user-visible (flagged stale so disconnect and
-      // future refreshes keep classifying it as discovered data).
+      // The user-managed list is untouched (edited object AND the plain entry
+      // the fresh fetch no longer lists); the healthy provider's fetched
+      // catalog is carried in the stale marker only.
       expect(coderSection.models).toEqual([
         { id: "anthropic/claude-old", contextWindowTokens: 100000 },
-        "anthropic/claude-new",
+        "anthropic/claude-old-2",
       ]);
       expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
       // The authoritative listing (including the new instance) is persisted.
       expect(coderSection.discoveredProviders).toEqual([
         { name: "anthropic", type: "anthropic" },
@@ -4786,7 +4868,7 @@ describe("CoderOauthService", () => {
       // probe-derived metadata is only the name === type default, which
       // routing applies without persistence — no provider metadata or
       // authoritative catalog to write. The healthy probe's fetched models
-      // still become user-visible (flagged stale).
+      // are carried in the stale marker only.
       deps.providersConfig = {
         coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
       };
@@ -4811,7 +4893,7 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toBeUndefined();
       expect(coderSection.discoveredProviders).toBeUndefined();
-      expect(coderSection.models).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.models).toBeUndefined();
       expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
     });
 
@@ -4861,17 +4943,17 @@ describe("CoderOauthService", () => {
       ]);
     });
 
-    it("retains stale display entries across consecutive inconclusive refreshes", async () => {
+    it("retains stale catalog entries across consecutive inconclusive refreshes", async () => {
       // After an inconclusive refresh the authoritative catalog is gone and
       // only staleDiscoveredModels remains. A second refresh where the same
-      // provider flakes again must keep those entries user-visible (Settings
-      // and the selector) instead of dropping them: the stale marker is the
-      // carry-forward source, while the catalog stays fail-open.
+      // provider flakes again must carry those entries forward instead of
+      // dropping them: the stale marker is the carry-forward source, while
+      // the catalog stays fail-open. The user-managed list plays no part.
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
           coderOauth: validAuth(),
-          models: ["prod-anthropic/claude-sonnet-4-5", "openai/gpt-5"],
+          models: ["openai/my-manual-model"],
           staleDiscoveredModels: ["prod-anthropic/claude-sonnet-4-5", "openai/gpt-5"],
           discoveredProviders: [
             { name: "prod-anthropic", type: "anthropic" },
@@ -4903,10 +4985,10 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(false);
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // Catalog still unknown (fail-open), but the healthy provider's fresh
-      // list and the flaky provider's stale entries stay user-visible.
+      // Catalog still unknown (fail-open); the healthy provider's fresh list
+      // and the flaky provider's stale entries are carried in the marker.
       expect(coderSection.discoveredModels).toBeUndefined();
-      expect(coderSection.models).toEqual(["prod-anthropic/claude-opus-4-6", "openai/gpt-5"]);
+      expect(coderSection.models).toEqual(["openai/my-manual-model"]);
       expect(coderSection.staleDiscoveredModels).toEqual([
         "prod-anthropic/claude-opus-4-6",
         "openai/gpt-5",
@@ -4914,15 +4996,16 @@ describe("CoderOauthService", () => {
     });
 
     it("clears stale-flagged catalog entries on disconnect", async () => {
-      // Entries retained through an inconclusive refresh are catalog data,
-      // not user-managed: without the stale marker they would classify as
-      // manual and survive logout.
+      // Entries carried through an inconclusive refresh are catalog data of
+      // the disconnected deployment; the user-managed list is untouched even
+      // where it overlaps the stale marker.
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
           coderOauth: validAuth(),
           models: ["anthropic/my-manual-model", "anthropic/retained-model"],
           staleDiscoveredModels: ["anthropic/retained-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4938,8 +5021,12 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(true);
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        "anthropic/retained-model",
+      ]);
       expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.discoveredModels).toEqual([]);
     });
 
     it("carries a provider's previous models forward through a transient catalog failure", async () => {
@@ -5136,6 +5223,96 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toEqual(["llm-proxy/llama-3.3-70b"]);
     });
+
+    /**
+     * Legacy merged list whose startup migration was skipped or failed (no
+     * flag). A refresh stamps the flag, so it must strip the entries the OLD
+     * markers list (including ones the fresh catalog no longer lists) before
+     * replacing the catalog; edited objects, manual IDs and the legacy
+     * tombstone survive.
+     */
+    function seedUnmigratedMergedList(): void {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/old-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/old-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+    }
+    const SEPARATED_USER_MANAGED_LIST = [
+      "anthropic/my-manual-model",
+      { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+    ];
+
+    it("finishes a skipped discovered-models migration on a conclusive refresh", async () => {
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-new" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshModels()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration on an inconclusive refresh", async () => {
+      // A newly listed provider's first fetch fails: the catalog flips to
+      // unknown (see the fail-open test above), but the write still stamps
+      // the flag and therefore still has to separate the merged list.
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse([
+              { name: "anthropic", type: "anthropic", enabled: true },
+              { name: "vertex", type: "google", enabled: true },
+            ])
+          );
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-new" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/vertex/v1/models`) {
+          return Promise.resolve(new Response("gateway overloaded", { status: 500 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshModels()).success).toBe(false);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toBeUndefined();
+      expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -5143,9 +5320,14 @@ describe("CoderOauthService", () => {
   // -------------------------------------------------------------------------
 
   describe("disconnect", () => {
-    it("revokes best-effort, clears stored auth, and clears models", async () => {
+    it("revokes best-effort, clears stored auth, and clears the catalog", async () => {
       deps.providersConfig = {
-        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          discoveredModels: ["anthropic/claude-sonnet-4-5"],
+          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+        },
       };
 
       let revokeBody: URLSearchParams | null = null;
@@ -5164,12 +5346,16 @@ describe("CoderOauthService", () => {
       expect(revokeBody).not.toBeNull();
       expect(revokeBody!.get("token")).toBe("rt_test");
 
-      // Tokens and models are cleared in one atomic section write; the
+      // Tokens and catalog are cleared in one atomic section write; the
       // now-empty discoveredModels stays present as the authoritative-empty
-      // catalog marker.
-      expect((deps.providersConfig.coder as Record<string, unknown>).coderOauth).toBeUndefined();
-      expect(deps.setModelsCalls).toEqual([{ provider: "coder", models: [] }]);
-      expect((deps.providersConfig.coder as Record<string, unknown>).discoveredModels).toEqual([]);
+      // catalog marker. The user-managed list is not written at all.
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.coderOauth).toBeUndefined();
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(coderSection.discoveredProviders).toEqual([]);
+      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
     });
 
     it("advances a malformed persisted disconnect generation so the tombstone self-heals", async () => {
@@ -5209,18 +5395,7 @@ describe("CoderOauthService", () => {
       expect(after).toBe(1);
     });
 
-    it("keeps manually added models when disconnecting", async () => {
-      // Discovered catalog entries are meaningless without credentials, but
-      // manually added ones are user-managed data and must survive.
-      deps.providersConfig = {
-        coder: {
-          deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth(),
-          models: ["anthropic/my-manual-model", "anthropic/discovered-model"],
-          discoveredModels: ["anthropic/discovered-model"],
-        },
-      };
-
+    function mockRevokeOnlyFetch(): void {
       mockFetch((input) => {
         const url = fetchUrl(input);
         if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
@@ -5228,13 +5403,95 @@ describe("CoderOauthService", () => {
         }
         return Promise.resolve(new Response("unexpected", { status: 500 }));
       });
+    }
+
+    it("keeps configured models when disconnecting", async () => {
+      // The catalog is meaningless without credentials, but every configured
+      // entry is user-managed data and must survive — including one whose ID
+      // the catalog also lists (the user explicitly added it under the new
+      // contract, which stamps the flag).
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/my-manual-model", "anthropic/discovered-model"],
+          discoveredModels: ["anthropic/discovered-model"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockRevokeOnlyFetch();
 
       const result = await service.disconnect();
       expect(result.success).toBe(true);
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        "anthropic/discovered-model",
+      ]);
       expect(coderSection.discoveredModels).toEqual([]);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("keeps a list that never had a catalog marker when disconnecting", async () => {
+      // No marker means old code never merged into this list (it is
+      // user-managed by construction), so a disconnect preserves it verbatim
+      // while stamping the flag like every new-code writer.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/my-manual-model"],
+        },
+      };
+      mockRevokeOnlyFetch();
+
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("finishes a skipped discovered-models migration before clearing the catalog", async () => {
+      // Legacy merged list whose startup migration was skipped or failed (no
+      // flag): the disconnect stamps the flag, so it must strip the catalog
+      // entries the OLD markers list first — or the merged list would be
+      // frozen and every later startup would skip the migration. Edited
+      // objects, manual IDs and the legacy tombstone survive.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/discovered-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/discovered-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+      mockRevokeOnlyFetch();
+
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+      ]);
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      // A later start finds the flag and does nothing.
+      const afterDisconnect = JSON.stringify(deps.providersConfig);
+      await service.separateDiscoveredModelsOnce();
+      expect(JSON.stringify(deps.providersConfig)).toBe(afterDisconnect);
     });
 
     it("does not clear a newer login that completed while revocation was pending", async () => {
@@ -5350,6 +5607,168 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(true);
 
       expect((deps.providersConfig.coder as Record<string, unknown>).coderOauth).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // separateDiscoveredModelsOnce (one-shot startup migration)
+  // -------------------------------------------------------------------------
+
+  describe("separateDiscoveredModelsOnce", () => {
+    it("strips catalog-derived plain entries once, keeping edited objects and manual IDs", async () => {
+      // Old-code shape: discovery merged the catalog into `models`. Only
+      // plain-string entries whose ID the catalog marker lists are catalog
+      // data; an object entry is user-edited even when its ID is listed, and
+      // IDs outside the catalog were added by hand.
+      // Compare against the seeded expiry, not a new timestamp after migration.
+      const auth = validAuth();
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: auth,
+          models: [
+            "anthropic/manual-model",
+            "anthropic/catalog-a",
+            { id: "anthropic/catalog-b", contextWindowTokens: 200_000 },
+            "openai/catalog-c",
+          ],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b"],
+          staleDiscoveredModels: ["openai/catalog-c"],
+          removedModels: ["anthropic/legacy-removed"],
+          coderCatalogGeneration: 7,
+        },
+      };
+
+      await service.separateDiscoveredModelsOnce();
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual([
+        "anthropic/manual-model",
+        { id: "anthropic/catalog-b", contextWindowTokens: 200_000 },
+      ]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      // Not a catalog commit: markers, legacy tombstones, and generation
+      // counters are left exactly as found.
+      expect(coderSection.discoveredModels).toEqual(["anthropic/catalog-a", "anthropic/catalog-b"]);
+      expect(coderSection.staleDiscoveredModels).toEqual(["openai/catalog-c"]);
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.coderCatalogGeneration).toBe(7);
+      expect(coderSection.coderOauth).toEqual(auth);
+
+      // Second start: the flag short-circuits — no write at all.
+      const afterFirstRun = JSON.stringify(deps.providersConfig);
+      const writesAfterFirstRun = deps.setModelsCalls.length;
+      await service.separateDiscoveredModelsOnce();
+      expect(JSON.stringify(deps.providersConfig)).toBe(afterFirstRun);
+      expect(deps.setModelsCalls).toHaveLength(writesAfterFirstRun);
+    });
+
+    it("deletes the list when every entry was catalog-derived", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          models: ["anthropic/catalog-a"],
+          discoveredModels: ["anthropic/catalog-a"],
+        },
+      };
+
+      await service.separateDiscoveredModelsOnce();
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("leaves sections without a catalog marker alone", async () => {
+      // Old code only merged when it wrote discoveredModels or
+      // staleDiscoveredModels; without either, `models` is user-managed by
+      // construction (e.g. a hand-written section that never logged in) and
+      // must not be flagged as migrated either — the first new-code write
+      // sets the flag.
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, models: ["anthropic/manual-model"] },
+      };
+      const before = JSON.stringify(deps.providersConfig);
+
+      await service.separateDiscoveredModelsOnce();
+
+      expect(JSON.stringify(deps.providersConfig)).toBe(before);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("does not create a coder section when none exists", async () => {
+      deps.providersConfig = { anthropic: { apiKey: "sk-test" } };
+
+      await service.separateDiscoveredModelsOnce();
+
+      expect(deps.providersConfig.coder).toBeUndefined();
+    });
+
+    it("does not strip an explicitly added catalog ID once the flag is set", async () => {
+      // A user who added a catalog model under the new contract has the flag
+      // set (every new-code write sets it). The migration must not reclassify
+      // that explicit entry as merged catalog data, and a later refresh or
+      // disconnect must leave it in place too.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/claude-sonnet-4-5"],
+          discoveredModels: ["anthropic/claude-sonnet-4-5"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
+          return Promise.resolve(new Response(null, { status: 200 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      await service.separateDiscoveredModelsOnce();
+      expect((await service.refreshModels()).success).toBe(true);
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("never throws when the write fails", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          models: ["anthropic/catalog-a"],
+          discoveredModels: ["anthropic/catalog-a"],
+        },
+      };
+      service = new CoderOauthService(
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
+        {
+          ...createMockProviderService(deps),
+          updateProviderSection: () => Promise.reject(new Error("lock timeout")),
+        } as unknown as ProviderService,
+        createMockWindowService(deps) as WindowService
+      );
+
+      // A rejection here would fail the test: the startup step must resolve.
+      await service.separateDiscoveredModelsOnce();
+      // Nothing landed; the next start retries.
+      expect((deps.providersConfig.coder as Record<string, unknown>).models).toEqual([
+        "anthropic/catalog-a",
+      ]);
     });
   });
 });

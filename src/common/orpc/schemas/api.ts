@@ -332,15 +332,16 @@ export const ProviderConfigInfoSchema = z.object({
   additionalProviders: z.array(z.object({ name: z.string(), type: z.string() })).optional(),
   /**
    * Coder-only: model IDs discovered from the deployment's AI Bridge
-   * catalogs. Authoritative for gateway routing when present; `models` is the
-   * user-visible union of these and manually added entries.
+   * catalogs. Authoritative for gateway routing when present; never merged
+   * into `models`, which holds only the entries the user added.
    */
   discoveredModels: z.array(z.string()).optional(),
   /**
-   * Coder-only: model IDs the user explicitly removed. Excluded from
+   * Coder-only: legacy routing tombstones — model IDs the user removed while
+   * discovery still merged the catalog into `models`. Excluded from
    * accessibility even while the discovered catalog is unknown, so the
    * frontend mirrors the backend's routing decisions (see
-   * gatewayModelCatalog.ts).
+   * gatewayModelCatalog.ts). Never written anymore; cleared on re-add.
    */
   removedModels: z.array(z.string()).optional(),
 });

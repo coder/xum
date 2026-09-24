@@ -788,6 +788,7 @@ describe("ServiceContainer", () => {
     "extensionMetadata.initialize",
     "telemetryService.initialize",
     "policyService.initialize",
+    "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
     "taskService.recoverInterruptedTasks",
   ];
@@ -887,6 +888,74 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
+  it("initializeCore lets a hung discovered-models migration time out without failing startup", async () => {
+    // Same TestClock harness as above; the migration is the one best-effort core step, so
+    // exceeding the bound must log and continue with the later steps instead of rejecting.
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    let migrationCalled: (() => void) | undefined;
+    const migrationCalledPromise = new Promise<void>((resolve) => {
+      migrationCalled = resolve;
+    });
+    spyOn(services.coderOauthService, "separateDiscoveredModelsOnce").mockImplementation(() => {
+      migrationCalled?.();
+      return new Promise<void>(() => {
+        // Never settles: the providers-file lock is held elsewhere for good.
+      });
+    });
+    const experimentsInitialize = spyOn(services.experimentsService, "initialize");
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
+      undefined
+    );
+
+    let outcome: { settled: boolean; error?: unknown } = { settled: false };
+    const core = services.initializeCore().then(
+      () => {
+        outcome = { settled: true };
+      },
+      (error: unknown) => {
+        outcome = { settled: true, error };
+      }
+    );
+    await migrationCalledPromise;
+
+    // The migration still gets the full budget: the later steps wait for it...
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS - 1)));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(outcome.settled).toBe(false);
+    expect(experimentsInitialize).not.toHaveBeenCalled();
+    // ...and at the budget it is abandoned while startup goes on and succeeds.
+    await runtime.runPromise(TestClock.adjust(Duration.millis(1)));
+    await core;
+    expect(outcome).toEqual({ settled: true });
+    expect(experimentsInitialize).toHaveBeenCalledTimes(1);
+    expect(recoverTasks).toHaveBeenCalledTimes(1);
+    expect(Object.keys(startupInternals(services).startupStepDurationsMs)).toEqual(CORE_STEP_NAMES);
+  });
+
+  it("initializeCore continues past a rejected discovered-models migration", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.coderOauthService, "separateDiscoveredModelsOnce").mockImplementation(() =>
+      Promise.reject(new Error("providers lock unavailable"))
+    );
+    const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
+      undefined
+    );
+
+    await services.initializeCore();
+
+    expect(recoverTasks).toHaveBeenCalledTimes(1);
+    expect(Object.keys(startupInternals(services).startupStepDurationsMs)).toEqual(CORE_STEP_NAMES);
+  });
+
   it("initializeCore rejects with the failing step's own error and skips the later steps", async () => {
     services = new ServiceContainer(stores);
     const boom = new Error("policy endpoint unreachable");
@@ -912,7 +981,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the five core steps and re-runs them when called again", async () => {
+  it("initializeCore records the six core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined

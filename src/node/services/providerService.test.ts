@@ -13,6 +13,7 @@ import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
 import { PolicyService } from "@/node/services/policyService";
+import { CoderOauthService } from "@/node/services/coderOauthService";
 import { ProviderService } from "./providerService";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import { openaiServiceTierAvailable } from "@/common/utils/ai/openaiProviderOptionsAvailability";
@@ -979,6 +980,8 @@ describe("ProviderService model normalization", () => {
               "anthropic/other-visible",
               "anthropic/hidden",
             ],
+            // Post-migration: `models` is the user's own list.
+            discoveredModelsUnlisted: true,
           },
         });
 
@@ -988,25 +991,31 @@ describe("ProviderService model normalization", () => {
 
         const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
           ?.coder as Record<string, unknown>;
-        // The hidden entry survives; only the visible removal took effect.
+        // The hidden entry survives; only the visible removal took effect,
+        // and a removal is just a removal — no routing tombstone.
         expect(stored.models).toEqual(["anthropic/visible-model", "anthropic/hidden"]);
-        expect(stored.removedModels).toEqual(["anthropic/other-visible"]);
+        expect(stored.removedModels).toBeUndefined();
+        expect(stored.discoveredModelsUnlisted).toBe(true);
       }
     );
   });
 
-  it("records removals of discovered Coder models and clears them on re-add", async () => {
+  it("does not record Coder removals; re-adding clears a legacy tombstone", async () => {
     await withTempConfigAsync(async (config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: ["anthropic/model-a", "anthropic/model-b"],
-          discoveredModels: ["anthropic/model-a", "anthropic/model-b"],
+          discoveredModels: ["anthropic/model-a", "anthropic/model-b", "anthropic/model-c"],
+          // Written by old code when the user deleted a merged catalog row.
+          removedModels: ["anthropic/model-c"],
+          // Post-migration: `models` is the user's own list.
+          discoveredModelsUnlisted: true,
         },
       });
 
-      // Removing a discovered model records the exclusion so catalog
-      // refreshes and re-logins cannot resurrect it.
+      // Removing a configured model only removes the row: the catalog still
+      // routes it, and no new tombstone is minted. The legacy one survives.
       const removal = await service.setModels("coder", ["anthropic/model-a"]);
       expect(removal.success).toBe(true);
       let stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder as Record<
@@ -1014,53 +1023,130 @@ describe("ProviderService model normalization", () => {
         unknown
       >;
       expect(stored.models).toEqual(["anthropic/model-a"]);
-      expect(stored.removedModels).toEqual(["anthropic/model-b"]);
+      expect(stored.removedModels).toEqual(["anthropic/model-c"]);
+      expect(stored.discoveredModelsUnlisted).toBe(true);
 
-      // Re-adding the model clears its exclusion.
-      const readd = await service.setModels("coder", ["anthropic/model-a", "anthropic/model-b"]);
+      // Re-adding the tombstoned model clears its tombstone (nothing else can).
+      const readd = await service.setModels("coder", ["anthropic/model-a", "anthropic/model-c"]);
       expect(readd.success).toBe(true);
       stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.coder as Record<
         string,
         unknown
       >;
-      expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-b"]);
+      expect(stored.models).toEqual(["anthropic/model-a", "anthropic/model-c"]);
       expect(stored.removedModels).toBeUndefined();
     });
   });
 
-  it("records removals of Coder models the current catalog no longer lists", async () => {
+  it("keeps rows added before the one-shot migration ran and separates resubmitted legacy rows", async () => {
     await withTempConfigAsync(async (config, service) => {
-      // Provenance is lossy: a discovered model with a user-authored object
-      // override survives a catalog that temporarily omits its ID (only
-      // `models` still knows it). Deleting it in that state must still
-      // record the exclusion, or the next catalog that lists the ID again
-      // would resurrect a model the user explicitly removed.
+      // Old-code shape (catalog merged into `models`, no flag) whose startup
+      // migration is still pending — e.g. waiting for the providers-file lock.
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        coder: {
+          deploymentUrl: "https://coder.example.com",
+          models: ["anthropic/catalog-a", "anthropic/catalog-b"],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b", "anthropic/catalog-c"],
+        },
+      });
+      const coderOauth = new CoderOauthService(
+        new ProvidersConfigStore(config.rootDir),
+        new FileLeaseManager(config.rootDir),
+        service
+      );
+      // Hold the migration right BEFORE it takes the providers-file lock, so
+      // the edit below deterministically lands first and the migration then
+      // reads the edited section inside the real locked read-modify-write.
+      const realUpdateProviderSection = service.updateProviderSection.bind(service);
+      let releaseMigration!: () => void;
+      const migrationGate = new Promise<void>((resolve) => (releaseMigration = resolve));
+      let migrationWaiting!: () => void;
+      const migrationWaitingPromise = new Promise<void>((resolve) => (migrationWaiting = resolve));
+      const updateSpy = spyOn(service, "updateProviderSection").mockImplementation(
+        async (provider, update) => {
+          migrationWaiting();
+          await migrationGate;
+          return realUpdateProviderSection(provider, update);
+        }
+      );
+      try {
+        const migration = coderOauth.separateDiscoveredModelsOnce();
+        await migrationWaitingPromise;
+
+        // Settings still shows the merged list: the edit resubmits the legacy
+        // catalog-a row, adds a manual model and explicitly adds catalog-c.
+        // It stamps the flag under the lock.
+        const edit = await service.setModels("coder", [
+          "anthropic/catalog-a",
+          "anthropic/manual-model",
+          "anthropic/catalog-c",
+        ]);
+        expect(edit.success).toBe(true);
+
+        releaseMigration();
+        await migration;
+      } finally {
+        updateSpy.mockRestore();
+        await coderOauth.dispose();
+      }
+
+      // The edit separated the resubmitted legacy row exactly as the migration
+      // would; the rows it added (including a catalog ID) survive, and the
+      // resumed migration found the flag and left them untouched.
+      const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
+        ?.coder as Record<string, unknown>;
+      expect(stored.models).toEqual(["anthropic/manual-model", "anthropic/catalog-c"]);
+      expect(stored.discoveredModels).toEqual([
+        "anthropic/catalog-a",
+        "anthropic/catalog-b",
+        "anthropic/catalog-c",
+      ]);
+      expect(stored.discoveredModelsUnlisted).toBe(true);
+    });
+  });
+
+  it("separates legacy catalog rows when a Coder edit follows a failed migration", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // The startup migration failed, so Settings loaded the merged list.
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
           models: [
-            { id: "anthropic/overridden", contextWindowTokens: 100_000 },
-            "anthropic/model-a",
+            "anthropic/catalog-a",
+            { id: "anthropic/catalog-b", contextWindowTokens: 123_000 },
+            "anthropic/manual-model",
           ],
-          // The current catalog omits the overridden model's ID.
-          discoveredModels: ["anthropic/model-a"],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b"],
         },
       });
 
-      const result = await service.setModels("coder", ["anthropic/model-a"]);
-      expect(result.success).toBe(true);
+      // The user edits one row and resubmits everything else it was shown.
+      const edit = await service.setModels("coder", [
+        "anthropic/catalog-a",
+        { id: "anthropic/catalog-b", contextWindowTokens: 123_000 },
+        "anthropic/manual-model",
+        "anthropic/new-manual",
+      ]);
+      expect(edit.success).toBe(true);
+
+      // Stamping must not freeze the merged catalog row; user-authored entries stay.
       const stored = new ProvidersConfigStore(config.rootDir).loadProvidersConfig()
         ?.coder as Record<string, unknown>;
-      expect(stored.models).toEqual(["anthropic/model-a"]);
-      expect(stored.removedModels).toEqual(["anthropic/overridden"]);
+      expect(stored.models).toEqual([
+        { id: "anthropic/catalog-b", contextWindowTokens: 123_000 },
+        "anthropic/manual-model",
+        "anthropic/new-manual",
+      ]);
+      expect(stored.removedModels).toBeUndefined();
+      expect(stored.discoveredModelsUnlisted).toBe(true);
     });
   });
 
   it("keeps prior Coder removals across edits made while the catalog is unknown", async () => {
     await withTempConfigAsync(async (config, service) => {
       // Post-login state: discoveredModels deleted (catalog unknown), but a
-      // removal recorded earlier must survive an unrelated edit — otherwise
-      // the pending discovery would resurrect the removed model.
+      // legacy tombstone must survive an unrelated edit — only re-adding
+      // that model may clear it.
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         coder: {
           deploymentUrl: "https://coder.example.com",
