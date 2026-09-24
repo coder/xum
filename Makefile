@@ -90,7 +90,7 @@ include fmt.mk
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook
 .PHONY: benchmark-terminal
 .PHONY: ensure-deps mux
-.PHONY: check-eager-imports check-bundle-size check-startup
+.PHONY: check-eager-imports check-bundle-size check-startup check-react-compiler
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
 TSGO := bun run tsgo
@@ -375,7 +375,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-eager-imports check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
+static-check: lint typecheck fmt-check check-eager-imports check-react-compiler check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
 
 static-check-full: static-check check-bench-agent check-docs-links ## Run the full CI static check suite
 
@@ -673,6 +673,10 @@ clean: ## Clean build artifacts
 ## Startup Performance Checks
 check-eager-imports: ## Check for eager AI SDK imports in critical files
 	@./scripts/check_eager_imports.sh
+
+# ~3 s: compiles only the hot-path files listed in the script, so it runs in static-check.
+check-react-compiler: node_modules/.installed ## Fail when a hot renderer component stops compiling under React Compiler
+	@bun scripts/check_react_compiler_coverage.ts
 
 check-bundle-size: build ## Check that bundle sizes are within limits
 	@./scripts/check_bundle_size.sh
