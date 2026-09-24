@@ -697,6 +697,9 @@ export class ProviderService {
       const enforced = this.policyService?.isEnforced() ?? false;
       if (
         isProviderDisabledInConfig(config) ||
+        // Gateway enablement lives in config.json (see getConfig), not providers.jsonc.
+        (provider === "mux-gateway" &&
+          this.config.loadConfigOrDefault().muxGatewayEnabled === false) ||
         (enforced && !this.policyService?.isProviderAllowed(provider))
       )
         return { status: "not-configured" };
@@ -716,9 +719,9 @@ export class ProviderService {
       } else {
         if (!isBuiltInProvider(provider)) return { status: "unsupported" };
         const credentials = resolveProviderCredentials(provider, config);
-        // OAuth tokens are not API keys; Ollama alone allows explicit keyless configuration.
+        // Use this provider's resolved credentials, never a Codex OAuth or ambient SDK token.
         if (!credentials.isConfigured) return { status: "not-configured" };
-        apiKey = credentials.apiKey;
+        apiKey = provider === "mux-gateway" ? credentials.couponCode : credentials.apiKey;
         baseUrl =
           policy.forcedBaseUrl ??
           credentials.baseUrl ??
@@ -731,17 +734,19 @@ export class ProviderService {
         ? custom === "anthropic-messages"
           ? "anthropic"
           : "openai"
-        : provider === "anthropic" ||
-            provider === "google" ||
-            provider === "ollama" ||
-            provider === "openrouter"
-          ? provider
-          : "openai";
+        : provider === "mux-gateway"
+          ? "gateway"
+          : provider === "anthropic" ||
+              provider === "google" ||
+              provider === "ollama" ||
+              provider === "openrouter"
+            ? provider
+            : "openai";
       return Object.freeze({
         provider,
         providerType: custom,
         format,
-        conditional: Boolean(custom) || provider === "zai",
+        conditional: Boolean(custom) || provider === "zai" || provider === "mux-gateway",
         baseUrl,
         apiKey,
         organization,
