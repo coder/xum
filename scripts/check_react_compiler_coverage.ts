@@ -51,7 +51,6 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
  * so fixing a component forces its removal here.
  */
 const KNOWN_SKIPPED: ReadonlySet<string> = new Set([
-  "src/browser/components/ChatPane/ChatPane.tsx#ChatPaneContent",
   "src/browser/features/Messages/MessageRenderer.tsx#MessageRenderer",
   "src/browser/features/Messages/AssistantMessage.tsx#AssistantMessage",
   "src/browser/components/ProjectSidebar/ProjectSidebar.tsx#ProjectSidebarInner",
