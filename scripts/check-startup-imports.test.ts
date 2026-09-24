@@ -89,6 +89,59 @@ test("fails when an allowed package loads a banned one", async () => {
   expect(report.eagerGraphSizes).toEqual({ "src/entry.ts": { projectModules: 1, packages: 1 } });
 });
 
+test("follows the CommonJS export branch that the built main process loads", async () => {
+  await writeFiles({
+    "src/entry.ts": 'import { wrap } from "dual-pkg";\nconsole.log(wrap);\n',
+    "node_modules/dual-pkg/package.json": JSON.stringify({
+      name: "dual-pkg",
+      exports: { import: "./clean.mjs", require: "./heavy.cjs" },
+    }),
+    "node_modules/dual-pkg/clean.mjs": "export const wrap = 1;\n",
+    "node_modules/dual-pkg/heavy.cjs": 'exports.wrap = require("ai").streamText;\n',
+  });
+
+  const report = await analyze();
+
+  expect(report.violations.map((v) => v.chain)).toEqual([
+    ["src/entry.ts", "node_modules/dual-pkg/heavy.cjs", "ai"],
+  ]);
+});
+
+test("detects a banned package reached through a package alias", async () => {
+  await writeFiles({
+    "src/entry.ts": 'import { wrap } from "alias-pkg";\nconsole.log(wrap);\n',
+    "node_modules/alias-pkg/package.json": JSON.stringify({
+      name: "alias-pkg",
+      main: "index.js",
+      imports: { "#model": "ai" },
+    }),
+    "node_modules/alias-pkg/index.js": 'exports.wrap = require("#model").streamText;\n',
+    "node_modules/ai/package.json": JSON.stringify({ name: "ai", main: "index.js" }),
+    "node_modules/ai/index.js": "exports.streamText = 1;\n",
+  });
+
+  const report = await analyze();
+
+  expect(report.violations.map((v) => v.chain)).toEqual([
+    ["src/entry.ts", "node_modules/alias-pkg/index.js", "node_modules/ai/index.js"],
+  ]);
+});
+
+test("a lazy import does not make an elided static import of the same package eager", async () => {
+  await writeFiles({
+    "src/entry.ts": [
+      'import { streamText } from "ai";',
+      "export let fn: typeof streamText | undefined;",
+      'export const load = () => import("ai");',
+      "",
+    ].join("\n"),
+  });
+
+  const report = await analyze();
+
+  expect(report.violations).toEqual([]);
+});
+
 test("passes when banned packages are only reached lazily or as types", async () => {
   await writeFiles({
     "src/entry.ts": [

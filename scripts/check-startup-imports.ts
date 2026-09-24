@@ -22,6 +22,10 @@
  *   packages load their dependencies with top-level `require()`. A `require()` inside
  *   a function is counted too, which errs on the side of reporting.
  *
+ * Known limitation: a module-scope `import()` (e.g. `const p = import("ai")`) starts
+ * loading at startup but is treated as lazy, because the metafile does not say where
+ * the call sits. Keep dynamic imports inside the functions that need them.
+ *
  * Run: bun scripts/check-startup-imports.ts
  */
 import assert from "node:assert/strict";
@@ -93,6 +97,14 @@ const BUILTIN_MODULES = new Set(builtinModules);
 /** Packages provided by the runtime rather than loaded from node_modules. */
 const RUNTIME_PROVIDED_PACKAGES = new Set(["electron"]);
 
+/** Marks the nested build.resolve() call so the plugin does not recurse into itself. */
+const CJS_RESOLVE = Symbol("cjs-resolve");
+
+/** Owning package of a resolved node_modules path ("node_modules/@a/b/x.js" -> "@a/b"). */
+function packageNameOfFile(file: string): string {
+  return packageNameOf(file.split("node_modules/").pop()!);
+}
+
 function isInNodeModules(file: string): boolean {
   return file.startsWith("node_modules/") || file.includes("/node_modules/");
 }
@@ -127,9 +139,13 @@ export async function analyzeStartupImports(options: {
 
   // esbuild lists imports it elided (type-only or unused bindings) in the metafile as
   // unresolved externals without calling onResolve. Record the banned imports that were
-  // really resolved so elided ones are not mistaken for eager loads.
+  // really resolved so elided ones are not mistaken for eager loads. The kind is part of
+  // the key: a lazy `import("ai")` must not vouch for an elided static import of "ai".
   const resolvedBannedImports = new Set<string>();
-  const edgeKey = (importer: string, specifier: string) => `${importer}\0${specifier}`;
+  const edgeKey = (importer: string, kind: string, specifier: string) =>
+    `${importer}\0${kind}\0${specifier}`;
+  const toProjectPath = (file: string) =>
+    path.relative(options.rootDir, file).split(path.sep).join("/");
 
   const result = await esbuild.build({
     absWorkingDir: options.rootDir,
@@ -147,8 +163,8 @@ export async function analyzeStartupImports(options: {
       {
         name: "externalize-banned-and-builtin",
         setup(build) {
-          build.onResolve({ filter: /.*/ }, (args) => {
-            if (!isBareSpecifier(args.path)) return undefined;
+          build.onResolve({ filter: /.*/ }, async (args) => {
+            if (!isBareSpecifier(args.path) || args.pluginData === CJS_RESOLVE) return undefined;
             const packageName = packageNameOf(args.path);
             if (args.path.startsWith("node:") || BUILTIN_MODULES.has(packageName)) {
               return { path: args.path, external: true };
@@ -156,15 +172,23 @@ export async function analyzeStartupImports(options: {
             if (RUNTIME_PROVIDED_PACKAGES.has(packageName)) {
               return { path: args.path, external: true };
             }
+            const importer = toProjectPath(args.importer);
             if (isBannedPackage(packageName, options.banned)) {
-              const importer = path
-                .relative(options.rootDir, args.importer)
-                .split(path.sep)
-                .join("/");
-              resolvedBannedImports.add(edgeKey(importer, args.path));
+              resolvedBannedImports.add(edgeKey(importer, args.kind, args.path));
               return { path: args.path, external: true };
             }
-            // Allowed package: let esbuild resolve it so its own imports are walked.
+            // Allowed package: resolve it so its own imports are walked. tsc emits project
+            // code as CommonJS, so Node loads the package's "require" export branch even
+            // for a source `import`; esbuild would pick the "import" branch.
+            if (args.kind === "import-statement" && !isInNodeModules(importer)) {
+              const resolved = await build.resolve(args.path, {
+                kind: "require-call",
+                importer: args.importer,
+                resolveDir: args.resolveDir,
+                pluginData: CJS_RESOLVE,
+              });
+              if (resolved.errors.length === 0) return { path: resolved.path };
+            }
             return undefined;
           });
         },
@@ -192,14 +216,24 @@ export async function analyzeStartupImports(options: {
           imp.kind === "import-statement" || (fromPackage && imp.kind === "require-call");
         if (!eager) continue;
         const specifier = imp.original ?? imp.path;
+        let bannedPackage: string | undefined;
         if (imp.external) {
-          if (!resolvedBannedImports.has(edgeKey(file, specifier))) continue;
-          const packageName = packageNameOf(specifier);
-          if (reported.has(packageName)) continue;
-          reported.add(packageName);
-          const chain = [specifier];
+          if (!resolvedBannedImports.has(edgeKey(file, imp.kind, specifier))) continue;
+          bannedPackage = packageNameOf(specifier);
+        } else if (
+          isInNodeModules(imp.path) &&
+          isBannedPackage(packageNameOfFile(imp.path), options.banned)
+        ) {
+          // Reached through an alias (e.g. a package.json "imports" entry) rather than
+          // the banned package's own name.
+          bannedPackage = packageNameOfFile(imp.path);
+        }
+        if (bannedPackage != null) {
+          if (reported.has(bannedPackage)) continue;
+          reported.add(bannedPackage);
+          const chain = [imp.external ? specifier : imp.path];
           for (let at: string | undefined = file; at != null; at = parent.get(at)) chain.push(at);
-          report.violations.push({ entry, packageName, chain: chain.reverse() });
+          report.violations.push({ entry, packageName: bannedPackage, chain: chain.reverse() });
         } else if (!visited.has(imp.path)) {
           visited.add(imp.path);
           parent.set(imp.path, file);
@@ -210,8 +244,7 @@ export async function analyzeStartupImports(options: {
     const packageFiles = [...visited].filter(isInNodeModules);
     report.eagerGraphSizes[entry] = {
       projectModules: visited.size - packageFiles.length,
-      packages: new Set(packageFiles.map((f) => packageNameOf(f.split("node_modules/").pop()!)))
-        .size,
+      packages: new Set(packageFiles.map(packageNameOfFile)).size,
     };
   }
   return report;
