@@ -11,7 +11,7 @@ jest.mock("lottie-react", () => ({
   __esModule: true,
   default: () => null,
 }));
-import { act, waitFor } from "@testing-library/react";
+import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getInputAttachmentsKey, getReviewsKey } from "@/common/constants/storage";
@@ -56,6 +56,17 @@ const composerText = (app: AppHarness) =>
     .map((section) => section.textContent ?? "")
     .join("\n");
 const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1;
+/** The composer review panel's "Detach from message" button for the note with this text. */
+const detachButtonForNote = (app: AppHarness, note: string) => {
+  const block = [
+    ...app.view.container.querySelectorAll('[data-component="ChatInputSection"] .group\\/review'),
+  ].find((element) => element.textContent?.includes(note));
+  const button = block?.querySelector<HTMLButtonElement>(
+    'button[aria-label="Detach from message"]'
+  );
+  if (button == null) throw new Error(`No detach button for ${note}`);
+  return button;
+};
 
 /** Attach one note in the review store, as the review panel does, and wait for the composer. */
 async function attachStoreReview(app: AppHarness, id: string, data: ReviewNoteData) {
@@ -141,7 +152,7 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
     await preloadTestModules();
   });
 
-  test("a newer rich draft is kept after the restored message; sending sends everything once and leaves nothing behind", async () => {
+  test("a newer rich draft is kept after the restored message; restored notes stay in sync with the review store and sending sends exactly the surviving notes once", async () => {
     const app = await createAppHarness({ branchPrefix: "stop-restore-merge" });
     try {
       const { session, holding } = await queueRichComposerMessage(app);
@@ -159,12 +170,50 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
         LOAD_TOLERANT_WAIT.timeout
       );
       expect(composerAttachmentNames(app)).toEqual(["queued.txt", "draft.txt"]);
+      // The restored note joins the draft's note in the review store (not a detached copy).
+      await waitFor(
+        () => expect(attachedStoreReviewNotes(app)).toEqual(["draft note", "queued note"]),
+        LOAD_TOLERANT_WAIT
+      );
       await waitFor(() => {
         expect(composerText(app)).toContain("queued note");
         expect(composerText(app)).toContain("draft note");
       }, LOAD_TOLERANT_WAIT);
 
-      // Sending the merged draft sends both texts, both files and each note exactly once.
+      // Later review actions keep working on every note: a new note attached afterwards shows,
+      // an edit made in the review store shows, and detaching one from the composer removes it.
+      await attachStoreReview(app, "review-late", review("late note"));
+      act(() => {
+        const state = readPersistedState<{
+          reviews: Record<string, { status: string; data: ReviewNoteData }>;
+        }>(getReviewsKey(app.workspaceId), { reviews: {} });
+        const [queuedId] = Object.entries(state.reviews).find(
+          // The queued send checked its original copy off; edit the restored, attached one.
+          ([, entry]) => entry.status === "attached" && entry.data.userNote === "queued note"
+        )!;
+        updatePersistedState(getReviewsKey(app.workspaceId), {
+          ...state,
+          reviews: {
+            ...state.reviews,
+            [queuedId]: {
+              ...state.reviews[queuedId],
+              data: { ...state.reviews[queuedId].data, userNote: "queued note, edited" },
+            },
+          },
+          lastUpdated: Date.now(),
+        });
+      });
+      await waitFor(
+        () => expect(composerText(app)).toContain("queued note, edited"),
+        LOAD_TOLERANT_WAIT
+      );
+      fireEvent.click(detachButtonForNote(app, "draft note"));
+      await waitFor(
+        () => expect(composerText(app)).not.toContain("draft note"),
+        LOAD_TOLERANT_WAIT
+      );
+
+      // Sending sends both texts, both files and each surviving note exactly once.
       await app.chat.send("queued follow-up\n\nnewer draft");
       const [sent] = await waitFor(async () => {
         const rows = await userRowsContaining(app, "newer draft");
@@ -172,24 +221,28 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
         return rows;
       }, LOAD_TOLERANT_WAIT);
       expect(sent.text).toContain("queued follow-up");
-      expect(countOccurrences(sent.text, formatReviewForModel(review("queued note")))).toBe(1);
-      expect(countOccurrences(sent.text, formatReviewForModel(review("draft note")))).toBe(1);
+      expect(countOccurrences(sent.text, formatReviewForModel(review("queued note, edited")))).toBe(
+        1
+      );
+      expect(countOccurrences(sent.text, formatReviewForModel(review("late note")))).toBe(1);
+      expect(countOccurrences(sent.text, formatReviewForModel(review("draft note")))).toBe(0);
       expect(sent.files).toEqual(["queued.txt", "draft.txt"]);
 
-      // Nothing the send consumed comes back into the composer.
+      // Nothing the send consumed, and nothing the user removed, comes back into the composer.
       await app.chat.expectInputValue("", LOAD_TOLERANT_WAIT.timeout);
       expect(composerAttachmentNames(app)).toEqual([]);
       await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
       await waitFor(() => {
-        expect(composerText(app)).not.toContain("queued note");
-        expect(composerText(app)).not.toContain("draft note");
+        for (const note of ["queued note", "late note", "draft note"]) {
+          expect(composerText(app)).not.toContain(note);
+        }
       }, LOAD_TOLERANT_WAIT);
     } finally {
       await app.dispose();
     }
   }, 120_000);
 
-  test("notes a send in flight is carrying stay with that send and are not restored as draft", async () => {
+  test("a restore during a send in flight leaves that send's notes to it and keeps the restored notes for the next send", async () => {
     const app = await createAppHarness({ branchPrefix: "stop-restore-inflight" });
     try {
       const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
@@ -209,6 +262,7 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
       });
       await app.chat.expectInputValue("restored", LOAD_TOLERANT_WAIT.timeout);
 
+      // The in-flight send settles and checks off only the note it carried.
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
       await waitFor(async () => {
         const rows = await userRowsContaining(app, "in flight");
@@ -216,16 +270,34 @@ describe("Stop restores a queued message without losing a newer draft (#4431)", 
         expect(countOccurrences(rows[0].text, formatReviewForModel(review("in-flight note")))).toBe(
           1
         );
+        expect(countOccurrences(rows[0].text, formatReviewForModel(review("restored note")))).toBe(
+          0
+        );
       }, LOAD_TOLERANT_WAIT);
-      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
+      await app.chat.expectStreamComplete();
+      await waitFor(
+        () => expect(attachedStoreReviewNotes(app)).toEqual(["restored note"]),
+        LOAD_TOLERANT_WAIT
+      );
       await waitFor(() => {
         expect(composerText(app)).toContain("restored note");
         expect(composerText(app)).not.toContain("in-flight note");
       }, LOAD_TOLERANT_WAIT);
+
+      // The restored draft then sends its own note once, and not the earlier one.
+      await app.chat.send("restored");
+      const [sent] = await waitFor(async () => {
+        const rows = await userRowsContaining(app, "restored");
+        expect(rows).toHaveLength(1);
+        return rows;
+      }, LOAD_TOLERANT_WAIT);
+      expect(countOccurrences(sent.text, formatReviewForModel(review("restored note")))).toBe(1);
+      expect(countOccurrences(sent.text, formatReviewForModel(review("in-flight note")))).toBe(0);
+      await waitFor(() => expect(attachedStoreReviewNotes(app)).toEqual([]), LOAD_TOLERANT_WAIT);
     } finally {
       await app.dispose();
     }
-  }, 90_000);
+  }, 120_000);
 
   test("an empty composer gets exactly the queued message back", async () => {
     const app = await createAppHarness({ branchPrefix: "stop-restore-empty" });

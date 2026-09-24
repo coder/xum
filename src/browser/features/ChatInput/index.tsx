@@ -475,7 +475,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { getDraft, setDraft, preEditDraftRef, preEditReviewsRef } = draft;
   const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
   const { removeDraftReview, updateDraftReviewNote, storageKeys, latestInputValueRef } = draft;
-  const { prependRestoredReviews } = draft;
   const {
     processingAttachmentCount,
     handlePaste,
@@ -493,6 +492,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const workspaceIdForComposerClear = variant === "workspace" ? props.workspaceId : null;
   const onDetachAllReviewsForComposerClear =
     variant === "workspace" ? props.onDetachAllReviews : undefined;
+  const onAddReviewForRestore = variant === "workspace" ? props.onAddReview : undefined;
 
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
@@ -1444,9 +1444,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (restoredAttachments.length > 0) {
           setAttachments((current) => [...restoredAttachments, ...current]);
         }
-        // Notes attached in the review store are hidden and still owned by a send in flight;
-        // they are not part of the draft.
-        prependRestoredReviews(restoredPending.reviews, hideReviewsDuringSend);
+        if (restoredPending.reviews.length > 0) {
+          if (draftReviews === null && onAddReviewForRestore) {
+            // The draft's notes live in the review store: add the restored ones there too, as
+            // new attached notes. A detached copy in the override would hide later store
+            // changes, and a send in flight checks off only the notes it captured, not these.
+            // Called here, not in a state updater, which may run more than once.
+            for (const review of restoredPending.reviews) onAddReviewForRestore(review);
+          } else {
+            // An active override (e.g. a queued-message edit) owns the composer's notes.
+            setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
+          }
+        }
         focusMessageInput();
       } else if (mode === "replace") {
         if (editingMessageForUi) {
@@ -1484,8 +1493,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     workspaceIdForComposerClear,
     setInput,
     setAttachments,
-    prependRestoredReviews,
-    hideReviewsDuringSend,
+    draftReviews,
+    setDraftReviews,
+    onAddReviewForRestore,
     focusMessageInput,
   ]);
 

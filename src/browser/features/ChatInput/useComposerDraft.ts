@@ -119,12 +119,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     ? draftReviewItems
     : attachedReviews.map((review) => review.data);
   const reviewData = reviews.length > 0 ? reviews : undefined;
-  // Under an override, only notes folded in from the review store (prependRestoredReviews) keep
-  // their store IDs; a send checks exactly those off, so they cannot reappear after it.
-  const attachedReviewIds = new Set(attachedReviews.map(({ id }) => id));
-  const reviewIdsForCheck = reviewOverrideActive
-    ? draftReviewItems.map(idForReview).filter((id) => attachedReviewIds.has(id))
-    : attachedReviews.map(({ id }) => id);
+  const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map(({ id }) => id);
   const reviewPanelItems = reviewOverrideActive
     ? draftReviewItems.map((data) => ({
         id: idForReview(data),
@@ -133,29 +128,6 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
         createdAt: 0,
       }))
     : attachedReviews;
-  /**
-   * Put restored reviews (a queued message returned by Stop, #4431) in front of the composer's
-   * current reviews, dropping and duplicating neither. Reviews shown from the review store move
-   * into the override with their store IDs, so the send that carries them also checks them off.
-   * `storeReviewsInFlight`: the store's attached notes belong to a send in flight (hidden until
-   * it settles and checked off by it), so they are not part of the draft.
-   */
-  const prependRestoredReviews = (
-    restored: ReviewNoteDataForDisplay[],
-    storeReviewsInFlight: boolean
-  ) => {
-    if (restored.length === 0) return;
-    setDraftReviews((previous) => {
-      if (previous !== null) return [...restored, ...previous];
-      const fromStore = storeReviewsInFlight
-        ? []
-        : attachedReviews.map((review) => {
-            draftReviewIdsRef.current.set(review.data, review.id);
-            return review.data;
-          });
-      return [...restored, ...fromStore];
-    });
-  };
   const getDraft = () => ({ text: input, attachments });
   const setDraft = (draft: { text: string; attachments: ChatAttachment[] }) => {
     setInput(draft.text);
@@ -180,7 +152,6 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
     reviewData,
     reviewIdsForCheck,
     reviewPanelItems,
-    prependRestoredReviews,
     removeDraftReview: (reviewId: string) => mutateDraftReview(reviewId),
     updateDraftReviewNote: mutateDraftReview,
   };
