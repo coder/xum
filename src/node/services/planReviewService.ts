@@ -404,11 +404,18 @@ export async function preparePlanReviewFeedback(
   // snapshot, whose additionalSystemInstructions/providerOptions are unbounded); refuse before
   // sendMessage writes a row the history scanners would skip as unreadable (which would also
   // silently drop the user's feedback from provider requests).
+  // AgentSession also stamps the (trimmed, otherwise unbounded) ACP prompt id on the user row and
+  // on an on-send compaction request row, so it counts toward both shapes below.
+  const acpPromptId =
+    typeof options.acpPromptId === "string" && options.acpPromptId.trim().length > 0
+      ? options.acpPromptId.trim()
+      : undefined;
   const rowBytes = measurePersistedRowBytes(
     createMuxMessage(createUserMessageId(), "user", text, {
       timestamp: Date.now(),
       toolPolicy: options.toolPolicy,
       retrySendOptions: pickStartupRetrySendOptions(options),
+      ...(acpPromptId !== undefined ? { acpPromptId } : {}),
       muxMetadata,
     }),
     workspaceId

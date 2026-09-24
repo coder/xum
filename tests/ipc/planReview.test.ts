@@ -981,6 +981,19 @@ describeIntegration("workspace.planReview", () => {
     expect(
       tail.success && tail.data[0]?.metadata?.retrySendOptions?.additionalSystemInstructions
     ).toBeUndefined();
+
+    // The ACP prompt id is stamped on the persisted row as metadata.acpPromptId and is unbounded
+    // at the API too, so an oversized one must also be refused before anything is written.
+    const heavyAcpId = await planReview().submitFeedback({
+      workspaceId,
+      snapshotId: snapshot.snapshotId,
+      comments: [{ anchor, quote: "# Plan A", body: "small body" }],
+      replies: [],
+      options: { ...options, acpPromptId: "p".repeat(1024 * 1024 + 1) },
+    });
+    expect(!heavyAcpId.success && heavyAcpId.error.type).toBe("feedback_too_large");
+    expect(fixture.requests.length).toBe(requestsBefore);
+    expect((await getState()).feedbacks.length).toBe(feedbacksBefore);
   }, 60_000);
   test("a persisted plan-review row with malformed parts cannot brick getState", async () => {
     // Valid JSON, valid discriminator, but `parts` is null: the full-history reader hands it to
