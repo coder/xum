@@ -16850,45 +16850,138 @@ describe("WorkspaceService shared-checkout tasks and owner renames", () => {
     expect(config.findWorkspace(childId)?.workspacePath).toBe(ownerPath);
   });
 
-  test("shared children follow an owner rename and removing one keeps the renamed checkout", async () => {
-    const emittedChildPaths: Array<string | undefined> = [];
-    workspaceService.on(
-      "metadata",
-      (event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => {
-        if (event.workspaceId === childId) {
-          emittedChildPaths.push(event.metadata?.namedWorkspacePath);
+  // Prep-stack compatibility with #4387: a host-local shared child is a protected agent-task
+  // footprint (whatever its status), so the owner rename #4387 carries shared children through
+  // is refused before any effect. #4387's follow survives where no protected footprint is
+  // involved (an off-host owner and child: workspaceService.structuralMutationGuard.test.ts) and
+  // in load-time re-derivation (taskCheckoutPreparation.test.ts).
+  const persistedRows = () =>
+    structuredClone(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces ?? []);
+  async function seedSessions(): Promise<void> {
+    for (const id of [ownerId, childId]) {
+      const appended = await historyService.appendToHistory(
+        id,
+        createMuxMessage(`kept-${id}`, "user", `session of ${id}`)
+      );
+      expect(appended.success).toBe(true);
+    }
+  }
+  async function expectSessionsKept(): Promise<void> {
+    for (const id of [ownerId, childId]) {
+      const history = await historyService.getHistoryFromLatestBoundary(id);
+      expect(history.success && history.data.map((message) => message.id)).toEqual([`kept-${id}`]);
+    }
+  }
+  const renamedOwnerPath = () =>
+    runtimeFactory
+      .createRuntime({ type: "worktree", srcBaseDir: config.srcDir }, { projectPath })
+      .getWorkspacePath(projectPath, "renamed-parent");
+
+  test.each(["reported", "running"] as const)(
+    "renaming an owner whose checkout a %s shared child uses is refused; rows, checkout and sessions are preserved",
+    async (childTaskStatus) => {
+      await config.editConfig((cfg) => {
+        const child = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === childId);
+        if (child) child.taskStatus = childTaskStatus;
+        return cfg;
+      });
+      await seedSessions();
+      // Read-time metadata migration persists missing createdAt stamps (main behavior, not an
+      // effect of the refused mutation): run it before the snapshot.
+      await config.getAllWorkspaceMetadata();
+      const rowsBefore = persistedRows();
+      const emittedChildPaths: Array<string | undefined> = [];
+      workspaceService.on(
+        "metadata",
+        (event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => {
+          if (event.workspaceId === childId) {
+            emittedChildPaths.push(event.metadata?.namedWorkspacePath);
+          }
         }
-      }
-    );
-    const renamed = await workspaceService.rename(ownerId, "renamed-parent");
-    expect(renamed.success).toBe(true);
-    const renamedOwnerPath = config.findWorkspace(ownerId)?.workspacePath;
-    if (renamedOwnerPath == null) throw new Error("renamed owner is missing from config");
-    expect(renamedOwnerPath).not.toBe(ownerPath);
-    expect(config.findWorkspace(childId)?.workspacePath).toBe(renamedOwnerPath);
-    expect(emittedChildPaths).toEqual([renamedOwnerPath]);
+      );
 
-    const removed = await workspaceService.remove(childId, true);
+      const renamed = await workspaceService.rename(ownerId, "renamed-parent");
 
-    expect(removed.success).toBe(true);
-    expect(config.findWorkspace(childId)).toBeNull();
-    expect(existsSync(path.join(renamedOwnerPath, "README.md"))).toBe(true);
-  });
+      expect(renamed.success).toBe(false);
+      if (!renamed.success) expect(renamed.error).toContain(`"${childId}"`);
+      // Rows (paths, parent link, isolation, status and any preparation data) are untouched.
+      expect(persistedRows()).toEqual(rowsBefore);
+      expect(config.findWorkspace(childId)?.workspacePath).toBe(ownerPath);
+      expect(emittedChildPaths).toEqual([]);
+      // The checkout never moved.
+      expect(existsSync(path.join(ownerPath, "README.md"))).toBe(true);
+      expect(existsSync(renamedOwnerPath())).toBe(false);
+      await expectSessionsKept();
+    }
+  );
 
-  test("removing a renamed owner keeps the checkout an active shared child still uses", async () => {
-    expect((await workspaceService.rename(ownerId, "renamed-parent")).success).toBe(true);
-    const renamedOwnerPath = config.findWorkspace(ownerId)?.workspacePath;
-    if (renamedOwnerPath == null) throw new Error("renamed owner is missing from config");
+  test.each(["reported", "running"] as const)(
+    "removing the owner or its %s shared child is refused; rows, checkout and sessions are preserved",
+    async (childTaskStatus) => {
+      await config.editConfig((cfg) => {
+        const child = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === childId);
+        if (child) child.taskStatus = childTaskStatus;
+        return cfg;
+      });
+      await seedSessions();
+      // Read-time metadata migration persists missing createdAt stamps (main behavior, not an
+      // effect of the refused mutation): run it before the snapshot.
+      await config.getAllWorkspaceMetadata();
+      const rowsBefore = persistedRows();
+
+      const removedChild = await workspaceService.remove(childId, true);
+      const removedOwner = await workspaceService.remove(ownerId, true);
+
+      expect(removedChild.success).toBe(false);
+      if (!removedChild.success) expect(removedChild.error).toContain(`"${childId}"`);
+      expect(removedOwner.success).toBe(false);
+      if (!removedOwner.success) expect(removedOwner.error).toContain(`"${childId}"`);
+      expect(persistedRows()).toEqual(rowsBefore);
+      expect(existsSync(path.join(ownerPath, "README.md"))).toBe(true);
+      await expectSessionsKept();
+    }
+  );
+
+  test("an unrelated workspace without a protected footprint still renames: its checkout moves", async () => {
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = runtimeFactory.createRuntime(runtimeConfig, { projectPath });
+    const created = await runtime.createWorkspace({
+      projectPath,
+      branchName: "unrelated",
+      trunkBranch: "main",
+      directoryName: "unrelated",
+      initLogger: {
+        logStep: () => undefined,
+        logStdout: () => undefined,
+        logStderr: () => undefined,
+        logComplete: () => undefined,
+        enterHookPhase: () => undefined,
+      },
+    });
+    expect(created.success).toBe(true);
+    const unrelatedPath = runtime.getWorkspacePath(projectPath, "unrelated");
     await config.editConfig((cfg) => {
-      const child = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === childId);
-      if (child) child.taskStatus = "running";
+      cfg.projects
+        .get(projectPath)
+        ?.workspaces.push({
+          id: "unrelated-ws",
+          name: "unrelated",
+          path: unrelatedPath,
+          runtimeConfig,
+        });
       return cfg;
     });
 
-    const removed = await workspaceService.remove(ownerId, true);
+    const renamed = await workspaceService.rename("unrelated-ws", "unrelated-renamed");
 
-    expect(removed.success).toBe(true);
-    expect(existsSync(path.join(renamedOwnerPath, "README.md"))).toBe(true);
+    expect(renamed.success).toBe(true);
+    const movedPath = runtime.getWorkspacePath(projectPath, "unrelated-renamed");
+    expect(config.findWorkspace("unrelated-ws")?.workspacePath).toBe(movedPath);
+    expect(existsSync(path.join(movedPath, "README.md"))).toBe(true);
+    expect(existsSync(unrelatedPath)).toBe(false);
+    // The protected owner and its shared child are untouched.
+    expect(config.findWorkspace(childId)?.workspacePath).toBe(ownerPath);
+    expect(config.findWorkspace(ownerId)?.workspacePath).toBe(ownerPath);
   });
 });
 

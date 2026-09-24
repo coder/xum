@@ -950,6 +950,30 @@ describe("WorkspaceService structural mutation guard", () => {
       return task;
     };
 
+    // #4387 compatibility: an off-host shared child is outside the checkout-preparation protocol
+    // (no protected footprint), so an off-host owner rename still carries it along — the only
+    // rename path on which #4387's follow remains reachable under the prep stack.
+    test("an off-host owner with an off-host shared child still renames, and the child follows (#4387)", async () => {
+      const remote = row("remote", ROOT_ID, { runtimeConfig: remoteRuntime() });
+      const sharedChild = taskRow("agent_remote_shared", TASK_ID, {
+        runtimeConfig: remoteRuntime(),
+        path: remote.path,
+        taskIsolation: "none",
+      });
+      await seed([row("other", "root-ws-other"), remote, sharedChild]);
+
+      expect(await service.rename(ROOT_ID, "remote-renamed")).toMatchObject({ success: true });
+
+      expect(physical.renamed).toEqual([{ from: remote.path, to: checkoutPath("remote-renamed") }]);
+      expect(persistedRow(ROOT_ID)?.path).toBe(checkoutPath("remote-renamed"));
+      expect(persistedRow(TASK_ID)).toMatchObject({
+        path: checkoutPath("remote-renamed"),
+        parentWorkspaceId: ROOT_ID,
+        taskIsolation: "none",
+      });
+      expect(await exists(path.join(sessionDir(TASK_ID), "chat.jsonl"))).toBe(true);
+    });
+
     test("a same-id row published after the guard refuses the removal before any effect", async () => {
       const remote = row("remote", ROOT_ID, { runtimeConfig: remoteRuntime() });
       await seed([row("other", "root-ws-other"), remote]);
