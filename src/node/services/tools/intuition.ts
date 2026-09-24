@@ -26,6 +26,7 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
   );
   const ctx = memoryScopeContextFromToolConfig(config);
   const hooks = deriveToolHookConfig(config) ?? undefined;
+  const createEvaluationModel = runtime.createEvaluationModel;
 
   return tool({
     description: TOOL_DEFINITIONS.intuition.description,
@@ -53,6 +54,10 @@ export const createIntuitionTool: ToolFactory = (config: ToolConfiguration) => {
           createModel: () => runtime.createModel(model),
           hooks,
           resolveAgentBody: () => runtime.resolveAgentBody(),
+          createEvaluationModel: createEvaluationModel
+            ? () => createEvaluationModel(model)
+            : undefined,
+          evaluationService: runtime.evaluationService,
           modelString: model,
           thinkingLevel: runtime.thinkingLevel,
           memoryService,

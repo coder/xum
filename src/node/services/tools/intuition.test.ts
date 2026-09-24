@@ -1,7 +1,11 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import {
+  Experimental_EvaluationMockModelV4,
+  MockLanguageModelV3,
+  simulateReadableStream,
+} from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import type { Tool } from "ai";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -15,6 +19,9 @@ import { Config } from "@/node/config";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { MemoryService } from "@/node/services/memoryService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
+import { EVAL_WHY } from "@/node/services/memoryIntuitionEvaluation";
+import { Ok } from "@/common/types/result";
 import { createIntuitionTool } from "./intuition";
 import { memoryScopeContextFromToolConfig } from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
@@ -115,6 +122,55 @@ async function fixture(empty = false, thinkingLevel?: ThinkingLevel, metadataMod
   };
 }
 
+/** Evaluation recall: rows mentioning the remembered file or its text score high. */
+function withEvaluator(
+  f: Awaited<ReturnType<typeof fixture>>,
+  onEvaluate?: () => PromiseLike<never> | undefined
+) {
+  const model = new Experimental_EvaluationMockModelV4({
+    provider: "openai",
+    modelId: "evaluator",
+    supportedQuestionTypes: ["boolean"],
+    doEvaluate: (options) => {
+      const stalled = onEvaluate?.();
+      if (stalled) return stalled;
+      const state = options.state as { memories?: object[]; excerpts?: object[] };
+      const rows = (state.memories ?? state.excerpts ?? []) as Array<{ id: string }>;
+      return Promise.resolve({
+        answers: Object.fromEntries(
+          rows.map((row) => [
+            row.id,
+            {
+              type: "boolean" as const,
+              probability: /remembered|locks/.test(JSON.stringify(row)) ? 0.9 : 0.5,
+            },
+          ])
+        ),
+        usage: { inputTokens: 50, outputTokens: 5 },
+        warnings: [],
+      });
+    },
+  });
+  const createEvaluationModel = mock((modelString: string) =>
+    Promise.resolve(
+      Ok({
+        model,
+        modelString,
+        effectiveModelString: modelString,
+        wireProviderName: "openai" as const,
+        metadataModel: "openai:evaluator-pricing",
+        routeKind: "direct" as const,
+        configFingerprint: "fixture",
+      })
+    )
+  );
+  Object.assign(f.config.intuitionRuntime, {
+    createEvaluationModel,
+    evaluationService: makeEvaluationService(),
+  });
+  return createEvaluationModel;
+}
+
 async function execute(tool: Tool, abortSignal?: AbortSignal) {
   expect(tool.execute).toBeDefined();
   return IntuitionToolResultSchema.parse(
@@ -150,6 +206,45 @@ describe("intuition tool", () => {
       usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
       providerMetadata: { anthropic: { cacheCreationInputTokens: 4 } },
     });
+  });
+
+  it("returns evaluation recall in the public shape and records only recognized paths", async () => {
+    using f = await fixture();
+    const createEvaluationModel = withEvaluator(f);
+    const result = await execute(createIntuitionTool(f.config));
+    expect(result).toMatchObject({
+      kind: "recognized",
+      memories: [{ path: rememberedPath, relevance: 0.9, excerpt: memory.excerpt, why: EVAL_WHY }],
+      candidates: [{ path: candidatePath, relevance: 0.5 }],
+      stats: { steps: 2 },
+    });
+    expect(createEvaluationModel).toHaveBeenCalledWith(f.config.intuitionRuntime.modelString);
+    expect(f.createModel).not.toHaveBeenCalled();
+    expect([...(await f.meta.getEntries()).keys()]).toEqual(["global:remembered.md"]);
+    expect(f.reportModelUsage).toHaveBeenCalledTimes(1);
+    expect(f.reportModelUsage.mock.calls[0][0]).toMatchObject({
+      toolName: "intuition",
+      model: f.config.intuitionRuntime.modelString,
+      metadataModel: "openai:evaluator-pricing",
+      usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+    });
+  });
+
+  it("reports caller cancellation during an evaluation request as cancelled", async () => {
+    using f = await fixture();
+    withEvaluator(f, () => {
+      f.controller.abort();
+      return new Promise<never>(() => {
+        /* stalled provider */
+      });
+    });
+    expect(await execute(createIntuitionTool(f.config))).toEqual({
+      kind: "error",
+      isError: true,
+      message: "Intuition request cancelled.",
+    });
+    expect(f.createModel).not.toHaveBeenCalled();
+    expect((await f.meta.getEntries()).size).toBe(0);
   });
 
   it("passes creation-time provider options for required reasoning while keeping ordinary thinking off", async () => {

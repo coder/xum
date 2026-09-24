@@ -808,6 +808,11 @@ class LocalMemoryStore implements MemoryStore {
 
 const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 
+/** Memory body without its leading YAML frontmatter (the index already carries the description). */
+export function stripMemoryFrontmatter(content: string): string {
+  return content.replace(FRONTMATTER_PATTERN, "");
+}
+
 /**
  * Extract a sanitized single-line description from optional YAML frontmatter.
  * Self-healing: malformed frontmatter yields an empty description.
