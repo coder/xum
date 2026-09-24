@@ -17,6 +17,7 @@ import {
 } from "@/common/types/workspaceTurn";
 import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 export type { WorkspaceTurnFinalMessageRef };
 
@@ -148,7 +149,10 @@ export class TaskHandleStore {
     this.assertValidRecord(record);
     const dir = this.getOwnerHandleDir(record.ownerWorkspaceId);
     await fsPromises.mkdir(dir, { recursive: true });
-    await fsPromises.writeFile(
+    // Replace atomically. Waiters, task_await and task_list read handles without the settlement
+    // lock, and a truncate-then-write update let them see an empty file, which reads as a missing
+    // handle ("Workspace turn not found or out of scope", coder/xum#4410).
+    await writeFileAtomic(
       this.getHandlePath(record.ownerWorkspaceId, record.handleId),
       JSON.stringify(record, null, 2)
     );

@@ -52,7 +52,6 @@ import {
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
 import { onError } from "@orpc/server";
-import { router } from "../node/orpc/router";
 import { formatOrpcError } from "../node/orpc/formatOrpcError";
 import { ServerLockfile } from "../node/services/serverLockfile";
 import "disposablestack/auto";
@@ -204,14 +203,14 @@ import { log } from "@/node/services/log";
 
 // IMPORTANT: Lazy-load heavy dependencies to maintain fast startup time
 //
-// To keep startup time under 4s, avoid importing AI SDK packages at the top level.
-// These files MUST use dynamic import():
-//   - main.ts, config.ts, preload.ts (startup-critical)
+// To keep startup time under 4s, nothing this file imports statically (directly or
+// transitively) may load AI SDK packages. Load them via dynamic import() instead:
 //
 // ✅ GOOD: const { createAnthropic } = await import("@ai-sdk/anthropic");
 // ❌ BAD:  import { createAnthropic } from "@ai-sdk/anthropic";
 //
-// Enforcement: scripts/check_eager_imports.sh validates this in CI
+// Enforcement: scripts/check-startup-imports.ts (make static-check) walks the static
+// import graph of this file and fails on banned packages.
 //
 // Lazy-load Config and ServiceContainer to avoid loading heavy AI SDK dependencies at startup
 // These will be loaded on-demand when createWindow() is called
@@ -758,10 +757,14 @@ async function loadServices(): Promise<void> {
     { createConfigStores },
     { ServiceContainer: ServiceContainerClass },
     { TerminalWindowManager: TerminalWindowManagerClass },
+    { router },
   ] = await Promise.all([
     import("../node/config"),
     import("../node/services/serviceContainer"),
     import("./terminalWindowManager"),
+    // The oRPC router statically reaches every handler (and the `ai` package via
+    // workspaceTitleGenerator), so it must stay off the pre-splash import path.
+    import("../node/orpc/router"),
   ]);
   /* eslint-enable no-restricted-syntax */
   const stores = createConfigStores();

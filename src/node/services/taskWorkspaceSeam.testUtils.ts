@@ -18,7 +18,9 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     acquireIdleTurnExclusion: () => Ok({ [Symbol.dispose]: () => undefined }),
     isBusyForMessage: () => false,
     hasQueuedMessages: () => false,
+    hasPendingUserInput: () => false,
     hasPendingQueuedOrPreparingTurn: () => false,
+    drainQueuedMessagesIfIdle: () => undefined,
     hasPendingAutoRetry: () => false,
     hasPendingBashMonitorWakeContinuation: () => false,
     hasPendingWorkspaceTurnContinuation: () => false,
@@ -35,6 +37,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     onQueuedMessageChanged: () => () => undefined,
     getActiveTurnGeneration: () => undefined,
     onWorkspaceTurnSettled: () => () => undefined,
+    onWorkspaceTurnSuperseded: () => () => undefined,
     archive: () => Promise.resolve(Ok({ kind: "archived" })),
     archiveWhileTaskTreeLocked: () => Promise.resolve(Ok({ kind: "archived" })),
     unarchiveWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
@@ -73,10 +76,13 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
   };
 }
 
+/** Attempt id the fake's derived reawakenInterruptedTask reports for a successful rescue. */
+export const FAKE_REAWAKENED_ATTEMPT_ID = "att_00000000000000fa";
+
 export function makeAgentTaskIntegrationFake(
   overrides: Partial<AgentTaskIntegration> = {}
 ): AgentTaskIntegration {
-  return {
+  const fake: AgentTaskIntegration = {
     withTaskTreeLifecycleLock: <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> =>
       operation(),
     hasDescendantAgentTasks: () => false,
@@ -89,6 +95,7 @@ export function makeAgentTaskIntegrationFake(
     acknowledgeAgentReports: () => Promise.resolve(new Set<string>()),
     backgroundForegroundWaitsForWorkspace: () => 0,
     markInterruptedTaskRunning: () => Promise.resolve(false),
+    admitTaskWorkspaceTurn: () => ({ kind: "not-a-task" as const }),
     restoreInterruptedTaskAfterResumeFailure: () => Promise.resolve(),
     markParentWorkspaceInterrupted: () => undefined,
     latchHardInterruptCascade: () => undefined,
@@ -97,6 +104,13 @@ export function makeAgentTaskIntegrationFake(
     isWorkspaceStopInProgress: () => false,
     getWorkspaceStopEpoch: () => 0,
     reactivateInactiveAgentTaskFromBashMonitorWake: () => Promise.resolve(null),
+    // Derived from the (possibly overridden) boolean rescue, so suites that script only
+    // markInterruptedTaskRunning keep driving the outcome WorkspaceService consumes.
+    reawakenInterruptedTask: async (workspaceId) =>
+      (await fake.markInterruptedTaskRunning(workspaceId))
+        ? { kind: "reawakened", attemptId: FAKE_REAWAKENED_ATTEMPT_ID, statusChanged: true }
+        : { kind: "not-applicable" },
     ...overrides,
   };
+  return fake;
 }

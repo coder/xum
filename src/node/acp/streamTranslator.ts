@@ -219,6 +219,7 @@ export class StreamTranslator {
       case "session-usage-delta":
       case "queued-message-changed":
       case "restore-to-input":
+      case "held-inputs-changed":
       case "runtime-status":
       case "init-start":
       case "init-output":

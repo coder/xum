@@ -88,6 +88,46 @@ export const MAX_CONSECUTIVE_PEER_WAKES = 3;
 export const WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE =
   "A stop is in progress for this workspace; retry once it has settled.";
 
+/**
+ * Refusal for a send that would continue an agent-task attempt whose settlement has begun or
+ * completed (idle stop, terminal failure, launch failure). Not retryable as a continuation: an
+ * intentional resume is a new attempt (user resume, task_send_message reawaken), which mints a
+ * fresh attempt id and is admitted on its own.
+ */
+export const TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE =
+  "This sub-agent's current attempt has settled; resume it explicitly to start a new attempt.";
+
+/**
+ * Stable refusal for every admission of an attempt a workflow retired (taskAttemptRetiredBy):
+ * reawaken, reactivation, startup re-drive and queue launch all surface exactly this text.
+ */
+export function retiredAttemptMessage(claim: { runId: string; stepId: string }): string {
+  return `This sub-agent's attempt was retired by workflow run ${claim.runId} (step ${claim.stepId}); start a new task instead.`;
+}
+
+/** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
+export const SEND_ADMISSION_STALE_MESSAGE =
+  "Send refused: the target was stopped or interrupted while the message was being admitted.";
+
+/**
+ * A manual send whose reawaken of a stopped or reported sub-agent lost its identity CAS: another
+ * send (another backend's resume) reawakened it first. Nothing was sent.
+ */
+export const TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE =
+  "Send refused: this sub-agent was resumed by another send at the same time; nothing was sent. Try again.";
+
+/**
+ * A message queued into a sub-agent while its last turn streamed, refused at dispatch because
+ * that turn turned out to be the task's terminal report. The session keeps it as held input;
+ * sending it again is a new, normally admitted send that starts a fresh attempt.
+ */
+export const TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE =
+  "The sub-agent completed its report before this queued message could run; it was not sent and is kept as an unsent message.";
+
+/** As above, when the report's outcome could not be established (handler failure, partial artifact). */
+export const TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE =
+  "The sub-agent's report outcome could not be determined; this queued message was not sent and is kept as an unsent message.";
+
 /** Bound on-demand instance discovery without growing the default task list. */
 export const INSTANCE_DISCOVERY_DEFAULT_LIMIT = 20;
 export const INSTANCE_DISCOVERY_MAX_LIMIT = 100;

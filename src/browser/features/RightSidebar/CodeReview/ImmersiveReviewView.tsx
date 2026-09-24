@@ -77,6 +77,7 @@ import {
 } from "@/common/types/review";
 import type { FileStats, FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { ReviewActionCallbacks } from "../../Shared/InlineReviewNote";
+import { runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
 
 interface ImmersiveReviewViewProps {
   workspaceId: string;
@@ -584,7 +585,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
         lineMap = newLineMap;
         range = parsed.new;
       } else if (parsed.old) {
-        oldLineMap ??= buildOldLineNumberToIndexMap(overlayData.content);
+        oldLineMap = oldLineMap ?? buildOldLineNumberToIndexMap(overlayData.content);
         lineMap = oldLineMap;
         range = parsed.old;
       } else {
@@ -721,7 +722,11 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
   // Refs keep hot-path callbacks stable so cursor movement doesn't trigger expensive re-renders.
   const activeLineIndexRef = useRef<number | null>(null);
+  // The ref serves the stable hot-path callbacks; the state mirror feeds render
+  // (the line-selection summary), since React Compiler rejects ref reads during render.
+  // Every write sets both, next to the cursor/selection updates it batches with.
   const hunkJumpLineRangeRef = useRef<SelectedLineRange | null>(null);
+  const [hunkJumpLineRange, setHunkJumpLineRange] = useState<SelectedLineRange | null>(null);
   const selectedLineRangeRef = useRef<SelectedLineRange | null>(null);
   const selectedHunkIdRef = useRef<string | null>(selectedHunkId);
   const isReadRef = useRef(isRead);
@@ -838,6 +843,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       pendingJumpSelectAllHunkIdRef.current = null;
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       skipScrollUntilCursorSettlesRef.current = false;
       setActiveLineIndex(null);
       setSelectedLineRange(null);
@@ -851,11 +857,10 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       const modifiedStart = selectedHunkRange.firstModifiedIndex ?? selectedHunkRange.startIndex;
       const modifiedEnd = selectedHunkRange.lastModifiedIndex ?? selectedHunkRange.endIndex;
       skipScrollUntilCursorSettlesRef.current = activeLineIndexRef.current !== modifiedEnd;
-      hunkJumpLineRangeRef.current = {
-        startIndex: modifiedStart,
-        endIndex: modifiedEnd,
-      };
-      applyHunkJumpRangeHighlight(hunkJumpLineRangeRef.current);
+      const jumpRange = { startIndex: modifiedStart, endIndex: modifiedEnd };
+      hunkJumpLineRangeRef.current = jumpRange;
+      setHunkJumpLineRange(jumpRange);
+      applyHunkJumpRangeHighlight(jumpRange);
       setActiveLineIndex(modifiedEnd);
       setSelectedLineRange(null);
       return;
@@ -867,6 +872,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     ) {
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
     }
 
     const cursorLineIndex = activeLineIndexRef.current;
@@ -1099,8 +1105,8 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       return selectedLineRange;
     }
 
-    if (hunkJumpLineRangeRef.current) {
-      return hunkJumpLineRangeRef.current;
+    if (hunkJumpLineRange) {
+      return hunkJumpLineRange;
     }
 
     if (activeLineIndex === null) {
@@ -1108,7 +1114,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     }
 
     return { startIndex: activeLineIndex, endIndex: activeLineIndex };
-  }, [activeLineIndex, selectedLineRange]);
+  }, [activeLineIndex, hunkJumpLineRange, selectedLineRange]);
 
   const selectedLineSummary = useMemo(() => {
     const selection = getCurrentLineSelection();
@@ -1195,6 +1201,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       // cursor (activeLineIndex) rather than the stale range from this comment.
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       setSelectedLineRange(null);
       containerRef.current?.focus();
     },
@@ -1207,6 +1214,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
     setInlineComposerRequest(null);
     clearHunkJumpRangeHighlight();
     hunkJumpLineRangeRef.current = null;
+    setHunkJumpLineRange(null);
     setSelectedLineRange(null);
     containerRef.current?.focus();
   }, [clearHunkJumpRangeHighlight]);
@@ -1223,6 +1231,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       setActiveLineIndex(nextIndex);
 
       if (extendRange) {
@@ -1396,13 +1405,16 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
   } | null>(null);
   const copyFileRequestIdRef = useRef(0);
   const pendingCopyFilePathRef = useRef<string | null>(null);
-  // Both refs update during render so isStale() sees path AND content-version
-  // changes before passive effects run; a resolved read's microtask can otherwise
-  // beat the invalidation effect after a same-path refresh commits.
+  // Both refs update in a layout effect (same task as the commit, before passive effects)
+  // so isStale() sees path AND content-version changes before passive effects run; a
+  // resolved read's microtask can otherwise beat the invalidation effect after a same-path
+  // refresh commits. (React Compiler rejects ref writes during render.)
   const activeFilePathRef = useRef(activeFilePath);
-  activeFilePathRef.current = activeFilePath;
   const activeFileContentVersionRef = useRef(activeFileContentVersion);
-  activeFileContentVersionRef.current = activeFileContentVersion;
+  useLayoutEffect(() => {
+    activeFilePathRef.current = activeFilePath;
+    activeFileContentVersionRef.current = activeFileContentVersion;
+  });
 
   useEffect(() => {
     return () => {
@@ -1485,7 +1497,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       requestId !== copyFileRequestIdRef.current ||
       activeFilePathRef.current !== filePath ||
       activeFileContentVersionRef.current !== contentVersion;
-    try {
+    const copyFileContents = async () => {
       const result = await api.workspace.executeBash({
         workspaceId: props.workspaceId,
         script: buildReadFileScript(filePath, {
@@ -1534,12 +1546,14 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       if (!isStale()) {
         showCopyFileFeedback("copied", filePath, contentVersion);
       }
-    } catch (error) {
+    };
+    const reportCopyFailure = (error: unknown) => {
       console.error("Failed to copy file contents:", error);
       if (!isStale()) {
         showCopyFileFeedback("failed", filePath, contentVersion);
       }
-    } finally {
+    };
+    await runWithCatchFinally(copyFileContents, reportCopyFailure, () => {
       // A superseding request owns the pending slot; only the current one releases it.
       if (
         pendingCopyFilePathRef.current === filePath &&
@@ -1547,13 +1561,15 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
       ) {
         pendingCopyFilePathRef.current = null;
       }
-    }
+    });
   };
 
   // Keyboard handling reads the handler through a ref (matching onToggleReadRef) so the
   // effect does not depend on a per-render function identity.
   const handleCopyFileRef = useRef(handleCopyFile);
-  handleCopyFileRef.current = handleCopyFile;
+  useLayoutEffect(() => {
+    handleCopyFileRef.current = handleCopyFile;
+  });
 
   const activeCopyFileFeedback = copyFileFeedback?.kind ?? null;
 
@@ -1567,6 +1583,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
 
       clearHunkJumpRangeHighlight();
       hunkJumpLineRangeRef.current = null;
+      setHunkJumpLineRange(null);
       const anchorIndex = shiftKey
         ? (selectedLineRangeRef.current?.startIndex ?? activeLineIndexRef.current ?? lineIndex)
         : lineIndex;

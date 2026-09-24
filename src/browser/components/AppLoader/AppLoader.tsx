@@ -80,7 +80,9 @@ function UserPreferencesStartupGate(props: { children: ReactNode }) {
     };
   }, [apiState.api]);
 
-  if (bootstrappedRef.current || ready) {
+  // bootstrappedRef is set together with `ready`, so `ready` alone decides here; reading
+  // the ref during render would make React Compiler skip this component.
+  if (ready) {
     return <>{props.children}</>;
   }
 

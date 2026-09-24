@@ -59,6 +59,7 @@ export const createSetGoalTool: ToolFactory = (config) => {
           expectedGoalId: expectedGoalId ?? null,
         },
         ...(expectedGoalId != null ? { expectedGoalId } : {}),
+        ...(config.goalKickoffModel != null ? { kickoffModel: config.goalKickoffModel } : {}),
       });
       if (!result.success) {
         throw new Error(`Failed to set goal: ${formatGoalSetError(result.error)}`);

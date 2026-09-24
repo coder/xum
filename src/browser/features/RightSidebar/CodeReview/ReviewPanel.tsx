@@ -29,6 +29,7 @@ import React, {
   useEffect,
   useMemo,
   useCallback,
+  useLayoutEffect,
   useRef,
   useSyncExternalStore,
 } from "react";
@@ -106,6 +107,7 @@ import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { invalidateGitStatus } from "@/browser/stores/GitStatusStore";
 import { getErrorMessage } from "@/common/utils/errors";
+import { runWithCatch, runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
 
 /** Stats reported to parent for tab display */
 interface ReviewPanelStats {
@@ -924,8 +926,8 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     }
 
     let cancelled = false;
-    void (async () => {
-      try {
+    void runWithCatch(
+      async () => {
         const branchResult = await api.projects.listBranches({ projectPath });
         const detectedBase = toOriginDiffBase(branchResult.recommendedTrunk);
         if (cancelled) {
@@ -949,10 +951,11 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             setDiffBase(detectedBase);
           }
         }
-      } catch {
+      },
+      () => {
         // Best effort only; keep WORKSPACE_DEFAULTS.reviewBase when detection fails.
       }
-    })();
+    );
 
     return () => {
       cancelled = true;
@@ -974,10 +977,14 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // Refs for values that change frequently but are only read at callback invocation time.
   // Using refs allows callbacks to stay stable (same reference) while still accessing current values.
   // This prevents all HunkViewer components from re-rendering when these values change.
+  // Refs are synced in layout effects (same task as the commit) because React Compiler
+  // rejects ref writes during render; the same applies to the other latest-value refs below.
   const isReadRef = useRef(isRead);
-  isReadRef.current = isRead;
   const selectedHunkIdRef = useRef(selectedHunkId);
-  selectedHunkIdRef.current = selectedHunkId;
+  useLayoutEffect(() => {
+    isReadRef.current = isRead;
+    selectedHunkIdRef.current = selectedHunkId;
+  });
 
   useEffect(() => {
     updatePersistedState(selectedHunkStorageKey, selectedHunkId);
@@ -1206,9 +1213,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // mirrored only `filters.showReadHunks`, which caused the panel to
   // navigate away from a hunk that was actually still visible whenever
   // Assisted's override forced show-read true.
-  showReadHunksRef.current = filters.assistedOnly
+  const effectiveShowReadHunks = filters.assistedOnly
     ? filters.assistedShowReadHunks
     : filters.showReadHunks;
+  useLayoutEffect(() => {
+    showReadHunksRef.current = effectiveShowReadHunks;
+  });
 
   // Track if user is drafting a review note (selection or editing an existing note).
   // We only pause scheduled refreshes while drafting so tool-driven refresh stays unified
@@ -1217,6 +1227,14 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   const isComposingReviewNoteRef = useRef(false);
   const composingHunksRef = useRef(new Set<string>());
   const editingReviewIdsRef = useRef(new Set<string>());
+
+  // Track if refresh button should be disabled (drafting or editing a review note)
+  const [isRefreshBlocked, setIsRefreshBlocked] = useState(false);
+
+  // RefreshController - handles debouncing, in-flight guards, etc.
+  // Created in useEffect to survive React StrictMode double-mount.
+  // (StrictMode calls cleanup then re-mounts; refs persist but controller would be disposed)
+  const controllerRef = useRef<RefreshController | null>(null);
 
   const updateRefreshBlockState = useCallback(() => {
     const wasComposing = isComposingReviewNoteRef.current;
@@ -1285,13 +1303,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   const [lastRefreshInfo, setLastRefreshInfo] = useState<LastRefreshInfo | null>(null);
   // Last refresh failure for UI display (tooltip showing latest refresh error)
   const [lastRefreshFailure, setLastRefreshFailure] = useState<RefreshFailureInfo | null>(null);
-  // Track if refresh button should be disabled (drafting or editing a review note)
-  const [isRefreshBlocked, setIsRefreshBlocked] = useState(false);
-
-  // RefreshController - handles debouncing, in-flight guards, etc.
-  // Created in useEffect to survive React StrictMode double-mount.
-  // (StrictMode calls cleanup then re-mounts; refs persist but controller would be disposed)
-  const controllerRef = useRef<RefreshController | null>(null);
 
   useEffect(() => {
     const controller = new RefreshController({
@@ -1408,7 +1419,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
 
     const loadFileTree = async () => {
       setIsLoadingTree(true);
-      try {
+      const fetchFileTree = async () => {
         await ensureOriginFetched({
           api,
           workspaceId,
@@ -1486,13 +1497,18 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         if (cancelled) return;
         lastFileTreeRefreshTriggerRef.current = refreshTrigger;
         setFileTree(tree);
-      } catch (err) {
-        console.error("Failed to load file tree:", err);
-      } finally {
-        if (!cancelled) {
-          setIsLoadingTree(false);
+      };
+      await runWithCatchFinally(
+        fetchFileTree,
+        (err) => {
+          console.error("Failed to load file tree:", err);
+        },
+        () => {
+          if (!cancelled) {
+            setIsLoadingTree(false);
+          }
         }
-      }
+      );
     };
 
     void loadFileTree();
@@ -1966,7 +1982,9 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       : false);
 
   // Keep ref in sync so callbacks can access current filtered list without dependency
-  filteredHunksRef.current = filteredHunks;
+  useLayoutEffect(() => {
+    filteredHunksRef.current = filteredHunks;
+  });
 
   // Ensure selectedHunkId is valid after filtering/sorting:
   // - If no selection or selection not in the validity list, select first visible hunk

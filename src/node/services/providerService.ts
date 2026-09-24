@@ -21,6 +21,7 @@
  * add fiber overhead without composition benefit.
  */
 import { discoverProviderModels } from "./providerModelDiscovery";
+import { discoverBedrockModels } from "./bedrockModelDiscovery";
 import { EventEmitter } from "events";
 import { Effect, Schema } from "effect";
 import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
@@ -685,6 +686,19 @@ export class ProviderService {
     signal?: AbortSignal
   ): Promise<ProviderModelDiscoveryResult> {
     // Autocomplete must never persist a catalog or change routing/user-managed models.
+    if (provider === "bedrock") {
+      return discoverBedrockModels(() => {
+        const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+        const enforced = this.policyService?.isEnforced() ?? false;
+        return {
+          config,
+          enabled:
+            !isProviderDisabledInConfig(config) &&
+            (!enforced || (this.policyService?.isProviderAllowed(provider) ?? false)),
+          policy: { ...this.getProviderPolicy(provider), enforced },
+        };
+      }, signal);
+    }
     return discoverProviderModels(() => {
       const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
       const custom = isCustomProviderConfig(config) ? config.providerType : undefined;
@@ -697,6 +711,9 @@ export class ProviderService {
       const enforced = this.policyService?.isEnforced() ?? false;
       if (
         isProviderDisabledInConfig(config) ||
+        // Gateway enablement lives in config.json (see getConfig), not providers.jsonc.
+        (provider === "mux-gateway" &&
+          this.config.loadConfigOrDefault().muxGatewayEnabled === false) ||
         (enforced && !this.policyService?.isProviderAllowed(provider))
       )
         return { status: "not-configured" };
@@ -716,9 +733,9 @@ export class ProviderService {
       } else {
         if (!isBuiltInProvider(provider)) return { status: "unsupported" };
         const credentials = resolveProviderCredentials(provider, config);
-        // OAuth tokens are not API keys; Ollama alone allows explicit keyless configuration.
+        // Use this provider's resolved credentials, never a Codex OAuth or ambient SDK token.
         if (!credentials.isConfigured) return { status: "not-configured" };
-        apiKey = credentials.apiKey;
+        apiKey = provider === "mux-gateway" ? credentials.couponCode : credentials.apiKey;
         baseUrl =
           policy.forcedBaseUrl ??
           credentials.baseUrl ??
@@ -731,17 +748,19 @@ export class ProviderService {
         ? custom === "anthropic-messages"
           ? "anthropic"
           : "openai"
-        : provider === "anthropic" ||
-            provider === "google" ||
-            provider === "ollama" ||
-            provider === "openrouter"
-          ? provider
-          : "openai";
+        : provider === "mux-gateway"
+          ? "gateway"
+          : provider === "anthropic" ||
+              provider === "google" ||
+              provider === "ollama" ||
+              provider === "openrouter"
+            ? provider
+            : "openai";
       return Object.freeze({
         provider,
         providerType: custom,
         format,
-        conditional: Boolean(custom) || provider === "zai",
+        conditional: Boolean(custom) || provider === "zai" || provider === "mux-gateway",
         baseUrl,
         apiKey,
         organization,

@@ -822,6 +822,7 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     name: "feat-x",
     messages: [],
     queuedMessage: null,
+    heldInputs: [],
     canInterrupt: false,
     isCompacting: false,
     isStreamStarting: false,

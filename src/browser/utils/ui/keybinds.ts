@@ -326,6 +326,12 @@ export const KEYBINDS = {
   /** Send an existing queued message immediately */
   SEND_QUEUED_MESSAGE_NOW: { key: "Enter", ctrl: true, shift: true },
 
+  /** Send the oldest held (refused, unsent) message from an empty composer */
+  SEND_HELD_INPUT: { key: "Enter", ctrl: true, alt: true },
+
+  /** Discard the oldest held (refused, unsent) message from an empty composer */
+  DISCARD_HELD_INPUT: { key: "Backspace", ctrl: true, alt: true },
+
   /** Send message after current turn ends */
   SEND_MESSAGE_AFTER_TURN: { key: "Enter", ctrl: true },
 

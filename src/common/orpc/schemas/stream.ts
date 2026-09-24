@@ -711,6 +711,33 @@ export const RestoreToInputEventSchema = z.object({
   reviews: z.array(ReviewNoteDataSchema).optional(),
 });
 
+/**
+ * The session's held inputs (see AgentSession.heldInputs): manual queued messages refused at
+ * dispatch because the task reported before they ran. Full list, oldest first; sent on every
+ * change and replayed on subscription while non-empty. The session keeps each full send and
+ * re-sends or discards it only on explicit request (workspace.sendHeldInput/discardHeldInput),
+ * so this carries display data only.
+ */
+export const HeldInputsChangedEventSchema = z.object({
+  type: z.literal("held-inputs-changed"),
+  workspaceId: z.string(),
+  heldInputs: z.array(
+    z.object({
+      id: z.string(),
+      /**
+       * Why it was refused. `reported`: the turn before it was the task's terminal report.
+       * `indeterminate`: it could not run and no report was confirmed (the report's outcome could
+       * not be established, or the attempt was otherwise closed/superseded).
+       */
+      reason: z.enum(["reported", "indeterminate"]),
+      /** The user's authored text (or slash command); empty for attachment/review-only input. */
+      displayText: z.string(),
+      attachmentCount: z.number().int().nonnegative(),
+      reviewCount: z.number().int().nonnegative(),
+    })
+  ),
+});
+
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
 // XumMessages (user/assistant chat messages) are emitted with type: "message"
 // when loading from history or sending new messages.
@@ -754,6 +781,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   SessionUsageDeltaEventSchema,
   QueuedMessageChangedEventSchema,
   RestoreToInputEventSchema,
+  HeldInputsChangedEventSchema,
   // Auto-compaction status events
   AutoCompactionTriggeredEventSchema,
   AutoCompactionCompletedEventSchema,
@@ -781,6 +809,8 @@ export const RestartBlockerSchema = z.object({
     "requests",
     "desktop-sessions",
     "queued-messages",
+    // Refused queued messages the session keeps for the user (AgentSession.heldInputs); memory only.
+    "held-inputs",
     "auto-retries",
     "terminals",
     "background-processes",
@@ -1031,4 +1061,12 @@ export const SendMessageOptionsSchema = z.object({
   allowAgentSetGoal: z.boolean().optional(),
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
+  /**
+   * The user's authored text when the message text is not it: the composer formats attached
+   * review notes into the provider-facing message (prepareUserMessageForSend) and also carries
+   * them as structured reviews. Queue restores and held-input previews show this text next to
+   * the reviews, so a retry does not send every review twice. Transient: the queue keeps it per
+   * add and never forwards it to the turn.
+   */
+  authoredText: z.string().optional(),
 });

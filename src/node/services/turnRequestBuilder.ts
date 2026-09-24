@@ -57,6 +57,8 @@ import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
+import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -99,7 +101,8 @@ import {
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { EvaluationService } from "./evaluation/evaluationService";
-import { readToolInstructions } from "./systemMessage";
+import type { InstructionSources } from "@/common/types/instructions";
+import { extractToolInstructionsFromSources } from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -1473,6 +1476,9 @@ export class TurnRequestBuilder {
           })
         : memoryContext;
     emitStartupBreadcrumb("loading_workspace_context");
+    // One cache per request: resolution, plan handoff, prompt body, and
+    // sub-agent discovery share definition reads; the next turn starts fresh.
+    const agentDefinitionCache = new AgentDefinitionRequestCache();
     const resolveAgentForStreamStartedAt = Date.now();
     const agentResult = await resolveAgentForStream({
       workspaceId,
@@ -1494,6 +1500,7 @@ export class TurnRequestBuilder {
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
+      agentDefinitionCache,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
     if (!agentResult.success) {
@@ -1698,6 +1705,7 @@ export class TurnRequestBuilder {
         taskDepth,
         taskSettings,
         requestPayloadMessages: providerRequestMessages,
+        agentDefinitionCache,
       });
     recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
 
@@ -1747,6 +1755,10 @@ export class TurnRequestBuilder {
         agentId: "intuition",
         resolvedFrontmatter: intuitionDefinition.frontmatter,
       });
+    const evaluationService = this.dependencies.bindings.evaluationService;
+    const builtInIntuitionBody = getBuiltInAgentDefinitions().find(
+      (definition) => definition.id === "intuition"
+    )?.body;
     const intuitionSettings = intuitionToolEligible
       ? resolveHeadlessAgentSettings(
           this.dependencies.config,
@@ -1756,6 +1768,9 @@ export class TurnRequestBuilder {
           intuitionDefinition.frontmatter.ai
         )
       : undefined;
+    // Filled by the first build: later rebuilds in this turn (tool policy,
+    // model fallback) reuse the same instruction snapshot instead of re-reading.
+    const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
       toolset: {
         advisorToolAvailable: boolean;
@@ -1791,6 +1806,8 @@ export class TurnRequestBuilder {
         hotMemoriesBlock: contextForModel?.hotMemoriesBlock ?? undefined,
         claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
         agentPluginsEnabled: agentPluginsExperimentEnabled,
+        instructionSources: turnInstructionSources.current,
+        agentDefinitionCache,
       });
 
     // Build provisional agent context before tool policy finalizes the toolset.
@@ -1806,8 +1823,14 @@ export class TurnRequestBuilder {
     // rebuild from the validated serve makes that context stale.
     const mcpServersAtPrePolicy = mcpServers;
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
-    const { agentSystemPromptSections, agentDefinitions, availableSkills, ancestorPlanFilePaths } =
-      prePolicyStreamSystemContext;
+    const {
+      agentSystemPromptSections,
+      agentDefinitions,
+      availableSkills,
+      ancestorPlanFilePaths,
+      instructionSources,
+    } = prePolicyStreamSystemContext;
+    turnInstructionSources.current = instructionSources;
     let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
     let systemMessage = prePolicyStreamSystemContext.systemMessage;
 
@@ -1939,14 +1962,13 @@ export class TurnRequestBuilder {
     recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
     const readToolInstructionsStartedAt = Date.now();
-    const toolInstructions = await readToolInstructions(
-      metadata,
-      runtime,
-      workspacePath,
+    // Same snapshot as the system message: no second AGENTS.md scan, and the
+    // prompt and tool descriptions cannot disagree about file contents.
+    const toolInstructions = extractToolInstructionsFromSources(
+      instructionSources,
       capabilityModelString,
-      agentSystemPromptSections,
-      cfg.projects,
-      claudeSkillsCompatExperimentEnabled
+      metadata,
+      agentSystemPromptSections
     );
     recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 
@@ -2316,6 +2338,15 @@ export class TurnRequestBuilder {
               usesThisTurn: 0,
               createModel: (ms) => createToolModel(ms, intuitionSettings.thinkingLevel),
               resolveAgentBody: () => Promise.resolve(intuitionDefinition?.body ?? null),
+              // Evaluation recall replaces only the built-in body's tool loop: a custom
+              // body was written for that loop, and evaluation ignores prompt bodies.
+              ...(evaluationService && intuitionDefinition?.body === builtInIntuitionBody
+                ? {
+                    createEvaluationModel: (ms: string) =>
+                      this.dependencies.providerModelFactory.createEvaluationModel(ms),
+                    evaluationService,
+                  }
+                : {}),
               abortSignal: combinedAbortSignal,
             },
           }
@@ -2358,6 +2389,7 @@ export class TurnRequestBuilder {
       workflowService,
       goalService: workspaceGoalService,
       goalDefaults: effectiveGoalDefaults,
+      goalKickoffModel: modelString,
       enableGoalTools: goalToolAvailability,
       // Only child workspaces (tasks) can report to a parent.
       enableAgentReport: Boolean(metadata.parentWorkspaceId),
@@ -2566,6 +2598,9 @@ export class TurnRequestBuilder {
           {
             ...toolsForModelConfig,
             capabilityModelString: seed.capabilityModelString,
+            // Per attempt: a fallback model that calls set_goal must price and
+            // kick off the goal on itself, not on the primary it replaced.
+            goalKickoffModel: seed.rawModelString,
             openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
             xaiNativeToolsEnabled: seed.routeProvider === "xai",
           },

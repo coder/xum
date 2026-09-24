@@ -369,11 +369,15 @@ import {
   type QueueCutReceipt,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
+  type TurnAdmissionToken,
   type WorkspaceHost,
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
-import { WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
+import {
+  SEND_ADMISSION_STALE_MESSAGE,
+  WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+} from "@/constants/agentMessaging";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 import type { DevToolsService } from "@/node/services/devToolsService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
@@ -771,10 +775,6 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
-
-/** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
-const SEND_ADMISSION_STALE_MESSAGE =
-  "Send refused: the target was stopped or interrupted while the message was being admitted.";
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
   assert(session instanceof AgentSession, "waitForAgentSessionIdle requires an AgentSession");
@@ -1757,6 +1757,11 @@ export interface WorkspaceServiceEvents {
   analyticsIngest: (event: { workspaceId: string }) => void;
   /** An admitted session turn generation ended for good (see TurnAdmissionHost). */
   "workspace-turn-settled": (event: { workspaceId: string; turnGeneration: symbol }) => void;
+  "workspace-turn-superseded": (event: {
+    workspaceId: string;
+    previous: symbol;
+    next: symbol;
+  }) => void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
@@ -4493,10 +4498,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
+    let heldInputs = 0;
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
       if (session.hasQueuedMessages()) queuedMessages++;
+      // Held inputs are not queued work, but they live only in session memory: a restart would
+      // silently drop the user's unsent text, attachments and reviews.
+      if (session.getHeldInputs().length > 0) heldInputs++;
       if (session.hasPendingAutoRetry()) autoRetries++;
     }
     const blockers: RestartBlocker[] = [
@@ -4524,6 +4533,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
+      { kind: "held-inputs", count: heldInputs },
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",
@@ -4792,6 +4802,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       },
       onTurnSettled: (turnGeneration) =>
         this.emit("workspace-turn-settled", { workspaceId, turnGeneration }),
+      onTurnSuperseded: (previous, next) =>
+        this.emit("workspace-turn-superseded", { workspaceId, previous, next }),
     });
   }
 
@@ -11840,8 +11852,53 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         : undefined;
 
     let resumedInterruptedTask = false;
+    // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
+    let resumedAttemptId: string | undefined;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     let claimedAutoTitle = false;
+    // Task-attempt admission (see TurnAdmissionToken): a send into an agent-task workspace
+    // carries exactly one obligation, minted by the caller (task launch) or by TaskService at the
+    // handoff below. The queue owns an enqueued token; the session owns an admitted one; a token
+    // that reaches this method's return in neither state never produced work and is disposed
+    // here — the only place a refusal path has to account for it.
+    let taskTurnAdmission: TurnAdmissionToken | undefined = internal?.turnAdmission;
+    let taskTurnHandedToQueue = false;
+    using _taskTurnAdmissionScope = {
+      [Symbol.dispose]: () => {
+        if (!taskTurnHandedToQueue) taskTurnAdmission?.onDisposed("refused");
+      },
+    };
+    let taskTurnAdmissionComposed = false;
+    // `expectedAttemptId`: the attempt this send's own reawaken committed (see below).
+    const admitTaskTurn = (expectedAttemptId?: string): Result<void, SendMessageError> => {
+      if (taskTurnAdmissionComposed) return Ok(undefined);
+      if (taskTurnAdmission == null) {
+        const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
+          acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(expectedAttemptId != null ? { expectedAttemptId } : {}),
+        });
+        if (admission == null || admission.kind === "not-a-task") return Ok(undefined);
+        if (admission.kind === "refused") {
+          log.debug("sendMessage refused by the task-attempt fence", {
+            workspaceId,
+            message: admission.message,
+          });
+          return Err({ type: "unknown", raw: admission.message });
+        }
+        taskTurnAdmission = admission.token;
+      }
+      // The token is the refusal authority at every later gate (enqueue block, session
+      // admission, dequeue), composed with any probe the caller already supplied.
+      taskTurnAdmissionComposed = true;
+      const callerAdmissionStale = internal?.admissionStale;
+      const token = taskTurnAdmission;
+      internal = {
+        ...internal,
+        admissionStale: () => callerAdmissionStale?.() === true || token.admissionStale(),
+        turnAdmission: token,
+      };
+      return Ok(undefined);
+    };
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -11911,10 +11968,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       // Restarted questions have no busy phase: regain their queue without preflight or dispatch.
       if (internal?.restoreQueued) {
-        this.getOrCreateSession(workspaceId).queueMessage(message, options, {
+        const admitted = admitTaskTurn();
+        if (!admitted.success) return admitted;
+        const restored = this.getOrCreateSession(workspaceId).queueMessage(message, options, {
           ...internal,
           dedupeKey,
         });
+        if (restored != null) taskTurnHandedToQueue = true;
+        else taskTurnAdmission?.onDisposed("no-work");
         return Ok(undefined);
       }
       // r41: capture the mutation epoch in the same synchronous block as the
@@ -12198,7 +12259,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           return Ok(undefined);
         }
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
-        // stale before the entry is enqueued.
+        // stale before the entry is enqueued. The task-attempt token is bound first so its
+        // staleness is part of this pass and rides the entry to its dispatch gate.
+        const admitted = admitTaskTurn();
+        if (!admitted.success) return admitted;
         if (internal?.admissionStale?.() === true) {
           if (internal.yieldToQueuedMessages === true) {
             return yieldToPreflightSend();
@@ -12299,6 +12363,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             // invisible to queue clearing, so the session's turn-admission gates must
             // re-check it at dispatch.
             admissionStale: internal?.admissionStale,
+            turnAdmission: taskTurnAdmission,
             compactionAdmissionStale: () => compactionAdmissionStale(),
             refreshCompactionAdmission:
               (internal?.acceptanceOrigin ?? "manual") === "manual"
@@ -12310,13 +12375,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
 
         // A dedupe-keyed send that raced an already-pending duplicate is a quiet success:
-        // the pending queue entry already covers it (coalescing), so don't double-queue.
+        // the pending queue entry already covers it (coalescing), so don't double-queue. The
+        // deduped-into entry keeps its own token; this send's token had no work.
         if (effectiveQueueDispatchMode == null && internal?.queueDedupeKey != null) {
           log.info("sendMessage: dropped duplicate queued message for dedupe key", {
             workspaceId,
             queueDedupeKey: internal.queueDedupeKey,
           });
         }
+        if (effectiveQueueDispatchMode != null) taskTurnHandedToQueue = true;
+        else taskTurnAdmission?.onDisposed("no-work");
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
@@ -12361,13 +12429,30 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // WTM-correlated sends already own their attempt and execution mirror. A second manual
       // rescue would replace that ownership, defeating rollback when admission is refused.
       // Use the dispatched correlation: a downgraded continuation still needs ordinary rescue.
+      let reawakenedAttemptId: string | undefined;
       if (
         internal?.admissionStale == null &&
         parseWorkspaceTurnTaskCorrelation(continuationSendState.options.muxMetadata) == null
       ) {
         previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+        const reawaken = await this.agentTaskIntegration?.reawakenInterruptedTask(workspaceId);
+        // A rescue that lost its identity CAS (another backend resumed the task first) refuses:
+        // binding generically would adopt the winner's attempt and stream it from two sessions.
+        if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
+        if (reawaken?.kind === "reawakened") {
+          reawakenedAttemptId = reawaken.attemptId;
+          resumedAttemptId = reawaken.attemptId;
+          resumedInterruptedTask = reawaken.statusChanged;
+        }
+      }
+      // Bind the obligation after the rescue above (a manual resume publishes a fresh attempt the
+      // send must be admitted under — exactly that one) and before the session's admission awaits.
+      {
+        const admitted = admitTaskTurn(reawakenedAttemptId);
+        if (!admitted.success) return admitted;
+        if (taskTurnAdmission?.admissionStale() === true) {
+          return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        }
       }
 
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
@@ -12375,7 +12460,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (restoreError: unknown) {
             log.error(
@@ -12438,6 +12524,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
+        turnAdmission: taskTurnAdmission,
       });
       if (
         !result.success &&
@@ -12462,7 +12549,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
@@ -12500,7 +12588,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         try {
           await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
             workspaceId,
-            previousTaskStatus
+            previousTaskStatus,
+            resumedAttemptId
           );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
@@ -12537,10 +12626,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       acceptanceOrigin?: TurnAcceptanceOrigin;
       allowQueuedAgentTask?: boolean;
       agentInitiated?: boolean;
+      turnAdmission?: TurnAdmissionToken;
     }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
+    // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
+    let resumedAttemptId: string | undefined;
     let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
+    // Task-attempt obligation (see sendMessage): a caller-supplied token is this method's from
+    // entry, so EVERY exit before the session handoff — each preflight return below, a throw —
+    // disposes it; a pending obligation nobody holds would keep a later Stop's latch waiting on
+    // it for good. Disposed as refused on error and as no-work when the resume returned without
+    // starting a turn; an admitted one belongs to its turn and ignores this disposal. A token the
+    // fence mints further down is assigned here and covered the same way.
+    let taskTurnAdmission: TurnAdmissionToken | undefined = internal?.turnAdmission;
+    let resumeRefused = true;
+    using _taskTurnAdmissionScope = {
+      [Symbol.dispose]: () => taskTurnAdmission?.onDisposed(resumeRefused ? "refused" : "no-work"),
+    };
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -12683,7 +12786,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
-      if (resumeStale() || resumeIntent?.signal.aborted) return Ok({ started: false });
+      if (resumeStale() || resumeIntent?.signal.aborted) {
+        resumeRefused = false;
+        return Ok({ started: false });
+      }
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
@@ -12697,8 +12803,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         );
       }
       previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-      resumedInterruptedTask =
-        (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
+      const reawaken = await this.agentTaskIntegration?.reawakenInterruptedTask(workspaceId);
+      // Same as sendMessage: a lost reawaken refuses, a won one binds to exactly its attempt.
+      if (reawaken?.kind === "refused") return Err({ type: "unknown", raw: reawaken.message });
+      resumedInterruptedTask = reawaken?.kind === "reawakened" && reawaken.statusChanged;
+      resumedAttemptId = reawaken?.kind === "reawakened" ? reawaken.attemptId : undefined;
+
+      // Task-attempt admission (see sendMessage): a resume is a stream-starting entry point and
+      // carries the same obligation, bound after the rescue above (disposal: method entry).
+      if (taskTurnAdmission == null) {
+        const admission = this.agentTaskIntegration?.admitTaskWorkspaceTurn(workspaceId, {
+          acceptanceOrigin: internal?.acceptanceOrigin ?? "manual",
+          ...(reawaken?.kind === "reawakened" ? { expectedAttemptId: reawaken.attemptId } : {}),
+        });
+        if (admission?.kind === "refused") {
+          return Err({ type: "unknown", raw: admission.message });
+        }
+        if (admission?.kind === "admitted") taskTurnAdmission = admission.token;
+      }
+      if (taskTurnAdmission?.admissionStale() === true) {
+        return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+      }
 
       // Codex P1 (PRRT_kwDOPxxmWM6cSREO): resumeStream runs its own async
       // admission (a second pricing gate) during which the session still
@@ -12713,8 +12838,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         preparationSignal: resumeIntent?.signal,
         readCompactionAdmission: () => Promise.resolve(admission),
         agentInitiated: internal?.agentInitiated,
+        turnAdmission: taskTurnAdmission,
       });
       sessionInvisiblePreflight.release();
+      // A resume that returned without starting a turn had no work for its obligation (an
+      // admitted one is bound to its turn and ignores this disposal).
+      resumeRefused = !result.success;
       if (!result.success) {
         log.error("resumeStream handler: session returned error", {
           workspaceId,
@@ -12724,7 +12853,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
@@ -12743,7 +12873,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           try {
             await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
               workspaceId,
-              previousTaskStatus
+              previousTaskStatus,
+              resumedAttemptId
             );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
@@ -12761,7 +12892,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         try {
           await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
             workspaceId,
-            previousTaskStatus
+            previousTaskStatus,
+            resumedAttemptId
           );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
@@ -12807,11 +12939,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
-  async dispatchPendingCompactionFollowUp(workspaceId: string): Promise<Result<boolean>> {
+  async dispatchPendingCompactionFollowUp(
+    workspaceId: string,
+    internal?: { turnAdmission?: TurnAdmissionToken }
+  ): Promise<Result<boolean>> {
     try {
       return Ok(
         await this.withStartupSession(workspaceId, (session) =>
-          session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true)
+          session.dispatchPendingCompactionFollowUpIfNeeded(undefined, true, internal)
         )
       );
     } catch (error) {
@@ -13272,6 +13407,46 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     }
   }
 
+  /**
+   * Re-send a held input (see AgentSession.heldInputs) exactly as it was queued, as a NEW manual
+   * send through the ordinary sendMessage path: a reported task's manual rescue mints a fresh
+   * attempt for it, like any message the user types. The held copy is removed only once the send
+   * is accepted (started or queued); a refused or failed send keeps it and returns the error.
+   */
+  async sendHeldInput(
+    workspaceId: string,
+    heldInputId: string
+  ): Promise<Result<void, SendMessageError>> {
+    assert(heldInputId.length > 0, "sendHeldInput requires a heldInputId");
+    const session = this.sessions.get(workspaceId.trim());
+    const claim = session?.claimHeldInputSend(heldInputId) ?? { kind: "missing" as const };
+    if (claim.kind === "missing") {
+      return Err({ type: "unknown", raw: "This unsent message is no longer held." });
+    }
+    if (claim.kind === "busy") {
+      return Err({ type: "unknown", raw: "This unsent message is already being sent." });
+    }
+    assert(session != null, "a claimed held input belongs to a live session");
+    try {
+      const result = await this.sendMessage(workspaceId, claim.send.message, claim.send.options);
+      if (result.success) session.removeHeldInput(heldInputId);
+      return result;
+    } finally {
+      session.releaseHeldInputSend(heldInputId);
+    }
+  }
+
+  discardHeldInput(workspaceId: string, heldInputId: string): Result<void> {
+    assert(heldInputId.length > 0, "discardHeldInput requires a heldInputId");
+    // Idempotent: a missing session or id means there is nothing left to discard. A send of it
+    // in flight owns it until that send settles (a failed send keeps it held).
+    const outcome = this.sessions.get(workspaceId.trim())?.discardHeldInput(heldInputId);
+    if (outcome === "busy") {
+      return Err("This unsent message is being sent; discard it after the send finishes.");
+    }
+    return Ok(undefined);
+  }
+
   setQueuedMessageDispatchMode(
     workspaceId: string,
     queueDispatchMode: "tool-end" | "turn-end"
@@ -13342,6 +13517,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   hasQueuedOrDispatchingEntry(workspaceId: string): boolean {
     return this.sessions.get(workspaceId.trim())?.hasQueuedOrDispatchingEntry() ?? false;
+  }
+
+  /** See WorkspaceHost.hasPendingUserInput. */
+  hasPendingUserInput(workspaceId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.hasPendingUserInput() ?? false;
   }
 
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
@@ -13424,6 +13604,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
     }
     if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
+  }
+
+  /** See WorkspaceHost.drainQueuedMessagesIfIdle. */
+  drainQueuedMessagesIfIdle(workspaceId: string): void {
+    this.sessions.get(workspaceId.trim())?.drainQueuedMessagesIfIdle();
   }
 
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean {
@@ -13509,6 +13694,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.on("workspace-turn-settled", handler);
     return () => {
       this.off("workspace-turn-settled", handler);
+    };
+  }
+
+  onWorkspaceTurnSuperseded(
+    listener: (workspaceId: string, previous: symbol, next: symbol) => void
+  ): () => void {
+    const handler = (payload: { workspaceId: string; previous: symbol; next: symbol }) =>
+      listener(payload.workspaceId, payload.previous, payload.next);
+    this.on("workspace-turn-superseded", handler);
+    return () => {
+      this.off("workspace-turn-superseded", handler);
     };
   }
 

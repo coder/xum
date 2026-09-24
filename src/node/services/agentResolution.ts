@@ -31,6 +31,7 @@ import {
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentFrontmatter,
+  type AgentDefinitionRequestCache,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
@@ -72,6 +73,11 @@ export interface ResolveAgentOptions {
   isAdvisorExperimentEnabled?: boolean;
   /** agent-plugins experiment: also resolve agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
+  /**
+   * Per-request definition reuse. The stream pipeline passes the same cache to
+   * system-context assembly so one turn reads each definition once.
+   */
+  agentDefinitionCache?: AgentDefinitionRequestCache;
 }
 
 /** Result of agent resolution — all computed values needed by the stream pipeline. */
@@ -205,6 +211,7 @@ export async function resolveAgentForStream(
     emitError,
     isAdvisorExperimentEnabled,
     includeAgentPlugins,
+    agentDefinitionCache: cache,
   } = opts;
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
@@ -258,7 +265,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { includeAgentPlugins }
+          { includeAgentPlugins, cache }
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -303,6 +310,7 @@ export async function resolveAgentForStream(
     });
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
       includeAgentPlugins,
+      cache,
     });
   }
 
@@ -349,6 +357,7 @@ export async function resolveAgentForStream(
         {
           includeAgentPlugins,
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
+          cache,
         }
       );
 
@@ -398,7 +407,7 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { includeAgentPlugins }
+          { includeAgentPlugins, cache }
         );
         effectiveAgentId = agentDefinition.id;
       }
@@ -433,6 +442,7 @@ export async function resolveAgentForStream(
     agentDefinition,
     workspaceId,
     includeAgentPlugins,
+    cache,
   });
 
   // Strict chain pin: inheritance resolution reloads every base independently, so a

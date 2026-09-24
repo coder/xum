@@ -556,10 +556,66 @@ export async function discoverAgentDefinitions(
   });
 }
 
+/**
+ * Request-scoped memo for `readAgentDefinition`.
+ *
+ * One stream request resolves the same definitions several times (agent
+ * resolution, disablement checks, inheritance, prompt body, frontmatter, and
+ * sub-agent discovery); on SSH runtimes every probe is a remote round-trip.
+ * Create one cache per request and drop it with the request. Nothing is shared
+ * across requests, so edits between turns are always picked up.
+ *
+ * The key covers every input that can change the winning definition (runtime
+ * identity, workspace path, agent id, roots identity, plugin inclusion, and
+ * skipped scopes), so precedence and base resolution are exactly as uncached.
+ * Promises are memoized so concurrent lookups in one request share one read.
+ */
+export class AgentDefinitionRequestCache {
+  private readonly definitions = new Map<string, Promise<AgentDefinitionPackage>>();
+  /** Identity keys: distinct runtime or roots objects never share entries. */
+  private readonly objectIds = new WeakMap<Runtime | AgentDefinitionsRoots, number>();
+  private nextObjectId = 1;
+
+  private objectId(value: Runtime | AgentDefinitionsRoots): number {
+    let id = this.objectIds.get(value);
+    if (id == null) {
+      id = this.nextObjectId++;
+      this.objectIds.set(value, id);
+    }
+    return id;
+  }
+
+  read(
+    runtime: Runtime,
+    workspacePath: string,
+    agentId: AgentId,
+    options: ReadAgentDefinitionOptions | undefined,
+    load: () => Promise<AgentDefinitionPackage>
+  ): Promise<AgentDefinitionPackage> {
+    const key = JSON.stringify([
+      this.objectId(runtime),
+      workspacePath,
+      agentId,
+      options?.roots != null ? this.objectId(options.roots) : null,
+      // getDefaultAgentDefinitionsRoots treats undefined like false.
+      options?.includeAgentPlugins === true,
+      options?.skipScopesAbove ?? null,
+    ]);
+    let definition = this.definitions.get(key);
+    if (definition == null) {
+      definition = load();
+      this.definitions.set(key, definition);
+    }
+    return definition;
+  }
+}
+
 export interface ReadAgentDefinitionOptions {
   roots?: AgentDefinitionsRoots;
   /** agent-plugins experiment: also probe Agent Plugins agents (used only when `roots` is absent). */
   includeAgentPlugins?: boolean;
+  /** Per-request reuse of resolved definitions; the caller owns its lifetime. */
+  cache?: AgentDefinitionRequestCache;
   /**
    * Skip scopes at or above this level when resolving.
    * Used for base resolution: when a project-scope agent has `base: exec`,
@@ -584,7 +640,21 @@ export async function readAgentDefinition(
   if (!workspacePath) {
     throw new Error("readAgentDefinition: workspacePath is required");
   }
+  const cache = options?.cache;
+  if (cache != null) {
+    return cache.read(runtime, workspacePath, agentId, options, () =>
+      loadAgentDefinition(runtime, workspacePath, agentId, options)
+    );
+  }
+  return loadAgentDefinition(runtime, workspacePath, agentId, options);
+}
 
+async function loadAgentDefinition(
+  runtime: Runtime,
+  workspacePath: string,
+  agentId: AgentId,
+  options?: ReadAgentDefinitionOptions
+): Promise<AgentDefinitionPackage> {
   const roots =
     options?.roots ??
     getDefaultAgentDefinitionsRoots(runtime, workspacePath, {
@@ -725,6 +795,7 @@ export async function resolveAgentBody(
     roots?: AgentDefinitionsRoots;
     includeAgentPlugins?: boolean;
     skipScopesAbove?: AgentDefinitionScope;
+    cache?: AgentDefinitionRequestCache;
   }
 ): Promise<string> {
   const visited = new Set<string>();
@@ -766,6 +837,7 @@ export async function resolveAgentBody(
       roots: options?.roots,
       includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
+      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);
@@ -909,6 +981,7 @@ export async function resolveAgentDefinition(
       roots: options?.roots,
       includeAgentPlugins: options?.includeAgentPlugins,
       skipScopesAbove,
+      cache: options?.cache,
     });
 
     const visitKey = agentVisitKey(pkg.id, pkg.scope);

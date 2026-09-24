@@ -32,6 +32,7 @@ const blockerLabels: Record<RestartBlocker["kind"], string> = {
   requests: "Requests in flight",
   "desktop-sessions": "Live desktop sessions",
   "queued-messages": "Sessions with queued messages",
+  "held-inputs": "Sessions with unsent messages",
   "auto-retries": "Pending auto-retries",
   terminals: "Open terminals",
   "background-processes": "Running background processes",
