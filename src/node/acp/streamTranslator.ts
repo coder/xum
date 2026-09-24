@@ -6,6 +6,7 @@ import type {
   ToolKind,
 } from "@agentclientprotocol/sdk";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import { completeInProgressTodoItems } from "@/common/utils/todoList";
 
 interface ActiveToolCall {
@@ -349,6 +350,14 @@ export class StreamTranslator {
     // Agent skill and MCP prompt snapshots are synthetic context injections
     // and should never be surfaced to ACP clients as user-visible text.
     if (event.metadata?.agentSkillSnapshot != null || event.metadata?.mcpPromptSnapshot != null) {
+      return { kind: "suppress" };
+    }
+
+    // Plan-review snapshot/resolve/reopen rows are hidden state records stored as user-role
+    // envelopes (the web transcript hides them too). Forwarding them on reconnect/full replay
+    // would show ACP clients internal JSON, including the whole persisted plan snapshot, as if
+    // the user had typed it. Authentic feedback stays visible, matching the web transcript.
+    if (isPlanReviewRecordMessage(event)) {
       return { kind: "suppress" };
     }
 
