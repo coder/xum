@@ -15742,7 +15742,9 @@ export class TaskService implements AgentTaskIntegration {
         options?.reportedAttempt,
         attemptFence
       );
-      if (!finalization.finalized) {
+      // A superseded report was not published because the row names another writer's attempt:
+      // the stable-id waiters are that attempt's and must not read this report's failure.
+      if (!finalization.finalized && finalization.reason !== "superseded_attempt") {
         this.rejectWaiters(workspaceId, new Error(finalization.message));
       }
       return;
@@ -15893,7 +15895,8 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (finalization.finalized) {
       await this.finalizeTerminationPhaseForReportedTask(args.workspaceId);
-    } else {
+    } else if (finalization.reason !== "superseded_attempt") {
+      // A superseded report leaves the stable-id waiters to the attempt that owns the row now.
       this.rejectWaiters(args.workspaceId, new Error(finalization.message));
     }
   }

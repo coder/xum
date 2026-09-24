@@ -1362,6 +1362,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       });
       // Backend B re-admits the row right before that path's report publication write.
       let rotated = false;
+      let waiterOutcome: string | undefined;
       const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
       spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
         const probe = structuredClone(entryOf(config, childId));
@@ -1374,6 +1375,17 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
               ws.taskAttemptId = foreign;
               ws.taskAttemptUnproven = true;
             });
+            // A parent now awaits the task by its stable id: B's waiter.
+            void taskService
+              .waitForAgentReport(childId, { timeoutMs: 3_000, requestingWorkspaceId: rootId })
+              .then(
+                () => {
+                  waiterOutcome = "resolved";
+                },
+                (error: unknown) => {
+                  waiterOutcome = error instanceof Error ? error.message : String(error);
+                }
+              );
           }
         }
         return editOriginal(id, updater, options);
@@ -1387,6 +1399,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         taskAttemptUnproven: true,
       });
       expect(entryOf(config, childId)?.reportedAt).toBeUndefined();
+      // B's waiter is neither resolved with A's report nor rejected by A's abandoned publication.
+      expect(waiterOutcome).toBeUndefined();
       expect(
         await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
       ).toBeNull();
