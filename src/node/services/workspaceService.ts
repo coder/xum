@@ -1887,7 +1887,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
  * registration-time plugin sanitization or, for a deferred checkout, after that checkout's own
  * sanitization; fork after all of its setup; scratch and multi-project have no such steps and
  * persist it with the entry. Delegated task(kind:"workspace") targets are not opted in yet (they
- * skip the default; tracked as a follow-up). Pre-existing workspaces are
+ * skip the default; tracked in #4453). Pre-existing workspaces are
  * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
  * TaskService and stay off; their parent owns them.
@@ -5406,7 +5406,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       awaitMaterialization?: boolean;
       /**
        * Do not opt this workspace in to unrelated messaging. WorkspaceTurnManager sets it for
-       * delegated targets until their default gets its own finalization design (follow-up).
+       * delegated targets until their default gets its own finalization design (#4453).
        */
       skipDefaultUnrelatedWorkspaceConsent?: boolean;
     }

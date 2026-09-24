@@ -2090,7 +2090,7 @@ describe("WorkspaceTurnManager", () => {
     });
 
     expect(result.success).toBe(true);
-    // Delegated targets need a default tied to this turn's lifecycle (follow-up to #4440);
+    // Delegated targets need a default tied to this turn's lifecycle (#4453);
     // until then create() must not opt them in.
     const createCall = createWorkspace.mock.calls[0] as unknown[];
     expect(createCall[8]).toMatchObject({
