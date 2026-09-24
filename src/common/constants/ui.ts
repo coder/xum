@@ -2,6 +2,9 @@
  * UI-related constants shared across components
  */
 
+// Bound model menus for large gateway catalogs; filter before applying the cap.
+export const MAX_RENDERED_MODELS = 200;
+
 /**
  * Auto-compaction threshold bounds (percentage)
  * MIN: Allow any value - user can choose aggressive compaction if desired
