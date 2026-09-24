@@ -215,8 +215,20 @@ describe("taskCheckoutPreparation", () => {
       kind: "ready",
       authority: { kind: "shared", anchorWorkspaceId: "lw05", anchorPath: checkout },
     });
+    // A shared child persisted at another path (as a pre-#4387 build could leave it) is
+    // re-derived by Config normalization (#4387) to its live owner's checkout: authorization and
+    // execution then both use that checkout, and the earlier authority stays current.
+    const captured = await validateTaskCheckoutPreparation(config, "lwc05");
+    if (captured.kind !== "ready") throw new Error("unreachable");
     await publish([rootRow("root1", projectPath), proven, { ...child, path: projectPath }]);
-    expect(await state(config, "lwc05")).toBe("shared-broken");
+    expect(config.findWorkspace("lwc05")?.workspacePath).toBe(checkout);
+    expect(await validateTaskCheckoutPreparation(config, "lwc05")).toMatchObject({
+      kind: "ready",
+      authority: { kind: "shared", anchorWorkspaceId: "lw05", anchorPath: checkout },
+    });
+    expect(assertCurrentTaskCheckoutAuthority(config, captured.authority)).toEqual({
+      current: true,
+    });
   });
 
   test("scratch rows execute in their OWN path (their metadata projectPath is the row's path, not the `_scratch` bucket): a scratch child anchors on its scratch root", async () => {
@@ -535,7 +547,7 @@ describe("taskCheckoutPreparation", () => {
     });
     if (ready.kind !== "ready") throw new Error("unreachable");
     expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toEqual({ current: true });
-    // Archived intermediate → broken; path-divergent intermediate → broken; missing anchor → broken.
+    // Archived intermediate → broken; missing anchor → broken.
     await publish([
       rootRow("root1", projectPath),
       dedicated,
@@ -546,13 +558,27 @@ describe("taskCheckoutPreparation", () => {
     expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toMatchObject({
       current: false,
     });
+    // A path-divergent intermediate cannot persist: Config normalization (#4387) re-derives it
+    // to the live owner's checkout, so the chain authorizes and executes in that checkout again
+    // (the validator's divergence branch stays as the defense for rows normalization skips).
     await publish([
       rootRow("root1", projectPath),
       dedicated,
       { ...mid, path: checkout + "-other" },
       leaf,
     ]);
-    expect(await state(config, "leaf04")).toBe("shared-broken");
+    expect(config.findWorkspace("mid04")?.workspacePath).toBe(checkout);
+    expect(config.findWorkspace("leaf04")?.workspacePath).toBe(checkout);
+    expect(await validateTaskCheckoutPreparation(config, "leaf04")).toMatchObject({
+      kind: "ready",
+      authority: {
+        kind: "shared",
+        anchorWorkspaceId: "ded04",
+        anchorPath: checkout,
+        ancestry: ["mid04"],
+      },
+    });
+    expect(assertCurrentTaskCheckoutAuthority(config, ready.authority)).toEqual({ current: true });
     await publish([rootRow("root1", projectPath), mid, leaf]);
     expect(await state(config, "leaf04")).toBe("shared-broken");
     // Anchor dedicated but legacy (no proof) → broken; anchor ordinary root → ready with empty revision.
