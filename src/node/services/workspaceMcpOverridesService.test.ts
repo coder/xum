@@ -2797,6 +2797,43 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(await pathExists(path.join(workspacePath, ".xum", "mcp.local.jsonc"))).toBe(true);
   });
 
+  it("clearing a host checkout removes the canonical document last", async () => {
+    // Read precedence picks the first present document: if the process dies
+    // between unlinks, only lower-precedence fallbacks may be gone already —
+    // otherwise a stale fallback would resurrect the cleared settings.
+    const service = new WorkspaceMcpOverridesService(config);
+    const { workspaceId, workspacePath } = await registerWorkspace("host-clear-order");
+    await service.setOverridesForWorkspace(workspaceId, { enabledServers: ["shots"] });
+    const canonical = path.join(workspacePath, ".xum", "mcp.local.jsonc");
+    const fallbacks = [".xum/mcp.local.json", ".mux/mcp.local.jsonc", ".mux/mcp.local.json"].map(
+      (relative) => path.join(workspacePath, relative)
+    );
+    for (const filePath of fallbacks) {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify({ enabledServers: ["stale"] }));
+    }
+    const realUnlink = fsPromisesModule.unlink;
+    // The crash: the canonical unlink never happens.
+    const unlinkSpy = spyOn(fsPromisesModule, "unlink").mockImplementation((target) =>
+      target === canonical
+        ? Promise.reject(Object.assign(new Error("EIO: simulated crash"), { code: "EIO" }))
+        : realUnlink(target)
+    );
+    try {
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+      await expect(service.setOverridesForWorkspace(workspaceId, {})).rejects.toThrow("EIO");
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+    for (const filePath of fallbacks) {
+      expect(await pathExists(filePath)).toBe(false);
+    }
+    expect(await pathExists(canonical)).toBe(true);
+    expect((await service.getOverridesForWorkspace(workspaceId)).overrides).toEqual({
+      enabledServers: ["shots"],
+    });
+  });
+
   it("clears a devcontainer workspace's settings on the host without a running container", async () => {
     const service = new WorkspaceMcpOverridesService(config);
     const checkout = path.join(config.srcDir, "devcontainer-clear");

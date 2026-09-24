@@ -1483,8 +1483,9 @@ export class WorkspaceMcpOverridesService {
       // this process — after a crash it could still delete a document a
       // successor saved under the lock it took over (#4415). fs calls end
       // with the process. ENOENT/ENOTDIR are the "nothing there" cases
-      // `rm -f` ignores too.
-      for (const relative of MCP_OVERRIDES_GITIGNORE_PATTERNS) {
+      // `rm -f` ignores too. Lowest read precedence first, canonical last: a
+      // crash between unlinks must never leave a stale fallback authoritative.
+      for (const relative of [...MCP_OVERRIDES_GITIGNORE_PATTERNS].reverse()) {
         try {
           await fsPromises.unlink(path.join(workspacePath, relative));
         } catch (error) {
