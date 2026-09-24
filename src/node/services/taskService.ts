@@ -7761,11 +7761,42 @@ export class TaskService implements AgentTaskIntegration {
             ? Err(registration.error)
             : retainedRefusal(registration.error);
         }
+      } else if (isDevcontainerRuntime(taskRuntimeConfig)) {
+        // A devcontainer checkout is exempt from preparation (no proof, no prune: plugin servers
+        // are never offered there), but its row is structurally protected once published. Its
+        // fork runs INSIDE the registration-lock hold exactly like a dedicated host-local fork
+        // (the same WorktreeManager fork: bounded origin fetch, checkout, hooks), so a structural
+        // mutator never deletes the repository the fork is writing into. The hold also spans the
+        // base-commit read, a `devcontainer exec` that fails fast for a fresh checkout (no
+        // container exists for its path yet).
+        let forkRefusal: Result<never, string> | undefined;
+        const registration = await this.workspaceService.prepareTaskCheckouts(
+          async () => {
+            const forked = await materializeCheckout();
+            if (!forked.success) {
+              forkRefusal = forked;
+              throw new Error(forked.error);
+            }
+            // A fork keeps the parent's runtime config type (see applyForkRuntimeUpdates).
+            assert(
+              checkout != null && isDevcontainerRuntime(checkout.forkedRuntimeConfig),
+              "Task.create: a devcontainer parent forked a non-devcontainer checkout"
+            );
+            return [];
+          },
+          () => publish()
+        );
+        if (forkRefusal != null) return forkRefusal;
+        if (!registration.success) {
+          if (checkout == null) return Err(registration.error);
+          return configWriteAttempted
+            ? Err(registration.error)
+            : retainedRefusal(registration.error);
+        }
       } else {
         // A local-runtime fork shares the project directory (shared by construction) and an
         // off-host fork is outside the protocol: both register without a proof as before, the
-        // host-local one sanitized under the registration lock and a devcontainer one (a
-        // structurally protected host worktree) published under it (see
+        // host-local one sanitized under the registration lock (see
         // registerSanitizedTaskCheckout).
         const forked = await materializeCheckout();
         if (!forked.success) return forked;

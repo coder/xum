@@ -264,7 +264,6 @@ import {
   buildTaskCheckoutPreparation,
   claimTaskCheckoutIdentity,
   isWorktreeSemanticsRuntime,
-  materializedCheckoutPublicationRefusal,
   revalidateTaskCheckoutIdentity,
   taskCheckoutMismatchLabel,
   taskCheckoutProofPaths,
@@ -3244,14 +3243,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * (both released by the prune) → the config write's own project
    * registration lock inside `publish`; nothing acquires the registration lock
    * while holding any of the others. Off-host runtimes publish without the
-   * lock (plugin servers never spawn there), except devcontainer: its host
-   * worktree is structurally protected (isProtectedTaskRow), so its row is
-   * published under the lock like every protected row — a structural
-   * mutator's scan sees every task row or none — but with nothing to prune
-   * (plugin servers are never offered there). Its fork ran BEFORE this hold
-   * (holding the lock across container exec would block every registration),
-   * so the checkout and its Git backing are revalidated under the lock first
-   * (materializedCheckoutPublicationRefusal): a refusal publishes nothing.
+   * lock (plugin servers never spawn there). Devcontainer checkouts never come
+   * here: their rows are structurally protected, so Task.create forks and
+   * publishes them inside one prepareTaskCheckouts hold instead.
    *
    * Returns `Err` when sanitization refused (NOTHING was published; the
    * caller decides the fate of its unregistered files) and `Ok` with
@@ -3262,13 +3256,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     publish: () => Promise<T>
   ): Promise<Result<T, string>> {
     assert(target.workspacePath.length > 0, "registerSanitizedTaskCheckout: path is required");
-    if (target.runtimeConfig.type === "devcontainer") {
-      return await this.prepareTaskCheckouts(async () => {
-        const refusal = await materializedCheckoutPublicationRefusal(target.workspacePath);
-        if (refusal != null) throw new Error(refusal);
-        return [];
-      }, publish);
-    }
+    assert(
+      target.runtimeConfig.type !== "devcontainer",
+      "registerSanitizedTaskCheckout: devcontainer checkouts are forked and published inside prepareTaskCheckouts"
+    );
     const hostLocal =
       target.runtimeConfig.type === "local" || target.runtimeConfig.type === "worktree";
     if (!hostLocal || !this.workspaceMcpOverridesService) {

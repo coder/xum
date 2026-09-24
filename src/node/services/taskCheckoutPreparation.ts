@@ -1030,7 +1030,6 @@ export function taskRowPublicationRefusal(
  * `.git` directory, or a pointer to an existing admin dir). A devcontainer task row is
  * structurally protected once published and could then never be removed, so each publication
  * or binding that trusts such a checkout checks it first:
- *  - a direct task's fresh checkout (forked before the hold, see registerSanitizedTaskCheckout);
  *  - a queued/reserved row's fork SOURCE (the parent's checkout, `subject`) when the row is
  *    published — the structural guard protects that source only from then on;
  *  - the checkout its launch forked, right before binding it (path/runtime) to the row.

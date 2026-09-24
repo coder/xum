@@ -663,83 +663,37 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
   }
 
   test.each(["backing-removed", "control"] as const)(
-    "a devcontainer fork whose backing repository a mutator removes after materialization, winning the registration lock first, is not published (%s)",
+    "a direct devcontainer fork runs inside the registration-lock hold: a backing removal that wins the lock first makes it fail and nothing is published (%s)",
     async (mode) => {
       const taskId = mode === "control" ? "devbacking1" : "devbacking2";
-      // The project repository lives INSIDE another registered (ordinary) workspace's checkout.
-      const backingPath = path.join(rootDir, "backing");
-      // Registered under another project (a bucket that is not a prefix of the repository).
-      const otherProjectPath = path.join(rootDir, "other-project");
-      const projectPath = await createRepoWithTrackedEnable(
-        undefined,
-        path.join("backing", "repo")
-      );
-      const { config, taskService, workspaceService, parentPath } =
-        await createRealStack(projectPath);
-      const previousXumRoot = process.env.XUM_ROOT;
-      process.env.XUM_ROOT = rootDir;
-      restores.push(() => {
-        if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
-        else process.env.XUM_ROOT = previousXumRoot;
-      });
-      const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockImplementation(() =>
-        Promise.reject(new Error("no devcontainer in tests"))
-      );
-      restores.push(() => exec.mockRestore());
-      const devcontainer: RuntimeConfig = {
-        type: "devcontainer",
-        configPath: ".devcontainer/x.json",
-      };
-      await saveWorkspaces(
-        config,
-        projectPath,
-        [{ path: parentPath, id: rootId, name: "parent", runtimeConfig: devcontainer }],
-        {
-          taskSettings: testTaskSettings(),
-          extraProjects: [
-            [
-              otherProjectPath,
-              {
-                trusted: true,
-                workspaces: [{ path: backingPath, id: "backingws1", name: "backing" }],
-              },
-            ],
-          ],
-        }
-      );
+      const { config, taskService, workspaceService, devcontainer, removeBacking } =
+        await createNestedDevcontainerStack();
       stubStableIds(config, [taskId]);
-      // Another backend removes the backing workspace after the fork and before the locked
-      // publication: its scan skips the ordinary parent and cannot see the unpublished child, so
-      // it deletes the checkout (with the repository backing both worktrees) and its row.
-      const otherConfig = new Config(config.rootDir);
+      // A structural mutator excluded by the hold cannot delete the repository the fork writes to.
+      const forkLocks: Array<"held" | "free"> = [];
+      const realFork = forkOrchestrator.orchestrateFork;
+      const fork = spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(async (params) => {
+        forkLocks.push(await probeRegistrationLock(config));
+        return realFork(params);
+      });
+      restores.push(() => fork.mockRestore());
       const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
       const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
         async (materialize, publish) => {
-          if (mode === "backing-removed") {
-            await fsPromises.rm(backingPath, { recursive: true, force: true });
-            await otherConfig.editConfig((cfg) => {
-              cfg.projects.delete(otherProjectPath);
-              return cfg;
-            });
-          }
+          if (mode === "backing-removed") await removeBacking();
           return realPrepare(materialize, publish);
         }
       );
       restores.push(() => prepare.mockRestore());
 
       const created = await taskService.create(createArgs("Backing"));
-      expect(prepare).toHaveBeenCalledTimes(1);
-      // The parent row itself stays registered: only the checkout revalidation can refuse.
-      expect(findWorkspaceInConfig(config, rootId)).toBeDefined();
+      expect(forkLocks).toEqual(["held"]);
       if (mode === "control") {
         expect(created).toMatchObject({ success: true, data: { taskId } });
         expect(findWorkspaceInConfig(config, taskId)?.runtimeConfig).toEqual(devcontainer);
         return;
       }
       expect(created.success).toBe(false);
-      if (created.success) throw new Error("unreachable");
-      expect(created.error).toContain("Git backing changed");
-      expect(created.error).toContain("nothing was published");
       expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
     },
     30_000
