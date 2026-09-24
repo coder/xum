@@ -9295,40 +9295,44 @@ describe("TaskService", () => {
           }),
         survived: (child: WorkspaceConfigEntry | undefined) => expect(child).toBeUndefined(),
       },
-    ])("$name between resolution and acceptance refuses with no claim or settings", async (row) => {
-      const target: { config?: Config; childId?: string; armed: boolean } = { armed: false };
-      const sendMessage = createAcceptingSendMessage(async () => {
-        if (!target.armed || target.config == null || target.childId == null) return;
-        // Lands after TaskService planned the snapshot, before acceptance commits it.
-        await row.mutate(target.config, target.childId);
-      });
-      const fixture = await spawnReportedChild({ sendMessage });
-      const { config, childId } = fixture;
-      target.config = config;
-      target.childId = childId;
-      await setDelegatedExec(config, { modelString: MODEL_B });
-      const before = findWorkspaceInConfig(config, childId);
-      target.armed = true;
+    ])(
+      "$name between resolution and acceptance refuses with no claim or settings",
+      async (row) => {
+        const target: { config?: Config; childId?: string; armed: boolean } = { armed: false };
+        const sendMessage = createAcceptingSendMessage(async () => {
+          if (!target.armed || target.config == null || target.childId == null) return;
+          // Lands after TaskService planned the snapshot, before acceptance commits it.
+          await row.mutate(target.config, target.childId);
+        });
+        const fixture = await spawnReportedChild({ sendMessage });
+        const { config, childId } = fixture;
+        target.config = config;
+        target.childId = childId;
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        const before = findWorkspaceInConfig(config, childId);
+        target.armed = true;
 
-      const result = await reawaken(fixture.taskService, fixture.parentId, childId);
-      expect(result.success).toBe(false);
-      if (result.success) return;
-      expect(result.error.code).toBe("send_failed");
-      if (row.commitRefusal) {
-        // Commit-point refusal: the prompt row is already durable, so the parent gets the
-        // retryable no-resend message rather than the pre-acceptance "send again" one.
-        const message = "message" in result.error ? result.error.message : "";
-        expect(message).toContain(formatReawakenCommitRefusedMessage(childId));
-        expect(message).not.toContain(formatReawakenChangedMessage(childId));
-      }
-      const child = findWorkspaceInConfig(config, childId);
-      row.survived(child, config);
-      if (child == null) return;
-      // Neither the planned settings nor the claim were written.
-      expect(child.taskModelString).toBe(SPAWN_MODEL);
-      expect(child.aiSettings).toEqual(before?.aiSettings);
-      expect(isActiveWorkspaceTurnTaskStatus(child.taskExecutionStatus)).toBe(false);
-    }, 20_000);
+        const result = await reawaken(fixture.taskService, fixture.parentId, childId);
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error.code).toBe("send_failed");
+        if (row.commitRefusal) {
+          // Commit-point refusal: the prompt row is already durable, so the parent gets the
+          // retryable no-resend message rather than the pre-acceptance "send again" one.
+          const message = "message" in result.error ? result.error.message : "";
+          expect(message).toContain(formatReawakenCommitRefusedMessage(childId));
+          expect(message).not.toContain(formatReawakenChangedMessage(childId));
+        }
+        const child = findWorkspaceInConfig(config, childId);
+        row.survived(child, config);
+        if (child == null) return;
+        // Neither the planned settings nor the claim were written.
+        expect(child.taskModelString).toBe(SPAWN_MODEL);
+        expect(child.aiSettings).toEqual(before?.aiSettings);
+        expect(isActiveWorkspaceTurnTaskStatus(child.taskExecutionStatus)).toBe(false);
+      },
+      20_000
+    );
 
     test("a send refused before acceptance leaves the AI-settings snapshot unchanged", async () => {
       let refuse = false;
@@ -9453,7 +9457,6 @@ describe("TaskService", () => {
       const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: recoverySend });
       const restarted = createTaskServiceHarness(restartedConfig, { workspaceService });
       await restarted.taskService.initialize();
-      const resumeStream = workspaceService.resumeStream as unknown as ReturnType<typeof mock>;
       const executionId = cutChild?.taskExecutionId;
       assert(executionId != null, "the cut must leave an execution mirror behind");
       const handle = await (
@@ -9465,7 +9468,9 @@ describe("TaskService", () => {
         handle,
         recoveredChild: findWorkspaceInConfig(restartedConfig, childId),
         childSends: recoverySend.mock.calls.filter((call) => call[0] === childId),
-        childResumes: resumeStream.mock.calls.filter((call) => call[0] === childId),
+        childResumes: (
+          workspaceService.resumeStream as unknown as ReturnType<typeof mock>
+        ).mock.calls.filter((call) => call[0] === childId),
       };
     }
 
@@ -9657,8 +9662,9 @@ describe("TaskService", () => {
 
     test("a queued acceptance commits only when its deferred onAccepted runs", async () => {
       const { sendMessage, deferred } = createDeferredAcceptSendMessage();
-      const { config, taskService, parentId, childId, workspaceService } =
-        await spawnReportedChild({ sendMessage });
+      const { config, taskService, parentId, childId, workspaceService } = await spawnReportedChild(
+        { sendMessage }
+      );
       const before = findWorkspaceInConfig(config, childId);
       await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
       const busy = admitQueued(workspaceService, childId);
@@ -9690,8 +9696,9 @@ describe("TaskService", () => {
 
     test("the commit lands claim and settings in one write and publishes metadata once after it", async () => {
       const { sendMessage, deferred } = createDeferredAcceptSendMessage();
-      const { config, taskService, parentId, childId, workspaceService } =
-        await spawnReportedChild({ sendMessage });
+      const { config, taskService, parentId, childId, workspaceService } = await spawnReportedChild(
+        { sendMessage }
+      );
       await setDelegatedExec(config, { modelString: MODEL_B });
       const busy = admitQueued(workspaceService, childId);
       deferred.armed = true;
