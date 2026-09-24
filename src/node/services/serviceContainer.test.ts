@@ -956,6 +956,64 @@ describe("ServiceContainer", () => {
     expect(Object.keys(startupInternals(services).startupStepDurationsMs)).toEqual(CORE_STEP_NAMES);
   });
 
+  it("initializeCore lets a hung task recovery time out and defers housekeeping until it settles", async () => {
+    const realAppLive = appLayers.AppLive;
+    const appLiveSpy = spyOn(appLayers, "AppLive").mockImplementation((appStores) =>
+      realAppLive(appStores).pipe(Layer.provideMerge(TestClock.layer()))
+    );
+    try {
+      services = new ServiceContainer(stores);
+    } finally {
+      appLiveSpy.mockRestore();
+    }
+    const runtime = services.runtime.managed;
+    let recoveryCalled: (() => void) | undefined;
+    const recoveryCalledPromise = new Promise<void>((resolve) => {
+      recoveryCalled = resolve;
+    });
+    let finishRecovery: (() => void) | undefined;
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() => {
+      recoveryCalled?.();
+      return new Promise<void>((resolve) => {
+        finishRecovery = resolve;
+      });
+    });
+    const workspaceInitialize = spyOn(services.workspaceService, "initialize").mockResolvedValue(
+      undefined
+    );
+    spyOn(services.taskService, "runStartupHousekeeping").mockResolvedValue(undefined);
+
+    const core = services.initializeCore();
+    await recoveryCalledPromise;
+    await runtime.runPromise(TestClock.adjust(Duration.millis(STARTUP_STEP_TIMEOUT_MS)));
+    // Startup succeeds (the listener may bind) although recovery is still running...
+    await core;
+    const housekeeping = services.runStartupHousekeeping();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // ...but housekeeping does not overlap the still-running recovery.
+    expect(workspaceInitialize).not.toHaveBeenCalled();
+    finishRecovery?.();
+    await housekeeping;
+    expect(workspaceInitialize).toHaveBeenCalledTimes(1);
+  });
+
+  it("initializeCore continues past a rejected task recovery", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>
+      Promise.reject(new Error("config unreadable"))
+    );
+    spyOn(services.workspaceService, "initialize").mockResolvedValue(undefined);
+    const taskHousekeeping = spyOn(
+      services.taskService,
+      "runStartupHousekeeping"
+    ).mockResolvedValue(undefined);
+
+    await services.initializeCore();
+    await services.runStartupHousekeeping();
+
+    expect(taskHousekeeping).toHaveBeenCalledTimes(1);
+  });
+
   it("initializeCore rejects with the failing step's own error and skips the later steps", async () => {
     services = new ServiceContainer(stores);
     const boom = new Error("policy endpoint unreachable");

@@ -141,8 +141,8 @@ async function main(): Promise<void> {
   constructedServices = serviceContainer;
   // Headless server has no interactive host-key dialog
   setOpenSSHHostKeyPolicyMode("headless-fallback");
-  // Core init (including agent-task recovery, which must finish before any client can act on
-  // tasks) gates the listener; the housekeeping that scales with the number of workspaces runs
+  // Core init (including agent-task recovery, bounded so a slow recovery cannot keep the server
+  // down) gates the listener; the housekeeping that scales with the number of workspaces runs
   // in the background once the server is accepting connections.
   await serviceContainer.initializeCore();
   serviceContainer.windowService.setMainWindow(mockWindow);

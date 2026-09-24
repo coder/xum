@@ -4197,7 +4197,8 @@ export class TaskService implements AgentTaskIntegration {
    * `awaiting_report`/`running` tasks. Bounded by the number of active tasks, not by deployment
    * size. Must finish before any client can act on tasks: a stop, resume, or send racing these
    * transitions would be overwritten or would resurrect a task the client just stopped, so the
-   * server binds its listener only after this resolves.
+   * server binds its listener after this resolves, or once it exceeds the startup step bound
+   * (ServiceContainer: a slow recovery must not keep the server down).
    */
   async recoverInterruptedTasks(): Promise<void> {
     const startupStartedAt = Date.now();
