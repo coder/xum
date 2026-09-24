@@ -22,9 +22,12 @@
  *   packages load their dependencies with top-level `require()`. A `require()` inside
  *   a function is counted too, which errs on the side of reporting.
  *
- * Known limitation: a module-scope `import()` (e.g. `const p = import("ai")`) starts
- * loading at startup but is treated as lazy, because the metafile does not say where
- * the call sits. Keep dynamic imports inside the functions that need them.
+ * Known limitations (static analysis cannot see them):
+ * - A module-scope `import()` (e.g. `const p = import("ai")`) starts loading at startup
+ *   but is treated as lazy, because the metafile does not say where the call sits.
+ *   Keep dynamic imports inside the functions that need them.
+ * - Computed loaders, such as a `createRequire()` result or `require(variable)`, are
+ *   invisible to the import graph.
  *
  * Run: bun scripts/check-startup-imports.ts
  */
@@ -38,20 +41,31 @@ export interface StartupEntry {
   entry: string;
   /** Why this module's eager graph is startup-critical. */
   reason: string;
+  /**
+   * How the build emits this entry, which decides the package export branch Node loads:
+   * "commonjs" (tsc output, `require` branch) or "bundle" (bundled, `import` branch).
+   */
+  output: EntryOutput;
 }
+
+export type EntryOutput = "commonjs" | "bundle";
 
 export const STARTUP_ENTRIES: readonly StartupEntry[] = [
   {
     entry: "src/cli/index.ts",
     reason: "CLI shim; runs before every subcommand and the desktop app",
+    output: "commonjs",
   },
   {
     entry: "src/desktop/main.ts",
     reason: "Electron main process before the splash screen (loadServices() loads the rest)",
+    output: "commonjs",
   },
   {
     entry: "src/desktop/preload.ts",
     reason: "renderer preload script",
+    // Makefile builds dist/preload.js with `bun build`, not tsc.
+    output: "bundle",
   },
 ];
 
@@ -65,6 +79,9 @@ export const BANNED_PACKAGES: readonly string[] = [
   "@aws-sdk/*",
   "@duckdb/*",
   "@modelcontextprotocol/*",
+  // Provider SDKs outside @ai-sdk/*, lazily loaded by src/common/constants/providers.ts.
+  "@openrouter/ai-sdk-provider",
+  "ollama-ai-provider-v2",
   "typescript",
 ];
 
@@ -133,6 +150,8 @@ export async function analyzeStartupImports(options: {
   rootDir: string;
   entries: readonly string[];
   banned: readonly string[];
+  /** Build output of every entry in this call; see StartupEntry.output. */
+  output: EntryOutput;
 }): Promise<StartupImportReport> {
   assert(path.isAbsolute(options.rootDir), "rootDir must be absolute");
   assert(options.entries.length > 0, "at least one entry is required");
@@ -177,10 +196,14 @@ export async function analyzeStartupImports(options: {
               resolvedBannedImports.add(edgeKey(importer, args.kind, args.path));
               return { path: args.path, external: true };
             }
-            // Allowed package: resolve it so its own imports are walked. tsc emits project
-            // code as CommonJS, so Node loads the package's "require" export branch even
-            // for a source `import`; esbuild would pick the "import" branch.
-            if (args.kind === "import-statement" && !isInNodeModules(importer)) {
+            // Allowed package: resolve it so its own imports are walked. When tsc emits
+            // project code as CommonJS, Node loads the package's "require" export branch
+            // even for a source `import`; esbuild would pick the "import" branch.
+            if (
+              options.output === "commonjs" &&
+              args.kind === "import-statement" &&
+              !isInNodeModules(importer)
+            ) {
               const resolved = await build.resolve(args.path, {
                 kind: "require-call",
                 importer: args.importer,
@@ -252,11 +275,14 @@ export async function analyzeStartupImports(options: {
 
 async function main(): Promise<number> {
   const rootDir = path.resolve(import.meta.dir, "..");
-  const report = await analyzeStartupImports({
-    rootDir,
-    entries: STARTUP_ENTRIES.map((e) => e.entry),
-    banned: BANNED_PACKAGES,
-  });
+  const report: StartupImportReport = { violations: [], eagerGraphSizes: {} };
+  for (const output of ["commonjs", "bundle"] as const) {
+    const entries = STARTUP_ENTRIES.filter((e) => e.output === output).map((e) => e.entry);
+    if (entries.length === 0) continue;
+    const part = await analyzeStartupImports({ rootDir, entries, banned: BANNED_PACKAGES, output });
+    report.violations.push(...part.violations);
+    Object.assign(report.eagerGraphSizes, part.eagerGraphSizes);
+  }
 
   for (const { entry, reason } of STARTUP_ENTRIES) {
     const size = report.eagerGraphSizes[entry];

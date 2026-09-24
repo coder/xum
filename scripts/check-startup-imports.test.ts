@@ -6,7 +6,12 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { analyzeStartupImports, isBannedPackage, packageNameOf } from "./check-startup-imports";
+import {
+  analyzeStartupImports,
+  type EntryOutput,
+  isBannedPackage,
+  packageNameOf,
+} from "./check-startup-imports";
 
 let rootDir: string;
 
@@ -31,8 +36,13 @@ async function writeFiles(files: Record<string, string>): Promise<void> {
   }
 }
 
-async function analyze(entry = "src/entry.ts") {
-  return analyzeStartupImports({ rootDir, entries: [entry], banned: ["ai", "@ai-sdk/*"] });
+async function analyze(output: EntryOutput = "commonjs") {
+  return analyzeStartupImports({
+    rootDir,
+    entries: ["src/entry.ts"],
+    banned: ["ai", "@ai-sdk/*"],
+    output,
+  });
 }
 
 test("fails on a banned package reached through static imports, with the chain", async () => {
@@ -89,7 +99,7 @@ test("fails when an allowed package loads a banned one", async () => {
   expect(report.eagerGraphSizes).toEqual({ "src/entry.ts": { projectModules: 1, packages: 1 } });
 });
 
-test("follows the CommonJS export branch that the built main process loads", async () => {
+test("follows the export branch that matches how the entry is built", async () => {
   await writeFiles({
     "src/entry.ts": 'import { wrap } from "dual-pkg";\nconsole.log(wrap);\n',
     "node_modules/dual-pkg/package.json": JSON.stringify({
@@ -100,11 +110,11 @@ test("follows the CommonJS export branch that the built main process loads", asy
     "node_modules/dual-pkg/heavy.cjs": 'exports.wrap = require("ai").streamText;\n',
   });
 
-  const report = await analyze();
-
-  expect(report.violations.map((v) => v.chain)).toEqual([
+  expect((await analyze("commonjs")).violations.map((v) => v.chain)).toEqual([
     ["src/entry.ts", "node_modules/dual-pkg/heavy.cjs", "ai"],
   ]);
+  // A bundled entry (the preload) loads the clean "import" branch instead.
+  expect((await analyze("bundle")).violations).toEqual([]);
 });
 
 test("detects a banned package reached through a package alias", async () => {
