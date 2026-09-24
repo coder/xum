@@ -460,10 +460,10 @@ describe("Held (refused) queued messages", () => {
     }
   }, 90_000);
 
-  test("the default restore (a Stop's queued input) still replaces the draft", async () => {
-    const app = await createAppHarness({ branchPrefix: "unsent-replace" });
+  test("the default restore (a Stop's queued input) keeps a newer draft after the restored input", async () => {
+    const app = await createAppHarness({ branchPrefix: "unsent-restore" });
     try {
-      await app.chat.typeWithoutSending("draft to be replaced");
+      await app.chat.typeWithoutSending("newer draft");
       const workspaceService = app.env.services.workspaceService;
       workspaceService.getOrCreateSession(app.workspaceId);
       workspaceService.emitChatEvent(app.workspaceId, {
@@ -471,7 +471,8 @@ describe("Held (refused) queued messages", () => {
         workspaceId: app.workspaceId,
         text: "queued input restored by stop",
       });
-      await app.chat.expectInputValue("queued input restored by stop");
+      // #4431: the restore used to replace the draft.
+      await app.chat.expectInputValue("queued input restored by stop\n\nnewer draft");
     } finally {
       await app.dispose();
     }
