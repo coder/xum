@@ -9508,7 +9508,9 @@ describe("TaskService", () => {
       const restartedConfig = new Config(crashRoot);
       const cutChild = findWorkspaceInConfig(restartedConfig, childId);
       const recoverySend = createAcceptingSendMessage();
-      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: recoverySend });
+      const { workspaceService, resumeStream } = createWorkspaceServiceMocks({
+        sendMessage: recoverySend,
+      });
       const restarted = createTaskServiceHarness(restartedConfig, { workspaceService });
       await restarted.taskService.initialize();
       const executionId = cutChild?.taskExecutionId;
@@ -9522,9 +9524,7 @@ describe("TaskService", () => {
         handle,
         recoveredChild: findWorkspaceInConfig(restartedConfig, childId),
         childSends: recoverySend.mock.calls.filter((call) => call[0] === childId),
-        childResumes: (
-          workspaceService.resumeStream as unknown as ReturnType<typeof mock>
-        ).mock.calls.filter((call) => call[0] === childId),
+        childResumes: resumeStream.mock.calls.filter((call) => call[0] === childId),
       };
     }
 
@@ -9621,7 +9621,11 @@ describe("TaskService", () => {
 
     interface AttemptLedger {
       taskHandleStore: TaskHandleStore;
-      beginOwnedTaskAttempt(taskId: string, source: string): unknown;
+      beginOwnedTaskAttempt(
+        taskId: string,
+        source: string,
+        identity: { attemptId: string | undefined; receiptEligible: boolean }
+      ): unknown;
       settleOwnedTaskAttempt(taskId: string, attempt: unknown, source: string): void;
       ownedAttemptByTaskId: Map<string, unknown>;
       attemptSettlementByTaskId: Map<string, { attempt: unknown; source: string }>;
@@ -9677,7 +9681,10 @@ describe("TaskService", () => {
             if (variant === "settled meanwhile") {
               ledger.settleOwnedTaskAttempt(childId, reactivationAttempt, "test-settlement");
             } else if (variant === "successor meanwhile") {
-              successor = ledger.beginOwnedTaskAttempt(childId, "test-successor");
+              successor = ledger.beginOwnedTaskAttempt(childId, "test-successor", {
+                attemptId: undefined,
+                receiptEligible: false,
+              });
             }
             throw new Error("handle store disk full");
           }
@@ -9695,9 +9702,10 @@ describe("TaskService", () => {
           expect(isActiveWorkspaceTurnTaskStatus(child?.taskExecutionStatus)).toBe(false);
           const owned = ledger.ownedAttemptByTaskId.get(childId);
           if (variant === "no settlement") {
-            // Only the speculative attempt, with no settlement or successor, is restored.
+            // A published attempt is never rolled back (#4308): the refused reactivation's
+            // attempt stays owned until a Stop settles it.
             expect(reactivationAttempt).not.toBe(previousAttempt);
-            expect(owned).toBe(previousAttempt);
+            expect(owned).toBe(reactivationAttempt);
           } else if (variant === "settled meanwhile") {
             expect(owned).toBe(reactivationAttempt);
             expect(ledger.attemptSettlementByTaskId.get(childId)?.attempt).toBe(
