@@ -1,5 +1,5 @@
 import { GlobalWindow } from "happy-dom";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
 import { ThinkingProvider } from "./ThinkingContext";
@@ -34,6 +34,11 @@ const METADATA_WAIT_OPTIONS = { timeout: 5000, interval: 50 };
 
 // Setup basic DOM environment for testing-library
 const dom = new GlobalWindow();
+const originalWindow = globalThis.window;
+const originalDocument = globalThis.document;
+const originalLocation = globalThis.location;
+const originalStorageEvent = globalThis.StorageEvent;
+const originalCustomEvent = globalThis.CustomEvent;
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
 (global as any).window = dom.window;
 (global as any).document = dom.window.document;
@@ -45,6 +50,16 @@ const dom = new GlobalWindow();
 
 (global as any).console = console;
 /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
+
+// Unit shards run many files in one Bun process: a leaked about:blank window makes
+// json-schema-ref-parser (PTC type generation) in later files parse paths as browser URLs.
+afterAll(() => {
+  globalThis.window = originalWindow;
+  globalThis.document = originalDocument;
+  globalThis.location = originalLocation;
+  globalThis.StorageEvent = originalStorageEvent;
+  globalThis.CustomEvent = originalCustomEvent;
+});
 
 interface TestProps {
   workspaceId: string;
