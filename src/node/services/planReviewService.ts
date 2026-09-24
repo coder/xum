@@ -51,7 +51,7 @@ import { createPlanReviewRecordMessageId, createUserMessageId } from "./utils/me
 
 type PlanReviewHistory = Pick<
   HistoryService,
-  "iterateFullHistory" | "appendDerivedFromFullHistory"
+  "iterateFullHistory" | "appendDerivedFromFullHistory" | "getLastMessages"
 >;
 
 export interface PlanReviewHistoryDeps {
@@ -71,6 +71,15 @@ export interface EnsurePlanSnapshotArgs {
    * or stopped can never publish a late row.
    */
   signal?: AbortSignal;
+  /**
+   * Refuse the append when rows present before the plan read were removed by admission time.
+   * WorkspaceService's context-mutation fencing (the `signal` for on-demand captures) is
+   * process-local, but the history write lock is cross-process: a full clear committed by a
+   * sibling backend (XUM_ALLOW_MULTIPLE_INSTANCES) between the read and the append would
+   * otherwise land pre-clear plan bytes in the emptied history. Only for on-demand captures:
+   * a turn-owned capture can legitimately see mid-turn compaction replace rows.
+   */
+  refuseAfterHistoryRemoval?: boolean;
 }
 
 export interface EnsurePlanSnapshotResult {
@@ -178,6 +187,14 @@ export async function ensurePlanSnapshot(
   args: EnsurePlanSnapshotArgs
 ): Promise<Result<EnsurePlanSnapshotResult, PlanReviewError>> {
   if (args.signal?.aborted) return Err(captureAborted());
+  // Anchor for refuseAfterHistoryRemoval: row ids are unique and appends never remove rows, so
+  // the newest pre-read row missing under the lock means rows were removed since the read.
+  let anchorRowId: string | undefined;
+  if (args.refuseAfterHistoryRemoval === true) {
+    const last = await deps.historyService.getLastMessages(args.workspaceId, 1);
+    if (!last.success) return Err(historyFailed(last.error));
+    anchorRowId = last.data.at(-1)?.id;
+  }
   const runtime = createRuntimeForWorkspace(args.metadata);
   const plan = await readPlanFile(
     runtime,
@@ -234,6 +251,9 @@ export async function ensurePlanSnapshot(
       // Admission check under the lock: the read above may have taken long enough for the
       // owning turn to settle or stop, and a late row must not be published after that.
       if (args.signal?.aborted) return { message: null, value: "aborted" };
+      if (anchorRowId !== undefined && !messages.some((row) => row.id === anchorRowId)) {
+        return { message: null, value: "aborted" };
+      }
       priorRows = messages.filter(isPlanReviewRow);
       const state = derivePlanReviewState(priorRows, deriveOptions(args.workspaceId));
       const existing = state.snapshots.find((snapshot) => snapshot.contentHash === contentHash);

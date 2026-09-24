@@ -11745,6 +11745,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         workspaceId,
         metadata,
         signal: capture.signal,
+        // The signal is process-local; this also fences sibling backends (see the arg's doc).
+        refuseAfterHistoryRemoval: true,
         ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
       });
     } finally {
