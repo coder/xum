@@ -31,7 +31,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
  * Every wait below is on an explicit signal (barrier files, the FIFO, process exit, the shim's
  * completion marker); none uses elapsed time as evidence.
  */
-const FIXTURE = path.join(import.meta.dir, "workspaceService.killedCoordinator.fixture.ts");
+const FIXTURE = path.join(import.meta.dir, "workspaceService.killedCoordinator.testHarness.ts");
 const REGISTRATION_LOCK = "workspace-registration.lock";
 const ROOT_ID = "kc-root";
 const PROTECTED_ID = "kcprotect01";

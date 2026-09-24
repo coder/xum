@@ -26,7 +26,7 @@ import { HistoryService } from "@/node/services/historyService";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { WorkspaceService } from "@/node/services/workspaceService";
 
-export const KILLED_COORDINATOR_BRANCH = "ordinary";
+const KILLED_COORDINATOR_BRANCH = "ordinary";
 
 async function main(): Promise<void> {
   const [rootDir, projectPath, mode] = process.argv.slice(2);
