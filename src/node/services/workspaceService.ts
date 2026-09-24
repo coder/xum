@@ -7625,6 +7625,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (granted != null) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
+    } catch (error) {
+      // Never throws: WorkspaceTurnManager awaits this after persisting and reserving its
+      // handle, so an exception would skip the send and every settlement path and leave a
+      // stuck "running" handle. The grant itself is durable; publication is best-effort and
+      // the next metadata refresh shows it.
+      log.warn("Failed to publish default unrelated-workspace consent", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     } finally {
       this.pendingDefaultUnrelatedConsent.delete(workspaceId);
     }

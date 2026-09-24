@@ -352,6 +352,20 @@ describe("WorkspaceService.grantDefaultUnrelatedWorkspaceConsent", () => {
     expect(published).toEqual([]);
   });
 
+  test("a failing metadata publication does not throw out of the deferred grant", async () => {
+    markDeferredDefault();
+    // A downstream metadata consumer throwing makes the publication reject.
+    harness.service.on("metadata", () => {
+      throw new Error("metadata consumer exploded");
+    });
+
+    // Resolves (WorkspaceTurnManager must still reach its send/settlement paths)...
+    await harness.service.grantDefaultUnrelatedWorkspaceConsent(WORKSPACE_ID);
+    // ...and the grant itself stays durable.
+    const generation = harness.persistedConsent();
+    expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
+  });
+
   test("grants nothing to a workspace whose creation did not defer the default", async () => {
     // Existing workspaces must never be backfilled, even through the deferred-grant entry point.
     await harness.service.grantDefaultUnrelatedWorkspaceConsent(OTHER_WORKSPACE_ID);
