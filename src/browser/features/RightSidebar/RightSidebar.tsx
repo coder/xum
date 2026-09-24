@@ -1434,7 +1434,9 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // - Adds tabs for backend sessions that don't have tabs (restore after reload)
   // - Removes "ghost" tabs for sessions that no longer exist (cleanup after app restart)
   // Runs only on workspace change, not layout change (layout.root as a dependency would
-  // loop), so it reads the latest layout through a ref when the session list arrives.
+  // loop), so it snapshots the layout through a ref when the request starts. Comparing the
+  // backend list with that snapshot (not the latest layout) keeps terminals created or
+  // closed while the request is in flight from being removed or re-added.
   const layoutForSessionSyncRef = React.useRef(layout);
   React.useLayoutEffect(() => {
     layoutForSessionSyncRef.current = layout;
@@ -1443,6 +1445,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     if (!api) return;
 
     let cancelled = false;
+    const layoutAtRequestStart = layoutForSessionSyncRef.current;
 
     void api.terminal.listSessions({ workspaceId }).then((backendSessionIds) => {
       if (cancelled) return;
@@ -1450,7 +1453,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       const backendSessionSet = new Set(backendSessionIds);
 
       // Get current terminal tabs in layout
-      const currentTabs = collectAllTabs(layoutForSessionSyncRef.current.root);
+      const currentTabs = collectAllTabs(layoutAtRequestStart.root);
       const currentTerminalTabs = currentTabs.filter(isTerminalTab);
       const currentTerminalSessionIds = new Set(
         currentTerminalTabs.map(getTerminalSessionId).filter(Boolean)
