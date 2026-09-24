@@ -13,6 +13,8 @@
  *                with that workspace; sub-agents share their parent's store)
  */
 
+import { EVALUATION_MAX_QUESTIONS } from "@/constants/evaluation";
+
 /** Virtual root prefix all memory paths are expressed under. */
 export const MEMORY_VIRTUAL_ROOT = "/memories";
 
@@ -117,3 +119,9 @@ export const MEMORY_INTUITION_MAX_READ_BYTES = 256 * 1024;
 export const MEMORY_INTUITION_MAX_INDEX_ENTRIES = 200;
 export const MEMORY_INTUITION_MAX_INDEX_BYTES = 32 * 1024;
 export const MEMORY_INTUITION_INDEX_AUTH_CONCURRENCY = 4;
+/**
+ * Evaluation recall: index entries judged by stage 1 and memory chunks scored by
+ * stage 2. Each stage is one request, so both follow the shared per-request cap.
+ */
+export const MEMORY_INTUITION_EVAL_MAX_ENTRIES = EVALUATION_MAX_QUESTIONS;
+export const MEMORY_INTUITION_EVAL_MAX_CHUNKS = EVALUATION_MAX_QUESTIONS;
