@@ -3,6 +3,7 @@ import React, {
   useRef,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useSyncExternalStore,
 } from "react";
@@ -339,9 +340,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     editMessageId: string;
     precondition: HistoryEditPrecondition;
   } | null>(null);
-  // Assigned during render, not in a passive effect: a refresh that settles between a commit
-  // that changed the edit and that effect must already see the new edit as current.
-  editingMessageIdRef.current = editingMessage?.id;
+  // Assigned in a layout effect, not a passive one: a refresh that settles between a commit
+  // that changed the edit and a passive effect must already see the new edit as current.
+  // Layout effects run in the same task as the commit, so no callback can observe the gap.
+  useLayoutEffect(() => {
+    editingMessageIdRef.current = editingMessage?.id;
+  });
   const [pendingBoundaryEditConfirmation, setPendingBoundaryEditConfirmation] =
     useState<SendOverrides | null>(null);
   // Hide edit-mode chrome as soon as an edit send starts so the input doesn't sit blank
@@ -444,9 +448,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setPendingError(null);
   }, [pendingErrorKey, pendingError, setPendingError]);
 
-  const handleToastDismiss = useCallback(() => {
+  const handleToastDismiss = () => {
     setToast(null);
-  }, []);
+  };
 
   const draft = useComposerDraft({
     variant,
@@ -689,91 +693,73 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { hours: idleCompactionHours, setHours: setIdleCompactionHours } = useIdleCompactionHours({
     projectPath: selectedWorkspace?.projectPath ?? null,
   });
-  const idleCompactionProps = useMemo(
-    () => ({
-      hours: idleCompactionHours,
-      setHours: setIdleCompactionHours,
-    }),
-    [idleCompactionHours, setIdleCompactionHours]
-  );
+  const idleCompactionProps = {
+    hours: idleCompactionHours,
+    setHours: setIdleCompactionHours,
+  };
 
-  const setPreferredModel = useCallback(
-    (model: string) => {
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
+  const setPreferredModel = (model: string) => {
+    type WorkspaceAISettingsByAgentCache = Partial<
+      Record<
+        string,
+        { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
+      >
+    >;
 
-      const selectedModel = normalizeSelectedModel(model);
-      if (
-        variant === "workspace" &&
-        hasBudgetedResumableGoal(workspaceGoal) &&
-        !modelHasPricingData(selectedModel, providersConfig)
-      ) {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
-        });
-        return;
+    const selectedModel = normalizeSelectedModel(model);
+    if (
+      variant === "workspace" &&
+      hasBudgetedResumableGoal(workspaceGoal) &&
+      !modelHasPricingData(selectedModel, providersConfig)
+    ) {
+      setToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
+      });
+      return;
+    }
+
+    ensureModelInSettings(selectedModel); // Ensure model exists in Settings
+    // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
+    setAutoModelRoutingActive(false);
+
+    if (onModelChange) {
+      // Notify parent of model change (for context switch warning + persisted model metadata).
+      // Called before early returns so warnings work even offline or with custom agents.
+      onModelChange(selectedModel);
+    } else {
+      const scopeId =
+        variant === "creation" ? getProjectScopeId(creationParentProjectPath) : workspaceId;
+      if (scopeId) {
+        setWorkspaceModelWithOrigin(scopeId, selectedModel, "user");
       }
+    }
 
-      ensureModelInSettings(selectedModel); // Ensure model exists in Settings
-      // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
-      setAutoModelRoutingActive(false);
+    if (variant !== "workspace" || !workspaceId) {
+      return;
+    }
 
-      if (onModelChange) {
-        // Notify parent of model change (for context switch warning + persisted model metadata).
-        // Called before early returns so warnings work even offline or with custom agents.
-        onModelChange(selectedModel);
-      } else {
-        const scopeId =
-          variant === "creation" ? getProjectScopeId(creationParentProjectPath) : workspaceId;
-        if (scopeId) {
-          setWorkspaceModelWithOrigin(scopeId, selectedModel, "user");
-        }
-      }
+    const normalizedAgentId = normalizeAgentId(agentId, "exec");
 
-      if (variant !== "workspace" || !workspaceId) {
-        return;
-      }
-
-      const normalizedAgentId = normalizeAgentId(agentId, "exec");
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
-          };
-        },
-        {}
-      );
-    },
-    [
-      agentId,
-      creationParentProjectPath,
-      ensureModelInSettings,
-      providersConfig,
-      onModelChange,
-      setAutoModelRoutingActive,
-      thinkingLevel,
-      reasoningMode,
-      variant,
-      workspaceGoal,
-      workspaceId,
-    ]
-  );
+    updatePersistedState<WorkspaceAISettingsByAgentCache>(
+      getWorkspaceAISettingsByAgentKey(workspaceId),
+      (prev) => {
+        const record: WorkspaceAISettingsByAgentCache =
+          prev && typeof prev === "object" ? prev : {};
+        return {
+          ...record,
+          [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
+        };
+      },
+      {}
+    );
+  };
 
   // Model cycling candidates: all visible models (custom + built-in, minus hidden).
   const cycleModels = models;
 
-  const cycleToNextModel = useCallback(() => {
+  const cycleToNextModel = () => {
     if (cycleModels.length < 2) {
       return;
     }
@@ -784,7 +770,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (nextModel) {
       setPreferredModel(nextModel);
     }
-  }, [baseModel, cycleModels, setPreferredModel]);
+  };
+
+  // The global shortcut listener reads the latest handler through a ref so it isn't
+  // re-subscribed whenever the model list or selection changes.
+  const cycleToNextModelRef = useRef(cycleToNextModel);
+  useLayoutEffect(() => {
+    cycleToNextModelRef.current = cycleToNextModel;
+  });
 
   const openModelSelector = useCallback(() => {
     modelSelectorRef.current?.open();
@@ -1256,7 +1249,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       if (matchesKeybind(event, KEYBINDS.CYCLE_MODEL)) {
         event.preventDefault();
         focusMessageInput();
-        cycleToNextModel();
+        cycleToNextModelRef.current();
       }
     };
 
@@ -1264,30 +1257,42 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
     };
-  }, [cycleToNextModel, focusMessageInput, openModelSelector]);
+  }, [focusMessageInput, openModelSelector]);
 
-  // When entering editing mode, save current draft and populate with message content
+  // When entering editing mode, save current draft and populate with message content.
+  // Runs once per edit target: the draft callbacks change identity as the user types, and
+  // re-applying would clobber the in-progress edit text. The applied-id ref makes that
+  // explicit instead of hiding the callbacks from the dependency list.
+  const appliedEditIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (editingMessage) {
-      preEditDraftRef.current = getDraft();
-      preEditReviewsRef.current = draftReviews;
-      applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
-      setDraftReviews(editingMessage.pending.reviews);
-      // Auto-resize textarea and focus
-      setTimeout(() => {
-        if (inputRef.current) {
-          inputRef.current.style.height = "auto";
-          inputRef.current.style.height =
-            Math.min(inputRef.current.scrollHeight, window.innerHeight * 0.5) + "px";
-          inputRef.current.focus();
-        }
-      }, 0);
+    if (!editingMessage) {
+      appliedEditIdRef.current = null;
+      return;
     }
-    // Key on the edit target only: function deps (applyDraftFromPending via the
-    // draft hook) are not identity-stable without manual memoization, and
-    // re-running would clobber the user's in-progress edit text every render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editingMessage?.id]);
+    if (appliedEditIdRef.current === editingMessage.id) return;
+    appliedEditIdRef.current = editingMessage.id;
+    preEditDraftRef.current = getDraft();
+    preEditReviewsRef.current = draftReviews;
+    applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
+    setDraftReviews(editingMessage.pending.reviews);
+    // Auto-resize textarea and focus
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.style.height = "auto";
+        inputRef.current.style.height =
+          Math.min(inputRef.current.scrollHeight, window.innerHeight * 0.5) + "px";
+        inputRef.current.focus();
+      }
+    }, 0);
+  }, [
+    editingMessage,
+    getDraft,
+    draftReviews,
+    applyDraftFromPending,
+    setDraftReviews,
+    preEditDraftRef,
+    preEditReviewsRef,
+  ]);
 
   // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
@@ -2546,8 +2551,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setPendingBoundaryEditConfirmation(null);
   };
 
-  // Keep the imperative API pointing at the latest send handler.
-  handleSendRef.current = handleSend;
+  // Keep the imperative API pointing at the latest send handler. A layout effect (not a
+  // render-time write, which React Compiler rejects) updates it in the commit's own task.
+  useLayoutEffect(() => {
+    handleSendRef.current = handleSend;
+  });
 
   // Handler for Escape in vim normal mode - cancels edit if editing
   const handleEscapeInNormalMode = () => {
