@@ -2184,20 +2184,32 @@ export class AgentSession {
    * from client flags or envelope-looking text), in getEditTruncateTargetId's lookup order. An
    * ordinary edit resends only the envelope text, which is neutralized as an untrusted lookalike,
    * so the threads that feedback opened would silently vanish from review state.
+   *
+   * Fails closed: an Err means the target could not be classified, and the caller must refuse
+   * the edit. Treating a failed read as "not feedback" let the edit proceed, and a later
+   * successful read could then truncate archived feedback and delete its threads.
    */
-  private async isPlanReviewFeedbackEditTarget(editMessageId: string): Promise<boolean> {
+  private async isPlanReviewFeedbackEditTarget(
+    editMessageId: string
+  ): Promise<Result<boolean, string>> {
     const isFeedback = (message: MuxMessage | undefined) =>
       message !== undefined && getAuthenticPlanReviewRecord(message)?.kind === "feedback";
+    // A failed latest-boundary read falls through to the full scan, which also covers it.
     const latest = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     const inLatest = latest.success
       ? latest.data.find((message) => message.id === editMessageId)
       : undefined;
-    if (inLatest) return isFeedback(inLatest);
+    if (inLatest) return Ok(isFeedback(inLatest));
     let target: MuxMessage | undefined;
-    await this.historyService.iterateFullHistory(this.workspaceId, "forward", (messages) => {
-      target ??= messages.find((message) => message.id === editMessageId);
-    });
-    return isFeedback(target);
+    const scanned = await this.historyService.iterateFullHistory(
+      this.workspaceId,
+      "forward",
+      (messages) => {
+        target ??= messages.find((message) => message.id === editMessageId);
+      }
+    );
+    if (!scanned.success) return Err(scanned.error);
+    return Ok(isFeedback(target));
   }
 
   private async getEditTruncateTargetId(editMessageId: string): Promise<string> {
@@ -4076,7 +4088,14 @@ export class AgentSession {
         );
       // The UI hides Edit for feedback rows; refuse direct API edits too, before the context
       // reset, the interruption and the truncation can touch anything.
-      if (await this.isPlanReviewFeedbackEditTarget(editMessageId))
+      const feedbackTarget = await this.isPlanReviewFeedbackEditTarget(editMessageId);
+      if (!feedbackTarget.success)
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(
+            `Cannot edit: history could not be read to check the message (${feedbackTarget.error}). Try again.`
+          )
+        );
+      if (feedbackTarget.data)
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE)
         );

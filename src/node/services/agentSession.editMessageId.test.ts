@@ -1,8 +1,9 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import { createMuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
+import { getPlanReviewState, hashPlanSnapshotContent } from "./planReviewService";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import {
   buildPlanReviewMetadata,
@@ -206,6 +207,81 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     await session.waitForIdle();
     expect(streamMessage).toHaveBeenCalledTimes(1);
     expect((await ids()).slice(0, 2)).toEqual(["plan-feedback", "assistant-reply"]);
+  });
+
+  it("refuses an edit when the full-history read that classifies an archived target fails", async () => {
+    // A compaction boundary archives the feedback row, so only the full-history scan can see
+    // it. If that read fails, the edit must not proceed: a later successful read would truncate
+    // the authentic feedback and replace it with a neutralized plain-text wrapper, deleting its
+    // threads from review state.
+    const workspaceId = "ws-edit-plan-feedback-read-failure";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const planContent = "# Plan\n\nStep one.\n";
+    const snapshotRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec-s",
+      snapshotId: "s1",
+      planPath: "/tmp/plan.md",
+      contentHash: hashPlanSnapshotContent(planContent),
+      content: planContent,
+    };
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: snapshotRecord.contentHash,
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    for (const [id, record] of [
+      ["plan-snapshot", snapshotRecord],
+      ["plan-feedback", feedbackRecord],
+    ] as const) {
+      const appended = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+          synthetic: record.kind === "snapshot",
+          muxMetadata: buildPlanReviewMetadata(record),
+        })
+      );
+      expect(appended.success).toBe(true);
+    }
+    const compacted = await historyService.persistBoundaryWithTailCopies(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "summary", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      }),
+      [],
+      false
+    );
+    expect(compacted.success).toBe(true);
+    const latest = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(latest.success && latest.data.map((message) => message.id)).toEqual(["summary"]);
+
+    spyOn(historyService, "iterateFullHistory").mockResolvedValueOnce(Err("disk read failed"));
+    const refused = await session.sendMessage("edited feedback", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "plan-feedback",
+    });
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error.type).toBe("unknown");
+      expect(refused.error.type === "unknown" && refused.error.raw).toContain("disk read failed");
+    }
+    expect(streamMessage).not.toHaveBeenCalled();
+    const state = await getPlanReviewState(historyService, workspaceId);
+    expect(state.success).toBe(true);
+    if (state.success) {
+      expect(state.data.feedbacks.map((feedback) => feedback.feedbackId)).toEqual(["f1"]);
+      expect(state.data.threads.map((thread) => thread.threadId)).toEqual(["t1"]);
+    }
   });
 
   it("clears image parts when editing with explicit empty fileParts", async () => {
