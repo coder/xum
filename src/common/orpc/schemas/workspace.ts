@@ -122,11 +122,12 @@ export const WorkflowTaskMetadataSchema = z.object({
  * The value is an opaque revocation GENERATION, not a bearer credential: the sender never supplies
  * it; the backend compares the generation captured at admission with the current one so an
  * off→on flip cannot revive work queued under the previous consent. Absent means off. New root
- * workspaces are created with a fresh generation (on by default); the app's settings surface writes it — same-UID processes with config access can too, so it is an
+ * workspaces (other than task-delegated targets) get a fresh generation once their creation setup
+ * is complete (on by default); the app's settings surface writes it — same-UID processes with config access can too, so it is an
  * application-level opt-in, not an isolation boundary.
  */
 export const UNRELATED_WORKSPACE_CONSENT_DESCRIPTION =
-  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. New root workspaces start with one; absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
+  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. New root workspaces (other than task-delegated targets) start with one; absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
 
 /**
  * Fail-closed reader for the persisted consent generation. Config entries are loaded without

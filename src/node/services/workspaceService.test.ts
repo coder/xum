@@ -21539,7 +21539,22 @@ describe("WorkspaceService init cancellation", () => {
       }),
     };
 
-    const configState: ProjectsConfig = { projects: new Map() };
+    // Two pre-existing workspaces — auto-naming should skip past them. loadConfigOrDefault
+    // returns the same state editConfig mutates, so post-write re-reads see real writes.
+    const configState: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { id: "x", name: "workspace-1", path: "/tmp/proj-auto/workspace-1" },
+              { id: "y", name: "workspace-2", path: "/tmp/proj-auto/workspace-2" },
+            ],
+            trusted: true,
+          },
+        ],
+      ]),
+    };
 
     const mockMetadata: FrontendWorkspaceMetadata = {
       id: workspaceId,
@@ -21563,21 +21578,7 @@ describe("WorkspaceService init cancellation", () => {
       getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
       sessionsDir: "/tmp/test/sessions",
       findWorkspace: mock(() => null),
-      // Two pre-existing workspaces — auto-naming should skip past them.
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map([
-          [
-            projectPath,
-            {
-              workspaces: [
-                { id: "x", name: "workspace-1", path: "/tmp/proj-auto/workspace-1" },
-                { id: "y", name: "workspace-2", path: "/tmp/proj-auto/workspace-2" },
-              ],
-              trusted: true,
-            },
-          ],
-        ]),
-      })),
+      loadConfigOrDefault: mock(() => configState),
     };
 
     const mockAIService = {
@@ -21687,7 +21688,7 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
-  test("create() with deferUnrelatedWorkspaceConsent leaves consent off and marks the default pending", async () => {
+  test("create() with skipDefaultUnrelatedWorkspaceConsent leaves the workspace opted out", async () => {
     // /new mirrors /fork's seamless flow: callers no longer have to invent a
     // workspace name. The backend should derive the next "workspace-N" slot
     // and persist `pendingAutoTitle` so the first message can title the workspace.
@@ -21828,7 +21829,7 @@ describe("WorkspaceService init cancellation", () => {
         // pendingAutoTitle: true mirrors the /fork-with-message flow.
         true,
         undefined,
-        { deferUnrelatedWorkspaceConsent: true }
+        { skipDefaultUnrelatedWorkspaceConsent: true }
       );
 
       expect(result.success).toBe(true);
@@ -21849,16 +21850,14 @@ describe("WorkspaceService init cancellation", () => {
       const newEntry = persisted.find((entry) => entry.id === workspaceId);
       expect(newEntry?.name).toBe("workspace-3");
       expect(newEntry?.pendingAutoTitle).toBe(true);
-      // WorkspaceTurnManager grants it later, once its handle reservation exists; until then
-      // the target is neither persisted nor announced as consented...
+      // Delegated targets are not opted in (yet): nothing persisted, announced or pending.
       expect(newEntry?.unrelatedWorkspaceConsent).toBeUndefined();
       expect(result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
-      // ...but the deferred default is pending, so that later grant applies.
       expect(
         (
           workspaceService as unknown as { pendingDefaultUnrelatedConsent: Set<string> }
         ).pendingDefaultUnrelatedConsent.has(workspaceId)
-      ).toBe(true);
+      ).toBe(false);
     } finally {
       createRuntimeSpy.mockRestore();
     }

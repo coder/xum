@@ -1882,10 +1882,12 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 /**
  * Mints a fresh unrelated-messaging consent generation (see setUnrelatedWorkspaceConsent).
  * New root workspaces (create, scratch, multi-project, fork) are opted in by default so an agent
- * in another task tree can reach them without a manual toggle. create grants it after
- * registration-time plugin sanitization, fork after all of its setup, and delegated targets after
- * WorkspaceTurnManager reserves their handle (grantCreationUnrelatedWorkspaceConsent); scratch and
- * multi-project have no such steps and persist it with the entry. Pre-existing workspaces are
+ * in another task tree can reach them without a manual toggle. Consent is granted only once the
+ * workspace's creation setup is complete (grantCreationUnrelatedWorkspaceConsent): create after
+ * registration-time plugin sanitization or, for a deferred checkout, after that checkout's own
+ * sanitization; fork after all of its setup; scratch and multi-project have no such steps and
+ * persist it with the entry. Delegated task(kind:"workspace") targets are not opted in yet (they
+ * skip the default; tracked as a follow-up). Pre-existing workspaces are
  * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
  * TaskService and stay off; their parent owns them.
@@ -2964,9 +2966,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingPluginSanitizations = new Set<string>();
 
   /**
-   * Workspaces created with `deferUnrelatedWorkspaceConsent` whose default grant has not run
-   * yet. An explicit consent toggle removes the entry, so the deferred grant (checked inside the
-   * serialized config edit) can never reverse a choice the user already made.
+   * Deferred-checkout creations whose default consent waits for the checkout's sanitization
+   * (materializeDeferredCheckout). The workspace is already announced then, so an explicit
+   * consent toggle removes the entry and the grant (re-checked inside the serialized config
+   * edit) can never reverse a choice the user already made. Process-local: a toggle handled by
+   * another backend sharing this root cannot cancel it (tracked with #4446).
    */
   private readonly pendingDefaultUnrelatedConsent = new Set<string>();
 
@@ -3361,6 +3365,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       initParams.initLogger.logComplete(-1);
       return;
     }
+    // Checkout populated and sanitized: only now may other task trees discover and message
+    // this workspace. Granting at registration would rely on waitForInit, which a second
+    // backend sharing this root does not observe.
+    await this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
     await runBackgroundInit(runtime, initParams, workspaceId, log);
   }
 
@@ -5397,12 +5405,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
        */
       awaitMaterialization?: boolean;
       /**
-       * Skip the default unrelated-messaging consent grant. WorkspaceTurnManager sets this
-       * for delegated targets and grants via grantDefaultUnrelatedWorkspaceConsent once its
-       * handle reservation exists, so no other task tree can wake the target before the
-       * delegated turn owns it.
+       * Do not opt this workspace in to unrelated messaging. WorkspaceTurnManager sets it for
+       * delegated targets until their default gets its own finalization design (follow-up).
        */
-      deferUnrelatedWorkspaceConsent?: boolean;
+      skipDefaultUnrelatedWorkspaceConsent?: boolean;
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
     if (tags != null) {
@@ -5736,19 +5742,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             );
           }
         }
-        // Registration is complete (sanitized when required) and nothing has been announced
-        // yet: only now may other task trees discover and message this workspace.
-        if (options?.deferUnrelatedWorkspaceConsent !== true) {
+        if (options?.skipDefaultUnrelatedWorkspaceConsent === true) {
+          // Delegated target: stays off (see the option).
+        } else if (pendingMaterialization !== undefined) {
+          // Deferred checkout: its files (and their sanitization) arrive after the announcement,
+          // so the grant waits for materializeDeferredCheckout. Marked before announcing, so a
+          // toggle the user makes once the workspace appears cancels it.
+          this.pendingDefaultUnrelatedConsent.add(workspaceId);
+        } else {
+          // Registration is complete (sanitized when required) and nothing has been announced
+          // yet: only now may other task trees discover and message this workspace.
           const unrelatedWorkspaceConsent = await this.grantCreationUnrelatedWorkspaceConsent(
             owningProjectPath,
             workspaceId,
             createResult!.workspacePath
           );
           completeMetadata = { ...completeMetadata, unrelatedWorkspaceConsent };
-        } else {
-          // Marked before the workspace is announced, so any toggle the user makes after it
-          // appears cancels the deferred default (see pendingDefaultUnrelatedConsent).
-          this.pendingDefaultUnrelatedConsent.add(workspaceId);
         }
       } finally {
         await releaseRegistrationLock?.();
@@ -5792,7 +5801,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
-              })
+                // Removal, failed checkout or failed sanitization: the default never applies.
+              }).finally(() => this.pendingDefaultUnrelatedConsent.delete(workspaceId))
             : runBackgroundInit(runtime, initParams, workspaceId, log)
         );
       } else {
@@ -7564,7 +7574,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * consent makes the entry discoverable (task_list scope:"instance" reads config directly) and
    * wakeable by other task trees, and an agent request during the sanitization window would
    * activate the stale plugin enable that sanitization exists to prune. Fails closed: if the
-   * edit throws the workspace simply stays off. Returns the granted generation, if any.
+   * edit throws or does not persist, the workspace simply stays off. Returns the persisted
+   * generation, if any.
    */
   private async grantCreationUnrelatedWorkspaceConsent(
     projectPath: string,
@@ -7597,20 +7608,31 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       });
       return undefined;
     }
-    // No post-write re-read: a swallowed save failure (Config.saveConfig logs and continues)
-    // leaves the edited object in the in-process config snapshot, so the settings switch,
-    // task_list discovery and send admission all read the same value; only a restart differs.
-    // That behavior is shared by every config edit, including setUnrelatedWorkspaceConsent.
-    return granted;
+    if (granted == null) {
+      return undefined;
+    }
+    // Config.saveConfig logs and swallows write failures, and editConfig's transform ran on an
+    // uncached read, so a failed save leaves loadConfigOrDefault() re-reading the unchanged
+    // file. Report only what discovery and admission will actually read (see #4444).
+    const persisted = getValidUnrelatedWorkspaceConsent(
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+        .unrelatedWorkspaceConsent
+    );
+    if (persisted !== granted) {
+      log.warn("Default unrelated-workspace consent did not persist; leaving it off", {
+        workspaceId,
+      });
+      return undefined;
+    }
+    return persisted;
   }
 
   /**
-   * Deferred default consent for a workspace created with `deferUnrelatedWorkspaceConsent`.
-   * Called by WorkspaceTurnManager once the delegated turn's handle reservation is installed,
-   * so unrelated senders see a delegated root (refused) rather than an idle one. Publishes the
-   * resulting metadata so the settings switch reflects the grant.
+   * Default consent for a deferred-checkout creation, once materializeDeferredCheckout has
+   * populated and sanitized it. Applies only while the creation is still pending (an explicit
+   * toggle cancels it), and publishes the metadata since the workspace is already announced.
    */
-  async grantDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
+  private async grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
     try {
       const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
       if (found == null || !this.pendingDefaultUnrelatedConsent.has(workspaceId)) {
@@ -7626,10 +7648,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
     } catch (error) {
-      // Never throws: WorkspaceTurnManager awaits this after persisting and reserving its
-      // handle, so an exception would skip the send and every settlement path and leave a
-      // stuck "running" handle. The grant itself is durable; publication is best-effort and
-      // the next metadata refresh shows it.
+      // Never throws: it runs inside the deferred checkout's init settlement, which must go on
+      // to run the init hook. The grant itself is durable; publication is best-effort and the
+      // next metadata refresh shows it.
       log.warn("Failed to publish default unrelated-workspace consent", {
         workspaceId,
         error: getErrorMessage(error),

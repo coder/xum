@@ -1232,9 +1232,10 @@ export class WorkspaceTurnManager {
         false,
         tags,
         // The agentId validation below reads the target checkout under the task mutex, so
-        // a local worktree must be populated before create() resolves. Default consent is
-        // granted below, once this turn's handle reservation exists (see create()).
-        { awaitMaterialization: true, deferUnrelatedWorkspaceConsent: true }
+        // a local worktree must be populated before create() resolves. Delegated targets are
+        // not opted in to unrelated messaging yet: their default needs a finalization point
+        // tied to this turn's lifecycle (follow-up to #4440).
+        { awaitMaterialization: true, skipDefaultUnrelatedWorkspaceConsent: true }
       );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);
@@ -1464,17 +1465,6 @@ export class WorkspaceTurnManager {
         }
       }
       return Err("Task.createWorkspaceTurn: owner workspace was archived during turn creation");
-    }
-    if (createdWorkspace) {
-      // New root workspaces are opted in to unrelated messaging by default. Granted only now:
-      // the handle reservation above makes unrelated senders see a delegated root (refused,
-      // and hidden from task_list scope:"instance") instead of an idle one they could wake
-      // before this turn owns the workspace.
-      assert(
-        this.activeWorkspaceTurnHandleByWorkspaceId.get(targetWorkspaceId)?.handleId === handleId,
-        "createWorkspaceTurn: a created target's handle reservation must exist before consent"
-      );
-      await this.workspaceService.grantDefaultUnrelatedWorkspaceConsent(targetWorkspaceId);
     }
     if (agentValidationError != null) {
       // Deferred post-create validation failure: the record above keeps the created

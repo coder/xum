@@ -2071,29 +2071,16 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
-  test("createWorkspaceTurn defers default unrelated-messaging consent until its handle is reserved", async () => {
+  test("createWorkspaceTurn creates delegated targets without default unrelated-messaging consent", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
     const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
-    // What an unrelated sender's guards would see at the moment consent is granted.
-    let registrationAtGrant: unknown = "not granted";
-    const managerRef: {
-      current?: ReturnType<typeof createWorkspaceTurnManagerHarness>["taskService"];
-    } = {};
-    const grantDefaultUnrelatedWorkspaceConsent = mock((workspaceId: string) => {
-      registrationAtGrant = managerRef.current?.getLiveWorkspaceTurnRegistration(workspaceId);
-      return Promise.resolve();
-    });
-    const workspaceMocks = createWorkspaceServiceMocks({
-      create: createWorkspace,
-      grantDefaultUnrelatedWorkspaceConsent,
-    });
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
     const { taskService } = createWorkspaceTurnManagerHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
     });
-    managerRef.current = taskService;
 
     const result = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
@@ -2103,16 +2090,12 @@ describe("WorkspaceTurnManager", () => {
     });
 
     expect(result.success).toBe(true);
-    // create() must not grant it: the target would be an idle, wakeable root before this turn
-    // owns it.
+    // Delegated targets need a default tied to this turn's lifecycle (follow-up to #4440);
+    // until then create() must not opt them in.
     const createCall = createWorkspace.mock.calls[0] as unknown[];
-    expect(createCall[8]).toMatchObject({ deferUnrelatedWorkspaceConsent: true });
-    // Granted exactly once, while the reservation already marks it as a delegated root.
-    expect(grantDefaultUnrelatedWorkspaceConsent).toHaveBeenCalledTimes(1);
-    expect(grantDefaultUnrelatedWorkspaceConsent.mock.calls[0]).toEqual(["childworkspace"]);
-    expect(registrationAtGrant).toMatchObject({
-      handleId: "wst_childworkspace",
-      ownerWorkspaceId: parentId,
+    expect(createCall[8]).toMatchObject({
+      awaitMaterialization: true,
+      skipDefaultUnrelatedWorkspaceConsent: true,
     });
   });
 

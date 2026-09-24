@@ -664,10 +664,8 @@ export interface WorkspaceProvisioningHost {
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
     tags?: Record<string, string>,
-    options?: { awaitMaterialization?: boolean; deferUnrelatedWorkspaceConsent?: boolean }
+    options?: { awaitMaterialization?: boolean; skipDefaultUnrelatedWorkspaceConsent?: boolean }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
-  /** Default unrelated-messaging consent for a target created with the grant deferred. */
-  grantDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,
     workspacePath: string,

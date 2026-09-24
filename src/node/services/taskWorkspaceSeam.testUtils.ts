@@ -60,7 +60,6 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     remove: () => Promise.resolve(Ok(undefined)),
     removeWhileTaskTreeLocked: () => Promise.resolve(Ok(undefined)),
     create: () => Promise.resolve(Err("workspaceHost.create not mocked")),
-    grantDefaultUnrelatedWorkspaceConsent: () => Promise.resolve(),
     // Task-create tests exercise launch flow, not plugin-override sanitization.
     sanitizeMaterializedTaskWorkspace: () => Promise.resolve(undefined),
     discardExtensionMetadataEntry: () => Promise.resolve(),
