@@ -852,6 +852,146 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     ).toEqual(consented);
   }, 30_000);
 
+  // lXMXq: the no-prune decision rests on a LIVE sibling sharing the checkout. Removing the last
+  // sharing workspace must not land between that decision and the publication, or the task would
+  // be published as the checkout's sole owner with the removed workspace's `plugin:` enables.
+  // Host-local root removal takes the registration lock the creation holds from before its prune
+  // until after its publication, and the publication edit re-derives the shared row's ancestry.
+  // The removal is another backend's (removeWhileTaskTreeLocked: this process's task-tree lock is
+  // not shared across processes), so the registration lock is the only exclusion exercised.
+  test.each(["publication-first", "removal-first"] as const)(
+    "removing the last workspace sharing a project-dir checkout cannot land between the no-prune decision and the publication (%s)",
+    async (order) => {
+      const taskId = order === "publication-first" ? "directshare01" : "directshare02";
+      const projectPath = await createRepoWithTrackedEnable();
+      const { config, taskService, workspaceService, overridesService } =
+        await createRealStack(projectPath);
+      const documentPath = path.join(projectPath, OVERRIDES_RELATIVE_PATH);
+      const consented = { enabledServers: ["plugin:fedcba9876543210:consented"] };
+      await fsPromises.writeFile(documentPath, JSON.stringify(consented), "utf-8");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: projectPath,
+            id: rootId,
+            name: "repo",
+            createdAt: new Date().toISOString(),
+            runtimeConfig: { type: "local" },
+          },
+        ],
+        testTaskSettings()
+      );
+      stubStableIds(config, [taskId]);
+      const verdicts: boolean[] = [];
+      const realPrune =
+        overridesService.prunePluginOverrideKeysForUnregisteredCheckout.bind(overridesService);
+      let removal: ReturnType<WorkspaceService["removeWhileTaskTreeLocked"]> | undefined;
+
+      if (order === "publication-first") {
+        // Pause between the no-prune decision (the prune returned, its checkout locks released)
+        // and the publication, and let the removal race the publication from there.
+        const decided = Promise.withResolvers<void>();
+        const resume = Promise.withResolvers<void>();
+        const prune = spyOn(
+          overridesService,
+          "prunePluginOverrideKeysForUnregisteredCheckout"
+        ).mockImplementation((target, keyPrefix, options) =>
+          realPrune(target, keyPrefix, {
+            ...options,
+            shouldPrune: async () => {
+              const verdict = (await options?.shouldPrune?.()) ?? true;
+              verdicts.push(verdict);
+              return verdict;
+            },
+          })
+        );
+        const realRegister = workspaceService.registerSanitizedTaskCheckout.bind(workspaceService);
+        const register = spyOn(
+          workspaceService,
+          "registerSanitizedTaskCheckout"
+        ).mockImplementation((target, publish) =>
+          realRegister(target, async () => {
+            decided.resolve();
+            await resume.promise;
+            return publish();
+          })
+        );
+        restores.push(
+          () => prune.mockRestore(),
+          () => register.mockRestore()
+        );
+        const creation = taskService.create(createArgs("Shared"));
+        await decided.promise;
+        removal = workspaceService.removeWhileTaskTreeLocked(rootId, true);
+        let removalSettled = false;
+        void removal.then(() => {
+          removalSettled = true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        // Blocked on the registration lock: nothing removed yet.
+        expect(removalSettled).toBe(false);
+        expect(findWorkspaceInConfig(config, rootId)).toBeDefined();
+        resume.resolve();
+
+        expect(await creation).toMatchObject({ success: true, data: { taskId } });
+        // The published shared task now aliases the root: the removal refuses.
+        const removed = await removal;
+        expect(removed.success).toBe(false);
+        expect(findWorkspaceInConfig(config, rootId)).toBeDefined();
+        expect(findWorkspaceInConfig(config, taskId)).toMatchObject({ path: projectPath });
+        expect(verdicts).toEqual([false]);
+        // The live sibling's consent was never pruned.
+        expect(JSON.parse(await fsPromises.readFile(documentPath, "utf-8"))).toEqual(consented);
+      } else {
+        // The removal wins the lock after the creation resolved its parent and before its
+        // registration transaction.
+        const prune = spyOn(
+          overridesService,
+          "prunePluginOverrideKeysForUnregisteredCheckout"
+        ).mockImplementation((target, keyPrefix, options) =>
+          realPrune(target, keyPrefix, {
+            ...options,
+            shouldPrune: async () => {
+              const verdict = (await options?.shouldPrune?.()) ?? true;
+              verdicts.push(verdict);
+              return verdict;
+            },
+          })
+        );
+        const realRegister = workspaceService.registerSanitizedTaskCheckout.bind(workspaceService);
+        const register = spyOn(
+          workspaceService,
+          "registerSanitizedTaskCheckout"
+        ).mockImplementation(async (target, publish) => {
+          removal ??= workspaceService.removeWhileTaskTreeLocked(rootId, true);
+          expect(await removal).toMatchObject({ success: true });
+          return realRegister(target, publish);
+        });
+        restores.push(
+          () => prune.mockRestore(),
+          () => register.mockRestore()
+        );
+
+        const created = await taskService.create(createArgs("Shared"));
+        expect(findWorkspaceInConfig(config, rootId)).toBeUndefined();
+        // Never published as the checkout's sole owner carrying the removed root's enables: with
+        // no live sibling left the prune runs, and the publication edit refuses the broken
+        // ancestry (nothing is published).
+        expect(created.success).toBe(false);
+        if (created.success) throw new Error("unreachable");
+        expect(created.error).toContain("parent workspace changed");
+        expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+        expect(verdicts).toEqual([true]);
+        expect(JSON.parse(await fsPromises.readFile(documentPath, "utf-8"))).toEqual({
+          enabledServers: [],
+        });
+      }
+    },
+    30_000
+  );
+
   test.each(["before-the-scan", "after-the-prune"] as const)(
     "an older-style in-place registration of the same physical checkout through a symlinked spelling (%s): a live alias of the fresh fork refuses the creation with its consent intact; consent saved after the prune survives publication",
     async (when) => {
