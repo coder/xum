@@ -575,6 +575,58 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     }
   }, 20_000);
 
+  test.each([
+    "turn completes with the stream end",
+    "turn completes after report publication",
+  ] as const)(
+    "ld5y_ classification: a manual message queued on a workflow-owned leaf that then reports and is auto-deleted is not silently lost (%s)",
+    async (ordering) => {
+      // Codex PRRT_kwDOPxxmWM6ld5y_: the reported workflow leaf is auto-deleted (remove() disposes
+      // the session) while the queued manual follow-up still waits in that session.
+      const late = ordering === "turn completes after report publication";
+      const childId = late ? "holdwfleaf0002" : "holdwfleaf0001";
+      const stack = await createStack(childId, {
+        workflowTask: { runId: "wfr_held_cleanup", stepId: "step" },
+      });
+      const { config, taskService, workspaceService, completions, sendOptions } = stack;
+      try {
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+        expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+        expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
+        const event = stack.endStream(0, { report: "done" }, !late);
+        await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
+        // Let report publication, the idle drain and any auto-delete run to completion.
+        await yieldMacrotasks(40);
+        const queuedAtRemoval = workspaceService.hasQueuedMessages(childId);
+        if (late) stack.completeStream(0, event);
+        await yieldMacrotasks(20);
+        const removed = entryOf(config, childId) == null;
+        const outcome = {
+          removed,
+          followUpStreamed: completions.length > 1,
+          held: stack.heldTexts(),
+          stillQueued: removed ? null : workspaceService.hasQueuedMessages(childId),
+          queuedBeforeTurnCompleted: late ? queuedAtRemoval : null,
+        };
+        console.log("LD5Y_OUTCOME", JSON.stringify(outcome));
+        // Preserved means sent, or still reachable by the user: a held input or queued entry of a
+        // deleted workspace lives only in its disposed session, which nothing can reach.
+        const preserved =
+          outcome.followUpStreamed ||
+          (!removed && (outcome.held.includes("follow-up text") || outcome.stillQueued === true));
+        expect(preserved).toBe(true);
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
+
   test("a session holding refused input blocks an app restart until the input is sent or discarded (it lives only in memory)", async () => {
     const childId = "holdrestart001";
     const stack = await createStack(childId);
