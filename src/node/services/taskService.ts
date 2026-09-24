@@ -15257,8 +15257,13 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     // No deferred dispatch may outlive the closure (the queue was empty when the idleness was
-    // decided; this only guards entries added while the write was awaited).
-    this.workspaceService.clearQueue(workspaceId);
+    // decided; this only guards entries added while the write was awaited). Only while this
+    // process still owns the attempt it decided for: a send during the write may have begun a
+    // new attempt (a user message reawakening the task), and entries queued behind that turn are
+    // its input, not the stopped attempt's — clearing them would drop the user's message.
+    if (this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt) {
+      this.workspaceService.clearQueue(workspaceId);
+    }
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
     // Verified idle inside the edit (no stream, no pending turn, no execution mirror).
     this.settleOwnedTaskAttempt(workspaceId, ownedAttempt, "user-stop-idle");

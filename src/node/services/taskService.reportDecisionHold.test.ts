@@ -304,6 +304,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await sessionHarness.cleanup();
     };
     return {
+      aiEmitter,
       config,
       taskService,
       svc,
@@ -1409,4 +1410,202 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  // ---------------------------------------------------------------------------------------------
+  // Shared-desktop user-abort cleanup (PR #4308 thread ld5y7): the handler's queue clear must not
+  // drop user input queued by a send made while the handler awaited its row write (a new attempt
+  // began meanwhile, in this process or through another backend's re-admission).
+  // ---------------------------------------------------------------------------------------------
+  describe("shared-desktop user-abort cleanup keeps input queued during the cleanup", () => {
+    const SUCCESSOR = "att_00000000000000e1";
+    async function admitSuccessorElsewhere(otherBackend: Config, workspaceId: string) {
+      await otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === workspaceId);
+          if (ws) {
+            ws.taskAttemptId = SUCCESSOR;
+            ws.taskAttemptUnproven = true;
+            ws.taskStatus = "running";
+          }
+        }
+        return cfg;
+      });
+    }
+
+    /**
+     * A runs stream 1 on a shared-desktop child; `beforeStop` may queue input; the user stops A
+     * (session Stop, then TaskService's user-abort handler). B re-admits the row while the handler
+     * awaits the execution-mirror finalizer (when `rotate`). `inWindow` runs after the handler's
+     * row write resolved and before it continues (closure for the row's id in place, before
+     * clearQueue / settleOwnedTaskAttempt).
+     */
+    async function runAbort(
+      childId: string,
+      options: {
+        rotate: boolean;
+        beforeStop?: (stack: Awaited<ReturnType<typeof createStack>>) => Promise<void>;
+        inWindow?: (stack: Awaited<ReturnType<typeof createStack>>) => Promise<void>;
+      }
+    ) {
+      const stack = await createStack(childId, { taskDesktopOwnerWorkspaceId: rootId });
+      const { config, taskService, svc, workspaceService, completions, sendOptions } = stack;
+      const otherBackend = await createTestConfig(rootDir);
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
+      if (options.beforeStop != null) {
+        // A running stream the user stops; input queued behind it (the session's own Stop runs
+        // first, as in production). The mock host never winds this session down afterwards, so
+        // only scenarios that need a queued-before-Stop entry take this path.
+        expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+        expect(completions).toHaveLength(1);
+        await options.beforeStop(stack);
+        expect(await workspaceService.interruptStream(childId)).toEqual(Ok(undefined));
+        await yieldMacrotasks(3);
+      } else {
+        // Idle session (the stopped stream already wound down): only TaskService's user-abort
+        // handler is left to run, and later sends take the ordinary idle path.
+        expect(stack.sessionHarness.session.isBusy()).toBe(false);
+      }
+      const queueAtClear: boolean[] = [];
+      const realClear = workspaceService.clearQueue.bind(workspaceService);
+      const clearSpy = spyOn(workspaceService, "clearQueue").mockImplementation((id, opts) => {
+        if (id === childId) queueAtClear.push(workspaceService.hasQueuedMessages(childId));
+        return realClear(id, opts);
+      });
+      const tsvc = taskService as unknown as {
+        closeAttemptAdmission: (...args: unknown[]) => void;
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+        releaseSharedDesktopTaskOnUserStop: (id: string) => Promise<void>;
+      };
+      let armed = false;
+      const closures: unknown[] = [];
+      const realClose = tsvc.closeAttemptAdmission.bind(taskService);
+      const closeSpy = spyOn(tsvc, "closeAttemptAdmission").mockImplementation((...args) => {
+        if (args[3] === "user-stop-idle") {
+          closures.push(args[1]);
+          armed = true;
+        }
+        realClose(...args);
+      });
+      const realEdit = tsvc.editWorkspaceEntry.bind(taskService);
+      const editSpy = spyOn(tsvc, "editWorkspaceEntry").mockImplementation(async (...args) => {
+        const result = await realEdit(...args);
+        if (armed) {
+          armed = false;
+          await options.inWindow?.(stack);
+        }
+        return result;
+      });
+      const finalizeSpy = spyOn(
+        WorkspaceTurnManager.prototype,
+        "finalizeWorkspaceTurnFromStreamAbort"
+      ).mockImplementation(async () => {
+        if (options.rotate) await admitSuccessorElsewhere(otherBackend, childId);
+        return false as never;
+      });
+      // Deliver the user abort the way StreamManager does: one "stream-abort" event that the
+      // session (turn wind-down) and TaskService's listener (handleStreamAbort under the task's
+      // event lock) both consume.
+      let handler: Promise<void> | undefined;
+      const realRelease = tsvc.releaseSharedDesktopTaskOnUserStop.bind(taskService);
+      const releaseSpy = spyOn(tsvc, "releaseSharedDesktopTaskOnUserStop").mockImplementation(
+        (id: string) => {
+          handler = realRelease(id);
+          return handler;
+        }
+      );
+      try {
+        stack.aiEmitter.emit("stream-abort", {
+          type: "stream-abort",
+          workspaceId: childId,
+          messageId: "assistant-1",
+          metadata: {},
+          abortReason: "user",
+        });
+        await until(() => handler != null, "user-abort handler started");
+        await handler;
+      } finally {
+        releaseSpy.mockRestore();
+        finalizeSpy.mockRestore();
+        editSpy.mockRestore();
+        closeSpy.mockRestore();
+        clearSpy.mockRestore();
+      }
+      await yieldMacrotasks(5);
+      return { stack, attemptA, closures, queueAtClear, svc };
+    }
+
+    test("(c1) input queued before the abort is restored by the session Stop; the handler's clearQueue finds nothing", async () => {
+      const { stack, queueAtClear } = await runAbort("r22fc01", {
+        rotate: true,
+        beforeStop: async ({ workspaceService, sendOptions }) => {
+          expect(
+            await workspaceService.sendMessage("r22fc01", "queued before stop", sendOptions)
+          ).toEqual(Ok(undefined));
+          expect(workspaceService.hasQueuedMessages("r22fc01")).toBe(true);
+        },
+      });
+      try {
+        const observed = {
+          queueAtClear,
+          restored: stack.restoreEvents().map((e) => e.text),
+          held: stack.heldTexts(),
+          streams: stack.streamStarts.length,
+          row: entryOf(stack.config, "r22fc01")?.taskStatus,
+        };
+        expect(observed.restored).toEqual(["queued before stop"]);
+      } finally {
+        await stack.cleanup();
+      }
+    }, 20_000);
+
+    test.each([
+      ["with B's rotation", true],
+      ["single backend", false],
+    ] as const)(
+      "(c2 %s) a user message queued behind a send made during the handler's write await is not silently dropped by the handler's clearQueue",
+      async (_label, rotate) => {
+        const childId = rotate ? "r22fc2r" : "r22fc2s";
+        const sends: unknown[] = [];
+        const { stack, queueAtClear } = await runAbort(childId, {
+          rotate,
+          inWindow: async ({ workspaceService, sendOptions }) => {
+            sends.push(
+              await workspaceService.sendMessage(childId, "first after stop", sendOptions)
+            );
+            sends.push(
+              await workspaceService.sendMessage(childId, "second after stop", sendOptions)
+            );
+            sends.push(workspaceService.hasQueuedMessages(childId));
+          },
+        });
+        try {
+          const row = entryOf(stack.config, childId);
+          const observed = {
+            sends,
+            queueAtClear,
+            queuedAfter: stack.workspaceService.hasQueuedMessages(childId),
+            restored: stack.restoreEvents().map((e) => e.text),
+            held: stack.heldTexts(),
+            streams: stack.streamStarts.map((s) => s.messageId),
+            row: { status: row?.taskStatus, attemptId: row?.taskAttemptId },
+          };
+          // Both sends are accepted: the first reawakens a fresh attempt and runs, the second queues
+          // behind it. The handler (still on the stale abort) must then leave that queue alone:
+          // the second message is kept (queued, restored or held), never dropped silently.
+          expect(sends).toEqual([Ok(undefined), Ok(undefined), true]);
+          const kept =
+            observed.queuedAfter ||
+            observed.restored.includes("second after stop") ||
+            observed.held.includes("second after stop");
+          expect(kept).toBe(true);
+        } finally {
+          await stack.cleanup();
+        }
+      },
+      20_000
+    );
+  });
 });
