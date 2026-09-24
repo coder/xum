@@ -9560,6 +9560,101 @@ describe("TaskService", () => {
       }
     }, 20_000);
 
+    interface AttemptLedger {
+      taskHandleStore: TaskHandleStore;
+      beginOwnedTaskAttempt(taskId: string, source: string): unknown;
+      settleOwnedTaskAttempt(taskId: string, attempt: unknown, source: string): void;
+      ownedAttemptByTaskId: Map<string, unknown>;
+      attemptSettlementByTaskId: Map<string, { attempt: unknown; source: string }>;
+    }
+
+    /** Queued admission: returns at once and hands onAccepted to the test once armed. */
+    function createDeferredAcceptSendMessage() {
+      const deferred: { armed: boolean; accept?: () => Promise<void> | void } = { armed: false };
+      const sendMessage = mock(
+        async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+          const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+          if (deferred.armed) {
+            deferred.accept = internal?.onAccepted;
+            return Ok(undefined);
+          }
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      return { sendMessage: sendMessage as unknown as AcceptingSend, deferred };
+    }
+
+    /** A busy child admits the reawakening queued: the handle is upserted to running at acceptance. */
+    function admitQueued(workspaceService: WorkspaceHost, childId: string) {
+      return spyOn(workspaceService, "isBusyForMessage").mockImplementation(
+        (workspaceId: string) => workspaceId === childId
+      );
+    }
+
+    test.each(["no settlement", "settled meanwhile", "successor meanwhile"] as const)(
+      "a handle-upsert rejection after a queued commit keeps the snapshot and settles the mirror (%s)",
+      async (variant) => {
+        const { config, taskService, parentId, childId, workspaceService } =
+          await spawnReportedChild();
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        const busy = admitQueued(workspaceService, childId);
+        const ledger = taskService as unknown as AttemptLedger;
+        const previousAttempt = ledger.ownedAttemptByTaskId.get(childId);
+        const store = ledger.taskHandleStore;
+        const originalUpsert = store.upsertWorkspaceTurn.bind(store);
+        let reactivationAttempt: unknown;
+        let successor: unknown;
+        const upsert = spyOn(store, "upsertWorkspaceTurn").mockImplementation(async (record) => {
+          const child = findWorkspaceInConfig(config, childId);
+          if (
+            reactivationAttempt == null &&
+            record.status === "running" &&
+            child?.taskModelString === MODEL_B &&
+            child.taskExecutionStatus === "running"
+          ) {
+            // The claim-and-settings write is committed; the next acceptance step fails.
+            reactivationAttempt = ledger.ownedAttemptByTaskId.get(childId);
+            if (variant === "settled meanwhile") {
+              ledger.settleOwnedTaskAttempt(childId, reactivationAttempt, "test-settlement");
+            } else if (variant === "successor meanwhile") {
+              successor = ledger.beginOwnedTaskAttempt(childId, "test-successor");
+            }
+            throw new Error("handle store disk full");
+          }
+          return originalUpsert(record);
+        });
+        try {
+          const result = await reawaken(taskService, parentId, childId);
+          expect(reactivationAttempt).toBeDefined();
+          expect(result).toMatchObject({ success: false, error: { code: "send_failed" } });
+          const child = findWorkspaceInConfig(config, childId);
+          expect(child?.taskModelString).toBe(MODEL_B);
+          expect(child?.aiSettings?.model).toBe(MODEL_B);
+          // Existing settlement settled the claimed mirror to a terminal status.
+          expect(child?.taskExecutionStatus).toBeDefined();
+          expect(isActiveWorkspaceTurnTaskStatus(child?.taskExecutionStatus)).toBe(false);
+          const owned = ledger.ownedAttemptByTaskId.get(childId);
+          if (variant === "no settlement") {
+            // Only the speculative attempt, with no settlement or successor, is restored.
+            expect(reactivationAttempt).not.toBe(previousAttempt);
+            expect(owned).toBe(previousAttempt);
+          } else if (variant === "settled meanwhile") {
+            expect(owned).toBe(reactivationAttempt);
+            expect(ledger.attemptSettlementByTaskId.get(childId)?.attempt).toBe(
+              reactivationAttempt
+            );
+          } else {
+            expect(owned).toBe(successor);
+          }
+        } finally {
+          upsert.mockRestore();
+          busy.mockRestore();
+        }
+      },
+      20_000
+    );
+
     test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
       const { config, taskService, parentId, childId, sendMessage, initStateManager } =
         await spawnReportedChild();
