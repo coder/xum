@@ -5,6 +5,7 @@ import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { StreamErrorMessage } from "@/common/orpc/types";
 import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import { createAssistantMessageId } from "./messageIds";
+import { formatSendMessageError as formatSendMessageErrorForDisplay } from "@/common/utils/errors/formatSendError";
 
 const getProviderDisplayName = (provider: string): string =>
   PROVIDER_DISPLAY_NAMES[provider as ProviderName] ?? provider;
@@ -111,11 +112,14 @@ export const formatSendMessageError = (
       };
     case "context_budget_blocked":
       return { message: error.message, errorType: "context_budget_blocked" };
-    case "context_budget_exceeded":
+    case "context_budget_exceeded": {
+      // Share the display formatter so early-stop counts never appear as exact request sizes.
+      const formatted = formatSendMessageErrorForDisplay(error);
       return {
-        message: `Request for ${error.model} is estimated at ${error.estimate} tokens, above the usable context budget of ${error.hardCeiling}. Shorten the request or choose a larger-context model.`,
+        message: [formatted.message, formatted.resolutionHint].filter(Boolean).join(" "),
         errorType: "context_budget_blocked",
       };
+    }
     case "unknown":
       return {
         message: error.raw,
