@@ -35232,10 +35232,14 @@ describe("TaskService", () => {
       }
     );
 
-    test.each(["before publication", "inside publication"] as const)(
-      "an attempt reawakened while an older report is blocked %s survives that report's cleanup",
-      async (blockPoint) => {
-        const taskId = `task-outcome-survive-${blockPoint.replace(" ", "-")}`;
+    test.each([
+      ["before publication", "reawakened"],
+      ["inside publication", "reawakened"],
+      ["inside publication", "not reawakened (control)"],
+    ] as const)(
+      "an older report blocked %s, attempt %s: it publishes only onto its own attempt's row",
+      async (blockPoint, successor) => {
+        const taskId = `task-outcome-survive-${blockPoint.replace(" ", "-")}-${successor === "reawakened" ? "r" : "c"}`;
         const { config } = await setupTree([
           { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
         ]);
@@ -35287,17 +35291,49 @@ describe("TaskService", () => {
             reportStreamEnd(taskId, "older report")
           );
           await blocked.promise;
+          if (successor !== "reawakened") {
+            // Control: nothing replaced the attempt, so its own late report still completes it.
+            release.resolve();
+            await publication;
+            expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
+            expect(
+              await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), taskId)
+            ).not.toBeNull();
+            return;
+          }
           // The user resumes the (still interrupted) task while the older report is in flight.
           expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
           const secondAttempt = internals.ownedAttemptByTaskId.get(taskId);
+          const secondAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
           expect(secondAttempt).toBeDefined();
           expect(secondAttempt).not.toBe(firstAttempt);
+          // A parent awaits the resumed task by its stable id: B's waiter.
+          let waiterOutcome: string | undefined;
+          void taskService
+            .waitForAgentReport(taskId, { timeoutMs: 3_000, requestingWorkspaceId: rootId })
+            .then(
+              () => {
+                waiterOutcome = "resolved";
+              },
+              (error: unknown) => {
+                waiterOutcome = error instanceof Error ? error.message : String(error);
+              }
+            );
           release.resolve();
           await publication;
 
-          expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
-          // The older report's cleanup names the attempt it belonged to; the new one stays owned.
+          // A report publishes only onto its own attempt's row (the publication is a CAS on the
+          // stream's attempt): the successor admitted meanwhile keeps running, stays owned, and
+          // no artifact of the older report is published for it.
+          expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+            taskStatus: "running",
+            taskAttemptId: secondAttemptId,
+          });
+          expect(waiterOutcome).toBeUndefined();
           expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(secondAttempt);
+          expect(
+            await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), taskId)
+          ).toBeNull();
         } finally {
           release.resolve();
           restore();
