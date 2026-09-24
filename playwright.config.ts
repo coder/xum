@@ -1,6 +1,13 @@
-import { defineConfig } from "@playwright/test";
+import { defineConfig, type ReporterDescription } from "@playwright/test";
+import { resolveXumEnvironmentValue } from "./src/common/compat/xumEnv";
 
 const isCI = process.env.CI === "true";
+// Perf runs also write per-test outcomes for the nightly trend report (scripts/perf/perfTrend.ts).
+// artifacts/perf/ is already uploaded by perf-profiles.yml and is not cleaned by Playwright.
+const perfResultsReporter: ReporterDescription[] =
+  resolveXumEnvironmentValue("E2E_RUN_PERF", process.env) === "1"
+    ? [["json", { outputFile: "artifacts/perf/playwright-results.json" }]]
+    : [];
 
 export default defineConfig({
   testDir: "./tests/e2e",
@@ -11,7 +18,11 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: isCI,
   retries: isCI ? 1 : 0,
-  reporter: [["list"], ["html", { outputFolder: "artifacts/playwright-report", open: "never" }]],
+  reporter: [
+    ["list"],
+    ["html", { outputFolder: "artifacts/playwright-report", open: "never" }],
+    ...perfResultsReporter,
+  ],
   use: {
     trace: isCI ? "on-first-retry" : "retain-on-failure",
     screenshot: "only-on-failure",
