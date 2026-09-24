@@ -1,10 +1,11 @@
+// Bootstrap DOM before API imports can initialize Radix layout effects.
+import { installDom } from "../../../tests/ui/dom";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import * as APIModule from "@/browser/contexts/API";
 import * as PolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RoutingModule from "@/browser/hooks/useRouting";
-import { installDom } from "../../../tests/ui/dom";
 import {
   filterHiddenModels,
   getDefaultModel,

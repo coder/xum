@@ -29,7 +29,12 @@ import {
 } from "@/common/utils/ai/models";
 import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
 import { LAST_CUSTOM_MODEL_PROVIDER_KEY } from "@/common/constants/storage";
-import type { ProviderModelEntry } from "@/common/orpc/types";
+import type {
+  EffectivePolicy,
+  ProviderModelDiscoveryResult,
+  ProviderModelEntry,
+  ProvidersConfigMap,
+} from "@/common/orpc/types";
 import {
   getProviderModelEntryContextWindowTokens,
   getProviderModelEntryId,
@@ -139,8 +144,23 @@ export function ModelsSection() {
   const { config, loading, updateModelsOptimistically } = useProvidersConfig();
   const [lastProvider, setLastProvider] = usePersistedState(LAST_CUSTOM_MODEL_PROVIDER_KEY, "");
   const [newModelId, setNewModelId] = useState("");
-  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
-  const [highlightedModel, setHighlightedModel] = useState<string | null>(null);
+  // Each opening owns its reply: closing and reopening must not resurrect an old catalog.
+  const [suggestionsSession, setSuggestionsSession] = useState<object | null>(null);
+  const [discovery, setDiscovery] = useState<{
+    session: object;
+    api: object;
+    provider: string;
+    config: ProvidersConfigMap;
+    policy: EffectivePolicy | null;
+    result: ProviderModelDiscoveryResult;
+  } | null>(null);
+  const [highlightedModel, setHighlightedModel] = useState<{
+    modelId: string;
+    api: object | null;
+    provider: string;
+    config: ProvidersConfigMap | null;
+    policy: EffectivePolicy | null;
+  } | null>(null);
   const modelInputRef = useRef<HTMLInputElement>(null);
   const suggestionsId = useId();
   const [editing, setEditing] = useState<EditingState | null>(null);
@@ -232,22 +252,82 @@ export function ModelsSection() {
 
     if (addModel(lastProvider, trimmedModelId)) {
       setNewModelId("");
-      setSuggestionsOpen(false);
+      setSuggestionsSession(null);
       setHighlightedModel(null);
     }
   };
 
+  useEffect(() => {
+    // Coder already publishes its routing catalog; discovery must not invoke its writers.
+    if (!suggestionsSession || !lastProvider || lastProvider === "coder" || !api || !config) {
+      return;
+    }
+    const controller = new AbortController();
+    const publish = (result: ProviderModelDiscoveryResult) => {
+      if (!controller.signal.aborted) {
+        setDiscovery({
+          session: suggestionsSession,
+          api,
+          provider: lastProvider,
+          config,
+          policy: effectivePolicy,
+          result,
+        });
+      }
+    };
+    api.providers
+      .discoverModels({ provider: lastProvider }, { signal: controller.signal })
+      .then(publish, () => publish({ status: "error", reason: "request-failed" }));
+    return () => controller.abort();
+  }, [api, suggestionsSession, lastProvider, config, effectivePolicy]);
+
+  // Key rotation can leave every sanitized field equal. Fence rendered suggestions as
+  // well as replies by the config object itself, before effect cleanup gets to run.
+  // Policy events are independent of config refreshes and also revoke completed catalogs.
+  // A disconnect or reconnect replaces the API client, which revokes them too.
+  const discoveryResult =
+    discovery?.session === suggestionsSession &&
+    discovery?.api === api &&
+    discovery?.provider === lastProvider &&
+    discovery?.config === config &&
+    discovery?.policy === effectivePolicy
+      ? discovery.result
+      : null;
+  const discoveredModels =
+    lastProvider === "coder"
+      ? (config?.coder?.discoveredModels ?? [])
+      : discoveryResult?.status === "ok"
+        ? discoveryResult.modelIds
+        : [];
+  const discoveryMessage =
+    suggestionsSession && lastProvider && lastProvider !== "coder" && api && config
+      ? !discoveryResult
+        ? "Loading models… You can still enter a model ID."
+        : discoveryResult.status !== "ok"
+          ? "Suggestions unavailable. Enter a model ID manually."
+          : discoveryResult.modelIds.length === 0
+            ? "No models found. Enter a model ID manually."
+            : null
+      : null;
+
   // One editable field handles both manual IDs and policy-filtered discovery.
   // Suggestions never replace a typed ID unless the user explicitly chooses one.
-  const discoveredUnconfigured = (config?.[lastProvider]?.discoveredModels ?? []).filter(
+  const discoveredUnconfigured = discoveredModels.filter(
     (modelId) => !modelExists(lastProvider, modelId)
   );
   const matchingModels = discoveredUnconfigured.filter((modelId) =>
     modelId.toLowerCase().includes(newModelId.trim().toLowerCase())
   );
   const suggestions = matchingModels.slice(0, MAX_RENDERED_MODELS);
-  const showSuggestions = suggestionsOpen && suggestions.length > 0;
-  const highlightedIndex = showSuggestions ? suggestions.indexOf(highlightedModel ?? "") : -1;
+  const showSuggestions = suggestionsSession !== null && suggestions.length > 0;
+  const highlightedIndex =
+    showSuggestions &&
+    highlightedModel?.api === api &&
+    highlightedModel?.config === config &&
+    highlightedModel?.provider === lastProvider &&
+    highlightedModel?.policy === effectivePolicy
+      ? suggestions.indexOf(highlightedModel.modelId)
+      : -1;
 
   const handleRemoveModel = useCallback(
     (provider: string, modelId: string) => {
@@ -459,7 +539,7 @@ export function ModelsSection() {
               value={lastProvider}
               onValueChange={(provider) => {
                 setLastProvider(provider);
-                setSuggestionsOpen(false);
+                setSuggestionsSession(null);
                 setHighlightedModel(null);
               }}
             >
@@ -484,7 +564,7 @@ export function ModelsSection() {
               className="relative min-w-[8rem] flex-1"
               onBlur={(e) => {
                 if (!e.currentTarget.contains(e.relatedTarget)) {
-                  setSuggestionsOpen(false);
+                  setSuggestionsSession(null);
                   setHighlightedModel(null);
                 }
               }}
@@ -495,6 +575,7 @@ export function ModelsSection() {
                 role="combobox"
                 aria-label="Model ID"
                 aria-autocomplete="list"
+                aria-describedby={discoveryMessage ? `${suggestionsId}-status` : undefined}
                 aria-expanded={showSuggestions}
                 aria-controls={showSuggestions ? suggestionsId : undefined}
                 aria-activedescendant={
@@ -505,33 +586,38 @@ export function ModelsSection() {
                 onChange={(e) => {
                   setNewModelId(e.target.value);
                   setHighlightedModel(null);
-                  setSuggestionsOpen(true);
+                  setSuggestionsSession((session) => session ?? {});
                 }}
-                onFocus={() => setSuggestionsOpen(true)}
-                onClick={() => setSuggestionsOpen(true)}
+                onFocus={() => setSuggestionsSession((session) => session ?? {})}
+                onClick={() => setSuggestionsSession((session) => session ?? {})}
                 placeholder="model-id"
                 className="bg-background border-border-medium focus:border-accent h-7 w-full rounded border py-1 pr-6 pl-2 font-mono text-xs focus:outline-none"
                 onKeyDown={(e) => {
                   if (e.nativeEvent.isComposing) return;
                   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                     e.preventDefault();
-                    setSuggestionsOpen(true);
+                    setSuggestionsSession((session) => session ?? {});
                     const next =
                       e.key === "ArrowDown"
                         ? Math.min(highlightedIndex + 1, suggestions.length - 1)
                         : highlightedIndex < 0
                           ? suggestions.length - 1
                           : Math.max(highlightedIndex - 1, 0);
-                    setHighlightedModel(suggestions[next] ?? null);
+                    const modelId = suggestions[next];
+                    setHighlightedModel(
+                      modelId
+                        ? { modelId, api, provider: lastProvider, config, policy: effectivePolicy }
+                        : null
+                    );
                   } else if (e.key === "Enter") {
                     e.preventDefault();
                     handleAddModel(
                       highlightedIndex >= 0 ? suggestions[highlightedIndex] : newModelId
                     );
-                  } else if (e.key === "Escape" && suggestionsOpen) {
+                  } else if (e.key === "Escape" && suggestionsSession) {
                     e.preventDefault();
                     stopKeyboardPropagation(e);
-                    setSuggestionsOpen(false);
+                    setSuggestionsSession(null);
                     setHighlightedModel(null);
                   }
                 }}
@@ -591,6 +677,15 @@ export function ModelsSection() {
               Add
             </Button>
           </div>
+          {discoveryMessage && (
+            <div
+              id={`${suggestionsId}-status`}
+              role="status"
+              className="text-muted px-2 py-1.5 text-xs md:px-3"
+            >
+              {discoveryMessage}
+            </div>
+          )}
           {error && !editing && (
             <div className="text-error px-2 py-1.5 text-xs md:px-3">{error}</div>
           )}

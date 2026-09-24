@@ -1,8 +1,16 @@
+// Real Radix exports must initialize after the DOM, even when this suite runs first.
+import { installDom } from "../../../../../tests/ui/dom";
 import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
-import { installDom } from "../../../../../tests/ui/dom";
+import * as APIModule from "@/browser/contexts/API";
+import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
+import * as ExperimentsModule from "@/browser/hooks/useExperiments";
+import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
+import * as ModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
+import * as SelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { PolicyProvider } from "@/browser/contexts/PolicyContext";
@@ -26,6 +34,17 @@ let apiMock: {
 } | null = null;
 
 let selectedWorkspaceMock: { projectPath: string; workspaceId: string } | null = null;
+
+// Snapshot real exports before Bun replaces their live bindings for this suite.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...APIModule }],
+  ["@/browser/contexts/WorkspaceContext", { ...WorkspaceModule }],
+  ["@/browser/hooks/useExperiments", { ...ExperimentsModule }],
+  ["@/browser/hooks/useModelsFromSettings", { ...ModelsModule }],
+  ["@/browser/components/Tooltip/Tooltip", { ...tooltipModule }],
+  ["@/browser/components/ModelSelector/ModelSelector", { ...ModelSelectorModule }],
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...SelectPrimitiveModule }],
+]);
 
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({ api: apiMock }),
@@ -56,17 +75,11 @@ void mock.module("@/browser/hooks/useModelsFromSettings", () => ({
   }),
 }));
 
-// Copy values before Bun replaces live module bindings. Otherwise this inline
-// tooltip mock leaks extra text into later suites' accessible names.
-const originalTooltipModule = { ...tooltipModule };
 void mock.module("@/browser/components/Tooltip/Tooltip", () => ({
   Tooltip: (props: { children: React.ReactNode }) => <>{props.children}</>,
   TooltipTrigger: (props: { children: React.ReactNode }) => <>{props.children}</>,
   TooltipContent: (props: { children: React.ReactNode }) => <div>{props.children}</div>,
 }));
-afterAll(() => {
-  void mock.module("@/browser/components/Tooltip/Tooltip", () => originalTooltipModule);
-});
 
 void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
   ModelSelector: (props: {

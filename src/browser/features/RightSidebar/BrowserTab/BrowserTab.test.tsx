@@ -1,3 +1,6 @@
+import "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import * as RealAPIModule from "@/browser/contexts/API";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -45,6 +48,8 @@ const apiResultMock = {
   retry: () => undefined,
 };
 
+// Later full-app suites must not inherit this partial API client.
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => apiResultMock,
 }));

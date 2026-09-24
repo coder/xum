@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
 import { installDom } from "../../../../../tests/ui/dom";
+import * as APIModule from "@/browser/contexts/API";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 interface MockAPIClient {
   config: {
@@ -13,6 +15,9 @@ interface MockAPIClient {
 }
 
 let mockApi: MockAPIClient;
+
+// Do not leave the config-only API stub in later settings component tests.
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...APIModule }]]);
 
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({
