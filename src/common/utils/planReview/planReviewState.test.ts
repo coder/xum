@@ -253,6 +253,36 @@ describe("derivePlanReviewState snapshot hash verification", () => {
     expect(withFeedback.threads).toHaveLength(0);
   });
 
+  test("a rejected copy does not consume the recordId of a later valid copy", () => {
+    // Crash-duplicated archive/active pair where the first copy was damaged: replay must fall
+    // through to the valid copy instead of treating it as a duplicate of the rejected one.
+    const skipped: string[] = [];
+    const corruptCopy: PlanReviewRecord = { ...snapshotA, content: PLAN_B };
+    const state = derivePlanReviewState(
+      [
+        recordRow(corruptCopy),
+        recordRow(snapshotA),
+        // Dangling copies (thread/snapshot not yet known) must not shadow later valid copies either.
+        recordRow(resolve("rec_r1", "thr_1")),
+        recordRow(feedback1),
+        recordRow(resolve("rec_r1", "thr_1")),
+        // Accepted records still dedupe: a replayed copy of the accepted resolve stays inert.
+        recordRow(reopen("rec_o1", "thr_1")),
+        recordRow(resolve("rec_r1", "thr_1")),
+      ],
+      { onSkip: (reason) => skipped.push(reason), hashContent }
+    );
+    expect(state.snapshots.map((snapshot) => snapshot.contentHash)).toEqual([HASH_A]);
+    expect(state.snapshots[0].content).toBe(PLAN_A);
+    expect(state.threads.map((thread) => thread.threadId)).toEqual(["thr_1", "thr_2"]);
+    expect(state.threads.find((thread) => thread.threadId === "thr_1")?.resolved).toBe(false);
+    expect(skipped).toEqual([
+      "snapshot-hash-mismatch",
+      "dangling-resolution-thread",
+      "duplicate-record",
+    ]);
+  });
+
   test("accepts snapshots whose content hashes back to the declared value", () => {
     const state = derivePlanReviewState([recordRow(snapshotA), recordRow(feedback1)], {
       hashContent,

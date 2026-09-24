@@ -110,7 +110,10 @@ export function derivePlanReviewState(
       skip("duplicate-record", message.id);
       continue;
     }
-    seenRecordIds.add(record.recordId);
+    // The record ID is consumed only once a row passes its kind-specific validation below
+    // (see `seenRecordIds.add` in each accepting branch). Consuming it up front let a corrupt
+    // copy (e.g. a damaged half of a crash-duplicated archive/active pair) shadow a later valid
+    // copy, so the snapshot and every thread anchored to it vanished instead of self-healing.
     // Rows persisted by the backend always carry a sequence; fall back to the visiting index
     // so relative order survives for rows that have not been stamped yet. Persisted rows are
     // parsed JSON without schema validation, so a damaged sequence (string, negative, fraction)
@@ -144,6 +147,7 @@ export function derivePlanReviewState(
         };
         snapshotsById.set(snapshot.snapshotId, snapshot);
         state.snapshots.push(snapshot);
+        seenRecordIds.add(record.recordId);
         break;
       }
       case "feedback": {
@@ -196,6 +200,7 @@ export function derivePlanReviewState(
           threadIds,
           historySequence,
         });
+        seenRecordIds.add(record.recordId);
         break;
       }
       case "resolve":
@@ -206,6 +211,7 @@ export function derivePlanReviewState(
           break;
         }
         thread.resolved = record.kind === "resolve";
+        seenRecordIds.add(record.recordId);
         break;
       }
     }
