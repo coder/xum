@@ -305,6 +305,12 @@ describe("WorkspaceService.grantDefaultUnrelatedWorkspaceConsent", () => {
     await harness.cleanup();
   });
 
+  /** What create() records when it defers the default grant to WorkspaceTurnManager. */
+  const markDeferredDefault = (workspaceId = WORKSPACE_ID) =>
+    (
+      harness.service as unknown as { pendingDefaultUnrelatedConsent: Set<string> }
+    ).pendingDefaultUnrelatedConsent.add(workspaceId);
+
   test("persists a generation for that workspace only and publishes it", async () => {
     const published: Array<{
       workspaceId: string;
@@ -316,6 +322,7 @@ describe("WorkspaceService.grantDefaultUnrelatedWorkspaceConsent", () => {
         published.push(event)
     );
 
+    markDeferredDefault();
     await harness.service.grantDefaultUnrelatedWorkspaceConsent(WORKSPACE_ID);
 
     const generation = harness.persistedConsent();
@@ -325,6 +332,41 @@ describe("WorkspaceService.grantDefaultUnrelatedWorkspaceConsent", () => {
     expect(published).toHaveLength(1);
     expect(published[0].workspaceId).toBe(WORKSPACE_ID);
     expect(published[0].metadata?.unrelatedWorkspaceConsent).toBe(generation as string);
+  });
+
+  test("an explicit toggle while the default is pending wins over the deferred grant", async () => {
+    markDeferredDefault();
+    // The user turns it on and back off after the workspace appeared, before the grant runs.
+    expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(
+      true
+    );
+    expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false)).success).toBe(
+      true
+    );
+    const published: unknown[] = [];
+    harness.service.on("metadata", (event: unknown) => published.push(event));
+
+    await harness.service.grantDefaultUnrelatedWorkspaceConsent(WORKSPACE_ID);
+
+    expect(harness.persistedConsent()).toBeUndefined();
+    expect(published).toEqual([]);
+  });
+
+  test("grants nothing to a workspace whose creation did not defer the default", async () => {
+    // Existing workspaces must never be backfilled, even through the deferred-grant entry point.
+    await harness.service.grantDefaultUnrelatedWorkspaceConsent(OTHER_WORKSPACE_ID);
+    expect(harness.persistedConsent(OTHER_WORKSPACE_ID)).toBeUndefined();
+
+    // And the pending mark is one-shot: a second call after a grant does nothing new.
+    markDeferredDefault();
+    await harness.service.grantDefaultUnrelatedWorkspaceConsent(WORKSPACE_ID);
+    const generation = harness.persistedConsent();
+    expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false)).success).toBe(
+      true
+    );
+    await harness.service.grantDefaultUnrelatedWorkspaceConsent(WORKSPACE_ID);
+    expect(generation).toBeDefined();
+    expect(harness.persistedConsent()).toBeUndefined();
   });
 });
 

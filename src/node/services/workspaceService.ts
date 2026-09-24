@@ -2964,6 +2964,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly pendingPluginSanitizations = new Set<string>();
 
   /**
+   * Workspaces created with `deferUnrelatedWorkspaceConsent` whose default grant has not run
+   * yet. An explicit consent toggle removes the entry, so the deferred grant (checked inside the
+   * serialized config edit) can never reverse a choice the user already made.
+   */
+  private readonly pendingDefaultUnrelatedConsent = new Set<string>();
+
+  /**
    * Serializes persist + sanitize of a new host-local registration across
    * PROCESSES sharing this config root. pendingPluginSanitizations only
    * covers this process: two processes registering the same preserved
@@ -5738,6 +5745,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             createResult!.workspacePath
           );
           completeMetadata = { ...completeMetadata, unrelatedWorkspaceConsent };
+        } else {
+          // Marked before the workspace is announced, so any toggle the user makes after it
+          // appears cancels the deferred default (see pendingDefaultUnrelatedConsent).
+          this.pendingDefaultUnrelatedConsent.add(workspaceId);
         }
       } finally {
         await releaseRegistrationLock?.();
@@ -7500,6 +7511,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
+      // An explicit choice (either value) supersedes a still-pending creation default; cleared
+      // before this edit is queued, so a deferred grant queued later re-checks and skips.
+      this.pendingDefaultUnrelatedConsent.delete(normalizedWorkspaceId);
       // Mutate inside the serialized editConfig transform against the FRESH entry (see
       // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
       let outcome: Result<void, string> = Err("Workspace not found");
@@ -7555,7 +7569,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async grantCreationUnrelatedWorkspaceConsent(
     projectPath: string,
     workspaceId: string,
-    workspacePath: string
+    workspacePath: string,
+    /** Re-checked inside the serialized edit; false skips the grant. */
+    shouldGrant: () => boolean = () => true
   ): Promise<string | undefined> {
     let granted: string | undefined;
     try {
@@ -7565,7 +7581,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           workspaceId,
           workspacePath,
         });
-        if (!entry) {
+        if (!entry || !shouldGrant()) {
           return freshConfig;
         }
         granted =
@@ -7595,17 +7611,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * resulting metadata so the settings switch reflects the grant.
    */
   async grantDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
-    const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (found == null) {
-      return;
-    }
-    const granted = await this.grantCreationUnrelatedWorkspaceConsent(
-      found.projectPath,
-      workspaceId,
-      found.workspace.path
-    );
-    if (granted != null) {
-      await this.emitCurrentWorkspaceMetadata(workspaceId);
+    try {
+      const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+      if (found == null || !this.pendingDefaultUnrelatedConsent.has(workspaceId)) {
+        return;
+      }
+      const granted = await this.grantCreationUnrelatedWorkspaceConsent(
+        found.projectPath,
+        workspaceId,
+        found.workspace.path,
+        () => this.pendingDefaultUnrelatedConsent.has(workspaceId)
+      );
+      if (granted != null) {
+        await this.emitCurrentWorkspaceMetadata(workspaceId);
+      }
+    } finally {
+      this.pendingDefaultUnrelatedConsent.delete(workspaceId);
     }
   }
 
