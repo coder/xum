@@ -406,7 +406,11 @@ export class ServiceContainer {
     {
       name: "taskService.recoverInterruptedTasks",
       run: () => {
-        const recovery = this.taskService.recoverInterruptedTasks();
+        // Same dispose-aborted signal as housekeeping: a recovery outliving the step bound must
+        // not keep reserving or re-driving tasks once shutdown began.
+        const recovery = this.taskService.recoverInterruptedTasks({
+          signal: this.startupHousekeepingAbort.signal,
+        });
         this.taskRecoverySettled = recovery.then(
           () => undefined,
           () => undefined
@@ -803,19 +807,22 @@ export class ServiceContainer {
     shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
     shutdownStep("projectService.beginShutdown", () => this.projectService.beginShutdown());
     await shutdownStep("updateService.beginShutdown", () => this.updateService.beginShutdown());
-    const housekeepingSettled = this.startupHousekeepingSettled;
-    if (housekeepingSettled != null) {
-      await shutdownStep("startupHousekeeping.join", async () => {
-        const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+    // Joined with a task recovery that outlived its startup bound (already settled otherwise):
+    // both observe the abort above only at their step boundaries.
+    const housekeepingSettled = Promise.all([
+      this.startupHousekeepingSettled,
+      this.taskRecoverySettled,
+    ]);
+    await shutdownStep("startupHousekeeping.join", async () => {
+      const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+        timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+      });
+      if (joined.kind === "timeout") {
+        log.warn("[shutdown] startup housekeeping still running; teardown continues", {
           timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
         });
-        if (joined.kind === "timeout") {
-          log.warn("[shutdown] startup housekeeping still running; teardown continues", {
-            timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
-          });
-        }
-      });
-    }
+      }
+    });
     // Interrupt and await the runtime's supervised fibers — the stream engine's
     // per-stream supervisors (StreamManager.superviseEngine): every in-flight
     // stream is aborted as "system" and its partial committed to chat.jsonl —

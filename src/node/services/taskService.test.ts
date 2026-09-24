@@ -4310,6 +4310,39 @@ describe("TaskService", () => {
     }
   );
 
+  test("startup recovery aborted by shutdown mid-run drains no queue and re-drives nothing", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", "parent"),
+        projectWorkspace(projectPath, "child", "child", {
+          parentWorkspaceId: "parent",
+          agentId: "exec",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const shutdown = new AbortController();
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      // Shutdown begins while recovery is still inspecting tasks (it outlived the startup bound).
+      getStartupRecoveryState: mock(() => {
+        shutdown.abort();
+        return Promise.resolve("interrupted" as const);
+      }),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const drainQueue = spyOn(taskService, "maybeStartQueuedTasks");
+
+    await taskService.recoverInterruptedTasks({ signal: shutdown.signal });
+
+    expect(drainQueue).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("startup does not recover a task that completed during blocker inspection", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
