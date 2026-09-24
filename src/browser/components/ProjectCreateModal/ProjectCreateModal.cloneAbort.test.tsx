@@ -7,6 +7,10 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as realAPI from "@/browser/contexts/API";
+
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
 
 let cleanupDom: (() => void) | null = null;
 let currentClientMock: RecursivePartial<APIClient> = {};

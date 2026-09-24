@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
+import * as RealAPIModule from "@/browser/contexts/API";
+import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
 import type * as APIModuleType from "@/browser/contexts/API";
@@ -36,6 +38,13 @@ import type { StreamAbortReasonSnapshot } from "@/common/types/stream";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
+
+// Restore the provider contexts after the suite; partial row stubs must not
+// replace the real contexts used by later full Settings renders.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...RealAPIModule }],
+  ["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }],
+]);
 
 let AgentListItem!: typeof AgentListItemComponent;
 

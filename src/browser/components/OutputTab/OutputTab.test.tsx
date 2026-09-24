@@ -1,8 +1,14 @@
+import "../../../../tests/ui/dom";
+
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { MAX_LOG_ENTRIES } from "@/common/constants/ui";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as realAPI from "@/browser/contexts/API";
+
+restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
 
 type LogLevel = "error" | "warn" | "info" | "debug";
 

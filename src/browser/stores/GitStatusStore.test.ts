@@ -185,6 +185,8 @@ function createStore(
 
 describe("GitStatusStore", () => {
   let store: GitStatusStore;
+  let hadWindow = false;
+  let originalWindow: unknown;
 
   beforeEach(() => {
     mockExecuteBash.mockReset();
@@ -200,6 +202,8 @@ describe("GitStatusStore", () => {
     } as Result<BashToolResult, string>);
     mockGetProjectGitStatuses.mockResolvedValue([]);
 
+    hadWindow = "window" in globalThis;
+    originalWindow = (globalThis as { window?: unknown }).window;
     (globalThis as unknown as { window: unknown }).window = {
       addEventListener: jest.fn(),
       removeEventListener: jest.fn(),
@@ -216,8 +220,15 @@ describe("GitStatusStore", () => {
 
   afterEach(() => {
     store.dispose();
-    // Cleanup mocked window to avoid leaking between tests
-    delete (globalThis as { window?: unknown }).window;
+    // Restore rather than delete: an earlier suite in the same bun process may have
+    // installed a DOM, and deleting only `window` leaves `document` behind. Later
+    // module-load checks (mermaid's `typeof document` then `window.addEventListener`)
+    // then crash with an unhandled error in whichever suite imports them next.
+    if (hadWindow) {
+      (globalThis as { window?: unknown }).window = originalWindow;
+    } else {
+      delete (globalThis as { window?: unknown }).window;
+    }
   });
 
   test("subscribe and unsubscribe", () => {
