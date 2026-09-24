@@ -9253,36 +9253,81 @@ describe("TaskService", () => {
       }
     }, 20_000);
 
-    test("a change between resolution and acceptance refuses with no claim or settings", async () => {
+    test.each([
+      {
+        name: "a manual pin",
+        commitRefusal: true,
+        mutate: (config: Config, childId: string) =>
+          editEntry(config, childId, (workspace) => {
+            workspace.taskAiPins = { model: MODEL_C };
+          }),
+        survived: (child: WorkspaceConfigEntry | undefined) =>
+          expect(child?.taskAiPins).toEqual({ model: MODEL_C }),
+      },
+      {
+        name: "an agentAiDefaults change",
+        commitRefusal: true,
+        mutate: (config: Config) => setDelegatedExec(config, { modelString: MODEL_C }),
+        survived: (_child: WorkspaceConfigEntry | undefined, config: Config) =>
+          expect(config.loadConfigOrDefault().agentAiDefaults?.exec?.subagent?.modelString).toBe(
+            MODEL_C
+          ),
+      },
+      {
+        name: "a child bucket change",
+        commitRefusal: true,
+        mutate: (config: Config, childId: string) =>
+          editEntry(config, childId, (workspace) => {
+            workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "low" } };
+          }),
+        survived: (child: WorkspaceConfigEntry | undefined) =>
+          expect(child?.aiSettingsByAgent?.exec).toEqual({ model: MODEL_C, thinkingLevel: "low" }),
+      },
+      {
+        name: "the entry's deletion",
+        commitRefusal: false,
+        mutate: (config: Config, childId: string) =>
+          config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              project.workspaces = project.workspaces.filter((entry) => entry.id !== childId);
+            }
+            return cfg;
+          }),
+        survived: (child: WorkspaceConfigEntry | undefined) => expect(child).toBeUndefined(),
+      },
+    ])("$name between resolution and acceptance refuses with no claim or settings", async (row) => {
       const target: { config?: Config; childId?: string; armed: boolean } = { armed: false };
       const sendMessage = createAcceptingSendMessage(async () => {
         if (!target.armed || target.config == null || target.childId == null) return;
         // Lands after TaskService planned the snapshot, before acceptance commits it.
-        await editEntry(target.config, target.childId, (workspace) => {
-          workspace.taskAiPins = { model: MODEL_C };
-        });
+        await row.mutate(target.config, target.childId);
       });
       const fixture = await spawnReportedChild({ sendMessage });
       const { config, childId } = fixture;
       target.config = config;
       target.childId = childId;
       await setDelegatedExec(config, { modelString: MODEL_B });
+      const before = findWorkspaceInConfig(config, childId);
       target.armed = true;
 
       const result = await reawaken(fixture.taskService, fixture.parentId, childId);
       expect(result.success).toBe(false);
       if (result.success) return;
-      // Commit-point refusal: the prompt row is already durable, so the parent gets the
-      // retryable no-resend message rather than the pre-acceptance "send again" one.
       expect(result.error.code).toBe("send_failed");
-      const message = "message" in result.error ? result.error.message : "";
-      expect(message).toContain(formatReawakenCommitRefusedMessage(childId));
-      expect(message).not.toContain(formatReawakenChangedMessage(childId));
+      if (row.commitRefusal) {
+        // Commit-point refusal: the prompt row is already durable, so the parent gets the
+        // retryable no-resend message rather than the pre-acceptance "send again" one.
+        const message = "message" in result.error ? result.error.message : "";
+        expect(message).toContain(formatReawakenCommitRefusedMessage(childId));
+        expect(message).not.toContain(formatReawakenChangedMessage(childId));
+      }
       const child = findWorkspaceInConfig(config, childId);
-      expect(child?.taskAiPins).toEqual({ model: MODEL_C });
-      expect(child?.taskModelString).toBe(SPAWN_MODEL);
-      expect(child?.aiSettingsByAgent?.exec).toBeUndefined();
-      expect(child?.taskExecutionStatus).not.toBe("running");
+      row.survived(child, config);
+      if (child == null) return;
+      // Neither the planned settings nor the claim were written.
+      expect(child.taskModelString).toBe(SPAWN_MODEL);
+      expect(child.aiSettings).toEqual(before?.aiSettings);
+      expect(isActiveWorkspaceTurnTaskStatus(child.taskExecutionStatus)).toBe(false);
     }, 20_000);
 
     test("a send refused before acceptance leaves the AI-settings snapshot unchanged", async () => {
