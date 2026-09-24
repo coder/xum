@@ -37,7 +37,7 @@ import {
   isParsedRuntimeAllowedByPolicy,
 } from "@/browser/utils/policyUi";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useUserPreferencePersistence } from "@/browser/contexts/UserPreferencesContext";
 import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
@@ -139,7 +139,6 @@ import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
 import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
 import {
-  type AgentSkillReference,
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
@@ -189,8 +188,6 @@ import {
   resolveMcpPromptRefsForSend,
   validateCreationRuntime,
   filePartsToChatAttachments,
-  type MCPPromptInvocation,
-  type SkillInvocation,
   type SkillResolutionTarget,
 } from "./utils";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -223,6 +220,11 @@ import {
   TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
 } from "@/constants/transcriptBarrier";
 import type { HistoryEditPrecondition } from "@/common/orpc/types";
+import {
+  runWithCatch,
+  runWithCatchFinally,
+  runWithFinally,
+} from "@/browser/utils/compilerSafeControlFlow";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -233,6 +235,38 @@ interface SendOverrides {
 
 interface InternalSendOverrides extends SendOverrides {
   skipBoundaryEditConfirmation?: boolean;
+}
+
+/**
+ * Calls `onChange` for each provider config change until `signal` aborts.
+ * A plain function because React Compiler can't lower `for await` inside a component.
+ * Some oRPC iterators don't eagerly close on abort alone, so `onIterator` hands the
+ * iterator to the caller, whose cleanup must `return()` it so backend subscriptions
+ * release their EventEmitter listeners.
+ */
+async function forEachProviderConfigChange(
+  api: APIClient,
+  signal: AbortSignal,
+  onIterator: (iterator: AsyncIterator<unknown>) => void,
+  onChange: () => void
+): Promise<void> {
+  try {
+    const subscribedIterator = await api.providers.onConfigChanged(undefined, { signal });
+
+    if (signal.aborted) {
+      void subscribedIterator.return?.();
+      return;
+    }
+
+    onIterator(subscribedIterator);
+
+    for await (const _ of subscribedIterator) {
+      if (signal.aborted) break;
+      onChange();
+    }
+  } catch {
+    // Subscription cancelled via abort signal - expected on cleanup
+  }
 }
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
@@ -1255,36 +1289,39 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         return;
       }
 
-      try {
-        const discoveryWorkspaceId = variant === "workspace" && workspaceId ? workspaceId : null;
-        const runs =
-          discoveryWorkspaceId != null && isTranscriptCaughtUp
-            ? await api.workflows.listRuns({ workspaceId: discoveryWorkspaceId })
-            : [];
-        if (!isMounted || workflowsRequestIdRef.current !== requestId) {
-          return;
-        }
-        if (discoveryWorkspaceId == null) {
-          return;
-        }
-        const muxMessages = store.getWorkspaceState(discoveryWorkspaceId).muxMessages;
-        for (const run of runs) {
-          const projection = getWorkflowRunCardProjection(muxMessages, run);
-          if (!projection.shouldProject) {
-            continue;
+      await runWithCatch(
+        async () => {
+          const discoveryWorkspaceId = variant === "workspace" && workspaceId ? workspaceId : null;
+          const runs =
+            discoveryWorkspaceId != null && isTranscriptCaughtUp
+              ? await api.workflows.listRuns({ workspaceId: discoveryWorkspaceId })
+              : [];
+          if (!isMounted || workflowsRequestIdRef.current !== requestId) {
+            return;
           }
-          const cardKey = `${discoveryWorkspaceId}:${run.id}:${run.updatedAt}:${run.status}`;
-          if (projectedWorkflowRunCardKeysRef.current.has(cardKey)) {
-            continue;
+          if (discoveryWorkspaceId == null) {
+            return;
           }
-          projectedWorkflowRunCardKeysRef.current.add(cardKey);
-          addWorkflowRunCardMessageForRun(discoveryWorkspaceId, run, {
-            existingMessage: projection.existingMessage,
-          });
+          const muxMessages = store.getWorkspaceState(discoveryWorkspaceId).muxMessages;
+          for (const run of runs) {
+            const projection = getWorkflowRunCardProjection(muxMessages, run);
+            if (!projection.shouldProject) {
+              continue;
+            }
+            const cardKey = `${discoveryWorkspaceId}:${run.id}:${run.updatedAt}:${run.status}`;
+            if (projectedWorkflowRunCardKeysRef.current.has(cardKey)) {
+              continue;
+            }
+            projectedWorkflowRunCardKeysRef.current.add(cardKey);
+            addWorkflowRunCardMessageForRun(discoveryWorkspaceId, run, {
+              existingMessage: projection.existingMessage,
+            });
+          }
+        },
+        (error) => {
+          console.error("Failed to project workflow run cards:", error);
         }
-      } catch (error) {
-        console.error("Failed to project workflow run cards:", error);
-      }
+      );
     };
 
     void loadWorkflows();
@@ -1309,47 +1346,37 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const abortController = new AbortController();
     const { signal } = abortController;
 
-    // Some oRPC iterators don't eagerly close on abort alone.
-    // Ensure we `return()` them so backend subscriptions clean up EventEmitter listeners.
+    // Set by forEachProviderConfigChange; returned on cleanup.
     let iterator: AsyncIterator<unknown> | null = null;
 
-    const checkTranscriptionConfig = async () => {
-      try {
-        const config = await api.providers.getConfig();
-        if (!signal.aborted) {
-          setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
-          setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
-          setMuxGatewayCouponSet(config?.["mux-gateway"]?.couponCodeSet ?? false);
-          setMuxGatewayEnabled(config?.["mux-gateway"]?.isEnabled ?? true);
+    const checkTranscriptionConfig = () =>
+      runWithCatch(
+        async () => {
+          const config = await api.providers.getConfig();
+          if (!signal.aborted) {
+            setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
+            setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
+            setMuxGatewayCouponSet(config?.["mux-gateway"]?.couponCodeSet ?? false);
+            setMuxGatewayEnabled(config?.["mux-gateway"]?.isEnabled ?? true);
+          }
+        },
+        () => {
+          // Ignore errors fetching config
         }
-      } catch {
-        // Ignore errors fetching config
-      }
-    };
+      );
 
     // Initial fetch
     void checkTranscriptionConfig();
 
     // Subscribe to provider config changes via oRPC
-    (async () => {
-      try {
-        const subscribedIterator = await api.providers.onConfigChanged(undefined, { signal });
-
-        if (signal.aborted) {
-          void subscribedIterator.return?.();
-          return;
-        }
-
+    void forEachProviderConfigChange(
+      api,
+      signal,
+      (subscribedIterator) => {
         iterator = subscribedIterator;
-
-        for await (const _ of subscribedIterator) {
-          if (signal.aborted) break;
-          void checkTranscriptionConfig();
-        }
-      } catch {
-        // Subscription cancelled via abort signal - expected on cleanup
-      }
-    })();
+      },
+      () => void checkTranscriptionConfig()
+    );
 
     return () => {
       abortController.abort();
@@ -1933,63 +1960,71 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // prompt discovery; mark the send in flight so a second Enter cannot start
     // a duplicate send against the same captured draft.
     setSendingCount((c) => c + 1);
-    sendResolutionAbortRef.current ??= new AbortController();
-    const resolutionSignal = sendResolutionAbortRef.current.signal;
+    const resolutionController = sendResolutionAbortRef.current ?? new AbortController();
+    sendResolutionAbortRef.current = resolutionController;
+    const resolutionSignal = resolutionController.signal;
     const isSendScopeCurrent = () =>
       !resolutionSignal.aborted &&
       asyncCommandScopeRef.current.variant === variant &&
       asyncCommandScopeRef.current.workspaceId === workspaceId;
-    let parsed: ParsedCommand;
-    let skillInvocation: SkillInvocation | null;
-    let mcpPromptInvocation: MCPPromptInvocation | null;
-    let combinedSkillRefs: AgentSkillReference[];
-    let mcpPromptRefsResult: Awaited<ReturnType<typeof resolveMcpPromptRefsForSend>>;
-    try {
-      const resolution = await parseCommandWithSkillInvocation({
-        messageText,
-        agentSkillDescriptors,
-        mcpPromptDescriptors,
-        api,
-        discovery: skillDiscovery,
-        signal: resolutionSignal,
-      });
-      if (!isSendScopeCurrent()) return;
-      parsed = resolution.parsed;
-      skillInvocation = resolution.skillInvocation;
-      mcpPromptInvocation = resolution.mcpPromptInvocation;
-      if (resolution.error) {
-        pushToast({ type: "error", message: resolution.error });
-        return;
-      }
-      const inlineReferenceCandidates = extractInlineSkillReferenceCandidates(messageText);
-      [combinedSkillRefs, mcpPromptRefsResult] = await Promise.all([
-        resolveInlineSkillRefsForSend({
+    const resolved = await runWithFinally(
+      async () => {
+        const resolution = await parseCommandWithSkillInvocation({
           messageText,
-          slashInvocation: skillInvocation,
           agentSkillDescriptors,
+          mcpPromptDescriptors,
           api,
           discovery: skillDiscovery,
-          candidates: inlineReferenceCandidates,
-        }),
-        resolveMcpPromptRefsForSend({
-          messageText,
-          slashInvocation: mcpPromptInvocation,
-          descriptors: mcpPromptDescriptors,
-          api,
-          discovery: skillDiscovery,
-          candidates: inlineReferenceCandidates,
           signal: resolutionSignal,
-        }),
-      ]);
-      if (!isSendScopeCurrent()) return;
-      if (mcpPromptRefsResult.error) {
-        pushToast({ type: "error", message: mcpPromptRefsResult.error });
-        return;
-      }
-    } finally {
-      setSendingCount((c) => c - 1);
-    }
-    const combinedMcpPromptRefs = mcpPromptRefsResult.refs;
+        });
+        if (!isSendScopeCurrent()) return null;
+        if (resolution.error) {
+          pushToast({ type: "error", message: resolution.error });
+          return null;
+        }
+        const inlineReferenceCandidates = extractInlineSkillReferenceCandidates(messageText);
+        const [skillRefs, mcpPromptRefs] = await Promise.all([
+          resolveInlineSkillRefsForSend({
+            messageText,
+            slashInvocation: resolution.skillInvocation,
+            agentSkillDescriptors,
+            api,
+            discovery: skillDiscovery,
+            candidates: inlineReferenceCandidates,
+          }),
+          resolveMcpPromptRefsForSend({
+            messageText,
+            slashInvocation: resolution.mcpPromptInvocation,
+            descriptors: mcpPromptDescriptors,
+            api,
+            discovery: skillDiscovery,
+            candidates: inlineReferenceCandidates,
+            signal: resolutionSignal,
+          }),
+        ]);
+        if (!isSendScopeCurrent()) return null;
+        if (mcpPromptRefs.error) {
+          pushToast({ type: "error", message: mcpPromptRefs.error });
+          return null;
+        }
+        return {
+          parsed: resolution.parsed,
+          skillInvocation: resolution.skillInvocation,
+          mcpPromptInvocation: resolution.mcpPromptInvocation,
+          combinedSkillRefs: skillRefs,
+          combinedMcpPromptRefs: mcpPromptRefs.refs,
+        };
+      },
+      () => setSendingCount((c) => c - 1)
+    );
+    if (!resolved) return;
+    const {
+      parsed,
+      skillInvocation,
+      mcpPromptInvocation,
+      combinedSkillRefs,
+      combinedMcpPromptRefs,
+    } = resolved;
 
     // The barrier is re-checked here, after the resolution awaits and before any command runs:
     // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
@@ -2113,7 +2148,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
-    try {
+    const runWorkspaceSend = async () => {
       const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
       // Mirror the creation-composer /goal bypass: with attachments present,
       // send the raw text as a normal message instead of processing the
@@ -2242,7 +2277,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
 
-      try {
+      const sendPreparedMessage = async () => {
         // Prepare file parts if any
         const fileParts = chatAttachmentsToFileParts(sendAttachments, { validate: true });
         const sendFileParts = editMessageForSend
@@ -2343,22 +2378,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // slider change is not ordered ahead of it; a rejected save refuses the send visibly
         // and leaves the draft untouched. (Config swallows disk-write failures for every
         // preference today, so acceptance is ordering, not durability.)
-        try {
-          await waitForPreferencePersisted(
-            { kind: "autoCompactionThreshold", model: effectiveModel },
-            resolutionSignal
-          );
-        } catch (error) {
-          if (!isSendScopeCurrent()) return;
-          setToast(
-            createErrorToast({
-              type: "unknown",
-              raw: error instanceof Error ? error.message : "Settings could not be saved",
-            })
-          );
-          return;
-        }
-        if (!isSendScopeCurrent()) return;
+        const preferencePersisted = await runWithCatch(
+          async () => {
+            await waitForPreferencePersisted(
+              { kind: "autoCompactionThreshold", model: effectiveModel },
+              resolutionSignal
+            );
+            return true;
+          },
+          (error) => {
+            if (isSendScopeCurrent()) {
+              setToast(
+                createErrorToast({
+                  type: "unknown",
+                  raw: error instanceof Error ? error.message : "Settings could not be saved",
+                })
+              );
+            }
+            return false;
+          }
+        );
+        if (!preferencePersisted || !isSendScopeCurrent()) return;
 
         // Last re-check before anything is cleared or sent: command/skill/MCP resolution and
         // the persistence wait above are async, and the transcript can stop being current in
@@ -2452,7 +2492,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           }
           props.onMessageSent?.(overrides?.queueDispatchMode ?? "tool-end");
         }
-      } catch (error) {
+      };
+      const restoreDraftOnError = (error: unknown) => {
         // Handle unexpected errors
         console.error("Unexpected error sending message:", error);
         setToast(
@@ -2465,16 +2506,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         setOptimisticallyDismissedEditId(null);
         setDraft(preSendDraft);
         setDraftReviews(preSendReviews);
-      } finally {
+      };
+      await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {
         setSendingCount((c) => c - 1);
         setHideReviewsDuringSend(false);
-      }
-    } finally {
+      });
+    };
+    await runWithFinally(runWorkspaceSend, () => {
       // Always restore focus at the end
       setTimeout(() => {
         inputRef.current?.focus();
       }, 0);
-    }
+    });
   };
 
   const handleBoundaryEditConfirm = async () => {
