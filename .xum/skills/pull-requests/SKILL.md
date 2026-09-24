@@ -44,7 +44,7 @@ _Automated by the `<workflow-name>` workflow (GitHub Actions)._
 
 - Prefer local validation first (e.g., `make static-check` or a targeted test subset) because CI waiting can take 10+ minutes.
 - Use `./scripts/wait_pr_ready.sh <pr_number>` as the default last-step helper when there's no more useful local work left.
-- `wait_pr_ready.sh` polls the Codex and checks gates together and fails fast when either gate reaches a terminal failure.
+- `wait_pr_ready.sh` polls the Codex, CI checks, and (when requested) `coder-agents-review` gates together and fails fast on the first terminal failure.
 - Use `./scripts/wait_pr_checks.sh <pr_number>` and `./scripts/wait_pr_codex.sh <pr_number>` directly only when you need to debug a specific gate.
 - If asked to fix an issue in CI, first replicate it locally, get it to pass locally, then use `wait_pr_ready.sh`.
 
@@ -82,17 +82,7 @@ Use these scripts to check, resolve, and wait on Codex review comments:
 - `./scripts/wait_pr_codex.sh <pr_number>` — Waits for Codex-only status (or one-shot status with `--once`).
 - `./scripts/wait_pr_ready.sh <pr_number>` — Unified Codex + CI gate poller (preferred for normal PR readiness loops).
 
-> PR readiness is mandatory. You MUST keep iterating until the PR is fully ready.
-> A PR is fully ready only when: (1) Codex explicitly approves, (2) all Codex review threads are resolved, and (3) all required CI checks pass.
-> You MUST NOT report success or stop the loop before these conditions are met.
-
-When a PR exists, stay in this loop until it is fully ready:
-
-1. Push your fixes.
-2. Resolve each review thread: `./scripts/resolve_pr_comment.sh <thread_id>`.
-3. Comment `@codex review` to re-request review.
-4. Run `./scripts/wait_pr_ready.sh <pr_number>`.
-5. If Codex or checks fail, fix locally, push, and repeat.
+The PR readiness definition, the review loop, and its early-stop cases live in the PR Workflow section of AGENTS.md; follow them there.
 
 ## Coder Agents Review Workflow
 
@@ -136,7 +126,7 @@ PR bodies should generally follow this structure; omit sections that are N/A or 
   - PRs that touch intricate logic must include an assessment of regression risk
   - Explain regression risk in terms of severity and affected product areas
 - Pains
-  - Only include for non-trivial changes that that took multiple iteration cycles
+  - Only include for non-trivial changes that took multiple iteration cycles
   - Explain codebase or environment pains that slowed down planning, implementation, or validation
 
 ### Edits
@@ -160,8 +150,8 @@ into a toggle.
 
 ## Upkeep
 
-Once the code is pushed to the remote (even if not yet a Pull Request), do your best to commit
-and push all changes before responding to ensure its visible to the user. Commits on the working branch
+Once the code is pushed to the remote (even if not yet a Pull Request), commit and push all
+changes before responding so they are visible to the user. Commits on the working branch
 are for yourself to understand the change, they do not have to follow repository conventions as the
 PR body and title become the commit subject and body respectively.
 

@@ -1,6 +1,7 @@
 import { ProvidersConfigStore, type ProvidersConfig } from "@/node/config";
 import { describe, expect, it, spyOn } from "bun:test";
 import { generateText, jsonSchema, streamText, tool, type LanguageModel, type Tool } from "ai";
+import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
 import { writeFile } from "node:fs/promises";
@@ -32,6 +33,7 @@ import {
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
   wrapFetchWithXAIServiceTier,
+  withAnthropicEvaluationEffort,
   type OauthServiceBindings,
 } from "./providerModelFactory";
 import { hasLanguageModelCleanup, runLanguageModelCleanup } from "./languageModelCleanup";
@@ -4708,6 +4710,81 @@ describe("ProviderModelFactory Coder", () => {
         expect(result.error.type).toBe("api_key_not_found");
       }
     });
+  });
+});
+
+describe("withAnthropicEvaluationEffort", () => {
+  const questions = {
+    q: { type: "choice", instructions: "Pick one.", criteria: { a: "A", b: "B" } },
+  } as const;
+
+  it("defaults always-thinking models to low effort without overriding the caller", async () => {
+    const seen: unknown[] = [];
+    const inner: Experimental_EvaluationModelV4 = {
+      specificationVersion: "v4",
+      provider: "anthropic.messages",
+      modelId: "claude-opus-5-5",
+      supportedQuestionTypes: ["choice"],
+      doEvaluate: (options) => {
+        seen.push(options.providerOptions);
+        return Promise.resolve({ answers: {}, warnings: [] });
+      },
+    };
+
+    expect(withAnthropicEvaluationEffort(inner, "claude-opus-5")).toBe(inner);
+    const wrapped = withAnthropicEvaluationEffort(inner, "claude-opus-5-5");
+    await wrapped.doEvaluate({
+      state: "x",
+      questions,
+      providerOptions: { other: { keep: true } },
+    });
+    await wrapped.doEvaluate({
+      state: "x",
+      questions,
+      providerOptions: { anthropic: { effort: "high" } },
+    });
+    expect(seen).toEqual([
+      { other: { keep: true }, anthropic: { effort: "low" } },
+      { anthropic: { effort: "high" } },
+    ]);
+  });
+
+  it("stops the SDK from sending disabled thinking to Opus 5.5", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const captureFetch = Object.assign(
+      (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        if (typeof init?.body !== "string") {
+          throw new Error("Expected a JSON request body");
+        }
+        bodies.push(JSON.parse(init.body) as Record<string, unknown>);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              type: "error",
+              error: { type: "invalid_request_error", message: "x" },
+            }),
+            { status: 400, headers: { "content-type": "application/json" } }
+          )
+        );
+      },
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+    const raw = createAnthropic({ apiKey: "test", fetch: captureFetch }).evaluationModel(
+      "claude-opus-5-5"
+    );
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(raw.doEvaluate({ state: "x", questions })).rejects.toThrow();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      withAnthropicEvaluationEffort(raw, "claude-opus-5-5").doEvaluate({ state: "x", questions })
+    ).rejects.toThrow();
+
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].thinking).toEqual({ type: "disabled" });
+    expect(bodies[1]).not.toHaveProperty("thinking");
+    expect(bodies[1].output_config).toMatchObject({ effort: "low" });
   });
 });
 

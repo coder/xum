@@ -5,7 +5,7 @@ description: Terminal-Bench integration for Xum agent benchmarking and failure a
 
 # Terminal-Bench Integration
 
-This directory contains the xum agent adapter for [Terminal-Bench 2.0](https://tbench.ai/), using [Harbor](https://harborframework.com/) as the evaluation harness.
+The xum agent adapter for [Terminal-Bench 2.0](https://tbench.ai/) lives in `benchmarks/terminal_bench/` and uses [Harbor](https://harborframework.com/) as the evaluation harness.
 
 ## Quick Start
 
@@ -19,7 +19,7 @@ make benchmark-terminal
 make benchmark-terminal TB_TASK_NAMES="hello-world chess-best-move"
 
 # Run with specific model and xhigh thinking
-MUX_RUN_ARGS="--thinking xhigh" make benchmark-terminal TB_ARGS="--agent-kwarg model_name=anthropic/claude-opus-5"
+MUX_RUN_ARGS="--thinking xhigh" make benchmark-terminal TB_ARGS="--agent-kwarg model_name=anthropic/claude-opus-5-5"
 
 # Run on Daytona cloud (high parallelism)
 TB_ENV=daytona TB_CONCURRENCY=48 make benchmark-terminal
@@ -91,7 +91,7 @@ TB_TIMEOUT=600 make benchmark-terminal TB_SAMPLE_SIZE=5
 
 The agent adapter accepts a few Harbor kwargs (passed via `--agent-kwarg`):
 
-- `model_name`: Model to use (e.g., `anthropic/claude-opus-5`, `openai/gpt-5.6-sol`)
+- `model_name`: Model to use (e.g., `anthropic/claude-opus-5-5`, `openai/gpt-5.6-sol`)
 - `experiments`: Experiments to enable, comma-separated (e.g., `programmatic-tool-calling`)
 
 All other `mux run` CLI flags (thinking level, mode, runtime, budget, etc.) are passed via `MUX_RUN_ARGS` — no per-flag plumbing needed.
@@ -101,7 +101,7 @@ All other `mux run` CLI flags (thinking level, mode, runtime, budget, etc.) are 
 ```bash
 # Run with model, thinking, and 1M context
 gh workflow run terminal-bench.yml \
-  -f model_name=anthropic/claude-opus-5 \
+  -f model_name=anthropic/claude-opus-5-5 \
   -f mux_run_args="--thinking high --use-1m"
 
 # Run GPT-5.6 Sol with budget cap and high thinking
@@ -120,7 +120,7 @@ make benchmark-terminal TB_TASK_NAMES="chess-best-move"
 
 # CI dispatch
 gh workflow run terminal-bench.yml \
-  -f model_name=anthropic/claude-sonnet-4-5 \
+  -f model_name=anthropic/claude-opus-5-5 \
   -f task_names=chess-best-move \
   -f mux_run_as_goal=true \
   -f mux_run_args="--thinking high --goal-turns 30 --goal-budget 10.00"
@@ -170,21 +170,23 @@ Results are saved to `runs/YYYY-MM-DD__HH-MM-SS/`:
 
 ## CI/CD Integration
 
+See `.github/workflows/terminal-bench.yml` and `.github/workflows/nightly-terminal-bench.yml` for GitHub Actions integration.
+
+**Nightly workflow** runs both Claude and GPT models on the full task suite, uploading results as artifacts.
+
 ## Querying Results from BigQuery
 
 Mux Terminal-Bench results are uploaded to BigQuery after CI runs. Query via `bq` CLI after authenticating with `gcloud auth login` and setting project to `mux-benchmarks`.
 
 **Table:** `mux-benchmarks.benchmarks.tbench_results`
 
-**Schema:** `run_id` (STRING), `task_id` (STRING), `model_name` (STRING), `thinking_level` (STRING: off/low/medium/high), `mode` (STRING: plan/exec), `dataset` (STRING), `experiments` (STRING), `passed` (BOOL), `score` (FLOAT), `n_input_tokens` (INT), `n_output_tokens` (INT), `github_run_id` (INT), `github_sha` (STRING), `ingested_at` (TIMESTAMP).
-
-See `.github/workflows/terminal-bench.yml` and `.github/workflows/nightly-terminal-bench.yml` for GitHub Actions integration.
-
-**Nightly workflow** runs both Claude and GPT models on the full task suite, uploading results as artifacts.
+**Schema:** one row per task trial, including `run_id`, `task_id`, `model_name`, `thinking_level`, `mode` (plan/exec), `dataset`, `experiments`, `passed` (BOOL), `score`, `n_input_tokens`, `n_output_tokens`, `github_workflow`, `github_run_id`, `github_sha`, and `ingested_at`. `scripts/upload-harbor-results.py` builds the rows and drops keys the table lacks, so list the live columns with `bq show --schema --format=prettyjson mux-benchmarks:benchmarks.tbench_results` before relying on others.
 
 ## Leaderboard Submission
 
 To submit xum results to the [Terminal-Bench 2.0 leaderboard](https://tbench.ai/leaderboard/terminal-bench/2.0):
+
+Prepare the submission, then give the user the upload commands below to run; do not upload or open PRs against the leaderboard repo yourself.
 
 ### Step 1: Prepare Submission
 
@@ -205,7 +207,7 @@ python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py --artifacts-
 python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py
 
 # Only prepare specific models
-python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py --n-runs 5 --models anthropic/claude-opus-5
+python3 benchmarks/terminal_bench/prepare_leaderboard_submission.py --n-runs 5 --models anthropic/claude-opus-5-5
 ```
 
 This creates a properly structured submission folder at `leaderboard_submission/` containing:
@@ -270,6 +272,8 @@ The PR will be automatically validated by the leaderboard bot. Once merged, resu
 - To remove stale files from a PR, use `api.delete_folder(..., revision="refs/pr/<N>")`
 
 ## Files
+
+All paths are under `benchmarks/terminal_bench/`:
 
 - `mux_agent.py`: Main agent adapter implementing Harbor's `BaseInstalledAgent` interface
 - `mux-run.sh`: Shell script that sets up environment and invokes xum CLI

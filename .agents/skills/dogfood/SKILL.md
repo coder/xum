@@ -37,7 +37,7 @@ Always use `agent-browser` directly -- never `npx agent-browser`. The direct bin
 
 ### Local target startup
 
-If the target is a local app that is not already running, start it before the browser loop using the repo's dev-server skill. For one long-running server command, prefer `bash({ run_in_background: true, monitor: ... })` with a readiness/error regex (for example `ready|localhost|ERROR|EADDRINUSE|failed`) so Mux wakes the workspace when the app is ready or broken. Do not repeatedly poll server logs from the parent; use `task_await` once only if the wake line lacks enough context.
+If the target is a local app that is not already running, start it before the browser loop using the repo's dev-server skill. For one long-running server command, prefer `bash({ run_in_background: true, monitor: ... })` with a readiness/error regex (for example `ready|localhost|ERROR|EADDRINUSE|failed`) so Xum wakes the workspace when the app is ready or broken. Do not repeatedly poll server logs from the parent; use `task_await` once only if the wake line lacks enough context.
 
 ### 1. Initialize
 

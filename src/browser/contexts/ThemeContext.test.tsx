@@ -2,6 +2,9 @@ import { GlobalWindow } from "happy-dom";
 
 // Setup basic DOM environment for testing-library
 const dom = new GlobalWindow();
+const originalWindow = globalThis.window;
+const originalDocument = globalThis.document;
+const originalLocation = globalThis.location;
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
 (global as any).window = dom.window;
 (global as any).document = dom.window.document;
@@ -9,11 +12,18 @@ const dom = new GlobalWindow();
 (global as any).console = console;
 /* eslint-enable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { ThemeProvider, type ThemeMode, type ThemePreference, useTheme } from "./ThemeContext";
 import { UI_THEME_KEY } from "@/common/constants/storage";
+
+// Unit shards run many files in one Bun process, so later files would inherit this window.
+afterAll(() => {
+  globalThis.window = originalWindow;
+  globalThis.document = originalDocument;
+  globalThis.location = originalLocation;
+});
 
 let prefersLight = false;
 const mediaQueryListeners = new Set<(event: MediaQueryListEvent) => void>();

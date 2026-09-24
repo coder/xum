@@ -202,7 +202,7 @@ describe("bash tool", () => {
     expect(result.success).toBe(true);
     if (isForegroundSuccess(result)) {
       expect(result.output).toBe("hello\nworld");
-      expect(result.note).toContain("DO NOT use `cat`");
+      expect(result.note).toContain("Use the `file_read` tool to read files instead of `cat`");
       expect(result.note).toContain("file_read");
     }
   });
@@ -365,7 +365,7 @@ describe("bash tool", () => {
     expect(result.success).toBe(true);
     if (isForegroundSuccess(result)) {
       expect(result.output).toBe("");
-      expect(result.note).toContain("DO NOT use `cat`");
+      expect(result.note).toContain("Use the `file_read` tool to read files instead of `cat`");
       expect(result.note).toContain("[OUTPUT OVERFLOW");
 
       const match = /saved to (\/.*?\.txt)/.exec(result.note ?? "");

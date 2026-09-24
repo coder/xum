@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { ModelMessage } from "ai";
+import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { stripWorkflowRunRecordsFromModelMessages } from "./stripWorkflowRunRecordsFromModelMessages";
 
 const INLINE_SOURCE = "export default function inlineSecretWorkflow() {}\n";
@@ -37,6 +38,59 @@ describe("stripWorkflowRunRecordsFromModelMessages", () => {
       type: "json",
       value: { status: "running", runId: "wfr_demo", result: null },
     });
+  });
+
+  it("strips ui_only fields the same way replay-time redaction does", () => {
+    const uiOnlyDiff = "--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-old\n+new\n";
+    const toolOutput = {
+      success: true,
+      diff: "[diff omitted]",
+      ui_only: { file_edit: { diff: uiOnlyDiff } },
+    };
+    const messages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-edit",
+            toolName: "file_edit_replace_string",
+            output: { type: "json", value: toolOutput },
+          },
+        ],
+      },
+    ];
+
+    const result = stripWorkflowRunRecordsFromModelMessages(messages);
+    const part = result[0]?.role === "tool" ? result[0].content[0] : undefined;
+    const inStreamOutput = part?.type === "tool-result" ? part.output : undefined;
+
+    const [replayed] = applyToolOutputRedaction([
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-edit",
+            toolName: "file_edit_replace_string",
+            state: "output-available",
+            input: {},
+            output: toolOutput,
+          },
+        ],
+      },
+    ]);
+    const replayedPart = replayed?.parts[0];
+    const replayedOutput =
+      replayedPart?.type === "dynamic-tool" && replayedPart.state === "output-available"
+        ? replayedPart.output
+        : undefined;
+
+    expect(JSON.stringify(inStreamOutput)).not.toContain(uiOnlyDiff);
+    expect(replayedOutput).toEqual(
+      inStreamOutput?.type === "json" ? inStreamOutput.value : undefined
+    );
   });
 
   it("does not redact original inline workflow tool-call inputs", () => {

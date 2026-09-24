@@ -3,6 +3,7 @@
  */
 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
 import { generateText, streamText } from "ai";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -216,6 +217,146 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(
         anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
       ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
+    });
+  });
+
+  describe("thinking block binding", () => {
+    const dropBlock = { prefixMismatchBehavior: "drop_block" };
+    const directConfig = (
+      overrides: Partial<NonNullable<ProvidersConfigMap["anthropic"]>> = {}
+    ): ProvidersConfigMap => ({
+      anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true, ...overrides },
+    });
+    const thinkingFor = (
+      model: string,
+      options: {
+        config?: ProvidersConfigMap | null;
+        route?: Parameters<typeof buildProviderOptions>[8];
+        disableBetaFeatures?: boolean;
+      } = {}
+    ): Record<string, unknown> =>
+      anthropicProviderOptions(
+        buildProviderOptions(
+          model,
+          "high",
+          undefined,
+          undefined,
+          options.disableBetaFeatures ? { anthropic: { disableBetaFeatures: true } } : undefined,
+          undefined,
+          undefined,
+          options.config === undefined ? directConfig() : options.config,
+          "route" in options ? options.route : "anthropic"
+        )
+      ).thinking as Record<string, unknown>;
+
+    test("drops invalidated blocks for prefix-binding models on the direct Anthropic API", () => {
+      for (const model of ["claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"]) {
+        expect(thinkingFor(`anthropic:${model}`)).toEqual({
+          type: "adaptive",
+          display: "summarized",
+          blockBinding: dropBlock,
+        });
+      }
+      expect(
+        thinkingFor("anthropic:claude-opus-5-5", {
+          config: directConfig({ baseUrl: "https://api.anthropic.com/v1" }),
+        })
+      ).toMatchObject({ blockBinding: dropBlock });
+    });
+
+    test("leaves models that do not bind thinking to the prefix unchanged", () => {
+      for (const model of ["claude-opus-5", "claude-fable-5"]) {
+        expect(thinkingFor(`anthropic:${model}`)).not.toHaveProperty("blockBinding");
+      }
+    });
+
+    test("fails closed on routes that may not forward the beta header", () => {
+      const cases: Array<[string, Parameters<typeof thinkingFor>[1]]> = [
+        ["no resolved route", { route: undefined }],
+        ["gateway route", { route: "mux-gateway" }],
+        ["no providers config", { config: null }],
+        ["config base URL", { config: directConfig({ baseUrl: "https://llm.example.com/v1" }) }],
+        [
+          "env base URL",
+          {
+            config: directConfig({
+              baseUrlSource: "env",
+              baseUrlResolved: "https://llm.example.com",
+            }),
+          },
+        ],
+        ["config beta opt-out", { config: directConfig({ disableBetaFeatures: true }) }],
+        ["request beta opt-out", { disableBetaFeatures: true }],
+      ];
+      for (const [label, options] of cases) {
+        const thinking = thinkingFor("anthropic:claude-opus-5-5", options);
+        expect({ label, thinking }).toEqual({
+          label,
+          thinking: { type: "adaptive", display: "summarized" },
+        });
+      }
+      expect(
+        thinkingFor("mux-gateway:anthropic/claude-opus-5-5", { route: "mux-gateway" })
+      ).not.toHaveProperty("blockBinding");
+    });
+
+    test("the SDK sends block_binding with its beta header only when eligible", async () => {
+      const captured: Array<{ body: Record<string, unknown>; beta: string | null }> = [];
+      const captureFetch = Object.assign(
+        (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+          if (typeof init?.body !== "string") {
+            throw new Error("Expected a JSON request body");
+          }
+          captured.push({
+            body: JSON.parse(init.body) as Record<string, unknown>,
+            beta: new Headers(init.headers).get("anthropic-beta"),
+          });
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "msg_test",
+                type: "message",
+                role: "assistant",
+                model: "claude-opus-5-5",
+                content: [{ type: "text", text: "ok" }],
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } }
+            )
+          );
+        },
+        { preconnect: fetch.preconnect.bind(fetch) }
+      );
+      const model = createAnthropic({ apiKey: "test", fetch: captureFetch })("claude-opus-5-5");
+      for (const route of ["anthropic", "mux-gateway"] as const) {
+        await generateText({
+          model,
+          prompt: "Return ok.",
+          providerOptions: buildProviderOptions(
+            "anthropic:claude-opus-5-5",
+            "high",
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            directConfig(),
+            route
+          ) as Parameters<typeof generateText>[0]["providerOptions"],
+          maxRetries: 0,
+        });
+      }
+
+      expect(captured).toHaveLength(2);
+      expect(captured[0].body.thinking).toMatchObject({
+        type: "adaptive",
+        block_binding: { prefix_mismatch_behavior: "drop_block" },
+      });
+      expect(captured[0].beta).toContain("thinking-binding-controls-2026-08-01");
+      expect(captured[1].body.thinking).not.toHaveProperty("block_binding");
+      expect(captured[1].beta ?? "").not.toContain("thinking-binding-controls");
     });
   });
 
