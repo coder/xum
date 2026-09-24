@@ -123,6 +123,7 @@ import {
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
+import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
 import {
   CUSTOM_EVENTS,
   type CustomEventType,
@@ -965,12 +966,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [api, workspaceId]
   );
 
-  const handleEditQueuedMessage = useCallback(async () => {
+  const handleEditQueuedMessage = async () => {
     const queuedMessage = workspaceState?.queuedMessage;
     if (!queuedMessage) return;
 
     await restoreQueuedDraft(queuedMessage);
-  }, [restoreQueuedDraft, workspaceState?.queuedMessage]);
+  };
 
   const sendQueuedImmediatelyInFlightRef = useRef<string | null>(null);
 
@@ -996,7 +997,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   };
 
   // Handler for sending queued message immediately (interrupt + send)
-  const handleSendQueuedImmediately = useCallback(async () => {
+  const handleSendQueuedImmediately = async () => {
     const queuedMessage = workspaceState?.queuedMessage;
     if (
       !api ||
@@ -1016,22 +1017,25 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         sendQueuedImmediatelyInFlightRef.current = null;
       }
     };
-    try {
-      // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
-      storeRaw.setInterrupting(workspaceId);
-      const interruptResult = await api.workspace.interruptStream({
-        workspaceId,
-        options: { sendQueuedImmediately: true },
-      });
-      if (!interruptResult.success) {
+    const interruptResult = await runWithCatch(
+      () => {
+        // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
+        storeRaw.setInterrupting(workspaceId);
+        return api.workspace.interruptStream({
+          workspaceId,
+          options: { sendQueuedImmediately: true },
+        });
+      },
+      (error) => {
         clearInFlightGuardIfCurrent();
-        throw new Error(interruptResult.error);
+        throw error;
       }
-    } catch (error) {
+    );
+    if (!interruptResult.success) {
       clearInFlightGuardIfCurrent();
-      throw error;
+      throw new Error(interruptResult.error);
     }
-  }, [api, workspaceId, workspaceState?.queuedMessage, workspaceState?.canInterrupt, storeRaw]);
+  };
 
   const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
     clearQueuedActionError();
