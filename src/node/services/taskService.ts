@@ -73,6 +73,7 @@ import {
   TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS,
 } from "@/constants/agentMessaging";
 import {
+  formatReawakenChangedMessage,
   REAWAKEN_DEFINITION_READ_TIMEOUT_MS,
   TASK_FAMILY_MESSAGE_MAX_CHARS,
 } from "@/constants/taskMessages";
@@ -167,7 +168,6 @@ import {
 import {
   buildParentAiSettingsFallbacks,
   buildReawakenContextKey,
-  formatReawakenChangedMessage,
   planReawakenAi,
   resolveParentWorkspaceExecSettings,
   type AgentTaskTurnAi,

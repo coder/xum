@@ -97,9 +97,9 @@ import {
   applyAgentTaskTurnAiSnapshot,
   buildReawakenContextKey,
   computeReawakenInputsKey,
-  formatReawakenChangedMessage,
   type AgentTaskTurnAi,
 } from "@/node/services/agentTaskReawakenAi";
+import { formatReawakenChangedMessage } from "@/constants/taskMessages";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { getErrorMessage } from "@/common/utils/errors";

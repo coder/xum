@@ -24,6 +24,7 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
+import { formatReawakenCommitRefusedMessage } from "@/constants/taskMessages";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
@@ -318,19 +319,15 @@ export function applyAgentTaskTurnAiSnapshot(
   workspace.taskThinkingLevel = snapshot.thinkingLevel;
 }
 
-/** Retryable refusal text shared by every "inputs changed during reawakening" outcome. */
-export function formatReawakenChangedMessage(taskId: string): string {
-  return `Sub-agent ${taskId} changed while it was being reawakened; send the message again.`;
-}
-
 /**
  * Thrown inside the execution-claim transform when the reawakening's inputs
  * changed after planning. Throwing aborts the whole config write: neither the
- * claim nor the AI settings are persisted.
+ * claim nor the AI settings are persisted. The prompt row is already durable
+ * at this point, hence the commit-specific (no-resend) message.
  */
 export class AgentTaskAiInputsChangedError extends Error {
   constructor(taskId: string) {
-    super(formatReawakenChangedMessage(taskId));
+    super(formatReawakenCommitRefusedMessage(taskId));
     this.name = "AgentTaskAiInputsChangedError";
   }
 }

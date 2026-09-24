@@ -52,6 +52,8 @@ import {
   INSTANCE_DISCOVERY_MAX_LIMIT,
 } from "@/constants/agentMessaging";
 import {
+  formatReawakenChangedMessage,
+  formatReawakenCommitRefusedMessage,
   TASK_FAMILY_MESSAGE_MAX_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
@@ -9238,10 +9240,11 @@ describe("TaskService", () => {
         const result = await reawaken(taskService, parentId, childId);
         expect(result.success).toBe(false);
         if (result.success) return;
-        expect(result.error.code).toBe("send_failed");
-        expect("message" in result.error ? result.error.message : "").toContain(
-          "changed while it was being reawakened"
-        );
+        // Pre-acceptance refusal: nothing was written, so resending the message is safe.
+        expect(result.error).toEqual({
+          code: "send_failed",
+          message: formatReawakenChangedMessage(childId),
+        });
         expect(sendMessage).not.toHaveBeenCalled();
         expect(JSON.stringify(findWorkspaceInConfig(config, childId))).toBe(before);
       } finally {
@@ -9267,6 +9270,13 @@ describe("TaskService", () => {
 
       const result = await reawaken(fixture.taskService, fixture.parentId, childId);
       expect(result.success).toBe(false);
+      if (result.success) return;
+      // Commit-point refusal: the prompt row is already durable, so the parent gets the
+      // retryable no-resend message rather than the pre-acceptance "send again" one.
+      expect(result.error.code).toBe("send_failed");
+      const message = "message" in result.error ? result.error.message : "";
+      expect(message).toContain(formatReawakenCommitRefusedMessage(childId));
+      expect(message).not.toContain(formatReawakenChangedMessage(childId));
       const child = findWorkspaceInConfig(config, childId);
       expect(child?.taskAiPins).toEqual({ model: MODEL_C });
       expect(child?.taskModelString).toBe(SPAWN_MODEL);
@@ -9348,7 +9358,7 @@ describe("TaskService", () => {
         },
       });
       expect(result.success).toBe(false);
-      if (!result.success) expect(result.error).toContain("changed while it was being reawakened");
+      if (!result.success) expect(result.error).toContain(formatReawakenChangedMessage(childId));
       expect(sendMessage).not.toHaveBeenCalled();
       expect(JSON.stringify(findWorkspaceInConfig(config, childId))).toBe(before);
     }, 20_000);
