@@ -3802,9 +3802,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     // going idle, so A's obligation is rebound to turn 2.
     const turn1 = Symbol("turn-1");
     const turn2 = Symbol("turn-2");
-    admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).onAdmitted(
-      turn1
-    );
+    admitted(
+      await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+    ).onAdmitted(turn1);
     host.supersedeTurn(taskId, turn1, turn2);
     // Backend B re-admits the row; B's own send is admitted directly into turn 2.
     await otherBackend.editConfig((cfg) => {
@@ -3814,9 +3814,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       }
       return cfg;
     });
-    admitted(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).onAdmitted(
-      turn2
-    );
+    admitted(
+      await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+    ).onAdmitted(turn2);
     session.activeTurn = turn2;
     const sends = [...(svc.admittedSendsByTaskId.get(taskId) ?? [])];
     expect(sends.map((send) => send.attemptId)).toEqual([attemptA, foreign]);
@@ -3856,14 +3856,18 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(raw).toContain(healed!.taskAttemptId!);
       expect(raw).not.toContain(`"${malformed}"`);
       // A manual send gets a turn-admission token bound to the healed attempt (never not-a-task).
-      const admission = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
+      const admission = await admitWithPreparation(taskService, taskId, {
+        acceptanceOrigin: "manual",
+      });
       expect(admission.kind).toBe("admitted");
       const pending = [...(svc.admittedSendsByTaskId.get(taskId) ?? [])];
       expect(pending.map((send) => send.attemptId)).toEqual([healed!.taskAttemptId!]);
       if (admission.kind === "admitted") admission.token.onDisposed("no-work");
       // The Stop/settlement fence applies to it: a closed attempt refuses further sends.
       svc.closeAttemptAdmission(taskId, healed!.taskAttemptId, undefined, "test-close");
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+      expect(
+        await admitWithPreparation(taskService, taskId, { acceptanceOrigin: "manual" })
+      ).toEqual({
         kind: "refused",
         message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
       });
