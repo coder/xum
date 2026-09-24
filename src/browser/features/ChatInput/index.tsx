@@ -137,11 +137,7 @@ import {
 
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { type OpenAIReasoningMode, type ThinkingLevel } from "@/common/types/thinking";
-import {
-  DEFAULT_RUNTIME_ENABLEMENT,
-  normalizeRuntimeEnablement,
-  type CoderWorkspaceConfig,
-} from "@/common/types/runtime";
+import { DEFAULT_RUNTIME_ENABLEMENT, normalizeRuntimeEnablement } from "@/common/types/runtime";
 import {
   type AgentSkillReference,
   type MuxMessageMetadata,
@@ -170,6 +166,7 @@ import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
 import { useCreationWorkspace } from "./useCreationWorkspace";
+import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
@@ -815,18 +812,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const currentRuntime = creationState.selectedRuntime;
   const coderRuntimeHost = currentRuntime.mode === "ssh" ? currentRuntime.host : null;
   const setCreationSelectedRuntime = creationState.setSelectedRuntime;
-  // Plain function: React Compiler stabilizes this handler from its primitive host
-  // and compiler-stable runtime setter dependencies.
-  const handleCoderConfigChange = (config: CoderWorkspaceConfig | null) => {
-    if (coderRuntimeHost == null) return;
-    // Existing Coder workspaces name the SSH host; new ones derive it later.
-    const computedHost = config?.workspaceName ? `${config.workspaceName}.coder` : coderRuntimeHost;
-    setCreationSelectedRuntime({
-      mode: "ssh",
-      host: computedHost,
-      coder: config ?? undefined,
-    });
-  };
+  // Compiler-memoized in its own module; see useCoderConfigChangeHandler for why.
+  const handleCoderConfigChange = useCoderConfigChangeHandler(
+    coderRuntimeHost,
+    setCreationSelectedRuntime
+  );
   const coderState = useCoderWorkspace({
     coderConfig: currentRuntime.mode === "ssh" ? (currentRuntime.coder ?? null) : null,
     onCoderConfigChange: handleCoderConfigChange,
