@@ -11,6 +11,8 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { prepareDedicatedTaskCheckout } from "@/node/services/taskCheckoutPreparation.testHarness";
 import { initGitRepo } from "@/node/services/taskService.testHarness";
+import { isTaskCheckoutAuthorizationCurrent } from "@/node/services/taskCheckoutAuthorization";
+import { validateTaskCheckoutPreparation } from "@/node/services/taskCheckoutPreparation";
 import {
   isPositivelyAbsent,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
@@ -1134,6 +1136,138 @@ describe("WorkspaceMcpOverridesService", () => {
         ["shared-parent", { enabledServers: ["shots"] }],
         ["shared-child", { enabledServers: ["shots"] }],
       ]);
+    });
+  });
+
+  // G1: inheritance reads an ancestor's document only under that ancestor's OWN authority. A
+  // prepared child whose own document is transparent (none, or emptied by the sanitizer) must not
+  // pick up the `plugin:` enables of a parent whose own read refuses; a ready parent's (or a
+  // root's) still flow, and the captured authority covers the chain the read depended on.
+  describe("inheritance through an ancestor's own authority", () => {
+    const PLUGIN_KEY = "plugin:0123456789abcdef:evil";
+    const writeDocument = async (workspacePath: string, document: unknown) => {
+      await fs.mkdir(path.join(workspacePath, ".xum"), { recursive: true });
+      await fs.writeFile(
+        path.join(workspacePath, ".xum", "mcp.local.jsonc"),
+        JSON.stringify(document),
+        "utf-8"
+      );
+    };
+    const editRow = (workspaceId: string, edit: (row: Record<string, unknown>) => void) =>
+      config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const row = project.workspaces.find((w) => w.id === workspaceId);
+          if (row) edit(row as unknown as Record<string, unknown>);
+        }
+        return cfg;
+      });
+
+    it("a legacy (proof-less) parent's plugin enable does not reach a prepared child whose document the sanitizer emptied: the child's read is non-authoritative", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const root = await registerWorkspace("g1-root");
+      // A dedicated task row WITHOUT a proof: its own read refuses (legacy).
+      const parentPath = getWorkspacePath({
+        srcDir: config.srcDir,
+        projectName: "g1-legacy",
+        workspaceName: "branch",
+      });
+      await fs.mkdir(parentPath, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/fake/g1-legacy", {
+          workspaces: [
+            {
+              path: parentPath,
+              id: "ws-g1-legacy",
+              name: "branch",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+              parentWorkspaceId: root.workspaceId,
+            },
+          ],
+        });
+        return cfg;
+      });
+      await writeDocument(parentPath, { enabledServers: [PLUGIN_KEY] });
+      const child = await registerPreparedChild("ws-g1-legacy", "g1-legacy-child");
+      // The fork materialized the stale enable; the real sanitizer leaves `{"enabledServers":[]}`.
+      await writeDocument(child.workspacePath, { enabledServers: [PLUGIN_KEY] });
+      await service.prunePluginOverrideKeysForUnregisteredCheckout(
+        {
+          workspacePath: child.workspacePath,
+          runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+        },
+        "plugin:"
+      );
+      expect(
+        JSON.parse(
+          await fs.readFile(path.join(child.workspacePath, ".xum", "mcp.local.jsonc"), "utf-8")
+        )
+      ).toEqual({ enabledServers: [] });
+      expect((await validateTaskCheckoutPreparation(config, "ws-g1-legacy")).kind).toBe("legacy");
+      expect((await validateTaskCheckoutPreparation(config, child.workspaceId)).kind).toBe("ready");
+      expect(await service.getOverridesForWorkspace("ws-g1-legacy")).toMatchObject({
+        overrides: {},
+        authoritative: false,
+      });
+
+      const read = await service.getOverridesForWorkspace(child.workspaceId);
+      expect(read.overrides.enabledServers ?? []).not.toContain(PLUGIN_KEY);
+      expect(read.authoritative).toBe(false);
+    });
+
+    it("a mismatched parent is refused the same way, while a READY parent's (and a root's) enables still flow to the prepared child", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const root = await registerWorkspace("g1-ready-root");
+      const parent = await registerPreparedChild(root.workspaceId, "g1-ready-parent");
+      const child = await registerPreparedChild(parent.workspaceId, "g1-ready-child");
+      await writeDocument(parent.workspacePath, { enabledServers: [PLUGIN_KEY] });
+      // Ready parent: later legitimate consent in a prepared parent is inherited (not re-pruned).
+      expect(await service.getOverridesForWorkspace(child.workspaceId)).toMatchObject({
+        overrides: { enabledServers: [PLUGIN_KEY] },
+        authoritative: true,
+      });
+      // Root parent: read-through inheritance as documented.
+      const rootChild = await registerPreparedChild(root.workspaceId, "g1-root-child");
+      await writeDocument(root.workspacePath, { enabledServers: [PLUGIN_KEY] });
+      expect(await service.getOverridesForWorkspace(rootChild.workspaceId)).toMatchObject({
+        overrides: { enabledServers: [PLUGIN_KEY] },
+        authoritative: true,
+      });
+      // The parent's proof no longer matches its checkout: its own read refuses, and so does
+      // the inheritance through it.
+      await editRow(parent.workspaceId, (row) => {
+        const proof = row.taskCheckoutPreparation as { realpath: string };
+        row.taskCheckoutPreparation = { ...proof, realpath: `${proof.realpath}-moved` };
+      });
+      expect((await validateTaskCheckoutPreparation(config, parent.workspaceId)).kind).toBe(
+        "mismatch"
+      );
+      const read = await service.getOverridesForWorkspace(child.workspaceId);
+      expect(read.overrides.enabledServers ?? []).not.toContain(PLUGIN_KEY);
+      expect(read.authoritative).toBe(false);
+    });
+
+    it("the captured authority covers the inheritance chain: a parent row change after the read refuses at the effect boundary", async () => {
+      const service = new WorkspaceMcpOverridesService(config);
+      const root = await registerWorkspace("g1-fence-root");
+      const parent = await registerPreparedChild(root.workspaceId, "g1-fence-parent");
+      const child = await registerPreparedChild(parent.workspaceId, "g1-fence-child");
+      await writeDocument(parent.workspacePath, { enabledServers: [PLUGIN_KEY] });
+      const read = await service.getOverridesForWorkspace(child.workspaceId);
+      expect(read).toMatchObject({
+        overrides: { enabledServers: [PLUGIN_KEY] },
+        authoritative: true,
+      });
+      // The MCP manager's synchronous, config-only check at every effect boundary.
+      const fence = () =>
+        isTaskCheckoutAuthorizationCurrent(config, child.workspaceId, read.preparation).current;
+      expect(fence()).toBe(true);
+      // Nothing about the child changed; its parent's proof did (a cooperating writer, or an
+      // older build, rewrote the row) — the enables the child inherited are no longer vouched.
+      await editRow(parent.workspaceId, (row) => {
+        const proof = row.taskCheckoutPreparation as { realpath: string };
+        row.taskCheckoutPreparation = { ...proof, realpath: `${proof.realpath}-moved` };
+      });
+      expect(fence()).toBe(false);
     });
   });
 

@@ -953,6 +953,33 @@ function multiProjectContainer(
 }
 
 /**
+ * The ONE ancestor walker: the live `parentWorkspaceId` chain above `entry`, nearest first, with
+ * cycle and depth protection. `end` is null when the chain reaches a parent-less row (a root) and
+ * names the problem otherwise (a cycle, a missing ancestor, the depth limit). Used by the shared
+ * ancestry derivation and by the signature of the inheritance chain (see
+ * deriveTaskCheckoutAuthorization): the MCP override reader inherits through these rows.
+ */
+function ancestorChain(
+  snapshot: ProjectsConfig,
+  entry: ConfigEntry
+): { ancestors: ConfigEntry[]; end: string | null } {
+  const ancestors: ConfigEntry[] = [];
+  const visited = new Set<string>([entry.workspace.id ?? ""]);
+  let current = entry;
+  for (let hop = 0; hop < MAX_SHARED_ANCESTRY_HOPS; hop++) {
+    const parentId = current.workspace.parentWorkspaceId;
+    if (parentId == null) return { ancestors, end: null };
+    if (visited.has(parentId)) return { ancestors, end: `ancestry cycle at ${parentId}` };
+    visited.add(parentId);
+    const parentEntry = findWorkspaceEntry(snapshot, parentId);
+    if (!parentEntry) return { ancestors, end: `ancestor ${parentId} not found` };
+    ancestors.push(parentEntry);
+    current = parentEntry;
+  }
+  return { ancestors, end: "ancestry exceeds the supported depth" };
+}
+
+/**
  * Pure (config-only) live same-directory ancestry walk of a shared row: child → parent while each
  * hop is a live shared row executing in the same directory, ending at the nearest dedicated task
  * or ordinary root.
@@ -965,18 +992,10 @@ function walkSharedAncestry(
   | { ok: false; detail: string } {
   const hops: ConfigEntry[] = [];
   const directory = executionDirectory(entry);
-  const visited = new Set<string>([entry.workspace.id ?? ""]);
-  let current = entry;
-  for (let hop = 0; hop < MAX_SHARED_ANCESTRY_HOPS; hop++) {
-    const parentId = current.workspace.parentWorkspaceId;
-    if (parentId == null) {
-      return { ok: false, detail: `${current.workspace.id ?? "?"} has no parent` };
-    }
-    if (visited.has(parentId)) return { ok: false, detail: `ancestry cycle at ${parentId}` };
-    visited.add(parentId);
-    const parentEntry = findWorkspaceEntry(snapshot, parentId);
-    if (!parentEntry) return { ok: false, detail: `ancestor ${parentId} not found` };
+  const chain = ancestorChain(snapshot, entry);
+  for (const parentEntry of chain.ancestors) {
     const parent = parentEntry.workspace;
+    const parentId = parent.id ?? "?";
     if (isWorkspaceArchived(parent.archivedAt, parent.unarchivedAt)) {
       return { ok: false, detail: `ancestor ${parentId} is archived` };
     }
@@ -1003,9 +1022,10 @@ function walkSharedAncestry(
       return { ok: false, detail: `shared ancestor ${parentId} carries a proof` };
     }
     hops.push(parentEntry);
-    current = parentEntry;
   }
-  return { ok: false, detail: "ancestry exceeds the supported depth" };
+  // Every parent-less row is a root, which returned above: the chain ended on a problem.
+  assert(chain.end !== null, "walkSharedAncestry: a chain ending at a root returned its anchor");
+  return { ok: false, detail: chain.end };
 }
 
 /**
@@ -1042,12 +1062,19 @@ function deriveTaskCheckoutAuthorization(
       ? { kind: "runtime-mismatch", detail: "proof present on a non-host-local runtime" }
       : { kind: "excluded-offhost" };
   }
+  // The MCP override reader inherits a transparent child's overrides through its ancestors, each
+  // under that ancestor's own authority (WorkspaceMcpOverridesService.loadInheritedOverrides), so
+  // an authority also signs the whole chain it may inherit through: a parent row changed between
+  // capture and effect (its proof, path, runtime, parent) makes the synchronous fence refuse.
+  const inheritance = ancestorChain(snapshot, entry);
   const sign = (hops: ConfigEntry[], anchor: ConfigEntry): string =>
     canonicalJson({
       v: 1,
       row: rowSignatureInputs(entry),
       ancestry: hops.map(rowSignatureInputs),
       anchor: rowSignatureInputs(anchor),
+      inheritance: inheritance.ancestors.map(rowSignatureInputs),
+      inheritanceEnd: inheritance.end,
     });
   if (kind === "dedicated") {
     const derived = deriveDedicatedRow(row);

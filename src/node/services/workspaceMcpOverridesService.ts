@@ -2244,6 +2244,24 @@ export class WorkspaceMcpOverridesService {
       if (parent === undefined) {
         return { overrides: {}, authoritative: true };
       }
+      // An ancestor's document is inherited only under that ancestor's OWN authority — the same
+      // verdict its own read gets (getOverridesForWorkspace): a ready task, valid shared
+      // ancestry, or a root/off-host exemption. A refused ancestor (legacy, unsupported,
+      // mismatched, or unverifiable) yields the result its own read yields: no overrides, not
+      // authoritative — in both modes, like an unreachable parent, so a strict prune re-read of
+      // a child under a refused parent neither throws forever nor publishes the parent's
+      // enables. Bounded and lock-free (stats and bounded reads; no checkout lock), so it is safe
+      // under the override writer's lock. The child's captured authority signs this chain, so
+      // the late config-only fence notices a parent row that changes afterwards.
+      const parentAuthority = await captureTaskCheckoutAuthorization(this.config, parent.id);
+      if (!parentAuthority.success) {
+        log.info("[MCP] Not inheriting MCP overrides through a refused ancestor", {
+          workspaceId: metadata.id,
+          parentWorkspaceId,
+          message: parentAuthority.error,
+        });
+        return { overrides: {}, authoritative: false, authorityLostInherited: true };
+      }
       const inherited = await this.resolveOverridesFor(
         parent,
         mode,
