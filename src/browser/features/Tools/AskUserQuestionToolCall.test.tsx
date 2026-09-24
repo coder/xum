@@ -86,13 +86,23 @@ const actualWorkspaceStore =
 // and static import bindings freeze at eval time, so this file-scope mock is what any
 // later-evaluated file in the same bun process gets forever. A bare fake missing store
 // methods (e.g. setNavigateToWorkspace) breaks those files' cleanup and cascades.
+// The overrides also apply only while this file's tests run: otherwise a later file that
+// patches the real singleton (PinnedTodoList) reads this file's todo-less state instead.
+// Outside that window, return the real store itself rather than a delegating wrapper, so
+// a later file that saves and restores store methods cannot capture this file's fake.
+let storeOverlayActive = false;
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
-  useWorkspaceStoreRaw: () =>
-    overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
+  useWorkspaceStoreRaw: () => {
+    const realStore = actualWorkspaceStore.useWorkspaceStoreRaw();
+    if (!storeOverlayActive) {
+      return realStore;
+    }
+    return overlayWorkspaceStoreRaw(realStore, {
       subscribeKey: (_workspaceId: string, _listener: () => void) => () => undefined,
       getWorkspaceState: (_workspaceId: string) => currentWorkspaceState,
-    }),
+    });
+  },
 }));
 
 import { AskUserQuestionToolCall } from "./AskUserQuestionToolCall";
@@ -101,6 +111,7 @@ describe("AskUserQuestionToolCall", () => {
   beforeEach(() => {
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
+    storeOverlayActive = true;
 
     currentWorkspaceState = {
       autoRetryStatus: null,
@@ -116,6 +127,7 @@ describe("AskUserQuestionToolCall", () => {
 
   afterEach(() => {
     cleanup();
+    storeOverlayActive = false;
     mock.restore();
     globalThis.window = undefined as unknown as Window & typeof globalThis;
     globalThis.document = undefined as unknown as Document;
