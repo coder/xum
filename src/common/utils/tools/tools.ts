@@ -293,6 +293,13 @@ export interface ToolConfiguration {
   goalService?: WorkspaceGoalService;
   /** Effective goal defaults for model-created goals in this workspace. */
   goalDefaults?: GoalDefaults;
+  /**
+   * Model running the turn that executes the tools. set_goal forwards it so a
+   * model-created goal is priced against, and kicks off on, the model the user
+   * is actually running — not the workspace's persisted default, which can
+   * differ (one-shot model sends, delegated turns with per-turn overrides).
+   */
+  goalKickoffModel?: string;
   /** Per-request goal tool gates derived from goal status and agent capabilities. */
   enableGoalTools?: {
     setGoal: boolean;
