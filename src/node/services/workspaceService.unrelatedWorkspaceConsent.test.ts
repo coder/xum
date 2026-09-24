@@ -293,6 +293,41 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
   });
 });
 
+describe("WorkspaceService.grantDefaultUnrelatedWorkspaceConsent", () => {
+  let harness: Awaited<ReturnType<typeof createHarness>>;
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    mock.restore();
+    await harness.cleanup();
+  });
+
+  test("persists a generation for that workspace only and publishes it", async () => {
+    const published: Array<{
+      workspaceId: string;
+      metadata: { unrelatedWorkspaceConsent?: string } | null;
+    }> = [];
+    harness.service.on(
+      "metadata",
+      (event: { workspaceId: string; metadata: { unrelatedWorkspaceConsent?: string } | null }) =>
+        published.push(event)
+    );
+
+    await harness.service.grantDefaultUnrelatedWorkspaceConsent(WORKSPACE_ID);
+
+    const generation = harness.persistedConsent();
+    expect(typeof generation).toBe("string");
+    expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
+    expect(harness.persistedConsent(OTHER_WORKSPACE_ID)).toBeUndefined();
+    expect(published).toHaveLength(1);
+    expect(published[0].workspaceId).toBe(WORKSPACE_ID);
+    expect(published[0].metadata?.unrelatedWorkspaceConsent).toBe(generation as string);
+  });
+});
+
 describe("getValidUnrelatedWorkspaceConsent", () => {
   test("accepts only non-empty, whitespace-free opaque strings", () => {
     expect(getValidUnrelatedWorkspaceConsent("3b6a1f9e-2c4d-4e8f-9a0b-1c2d3e4f5a6b")).toBe(

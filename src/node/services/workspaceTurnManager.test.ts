@@ -2071,6 +2071,51 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  test("createWorkspaceTurn defers default unrelated-messaging consent until its handle is reserved", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+    // What an unrelated sender's guards would see at the moment consent is granted.
+    let registrationAtGrant: unknown = "not granted";
+    const managerRef: {
+      current?: ReturnType<typeof createWorkspaceTurnManagerHarness>["taskService"];
+    } = {};
+    const grantDefaultUnrelatedWorkspaceConsent = mock((workspaceId: string) => {
+      registrationAtGrant = managerRef.current?.getLiveWorkspaceTurnRegistration(workspaceId);
+      return Promise.resolve();
+    });
+    const workspaceMocks = createWorkspaceServiceMocks({
+      create: createWorkspace,
+      grantDefaultUnrelatedWorkspaceConsent,
+    });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+    managerRef.current = taskService;
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize the repo",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    // create() must not grant it: the target would be an idle, wakeable root before this turn
+    // owns it.
+    const createCall = createWorkspace.mock.calls[0] as unknown[];
+    expect(createCall[8]).toMatchObject({ deferUnrelatedWorkspaceConsent: true });
+    // Granted exactly once, while the reservation already marks it as a delegated root.
+    expect(grantDefaultUnrelatedWorkspaceConsent).toHaveBeenCalledTimes(1);
+    expect(grantDefaultUnrelatedWorkspaceConsent.mock.calls[0]).toEqual(["childworkspace"]);
+    expect(registrationAtGrant).toMatchObject({
+      handleId: "wst_childworkspace",
+      ownerWorkspaceId: parentId,
+    });
+  });
+
   test("createWorkspaceTurn launches a new workspace with an explicit agent id", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);

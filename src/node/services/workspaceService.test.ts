@@ -22601,6 +22601,20 @@ describe("WorkspaceService fork", () => {
       })
     );
 
+    // Record what other task trees could see while goal inheritance (post-registration fork
+    // setup) runs; the real inheritance still executes.
+    const consentDuringGoalInheritance: unknown[] = [];
+    const originalInheritFromFork = goalService.inheritFromFork.bind(goalService);
+    const inheritSpy = spyOn(goalService, "inheritFromFork").mockImplementation(
+      async (sourceId: string, targetId: string) => {
+        consentDuringGoalInheritance.push(
+          (await config.getAllWorkspaceMetadata()).find((entry) => entry.id === targetId)
+            ?.unrelatedWorkspaceConsent
+        );
+        return originalInheritFromFork(sourceId, targetId);
+      }
+    );
+
     // Record what other task trees could see while registration-time sanitization runs.
     const consentDuringSanitize: unknown[] = [];
     const sanitizeSpy = spyOn(
@@ -22629,6 +22643,8 @@ describe("WorkspaceService fork", () => {
       // Consent is granted only after sanitization: while it runs the fork is registered but
       // must not be discoverable or wakeable by unrelated agents.
       expect(consentDuringSanitize).toEqual([undefined]);
+      // ...nor while the rest of the fork's setup (goal inheritance) is still running.
+      expect(consentDuringGoalInheritance).toEqual([undefined]);
 
       const metadataAfterFork = await config.getAllWorkspaceMetadata();
       expect(
@@ -22663,6 +22679,7 @@ describe("WorkspaceService fork", () => {
         turnsUsed: 1,
       });
     } finally {
+      inheritSpy.mockRestore();
       sanitizeSpy.mockRestore();
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();
