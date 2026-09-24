@@ -4197,10 +4197,20 @@ export class TaskService implements AgentTaskIntegration {
    * `awaiting_report`/`running` tasks. Bounded by the number of active tasks, not by deployment
    * size. Must finish before any client can act on tasks: a stop, resume, or send racing these
    * transitions would be overwritten or would resurrect a task the client just stopped, so the
-   * server binds its listener only after this resolves.
+   * server binds its listener after this resolves, or once it exceeds the startup step bound
+   * (ServiceContainer: a slow recovery must not keep the server down).
+   *
+   * Such a recovery can still be running at shutdown, so `options.signal` (aborted by dispose)
+   * stops it before the queue drain and before each re-drive: work reserved or dispatched after
+   * shutdown began would fail against latched services and be persisted as interrupted.
    */
-  async recoverInterruptedTasks(): Promise<void> {
+  async recoverInterruptedTasks(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
+    const cancelled = (stage: string): boolean => {
+      if (options?.signal?.aborted !== true) return false;
+      log.info("[startup] TaskService.recoverInterruptedTasks cancelled by shutdown", { stage });
+      return true;
+    };
     const startupConfig = this.config.loadConfigOrDefault();
     const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) => task.taskStatus === "queued" && typeof task.id === "string"
@@ -4293,6 +4303,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Normalize stopped capacity before launching siblings; newly launched work is not part of
     // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
+    if (cancelled("queue-drain")) return;
     const maybeStartQueuedTasksStartedAt = Date.now();
     await this.maybeStartQueuedTasks();
     const maybeStartQueuedTasksMs = Date.now() - maybeStartQueuedTasksStartedAt;
@@ -4332,6 +4343,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const task of awaitingReportTasks) {
       if (!task.id) continue;
+      if (cancelled("awaiting-report")) return;
       if (!(await admitRecovery(task, "startup-awaiting-report"))) continue;
 
       // Avoid resuming a task while it still has blocking active descendants (it shouldn't report yet).
@@ -4391,6 +4403,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const task of runningTasks) {
       if (!task.id) continue;
+      if (cancelled("running")) return;
       if (!(await admitRecovery(task, "startup-running"))) continue;
 
       const pendingGuidance = task.taskPendingGuidance ?? [];

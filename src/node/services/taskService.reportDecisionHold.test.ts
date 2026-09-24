@@ -683,6 +683,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           expect(entryOf(config, childId)).toBeDefined();
           stack.completeStream(0, event);
         }
+        // Wait for the hold itself rather than a fixed number of turns (too few on loaded CI).
+        await until(() => stack.heldTexts().length > 0, "follow-up held");
         await yieldMacrotasks(20);
         // Not sent under the completed attempt, not deleted, held for the user.
         expect(completions).toHaveLength(1);

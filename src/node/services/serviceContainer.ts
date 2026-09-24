@@ -165,9 +165,9 @@ interface StartupStep {
   /**
    * Log and continue with the next step instead of rejecting `initializeCore()` when this step
    * fails or exceeds `STARTUP_STEP_TIMEOUT_MS`. For work that should land before IPC/HTTP mount
-   * but that request handling does not depend on (the one-shot providers.jsonc migration); the
-   * abandoned step keeps running as a plain promise exactly like a timed-out hard step. Absent
-   * means hard: the step is mandatory and a failure stops startup.
+   * but must not keep the app from starting (the one-shot providers.jsonc migration, agent-task
+   * recovery); the abandoned step keeps running as a plain promise exactly like a timed-out hard
+   * step. Absent means hard: the step is mandatory and a failure stops startup.
    */
   readonly bestEffort?: boolean;
 }
@@ -269,6 +269,9 @@ export class ServiceContainer {
   // Retained so dispose() can wait for the in-flight housekeeping step to settle (bounded)
   // before tearing down the services it is using.
   private startupHousekeepingSettled: Promise<void> | null = null;
+  // Settles when the latest task recovery run settles, even one the startup bound abandoned:
+  // housekeeping and the periodic services must not overlap the recovery transitions.
+  private taskRecoverySettled: Promise<void> = Promise.resolve();
 
   /**
    * The in-flight (or completed) `dispose()` teardown. Every caller shares it,
@@ -395,17 +398,34 @@ export class ServiceContainer {
       bestEffort: true,
     },
     { name: "experimentsService.initialize", run: () => this.experimentsService.initialize() },
+    // Best-effort: a slow or failing recovery (e.g. a large instance re-launching many tasks)
+    // must not keep the server from starting, and a fatal timeout crash-loops under a supervisor
+    // that restarts xum, re-driving the same partial recovery each time. The listener still waits
+    // for it within the step bound (sub-second normally), so clients do not race recovery in the
+    // common case; past the bound it keeps running and runStartupHousekeeping() waits for it.
     {
       name: "taskService.recoverInterruptedTasks",
-      run: () => this.taskService.recoverInterruptedTasks(),
+      run: () => {
+        // Same dispose-aborted signal as housekeeping: a recovery outliving the step bound must
+        // not keep reserving or re-driving tasks once shutdown began.
+        const recovery = this.taskService.recoverInterruptedTasks({
+          signal: this.startupHousekeepingAbort.signal,
+        });
+        this.taskRecoverySettled = recovery.then(
+          () => undefined,
+          () => undefined
+        );
+        return recovery;
+      },
+      bestEffort: true,
     },
   ];
 
   /**
    * Runs `startupCoreSteps` on the app runtime (startup contract in di/appRuntime.ts). The
-   * server entry point awaits this before binding its listener: task recovery must finish before
-   * any client can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks), and
-   * it is bounded by the number of active tasks rather than by deployment size. The per-workspace
+   * server entry point awaits this before binding its listener so task recovery normally finishes
+   * before any client can stop, resume, or send to a task (see TaskService.recoverInterruptedTasks);
+   * a recovery past the step bound keeps running while startup continues. The per-workspace
    * housekeeping lives in runStartupHousekeeping().
    *
    * Rejects with the failing step's own error (identity preserved — a synchronous throw included)
@@ -454,10 +474,9 @@ export class ServiceContainer {
           duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
           // Fatal on purpose for a hard step — the same exit path a throwing step already takes
           // on every root (desktop "Startup Failed" dialog, server/ACP log-and-exit). These are
-          // the steps request handling depends on (#4058): continuing past a timed-out step
-          // would, e.g., let the server accept task operations while task recovery is still
-          // running. The "startup must never crash the app" rule governs the best-effort work
-          // (runStartupHousekeeping() and the `bestEffort` step below), which stays non-fatal;
+          // the steps request handling depends on (#4058). The "startup must never crash the
+          // app" rule governs the best-effort work (runStartupHousekeeping() and the `bestEffort`
+          // steps, task recovery included), which stays non-fatal;
           // this bound only turns an indefinite hang (splash pinned, listener never bound, no
           // dispose) into the existing failure path.
           orElse: () =>
@@ -502,6 +521,33 @@ export class ServiceContainer {
   private async runStartupHousekeepingSteps(): Promise<void> {
     const housekeepingStartedAt = Date.now();
     const signal = this.startupHousekeepingAbort.signal;
+    // A task recovery that outlived its startup bound is still mutating task state: wait for it
+    // (or for dispose) before the housekeeping passes and periodic services act on the same tasks.
+    // Bounded again on the runtime clock: a permanently hung recovery must not disable the
+    // periodic services for the server's lifetime, nor keep `initialize()` callers (ACP) waiting.
+    const recoveryWait = this.runtime.managed
+      .runPromise(
+        Effect.promise(() => this.taskRecoverySettled).pipe(
+          Effect.as(true),
+          Effect.timeoutOrElse({
+            duration: Duration.millis(STARTUP_STEP_TIMEOUT_MS),
+            orElse: () => Effect.succeed(false),
+          })
+        )
+      )
+      .catch(() => true);
+    const recoverySettled = await new Promise<boolean>((resolve) => {
+      if (signal.aborted) return resolve(true);
+      signal.addEventListener("abort", () => resolve(true), { once: true });
+      void recoveryWait.then(resolve);
+    });
+    if (!recoverySettled) {
+      log.warn("[startup] Task recovery still running; starting housekeeping without it");
+    }
+    if (signal.aborted) {
+      log.info("[startup] Startup housekeeping cancelled by dispose before it started");
+      return;
+    }
     // Housekeeping is best-effort and may run while the server is already serving requests: a
     // failing step must not skip the periodic services below (startup-time rule: never let
     // background housekeeping take the app down).
@@ -761,19 +807,22 @@ export class ServiceContainer {
     shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
     shutdownStep("projectService.beginShutdown", () => this.projectService.beginShutdown());
     await shutdownStep("updateService.beginShutdown", () => this.updateService.beginShutdown());
-    const housekeepingSettled = this.startupHousekeepingSettled;
-    if (housekeepingSettled != null) {
-      await shutdownStep("startupHousekeeping.join", async () => {
-        const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+    // Joined with a task recovery that outlived its startup bound (already settled otherwise):
+    // both observe the abort above only at their step boundaries.
+    const housekeepingSettled = Promise.all([
+      this.startupHousekeepingSettled,
+      this.taskRecoverySettled,
+    ]);
+    await shutdownStep("startupHousekeeping.join", async () => {
+      const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
+        timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
+      });
+      if (joined.kind === "timeout") {
+        log.warn("[shutdown] startup housekeeping still running; teardown continues", {
           timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
         });
-        if (joined.kind === "timeout") {
-          log.warn("[shutdown] startup housekeeping still running; teardown continues", {
-            timeoutMs: STARTUP_HOUSEKEEPING_JOIN_TIMEOUT_MS,
-          });
-        }
-      });
-    }
+      }
+    });
     // Interrupt and await the runtime's supervised fibers — the stream engine's
     // per-stream supervisors (StreamManager.superviseEngine): every in-flight
     // stream is aborted as "system" and its partial committed to chat.jsonl —

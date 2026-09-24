@@ -586,13 +586,15 @@ export class WorkflowRunner {
         }
       },
     };
-    let leaseRenewalInFlight = false;
+    // Retained so the finally below can await a renewal already in flight: clearInterval only
+    // stops future ticks, and a renewal that takes the lease mutation lock after releaseLease()
+    // would make an immediate re-acquire (checkpoint retry) fail as "already active".
+    let leaseRenewalInFlight: Promise<void> | undefined;
     const leaseRenewal = setInterval(() => {
-      if (leaseRenewalInFlight) {
+      if (leaseRenewalInFlight != null) {
         return;
       }
-      leaseRenewalInFlight = true;
-      void this.runStore
+      leaseRenewalInFlight = this.runStore
         .renewLease(runId, this.runnerId, this.clock.nowMs())
         .then((renewed) => {
           if (!renewed) {
@@ -601,7 +603,7 @@ export class WorkflowRunner {
         })
         .catch(markLeaseLost)
         .finally(() => {
-          leaseRenewalInFlight = false;
+          leaseRenewalInFlight = undefined;
         });
     }, this.runStore.getLeaseRenewalIntervalMs());
 
@@ -933,6 +935,7 @@ export class WorkflowRunner {
       removeAbortListener();
       clearInterval(leaseRenewal);
       this.releaseOwnedAttempts(runId);
+      await leaseRenewalInFlight;
       await this.runStore.releaseLease(runId, this.runnerId);
     }
   }
