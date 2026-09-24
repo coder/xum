@@ -23,6 +23,7 @@ import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
+import type { InstructionSources } from "@/common/types/instructions";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
@@ -45,7 +46,7 @@ import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/age
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
-import { buildSystemMessage } from "./systemMessage";
+import { buildSystemMessageFromSources, loadWorkspaceInstructionSources } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { log } from "./log";
@@ -387,7 +388,7 @@ export interface BuildStreamSystemContextOptions {
   modelString: string;
   cfg: ProjectsConfig;
   providersConfig?: ProvidersConfigMap | null;
-  mcpServers: Parameters<typeof buildSystemMessage>[5];
+  mcpServers: Parameters<typeof buildSystemMessageFromSources>[5];
   xumScope?: XumToolScope;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /** Whether the advisor tool is available for the current agent */
@@ -416,6 +417,11 @@ export interface BuildStreamSystemContextOptions {
   claudeSkillsCompatEnabled?: boolean;
   /** agent-plugins experiment: discover skills from Agent Plugins containers (read-only). */
   agentPluginsEnabled?: boolean;
+  /**
+   * Instruction snapshot from an earlier build in the same turn. Post-policy
+   * and per-model rebuilds reuse it so one turn reads AGENTS.md files once.
+   */
+  instructionSources?: InstructionSources;
 }
 
 /** Result of system context assembly. */
@@ -437,6 +443,8 @@ export interface StreamSystemContextResult {
   availableSkills: Awaited<ReturnType<typeof discoverAgentSkills>> | undefined;
   /** Exact ancestor plan files surfaced in the prompt and forwarded through tool configuration. */
   ancestorPlanFilePaths: string[];
+  /** Instruction snapshot used for the prompt; reuse it for tool-scoped instructions. */
+  instructionSources: InstructionSources;
 }
 
 const MAX_ANCESTOR_PLAN_PATH_HOPS = 32;
@@ -744,38 +752,89 @@ export async function buildStreamSystemContext(
 
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
 
-  // Resolve the body with inheritance (prompt.append merges with base).
-  // Use agentDefinition.id (may have fallen back to exec) instead of effectiveAgentId.
-  const resolvedBody = await resolveAgentBody(
-    agentDiscoveryRuntime,
-    agentDiscoveryPath,
-    agentDefinition.id,
-    {
-      includeAgentPlugins: opts.agentPluginsEnabled,
-      skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
-    }
-  );
+  const agentResolveOptions = {
+    includeAgentPlugins: opts.agentPluginsEnabled,
+    skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
+  };
+  const skillCtx = resolveSkillStorageContext({
+    runtime,
+    workspacePath,
+    xumScope,
+    includeClaudeSkills: opts.claudeSkillsCompatEnabled,
+    includeAgentPlugins: opts.agentPluginsEnabled,
+  });
 
-  let subagentAppendPrompt: string | undefined;
-  if (isSubagentWorkspace) {
-    try {
-      const resolvedFrontmatter = await resolveAgentFrontmatter(
-        agentDiscoveryRuntime,
-        agentDiscoveryPath,
-        agentDefinition.id,
-        {
+  // The agent body, subagent frontmatter, subagent discovery, skill discovery,
+  // and instruction files are independent reads. On SSH runtimes each is a
+  // chain of remote round-trips, so run them concurrently instead of paying
+  // for them one after another. Error handling per read is unchanged.
+  const [
+    resolvedBody,
+    subagentAppendPrompt,
+    agentDefinitions,
+    availableSkills,
+    instructionSources,
+  ] = await Promise.all([
+    // Resolve the body with inheritance (prompt.append merges with base).
+    // Use agentDefinition.id (may have fallen back to exec) instead of effectiveAgentId.
+    resolveAgentBody(
+      agentDiscoveryRuntime,
+      agentDiscoveryPath,
+      agentDefinition.id,
+      agentResolveOptions
+    ),
+    isSubagentWorkspace
+      ? resolveAgentFrontmatter(
+          agentDiscoveryRuntime,
+          agentDiscoveryPath,
+          agentDefinition.id,
+          agentResolveOptions
+        ).then(
+          (resolvedFrontmatter) => resolvedFrontmatter.subagent?.append_prompt,
+          (error: unknown) => {
+            workspaceLog.debug("Failed to resolve agent frontmatter for subagent append_prompt", {
+              agentId: agentDefinition.id,
+              error: getErrorMessage(error),
+            });
+            return undefined;
+          }
+        )
+      : undefined,
+    // Discover available agent definitions for sub-agent context (only for top-level workspaces).
+    //
+    // NOTE: discoverAgentDefinitions returns disabled agents too, so Settings can surface them.
+    // For tool descriptions (task tool), filter to agents that are effectively enabled.
+    isSubagentWorkspace
+      ? undefined
+      : discoverAvailableSubagentsForToolContext({
+          runtime: agentDiscoveryRuntime,
+          workspacePath: agentDiscoveryPath,
+          cfg,
+          loadDesktopCapability,
           includeAgentPlugins: opts.agentPluginsEnabled,
-          skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
-        }
-      );
-      subagentAppendPrompt = resolvedFrontmatter.subagent?.append_prompt;
-    } catch (error: unknown) {
-      workspaceLog.debug("Failed to resolve agent frontmatter for subagent append_prompt", {
-        agentId: agentDefinition.id,
-        error: getErrorMessage(error),
-      });
-    }
-  }
+        }),
+    // Discover available skills for tool description context
+    discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
+      roots: skillCtx.roots,
+      containment: skillCtx.containment,
+      // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
+      includeClaudeSkills: opts.claudeSkillsCompatEnabled,
+      includeAgentPlugins: opts.agentPluginsEnabled,
+    }).catch((error: unknown) => {
+      workspaceLog.warn("Failed to discover agent skills for tool description", { error });
+      return undefined;
+    }),
+    // Rebuilds within one turn pass the earlier snapshot, so the prompt and
+    // tool-scoped instructions always come from a single read.
+    opts.instructionSources ??
+      loadWorkspaceInstructionSources(
+        metadata,
+        runtime,
+        workspacePath,
+        cfg.projects,
+        opts.claudeSkillsCompatEnabled
+      ),
+  ]);
 
   const agentSystemPromptSections = [resolvedBody];
   if (isSubagentWorkspace && subagentAppendPrompt) {
@@ -805,43 +864,6 @@ export async function buildStreamSystemContext(
     }
   }
 
-  // Discover available agent definitions for sub-agent context (only for top-level workspaces).
-  //
-  // NOTE: discoverAgentDefinitions returns disabled agents too, so Settings can surface them.
-  // For tool descriptions (task tool), filter to agents that are effectively enabled.
-  let agentDefinitions: Awaited<ReturnType<typeof discoverAgentDefinitions>> | undefined;
-  if (!isSubagentWorkspace) {
-    agentDefinitions = await discoverAvailableSubagentsForToolContext({
-      runtime: agentDiscoveryRuntime,
-      workspacePath: agentDiscoveryPath,
-      cfg,
-      loadDesktopCapability,
-      includeAgentPlugins: opts.agentPluginsEnabled,
-    });
-  }
-
-  // Discover available skills for tool description context
-  const skillCtx = resolveSkillStorageContext({
-    runtime,
-    workspacePath,
-    xumScope,
-    includeClaudeSkills: opts.claudeSkillsCompatEnabled,
-    includeAgentPlugins: opts.agentPluginsEnabled,
-  });
-
-  let availableSkills: Awaited<ReturnType<typeof discoverAgentSkills>> | undefined;
-  try {
-    availableSkills = await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-      roots: skillCtx.roots,
-      containment: skillCtx.containment,
-      // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
-      includeClaudeSkills: opts.claudeSkillsCompatEnabled,
-      includeAgentPlugins: opts.agentPluginsEnabled,
-    });
-  } catch (error) {
-    workspaceLog.warn("Failed to discover agent skills for tool description", { error });
-  }
-
   const ancestorPlanContext = resolveAncestorPlanContext({
     metadata,
     workspaceId,
@@ -857,9 +879,9 @@ export async function buildStreamSystemContext(
   );
 
   // Build system message from workspace metadata
-  let systemMessage = await buildSystemMessage(
+  let systemMessage = buildSystemMessageFromSources(
     metadata,
-    runtime,
+    instructionSources,
     workspacePath,
     mergedAdditionalInstructions,
     modelString,
@@ -872,8 +894,6 @@ export async function buildStreamSystemContext(
     {
       agentSystemPromptSections,
       modes: [effectiveMode, agentDefinition.id],
-      projectConfigs: cfg.projects,
-      claudeSkillsCompatEnabled: opts.claudeSkillsCompatEnabled,
     }
   );
 
@@ -897,6 +917,7 @@ export async function buildStreamSystemContext(
     agentDefinitions,
     availableSkills,
     ancestorPlanFilePaths: ancestorPlanContext.ancestorPlanFilePaths,
+    instructionSources,
   };
 }
 

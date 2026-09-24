@@ -16,6 +16,7 @@ import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { extractToolInstructionsFromSources } from "./systemMessage";
 
 import {
   assemblePromptPayload,
@@ -96,6 +97,7 @@ async function buildSystemContextForTest(args: {
   workspaceMemoryWritable?: boolean;
   hotMemoriesBlock?: string;
   intuitionToolAvailable?: boolean;
+  instructionSources?: Parameters<typeof buildStreamSystemContext>[0]["instructionSources"];
 }) {
   return buildStreamSystemContext({
     runtime: args.runtime,
@@ -118,6 +120,7 @@ async function buildSystemContextForTest(args: {
     workspaceMemoryWritable: args.workspaceMemoryWritable,
     hotMemoriesBlock: args.hotMemoriesBlock,
     intuitionToolAvailable: args.intuitionToolAvailable,
+    instructionSources: args.instructionSources,
   });
 }
 
@@ -623,6 +626,125 @@ class RestrictedTestRuntime extends TestRuntime {
 }
 
 describe("buildStreamSystemContext", () => {
+  test("shares one instruction snapshot between the prompt, tool instructions, and rebuilds", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-instruction-snapshot");
+
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+    const agentsPath = path.join(projectPath, "AGENTS.md");
+    const writeAgents = (version: string) =>
+      fs.writeFile(
+        agentsPath,
+        [`Prompt guidance ${version}.`, "", "## Tool: bash", `Bash guidance ${version}.`, ""].join(
+          "\n"
+        )
+      );
+    await writeAgents("v1");
+
+    const metadata = createWorkspaceMetadata({
+      id: "instruction-snapshot-ws",
+      name: "instruction-snapshot-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const buildArgs = {
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    };
+
+    const first = await buildSystemContextForTest(buildArgs);
+    expect(first.systemMessage).toContain("Prompt guidance v1.");
+    const toolInstructions = extractToolInstructionsFromSources(
+      first.instructionSources,
+      "openai:gpt-5.2",
+      metadata,
+      first.agentSystemPromptSections
+    );
+    expect(toolInstructions.bash).toContain("Bash guidance v1.");
+
+    // A rebuild within the same turn reuses the snapshot even if the file
+    // changed meanwhile, so the prompt cannot disagree with tool descriptions.
+    await writeAgents("v2");
+    const rebuilt = await buildSystemContextForTest({
+      ...buildArgs,
+      instructionSources: first.instructionSources,
+    });
+    expect(rebuilt.instructionSources).toBe(first.instructionSources);
+    expect(rebuilt.systemMessage).toContain("Prompt guidance v1.");
+    expect(rebuilt.systemMessage).not.toContain("Prompt guidance v2.");
+
+    // A new turn (no snapshot) reads the files again: nothing is cached across turns.
+    const nextTurn = await buildSystemContextForTest(buildArgs);
+    expect(nextTurn.systemMessage).toContain("Prompt guidance v2.");
+  });
+
+  test("reads instruction files while agent discovery is still in flight", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-parallel-reads");
+
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+    await fs.writeFile(path.join(projectPath, "AGENTS.md"), "Project guidance.\n");
+
+    const events: string[] = [];
+    let markInstructionRead!: () => void;
+    const instructionRead = new Promise<void>((resolve) => {
+      markInstructionRead = resolve;
+    });
+    // Agent-root resolution waits (bounded) for an AGENTS.md read. Sequential
+    // assembly only reads instructions after discovery finishes, so it hits
+    // the fallback and records the read after the release.
+    class OrderingRuntime extends TestRuntime {
+      override async resolvePath(filePath: string): Promise<string> {
+        if (path.basename(filePath) === "agents") {
+          events.push("agent-scan");
+          await Promise.race([instructionRead, new Promise((resolve) => setTimeout(resolve, 250))]);
+          events.push("agent-scan-released");
+        }
+        return super.resolvePath(filePath);
+      }
+
+      override readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+        if (filePath === path.join(projectPath, "AGENTS.md")) {
+          events.push("instruction-read");
+          markInstructionRead();
+        }
+        return super.readFile(filePath, abortSignal);
+      }
+    }
+
+    const metadata = createWorkspaceMetadata({
+      id: "parallel-reads-ws",
+      name: "parallel-reads-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const result = await buildSystemContextForTest({
+      runtime: new OrderingRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    });
+
+    expect(result.systemMessage).toContain("Project guidance.");
+    expect(events).toContain("agent-scan");
+    expect(events.indexOf("instruction-read")).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf("instruction-read")).toBeLessThan(events.indexOf("agent-scan-released"));
+  });
+
   test("includes proactive memory guidance only when the memory tool is available", async () => {
     using tempRoot = new DisposableTempDir("stream-system-context-memory-guidance");
 

@@ -40,6 +40,7 @@ import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 import { jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
 import type { ModelMessage } from "@/common/types/message";
+import type { InstructionSources } from "@/common/types/instructions";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
@@ -322,11 +323,13 @@ function stubCommonStreamMessageDependencies(args: {
   useRequestedModelString?: boolean;
   onPlanPayloadMessageIds?: (messageIds: string[]) => void;
   onBuildStreamSystemContext?: (
-    args: Parameters<typeof turnContextAssembler.buildStreamSystemContext>[0]
+    args: Parameters<typeof turnContextAssembler.buildStreamSystemContext>[0],
+    builtInstructionSources: InstructionSources
   ) => void;
   onPrepareMessagesForProvider?: (
     args: Parameters<typeof messagePipeline.prepareMessagesForProvider>[0]
   ) => void;
+  onExtractToolInstructions?: (sources: InstructionSources) => void;
 }): ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">> {
   spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(
     resolvedAgentResultFor(args.metadata)
@@ -340,8 +343,14 @@ function stubCommonStreamMessageDependencies(args: {
     });
   });
   spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation((contextArgs) => {
-    args.onBuildStreamSystemContext?.(contextArgs);
+    // Fresh object per build so identity assertions can tell snapshots apart.
+    const instructionSources: InstructionSources = contextArgs.instructionSources ?? {
+      global: [],
+      context: [],
+    };
+    args.onBuildStreamSystemContext?.(contextArgs, instructionSources);
     return Promise.resolve({
+      instructionSources,
       agentSystemPromptSections: ["test-agent-prompt"],
       systemMessage: "test-system-message",
       systemMessageTokens: 1,
@@ -361,7 +370,10 @@ function stubCommonStreamMessageDependencies(args: {
   const getToolsForModelSpy = spyOn(toolsModule, "getToolsForModel").mockResolvedValue(
     args.allTools ?? {}
   );
-  spyOn(systemMessageModule, "readToolInstructions").mockResolvedValue({});
+  spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockImplementation((sources) => {
+    args.onExtractToolInstructions?.(sources);
+    return {};
+  });
 
   const providerModelFactory = Reflect.get(args.service, "providerModelFactory") as
     | ProviderModelFactory
@@ -1113,6 +1125,11 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     streamSystemContextMemoryToolFlags: Array<boolean | undefined>;
     streamSystemContextIntuitionFlags: Array<boolean | undefined>;
     streamSystemContextHotMemoriesBlocks: Array<string | undefined>;
+    /** Snapshot passed into each system-context build (undefined = load from disk). */
+    streamSystemContextInstructionInputs: Array<InstructionSources | undefined>;
+    /** Snapshot each system-context build returned. */
+    streamSystemContextInstructionOutputs: InstructionSources[];
+    toolInstructionSources: InstructionSources[];
     startStreamCalls: TurnExecutionOptions[];
     getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
   }
@@ -1160,6 +1177,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const streamSystemContextMemoryToolFlags: Array<boolean | undefined> = [];
     const streamSystemContextIntuitionFlags: Array<boolean | undefined> = [];
     const streamSystemContextHotMemoriesBlocks: Array<string | undefined> = [];
+    const streamSystemContextInstructionInputs: Array<InstructionSources | undefined> = [];
+    const streamSystemContextInstructionOutputs: InstructionSources[] = [];
+    const toolInstructionSources: InstructionSources[] = [];
     const startStreamCalls: TurnExecutionOptions[] = [];
 
     const getToolsForModelSpy = stubCommonStreamMessageDependencies({
@@ -1176,7 +1196,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalModelId: options?.canonicalModelId,
       useRequestedModelString: options?.useRequestedModelString,
       onPlanPayloadMessageIds: (messageIds) => planPayloadMessageIds.push(messageIds),
-      onBuildStreamSystemContext: (contextArgs) => {
+      onBuildStreamSystemContext: (contextArgs, builtInstructionSources) => {
+        streamSystemContextInstructionInputs.push(contextArgs.instructionSources);
+        streamSystemContextInstructionOutputs.push(builtInstructionSources);
         if (!contextArgs.xumScope) {
           throw new Error("Expected xumScope in stream system context build args");
         }
@@ -1192,6 +1214,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         );
         preparedToolNamesForSentinel.push(pipelineArgs.toolNamesForSentinel);
       },
+      onExtractToolInstructions: (sources) => toolInstructionSources.push(sources),
     });
     if (options?.postPolicyTools) {
       spyOn(toolAssembly, "applyToolPolicyAndExperiments").mockResolvedValue(
@@ -1210,6 +1233,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       streamSystemContextMemoryToolFlags,
       streamSystemContextIntuitionFlags,
       streamSystemContextHotMemoriesBlocks,
+      streamSystemContextInstructionInputs,
+      streamSystemContextInstructionOutputs,
+      toolInstructionSources,
       startStreamCalls,
       getToolsForModelSpy,
     };
@@ -1818,6 +1844,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(harness.streamSystemContextAdvisorFlags).toEqual([false]);
+    // Tool-scoped instructions come from the snapshot the system message used.
+    expect(harness.streamSystemContextInstructionInputs).toEqual([undefined]);
+    expect(harness.toolInstructionSources).toHaveLength(1);
+    expect(harness.toolInstructionSources[0]).toBe(
+      harness.streamSystemContextInstructionOutputs[0]
+    );
     expect(harness.startStreamCalls[0]?.providedRuntimeTempDir).toBe(
       path.join(metadata.projectPath, ".tmp-stream")
     );
@@ -1851,6 +1883,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
     expect(result.success).toBe(true);
     expect(harness.streamSystemContextAdvisorFlags).toEqual([true, false]);
+    // The post-policy rebuild reuses the first build's instruction snapshot
+    // instead of re-reading AGENTS.md files, and tool extraction shares it.
+    const [firstSnapshot] = harness.streamSystemContextInstructionOutputs;
+    expect(harness.streamSystemContextInstructionInputs).toHaveLength(2);
+    expect(harness.streamSystemContextInstructionInputs[0]).toBeUndefined();
+    expect(harness.streamSystemContextInstructionInputs[1]).toBe(firstSnapshot);
+    expect(harness.toolInstructionSources).toHaveLength(1);
+    expect(harness.toolInstructionSources[0]).toBe(firstSnapshot);
   });
 
   it("rebuilds the stream system context without memory availability when policy strips the memory tool", async () => {
