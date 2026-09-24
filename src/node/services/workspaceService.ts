@@ -1882,7 +1882,9 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 /**
  * Mints a fresh unrelated-messaging consent generation (see setUnrelatedWorkspaceConsent).
  * New root workspaces (create, scratch, multi-project, fork) are opted in by default so an agent
- * in another task tree can reach them without a manual toggle. Pre-existing workspaces are
+ * in another task tree can reach them without a manual toggle; create and fork grant it only
+ * after registration-time plugin sanitization (grantCreationUnrelatedWorkspaceConsent), while
+ * scratch and multi-project have no such step and persist it with the entry. Pre-existing workspaces are
  * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
  * TaskService and stay off; their parent owns them.
@@ -5668,7 +5670,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             createdAt: metadata.createdAt,
             runtimeConfig: finalRuntimeConfig,
             subProjectPath: effectiveSubProjectPath,
-            unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
             // Persist tags atomically with creation so orchestration loops that
             // look workspaces up by tag (e.g. workspace.ensure) never observe a
             // created-but-untagged window after a crash.
@@ -5720,6 +5721,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             );
           }
         }
+        // Registration is complete (sanitized when required) and nothing has been announced
+        // yet: only now may other task trees discover and message this workspace.
+        const unrelatedWorkspaceConsent = await this.grantCreationUnrelatedWorkspaceConsent(
+          owningProjectPath,
+          workspaceId,
+          createResult!.workspacePath
+        );
+        completeMetadata = { ...completeMetadata, unrelatedWorkspaceConsent };
       } finally {
         await releaseRegistrationLock?.();
         this.pendingPluginSanitizations.delete(workspaceId);
@@ -7523,6 +7532,46 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
     }
+  }
+
+  /**
+   * Opts a newly created root workspace in to unrelated messaging. Callers run this only once
+   * the registration is complete, i.e. after registration-time plugin-override sanitization:
+   * consent makes the entry discoverable (task_list scope:"instance" reads config directly) and
+   * wakeable by other task trees, and an agent request during the sanitization window would
+   * activate the stale plugin enable that sanitization exists to prune. Fails closed: if the
+   * write fails the workspace simply stays off. Returns the persisted generation, if any.
+   */
+  private async grantCreationUnrelatedWorkspaceConsent(
+    projectPath: string,
+    workspaceId: string,
+    workspacePath: string
+  ): Promise<string | undefined> {
+    let granted: string | undefined;
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          return freshConfig;
+        }
+        granted =
+          getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent) ??
+          mintUnrelatedWorkspaceConsent();
+        entry.unrelatedWorkspaceConsent = granted;
+        return freshConfig;
+      });
+    } catch (error) {
+      log.warn("Failed to grant default unrelated-workspace consent; leaving it off", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+    return granted;
   }
 
   async setHeartbeatSettings(
@@ -11259,9 +11308,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         namedWorkspacePath,
         // Preserve sub-project cwd/prompt context when forking via /fork.
         subProjectPath: sourceMetadata.subProjectPath,
-        // A fork is a new root workspace: opted in with its OWN generation, never the source's,
-        // so revoking one workspace's consent cannot be bypassed through the other.
-        unrelatedWorkspaceConsent: mintUnrelatedWorkspaceConsent(),
         // Forks with a continue message stay pending until the first accepted user send
         // can generate a more specific title, unless the user edits the title first.
         pendingAutoTitle: pendingAutoTitle === true ? true : undefined,
@@ -11347,6 +11393,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             );
           }
         }
+        // A fork is a new root workspace: opted in with its OWN generation (the metadata above
+        // never copies the source's, so revoking one cannot be bypassed through the other), and
+        // only once registration-time sanitization has succeeded.
+        metadata.unrelatedWorkspaceConsent = await this.grantCreationUnrelatedWorkspaceConsent(
+          foundProjectPath,
+          newWorkspaceId,
+          workspacePath
+        );
       } finally {
         await releaseRegistrationLock?.();
         this.pendingPluginSanitizations.delete(newWorkspaceId);

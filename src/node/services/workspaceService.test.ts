@@ -21624,6 +21624,24 @@ describe("WorkspaceService init cancellation", () => {
       // Skip the background init path so the test stays focused on auto-naming/persistence.
       removingWorkspaces.add(workspaceId);
 
+      // Record the persisted consent while registration-time sanitization runs.
+      const consentDuringSanitize: unknown[] = [];
+      spyOn(
+        workspaceService as unknown as {
+          sanitizeStalePluginOverridesForNewWorkspace: (
+            workspaceId: string,
+            workspacePath: string
+          ) => Promise<string | undefined>;
+        },
+        "sanitizeStalePluginOverridesForNewWorkspace"
+      ).mockImplementation((id: string) => {
+        consentDuringSanitize.push(
+          configState.projects.get(projectPath)?.workspaces.find((entry) => entry.id === id)
+            ?.unrelatedWorkspaceConsent
+        );
+        return Promise.resolve(undefined);
+      });
+
       const result = await workspaceService.create(
         projectPath,
         // No branchName — backend should auto-generate workspace-3.
@@ -21654,11 +21672,16 @@ describe("WorkspaceService init cancellation", () => {
       const newEntry = persisted.find((entry) => entry.id === workspaceId);
       expect(newEntry?.name).toBe("workspace-3");
       expect(newEntry?.pendingAutoTitle).toBe(true);
-      // New root workspaces are opted in to unrelated messaging at creation.
+      // New root workspaces are opted in to unrelated messaging at creation, but only after
+      // registration-time sanitization; the announced metadata carries the same generation.
+      expect(consentDuringSanitize).toEqual([undefined]);
       expect(getValidUnrelatedWorkspaceConsent(newEntry?.unrelatedWorkspaceConsent)).toBe(
         newEntry?.unrelatedWorkspaceConsent
       );
       expect(newEntry?.unrelatedWorkspaceConsent).toBeDefined();
+      expect(result.data.metadata.unrelatedWorkspaceConsent).toBe(
+        newEntry?.unrelatedWorkspaceConsent
+      );
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -22578,6 +22601,24 @@ describe("WorkspaceService fork", () => {
       })
     );
 
+    // Record what other task trees could see while registration-time sanitization runs.
+    const consentDuringSanitize: unknown[] = [];
+    const sanitizeSpy = spyOn(
+      workspaceService as unknown as {
+        sanitizeStalePluginOverridesForNewWorkspace: (
+          workspaceId: string,
+          workspacePath: string
+        ) => Promise<string | undefined>;
+      },
+      "sanitizeStalePluginOverridesForNewWorkspace"
+    ).mockImplementation(async (workspaceId: string) => {
+      consentDuringSanitize.push(
+        (await config.getAllWorkspaceMetadata()).find((entry) => entry.id === workspaceId)
+          ?.unrelatedWorkspaceConsent
+      );
+      return undefined;
+    });
+
     try {
       const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
 
@@ -22585,6 +22626,9 @@ describe("WorkspaceService fork", () => {
       if (!result.success) {
         throw new Error(`Expected success result, got error: ${result.error}`);
       }
+      // Consent is granted only after sanitization: while it runs the fork is registered but
+      // must not be discoverable or wakeable by unrelated agents.
+      expect(consentDuringSanitize).toEqual([undefined]);
 
       const metadataAfterFork = await config.getAllWorkspaceMetadata();
       expect(
@@ -22598,6 +22642,8 @@ describe("WorkspaceService fork", () => {
       expect(forkConsent).toBeDefined();
       expect(getValidUnrelatedWorkspaceConsent(forkConsent)).toBe(forkConsent);
       expect(forkConsent).not.toBe("source-consent");
+      // The announced metadata matches what was persisted, so the UI switch starts on.
+      expect(result.data.metadata.unrelatedWorkspaceConsent).toBe(forkConsent);
 
       const forkGoal = await goalService.getGoal(newWorkspaceId);
       expect(forkGoal).toMatchObject({
@@ -22617,6 +22663,7 @@ describe("WorkspaceService fork", () => {
         turnsUsed: 1,
       });
     } finally {
+      sanitizeSpy.mockRestore();
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
