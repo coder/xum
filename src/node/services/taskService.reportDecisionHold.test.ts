@@ -1622,7 +1622,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       const tsvc = taskService as unknown as {
         closeAttemptAdmission: (...args: unknown[]) => void;
         editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
-        releaseSharedDesktopTaskOnUserStop: (id: string) => Promise<void>;
+        releaseSharedDesktopTaskOnUserStop: (id: string, abortOrigin: unknown) => Promise<void>;
       };
       let armed = false;
       const closures: unknown[] = [];
@@ -1656,8 +1656,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       let handler: Promise<void> | undefined;
       const realRelease = tsvc.releaseSharedDesktopTaskOnUserStop.bind(taskService);
       const releaseSpy = spyOn(tsvc, "releaseSharedDesktopTaskOnUserStop").mockImplementation(
-        (id: string) => {
-          handler = realRelease(id);
+        (id: string, abortOrigin: unknown) => {
+          handler = realRelease(id, abortOrigin);
           return handler;
         }
       );
@@ -1706,13 +1706,26 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       }
     }, 20_000);
 
-    test.each([
-      ["with B's rotation", true],
-      ["single backend", false],
-    ] as const)(
+    test("(c2 with B's rotation) the stale abort leaves B's row alone: no transition, no closure, no queue clear", async () => {
+      // #4414: the abort acts for the attempt it captured at the event; B's re-admission during
+      // the finalizer await makes the row B's, so the handler stops before any effect.
+      const { stack, closures, queueAtClear } = await runAbort("r22fc2r", { rotate: true });
+      try {
+        expect(closures).toEqual([]);
+        expect(queueAtClear).toEqual([]);
+        expect(entryOf(stack.config, "r22fc2r")).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: SUCCESSOR,
+        });
+      } finally {
+        await stack.cleanup();
+      }
+    }, 20_000);
+
+    test.each([["single backend", false]] as const)(
       "(c2 %s) a user message queued behind a send made during the handler's write await is not silently dropped by the handler's clearQueue",
       async (_label, rotate) => {
-        const childId = rotate ? "r22fc2r" : "r22fc2s";
+        const childId = "r22fc2s";
         const sends: unknown[] = [];
         const { stack, queueAtClear } = await runAbort(childId, {
           rotate,
@@ -1753,4 +1766,83 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       20_000
     );
   });
+
+  // #4414 on the real host: the stream-end completion prompt carries an admission token bound to
+  // the ended stream's attempt. Untouched, its turn runs under A; when another backend admitted B
+  // after the recovery-budget write, the prompt never starts a turn and leaves no obligation.
+  test.each([
+    ["untouched", false],
+    ["B admitted after the budget write", true],
+  ] as const)(
+    "completion-recovery prompt on the real host (%s)",
+    async (_label, rotate) => {
+      const childId = rotate ? "promptrotated01" : "promptcontrol01";
+      const successor = "att_00000000000000f1";
+      const stack = await createStack(childId);
+      const { config, taskService, svc, workspaceService, completions, streamStarts, sendOptions } =
+        stack;
+      try {
+        const otherBackend = await createTestConfig(rootDir);
+        expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+        const attemptA = entryOf(config, childId)!.taskAttemptId!;
+        expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+          Ok(undefined)
+        );
+        expect(completions).toHaveLength(1);
+        let rotated = false;
+        const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
+        const editSpy = spyOn(taskService, "editWorkspaceEntry").mockImplementation(
+          async (...args) => {
+            const result = await editOriginal(...args);
+            if (
+              rotate &&
+              !rotated &&
+              args[0] === childId &&
+              entryOf(config, childId)?.taskRecoveryAttempts === 1
+            ) {
+              rotated = true;
+              await otherBackend.editConfig((cfg) => {
+                for (const project of cfg.projects.values()) {
+                  const ws = project.workspaces.find((w) => w.id === childId);
+                  if (ws) {
+                    ws.taskStatus = "running";
+                    ws.taskAttemptId = successor;
+                    ws.taskAttemptUnproven = true;
+                  }
+                }
+                return cfg;
+              });
+            }
+            return result;
+          }
+        );
+        try {
+          // A's turn ends length-truncated (no agent_report): stream-end recovery prompts.
+          stack.endStream(0, { finishReason: "length" }, true);
+          if (rotate) {
+            await until(() => rotated, "B's admission after the budget write");
+            await until(
+              () => !stack.sessionHarness.session.isBusy(),
+              "A's turn wound down without a successor turn"
+            );
+            await yieldMacrotasks(20);
+            expect(streamStarts).toHaveLength(1);
+            expect(entryOf(config, childId)).toMatchObject({
+              taskStatus: "running",
+              taskAttemptId: successor,
+            });
+          } else {
+            await until(() => completions.length === 2, "A's completion prompt dispatched");
+            expect(streamStarts[1]).toMatchObject({ row: attemptA, owner: attemptA });
+          }
+          expect(outstanding(svc, childId)).toHaveLength(0);
+        } finally {
+          editSpy.mockRestore();
+        }
+      } finally {
+        await stack.cleanup();
+      }
+    },
+    20_000
+  );
 });
