@@ -15,6 +15,11 @@ import {
   GOAL_CONTINUATION_KIND,
 } from "@/constants/goals";
 import { createMuxMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 // Shared dispatch helpers live in `./testDispatchHelpers` instead of local
 // copies so future callers cannot drift.
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
@@ -615,6 +620,41 @@ describe("WorkspaceGoalService", () => {
     await setGoalOk(service, {
       workspaceId,
       objective: "Processed prompt",
+      initiator: "model",
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "active" });
+  });
+
+  test("getGoal keeps a never-driven goal active when a hidden plan snapshot follows the processed prompt", async () => {
+    // A plan turn that sets a goal and calls propose_plan appends a hidden snapshot record
+    // between the manual row and the completed assistant row; the record is state, not a turn,
+    // so the initiating prompt still counts as processed after candidate loss.
+    await appendUserHistoryMessage(historyService, workspaceId, "Plan it and set a goal");
+    const snapshot: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec_goal_snap",
+      snapshotId: "snap_goal",
+      planPath: "/plans/p.md",
+      contentHash: "a".repeat(64),
+      content: "# Plan\n",
+    };
+    const appended = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("goal-test-snapshot", "user", formatPlanReviewEnvelope(snapshot), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+    expect(appended.success).toBe(true);
+    await appendAssistantHistoryMessage(historyService, workspaceId, "Plan proposed, goal set");
+    await setGoalOk(service, {
+      workspaceId,
+      objective: "Processed prompt behind a snapshot",
       initiator: "model",
     });
 
