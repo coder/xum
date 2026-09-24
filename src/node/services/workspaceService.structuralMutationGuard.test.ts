@@ -864,6 +864,64 @@ describe("WorkspaceService structural mutation guard", () => {
       expect(persistedRow(ROOT_ID)).toBeUndefined();
       await expectIntact(unrelatedTask);
     });
+
+    // A devcontainer task forks its checkout LAZILY (at dequeue / reserved launch, outside the
+    // registration lock): until it is launched its own checkout cannot protect anything, so its
+    // fork source must.
+    test.each([
+      ["queued", "refused"],
+      ["starting", "refused"],
+      ["running", "allowed"],
+    ] as const)(
+      "a %s devcontainer task's fork source (the parent's checkout and its Git backing) is protected: removal %s (real git)",
+      async (taskStatus, expected) => {
+        const git = (cwd: string, ...args: string[]) =>
+          promisify(execFile)("git", args, {
+            cwd,
+            env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+          });
+        // An ordinary workspace whose checkout holds the repository backing the parent.
+        const backing = row("backing", "backing-ws");
+        await seed([backing]);
+        const nestedRepo = path.join(backing.path, "nested");
+        await fsPromises.mkdir(nestedRepo, { recursive: true });
+        await git(nestedRepo, "init", "-q");
+        await fsPromises.writeFile(path.join(nestedRepo, "README.md"), "nested\n");
+        await git(nestedRepo, "add", "README.md");
+        await git(
+          nestedRepo,
+          "-c",
+          "user.name=t",
+          "-c",
+          "user.email=t@x.invalid",
+          "commit",
+          "-qm",
+          "i"
+        );
+        const parentPath = path.join(srcBaseDir, "nested", "parent");
+        await git(nestedRepo, "worktree", "add", "-q", parentPath, "-b", "parent");
+        const adminDir = path.join(nestedRepo, ".git", "worktrees", "parent");
+        const parent = devRow("parent", ROOT_ID, { path: parentPath });
+        const task = devTaskRow("agent_pending", TASK_ID, {
+          taskStatus,
+          path: path.join(srcBaseDir, "nested", "agent_pending"),
+        });
+        await saveWorkspaces(config, projectPath, [backing, parent, task]);
+
+        if (expected === "allowed") {
+          expect(await service.remove("backing-ws", true)).toEqual(Ok(undefined));
+          expect(physical.deleted).toEqual([backing.path]);
+          return;
+        }
+        expectRefused(await service.remove("backing-ws", true), `"${TASK_ID}"`);
+        expectRefused(await service.remove(ROOT_ID, true), `"${TASK_ID}"`);
+        expectRefused(await service.rename(ROOT_ID, "parent-renamed"), `"${TASK_ID}"`);
+        expect(physical.deleted).toEqual([]);
+        expect(physical.renamed).toEqual([]);
+        expect(await exists(adminDir)).toBe(true);
+        expect(persistedRow(ROOT_ID)).toMatchObject({ path: parentPath });
+      }
+    );
   });
 
   describe("root mutation and task publication are fenced through the registration lock", () => {

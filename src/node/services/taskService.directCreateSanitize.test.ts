@@ -400,31 +400,32 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     ).toEqual(consented);
   }, 30_000);
 
+  /** Whether the cross-process registration lock is held right now (by anyone). */
+  async function probeRegistrationLock(config: Config): Promise<"held" | "free"> {
+    try {
+      const release = await acquireCrossProcessLock({
+        lockPath: path.join(config.rootDir, "workspace-registration.lock"),
+        acquireTimeoutMs: 100,
+        staleMs: 60_000,
+        timeoutMessage: "registration lock held",
+      });
+      await release();
+      return "free";
+    } catch (error) {
+      expect(String(error)).toContain("registration lock held");
+      return "held";
+    }
+  }
+
   /**
    * For each config edit that first lands `taskId`'s row: whether the cross-process registration
    * lock was held at that moment (probed right before the edit).
    */
   function recordRowPublicationLock(config: Config, taskId: string): Array<"held" | "free"> {
-    const lockPath = path.join(config.rootDir, "workspace-registration.lock");
-    const probeRegistrationLock = async (): Promise<"held" | "free"> => {
-      try {
-        const release = await acquireCrossProcessLock({
-          lockPath,
-          acquireTimeoutMs: 100,
-          staleMs: 60_000,
-          timeoutMessage: "registration lock held",
-        });
-        await release();
-        return "free";
-      } catch (error) {
-        expect(String(error)).toContain("registration lock held");
-        return "held";
-      }
-    };
     const realEdit = config.editConfig.bind(config);
     const publications: Array<"held" | "free"> = [];
     const edit = spyOn(config, "editConfig").mockImplementation(async (fn, options) => {
-      const lock = await probeRegistrationLock();
+      const lock = await probeRegistrationLock(config);
       await realEdit((cfg) => {
         const before = findWorkspaceEntry(cfg, taskId) != null;
         const next = fn(cfg);
@@ -606,6 +607,61 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
     30_000
   );
 
+  /**
+   * A devcontainer parent whose project repository lives INSIDE another registered ordinary
+   * workspace's checkout (registered under a bucket that is not a prefix of the repository).
+   * `removeBacking` is another backend's removal of that workspace: it deletes the checkout (with
+   * the repository backing every worktree of the project) and its row.
+   */
+  async function createNestedDevcontainerStack(maxParallelAgentTasks = 3) {
+    const backingPath = path.join(rootDir, "backing");
+    const otherProjectPath = path.join(rootDir, "other-project");
+    const projectPath = await createRepoWithTrackedEnable(undefined, path.join("backing", "repo"));
+    const stack = await createRealStack(projectPath);
+    // DevcontainerRuntime forks a host worktree under `new Config().srcDir` (runtimeFactory):
+    // XUM_ROOT at the harness root makes that config.srcDir. No container runs in tests.
+    const previousXumRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = rootDir;
+    restores.push(() => {
+      if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousXumRoot;
+    });
+    const exec = spyOn(DevcontainerRuntime.prototype, "exec").mockImplementation(() =>
+      Promise.reject(new Error("no devcontainer in tests"))
+    );
+    restores.push(() => exec.mockRestore());
+    const devcontainer: RuntimeConfig = {
+      type: "devcontainer",
+      configPath: ".devcontainer/x.json",
+    };
+    await saveWorkspaces(
+      stack.config,
+      projectPath,
+      [{ path: stack.parentPath, id: rootId, name: "parent", runtimeConfig: devcontainer }],
+      {
+        taskSettings: testTaskSettings(maxParallelAgentTasks),
+        extraProjects: [
+          [
+            otherProjectPath,
+            {
+              trusted: true,
+              workspaces: [{ path: backingPath, id: "backingws1", name: "backing" }],
+            },
+          ],
+        ],
+      }
+    );
+    const otherConfig = new Config(stack.config.rootDir);
+    const removeBacking = async () => {
+      await fsPromises.rm(backingPath, { recursive: true, force: true });
+      await otherConfig.editConfig((cfg) => {
+        cfg.projects.delete(otherProjectPath);
+        return cfg;
+      });
+    };
+    return { ...stack, devcontainer, removeBacking };
+  }
+
   test.each(["backing-removed", "control"] as const)(
     "a devcontainer fork whose backing repository a mutator removes after materialization, winning the registration lock first, is not published (%s)",
     async (mode) => {
@@ -685,6 +741,71 @@ describe("TaskService direct create: pre-publication sanitization of the forked 
       expect(created.error).toContain("Git backing changed");
       expect(created.error).toContain("nothing was published");
       expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+    },
+    30_000
+  );
+
+  test.each([
+    ["queued", "control"],
+    ["queued", "before-publication"],
+    ["queued", "before-launch-binding"],
+    ["reserved", "control"],
+    ["reserved", "before-publication"],
+    ["reserved", "before-launch-binding"],
+  ] as const)(
+    "a %s devcontainer task checks its fork source when published and its fresh checkout under the lock before binding it at launch (%s)",
+    async (shape, mode) => {
+      const taskId = `dev${shape}-${mode}`;
+      const { config, taskService, workspaceService, devcontainer, removeBacking } =
+        await createNestedDevcontainerStack(shape === "queued" ? 1 : 3);
+      stubStableIds(config, [taskId]);
+      const busy = spyOn(taskService, "countActiveAgentTasks").mockReturnValue(
+        shape === "queued" ? 1 : 0
+      );
+      restores.push(() => busy.mockRestore());
+      // Registration-lock holds: #1 publishes the row, #2 binds the launched checkout. The removal
+      // before #2 bypasses the structural guard (an older build): only the revalidation sees it.
+      const removeBeforeHold = mode === "before-publication" ? 1 : mode === "control" ? 0 : 2;
+      let holds = 0;
+      const realPrepare = workspaceService.prepareTaskCheckouts.bind(workspaceService);
+      const prepare = spyOn(workspaceService, "prepareTaskCheckouts").mockImplementation(
+        async (materialize, publish) => {
+          holds += 1;
+          if (holds === removeBeforeHold) await removeBacking();
+          return realPrepare(materialize, publish);
+        }
+      );
+      restores.push(() => prepare.mockRestore());
+
+      const created =
+        shape === "queued"
+          ? await taskService.create(createArgs("Devcontainer"))
+          : await taskService.createMany([createArgs("Devcontainer")]);
+      if (mode === "before-publication") {
+        expect(created.success).toBe(false);
+        if (created.success) throw new Error("unreachable");
+        expect(created.error).toContain("parent's checkout or its Git backing changed");
+        expect(findWorkspaceInConfig(config, taskId)).toBeUndefined();
+        return;
+      }
+      expect(created.success).toBe(true);
+      if (shape === "queued") {
+        busy.mockReturnValue(0);
+        await taskService.maybeStartQueuedTasks();
+      }
+      const settled = () => findWorkspaceInConfig(config, taskId)?.taskStatus;
+      await waitUntil(() => settled() === "running" || settled() === "interrupted", "launch");
+      const row = findWorkspaceInConfig(config, taskId);
+      if (mode === "control") {
+        expect(row).toMatchObject({
+          taskStatus: "running",
+          path: forkPathFor(config.srcDir, taskId),
+          runtimeConfig: devcontainer,
+        });
+        return;
+      }
+      expect(row?.taskStatus).toBe("interrupted");
+      expect(row?.taskLaunchError).toContain("task's checkout or its Git backing changed");
     },
     30_000
   );

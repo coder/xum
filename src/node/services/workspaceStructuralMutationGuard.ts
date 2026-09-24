@@ -140,6 +140,42 @@ export function isProtectedTaskRow(row: Workspace): boolean {
 }
 
 /**
+ * A task row whose checkout is forked LAZILY, after its publication: a devcontainer task's host
+ * worktree is forked at dequeue / reserved launch, outside the registration lock. Shared rows run
+ * in their parent's checkout and never fork.
+ */
+export function isLazilyForkedTaskRow(row: Workspace): boolean {
+  return (
+    row.parentWorkspaceId != null &&
+    row.runtimeConfig?.type === "devcontainer" &&
+    row.taskIsolation !== "none"
+  );
+}
+
+/**
+ * The fork SOURCE of a lazily forked row that can still fork — queued, or starting until its
+ * launch is admitted: the parent's checkout footprint (stored + derived paths; their Git backing,
+ * i.e. the repository the fork writes into, joins in footprintWithGitBacking). The row is
+ * protected from publication on, but its own checkout does not exist yet, so without this a
+ * mutator could delete the parent, or a workspace containing the backing repository, before or
+ * while the fork runs, leaving a protected row that can never materialize. TaskService checks the
+ * source under the publication's lock hold, so this protection starts from an intact source.
+ */
+function pendingForkSourcePaths(snapshot: ProjectsConfig, row: Workspace): string[] {
+  if (!isLazilyForkedTaskRow(row)) return [];
+  if (row.taskStatus !== "queued" && row.taskStatus !== "starting") return [];
+  const paths: string[] = [];
+  for (const [bucketProjectPath, project] of snapshot.projects) {
+    for (const parent of project.workspaces) {
+      if (parent.id === row.parentWorkspaceId) {
+        paths.push(...footprintPathsForRow(parent, bucketProjectPath));
+      }
+    }
+  }
+  return paths;
+}
+
+/**
  * The runtime a row actually runs under: Config.getAllMetadata substitutes
  * DEFAULT_RUNTIME_CONFIG for a missing runtimeConfig before any runtime is
  * created, so a legacy row without one is a worktree row under the default
@@ -287,9 +323,10 @@ async function readGitBacking(checkoutPath: string): Promise<GitBacking> {
  */
 async function footprintWithGitBacking(
   row: Workspace,
-  bucketProjectPath: string
+  bucketProjectPath: string,
+  extraPaths: readonly string[] = []
 ): Promise<{ paths: string[]; unknown?: string }> {
-  const paths = footprintPathsForRow(row, bucketProjectPath);
+  const paths = [...footprintPathsForRow(row, bucketProjectPath), ...extraPaths];
   let unknown: string | undefined;
   for (const checkoutPath of [...paths]) {
     const backing = await readGitBacking(checkoutPath);
@@ -419,7 +456,11 @@ async function scanProtectedFootprintOverlap(
       const taskWorkspaceId = row.id ?? row.path;
       // Either side's Git backing could not be established: with a protected row in
       // play, that unknown may be exactly the backing the mutation would destroy.
-      const taskFootprint = await footprintWithGitBacking(row, bucketProjectPath);
+      const taskFootprint = await footprintWithGitBacking(
+        row,
+        bucketProjectPath,
+        pendingForkSourcePaths(snapshot, row)
+      );
       const unknownBacking = targetFootprint.unknown ?? taskFootprint.unknown;
       if (unknownBacking !== undefined) {
         return { kind: "unknown", taskWorkspaceId, reason: unknownBacking };

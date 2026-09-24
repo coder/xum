@@ -102,6 +102,7 @@ import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   isProjectDirLocalRuntime,
   isWorktreeSemanticsRuntime,
+  materializedCheckoutPublicationRefusal,
   newMaterializationId,
   taskRowPublicationRefusal,
   type TaskCheckoutPreparation,
@@ -109,6 +110,7 @@ import {
 } from "@/node/services/taskCheckoutPreparation";
 import {
   deriveHostLocalCheckoutPath,
+  isLazilyForkedTaskRow,
   isProtectedTaskRow,
 } from "@/node/services/workspaceStructuralMutationGuard";
 import {
@@ -158,6 +160,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/const
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   getSrcBaseDir,
+  isDevcontainerRuntime,
   isLocalProjectRuntime,
   isWorktreeRuntime,
   runtimeModeSupportsSharedTaskWorkspace,
@@ -5607,6 +5610,19 @@ export class TaskService implements AgentTaskIntegration {
                 : Err(`Task preparation failed: ${prepared.error}`);
               throw new Error(prepared.error);
             }
+            // Lazily forked (devcontainer) rows: their fork source must be intact when their
+            // structural protection begins (see lazyForkSourceRefusal).
+            for (const plan of plans) {
+              if (plan.sharedWorkspacePath != null) continue;
+              if (!isDevcontainerRuntime(plan.taskRuntimeConfig)) continue;
+              const refusal = await this.lazyForkSourceRefusal(plan.parentWorkspaceId);
+              if (refusal != null) {
+                refusedBeforeOwnership = Err(
+                  `Task.createMany: ${refusal}${retainedPreparedNotice()}`
+                );
+                throw new Error(refusal);
+              }
+            }
             // Checkpoint entry is the LAST cancellation point: an abort observed here leaves
             // nothing durable. Once a callback is entered it is owned to completion (the runner
             // checks the signal itself before its store write).
@@ -6159,6 +6175,24 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * The fork SOURCE check of a lazily forked (devcontainer) task row, run under the lock hold that
+   * publishes the row. From publication until its launch, the structural guard protects the
+   * source — the parent's checkout and its Git backing — so no cooperating mutator can delete it
+   * (see isLazilyForkedTaskRow). That protection is only useful from an intact source: a removal
+   * that won the lock first must refuse this publication, not leave a protected row whose fork
+   * can never succeed. A missing parent row is left to taskRowPublicationRefusal.
+   */
+  private async lazyForkSourceRefusal(parentWorkspaceId: string): Promise<string | null> {
+    const parentPath = coerceNonEmptyString(
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), parentWorkspaceId)?.workspace.path
+    );
+    if (parentPath == null) return null;
+    return await materializedCheckoutPublicationRefusal(parentPath, {
+      subject: "the parent's checkout",
+    });
+  }
+
+  /**
    * Fork a fresh checkout for a reserved task (no row checks, no reuse of an existing path: the
    * fork refuses an existing directory). Used by lazy materialization (off-host, shared fallback)
    * and by the pre-publication prepare stage of dedicated host-local reservations.
@@ -6588,21 +6622,42 @@ export class TaskService implements AgentTaskIntegration {
     });
     const taskBaseCommitSha = taskBaseCommitShaByProjectPath[plan.parentMeta.projectPath];
 
-    await this.editWorkspaceEntry(
-      plan.taskId,
-      (ws) => {
-        if (ws.taskStatus !== "starting" || this.launchSuperseded(plan, ws)) {
-          return;
+    const bindCheckout = () =>
+      this.editWorkspaceEntry(
+        plan.taskId,
+        (ws) => {
+          if (ws.taskStatus !== "starting" || this.launchSuperseded(plan, ws)) {
+            return;
+          }
+          ws.path = workspacePath;
+          ws.runtimeConfig = forkedRuntimeConfig;
+          ws.taskTrunkBranch = trunkBranch;
+          ws.taskBaseCommitSha = taskBaseCommitSha ?? undefined;
+          ws.taskBaseCommitShaByProjectPath = taskBaseCommitShaByProjectPath;
+          ws.projects = inheritedProjects;
+        },
+        { allowMissing: true }
+      );
+    if (isDevcontainerRuntime(forkedRuntimeConfig)) {
+      // The lazy fork ran outside the registration lock, its source protected meanwhile by the
+      // structural guard (see isLazilyForkedTaskRow). Bind the fresh checkout under the lock only
+      // after checking it and its Git backing: a deletion the guard never saw (an older build)
+      // must fail this launch instead of binding a broken checkout to a protected row.
+      const checkoutPaths = materializedCheckoutPaths(materialized);
+      const bound = await this.workspaceService.prepareTaskCheckouts(async () => {
+        for (const checkoutPath of checkoutPaths) {
+          const refusal = await materializedCheckoutPublicationRefusal(checkoutPath);
+          if (refusal != null) throw new Error(refusal);
         }
-        ws.path = workspacePath;
-        ws.runtimeConfig = forkedRuntimeConfig;
-        ws.taskTrunkBranch = trunkBranch;
-        ws.taskBaseCommitSha = taskBaseCommitSha ?? undefined;
-        ws.taskBaseCommitShaByProjectPath = taskBaseCommitShaByProjectPath;
-        ws.projects = inheritedProjects;
-      },
-      { allowMissing: true }
-    );
+        return [];
+      }, bindCheckout);
+      if (!bound.success) {
+        initLogger.logComplete(-1);
+        throw new Error(bound.error);
+      }
+    } else {
+      await bindCheckout();
+    }
     await this.emitWorkspaceMetadata(plan.taskId);
     if (plan.abortSignal?.aborted) {
       await cancelMaterializedLaunch();
@@ -7150,10 +7205,13 @@ export class TaskService implements AgentTaskIntegration {
           // at the old path (PREP_SHARED_BROKEN). Publish it under the same empty-target lock hold
           // as the unqueued shared path (no checkout, no prune): the scan sees every task row or
           // none.
-          const registration = await this.workspaceService.prepareTaskCheckouts(
-            () => Promise.resolve([]),
-            publishQueuedRow
-          );
+          const registration = await this.workspaceService.prepareTaskCheckouts(async () => {
+            if (isLazilyForkedTaskRow(queuedRow)) {
+              const refusal = await this.lazyForkSourceRefusal(parentWorkspaceId);
+              if (refusal != null) throw new Error(`Task.create: ${refusal}`);
+            }
+            return [];
+          }, publishQueuedRow);
           if (!registration.success) throw new Error(registration.error);
         });
       } catch (error) {

@@ -1025,19 +1025,21 @@ export function taskRowPublicationRefusal(
 }
 
 /**
- * Physical publication check for a proof-less checkout materialized BEFORE the registration-lock
- * hold (a devcontainer task's host worktree: its fork stays outside the lock, see
- * registerSanitizedTaskCheckout). Run under that lock right before publication: the checkout must
- * still be a directory and its Git backing must still resolve (a `.git` directory, or a pointer
- * to an existing admin dir). A structural mutator that won the lock first may have deleted or
- * moved a workspace CONTAINING the backing repository — its task-row scan skips the ordinary
- * parent and cannot see the unpublished child, and the parent row survives — and the row, once
- * published, is structurally protected and could not be removed. Deadline-bounded like every
- * read under the lock (a stalled mount refuses). Returns the refusal, or null to publish.
+ * Physical check, under the registration lock, of a proof-less devcontainer checkout the task
+ * depends on: the checkout must still be a directory and its Git backing must still resolve (a
+ * `.git` directory, or a pointer to an existing admin dir). A devcontainer task row is
+ * structurally protected once published and could then never be removed, so each publication
+ * or binding that trusts such a checkout checks it first:
+ *  - a direct task's fresh checkout (forked before the hold, see registerSanitizedTaskCheckout);
+ *  - a queued/reserved row's fork SOURCE (the parent's checkout, `subject`) when the row is
+ *    published — the structural guard protects that source only from then on;
+ *  - the checkout its launch forked, right before binding it (path/runtime) to the row.
+ * Deadline-bounded like every read under the lock (a stalled mount refuses). Returns the
+ * refusal, or null to proceed.
  */
 export async function materializedCheckoutPublicationRefusal(
   workspacePath: string,
-  options: { timeoutMs?: number } = {}
+  options: { subject?: string; timeoutMs?: number } = {}
 ): Promise<string | null> {
   assert(workspacePath.length > 0, "materializedCheckoutPublicationRefusal: path is required");
   const timeoutMs = options.timeoutMs ?? TASK_CHECKOUT_VALIDATION_TIMEOUT_MS;
@@ -1056,7 +1058,7 @@ export async function materializedCheckoutPublicationRefusal(
   const detail = checked.kind === "ok" ? checked.value : `timed out after ${timeoutMs}ms`;
   return detail === null
     ? null
-    : `the task's checkout or its Git backing changed while this task was being created (${detail}); nothing was published. Retry the task.`;
+    : `${options.subject ?? "the task's checkout"} or its Git backing changed while this task was being created (${detail}); nothing was published. Retry the task.`;
 }
 
 /** The mismatch dimension, naming the secondary checkout it concerns (if any). */
