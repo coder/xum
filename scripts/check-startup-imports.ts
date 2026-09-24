@@ -10,14 +10,22 @@
  * of dist/desktop/main.js says nothing about what it loads. Instead this walks the
  * real static import graph: esbuild resolves every entry point (tsconfig path aliases
  * included, type-only imports elided like tsc does) and records each import's kind.
- * Only static `import`/`export ... from` edges count as eager:
- * - `await import()` is the documented lazy-loading mechanism.
- * - `require()` is lint-banned (`no-require-imports`), so each call is a reviewed
- *   escape hatch; the CLI shim uses it to route subcommands lazily.
+ * Third-party packages are traversed too, so an allowed package that loads a banned
+ * one is caught. Banned packages, Node built-ins and `electron` stay external.
+ *
+ * Eager edges:
+ * - Project code: only static `import`/`export ... from`. `await import()` is the
+ *   documented lazy-loading mechanism, and `require()` is lint-banned
+ *   (`no-require-imports`), so each call is a reviewed escape hatch; the CLI shim
+ *   uses it to route subcommands lazily.
+ * - Packages (node_modules): static imports and `require()` calls, since CommonJS
+ *   packages load their dependencies with top-level `require()`. A `require()` inside
+ *   a function is counted too, which errs on the side of reporting.
  *
  * Run: bun scripts/check-startup-imports.ts
  */
 import assert from "node:assert/strict";
+import { builtinModules } from "node:module";
 import * as path from "node:path";
 import * as esbuild from "esbuild";
 
@@ -64,14 +72,30 @@ export interface EagerImportViolation {
   chain: string[];
 }
 
+export interface EagerGraphSize {
+  /** Project modules (outside node_modules) loaded eagerly. */
+  projectModules: number;
+  /** Distinct third-party packages loaded eagerly (built-ins and externals excluded). */
+  packages: number;
+}
+
 export interface StartupImportReport {
   violations: EagerImportViolation[];
-  /** Number of project modules each entry loads eagerly (informational). */
-  eagerModuleCounts: Record<string, number>;
+  /** Eager graph size per entry (informational). */
+  eagerGraphSizes: Record<string, EagerGraphSize>;
 }
 
 // tsconfig path aliases resolve to project files, not packages.
 const PATH_ALIAS_PREFIXES = ["@/", "@shared/"];
+
+const BUILTIN_MODULES = new Set(builtinModules);
+
+/** Packages provided by the runtime rather than loaded from node_modules. */
+const RUNTIME_PROVIDED_PACKAGES = new Set(["electron"]);
+
+function isInNodeModules(file: string): boolean {
+  return file.startsWith("node_modules/") || file.includes("/node_modules/");
+}
 
 function isBareSpecifier(specifier: string): boolean {
   return (
@@ -102,9 +126,9 @@ export async function analyzeStartupImports(options: {
   assert(options.entries.length > 0, "at least one entry is required");
 
   // esbuild lists imports it elided (type-only or unused bindings) in the metafile as
-  // unresolved externals without calling onResolve. Record the bare imports that were
+  // unresolved externals without calling onResolve. Record the banned imports that were
   // really resolved so elided ones are not mistaken for eager loads.
-  const resolvedBareImports = new Set<string>();
+  const resolvedBannedImports = new Set<string>();
   const edgeKey = (importer: string, specifier: string) => `${importer}\0${specifier}`;
 
   const result = await esbuild.build({
@@ -117,18 +141,31 @@ export async function analyzeStartupImports(options: {
     format: "cjs",
     outdir: path.join(options.rootDir, ".startup-imports-unused-outdir"),
     logLevel: "silent",
+    // Native addons and wasm blobs are leaves; their contents do not matter here.
+    loader: { ".node": "empty", ".wasm": "empty" },
     plugins: [
       {
-        name: "externalize-packages",
+        name: "externalize-banned-and-builtin",
         setup(build) {
           build.onResolve({ filter: /.*/ }, (args) => {
             if (!isBareSpecifier(args.path)) return undefined;
-            const importer = path
-              .relative(options.rootDir, args.importer)
-              .split(path.sep)
-              .join("/");
-            resolvedBareImports.add(edgeKey(importer, args.path));
-            return { path: args.path, external: true };
+            const packageName = packageNameOf(args.path);
+            if (args.path.startsWith("node:") || BUILTIN_MODULES.has(packageName)) {
+              return { path: args.path, external: true };
+            }
+            if (RUNTIME_PROVIDED_PACKAGES.has(packageName)) {
+              return { path: args.path, external: true };
+            }
+            if (isBannedPackage(packageName, options.banned)) {
+              const importer = path
+                .relative(options.rootDir, args.importer)
+                .split(path.sep)
+                .join("/");
+              resolvedBannedImports.add(edgeKey(importer, args.path));
+              return { path: args.path, external: true };
+            }
+            // Allowed package: let esbuild resolve it so its own imports are walked.
+            return undefined;
           });
         },
       },
@@ -136,7 +173,7 @@ export async function analyzeStartupImports(options: {
   });
 
   const inputs = result.metafile.inputs;
-  const report: StartupImportReport = { violations: [], eagerModuleCounts: {} };
+  const report: StartupImportReport = { violations: [], eagerGraphSizes: {} };
 
   for (const entry of options.entries) {
     assert(inputs[entry] != null, `esbuild did not resolve entry ${entry}`);
@@ -149,13 +186,16 @@ export async function analyzeStartupImports(options: {
       const file = queue.shift()!;
       const input = inputs[file];
       assert(input != null, `metafile is missing ${file}`);
+      const fromPackage = isInNodeModules(file);
       for (const imp of input.imports) {
-        if (imp.kind !== "import-statement") continue;
+        const eager =
+          imp.kind === "import-statement" || (fromPackage && imp.kind === "require-call");
+        if (!eager) continue;
         const specifier = imp.original ?? imp.path;
         if (imp.external) {
-          if (!resolvedBareImports.has(edgeKey(file, specifier))) continue;
+          if (!resolvedBannedImports.has(edgeKey(file, specifier))) continue;
           const packageName = packageNameOf(specifier);
-          if (!isBannedPackage(packageName, options.banned) || reported.has(packageName)) continue;
+          if (reported.has(packageName)) continue;
           reported.add(packageName);
           const chain = [specifier];
           for (let at: string | undefined = file; at != null; at = parent.get(at)) chain.push(at);
@@ -167,7 +207,12 @@ export async function analyzeStartupImports(options: {
         }
       }
     }
-    report.eagerModuleCounts[entry] = visited.size;
+    const packageFiles = [...visited].filter(isInNodeModules);
+    report.eagerGraphSizes[entry] = {
+      projectModules: visited.size - packageFiles.length,
+      packages: new Set(packageFiles.map((f) => packageNameOf(f.split("node_modules/").pop()!)))
+        .size,
+    };
   }
   return report;
 }
@@ -181,7 +226,10 @@ async function main(): Promise<number> {
   });
 
   for (const { entry, reason } of STARTUP_ENTRIES) {
-    console.log(`${entry}: ${report.eagerModuleCounts[entry]} eager modules (${reason})`);
+    const size = report.eagerGraphSizes[entry];
+    console.log(
+      `${entry}: ${size.projectModules} eager project modules, ${size.packages} packages (${reason})`
+    );
   }
   if (report.violations.length === 0) {
     console.log("✅ No banned packages on the eager startup path");

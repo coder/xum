@@ -65,6 +65,30 @@ test("fails on side-effect imports and re-exports of banned scoped packages", as
   expect(report.violations.map((v) => v.packageName).sort()).toEqual(["@ai-sdk/openai", "ai"]);
 });
 
+test("fails when an allowed package loads a banned one", async () => {
+  await writeFiles({
+    "src/entry.ts": 'import { wrap } from "wrapper-pkg";\nconsole.log(wrap);\n',
+    "node_modules/wrapper-pkg/package.json": JSON.stringify({
+      name: "wrapper-pkg",
+      main: "index.js",
+    }),
+    // CommonJS packages load dependencies with require(), which counts as eager there.
+    "node_modules/wrapper-pkg/index.js":
+      'const ai = require("ai");\nexports.wrap = ai.streamText;\n',
+  });
+
+  const report = await analyze();
+
+  expect(report.violations).toEqual([
+    {
+      entry: "src/entry.ts",
+      packageName: "ai",
+      chain: ["src/entry.ts", "node_modules/wrapper-pkg/index.js", "ai"],
+    },
+  ]);
+  expect(report.eagerGraphSizes).toEqual({ "src/entry.ts": { projectModules: 1, packages: 1 } });
+});
+
 test("passes when banned packages are only reached lazily or as types", async () => {
   await writeFiles({
     "src/entry.ts": [
@@ -85,7 +109,7 @@ test("passes when banned packages are only reached lazily or as types", async ()
   const report = await analyze();
 
   expect(report.violations).toEqual([]);
-  expect(report.eagerModuleCounts).toEqual({ "src/entry.ts": 1 });
+  expect(report.eagerGraphSizes).toEqual({ "src/entry.ts": { projectModules: 1, packages: 0 } });
 });
 
 test("package matching handles subpaths and scopes", () => {
