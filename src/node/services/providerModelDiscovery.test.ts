@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EnvHttpProxyAgent } from "undici/index.js";
 import { Config } from "@/node/config";
+import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
 import { PolicyService } from "./policyService";
 import { ProviderService } from "./providerService";
@@ -26,6 +27,15 @@ const envKeys = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "ANTHROPIC_BASE_URL",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GOOGLE_API_KEY",
+  "GOOGLE_BASE_URL",
+  "XAI_API_KEY",
+  "XAI_BASE_URL",
+  "OPENROUTER_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "MOONSHOT_API_KEY",
+  "ZAI_API_KEY",
 ];
 let savedEnv: Array<string | undefined>;
 function save(provider: string, extra: BaseProviderConfig = {}) {
@@ -333,3 +343,338 @@ it.each(["unchanged", "key", "abort"])(
     }
   }
 );
+
+const httpAdapters = [
+  "google",
+  "xai",
+  "deepseek",
+  "moonshotai",
+  "openrouter",
+  "ollama",
+  "zai",
+  ...CUSTOM_PROVIDER_TYPES,
+];
+function catalog(provider: string) {
+  if (provider === "google")
+    return {
+      models: [
+        { name: "models/chat", supportedGenerationMethods: ["generateContent"] },
+        { name: "models/not-chat", supportedGenerationMethods: ["embedContent"] },
+        { name: "publishers/models/another", supportedGenerationMethods: ["generateContent"] },
+      ],
+    };
+  if (provider === "ollama")
+    return { models: [{ name: "chat" }, { model: "chat" }, { model: "another:tag" }] };
+  return { data: [{ id: "chat" }, { id: "chat" }], has_more: false };
+}
+function saveAdapter(provider: string, overrides: BaseProviderConfig = {}) {
+  const custom = CUSTOM_PROVIDER_TYPES.find((type) => type === provider);
+  const id = custom ? "fixture" : provider;
+  save(id, {
+    baseUrl: `${server.url}proxy/api/`,
+    ...(custom && { providerType: custom }),
+    ...overrides,
+  });
+  return id;
+}
+
+it.each(httpAdapters)(
+  "HTTP adapter %s preserves explicit URLs, credentials, IDs and config bytes",
+  async (provider) => {
+    const id = saveAdapter(provider, { headers: { "x-custom": "private-header" } });
+    await config.editConfig((current) => ({
+      ...current,
+      routePriority: ["direct"],
+      routeOverrides: { [id]: "direct" },
+    }));
+    const files = [service.providersConfigStore.providersFile, join(root, "config.json")];
+    const before = files.map((file) => readFileSync(file, "utf8"));
+    respond = () => Response.json(catalog(provider));
+    expect(await service.discoverModels(id)).toEqual({
+      status: "ok",
+      modelIds:
+        provider === "google"
+          ? ["chat", "publishers/models/another"]
+          : provider === "ollama"
+            ? ["chat", "another:tag"]
+            : ["chat"],
+    });
+    const url = new URL(requests[0].url);
+    expect(url.pathname).toBe(
+      provider === "ollama"
+        ? "/proxy/api/tags"
+        : provider === "anthropic-messages"
+          ? "/proxy/api/v1/models"
+          : "/proxy/api/models"
+    );
+    expect(requests[0].headers.get("x-custom")).toBe("private-header");
+    const keyHeader =
+      provider === "google"
+        ? "x-goog-api-key"
+        : provider === "anthropic-messages"
+          ? "x-api-key"
+          : "authorization";
+    expect(requests[0].headers.get(keyHeader)).toBe(
+      provider === "ollama"
+        ? null
+        : keyHeader === "authorization"
+          ? "Bearer private-key"
+          : "private-key"
+    );
+    if (provider === "google") expect(url.searchParams.get("pageSize")).toBe("1000");
+    respond = () =>
+      Response.json(
+        provider === "google" || provider === "ollama"
+          ? { models: [] }
+          : { data: [], has_more: false }
+      );
+    expect(await service.discoverModels(id)).toEqual({ status: "ok", modelIds: [] });
+    expect(files.map((file) => readFileSync(file, "utf8"))).toEqual(before);
+  }
+);
+
+it.each(["google", "openrouter", "anthropic-messages"])(
+  "paginates %s without guessing model names",
+  async (provider) => {
+    const id = saveAdapter(
+      provider,
+      provider === "openrouter"
+        ? { baseUrl: `${server.url}proxy/api?tenant=one&scope=a&scope=b` }
+        : {}
+    );
+    respond = () => {
+      const more = requests.length === 1;
+      if (provider === "google")
+        return Response.json({
+          models: [
+            {
+              name: "models/chat",
+              supportedGenerationMethods: more ? ["embedContent"] : ["generateContent"],
+            },
+          ],
+          ...(more && { nextPageToken: "next/token" }),
+        });
+      return Response.json({
+        data: [{ id: more ? "first" : "second" }],
+        has_more: more,
+        last_id: more ? "first" : "second",
+        ...(provider === "openrouter" && { links: { next: more ? "?offset=1" : null } }),
+      });
+    };
+    expect(await service.discoverModels(id)).toEqual({
+      status: "ok",
+      modelIds: provider === "google" ? ["chat"] : ["first", "second"],
+    });
+    const next = new URL(requests[1].url);
+    expect(next.pathname).toBe(new URL(requests[0].url).pathname);
+    if (provider === "openrouter") {
+      expect(next.searchParams.get("tenant")).toBe("one");
+      expect(next.searchParams.getAll("scope")).toEqual(["a", "b"]);
+    }
+    expect(
+      next.searchParams.get(
+        provider === "google" ? "pageToken" : provider === "openrouter" ? "offset" : "after_id"
+      )
+    ).toBe(provider === "google" ? "next/token" : provider === "openrouter" ? "1" : "first");
+  }
+);
+
+it.each([
+  ["google", "pageToken"],
+  ["openrouter", "offset"],
+] as const)("%s ignores a %s cursor carried in the configured base URL", async (provider, key) => {
+  const id = saveAdapter(provider, { baseUrl: `${server.url}proxy/api?tenant=one&${key}=zzz` });
+  respond = () => Response.json(catalog(provider));
+  expect((await service.discoverModels(id)).status).toBe("ok");
+  const first = new URL(requests[0].url);
+  expect(first.searchParams.has(key)).toBe(false);
+  expect(first.searchParams.get("tenant")).toBe("one");
+});
+
+it.each(["zai", ...CUSTOM_PROVIDER_TYPES])(
+  "conditional %s probes distinguish missing endpoints from upstream errors",
+  async (provider) => {
+    const id = saveAdapter(provider);
+    for (const status of [404, 405, 401, 403, 429]) {
+      respond = () => new Response("private-upstream-error", { status });
+      expect(await service.discoverModels(id)).toEqual(
+        status === 404 || status === 405
+          ? { status: "unsupported" }
+          : { status: "error", reason: "request-failed" }
+      );
+    }
+    respond = () => Response.json({ unexpected: [] });
+    expect(await service.discoverModels(id)).toEqual({
+      status: "error",
+      reason: "invalid-response",
+    });
+    respond = () => Response.json({ data: [{ id: "partial" }], has_more: true });
+    expect(await service.discoverModels(id)).toEqual({
+      status: "error",
+      reason: "invalid-response",
+    });
+    if (provider === "anthropic-messages") {
+      respond = () => Response.json({ data: [] });
+      expect(await service.discoverModels(id)).toEqual({
+        status: "error",
+        reason: "invalid-response",
+      });
+    }
+  }
+);
+
+it.each(["zai", ...CUSTOM_PROVIDER_TYPES])(
+  "conditional %s unsupported replies are fenced by config changes",
+  async (provider) => {
+    const id = saveAdapter(provider);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<Response>();
+    respond = () => {
+      started.resolve();
+      return release.promise;
+    };
+    const pending = service.discoverModels(id);
+    await started.promise;
+    saveAdapter(provider, { headers: { "x-tenant": "new" } });
+    release.resolve(new Response("missing", { status: 404 }));
+    expect(await pending).toEqual({ status: "error", reason: "stale-config" });
+  }
+);
+
+it.each(["openrouter", "openai-compatible"])(
+  "%s endpoints mounted under /deployments are still listed",
+  async (provider) => {
+    const id = saveAdapter(provider, { baseUrl: `${server.url}deployments/v1` });
+    respond = () => Response.json({ data: [{ id: "proxied" }] });
+    expect(await service.discoverModels(id)).toEqual({ status: "ok", modelIds: ["proxied"] });
+  }
+);
+
+it.each([...CUSTOM_PROVIDER_TYPES])(
+  "isolates %s credentials and supports only explicit keyless endpoints",
+  async (provider) => {
+    process.env.OPENAI_API_KEY = "must-not-leak";
+    process.env.ANTHROPIC_API_KEY = "must-not-leak";
+    const id = saveAdapter(provider, { apiKey: undefined });
+    respond = () => Response.json(catalog(provider));
+    expect((await service.discoverModels(id)).status).toBe("ok");
+    expect(requests[0].headers.get("authorization")).toBeNull();
+    expect(requests[0].headers.get("x-api-key")).toBeNull();
+    const keyFile = join(root, "custom-key");
+    writeFileSync(keyFile, "file-key");
+    saveAdapter(provider, { apiKey: undefined, apiKeyFile: keyFile });
+    expect((await service.discoverModels(id)).status).toBe("ok");
+    expect(
+      requests[1].headers.get(provider === "anthropic-messages" ? "x-api-key" : "authorization")
+    ).toBe(provider === "anthropic-messages" ? "file-key" : "Bearer file-key");
+    rmSync(keyFile);
+    expect((await service.discoverModels(id)).status).not.toBe("ok");
+    saveAdapter(provider, { apiKey: undefined, baseUrl: undefined });
+    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
+    expect(requests).toHaveLength(2);
+  }
+);
+
+it.each(httpAdapters)(
+  "does not request disabled or policy-denied %s catalogs",
+  async (provider) => {
+    const id = saveAdapter(provider, { enabled: false });
+    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
+    saveAdapter(provider);
+    policySpy("isEnforced").mockReturnValue(true);
+    policySpy("isProviderAllowed").mockReturnValue(false);
+    expect(await service.discoverModels(id)).toEqual({ status: "not-configured" });
+    expect(requests).toHaveLength(0);
+  }
+);
+
+it("does not implicitly contact an unconfigured Ollama service", async () => {
+  expect(await service.discoverModels("ollama")).toEqual({ status: "not-configured" });
+  expect(requests).toHaveLength(0);
+});
+
+it.each(["google", "openrouter", "anthropic-messages"])(
+  "rejects malformed, repeating and excessive %s pages",
+  async (provider) => {
+    const id = saveAdapter(provider);
+    for (const failure of ["malformed", "repeat", "pages", "partial"]) {
+      requests = [];
+      respond = () => {
+        if (failure === "malformed") return Response.json({ data: "wrong", models: "wrong" });
+        if (failure === "partial" && requests.length > 1)
+          return new Response("private-error", { status: 404 });
+        const cursor = failure === "pages" ? String(requests.length) : "repeat";
+        if (provider === "google")
+          return Response.json({
+            models: [{ name: "models/chat", supportedGenerationMethods: ["generateContent"] }],
+            nextPageToken: cursor,
+          });
+        return Response.json({
+          data: [{ id: "chat" }],
+          has_more: true,
+          last_id: cursor,
+          ...(provider === "openrouter" && { links: { next: `?page=${cursor}` } }),
+        });
+      };
+      expect((await service.discoverModels(id)).status).toBe("error");
+      expect(requests.length).toBeLessThanOrEqual(10);
+    }
+  }
+);
+
+it.each(["https://untrusted.invalid/models", "/escaped/models", "?page=same"])(
+  "refuses OpenRouter page escapes or cycles: %s",
+  async (next) => {
+    saveAdapter("openrouter");
+    respond = () => Response.json({ data: [{ id: "chat" }], links: { next } });
+    expect(await service.discoverModels("openrouter")).toEqual({
+      status: "error",
+      reason: "invalid-response",
+    });
+    expect(requests.length).toBeLessThanOrEqual(2);
+    expect(requests.every((request) => new URL(request.url).origin === server.url.origin)).toBe(
+      true
+    );
+  }
+);
+
+it.each(["google", "ollama"])(
+  "bounds %s model counts before filtering or deduplication",
+  async (provider) => {
+    saveAdapter(provider);
+    const item =
+      provider === "google"
+        ? { name: "models/embedding", supportedGenerationMethods: ["embedContent"] }
+        : { name: "duplicate" };
+    respond = () => Response.json({ models: Array.from({ length: 10001 }, () => item) });
+    expect(await service.discoverModels(provider)).toEqual({
+      status: "error",
+      reason: "limit-exceeded",
+    });
+  }
+);
+
+it("fences custom wire-type changes while a catalog is in flight", async () => {
+  const id = saveAdapter("openai-compatible");
+  const started = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<Response>();
+  respond = () => {
+    started.resolve();
+    return release.promise;
+  };
+  const pending = service.discoverModels(id);
+  try {
+    await Promise.race([
+      started.promise,
+      pending.then(() => {
+        throw new Error("Expected a loopback request");
+      }),
+    ]);
+    saveAdapter("openai-responses");
+    release.resolve(Response.json({ data: [{ id: "old" }] }));
+    expect(await pending).toEqual({ status: "error", reason: "stale-config" });
+  } finally {
+    release.resolve(Response.json({ data: [] }));
+    await pending;
+  }
+});
