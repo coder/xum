@@ -52,7 +52,6 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
  */
 const KNOWN_SKIPPED: ReadonlySet<string> = new Set([
   "src/browser/components/ProjectSidebar/ProjectSidebar.tsx#ProjectSidebarInner",
-  "src/browser/features/RightSidebar/CodeReview/ImmersiveReviewView.tsx#ImmersiveReviewView",
 ]);
 
 // Subset of babel-plugin-react-compiler's logger events that this guard reads.
