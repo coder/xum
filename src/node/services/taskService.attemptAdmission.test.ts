@@ -3819,4 +3819,49 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       ).streamAttemptIdAtEvent(taskId)
     ).toBe(foreign);
   });
+  test.each(["broken", "att_NOT-HEX-0000000"] as const)(
+    "a malformed persisted attempt id (%s) self-heals to a stable unproven attempt: the task stays fenced and a valid id is untouched",
+    async (malformed) => {
+      const taskId = "malformed-attempt-id";
+      const validTaskId = "valid-attempt-id";
+      const validAttemptId = "att_00000000000000ad";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: { taskStatus: "running", taskAttemptId: malformed },
+        },
+        { id: validTaskId, overrides: { taskStatus: "running", taskAttemptId: validAttemptId } },
+      ]);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      // Load-time normalization: a task row keeps its task-ness; the bad value becomes a valid,
+      // unproven attempt id, identical on every load (derived from the bad value) so CAS readers
+      // agree before and after the healed value is persisted.
+      const healed = entryOf(config, taskId);
+      expect(healed?.taskAttemptId).toMatch(ATTEMPT_ID);
+      expect(healed?.taskAttemptUnproven).toBe(true);
+      await config.editConfig((cfg) => cfg);
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(healed?.taskAttemptId);
+      const raw = JSON.stringify(
+        JSON.parse(await fsPromises.readFile(path.join(config.rootDir, "config.json"), "utf-8"))
+      );
+      expect(raw).toContain(healed!.taskAttemptId!);
+      expect(raw).not.toContain(`"${malformed}"`);
+      // A manual send gets a turn-admission token bound to the healed attempt (never not-a-task).
+      const admission = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
+      expect(admission.kind).toBe("admitted");
+      const pending = [...(svc.admittedSendsByTaskId.get(taskId) ?? [])];
+      expect(pending.map((send) => send.attemptId)).toEqual([healed!.taskAttemptId!]);
+      if (admission.kind === "admitted") admission.token.onDisposed("no-work");
+      // The Stop/settlement fence applies to it: a closed attempt refuses further sends.
+      svc.closeAttemptAdmission(taskId, healed!.taskAttemptId, undefined, "test-close");
+      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
+      // A valid id is unchanged (and not marked unproven).
+      expect(entryOf(config, validTaskId)?.taskAttemptId).toBe(validAttemptId);
+      expect(entryOf(config, validTaskId)?.taskAttemptUnproven).toBeUndefined();
+    }
+  );
 });

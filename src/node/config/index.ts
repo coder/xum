@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as crypto from "crypto";
 import { EventEmitter } from "events";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import { Effect, Semaphore } from "effect";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
@@ -664,6 +665,32 @@ function normalizeProjectKind(value: unknown): "user" | "system" | undefined {
   return undefined;
 }
 
+/**
+ * Self-healing for a corrupted or foreign-written `taskAttemptId` (anything but att_ + 16 hex).
+ * Task-ness comes from the row's task markers, never from the id's validity: a task row keeps an
+ * attempt identity, so its sends stay behind the admission/Stop/settlement fence (a missing id
+ * would read as a pre-identity entry). The bad value is replaced by a valid id derived from it —
+ * identical on every load, so readers and CAS writers agree before and after the healed value is
+ * persisted — and the attempt is marked unproven (its lineage cannot be vouched for). A non-task
+ * row simply drops the value.
+ */
+function healMalformedTaskAttemptId(
+  persisted: Record<string, unknown> & { id?: unknown; parentWorkspaceId?: unknown }
+): void {
+  if (!Object.hasOwn(persisted, "taskAttemptId") || persisted.taskAttemptId === undefined) return;
+  if (isTaskAttemptId(persisted.taskAttemptId)) return;
+  if (typeof persisted.parentWorkspaceId !== "string" || persisted.parentWorkspaceId.length === 0) {
+    delete persisted.taskAttemptId;
+    return;
+  }
+  const digest = crypto
+    .createHash("sha256")
+    .update(`${String(persisted.id)}\0${JSON.stringify(persisted.taskAttemptId)}`)
+    .digest("hex");
+  persisted.taskAttemptId = `att_${digest.slice(0, 16)}`;
+  persisted.taskAttemptUnproven = true;
+}
+
 function normalizePersistedWorkspace(
   workspace: ProjectConfig["workspaces"][number]
 ): ProjectConfig["workspaces"][number] {
@@ -688,12 +715,20 @@ function normalizePersistedWorkspace(
   const hasLegacyPtcExclusive =
     taskExperiments?.programmaticToolCallingExclusive === true &&
     taskExperiments.programmaticToolCalling !== true;
-  if (!hasLegacyWorkflowSchedule && !hasBestOf && !hasLegacyPtcExclusive) {
+  const hasMalformedTaskAttemptId =
+    persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
+  if (
+    !hasLegacyWorkflowSchedule &&
+    !hasBestOf &&
+    !hasLegacyPtcExclusive &&
+    !hasMalformedTaskAttemptId
+  ) {
     return workspace;
   }
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+  if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
