@@ -79,7 +79,7 @@ function getTranscriptQuoteText(message: DisplayedMessage): string | null {
 // Memoized to prevent unnecessary re-renders when parent (AIView) updates
 export const MessageRenderer = React.memo<MessageRendererProps>(
   ({
-    message,
+    message: messageProp,
     className,
     onEditUserMessage,
     workspaceId,
@@ -90,7 +90,7 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
     taskReportLinking,
     userMessageNavigation,
   }) => {
-    message = useStreamingMessageDelta(workspaceId, message);
+    const message = useStreamingMessageDelta(workspaceId, messageProp);
     let renderedMessage: React.ReactNode;
 
     // Route based on message type
