@@ -9442,6 +9442,40 @@ describe("TaskService", () => {
         await fsPromises.rm(crashRoot, { recursive: true, force: true });
       }
     }, 20_000);
+
+    test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
+      const { config, taskService, parentId, childId, sendMessage, initStateManager } =
+        await spawnReportedChild();
+      const sibling = await createAgentTask(taskService, parentId, "sibling", {
+        agentType: "exec",
+      });
+      assert(sibling.success, sibling.success ? "" : sibling.error);
+      await initStateManager.waitForInit(sibling.data.taskId);
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      sendMessage.mockClear();
+      const loader = spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers");
+      try {
+        const result = await taskService.sendMessageToSiblingAgentTask(
+          sibling.data.taskId,
+          childId,
+          "the fixture moved",
+          "tool-end"
+        );
+        expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+        const childSends = sendMessage.mock.calls.filter((call) => call[0] === childId);
+        expect(childSends).toHaveLength(1);
+        const options = childSends[0][2] as Record<string, unknown>;
+        expect(options.model).toBe(SPAWN_MODEL);
+        expect(options.skipAiSettingsPersistence).toBeUndefined();
+        expect(loader).not.toHaveBeenCalled();
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(SPAWN_MODEL);
+        // The normal reactivation lifecycle still ran.
+        expect(child?.taskExecutionStatus).toBe("running");
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
   });
 
   test("nested Exec delegation inherits the immediate child rather than the root chat", async () => {

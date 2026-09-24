@@ -6176,6 +6176,12 @@ export class TaskService implements AgentTaskIntegration {
     taskId: string,
     trimmedMessage: string,
     queueDispatchMode: TaskMessageQueueDispatchMode,
+    /**
+     * Who reawakens an inactive child: only an ancestor re-resolves its AI settings.
+     * Sibling-family messages ride this trusted path too but keep the frozen settings
+     * (plan D1), so they skip definition reads and the refresh policy entirely.
+     */
+    sender: "ancestor" | "sibling",
     options?: TrustedDescendantMessageOptions
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
@@ -6250,7 +6256,8 @@ export class TaskService implements AgentTaskIntegration {
 
     // Definition I/O never runs under the event or tree lifecycle lock: read the child's
     // definition layers first (inactive candidates only), then plan under the locks.
-    const preparedReawakenAi = await this.prepareReawakenAi(taskId);
+    const preparedReawakenAi =
+      sender === "ancestor" ? await this.prepareReawakenAi(taskId) : undefined;
 
     // Event lock first, then the task-tree lock: the order every path holding both follows (see
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
@@ -6303,7 +6310,7 @@ export class TaskService implements AgentTaskIntegration {
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
             onPreTurnPersisted: options?.onPreTurnPersisted,
-            aiRefresh: { prepared: preparedReawakenAi },
+            ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
           });
         }
 
@@ -6669,6 +6676,7 @@ export class TaskService implements AgentTaskIntegration {
         spec.targetId,
         prepared.triggerContent,
         spec.queueDispatchMode,
+        "sibling",
         {
           messageLabel: triggerLabel,
           preTurnMessages: [payloadRow],
@@ -6741,6 +6749,7 @@ export class TaskService implements AgentTaskIntegration {
         spec.targetId,
         message,
         spec.queueDispatchMode,
+        "ancestor",
         spec.options
       );
     }
