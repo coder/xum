@@ -579,10 +579,10 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     "turn completes with the stream end",
     "turn completes after report publication",
   ] as const)(
-    "ld5y_ classification: a manual message queued on a workflow-owned leaf that then reports and is auto-deleted is not silently lost (%s)",
+    "a workflow-owned leaf that reports while the user's manual message is queued is not auto-deleted: the message stays held and reachable (%s)",
     async (ordering) => {
-      // Codex PRRT_kwDOPxxmWM6ld5y_: the reported workflow leaf is auto-deleted (remove() disposes
-      // the session) while the queued manual follow-up still waits in that session.
+      // Codex PRRT_kwDOPxxmWM6ld5y_: auto-deleting the reported workflow leaf disposes its session,
+      // which is the only place the queued (then held) manual message lives.
       const late = ordering === "turn completes after report publication";
       const childId = late ? "holdwfleaf0002" : "holdwfleaf0001";
       const stack = await createStack(childId, {
@@ -600,32 +600,49 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
         const event = stack.endStream(0, { report: "done" }, !late);
         await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
-        // Let report publication, the idle drain and any auto-delete run to completion.
+        // Let report publication, the idle drain and any auto-delete attempt run to completion.
         await yieldMacrotasks(40);
-        const queuedAtRemoval = workspaceService.hasQueuedMessages(childId);
-        if (late) stack.completeStream(0, event);
+        if (late) {
+          // Report published while the entry still waits in the queue: cleanup already ran.
+          expect(entryOf(config, childId)).toBeDefined();
+          stack.completeStream(0, event);
+        }
         await yieldMacrotasks(20);
-        const removed = entryOf(config, childId) == null;
-        const outcome = {
-          removed,
-          followUpStreamed: completions.length > 1,
-          held: stack.heldTexts(),
-          stillQueued: removed ? null : workspaceService.hasQueuedMessages(childId),
-          queuedBeforeTurnCompleted: late ? queuedAtRemoval : null,
-        };
-        console.log("LD5Y_OUTCOME", JSON.stringify(outcome));
-        // Preserved means sent, or still reachable by the user: a held input or queued entry of a
-        // deleted workspace lives only in its disposed session, which nothing can reach.
-        const preserved =
-          outcome.followUpStreamed ||
-          (!removed && (outcome.held.includes("follow-up text") || outcome.stillQueued === true));
-        expect(preserved).toBe(true);
+        // Not sent under the completed attempt, not deleted, held for the user.
+        expect(completions).toHaveLength(1);
+        expect(entryOf(config, childId)).toMatchObject({ taskStatus: "reported" });
+        expect(stack.heldTexts()).toEqual(["follow-up text"]);
+
+        // Discarding does not re-trigger cleanup (documented trade-off): the leaf stays until the
+        // next cleanup trigger.
+        const [held] = stack.heldInputs();
+        expect(workspaceService.discardHeldInput(childId, held.id)).toEqual(Ok(undefined));
+        await yieldMacrotasks(10);
+        expect(entryOf(config, childId)).toBeDefined();
       } finally {
         await stack.cleanup();
       }
     },
     20_000
   );
+
+  test("control: a workflow-owned leaf that reports with no pending user input is still auto-deleted", async () => {
+    const childId = "holdwfleaf0003";
+    const stack = await createStack(childId, {
+      workflowTask: { runId: "wfr_held_cleanup", stepId: "step" },
+    });
+    const { config, taskService, workspaceService, sendOptions } = stack;
+    try {
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
+        Ok(undefined)
+      );
+      stack.endStream(0, { report: "done" }, true);
+      await until(() => entryOf(config, childId) == null, "leaf auto-deleted");
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 
   test("a session holding refused input blocks an app restart until the input is sent or discarded (it lives only in memory)", async () => {
     const childId = "holdrestart001";

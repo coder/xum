@@ -453,6 +453,11 @@ export interface TurnAdmissionHost {
   ): Promise<Result<boolean>>;
   isBusyForMessage(workspaceId: string): boolean;
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean;
+  /**
+   * The user's manual input is queued or held (refused, unsent) in the workspace's session. Both
+   * live only in that session, so removing the workspace would silently lose them.
+   */
+  hasPendingUserInput(workspaceId: string): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   /**
    * Re-run the workspace's idle queue drain. Called by the task layer when a stream-end decision

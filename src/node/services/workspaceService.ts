@@ -13452,6 +13452,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return this.sessions.get(workspaceId.trim())?.hasQueuedOrDispatchingEntry() ?? false;
   }
 
+  /** See WorkspaceHost.hasPendingUserInput. */
+  hasPendingUserInput(workspaceId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.hasPendingUserInput() ?? false;
+  }
+
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
     return this.sessions.get(workspaceId.trim())?.hasQueuedMessages(dispatchMode) ?? false;
   }

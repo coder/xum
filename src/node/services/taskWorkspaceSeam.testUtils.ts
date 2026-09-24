@@ -18,6 +18,7 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     acquireIdleTurnExclusion: () => Ok({ [Symbol.dispose]: () => undefined }),
     isBusyForMessage: () => false,
     hasQueuedMessages: () => false,
+    hasPendingUserInput: () => false,
     hasPendingQueuedOrPreparingTurn: () => false,
     drainQueuedMessagesIfIdle: () => undefined,
     hasPendingAutoRetry: () => false,

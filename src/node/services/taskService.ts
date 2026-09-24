@@ -17942,6 +17942,14 @@ export class TaskService implements AgentTaskIntegration {
       return { ok: false, reason: "preserved" };
     }
 
+    // Queued or held manual input lives only in this workspace's session, which removal disposes.
+    // Keep the leaf while the user still has unsent input there. Trade-off: sending re-runs
+    // cleanup at the next report, but Discard does not re-trigger it, so a leaf whose input was
+    // discarded stays until the next cleanup trigger (e.g. the startup recheck).
+    if (this.workspaceService.hasPendingUserInput(workspaceId)) {
+      return { ok: false, reason: "pending_user_input" };
+    }
+
     const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
     const patchArtifact = await readSubagentGitPatchArtifact(parentSessionDir, workspaceId);
     if (patchArtifact?.status === "pending") {

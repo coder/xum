@@ -1329,6 +1329,19 @@ export class MessageQueue {
   }
 
   /**
+   * Whether the user's own manual input is queued, including an entry whose admission already
+   * reads stale (the dequeue gate will refuse it into held input, not drop it).
+   */
+  hasManualUserInput(): boolean {
+    return this.entries.some(
+      (entry) =>
+        entry.userAuthored &&
+        this.getAcceptanceOrigin(entry) === "manual" &&
+        entry.cancelSignal?.aborted !== true
+    );
+  }
+
+  /**
    * Number of pending entries, including synthetic/internal ones. Archive admission uses
    * this to compare the queue against the delegated turns it is about to interrupt, so it
    * must count every entry — a "visible" count could hide user work behind synthetic
