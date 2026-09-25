@@ -16,7 +16,10 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import {
+  acquireCrossProcessLock,
+  CrossProcessLockTimeoutError,
+} from "@/node/utils/main/crossProcessLock";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
 import {
@@ -2200,8 +2203,8 @@ export class WorkspaceMcpOverridesService {
     } finally {
       // Steps that timed out may still have a migration write in flight; the
       // caller releases the lock right after this returns, so wait for them
-      // (they are the only writes this operation started). The lock's lease
-      // renewal keeps the holder non-reclaimable meanwhile.
+      // (they are the only writes this operation started). The lock is never
+      // reclaimed from a live holder meanwhile.
       await snapshot.settleSideEffects();
     }
   }
@@ -2302,7 +2305,7 @@ export class WorkspaceMcpOverridesService {
     // One budget for the WHOLE fan-out (own publication, sharer scan, every
     // level): each probe is bounded, but thousands of candidates on stalled
     // mounts would still add up under the exclusive lock past its acquisition
-    // timeout (and the stale lease). When the budget runs out nothing below
+    // timeout. When the budget runs out nothing below
     // can be published authoritatively: evict every cache instead, and let
     // the abandoned work's cancellation flags keep it from publishing later.
     budget: PublicationBudget
@@ -2624,7 +2627,7 @@ export class WorkspaceMcpOverridesService {
    * resolution is read-only and runs OUTSIDE the lock, because an inheriting
    * SSH source probes one round of remote paths per ancestor level and holding
    * the global lock through that would stall every unrelated save/prune past
-   * the acquisition timeout (or the stale lease).
+   * the acquisition timeout.
    */
   async copyOverridesToForkedCheckout(
     sourceWorkspaceId: string,
@@ -2695,10 +2698,9 @@ export class WorkspaceMcpOverridesService {
                   // …and a write that had already started keeps the lock until it
                   // settles: it cannot be cancelled, and landing it under the
                   // released lock could clobber a newer save. Holding is safe for
-                  // as long as it takes: the cross-process lock re-stamps its lease
-                  // while held (acquireCrossProcessLock's renewal), so a live
-                  // holder waiting on a stalled write never becomes reclaimable —
-                  // only a crashed process (which cannot complete the write) does.
+                  // as long as it takes: the cross-process lock never reclaims a
+                  // live holder, however long it holds — only a provably dead
+                  // process (which cannot complete the write) loses it.
                   await locked.settleSideEffects();
                 }
               },
@@ -3519,8 +3521,8 @@ export class WorkspaceMcpOverridesService {
    *
    * LOCK ORDER: workspace locks are acquired in sorted order and ALWAYS
    * before the global lock (runExclusive), never while holding it.
-   * Staleness (crashed holder) is handled by the lock's lease renewal and
-   * reclamation, like the global lock.
+   * A crashed holder is reclaimed once provably dead (never on age), like
+   * the global lock.
    */
   acquireWorkspaceLock(
     workspaceId: string,
@@ -3757,6 +3759,8 @@ export class WorkspaceMcpOverridesService {
           !acquiredAll &&
           error instanceof Error &&
           (error instanceof CheckoutKeysChangedError ||
+            // The lock's timeout message appends holder details to ours.
+            error instanceof CrossProcessLockTimeoutError ||
             error.message === WORKSPACE_LOCK_TIMEOUT_MESSAGE) &&
           Date.now() < deadlineAt;
         if (!retry) {

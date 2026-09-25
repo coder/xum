@@ -168,7 +168,11 @@ export function getProcessBirth(pid: number): string | null {
   return birth;
 }
 
-function probeProcessBirth(pid: number): string | null {
+/**
+ * Uncached probe behind getProcessBirth. Exported for crossProcessLock, which
+ * must never compare against a cached birth of a previous pid incarnation.
+ */
+export function probeProcessBirth(pid: number): string | null {
   // Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot) is
   // unique per pid incarnation. The comm field can embed spaces/parens, so
   // fields are parsed after the LAST ')' where the format is well-defined
