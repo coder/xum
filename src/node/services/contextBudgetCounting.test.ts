@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { jsonSchema, tool } from "ai";
 import * as tokenizerModule from "@/node/utils/main/tokenizer";
+import { OUTPUT_RESERVE_TOKENS } from "@/common/constants/contextBudget";
 import {
-  estimateAssembledRequestTokens,
   getContextBudgetHardCeiling,
+  prepareAssembledRequestTokenCount,
+  type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
 import {
   checkAssembledRequestBudgetForModel,
@@ -13,6 +15,10 @@ import {
 
 const model = "openai:gpt-4o";
 afterEach(() => mock.restore());
+
+// Character heuristic alone; the tests below show where real encoding must exceed it.
+const estimateAssembledRequestTokens = (payload: AssembledRequestBudgetInput) =>
+  prepareAssembledRequestTokenCount(payload).heuristicTokens;
 
 describe("real-encoding budget guards", () => {
   test.each([
@@ -135,6 +141,51 @@ describe("real-encoding budget guards", () => {
         { model }
       )
     ).toBeLessThan(getContextBudgetHardCeiling(4096));
+  });
+
+  test.each([4096, 8192])(
+    "keeps fitting requests usable and blocks oversized ones with a %d-token window",
+    async (modelContextLimit) => {
+      const fitting = { system: "instructions", messages: [{ role: "user", content: "hello" }] };
+      expect(
+        await checkAssembledRequestBudgetForModel(fitting, { model, modelContextLimit })
+      ).toBeUndefined();
+      const oversized = {
+        messages: [{ role: "user", content: "x".repeat(modelContextLimit * 4) }],
+      };
+      expect(
+        await checkAssembledRequestBudgetForModel(oversized, { model, modelContextLimit })
+      ).toMatchObject({
+        type: "context_budget_exceeded",
+        model,
+        hardCeiling: getContextBudgetHardCeiling(modelContextLimit),
+      });
+    }
+  );
+
+  test("per-attempt preflight blocks smaller fallback windows with exact-ceiling semantics and skips unknown limits", async () => {
+    // Common English words encode far below the 4-chars-per-token heuristic, so the
+    // heuristic is the exact estimate and the ceiling boundary is deterministic.
+    const payload = {
+      system: "s".repeat(1000),
+      messages: [{ role: "user", content: "hello world ".repeat(30_000) }],
+    };
+    const estimate = estimateAssembledRequestTokens(payload);
+    expect(
+      await checkAssembledRequestBudgetForModel(payload, {
+        model,
+        modelContextLimit: estimate + OUTPUT_RESERVE_TOKENS,
+      })
+    ).toBeUndefined();
+    expect(
+      await checkAssembledRequestBudgetForModel(payload, {
+        model,
+        modelContextLimit: estimate + OUTPUT_RESERVE_TOKENS - 1,
+      })
+    ).toEqual({ type: "context_budget_exceeded", model, estimate, hardCeiling: estimate - 1 });
+    expect(
+      await checkAssembledRequestBudgetForModel(payload, { model, modelContextLimit: undefined })
+    ).toBeUndefined();
   });
 
   test("encrypted OpenAI reasoning does not inflate either count or mutate the request", async () => {
