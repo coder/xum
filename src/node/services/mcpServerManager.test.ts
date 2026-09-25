@@ -1947,31 +1947,26 @@ describe("MCPServerManager", () => {
     const pendingRead = new Promise<Record<string, unknown>>((resolve) => {
       resolveRead = resolve;
     });
+    let reads = 0;
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: {
         keyPrefix: "plugin:",
         readToken: () => Promise.resolve("epoch-1"),
         readWorkspaceOverrides: () => {
+          reads += 1;
+          if (reads > 1) return Promise.resolve({}); // Disk after the save.
           readStarted();
           return pendingRead;
         },
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-first-serve-race";
     const pluginKey = "plugin:abc123:echo";
     configService.listServers.mockImplementation(() =>
       Promise.resolve({ [pluginKey]: stdioConfig("node server.js", true) })
     );
-    let startedPluginServer = false;
-    access.startServers = (...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      if (pluginKey in servers) {
-        startedPluginServer = true;
-      }
-      return Promise.resolve(startResult([]));
-    };
+    servers.serve("node server.js", { tools: { echo: testTool() } });
 
     const serve = manager.getToolsForWorkspace(
       workspaceRequest(workspaceId, { overrides: { enabledServers: [pluginKey] } })
@@ -1983,12 +1978,10 @@ describe("MCPServerManager", () => {
     resolveRead({ enabledServers: [pluginKey] });
 
     const result = await serve;
-    expect(startedPluginServer).toBe(false);
+    expect(servers.connectCount("node server.js")).toBe(0);
     expect(Object.keys(result.tools)).toHaveLength(0);
-    const internals = access as unknown as {
-      lastWorkspaceRequestOptions: Map<string, { overrides?: unknown }>;
-    };
-    expect(internals.lastWorkspaceRequestOptions.get(workspaceId)?.overrides).toEqual({});
+    // The serve recorded (and reports) the save's overrides, not the stale read.
+    expect(result.overridesUsed).toEqual({});
   });
 
   test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup, then retries them", async () => {
@@ -1998,91 +1991,81 @@ describe("MCPServerManager", () => {
       Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
     );
 
-    // Block startServers mid-flight so a plugin swap can land while the
-    // instance exists but is not yet published in workspaceServers.
-    let releaseStartup!: () => void;
-    const startupGate = new Promise<void>((resolve) => {
-      releaseStartup = resolve;
-    });
+    // Hold the connection mid-flight so a plugin swap can land while the
+    // instance exists but is not yet published.
+    const connecting = Promise.withResolvers<void>();
+    const startupGate = Promise.withResolvers<void>();
     const close = mock(() => Promise.resolve(undefined));
-    access.startServers = async () => {
-      await startupGate;
-      return startResult([[pluginKey, { close }]]);
-    };
+    servers.serve("node server.js", {
+      tools: { echo: testTool() },
+      connect: () => {
+        connecting.resolve();
+        return startupGate.promise;
+      },
+      close,
+    });
 
     const toolsPromise = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    // Give getToolsForWorkspace time to enter the (gated) startServers call.
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await connecting.promise;
 
     // The updater's recycle runs while startup is in flight: the scan sees
     // nothing (not yet published), so the epoch record must catch it.
     await manager.stopServersWithKeyPrefix("plugin:abc123:");
 
-    releaseStartup();
+    startupGate.resolve();
     const result = await toolsPromise;
 
     // The stale instance was closed instead of published.
     expect(close).toHaveBeenCalledTimes(1);
     expect(Object.keys(result.tools)).toEqual([]);
-    const entry = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, unknown>;
-      timedOutServerNames: string[];
-    };
-    expect(entry.instances.size).toBe(0);
+    expect(result.stats.startedServerCount).toBe(0);
 
     // The entry was published under the UNCHANGED config signature, so the
     // next call hits the cached path — the removed server must carry a retry
     // marker there, or the updated plugin's tools stay unavailable forever.
-    expect(entry.timedOutServerNames).toContain(pluginKey);
-    const echoTool = testTool();
     const close2 = mock(() => Promise.resolve(undefined));
-    access.startServers = () =>
-      Promise.resolve(startResult([[pluginKey, { tools: { echo: echoTool }, close: close2 }]]));
+    servers.serve("node server.js", { tools: { echo: testTool() }, close: close2 });
 
     const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     // Restarted from the (new) tree via the retry path — not served from the
     // reduced cached map, and not torn down again.
+    expect(servers.connectCount("node server.js")).toBe(1);
     expect(close2).toHaveBeenCalledTimes(0);
     expect(Object.keys(second.tools)).toHaveLength(1);
-    const secondEntry = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, unknown>;
-      timedOutServerNames: string[];
-    };
-    expect(secondEntry.instances.size).toBe(1);
-    expect(secondEntry.timedOutServerNames).toEqual([]);
+
+    // The retry marker cleared: the restarted instance is now served cached.
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("node server.js")).toBe(1);
+    expect(Object.keys(third.tools)).toHaveLength(1);
   });
 
   test("invalidation landing between the final epoch scan and cache publication never publishes the stale instance", async () => {
     const workspaceId = "ws-publish-race";
     const pluginKey = "plugin:abc123:echo";
+    const triggerKey = "plugin:zzz:trigger";
     configService.listServers.mockImplementation(() =>
-      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+      Promise.resolve({
+        [pluginKey]: stdioConfig("node server.js"),
+        [triggerKey]: stdioConfig("node trigger.js"),
+      })
     );
 
-    // The invalidation scan iterates the instances map ([...instances]), so a
-    // one-shot iterator hook that QUEUES a microtask runs stopServersWithKeyPrefix
-    // strictly after that scan's checks but before the awaiting continuation
-    // publishes: the stop's epoch record lands after the scan read it, and its
-    // own published-map scan runs before workspaceServers.set — the exact
-    // window where both mechanisms used to miss.
+    // The trigger's tree is swapped mid-startup, so the pre-publication scan
+    // closes it — AFTER it already checked the (sorted-first) echo key. The
+    // trigger's close invalidates the echo prefix: that epoch record lands
+    // after the scan read it, and its own published-map scan runs before
+    // publication — the exact window where both mechanisms used to miss.
     const close = mock(() => Promise.resolve(undefined));
     let stopPromise: Promise<void> | undefined;
-    const instances = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
-    let armed = true;
-    const originalIterator = instances[Symbol.iterator].bind(instances);
-    instances[Symbol.iterator] = () => {
-      if (armed) {
-        armed = false;
-        queueMicrotask(() => {
-          stopPromise = manager.stopServersWithKeyPrefix("plugin:abc123:");
-        });
-      }
-      return originalIterator();
-    };
-
-    access.startServers = () =>
-      Promise.resolve({ instances, failedServerNames: [], timedOutServerNames: [] });
+    servers.serve("node server.js", { tools: { echo: testTool() }, close });
+    servers.serve("node trigger.js", {
+      connect: () => manager.stopServersWithKeyPrefix("plugin:zzz:"),
+      close: () => {
+        stopPromise = manager.stopServersWithKeyPrefix("plugin:abc123:");
+        return Promise.resolve();
+      },
+    });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(stopPromise).toBeDefined();
@@ -2092,49 +2075,41 @@ describe("MCPServerManager", () => {
     // retry marker so the next call restarts it from the new tree.
     expect(close).toHaveBeenCalledTimes(1);
     expect(Object.keys(result.tools)).toEqual([]);
-    const entry = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, unknown>;
-      timedOutServerNames: string[];
-    };
-    expect(entry.instances.size).toBe(0);
-    expect(entry.timedOutServerNames).toContain(pluginKey);
 
-    const echoTool = testTool();
-    access.startServers = () =>
-      Promise.resolve(startResult([[pluginKey, { tools: { echo: echoTool } }]]));
+    servers.serve("node server.js", { tools: { echo: testTool() } });
+    servers.serve("node trigger.js");
     const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("node server.js")).toBe(1);
     expect(Object.keys(second.tools)).toHaveLength(1);
   });
 
   test("workspace removal landing during the invalidation scan never publishes the started servers", async () => {
     const workspaceId = "ws-removal-race";
     const pluginKey = "plugin:abc123:echo";
+    const triggerKey = "plugin:zzz:trigger";
     configService.listServers.mockImplementation(() =>
-      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+      Promise.resolve({
+        [pluginKey]: stdioConfig("node server.js"),
+        [triggerKey]: stdioConfig("node trigger.js"),
+      })
     );
 
-    // Same one-shot iterator hook as the invalidation race above, but the
-    // queued call is a removal-style stopServers(workspaceId): it bumps the
-    // stop epoch AFTER the pre-publication epoch check ran and finds no cache
-    // entry to close (publication hasn't happened) — publishing anyway would
-    // resurrect MCP processes for a removed workspace until idle cleanup.
+    // Same trigger as the invalidation race above, but its close (during the
+    // pre-publication scan) is a removal-style stopServers(workspaceId): it
+    // bumps the stop epoch AFTER the pre-publication epoch check ran and
+    // finds no cache entry to close (publication hasn't happened) —
+    // publishing anyway would resurrect MCP processes for a removed workspace
+    // until idle cleanup.
     const close = mock(() => Promise.resolve(undefined));
     let stopPromise: Promise<void> | undefined;
-    const instances = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
-    let armed = true;
-    const originalIterator = instances[Symbol.iterator].bind(instances);
-    instances[Symbol.iterator] = () => {
-      if (armed) {
-        armed = false;
-        queueMicrotask(() => {
-          stopPromise = manager.stopServers(workspaceId);
-        });
-      }
-      return originalIterator();
-    };
-
-    access.startServers = () =>
-      Promise.resolve({ instances, failedServerNames: [], timedOutServerNames: [] });
+    servers.serve("node server.js", { tools: { echo: testTool() }, close });
+    servers.serve("node trigger.js", {
+      connect: () => manager.stopServersWithKeyPrefix("plugin:zzz:"),
+      close: () => {
+        stopPromise = manager.stopServers(workspaceId);
+        return Promise.resolve();
+      },
+    });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(stopPromise).toBeDefined();
@@ -2143,51 +2118,56 @@ describe("MCPServerManager", () => {
     // Publication was skipped and the late clients were closed.
     expect(close).toHaveBeenCalledTimes(1);
     expect(Object.keys(result.tools)).toEqual([]);
-    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+
+    // Nothing was cached for the removed workspace: its next use starts afresh.
+    servers.serve("node server.js");
+    servers.serve("node trigger.js");
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("node server.js")).toBe(1);
+    expect(servers.connectCount("node trigger.js")).toBe(1);
   });
 
   test("workspace removal landing during a timed-out retry never merges into the detached entry", async () => {
     const workspaceId = "ws-retry-removal-race";
     const pluginKey = "plugin:abc123:echo";
+    const triggerKey = "plugin:zzz:trigger";
     configService.listServers.mockImplementation(() =>
-      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+      Promise.resolve({
+        [pluginKey]: stdioConfig("node server.js"),
+        [triggerKey]: stdioConfig("node trigger.js"),
+      })
     );
 
-    // First call: the server times out, so the cached entry carries a retry
-    // marker and no live instance.
-    access.startServers = () =>
-      Promise.resolve({
-        instances: new Map(),
-        failedServerNames: [],
-        timedOutServerNames: [pluginKey],
-      });
-    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    expect(access.workspaceServers.has(workspaceId)).toBe(true);
+    // First call: both servers time out, so the cached entry carries retry
+    // markers and no live instance.
+    servers.serve("node server.js", { hang: true });
+    servers.serve("node trigger.js", { hang: true });
+    const request = workspaceRequest(workspaceId);
+    const timedOut = await servers.expireStartupDeadline(
+      () => manager.getToolsForWorkspace(request),
+      2
+    );
+    expect(timedOut.stats.failedServerNames.sort()).toEqual([pluginKey, triggerKey]);
 
-    // Second call retries the timed-out server. The one-shot iterator hook
-    // queues a removal-style stopServers(workspaceId) during the retry's
-    // invalidation scan: it deletes the cache entry, so the merge callback
-    // must NOT attach these clients to the detached entry (they would have
-    // no owner to ever clean them up).
+    // Second call retries both. The trigger's close during the retry's
+    // invalidation scan is a removal-style stopServers(workspaceId): it
+    // deletes the cache entry, so the merge callback must NOT attach these
+    // clients to the detached entry (they would have no owner to ever clean
+    // them up).
     const close = mock(() => Promise.resolve(undefined));
     let stopPromise: Promise<void> | undefined;
-    const retried = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
-    let armed = true;
-    const originalIterator = retried[Symbol.iterator].bind(retried);
-    retried[Symbol.iterator] = () => {
-      if (armed) {
-        armed = false;
-        queueMicrotask(() => {
-          stopPromise = manager.stopServers(workspaceId);
-        });
-      }
-      return originalIterator();
-    };
-    access.startServers = () =>
-      Promise.resolve({ instances: retried, failedServerNames: [], timedOutServerNames: [] });
+    servers.serve("node server.js", { tools: { echo: testTool() }, close });
+    servers.serve("node trigger.js", {
+      connect: () => manager.stopServersWithKeyPrefix("plugin:zzz:"),
+      close: () => {
+        stopPromise = manager.stopServers(workspaceId);
+        return Promise.resolve();
+      },
+    });
 
     elapseTimedOutRetryBackoff();
-    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const result = await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("node server.js")).toBe(1);
     expect(stopPromise).toBeDefined();
     await stopPromise;
 
@@ -2195,7 +2175,11 @@ describe("MCPServerManager", () => {
     // entry, and the removed workspace stays uncached.
     expect(close).toHaveBeenCalledTimes(1);
     expect(Object.keys(result.tools)).toEqual([]);
-    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+    servers.serve("node server.js");
+    servers.serve("node trigger.js");
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("node server.js")).toBe(1);
+    expect(servers.connectCount("node trigger.js")).toBe(1);
   });
 
   test("stopServersWithKeyPrefix closes only matching instances and retries them on next use", async () => {
@@ -2211,14 +2195,8 @@ describe("MCPServerManager", () => {
 
     const pluginClose = mock(() => Promise.resolve(undefined));
     const userClose = mock(() => Promise.resolve(undefined));
-    const userTool = testTool();
-    access.startServers = () =>
-      Promise.resolve(
-        startResult([
-          [pluginKey, { close: pluginClose }],
-          [userServer, { tools: { toolu: userTool }, close: userClose }],
-        ])
-      );
+    servers.serve("node server.js", { tools: { echo: testTool() }, close: pluginClose });
+    servers.serve("npx user-server", { tools: { toolu: testTool() }, close: userClose });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     // Simulate a live agent stream holding the workspace's servers.
@@ -2230,73 +2208,71 @@ describe("MCPServerManager", () => {
       // survives underneath the live lease.
       expect(pluginClose).toHaveBeenCalledTimes(1);
       expect(userClose).toHaveBeenCalledTimes(0);
-      const entry = access.workspaceServers.get(workspaceId) as {
-        instances: Map<string, unknown>;
-        timedOutServerNames: string[];
-      };
-      expect(entry.instances.has(userServer)).toBe(true);
-      expect(entry.instances.has(pluginKey)).toBe(false);
-      // The stopped plugin server is queued for restart on next use.
-      expect(entry.timedOutServerNames).toContain(pluginKey);
+
+      // The stopped plugin server is queued for restart on next use, beside
+      // the still-cached user client.
+      const next = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+      expect(servers.connectCount("node server.js")).toBe(2);
+      expect(servers.connectCount("npx user-server")).toBe(1);
+      expect(Object.keys(next.tools)).toHaveLength(2);
     } finally {
       manager.releaseLease(workspaceId);
     }
   });
 
-  test("cleanupIdleServers stops idle servers when workspace is not leased", () => {
+  /**
+   * Replace the suite's manager with one whose idle sweep — reached only by
+   * a one-minute interval armed in the constructor — the test runs on demand.
+   */
+  function useManagerWithIdleSweep(): () => void {
+    const setIntervalSpy = spyOn(globalThis, "setInterval");
+    let sweep: unknown;
+    try {
+      manager.dispose();
+      manager = new MCPServerManager(configService as unknown as MCPConfigService);
+      sweep = setIntervalSpy.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+    if (typeof sweep !== "function") throw new Error("idle sweep interval was not armed");
+    return sweep as () => void;
+  }
+
+  test("cleanupIdleServers stops idle servers when workspace is not leased", async () => {
     const workspaceId = "ws-idle";
-
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd") }));
     const close = mock(() => Promise.resolve(undefined));
+    servers.serve("cmd", { close });
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    const entry = {
-      configSignature: "sig",
-      instances: new Map([["server", testInstance("server", { close })]]),
-      stats: cachedStats({
-        startedServerCount: 1,
-        failedServerCount: 0,
-        failedServerNames: [],
-        hasStdio: true,
-        transportMode: "stdio_only",
-      }),
-      lastActivity: Date.now() - 11 * 60_000,
-    };
+    setSystemTime(new Date(Date.now() + 11 * 60_000));
+    sweepIdleServers();
 
-    access.workspaceServers.set(workspaceId, entry);
-
-    access.cleanupIdleServers();
-
-    expect(access.workspaceServers.has(workspaceId)).toBe(false);
     expect(close).toHaveBeenCalledTimes(1);
+    // Evicted: the next use starts the server again.
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd")).toBe(2);
   });
 
-  test("cleanupIdleServers does not stop idle servers when workspace is leased", () => {
+  test("cleanupIdleServers does not stop idle servers when workspace is leased", async () => {
     const workspaceId = "ws-leased";
-
+    const sweepIdleServers = useManagerWithIdleSweep();
+    configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd") }));
     const close = mock(() => Promise.resolve(undefined));
-
-    const entry = {
-      configSignature: "sig",
-      instances: new Map([["server", testInstance("server", { close })]]),
-      stats: cachedStats({
-        startedServerCount: 1,
-        failedServerCount: 0,
-        failedServerNames: [],
-        hasStdio: true,
-        transportMode: "stdio_only",
-      }),
-      lastActivity: Date.now() - 11 * 60_000,
-    };
-
-    access.workspaceServers.set(workspaceId, entry);
+    servers.serve("cmd", { close });
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     manager.acquireLease(workspaceId);
 
-    // Ensure the workspace still looks idle even after acquireLease() updates activity.
-    (entry as { lastActivity: number }).lastActivity = Date.now() - 11 * 60_000;
+    // The workspace looks idle even though acquireLease() updated activity.
+    setSystemTime(new Date(Date.now() + 11 * 60_000));
+    sweepIdleServers();
 
-    access.cleanupIdleServers();
-
-    expect(access.workspaceServers.has(workspaceId)).toBe(true);
     expect(close).toHaveBeenCalledTimes(0);
+    // Still cached: the next use reuses the running server.
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd")).toBe(1);
+    manager.releaseLease(workspaceId);
   });
 
   test("startSingleServer times out when startup never finishes", async () => {
