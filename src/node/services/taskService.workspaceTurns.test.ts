@@ -47,6 +47,7 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
+  registerLiveWorkspaceTurnHandle,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
@@ -580,22 +581,19 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const taskHandleStore = new TaskHandleStore(config);
     const createdAt = "2026-06-19T00:00:00.000Z";
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "running", {
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "childworkspace",
+      "wst_handle",
+      parentId,
+      "reserved",
+      {
         createdAt,
         updatedAt: createdAt,
         createdWorkspace: true,
         attentionPolicy: "notify_on_terminal",
-      })
-    );
-    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
-      "childworkspace",
-      {
-        handleId: "wst_handle",
-        ownerWorkspaceId: parentId,
-        accepted: false,
+        turnId: "turn",
       }
     );
 
@@ -662,22 +660,19 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const taskHandleStore = new TaskHandleStore(config);
     const createdAt = "2026-06-19T00:00:00.000Z";
-    await taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "running", {
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "childworkspace",
+      "wst_handle",
+      parentId,
+      "reserved",
+      {
         createdAt,
         updatedAt: createdAt,
         createdWorkspace: true,
         attentionPolicy: "notify_on_terminal",
-      })
-    );
-    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
-      "childworkspace",
-      {
-        handleId: "wst_handle",
-        ownerWorkspaceId: parentId,
-        accepted: false,
+        turnId: "turn",
       }
     );
 
@@ -1239,24 +1234,22 @@ describe("TaskService", () => {
       sourceId: "task_done",
     });
 
-    await new TaskHandleStore(config).upsertWorkspaceTurn(
-      workspaceTurnRecord(parentId, "childworkspace", "wst_blocking_active", "running", {
-        updatedAt: "2026-06-19T00:00:00.000Z",
-        createdWorkspace: true,
-      })
-    );
-
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
       "childworkspace",
+      "wst_blocking_active",
+      parentId,
+      "reserved",
       {
-        handleId: "wst_blocking_active",
-        ownerWorkspaceId: parentId,
-        accepted: false,
+        updatedAt: "2026-06-19T00:00:00.000Z",
+        createdWorkspace: true,
+        turnId: "turn",
+        createdAt: "2026-06-19T00:00:00.000Z",
       }
     );
 

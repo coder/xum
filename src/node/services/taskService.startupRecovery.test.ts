@@ -709,7 +709,7 @@ describe("TaskService", () => {
           pausedId,
           interruptedHandle,
           parentId,
-          false
+          "reserved"
         );
       }
       try {
@@ -794,7 +794,7 @@ describe("TaskService", () => {
       "first",
       "wst_startup_batch",
       parentId,
-      false
+      "reserved"
     );
     await taskService.recoverInterruptedTasks();
     await taskService.maybeStartQueuedTasks();
@@ -902,7 +902,7 @@ describe("TaskService", () => {
           childId,
           "wst_canceled_guidance",
           parentId,
-          false
+          "reserved"
         );
         const interrupt = manager.interruptWorkspaceTurn.bind(manager);
         spyOn(manager, "interruptWorkspaceTurn").mockImplementationOnce(async (...args) => {

@@ -22,7 +22,6 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
-  workspaceTurnManagerInternals,
   workspaceTurnMuxMetadata,
   workspaceTurnRecord,
   workspaceTurnSnapshot,
@@ -265,7 +264,7 @@ describe("TaskService", () => {
       "sib-b",
       "wst_preaccept",
       "tree-root",
-      false
+      "reserved"
     );
 
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).toEqual(
@@ -279,7 +278,13 @@ describe("TaskService", () => {
 
     // Once the owner's turn is admitted (onAccepted marks the registration accepted), the same
     // target accepts peer messages.
-    await registerLiveWorkspaceTurnHandle(taskService, "sib-b", "wst_preaccept", "tree-root", true);
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "sib-b",
+      "wst_preaccept",
+      "tree-root",
+      "accepted"
+    );
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello again")).toEqual(
       Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
     );
@@ -829,7 +834,7 @@ describe("TaskService", () => {
       "tree-root",
       "wst_unaccepted_corr",
       "owner-ws",
-      false
+      "reserved"
     );
 
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
@@ -850,7 +855,7 @@ describe("TaskService", () => {
       "tree-root",
       "wst_unaccepted_corr",
       "owner-ws",
-      true
+      "accepted"
     );
     expect(
       (await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).success
@@ -916,7 +921,7 @@ describe("TaskService", () => {
       "task-b",
       "wst_stale_overlay",
       "tree-root",
-      false
+      "recovered"
     );
     const reserved = taskService
       .listTaskTreeAgents("task-a")
@@ -1879,23 +1884,21 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    await new TaskHandleStore(config).upsertWorkspaceTurn(
-      workspaceTurnRecord(parentTaskId, workspaceTurnId, workspaceTurnHandleId, "running", {
-        turnId: "turn-1",
-        updatedAt: "2026-06-19T00:00:00.000Z",
-        createdWorkspace: true,
-      })
-    );
 
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
       workspaceTurnId,
+      workspaceTurnHandleId,
+      parentTaskId,
+      "reserved",
       {
-        handleId: workspaceTurnHandleId,
-        ownerWorkspaceId: parentTaskId,
-        accepted: false,
+        turnId: "turn-1",
+        updatedAt: "2026-06-19T00:00:00.000Z",
+        createdWorkspace: true,
+        createdAt: "2026-06-19T00:00:00.000Z",
       }
     );
 
@@ -1953,23 +1956,21 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    await new TaskHandleStore(config).upsertWorkspaceTurn(
-      workspaceTurnRecord(parentTaskId, workspaceTurnId, workspaceTurnHandleId, "running", {
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      workspaceTurnId,
+      workspaceTurnHandleId,
+      parentTaskId,
+      "reserved",
+      {
         turnId: "turn-1",
         updatedAt: "2026-06-19T00:00:00.000Z",
         createdWorkspace: true,
         attentionPolicy: "notify_on_terminal",
-      })
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
-      workspaceTurnId,
-      {
-        handleId: workspaceTurnHandleId,
-        ownerWorkspaceId: parentTaskId,
-        accepted: false,
+        createdAt: "2026-06-19T00:00:00.000Z",
       }
     );
 
@@ -2009,23 +2010,21 @@ describe("TaskService", () => {
       ],
       testTaskSettings()
     );
-    await new TaskHandleStore(config).upsertWorkspaceTurn(
-      workspaceTurnRecord(parentTaskId, workspaceTurnId, workspaceTurnHandleId, "running", {
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      workspaceTurnId,
+      workspaceTurnHandleId,
+      parentTaskId,
+      "reserved",
+      {
         turnId: "turn-1",
         updatedAt: "2026-06-19T00:00:00.000Z",
         createdWorkspace: true,
         attentionPolicy: "notify_on_terminal",
-      })
-    );
-
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
-      workspaceTurnId,
-      {
-        handleId: workspaceTurnHandleId,
-        ownerWorkspaceId: parentTaskId,
-        accepted: false,
+        createdAt: "2026-06-19T00:00:00.000Z",
       }
     );
 
