@@ -1042,4 +1042,97 @@ describe("TaskService settlement receipt producers (G2)", () => {
       await expectNoReceipt(config, taskId, attemptId);
     });
   });
+
+  describe("direct create launch failure (#4553)", () => {
+    const direct = {
+      parentWorkspaceId: midId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "go",
+      title: "D",
+    } as const;
+
+    function failingSanitizeHarness(config: Config) {
+      const { workspaceService } = createWorkspaceServiceMocks();
+      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve("sanitize failed")
+      );
+      return createHarness(config, { workspaceService });
+    }
+
+    test("a failure before the send is admitted writes the receipt, and a restart proves the successor", async () => {
+      const spawnedId = "directnosend";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService, svc } = failingSanitizeHarness(config);
+      expect((await taskService.create(direct)).success).toBe(false);
+      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
+      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        attemptId,
+        phase: "settled",
+        source: "launch-failed",
+      });
+      await expectReceiptEverywhere(config, spawnedId, attemptId, "launch-failed", false);
+      const restartedConfig = await createTestConfig(rootDir);
+      const restarted = createHarness(restartedConfig);
+      expect(await restarted.taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
+      expect(restarted.svc.ownedAttemptByTaskId.get(spawnedId)?.receiptEligible).toBe(true);
+      expect(entryOf(restartedConfig, spawnedId)?.taskAttemptUnproven).toBeUndefined();
+    });
+
+    test("a failure after the send was admitted settles in memory only", async () => {
+      const spawnedId = "directsent";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { workspaceService } = createWorkspaceServiceMocks({
+        // Admitted, then failed without leaving work behind (the idle failure branch).
+        sendMessage: mock(
+          (
+            _id: string,
+            _prompt: string,
+            _options: unknown,
+            internal?: { turnAdmission?: TurnAdmissionToken }
+          ): Promise<Result<void>> => {
+            internal?.turnAdmission?.onDisposed("no-work");
+            return Promise.resolve(Err("provider unavailable"));
+          }
+        ),
+      });
+      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve(undefined)
+      );
+      const { taskService, svc } = createHarness(config, { workspaceService });
+      expect((await taskService.create(direct)).success).toBe(false);
+      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        attemptId,
+        phase: "settled",
+        source: "launch-failed",
+      });
+      await expectNoReceipt(config, spawnedId, attemptId);
+    });
+
+    test("crash cut: a blocked receipt write leaves the failed launch closing", async () => {
+      const spawnedId = "directcut";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      // The outermost owner is written first: blocking it leaves no copy anywhere.
+      const blocker = path.join(ownerDir(config, rootId), "subagent-attempt-settlements");
+      await fsPromises.mkdir(path.dirname(blocker), { recursive: true });
+      await fsPromises.writeFile(blocker, "not a directory", "utf-8");
+      const { taskService, svc } = failingSanitizeHarness(config);
+      expect((await taskService.create(direct)).success).toBe(false);
+      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        attemptId,
+        phase: "closing",
+      });
+      expect(
+        await taskService.readAttemptOutcome(spawnedId, { requestingWorkspaceId: midId })
+      ).toEqual({ kind: "cleanup-pending" });
+      await fsPromises.rm(blocker);
+      await expectNoReceipt(config, spawnedId, attemptId);
+    });
+  });
 });
