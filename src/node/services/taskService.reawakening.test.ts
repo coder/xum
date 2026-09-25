@@ -955,7 +955,9 @@ describe("TaskService", () => {
       });
       return Ok(undefined);
     });
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ unarchive });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      unarchiveWhileTaskTreeLocked: unarchive,
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     const reactivated = await taskService.sendMessageToDescendantAgentTask(
