@@ -1,5 +1,4 @@
 import { describe, expect, test, mock, afterEach, spyOn } from "bun:test";
-import { EventEmitter } from "events";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -8,19 +7,12 @@ import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { MemorySessionContext } from "./memoryService";
 import type { AgentSession, AgentSessionAIService } from "./agentSession";
-import {
-  createStreamLifecycleMocks,
-  createAgentSessionHarness,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { HistoryService } from "./historyService";
-import type { InitStateManager } from "./initStateManager";
-import { DisposableTempDir } from "./tempDir";
 import { createTestHistoryService } from "./testHistoryService";
 
 /**
@@ -32,60 +24,23 @@ import { createTestHistoryService } from "./testHistoryService";
 
 const WORKSPACE_ID = "workspace-hot-memories-test";
 
-function createSession(args: {
+async function createSession(args: {
   historyService: HistoryService;
-  sessionDir: string;
+  config: Config;
   buildMemorySessionContext: AIService["buildMemorySessionContext"];
   isExperimentEnabled?: AIService["isExperimentEnabled"];
-}): AgentSession {
-  const aiEmitter = new EventEmitter();
-  const aiService: AIService = {
-    ...createStreamLifecycleMocks(),
-    on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-      aiEmitter.on(String(eventName), listener);
-      return this;
-    },
-    off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-      aiEmitter.off(String(eventName), listener);
-      return this;
-    },
-    getWorkspaceMetadata: mock(() =>
-      Promise.resolve({ success: false as const, error: "metadata unavailable" })
-    ),
-    stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-    buildMemorySessionContext: args.buildMemorySessionContext,
-    isExperimentEnabled: args.isExperimentEnabled ?? (() => false),
-  } as unknown as AIService;
-
-  const initStateManager: InitStateManager = {
-    on() {
-      return this;
-    },
-    off() {
-      return this;
-    },
-  } as unknown as InitStateManager;
-
-  const backgroundProcessManager: BackgroundProcessManager = {
-    setMessageQueued: mock(() => undefined),
-    cleanup: mock(() => Promise.resolve()),
-  } as unknown as BackgroundProcessManager;
-
-  const config: Config = {
-    rootDir: path.dirname(args.sessionDir),
-    sessionsDir: path.dirname(args.sessionDir),
-    srcDir: "/tmp",
-    loadConfigOrDefault: mock(() => ({})),
-  } as unknown as Config;
-
-  return createTestAgentSession({
+}): Promise<AgentSession> {
+  const { session } = await createAgentSessionHarness({
     workspaceId: WORKSPACE_ID,
-    config,
+    config: args.config,
     historyService: args.historyService,
-    aiService,
-    initStateManager,
-    backgroundProcessManager,
+    aiServiceOverrides: {
+      getWorkspaceMetadata: mock(() => Promise.resolve(Err("metadata unavailable"))),
+      buildMemorySessionContext: args.buildMemorySessionContext,
+      isExperimentEnabled: args.isExperimentEnabled ?? (() => false),
+    },
   });
+  return session;
 }
 
 interface PrivateSessionAccess {
@@ -112,8 +67,7 @@ describe("AgentSession memory context", () => {
   });
 
   test("computes the context once for a model and reuses it across turns", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-context");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const context: MemorySessionContext = {
@@ -121,9 +75,9 @@ describe("AgentSession memory context", () => {
       hotMemoriesBlock: "<hot_memories>v1</hot_memories>",
     };
     const buildMemorySessionContext = mock(() => Promise.resolve(context));
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -144,8 +98,7 @@ describe("AgentSession memory context", () => {
   });
 
   test("does not cache a context whose build overlapped an invalidation", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-context-race");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     let release!: () => void;
@@ -158,9 +111,9 @@ describe("AgentSession memory context", () => {
       if (calls === 1) await gate;
       return calls === 1 ? stale : fresh;
     });
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -184,8 +137,7 @@ describe("AgentSession memory context", () => {
   });
 
   test("upgrades an index-only memory context when hot memories are requested", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-context-upgrade");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const buildMemorySessionContext = mock(
@@ -198,9 +150,9 @@ describe("AgentSession memory context", () => {
               : `<hot_memories>${modelString}</hot_memories>`,
         })
     );
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -223,8 +175,7 @@ describe("AgentSession memory context", () => {
   });
 
   test("caches memory context separately per model", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-context-model");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const buildMemorySessionContext = mock((_workspaceId: string, modelString: string) =>
@@ -233,9 +184,9 @@ describe("AgentSession memory context", () => {
         hotMemoriesBlock: `<hot_memories>${modelString}</hot_memories>`,
       })
     );
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -257,14 +208,13 @@ describe("AgentSession memory context", () => {
   });
 
   test("caches the absence of memory context without re-querying per turn", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-context-null");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const buildMemorySessionContext = mock(() => Promise.resolve(null));
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -279,8 +229,7 @@ describe("AgentSession memory context", () => {
   });
 
   test("invalidates mode and Memory/HotSet gate changes without losing model-specific caching", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-additive-memory-cache");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
     let memoryEnabled = true;
     let hotSetEnabled = true;
@@ -298,9 +247,9 @@ describe("AgentSession memory context", () => {
             : null
         )
     );
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
       isExperimentEnabled: (id) =>
         (id === EXPERIMENT_IDS.MEMORY && memoryEnabled) ||
@@ -449,8 +398,7 @@ describe("AgentSession memory context", () => {
   });
 
   test("recomputes the context after a compaction boundary is consumed", async () => {
-    using sessionDir = new DisposableTempDir("agent-session-memory-context-compaction");
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     let version = 1;
@@ -460,9 +408,9 @@ describe("AgentSession memory context", () => {
         hotMemoriesBlock: `<hot_memories>v${version}</hot_memories>`,
       })
     );
-    const session = createSession({
+    const session = await createSession({
       historyService,
-      sessionDir: path.join(sessionDir.path, WORKSPACE_ID),
+      config,
       buildMemorySessionContext,
     });
     const priv = session as unknown as PrivateSessionAccess;
@@ -474,7 +422,7 @@ describe("AgentSession memory context", () => {
 
       // Consume a pending compaction boundary (first stream after compaction).
       version = 2;
-      await writePendingPostCompactionState(path.join(sessionDir.path, WORKSPACE_ID));
+      await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
       await priv.getPostCompactionAttachmentsIfNeeded();
 
       expect((await priv.resolveMemoryContext("test-model"))?.hotMemoriesBlock).toBe(
