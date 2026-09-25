@@ -18,7 +18,7 @@ import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { HistoryService } from "@/node/services/historyService";
-import type { InitStateManager } from "@/node/services/initStateManager";
+import { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
@@ -85,8 +85,12 @@ function createMockBackgroundProcessManager(
   } as unknown as BackgroundProcessManager;
 }
 
-function createMockInitStateManager(overrides?: Partial<InitStateManager>): InitStateManager {
-  return Object.assign(new EventEmitter(), overrides) as unknown as InitStateManager;
+/** Real manager (no init runs recorded) with per-test method overrides applied on top. */
+function createTestInitStateManager(
+  config: Config,
+  overrides?: Partial<InitStateManager>
+): InitStateManager {
+  return Object.assign(new InitStateManager(config), overrides);
 }
 
 /** Stream-lifecycle surface AgentSession's constructor requires from its engine seam. */
@@ -249,11 +253,11 @@ export async function seedAutoCompactionThreshold(
 export async function createAgentSessionHarness(
   options: AgentSessionHarnessOptions
 ): Promise<AgentSessionHarness> {
-  // A caller-owned HistoryService must come with the Config that owns its sessions dir;
-  // pairing it with a stand-in config would split session state across two roots.
+  // A caller-owned HistoryService must come with the Config that owns its sessions dir (and
+  // vice versa); pairing either with a temp stand-in would split session state across roots.
   assert(
-    options.historyService == null || options.config != null,
-    "createAgentSessionHarness: pass config together with historyService"
+    (options.historyService == null) === (options.config == null),
+    "createAgentSessionHarness: pass config and historyService together"
   );
   const testHistory = options.historyService ? undefined : await createTestHistoryService();
   const historyService = options.historyService ?? testHistory!.historyService;
@@ -267,7 +271,8 @@ export async function createAgentSessionHarness(
         overrides: options.aiServiceOverrides,
       });
   const initStateManager =
-    options.initStateManager ?? createMockInitStateManager(options.initStateManagerOverrides);
+    options.initStateManager ??
+    createTestInitStateManager(config, options.initStateManagerOverrides);
   const backgroundProcessManager =
     options.backgroundProcessManager ??
     createMockBackgroundProcessManager(options.backgroundProcessManagerOverrides);
