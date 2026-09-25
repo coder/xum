@@ -443,10 +443,6 @@ describe("AgentSession continuous compaction wiring", () => {
           historyService: h.historyService,
         });
         try {
-          // Recovery must precede retry; this fixture has no provider engine to resume.
-          Reflect.set(restarted.session, "scheduleStartupAutoRetryIfNeeded", () =>
-            Promise.resolve("completed")
-          );
           await restarted.session.runStartupRecovery();
           expect((await rows(restarted))[0].id).toBe(journal.boundary.id);
           expect(await store.read()).toBeNull();
@@ -511,17 +507,31 @@ describe("AgentSession continuous compaction wiring", () => {
       order.push("journal");
       return read();
     });
-    let retryChecks = 0;
-    Reflect.set(h.session, "scheduleStartupAutoRetryIfNeeded", async () => {
-      const history = await rows(h);
-      expect(history[0].id).toBe(journal.boundary.id);
-      expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
-      retryChecks++;
-      return "completed";
+    // The real startup retry resumes the recovered (still partial) live tail; the history it
+    // schedules against must already be the folded one.
+    // Read history when the retry is scheduled, but await the read from the test body so a
+    // failed read fails the test instead of leaving the deferred pending.
+    const retryScheduled = deferred<void>();
+    let historyAtRetry: Promise<MuxMessage[]> | undefined;
+    h.session.onChatEvent(({ message }) => {
+      if ("type" in message && message.type === "auto-retry-scheduled") {
+        order.push("retry");
+        historyAtRetry = rows(h);
+        // Marked handled here; the await below still rethrows a rejection.
+        historyAtRetry.catch(() => undefined);
+        retryScheduled.resolve();
+      }
     });
     await h.session.runStartupRecovery();
+    await retryScheduled.promise;
+    if (historyAtRetry === undefined) throw new Error("auto-retry-scheduled never fired");
+    const history = await historyAtRetry;
+    expect(history[0].id).toBe(journal.boundary.id);
+    expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
     expect(order.slice(0, 2)).toEqual(["commit", "journal"]);
-    expect(retryChecks).toBe(1);
+    expect(order.filter((step) => step === "retry")).toHaveLength(1);
+    expect(order.indexOf("retry")).toBeGreaterThan(order.indexOf("journal"));
+    expect(h.session.hasPendingAutoRetry()).toBe(true);
     expect(await store.read()).toBeNull();
   });
 
@@ -529,6 +539,15 @@ describe("AgentSession continuous compaction wiring", () => {
     "consumed swaps do not bypass the mid-stream %s guard",
     async (guard) => {
       const h = await setup();
+      if (guard === "compaction-request") {
+        // A real compaction turn owns the stream (its request stays active until stream end).
+        const compacting = await h.session.sendMessage("Summarize the conversation", {
+          model,
+          agentId: "compact",
+          muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+        });
+        expect(compacting.success).toBe(true);
+      }
       const state = internals(h.session);
       state.activeStreamContext = {
         modelString: model,
@@ -538,9 +557,6 @@ describe("AgentSession continuous compaction wiring", () => {
           experiments: { continuousCompaction: false, tokenBudget: guard === "token-budget" },
         },
       };
-      if (guard === "compaction-request") {
-        Reflect.set(h.session, "activeCompactionRequest", { id: "manual-compact" });
-      }
       const strategy = continuous(h.session);
       spyOn(strategy.continuousCompactor, "hasConsumedSwap").mockReturnValue(true);
       const observation = spyOn(strategy, "runContinuousCompactionObservation");
@@ -601,22 +617,23 @@ describe("AgentSession continuous compaction wiring", () => {
         shouldPersist: () => true,
       })
     ).toBe(true);
-    await h.historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("legacy-request", "user", "Please compact", {
-        muxMetadata: {
-          type: "compaction-request",
-          rawCommand: "/compact",
-          parsed: { followUpContent: { text: "Current saved follow-up", model, agentId: "exec" } },
-        },
-      })
-    );
-    Reflect.set(h.session, "activeCompactionRequest", { id: "legacy-request", modelString: model });
-    const completion = h.session.waitForPendingCompactionCompletionDecision("legacy-summary");
+    // A later legacy /compact turn, sent for real, owns the active compaction request.
+    const compacting = await h.session.sendMessage("Please compact", {
+      model,
+      agentId: "compact",
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: { followUpContent: { text: "Current saved follow-up", model, agentId: "exec" } },
+      },
+    });
+    expect(compacting.success).toBe(true);
+    const summaryId = "test-assistant-message";
+    const completion = h.session.waitForPendingCompactionCompletionDecision(summaryId);
     void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
       workspaceId,
-      messageId: "legacy-summary",
+      messageId: summaryId,
       metadata: { model, agentId: "compact", finishReason: "stop" },
       parts: [{ type: "text", text: "Legacy summary" }],
     });
@@ -848,7 +865,8 @@ describe("AgentSession continuous compaction wiring", () => {
       parts: [],
       toolCompletionTimestamps: new Map(),
     });
-    Reflect.set(Reflect.get(h.session, "streamManager"), "getPrefixSwapState", () => "invalidated");
+    // The harness injects aiService as the session's stream manager; give it the swap probe.
+    Object.assign(h.aiService, { getPrefixSwapState: () => "invalidated" as const });
     spyOn(compactor, "waitForIdle").mockImplementationOnce(() =>
       Promise.reject(new Error("apply wait failed"))
     );
