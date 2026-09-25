@@ -17,7 +17,7 @@ import {
 } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
-import type { AgentSession } from "./agentSession";
+import type { AgentSession, AgentSessionStreamManager } from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
@@ -30,6 +30,7 @@ import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
+import { eventSpine } from "./events/eventSpine";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -104,15 +105,17 @@ function deferred<T>() {
 
 describe("AgentSession continuous compaction wiring", () => {
   let harness: AgentSessionHarness | undefined;
+  const unregisterHooks: Array<() => void> = [];
   afterEach(async () => {
+    for (const unregister of unregisterHooks.splice(0)) unregister();
     await harness?.session.dispose();
     await harness?.cleanup();
     harness = undefined;
     mock.restore();
   });
 
-  async function setup(usagePercent = 0) {
-    harness = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+  async function setup(usagePercent = 0, streamManager?: AgentSessionStreamManager) {
+    harness = await createAgentSessionHarness({ workspaceId, captureEvents: true, streamManager });
     if (usagePercent > 0) {
       await harness.historyService.appendToHistory(
         workspaceId,
@@ -137,6 +140,44 @@ describe("AgentSession continuous compaction wiring", () => {
     const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) throw new Error(history.error);
     return history.data;
+  }
+
+  /**
+   * Routes the session's real continuous-compaction collaborators to scripted inputs: the
+   * eager `compaction.prepare` hook point runs `prepare`, and the real summarizer streams from a
+   * mock pinned model once `beforeSummary` settles.
+   */
+  function scriptContinuousWork(
+    h: AgentSessionHarness,
+    work: { prepare?: () => Promise<void>; beforeSummary?: () => Promise<void> } = {}
+  ) {
+    spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Ok({
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "continuous-test",
+        projectPath: h.config.rootDir,
+        runtimeConfig: { type: "local" },
+      })
+    );
+    const sdkModel = new MockLanguageModelV3({
+      doStream: async () => {
+        await work.beforeSummary?.();
+        return { stream: simulateReadableStream({ chunks: modelChunks() }) };
+      },
+    });
+    spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+      Ok(pinnedSummaryModel(sdkModel, model))
+    );
+    unregisterHooks.push(
+      eventSpine.useBefore(
+        "compaction.prepare",
+        async (ctx) => {
+          if (ctx.reason === "continuous-eager") await work.prepare?.();
+        },
+        { workspaceId }
+      )
+    );
   }
 
   async function appendBoundary(
@@ -167,9 +208,6 @@ describe("AgentSession continuous compaction wiring", () => {
         expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
       }
       const compactor = continuous(h.session).continuousCompactor;
-      const deps = Reflect.get(compactor, "deps") as ConstructorParameters<
-        typeof ContinuousCompactor
-      >[0];
       const { coordinator } = h.session as unknown as { coordinator: TurnCoordinator };
       const enterExecution = coordinator.enterExecution.bind(coordinator);
       const releases: Array<ReturnType<typeof mock<() => void>>> = [];
@@ -180,9 +218,12 @@ describe("AgentSession continuous compaction wiring", () => {
         releases.push(release);
         return { [Symbol.dispose]: release };
       });
-      deps.prepare = () => Promise.resolve();
-      deps.estimateAttachmentTokens = () => Promise.resolve(0);
-      deps.summarize = () => Promise.resolve({ text: "Earlier work summarized", model });
+      // Each test scripts the real eager work: the prepare hook point and the summary model.
+      const work: { prepare?: () => Promise<void>; beforeSummary?: () => Promise<void> } = {};
+      scriptContinuousWork(h, {
+        prepare: () => work.prepare?.() ?? Promise.resolve(),
+        beforeSummary: () => work.beforeSummary?.() ?? Promise.resolve(),
+      });
       async function start() {
         await compactor.observe(60, {
           enabled: true,
@@ -194,14 +235,14 @@ describe("AgentSession continuous compaction wiring", () => {
         const job = Reflect.get(compactor, "job") as { done: Promise<void> };
         return { done: job.done };
       }
-      return { h, compactor, deps, coordinator, releases, start };
+      return { h, compactor, work, coordinator, releases, start };
     }
 
     for (const phase of ["prepare", "summarize"] as const) {
       test.each(["complete", "reject", "reset", "shutdown", "dispose"] as const)(
         `retains eager ${phase} execution until the original Promise settles: %s`,
         async (outcome) => {
-          const { h, compactor, deps, coordinator, releases, start } = await setupEager();
+          const { h, compactor, work: scripted, coordinator, releases, start } = await setupEager();
           const entered = deferred<void>();
           const release = deferred<void>();
           async function work() {
@@ -209,12 +250,8 @@ describe("AgentSession continuous compaction wiring", () => {
             await release.promise;
             if (outcome === "reject") throw new Error("eager work failed");
           }
-          if (phase === "prepare") deps.prepare = work;
-          else
-            deps.summarize = async () => {
-              await work();
-              return { text: "Earlier work summarized", model };
-            };
+          if (phase === "prepare") scripted.prepare = work;
+          else scripted.beforeSummary = work;
           const job = await start();
           let shutdown: Promise<void> | undefined;
           try {
@@ -262,11 +299,11 @@ describe("AgentSession continuous compaction wiring", () => {
     }
 
     test("reset permits replacement work without releasing either job's physical ownership", async () => {
-      const { h, compactor, deps, releases, start } = await setupEager();
+      const { h, compactor, work, releases, start } = await setupEager();
       const first = deferred<void>();
       const second = deferred<void>();
       let preparations = 0;
-      deps.prepare = () => (preparations++ === 0 ? first.promise : second.promise);
+      work.prepare = () => (preparations++ === 0 ? first.promise : second.promise);
       const original = await start();
       compactor.reset("threshold-changed");
       const replacement = await start();
@@ -299,7 +336,30 @@ describe("AgentSession continuous compaction wiring", () => {
     "failed-consumed-apply",
     "dispose-during-finalization",
   ] as const)("%s commits a consumed journal before retry or new work", async (mode) => {
-    const h = await setup();
+    // The session's stream manager (and so the compactor's) sees the live source stream once
+    // the source row exists.
+    let streaming = false;
+    let swap: ContinuousPrefixSwap | undefined;
+    const h = await setup(0, {
+      isStreaming: () => streaming,
+      getStreamInfo: () =>
+        streaming
+          ? {
+              messageId: source.id,
+              parts: source.parts,
+              stepStartIndices: [0, 1, 2],
+              currentStepStartIndex: 2,
+              toolCompletionTimestamps: new Map(),
+            }
+          : undefined,
+      setPrefixSwap: (_id, value) => {
+        swap = value;
+        return true;
+      },
+      getPrefixSwapState: () => (streaming ? (swap?.consumed ? "consumed" : "pending") : "none"),
+      stopStream: () => Promise.resolve(Ok(undefined)),
+      replayStream: () => Promise.resolve(),
+    });
     const source = createMuxMessage("live-answer", "assistant", "", {
       partial: true,
       stepStartPartIndices: [0, 1, 2],
@@ -324,32 +384,14 @@ describe("AgentSession continuous compaction wiring", () => {
     ]) {
       expect((await h.historyService.appendToHistory(workspaceId, row)).success).toBe(true);
     }
+    streaming = true;
     const compactor = continuous(h.session).continuousCompactor;
+    scriptContinuousWork(h);
     const deps = Reflect.get(compactor, "deps") as ConstructorParameters<
       typeof ContinuousCompactor
     >[0];
-    let streaming = true;
-    let swap: ContinuousPrefixSwap | undefined;
-    deps.streamManager = {
-      isStreaming: () => streaming,
-      getStreamInfo: () =>
-        streaming
-          ? {
-              messageId: source.id,
-              parts: source.parts,
-              stepStartIndices: [0, 1, 2],
-              currentStepStartIndex: 2,
-            }
-          : undefined,
-      setPrefixSwap: (_id, value) => {
-        swap = value;
-        return true;
-      },
-      getPrefixSwapState: () => (streaming ? (swap?.consumed ? "consumed" : "pending") : "none"),
-    };
-    deps.prepare = () => Promise.resolve();
-    deps.estimateAttachmentTokens = () => Promise.resolve(0);
-    deps.summarize = () => Promise.resolve({ text: "Earlier work summarized", model });
+    // Kept private: the real prepareSwap reads the live turn's captured send options, and this
+    // scenario has no session turn (a real one would take the terminal paths driven below).
     deps.prepareSwap = () =>
       Promise.resolve({
         preparation: {
@@ -382,6 +424,8 @@ describe("AgentSession continuous compaction wiring", () => {
     if (mode === "threshold-terminal") compactor.reset("threshold-changed");
     if (mode === "disabled-terminal") compactor.reset("disabled");
     if (mode === "disabled-usage-terminal") {
+      // Kept private: a real send here would be queued behind the live source stream, so the
+      // disabled usage observation needs the turn context seeded directly (cleared below).
       internals(h.session).activeStreamContext = {
         modelString: model,
         providersConfig: null,
@@ -582,14 +626,36 @@ describe("AgentSession continuous compaction wiring", () => {
   );
 
   test("does not activate a prefix without the captured options required by fast-stop fallback", async () => {
-    const h = await setup();
-    internals(h.session).activeStreamContext = { modelString: model, providersConfig: null };
+    // The stream manager always has a preparation, so only the captured send options gate it.
+    const h = await setup(0, {
+      isStreaming: () => false,
+      getStreamInfo: () => undefined,
+      getPrefixSwapPreparation: () => ({
+        requestProviderOptions: undefined,
+        preparation: {
+          modelString: model,
+          providerForMessages: "openai",
+          effectiveAgentId: "exec",
+          effectiveThinkingLevel: "off",
+          toolNamesForSentinel: [],
+          anthropicCacheTtl: undefined,
+        },
+        systemPrefix: [],
+        cacheEnabled: false,
+      }),
+      stopStream: () => Promise.resolve(Ok(undefined)),
+      replayStream: () => Promise.resolve(),
+    });
     const deps = Reflect.get(
       continuous(h.session).continuousCompactor,
       "deps"
     ) as ConstructorParameters<typeof ContinuousCompactor>[0];
     assert(deps.prepareSwap !== undefined, "Expected session prefix preparation");
+    // No turn has captured send options yet.
     expect(await deps.prepareSwap([])).toBeNull();
+    // A real send captures them for its live turn.
+    expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+    expect(await deps.prepareSwap([])).toMatchObject({ attachments: [], cacheEnabled: false });
   });
 
   test("resumeless continuous fold cannot divert a later legacy compaction's saved follow-up", async () => {
@@ -796,6 +862,15 @@ describe("AgentSession continuous compaction wiring", () => {
     });
   }
 
+  /** Starts a real turn through sendMessage; its provider stream stays live until stopped. */
+  async function startLiveTurn(h: AgentSessionHarness) {
+    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      startStream(h);
+      return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+    });
+    expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+  }
+
   function endStream(h: AgentSessionHarness) {
     void runSessionTerminalPolicy(h.session, h.aiEmitter, {
       type: "stream-end",
@@ -854,11 +929,7 @@ describe("AgentSession continuous compaction wiring", () => {
     };
     process.on("unhandledRejection", onUnhandled);
     let streaming = true;
-    internals(h.session).activeStreamContext = {
-      modelString: model,
-      options: sendOptions,
-      providersConfig: null,
-    };
+    await startLiveTurn(h);
     spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
     spyOn(h.aiService, "getStreamInfo").mockReturnValue({
       messageId: "live-assistant",
@@ -884,7 +955,6 @@ describe("AgentSession continuous compaction wiring", () => {
       return Promise.resolve(Ok(undefined));
     });
     try {
-      startStream(h);
       h.aiEmitter.emit("prefix-swap-invalidated", {
         type: "prefix-swap-invalidated",
         workspaceId,
@@ -906,11 +976,7 @@ describe("AgentSession continuous compaction wiring", () => {
   test("duplicate invalidations wait for the owner and never clear another observation's flags", async () => {
     const h = await setup();
     let streaming = true;
-    internals(h.session).activeStreamContext = {
-      modelString: model,
-      options: sendOptions,
-      providersConfig: null,
-    };
+    await startLiveTurn(h);
     spyOn(h.aiService, "isStreaming").mockImplementation(() => streaming);
     spyOn(h.aiService, "getStreamInfo").mockReturnValue({
       messageId: "live-assistant",
@@ -927,7 +993,6 @@ describe("AgentSession continuous compaction wiring", () => {
     const observe = spyOn(continuous(h.session).continuousCompactor, "observe").mockImplementation(
       () => {
         streaming = false;
-        internals(h.session).activeStreamContext = undefined;
         invoked.resolve();
         return Promise.resolve("none");
       }
