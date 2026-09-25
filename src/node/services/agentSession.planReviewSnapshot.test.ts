@@ -14,6 +14,9 @@ import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSess
 import { HistoryService } from "./historyService";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import type { TurnCompletion } from "./streamManager";
+import type { StreamMessageOptions } from "./turnRequestBuilder";
+import { createProposePlanTool } from "./tools/propose_plan";
+import { TestTempDir, createTestToolConfig } from "./tools/testHelpers";
 import { createTestHistoryService } from "./testHistoryService";
 
 const model = "openai:gpt-4o";
@@ -374,6 +377,80 @@ describe("AgentSession plan-review snapshot capture", () => {
       expect(compacted.success).toBe(true);
     });
     expect(rows).toHaveLength(1);
+  });
+
+  test("a turn-owned capture snapshots the bytes propose_plan validated, not a later edit", async () => {
+    const workspaceId = "session-plan-capture-proposed-bytes";
+    const proposed = "# Plan\n\nAs proposed.\n";
+    const planPath = await writePlan(workspaceId, proposed);
+    using toolDir = new TestTempDir("plan-capture-proposed-bytes");
+    const emitter = new EventEmitter();
+    const settled = Promise.withResolvers<void>();
+    const completion = Promise.withResolvers<TurnCompletion>();
+    let proposalResult: unknown;
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      onTurnSettled: () => settled.resolve(),
+      aiServiceOverrides: {
+        streamMessage: mock(async (opts: StreamMessageOptions) => {
+          emitter.emit("stream-start", {
+            type: "stream-start",
+            workspaceId,
+            messageId: "assistant-1",
+            model,
+            startTime: Date.now(),
+          });
+          // The real tool, given the callbacks the session hands to this stream's tools.
+          const tool = createProposePlanTool({
+            ...createTestToolConfig(toolDir.path),
+            planFilePath: planPath,
+            recordProposedPlan: opts.recordProposedPlan,
+          });
+          proposalResult = await tool.execute!(
+            {},
+            { toolCallId: "call-plan", messages: [], context: undefined }
+          );
+          return Ok({ messageId: "assistant-1", completion: completion.promise });
+        }),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadataFor(workspaceId)))),
+      },
+    });
+    try {
+      expect((await h.session.sendMessage("propose", sendOptions)).success).toBe(true);
+      // Edited after propose_plan read and validated it, before the capture runs.
+      await fs.writeFile(planPath, "# Plan\n\nEdited afterwards.\n");
+      emitter.emit("tool-call-end", {
+        type: "tool-call-end",
+        workspaceId,
+        messageId: "assistant-1",
+        toolCallId: "call-plan",
+        toolName: "propose_plan",
+        result: proposalResult,
+        timestamp: Date.now(),
+      });
+      completion.resolve({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model },
+          parts: [{ type: "text", text: "Proposed." }],
+        },
+      });
+      await settled.promise;
+      const state = await getPlanReviewState(h.historyService, workspaceId);
+      expect(state.success).toBe(true);
+      if (!state.success) return;
+      expect(
+        state.data.snapshots.map((snapshot) => [snapshot.proposalToolCallId, snapshot.content])
+      ).toEqual([["call-plan", proposed]]);
+      expect(state.data.snapshots[0].planPath).toBe(planPath);
+    } finally {
+      completion.resolve({ status: "aborted", abortReason: "user" });
+      await h.session.dispose();
+      await h.cleanup();
+    }
   });
 
   test("ensurePlanSnapshot refuses an aborted capture at append admission, after the read", async () => {

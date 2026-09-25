@@ -1048,6 +1048,14 @@ export class AgentSession {
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedProviderToolEndAbortInFlight = false;
   private readonly activeToolCallIds = new Set<string>();
+  /**
+   * Plan bytes each successful propose_plan read and validated, by tool call (see
+   * ToolConfiguration.recordProposedPlan); consumed by that proposal's snapshot capture.
+   */
+  private readonly proposedPlanContents = new Map<string, string>();
+  private readonly recordProposedPlan = (toolCallId: string, content: string): void => {
+    this.proposedPlanContents.set(toolCallId, content);
+  };
   /** In-flight propose_plan snapshot captures; completion policy settles them (see policy). */
   private readonly pendingPlanSnapshots = new Set<{
     promise: Promise<void>;
@@ -5865,6 +5873,7 @@ export class AgentSession {
           messages
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
+        recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments: null,
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(
@@ -7682,6 +7691,7 @@ export class AgentSession {
           ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
           : streamMuxMetadata,
         recordFileState,
+        recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments,
         // Invoked by AIService after runtime.ensureReady() (project-scope
         // listing needs a running runtime). Still ordered after the
@@ -9965,6 +9975,10 @@ export class AgentSession {
     // this turn) refuses it, while the turn's own rollovers advance this live capture in place
     // (advanceOwnedCompactionAdmission) and compaction leaves it alone.
     const frontier = this.activeStreamContext?.admissionCapture;
+    // The bytes propose_plan validated, not a re-read of the mutable plan file. Absent only when
+    // the tool did not run here (e.g. a delegated result); then the file is read as before.
+    const proposedContent = this.proposedPlanContents.get(proposalToolCallId);
+    this.proposedPlanContents.delete(proposalToolCallId);
     try {
       // Guard for test mocks that may not implement getWorkspaceMetadata.
       if (typeof this.aiService.getWorkspaceMetadata !== "function") return;
@@ -9995,6 +10009,7 @@ export class AgentSession {
           proposalToolCallId,
           signal: captureSignal,
           ...(frontier !== undefined ? { frontier } : {}),
+          ...(proposedContent !== undefined ? { proposedContent } : {}),
         }
       );
       if (!result.success) {

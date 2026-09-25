@@ -38,6 +38,7 @@ import {
   createRuntimeForWorkspace,
   type WorkspaceMetadataForRuntime,
 } from "@/node/runtime/runtimeHelpers";
+import { getPlanFilePath } from "@/common/utils/planStorage";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 
 import type { HistoryService } from "./historyService";
@@ -79,6 +80,12 @@ export interface EnsurePlanSnapshotArgs {
    * rollovers. When omitted (on-demand), the generation is read before the plan read.
    */
   frontier?: { readonly generation: string | undefined };
+  /**
+   * The exact plan bytes the proposal read and validated (turn-owned captures, handed over by
+   * propose_plan through a backend-owned callback). When set, the mutable plan file is not
+   * re-read, so an edit after the proposal cannot be snapshotted as the proposal.
+   */
+  proposedContent?: string;
 }
 
 export interface EnsurePlanSnapshotResult {
@@ -232,12 +239,22 @@ export async function ensurePlanSnapshot(
     frontier = { generation: captured.data.generation };
   }
   const runtime = createRuntimeForWorkspace(args.metadata);
-  const plan = await readPlanFile(
-    runtime,
-    args.metadata.name,
-    args.metadata.projectName,
-    args.workspaceId
-  );
+  const plan =
+    args.proposedContent !== undefined
+      ? {
+          exists: true,
+          content: args.proposedContent,
+          // The same resolved path readPlanFile reports.
+          path: await runtime.resolvePath(
+            getPlanFilePath(args.metadata.name, args.metadata.projectName, runtime.getXumHome())
+          ),
+        }
+      : await readPlanFile(
+          runtime,
+          args.metadata.name,
+          args.metadata.projectName,
+          args.workspaceId
+        );
   if (args.signal?.aborted) return Err(captureAborted());
   if (!plan.exists) {
     return Err({ type: "plan_missing", message: `Plan file not found at ${plan.path}` });

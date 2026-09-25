@@ -63,6 +63,10 @@ export const createProposePlanTool: ToolFactory = (config) => {
         };
       }
 
+      // The plan-review snapshot of this proposal must hold these validated bytes, not a later
+      // re-read of the (mutable) plan file.
+      config.recordProposedPlan?.(options.toolCallId, planContent);
+
       // Record file state for external edit detection
       if (config.recordFileState) {
         try {

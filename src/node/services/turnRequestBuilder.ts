@@ -311,6 +311,8 @@ export interface StreamMessageOptions {
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
+  /** See ToolConfiguration.recordProposedPlan. */
+  recordProposedPlan?: (toolCallId: string, content: string) => void;
   postCompactionAttachments?: PostCompactionAttachment[] | null;
   /**
    * Resolver for the session-segment memory context (memory experiment):
@@ -882,6 +884,7 @@ export class TurnRequestBuilder {
       onPreStartError,
       delegatedToolNames,
       recordFileState,
+      recordProposedPlan,
       postCompactionAttachments,
       resolveMemoryContext,
       experiments: experimentsFromOptions,
@@ -2411,6 +2414,7 @@ export class TurnRequestBuilder {
       workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
       allowLegacyInvalidWorkflowAgentOutputSchema,
       recordFileState,
+      recordProposedPlan,
       reportModelUsage: (event) => {
         try {
           const eventModel = event.model.trim();
