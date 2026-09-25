@@ -1,10 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
+import type { Runtime } from "@/node/runtime/Runtime";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS } from "@/constants/planReview";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { HistoryService } from "./historyService";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
@@ -196,5 +199,120 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
     );
     expect(captured.success && captured.data.created).toBe(true);
     expect(await snapshotCount()).toBe(1);
+  });
+
+  /**
+   * The existence probe runs while the append holds the cross-process history write lock. SSH
+   * metadata routes it through one remote exec; the runtime is a real local one (so the plan read
+   * works) whose exec these tests control, standing in for a slow or stalled host.
+   */
+  describe("existence probe under the history lock", () => {
+    const remoteMetadata = {
+      ...metadata,
+      runtimeConfig: { type: "ssh" as const, host: "remote.invalid", srcBaseDir: "~/src" },
+    };
+    let runtime: Runtime;
+    let probeSignals: AbortSignal[];
+    let probeCount: number;
+
+    beforeEach(() => {
+      runtime = runtimeFactory.createRuntime(
+        { type: "local" },
+        { projectPath: metadata.projectPath }
+      );
+      spyOn(runtimeFactory, "createRuntime").mockReturnValue(runtime);
+      probeSignals = [];
+      probeCount = 0;
+    });
+
+    afterEach(() => {
+      mock.restore();
+    });
+
+    /**
+     * Intercept the runtime's exec calls. With a local runtime the plan read uses the filesystem,
+     * so every exec here is the existence probe. `stall` makes it never answer, like a hung host.
+     */
+    function watchProbe(options: { stall: boolean; onStart?: () => void }) {
+      const original = runtime.exec.bind(runtime);
+      spyOn(runtime, "exec").mockImplementation((command, execOptions) => {
+        probeCount += 1;
+        if (execOptions.abortSignal) probeSignals.push(execOptions.abortSignal);
+        options.onStart?.();
+        return options.stall ? new Promise(() => undefined) : original(command, execOptions);
+      });
+    }
+
+    function capture(
+      options: { signal?: AbortSignal; beforeAppend?: () => Promise<unknown> } = {}
+    ) {
+      const original = handle.historyService.appendDerivedFromFullHistory.bind(
+        handle.historyService
+      );
+      const spy = spyOn(handle.historyService, "appendDerivedFromFullHistory").mockImplementation(
+        async <T>(id: string, derive: Derive<T>) => {
+          await options.beforeAppend?.();
+          return original(id, derive);
+        }
+      );
+      return ensurePlanSnapshot(
+        {
+          historyService: handle.historyService,
+          emitChatEvent: (_id, message) => emitted.push(message),
+        },
+        {
+          workspaceId,
+          metadata: remoteMetadata,
+          ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      ).finally(() => spy.mockRestore());
+    }
+
+    test("one remote exec probes both plan paths and refuses once the plan is gone", async () => {
+      await seedRow();
+      watchProbe({ stall: false });
+      const found = await capture();
+      expect(found.success && found.data.created).toBe(true);
+      const gone = await capture({ beforeAppend: deletePlan });
+      expect(!gone.success && gone.error.type).toBe("plan_missing");
+      expect(probeCount).toBe(2);
+      expect(await snapshotCount()).toBe(1);
+    });
+
+    test("a stalled remote probe refuses the capture within its bound and frees the lock", async () => {
+      await seedRow();
+      watchProbe({ stall: true });
+      const startedAt = Date.now();
+      const captured = await capture();
+      const elapsed = Date.now() - startedAt;
+      // Fail closed: an unanswered probe refuses instead of skipping the check.
+      expect(!captured.success && captured.error.type).toBe("capture_aborted");
+      expect(elapsed).toBeLessThan(PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS + 2_000);
+      // The abandoned remote command is cancelled too.
+      expect(probeSignals).toHaveLength(1);
+      expect(probeSignals[0]?.aborted).toBe(true);
+      // The history write lock is free again: another backend's append goes through at once
+      // instead of waiting out the lock timeout.
+      const appendStartedAt = Date.now();
+      const appended = await sibling.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-2", "user", "after the probe", {})
+      );
+      expect(appended.success).toBe(true);
+      expect(Date.now() - appendStartedAt).toBeLessThan(2_000);
+      expect(await snapshotCount()).toBe(0);
+    }, 20_000);
+
+    test("the capture's abort ends a stalled probe well before the bound", async () => {
+      await seedRow();
+      const controller = new AbortController();
+      watchProbe({ stall: true, onStart: () => setTimeout(() => controller.abort(), 50) });
+      const startedAt = Date.now();
+      const captured = await capture({ signal: controller.signal });
+      expect(!captured.success && captured.error.type).toBe("capture_aborted");
+      expect(Date.now() - startedAt).toBeLessThan(PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS / 2);
+      expect(probeSignals[0]?.aborted).toBe(true);
+      expect(await snapshotCount()).toBe(0);
+    }, 20_000);
   });
 });

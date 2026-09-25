@@ -36,13 +36,16 @@ import {
   PLAN_REVIEW_MAX_QUOTE_CHARS,
   PLAN_REVIEW_MAX_REPLY_THREAD_COMMENT_CHARS,
   PLAN_REVIEW_METADATA_TYPE,
+  PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS,
 } from "@/constants/planReview";
 import {
   createRuntimeForWorkspace,
   type WorkspaceMetadataForRuntime,
 } from "@/node/runtime/runtimeHelpers";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
-import { readPlanFile } from "@/node/utils/runtime/helpers";
+import { execBuffered, readPlanFile } from "@/node/utils/runtime/helpers";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { isDockerRuntime, isSSHRuntime } from "@/common/types/runtime";
 
 import type { HistoryService } from "./historyService";
 import { log } from "./log";
@@ -261,8 +264,8 @@ export async function ensurePlanSnapshot(
   // a capture that read the old plan before it append a snapshot of the old bytes beside the new
   // plan. Snapshot rows are hidden from the model (isPlanReviewRecordMessage); only the review
   // panel shows it.
-  // Never hold the lock across the (possibly remote) plan read itself; the existence check is a
-  // stat of the two plan paths.
+  // Never hold the lock across the (possibly remote) plan read itself; the existence check is one
+  // bounded probe of the two plan paths (probePlanExistence).
   let frontier: { readonly generation: string | undefined };
   if (args.frontier !== undefined) {
     frontier = args.frontier;
@@ -331,15 +334,53 @@ export async function ensurePlanSnapshot(
     // readPlanFile falls back to (and migrates) the legacy path, so it still counts as the plan.
     getLegacyPlanFilePath(args.workspaceId, xumHome),
   ];
-  const planStillExists = async (): Promise<boolean> => {
-    for (const planPath of planPaths) {
-      try {
-        if (!(await runtime.stat(planPath)).isDirectory) return true;
-      } catch {
-        // Missing (or unreachable): not a plan.
+  // Same split as WorkspaceService.deletePlanFilesForWorkspace: SSH and Docker plans are reached
+  // through a remote shell, everything else through runtime.stat (host paths, or a devcontainer's
+  // mounted/exec'd view).
+  const remotePlan =
+    isSSHRuntime(args.metadata.runtimeConfig) || isDockerRuntime(args.metadata.runtimeConfig);
+  const probe = async (signal: AbortSignal): Promise<"exists" | "missing" | "unconfirmed"> => {
+    if (!remotePlan) {
+      for (const planPath of planPaths) {
+        try {
+          if (!(await runtime.stat(planPath, signal)).isDirectory) return "exists";
+        } catch {
+          // Missing: not a plan.
+        }
       }
+      return "missing";
     }
-    return false;
+    // SSH/Docker: both paths in ONE exec, so the lock waits one round trip; pathEnv
+    // canonicalizes them per runtime (tilde, remote home, container paths).
+    const result = await execBuffered(
+      runtime,
+      'for p in "$XUM_PLAN" "$XUM_LEGACY_PLAN"; do [ -e "$p" ] && [ ! -d "$p" ] && exit 0; done; exit 1',
+      {
+        cwd: "/tmp",
+        pathEnv: { XUM_PLAN: planPaths[0], XUM_LEGACY_PLAN: planPaths[1] },
+        timeout: Math.ceil(PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS / 1000),
+        abortSignal: signal,
+        maxOutputBytes: 1024,
+      }
+    );
+    return result.exitCode === 0 ? "exists" : result.exitCode === 1 ? "missing" : "unconfirmed";
+  };
+  // Runs under the cross-process history write lock, so it is bounded (raced, in case a runtime
+  // ignores its signal), follows the capture's signal, and FAILS CLOSED: an aborted, timed-out
+  // or failed probe refuses the capture instead of skipping the check.
+  const probePlanExistence = async (): Promise<"exists" | "missing" | "unconfirmed"> => {
+    const cancelProbe = new AbortController();
+    try {
+      const raced = await raceWithAbortAndTimeout(probe(cancelProbe.signal), {
+        signal: args.signal,
+        timeoutMs: PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS,
+      });
+      return raced.kind === "ok" ? raced.value : "unconfirmed";
+    } catch {
+      return "unconfirmed";
+    } finally {
+      cancelProbe.abort();
+    }
   };
 
   let priorRows: MuxMessage[] = [];
@@ -358,7 +399,9 @@ export async function ensurePlanSnapshot(
       if (lockState.generation !== frontier.generation) {
         return { message: null, value: "aborted" };
       }
-      if (!(await planStillExists())) return { message: null, value: "plan_missing" };
+      const existence = await probePlanExistence();
+      if (existence === "missing") return { message: null, value: "plan_missing" };
+      if (existence !== "exists") return { message: null, value: "aborted" };
       priorRows = messages.filter(isPlanReviewRow);
       const state = derivePlanReviewState(priorRows, deriveOptions(args.workspaceId));
       const existing = state.snapshots.find((snapshot) => snapshot.contentHash === contentHash);

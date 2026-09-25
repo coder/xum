@@ -45,5 +45,13 @@ export const PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES = 16 * 1024;
  */
 export const PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS = 15_000;
 
+/**
+ * Bound on the plan-existence probe a snapshot append runs while it holds the cross-process
+ * history write lock (one remote exec on SSH/Docker). Well under that lock's 10 s
+ * wait so a stalled host cannot time out other backends' sends and clears; a probe that does not
+ * answer in time refuses the capture.
+ */
+export const PLAN_SNAPSHOT_EXISTENCE_PROBE_TIMEOUT_MS = 3_000;
+
 /** muxMetadata discriminator shared by every plan-review record row. */
 export const PLAN_REVIEW_METADATA_TYPE = "plan-review" as const;
