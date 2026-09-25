@@ -1,18 +1,16 @@
 import { describe, expect, test, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
-import { tmpdir } from "os";
 import path from "path";
 import { Ok } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import { WorkflowRunStore } from "./workflows/WorkflowRunStore";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   createDeferred,
-  mockExtensionMetadataService,
   createMockAIService,
   createWorkspaceServiceForTest,
+  createWorkspaceServiceHarness,
   createFrontendWorkspaceMetadata,
 } from "./workspaceService.testHarness";
 
@@ -3168,73 +3166,47 @@ describe("WorkspaceService activity list scoping", () => {
   });
 
   test("prunes the extension metadata entry after a workspace is removed", async () => {
-    const { historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "remove-prunes-metadata";
-    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-metadata-"));
+    const harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve(
+            Ok(createFrontendWorkspaceMetadata({ id: workspaceId, name: workspaceId }))
+          )
+        ),
+      }),
+    });
+    const { service: workspaceService, config, extensionMetadata } = harness;
     try {
-      const sessionRoot = path.join(tempRoot, "sessions");
-      await fsPromises.mkdir(path.join(sessionRoot, workspaceId), { recursive: true });
-
-      const deleteWorkspace = mock(() => Promise.resolve());
-      const extensionMetadata = {
-        ...mockExtensionMetadataService,
-        deleteWorkspace,
-      } as unknown as ExtensionMetadataService;
-      const mockConfig: MockWorkspaceConfig = {
-        rootDir: path.join(tempRoot, "root"),
-        srcDir: "/tmp/src",
-        sessionsDir: sessionRoot,
-        removeWorkspace: mock(() => Promise.resolve()),
-        findWorkspace: mock(() => null),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-        // The discard verifies deregistration against the persisted superset
-        // (and the findWorkspace mock above) before deleting.
-        readPersistedWorkspaceIdSuperset: mock(() => new Set<string>()),
-        getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      };
-      const workspaceService = createWorkspaceServiceForTest({
-        config: mockConfig,
-        historyService,
-        extensionMetadata,
-        aiService: createMockAIService({
-          isStreaming: mock(() => false),
-          stopStream: mock(() => Promise.resolve(Ok(undefined))),
-          getWorkspaceMetadata: mock(() =>
-            Promise.resolve(
-              Ok(createFrontendWorkspaceMetadata({ id: workspaceId, name: workspaceId }))
-            )
-          ),
-        }),
-      });
+      await fsPromises.mkdir(path.join(config.sessionsDir, workspaceId), { recursive: true });
+      // The workspace is not registered in config, so the discard's deregistration check
+      // (persisted superset + findWorkspace) passes and the entry is deleted.
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      expect((await extensionMetadata.getAllSnapshots()).has(workspaceId)).toBe(true);
 
       const removeResult = await workspaceService.remove(workspaceId, true);
       expect(removeResult.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledWith(workspaceId);
+      expect((await extensionMetadata.getAllSnapshots()).has(workspaceId)).toBe(false);
     } finally {
-      await fsPromises.rm(tempRoot, { recursive: true, force: true });
-      await cleanup();
+      await harness.cleanup();
     }
   });
 
   test("discardExtensionMetadataEntry swallows deletion failures", async () => {
     // Rollback paths (e.g. TaskService's failed task-create rollback) call
     // this best-effort; a metadata disk failure must not abort the rollback.
-    const { config, historyService, cleanup } = await createTestHistoryService();
+    const harness = await createWorkspaceServiceHarness();
     try {
-      const deleteWorkspace = mock(() => Promise.reject(new Error("disk full")));
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        extensionMetadata: {
-          ...mockExtensionMetadataService,
-          deleteWorkspace,
-        } as unknown as ExtensionMetadataService,
-      });
+      const deleteWorkspace = spyOn(harness.extensionMetadata, "deleteWorkspace").mockRejectedValue(
+        new Error("disk full")
+      );
 
-      await workspaceService.discardExtensionMetadataEntry("rollback-ws");
+      await harness.service.discardExtensionMetadataEntry("rollback-ws");
       expect(deleteWorkspace).toHaveBeenCalledWith("rollback-ws");
     } finally {
-      await cleanup();
+      await harness.cleanup();
     }
   });
 });

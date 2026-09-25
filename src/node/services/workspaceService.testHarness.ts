@@ -1,14 +1,14 @@
 // Shared fixtures for the workspaceService.*.test.ts suites (split from workspaceService.test.ts).
 import { expect, mock } from "bun:test";
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
-import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
+import type { Config } from "@/node/config";
+import { HistoryService } from "./historyService";
 import type { AIService } from "./aiService";
 import { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -124,10 +124,6 @@ export function createTestBackgroundProcessManager(): BackgroundProcessManager {
 
 export type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
 
-export type MockWorkspaceConfig = Partial<Config> & {
-  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
-};
-
 /**
  * AI-service fake with every member WorkspaceService and AgentSession call unconditionally:
  * no provider config, no experiments, and no workspace metadata (the real service's answer
@@ -148,9 +144,7 @@ export function createMockAIService(overrides: Partial<AIService> = {}): AIServi
 }
 
 export interface WorkspaceServiceForTestOptions {
-  config:
-    | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
-    | Config;
+  config: Config;
   historyService?: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
@@ -166,17 +160,15 @@ export interface WorkspaceServiceForTestOptions {
 }
 
 /**
- * Low-level constructor for tests that already own their stores. Prefer
- * createWorkspaceServiceHarness, which also owns a real Config and HistoryService.
+ * Low-level constructor for tests that already own their Config. Omitted stores default to
+ * real instances rooted in that Config. Prefer createWorkspaceServiceHarness, which also
+ * owns the temp root and its cleanup.
  */
 export function createWorkspaceServiceForTest(
   options: WorkspaceServiceForTestOptions
 ): WorkspaceService {
-  // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
-  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
-  const defaultHistoryService: HistoryService = {} as HistoryService;
-  const config = options.config as Config;
-  const historyService = options.historyService ?? defaultHistoryService;
+  const config = options.config;
+  const historyService = options.historyService ?? new HistoryService(config);
   const aiService = options.aiService ?? createMockAIService();
   return new WorkspaceService(
     config,
@@ -189,8 +181,9 @@ export function createWorkspaceServiceForTest(
       sessionUsageService: options.sessionUsageService,
       telemetryService: options.telemetryService,
     }),
-    options.initStateManager ?? (mockInitStateManager as InitStateManager),
-    options.extensionMetadata ?? (mockExtensionMetadataService as ExtensionMetadataService),
+    options.initStateManager ?? new InitStateManager(config),
+    options.extensionMetadata ??
+      new ExtensionMetadataService(path.join(config.rootDir, "extensionMetadata.json")),
     options.backgroundProcessManager ?? createTestBackgroundProcessManager(),
     options.sessionUsageService,
     options.policyService,
@@ -205,7 +198,13 @@ export function createWorkspaceServiceForTest(
 export type WorkspaceServiceHarnessOptions = Omit<
   WorkspaceServiceForTestOptions,
   "config" | "historyService"
->;
+> & {
+  /**
+   * Members layered over the default AI fake (ignored when `aiService` is passed). The
+   * default answers getWorkspaceMetadata from the harness's real Config, as AIService does.
+   */
+  aiServiceOverrides?: Partial<AIService>;
+};
 
 export interface WorkspaceServiceHarness extends AsyncDisposable {
   service: WorkspaceService;
@@ -232,7 +231,16 @@ export async function createWorkspaceServiceHarness(
   options: WorkspaceServiceHarnessOptions = {}
 ): Promise<WorkspaceServiceHarness> {
   const { config, historyService, tempDir, cleanup } = await createTestHistoryService();
-  const aiService = options.aiService ?? createMockAIService();
+  const { aiServiceOverrides, ...serviceOptions } = options;
+  const aiService =
+    options.aiService ??
+    createMockAIService({
+      getWorkspaceMetadata: mock(async (workspaceId: string) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
+      }),
+      ...aiServiceOverrides,
+    });
   const initStateManager = options.initStateManager ?? new InitStateManager(config);
   const extensionMetadata =
     options.extensionMetadata ??
@@ -244,7 +252,7 @@ export async function createWorkspaceServiceHarness(
   const backgroundProcessManager =
     options.backgroundProcessManager ?? ownedBackgroundProcessManager!;
   const service = createWorkspaceServiceForTest({
-    ...options,
+    ...serviceOptions,
     config,
     historyService,
     aiService,

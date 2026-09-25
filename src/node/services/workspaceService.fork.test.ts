@@ -8,7 +8,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
-import type { Config, SecretsStore } from "@/node/config";
+import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -18,7 +18,7 @@ import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ExperimentsService } from "./experimentsService";
 import { awaitPendingBranchSummary } from "./branchSummary";
-import type { InitStateManager, InitStatus } from "./initStateManager";
+import { InitStateManager, type InitStatus } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { createMuxMessage } from "@/common/types/message";
@@ -26,9 +26,9 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator";
 import * as runtimeExecHelpers from "@/node/utils/runtime/helpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   mockExtensionMetadataService,
+  createMockAIService,
   createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
   setWorkspaceGoalOk,
@@ -58,53 +58,38 @@ describe("WorkspaceService fork", () => {
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = "/tmp/project";
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve(
-          Ok({
-            id: sourceWorkspaceId,
-            name: "source-branch",
-            projectPath: sourceProjectPath,
-            projectName: "project",
-            runtimeConfig: { type: "local" },
-          })
-        )
-      ),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    const startInitMock = mock(() => undefined);
-    const endInitMock = mock(() => Promise.resolve());
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: startInitMock,
-      endInit: endInitMock,
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      generateStableId: mock(() => newWorkspaceId),
-      findWorkspace: mock(() => null),
-      sessionsDir: "/tmp/test/sessions",
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map([[sourceProjectPath, { workspaces: [], trusted: true }]]),
-      })),
-    };
+    // A trusted project with no registered source checkout (findWorkspace misses).
+    await config.editConfig((current) => {
+      current.projects.set(sourceProjectPath, { workspaces: [], trusted: true });
+      return current;
+    });
+    spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
+    // Real init manager: the spies record the lifecycle calls while the real state runs.
+    const initStateManager = new InitStateManager(config);
+    const startInitMock = spyOn(initStateManager, "startInit");
+    const endInitMock = spyOn(initStateManager, "endInit");
 
     const workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
+      config,
       historyService,
-      aiService: mockAIService,
-      initStateManager: mockInitStateManager as InitStateManager,
-      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() =>
+          Promise.resolve(
+            Ok({
+              id: sourceWorkspaceId,
+              name: "source-branch",
+              projectPath: sourceProjectPath,
+              projectName: "project",
+              runtimeConfig: { type: "local" as const },
+            })
+          )
+        ),
+      }),
+      initStateManager,
+      extensionMetadata: new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      ),
     });
 
     const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
@@ -127,6 +112,9 @@ describe("WorkspaceService fork", () => {
 
       expect(startInitMock).toHaveBeenCalledWith(newWorkspaceId, sourceProjectPath);
       expect(endInitMock).toHaveBeenCalledWith(newWorkspaceId, -1);
+      // The logger fires endInit without awaiting it; settle its persistence before cleanup.
+      await endInitMock.mock.results[0]?.value;
+      expect(initStateManager.getInitState(newWorkspaceId)?.status).toBe("error");
 
       const initAbortControllers = (
         workspaceService as unknown as { initAbortControllers: Map<string, AbortController> }

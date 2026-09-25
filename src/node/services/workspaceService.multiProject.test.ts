@@ -23,6 +23,7 @@ import { WorkspaceService } from "@/node/services/workspaceService";
 import {
   createMockAIService,
   createTestBackgroundProcessManager,
+  createWorkspaceServiceHarness,
 } from "@/node/services/workspaceService.testHarness";
 import { Ok } from "@/common/types/result";
 import type { ProjectsConfig } from "@/common/types/project";
@@ -74,20 +75,15 @@ function createMockExperimentsService(enabled: boolean): ExperimentsService {
 }
 type BashToolConfig = Parameters<typeof bashToolModule.createBashTool>[0];
 interface WorkspaceServiceTestOptions {
-  config: Partial<Config>;
+  config: Config;
   historyService: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
   experimentsEnabled?: boolean;
   secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
 }
-function createMockAIServiceWithMetadata(metadata: WorkspaceMetadata): AIService {
-  return createMockAIService({
-    getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
-  });
-}
 function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): WorkspaceService {
-  const config = options.config as Config;
+  const config = options.config;
   const aiService = options.aiService ?? createMockAIService();
   return new WorkspaceService(
     config,
@@ -107,10 +103,8 @@ function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): Wo
   );
 }
 interface ExecuteBashHarnessOptions {
-  historyService: HistoryService;
   workspaceId: string;
   workspaceName: string;
-  srcDir?: string;
   projectAPath?: string;
   projectBPath?: string;
   primaryWorkspacePath?: string;
@@ -118,16 +112,13 @@ interface ExecuteBashHarnessOptions {
   projects?: WorkspaceMetadata["projects"];
   trustedProjects?: Array<[string, boolean]>;
   runtimeWorkspacePaths?: Record<string, string>;
-  findWorkspaceProjectPath?: string;
-  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
   secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
   onCreateRuntime?: (
     projectPath: string,
     options: Parameters<typeof runtimeFactory.createRuntime>[1]
   ) => void;
 }
-function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
-  const srcDir = options.srcDir ?? "/tmp/src";
+async function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
   const projectAPath = options.projectAPath ?? "/tmp/project-a";
   const projectBPath = options.projectBPath ?? "/tmp/project-b";
   const projects = options.projects ?? [
@@ -140,15 +131,36 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
     [projectAPath]: `/tmp/workspaces/project-a/${options.workspaceName}`,
     [projectBPath]: `/tmp/workspaces/project-b/${options.workspaceName}`,
   };
-  const metadata: WorkspaceMetadata = {
-    id: options.workspaceId,
-    name: options.workspaceName,
-    projectPath: projects[0]?.projectPath ?? projectAPath,
-    projectName: projects[0]?.projectName ?? "project-a",
-    projects,
-    runtimeConfig: options.runtimeConfig ?? { type: "local" },
-  };
-  const waitForInitMock = mock(() => Promise.resolve());
+  const runtimeConfig = options.runtimeConfig ?? { type: "local" as const };
+  const serviceHarness = await createWorkspaceServiceHarness({
+    experimentsService: createMockExperimentsService(true),
+    secretsStore: options.secretsStore,
+  });
+  const { config } = serviceHarness;
+  const trustedProjects =
+    options.trustedProjects ??
+    projects.map((project) => [project.projectPath, true] as [string, boolean]);
+  // Multi-project workspaces persist under the shared key; each repo's trust lives on its own
+  // project entry.
+  await config.editConfig((cfg) => {
+    for (const [projectPath, trusted] of trustedProjects) {
+      cfg.projects.set(projectPath, { workspaces: [], trusted });
+    }
+    cfg.projects.set(MULTI_PROJECT_CONFIG_KEY, {
+      workspaces: [
+        {
+          id: options.workspaceId,
+          name: options.workspaceName,
+          path: primaryWorkspacePath,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          runtimeConfig,
+          projects,
+        },
+      ],
+    });
+    return cfg;
+  });
+  const waitForInitSpy = spyOn(serviceHarness.initStateManager, "waitForInit");
   const ensureReadyMocks = new Map(
     projects.map((project) => [
       project.projectPath,
@@ -182,101 +194,63 @@ function createExecuteBashHarness(options: ExecuteBashHarnessOptions) {
       typeof bashToolModule.createBashTool
     >;
   });
-  const trustedProjects =
-    options.trustedProjects ??
-    projects.map((project) => [project.projectPath, true] as [string, boolean]);
-  const workspaceService = createWorkspaceServiceForTest({
-    historyService: options.historyService,
-    aiService: createMockAIServiceWithMetadata(metadata),
-    initStateManager: {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-      waitForInit: waitForInitMock,
-    } as unknown as InitStateManager,
-    secretsStore:
-      options.secretsStore ??
-      ({ getEffectiveSecrets: options.getEffectiveSecrets ?? mock(() => []) } satisfies Pick<
-        SecretsStore,
-        "getEffectiveSecrets"
-      >),
-    config: {
-      srcDir,
-      sessionsDir: "/tmp/test/sessions",
-      findWorkspace: mock(() => ({
-        projectPath: options.findWorkspaceProjectPath ?? projectAPath,
-        workspacePath: primaryWorkspacePath,
-      })),
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map(
-          trustedProjects.map(([projectPath, trusted]) => [
-            projectPath,
-            { workspaces: [], trusted },
-          ])
-        ),
-      })),
-    },
-  });
   return {
     bashExecuteMock,
     capturedToolConfig: () => {
       assert(capturedToolConfig);
       return capturedToolConfig;
     },
+    config,
     createRuntimeSpy,
-    dispose: () => {
+    dispose: async () => {
       createBashToolSpy.mockRestore();
       createRuntimeSpy.mockRestore();
+      await serviceHarness.cleanup();
     },
     ensureReadyMock: (projectPath: string) => ensureReadyMocks.get(projectPath),
-    metadata,
-    waitForInitMock,
-    workspaceService,
+    runtimeConfig,
+    waitForInitMock: waitForInitSpy,
+    workspaceService: serviceHarness.service,
   };
 }
 describe("WorkspaceService executeBash runtime selection", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
-  afterEach(async () => {
-    await cleanupHistory();
-  });
   test("uses the shared container-root cwd for multi-project script mode even when the persisted workspace path points at the primary checkout", async () => {
     const workspaceId = "ws-multi-bash";
     const workspaceName = "feature-multi-bash";
-    const harness = createExecuteBashHarness({ historyService, workspaceId, workspaceName });
+    const harness = await createExecuteBashHarness({ workspaceId, workspaceName });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "pwd");
       expect(result.success).toBe(true);
       expect(harness.waitForInitMock).toHaveBeenCalledWith(workspaceId);
       expect(harness.createRuntimeSpy).toHaveBeenCalledTimes(2);
-      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(1, harness.metadata.runtimeConfig, {
+      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(1, harness.runtimeConfig, {
         projectPath: "/tmp/project-a",
         workspaceName,
         workspacePath: undefined,
       });
-      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(2, harness.metadata.runtimeConfig, {
+      expect(harness.createRuntimeSpy).toHaveBeenNthCalledWith(2, harness.runtimeConfig, {
         projectPath: "/tmp/project-b",
         workspaceName,
         workspacePath: undefined,
       });
       const toolConfig = harness.capturedToolConfig();
       expect(toolConfig.runtime).toBeInstanceOf(MultiProjectRuntime);
-      expect(toolConfig.cwd).toBe(new ContainerManager("/tmp/src").getContainerPath(workspaceName));
+      // A local runtime has no srcBaseDir, so the container root comes from the config's srcDir.
+      expect(toolConfig.cwd).toBe(
+        new ContainerManager(harness.config.srcDir).getContainerPath(workspaceName)
+      );
       expect(toolConfig.trusted).toBe(true);
       expect(harness.ensureReadyMock("/tmp/project-a")).toHaveBeenCalledTimes(1);
       expect(harness.ensureReadyMock("/tmp/project-b")).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("preserves the current SSH repo root and derives sibling legacy repo roots for multi-project repo-root bash mode when the persisted root matches that layout", async () => {
     const workspaceId = "ws-multi-bash-ssh";
     const workspaceName = "feature-multi-bash-ssh";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       primaryWorkspacePath: `/tmp/src/project-a/${workspaceName}`,
@@ -303,13 +277,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.ensureReadyMock("/tmp/project-b")).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("lets multi-project script mode target a secondary repo checkout explicitly", async () => {
     const workspaceId = "ws-multi-bash-repo-root";
     const workspaceName = "feature-multi-bash-repo-root";
-    const harness = createExecuteBashHarness({ historyService, workspaceId, workspaceName });
+    const harness = await createExecuteBashHarness({ workspaceId, workspaceName });
     try {
       const result = await harness.workspaceService.executeBash(workspaceId, "git status --short", {
         cwdMode: "repo-root",
@@ -326,7 +300,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.ensureReadyMock("/tmp/project-b")).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("normalizes repo-root project paths before matching secondary runtimes", async () => {
@@ -334,8 +308,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
     const workspaceName = "feature-multi-bash-repo-root-windows";
     const projectAPath = "C:\\tmp\\project-a\\";
     const projectBPath = "C:\\tmp\\project-b\\";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       projectAPath,
@@ -361,13 +334,12 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.ensureReadyMock(projectBPath)).toHaveBeenCalledTimes(1);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("marks multi-project executeBash untrusted when any secondary project is untrusted", async () => {
     const workspaceId = "ws-multi-bash-untrusted";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName: "feature-multi-bash-untrusted",
       trustedProjects: [
@@ -381,7 +353,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(harness.capturedToolConfig().trusted).toBe(false);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("merges multi-project executeBash secrets across all repos with primary-project precedence", async () => {
@@ -402,8 +374,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       }
       throw new Error(`Unexpected secrets lookup: ${projectPath}`);
     });
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       secretsStore: {
@@ -421,14 +392,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(getEffectiveSecretsMock.mock.calls).toEqual([["/tmp/project-a"], ["/tmp/project-b"]]);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("keeps multi-project git command mode on the primary repo checkout even when the persisted workspace path points at that checkout", async () => {
     const workspaceId = "ws-multi-git";
     const workspaceName = "feature-multi-git";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       trustedProjects: [["/tmp/project-a", true]],
@@ -446,14 +416,13 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(toolConfig.cwd).toBe(`/tmp/workspaces/project-a/${workspaceName}`);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("uses the primary project runtime workspace path for _multi git command mode", async () => {
     const workspaceId = "ws-multi-git-container";
     const workspaceName = "feature-multi-git-container";
-    const harness = createExecuteBashHarness({
-      historyService,
+    const harness = await createExecuteBashHarness({
       workspaceId,
       workspaceName,
       trustedProjects: [["/tmp/project-a", true]],
@@ -472,7 +441,7 @@ describe("WorkspaceService executeBash runtime selection", () => {
       expect(toolConfig.cwd).toBe(`/tmp/workspaces/project-a/${workspaceName}`);
       expect(harness.bashExecuteMock).toHaveBeenCalledTimes(1);
     } finally {
-      harness.dispose();
+      await harness.dispose();
     }
   });
   test("keeps single-project executeBash on the workspace runtime path", async () => {
@@ -480,14 +449,6 @@ describe("WorkspaceService executeBash runtime selection", () => {
     const workspaceName = "feature-single-bash";
     const projectPath = "/tmp/project-a";
     const workspacePath = `/tmp/workspaces/project-a/${workspaceName}`;
-    const metadata: WorkspaceMetadata = {
-      id: workspaceId,
-      name: workspaceName,
-      projectPath,
-      projectName: "project-a",
-      runtimeConfig: { type: "local" },
-    };
-    const waitForInitMock = mock(() => Promise.resolve());
     const singleRuntime = {
       ensureReady: mock(() => Promise.resolve({ ready: true as const })),
       getWorkspacePath: mock(() => workspacePath),
@@ -505,24 +466,26 @@ describe("WorkspaceService executeBash runtime selection", () => {
         >;
       }
     );
-    const workspaceService = createWorkspaceServiceForTest({
-      historyService,
-      aiService: createMockAIServiceWithMetadata(metadata),
-      initStateManager: {
-        on: mock(() => undefined as unknown as InitStateManager),
-        getInitState: mock(() => undefined),
-        waitForInit: waitForInitMock,
-      } as unknown as InitStateManager,
-      config: {
-        srcDir: "/tmp/src",
-        sessionsDir: "/tmp/test/sessions",
-        findWorkspace: mock(() => ({ projectPath, workspacePath })),
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([[projectPath, { workspaces: [], trusted: true }]]),
-        })),
-      },
-      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
+    await using serviceHarness = await createWorkspaceServiceHarness({
+      experimentsService: createMockExperimentsService(true),
     });
+    const { config, service: workspaceService } = serviceHarness;
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        trusted: true,
+        workspaces: [
+          {
+            id: workspaceId,
+            name: workspaceName,
+            path: workspacePath,
+            createdAt: "2020-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+      });
+      return cfg;
+    });
+    const waitForInitMock = spyOn(serviceHarness.initStateManager, "waitForInit");
     try {
       const result = await workspaceService.executeBash(workspaceId, "pwd");
       expect(result.success).toBe(true);

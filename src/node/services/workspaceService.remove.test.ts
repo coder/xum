@@ -1,7 +1,5 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import type { WorkspaceService } from "./workspaceService";
 import { EventEmitter } from "events";
 import { existsSync } from "fs";
 import * as fsPromises from "fs/promises";
@@ -10,14 +8,10 @@ import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { Config } from "@/node/config";
-import type { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
-import { createTestProject, saveWorkspaces } from "./taskService.testHarness";
+import { createTestProject, projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import type { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
@@ -27,19 +21,17 @@ import { MemoryMetaService } from "./memoryMeta";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
-import {
-  mockInitStateManager,
-  mockExtensionMetadataService,
-  createTestBackgroundProcessManager,
-  createMockAIService,
-  createWorkspaceServiceForTest,
-} from "./workspaceService.testHarness";
+import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
+import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
+
+function sessionDirOf(config: Config, workspaceId: string): string {
+  return path.join(config.sessionsDir, workspaceId);
+}
 
 describe("WorkspaceService remove lifecycle coordination", () => {
   test("acknowledged removal keeps the parent last and returns forced failure scope", async () => {
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+    await using harness = await createWorkspaceServiceHarness();
+    const { config, service: workspaceService } = harness;
     let notifications = 0;
     const unsubscribe = config.onConfigChanged(() => {
       notifications += 1;
@@ -114,16 +106,12 @@ describe("WorkspaceService remove lifecycle coordination", () => {
     expect(notifications).toBe(3);
     unsubscribe();
     removeParent.mockRestore();
-    await cleanup();
   });
 
   test("checks descendant tasks while holding the task-tree lifecycle lock", async () => {
     const workspaceId = "parent-remove-lifecycle";
-    const workspaceService = createWorkspaceServiceForTest({
-      config: {
-        findWorkspace: mock(() => null),
-      },
-    });
+    await using harness = await createWorkspaceServiceHarness();
+    const workspaceService = harness.service;
     let insideLifecycleLock = false;
     const withTaskTreeLifecycleLock = mock(
       (_workspaceId: string, _operation: () => Promise<unknown>) => undefined
@@ -162,107 +150,73 @@ describe("WorkspaceService remove lifecycle coordination", () => {
 });
 
 describe("WorkspaceService remove timing rollup", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
-
-  afterEach(async () => {
-    await cleanupHistory();
-  });
-
   test("waits for stream-abort before rolling up session timing", async () => {
     const workspaceId = "child-ws";
     const parentWorkspaceId = "parent-ws";
+    const projectPath = "/tmp/proj";
 
-    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-"));
     const stopEntered = Promise.withResolvers<void>();
     const stopRelease = Promise.withResolvers<void>();
-    try {
-      const sessionRoot = path.join(tempRoot, "sessions");
-      await fsPromises.mkdir(path.join(sessionRoot, workspaceId), { recursive: true });
+    let abortEmitted = false;
+    let rollUpSawAbort = false;
 
-      let abortEmitted = false;
-      let rollUpSawAbort = false;
-
-      class FakeAIService extends EventEmitter {
-        isStreaming = mock(() => true);
-
-        stopStream = mock(async () => {
-          stopEntered.resolve();
-          await stopRelease.promise;
-          abortEmitted = true;
-          this.emit("stream-abort", {
-            type: "stream-abort",
-            workspaceId,
-            messageId: "msg",
-            abortReason: "system",
-            metadata: { duration: 123 },
-            abandonPartial: true,
-          });
-          return { success: true as const, data: undefined };
+    const aiEmitter = new EventEmitter();
+    const aiServiceOverrides: Partial<AIService> = {
+      on: aiEmitter.on.bind(aiEmitter) as unknown as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as unknown as AIService["off"],
+      isStreaming: mock(() => true),
+      stopStream: mock(async () => {
+        stopEntered.resolve();
+        await stopRelease.promise;
+        abortEmitted = true;
+        aiEmitter.emit("stream-abort", {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "msg",
+          abortReason: "system",
+          metadata: { duration: 123 },
+          abandonPartial: true,
         });
+        return Ok(undefined);
+      }),
+    };
 
-        getWorkspaceMetadata = mock(() =>
-          Promise.resolve({
-            success: true as const,
-            data: {
-              id: workspaceId,
-              name: "child",
-              projectPath: "/tmp/proj",
-              runtimeConfig: { type: "local" },
-              parentWorkspaceId,
-            },
-          })
-        );
-      }
+    const timingService: Partial<SessionTimingService> = {
+      waitForIdle: mock(() => Promise.resolve()),
+      rollUpTimingIntoParent: mock(() => {
+        rollUpSawAbort = abortEmitted;
+        return Promise.resolve({ didRollUp: true });
+      }),
+    };
 
-      const aiService = new FakeAIService() as unknown as AIService;
-      const mockConfig: MockWorkspaceConfig = {
-        rootDir: path.join(tempRoot, "root"),
-        srcDir: "/tmp/src",
-        sessionsDir: sessionRoot,
-        removeWorkspace: mock(() => Promise.resolve()),
-        findWorkspace: mock(() => null),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-      };
+    await using harness = await createWorkspaceServiceHarness({
+      aiServiceOverrides,
+      sessionTimingService: timingService as SessionTimingService,
+    });
+    const { config, service: workspaceService, initStateManager } = harness;
+    await saveWorkspaces(config, projectPath, [
+      projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+        runtimeConfig: { type: "local" },
+      }),
+      projectWorkspace(projectPath, "child", workspaceId, {
+        runtimeConfig: { type: "local" },
+        parentWorkspaceId,
+      }),
+    ]);
+    await fsPromises.mkdir(sessionDirOf(config, workspaceId), { recursive: true });
+    const clearInMemoryState = spyOn(initStateManager, "clearInMemoryState");
 
-      const timingService: Partial<SessionTimingService> = {
-        waitForIdle: mock(() => Promise.resolve()),
-        rollUpTimingIntoParent: mock(() => {
-          rollUpSawAbort = abortEmitted;
-          return Promise.resolve({ didRollUp: true });
-        }),
-      };
-
-      const workspaceService = new WorkspaceService(
-        mockConfig as Config,
-        historyService,
-        aiService,
-        new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
-        mockInitStateManager as InitStateManager,
-        mockExtensionMetadataService as ExtensionMetadataService,
-        createTestBackgroundProcessManager(),
-        undefined, // sessionUsageService
-        undefined, // policyService
-        undefined, // telemetryService
-        undefined, // experimentsService
-        timingService as SessionTimingService
-      );
-
+    try {
       const removing = workspaceService.remove(workspaceId, true);
       await stopEntered.promise;
       expect(timingService.rollUpTimingIntoParent).not.toHaveBeenCalled();
       stopRelease.resolve();
       const removeResult = await removing;
       expect(removeResult.success).toBe(true);
-      expect(mockInitStateManager.clearInMemoryState).toHaveBeenCalledWith(workspaceId);
+      expect(clearInMemoryState).toHaveBeenCalledWith(workspaceId);
       expect(rollUpSawAbort).toBe(true);
     } finally {
       stopRelease.resolve();
-      await fsPromises.rm(tempRoot, { recursive: true, force: true });
     }
   });
 });
@@ -277,75 +231,19 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
   const ownerId = "owner-handover";
   const workspacePath = path.join(projectPath, "child-ws");
   const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
-  let rootDir: string;
 
-  beforeEach(async () => {
-    rootDir = path.join(tmpdir(), "mux-handover-order", `root-${crypto.randomUUID()}`);
-    await fsPromises.mkdir(path.join(rootDir, "sessions", workspaceId), { recursive: true });
-  });
-  afterEach(async () => {
-    await fsPromises.rm(rootDir, { recursive: true, force: true });
-  });
-
-  function buildConfig(): Partial<Config> {
-    const topology = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            trusted: true,
-            workspaces: [
-              {
-                id: ownerId,
-                name: "owner",
-                path: path.join(projectPath, "owner-ws"),
-                runtimeConfig,
-              },
-              {
-                id: workspaceId,
-                name: "child",
-                path: workspacePath,
-                runtimeConfig,
-                parentWorkspaceId: ownerId,
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-    return {
-      rootDir,
-      srcDir: "/tmp/src",
-      sessionsDir: path.join(rootDir, "sessions"),
-      removeWorkspace: mock(() => Promise.resolve()),
-      findWorkspace: mock(() => ({ workspacePath, projectPath })),
-      loadConfigOrDefault: mock(() => topology),
-      editConfig: mock((edit: (cfg: typeof topology) => typeof topology) =>
-        Promise.resolve(edit(topology))
-      ),
-    } as unknown as Partial<Config>;
-  }
-
-  function buildAiService(): AIService {
-    return {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve(
-          Ok({
-            id: workspaceId,
-            name: "child",
-            projectPath,
-            projectName: "proj",
-            runtimeConfig,
-            parentWorkspaceId: ownerId,
-          })
-        )
-      ),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
+  async function createHandoverHarness(): Promise<WorkspaceServiceHarness> {
+    const harness = await createWorkspaceServiceHarness();
+    await saveWorkspaces(harness.config, projectPath, [
+      projectWorkspace(projectPath, "owner-ws", ownerId, { name: "owner", runtimeConfig }),
+      projectWorkspace(projectPath, "child-ws", workspaceId, {
+        name: "child",
+        runtimeConfig,
+        parentWorkspaceId: ownerId,
+      }),
+    ]);
+    await fsPromises.mkdir(sessionDirOf(harness.config, workspaceId), { recursive: true });
+    return harness;
   }
 
   test("a handover the owner cannot take aborts before the checkout is deleted", async () => {
@@ -355,11 +253,9 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       deleteWorkspace,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    await using harness = await createHandoverHarness();
+    const { config, service: workspaceService } = harness;
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig(),
-        aiService: buildAiService(),
-      });
       let adoptions = 0;
       workspaceService.setSharedWorkspaceMemoryStore({
         adoptLegacyPrivateStoreForRemoval: (_child, _owner, options) => {
@@ -376,12 +272,12 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
       if (!result.success) expect(result.error).toContain("could not be folded");
       expect(adoptions).toBe(2);
       expect(deleteWorkspace).not.toHaveBeenCalled();
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+      expect(existsSync(sessionDirOf(config, workspaceId))).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(config.rootDir, workspaceId)).toBe(false);
       // force accepts the loss and completes the removal.
       expect((await workspaceService.remove(workspaceId, true)).success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(false);
+      expect(existsSync(sessionDirOf(config, workspaceId))).toBe(false);
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -394,12 +290,9 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       deleteWorkspace,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    await using harness = await createHandoverHarness();
+    const { config, service: workspaceService } = harness;
     try {
-      const config = buildConfig();
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        aiService: buildAiService(),
-      });
       workspaceService.setSharedWorkspaceMemoryStore({
         adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
       });
@@ -432,23 +325,14 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
       if (!failed.success) expect(failed.error).toContain("sandbox teardown failed");
       // Still registered: the sealed marker is gone, the gate lifted, and
       // nothing was finalized.
-      expect(config.removeWorkspace).not.toHaveBeenCalled();
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(config.findWorkspace(workspaceId)).not.toBeNull();
+      expect(await isWorkspaceRemovalTombstoned(config.rootDir, workspaceId)).toBe(false);
+      expect(existsSync(sessionDirOf(config, workspaceId))).toBe(true);
       expect(calls).toContain("release");
       expect(calls).not.toContain("finalize");
       // The child's memory works again: its shared-store write is not
       // refused by a stale tombstone.
-      const memoryService = new MemoryService(
-        {
-          rootDir,
-          sessionsDir: path.join(rootDir, "sessions"),
-          loadConfigOrDefault: config.loadConfigOrDefault,
-          configFileStamp: () => "stable",
-          onConfigChanged: () => undefined,
-        } as unknown as Config,
-        new MemoryMetaService(rootDir)
-      );
+      const memoryService = new MemoryService(config, new MemoryMetaService(config.rootDir));
       const created = await memoryService.create(
         { runtime: null, checkoutCwd: "", workspaceId, projectPath: "" },
         "/memories/workspace/after-abort.md",
@@ -460,7 +344,7 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
       failSecondCancel = false;
       calls.length = 0;
       expect((await workspaceService.remove(workspaceId)).success).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(config.rootDir, workspaceId)).toBe(true);
       expect(calls).toContain("finalize");
       expect(calls).not.toContain("release");
     } finally {
@@ -480,18 +364,16 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       deleteWorkspace,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    await using harness = await createHandoverHarness();
+    const { config, service: workspaceService } = harness;
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig(),
-        aiService: buildAiService(),
-      });
       let sealedTombstone = false;
       workspaceService.setSharedWorkspaceMemoryStore({
         adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
       });
       deleteWorkspace.mockImplementation(async () => {
         // Runtime deletion runs with the tombstone already sealed.
-        sealedTombstone = await isWorkspaceRemovalTombstoned(rootDir, workspaceId);
+        sealedTombstone = await isWorkspaceRemovalTombstoned(config.rootDir, workspaceId);
         return refuse
           ? { success: false as const, error: "Workspace has uncommitted changes" }
           : { success: true as const, deletedPath: workspacePath };
@@ -500,11 +382,11 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
       expect(refused.success).toBe(false);
       if (!refused.success) expect(refused.error).toContain("uncommitted changes");
       expect(sealedTombstone).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
-      expect(existsSync(path.join(rootDir, "sessions", workspaceId))).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(config.rootDir, workspaceId)).toBe(false);
+      expect(existsSync(sessionDirOf(config, workspaceId))).toBe(true);
       refuse = false;
       expect((await workspaceService.remove(workspaceId)).success).toBe(true);
-      expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+      expect(await isWorkspaceRemovalTombstoned(config.rootDir, workspaceId)).toBe(true);
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -517,70 +399,36 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   const sharedPath = path.join(projectPath, "parent-ws");
   const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
 
-  function buildConfig(taskIsolation?: "none" | "fork"): Partial<Config> {
-    return {
-      // Unique per-build root: removal publishes durable tombstones under
-      // <rootDir>/locks, which must not leak across tests or runs.
-      rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
-      srcDir: "/tmp/src",
-      sessionsDir: path.join(tmpdir(), "mux-shared-guard"),
-      removeWorkspace: mock(() => Promise.resolve()),
-      findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map([
-          [
-            projectPath,
-            {
-              trusted: true,
-              workspaces: [
-                {
-                  id: workspaceId,
-                  name: "agent_explore_child",
-                  path: sharedPath,
-                  runtimeConfig,
-                  taskIsolation,
-                },
-              ],
-            },
-          ],
-        ]),
-      })),
-    } as unknown as Partial<Config>;
+  async function createChildHarness(
+    taskIsolation?: "none" | "fork"
+  ): Promise<WorkspaceServiceHarness> {
+    const harness = await createWorkspaceServiceHarness();
+    await saveWorkspaces(harness.config, projectPath, [
+      projectWorkspace(projectPath, "parent-ws", workspaceId, {
+        name: "agent_explore_child",
+        runtimeConfig,
+        taskIsolation,
+      }),
+    ]);
+    return harness;
   }
 
-  function buildAiService(): AIService {
-    class FakeAIService extends EventEmitter {
-      isStreaming = mock(() => false);
-      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            id: workspaceId,
-            name: "agent_explore_child",
-            projectPath,
-            runtimeConfig,
-          },
-        })
-      );
-    }
-    return new FakeAIService() as unknown as AIService;
-  }
-
-  test("does not delete the shared parent checkout for isolation: none tasks", async () => {
+  function mockDeleteWorkspace() {
     const deleteWorkspace = mock(() =>
       Promise.resolve({ success: true as const, deletedPath: sharedPath })
     );
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       deleteWorkspace,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig("none"),
-        aiService: buildAiService(),
-      });
+    return { deleteWorkspace, createRuntimeSpy };
+  }
 
-      const result = await workspaceService.remove(workspaceId, true);
+  test("does not delete the shared parent checkout for isolation: none tasks", async () => {
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
+    try {
+      await using harness = await createChildHarness("none");
+
+      const result = await harness.service.remove(workspaceId, true);
       expect(result.success).toBe(true);
       // The parent's checkout must never be physically deleted on behalf of a shared task.
       expect(deleteWorkspace).not.toHaveBeenCalled();
@@ -590,19 +438,11 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   });
 
   test("deletes the workspace for normal (forked) tasks", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildConfig(undefined),
-        aiService: buildAiService(),
-      });
+      await using harness = await createChildHarness(undefined);
 
-      const result = await workspaceService.remove(workspaceId, true);
+      const result = await harness.service.remove(workspaceId, true);
       expect(result.success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
     } finally {
@@ -611,76 +451,29 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   });
 
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
-  function buildParentConfig(childTaskStatus: string): Partial<Config> {
-    return {
-      rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
-      srcDir: "/tmp/src",
-      sessionsDir: path.join(tmpdir(), "mux-shared-guard"),
-      removeWorkspace: mock(() => Promise.resolve()),
-      findWorkspace: mock(() => ({ workspacePath: sharedPath, projectPath })),
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map([
-          [
-            projectPath,
-            {
-              trusted: true,
-              workspaces: [
-                {
-                  id: "parent-ws-id",
-                  name: "parent-ws",
-                  path: sharedPath,
-                  runtimeConfig,
-                },
-                {
-                  id: workspaceId,
-                  name: "agent_explore_child",
-                  path: sharedPath,
-                  runtimeConfig,
-                  parentWorkspaceId: "parent-ws-id",
-                  taskIsolation: "none",
-                  taskStatus: childTaskStatus,
-                },
-              ],
-            },
-          ],
-        ]),
-      })),
-    } as unknown as Partial<Config>;
-  }
-
-  function buildParentAiService(): AIService {
-    class FakeAIService extends EventEmitter {
-      isStreaming = mock(() => false);
-      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({
-          success: true as const,
-          data: {
-            id: "parent-ws-id",
-            name: "parent-ws",
-            projectPath,
-            runtimeConfig,
-          },
-        })
-      );
-    }
-    return new FakeAIService() as unknown as AIService;
+  async function createParentHarness(
+    childTaskStatus: "running" | "queued" | "reported"
+  ): Promise<WorkspaceServiceHarness> {
+    const harness = await createWorkspaceServiceHarness();
+    await saveWorkspaces(harness.config, projectPath, [
+      projectWorkspace(projectPath, "parent-ws", "parent-ws-id", { runtimeConfig }),
+      projectWorkspace(projectPath, "parent-ws", workspaceId, {
+        name: "agent_explore_child",
+        runtimeConfig,
+        parentWorkspaceId: "parent-ws-id",
+        taskIsolation: "none",
+        taskStatus: childTaskStatus,
+      }),
+    ]);
+    return harness;
   }
 
   test("does not delete a parent checkout shared by an active isolation: none child", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildParentConfig("running"),
-        aiService: buildParentAiService(),
-      });
+      await using harness = await createParentHarness("running");
 
-      const result = await workspaceService.remove("parent-ws-id", true);
+      const result = await harness.service.remove("parent-ws-id", true);
       expect(result.success).toBe(true);
       // The running shared child still uses this checkout as its cwd.
       expect(deleteWorkspace).not.toHaveBeenCalled();
@@ -690,19 +483,11 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   });
 
   test("deletes a parent checkout when its shared child is only queued (fails fast at dequeue like forked tasks)", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildParentConfig("queued"),
-        aiService: buildParentAiService(),
-      });
+      await using harness = await createParentHarness("queued");
 
-      const result = await workspaceService.remove("parent-ws-id", true);
+      const result = await harness.service.remove("parent-ws-id", true);
       expect(result.success).toBe(true);
       // Queued children require the parent config entry to launch regardless of isolation, so
       // they fail fast at dequeue either way — preserving the checkout would only leak it.
@@ -713,19 +498,11 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   });
 
   test("deletes a parent checkout when its shared child already reported", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: sharedPath })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config: buildParentConfig("reported"),
-        aiService: buildParentAiService(),
-      });
+      await using harness = await createParentHarness("reported");
 
-      const result = await workspaceService.remove("parent-ws-id", true);
+      const result = await harness.service.remove("parent-ws-id", true);
       expect(result.success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
     } finally {
@@ -737,15 +514,15 @@ describe("WorkspaceService remove shared-workspace guard", () => {
 describe("WorkspaceService shared-checkout tasks and owner renames", () => {
   const ownerId = "owner-shared-rename";
   const childId = "child-shared-rename";
+  let harness: WorkspaceServiceHarness;
   let config: Config;
-  let historyService: HistoryService;
-  let cleanup: () => Promise<void>;
   let workspaceService: WorkspaceService;
   let projectPath: string;
   let ownerPath: string;
 
   beforeEach(async () => {
-    ({ config, historyService, cleanup } = await createTestHistoryService());
+    harness = await createWorkspaceServiceHarness();
+    ({ config, service: workspaceService } = harness);
     projectPath = await createTestProject(config.rootDir);
     const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
     const runtime = runtimeFactory.createRuntime(runtimeConfig, { projectPath });
@@ -777,24 +554,10 @@ describe("WorkspaceService shared-checkout tasks and owner renames", () => {
         taskTrunkBranch: "parent",
       },
     ]);
-
-    class FakeAIService extends EventEmitter {
-      isStreaming = mock(() => false);
-      stopStream = mock(() => Promise.resolve(Ok(undefined)));
-      getWorkspaceMetadata = mock(async (workspaceId: string) => {
-        const metadata = await config.getWorkspaceMetadataById(workspaceId);
-        return metadata ? Ok(metadata) : Err("not found");
-      });
-    }
-    workspaceService = createWorkspaceServiceForTest({
-      config,
-      historyService,
-      aiService: new FakeAIService() as unknown as AIService,
-    });
   });
 
   afterEach(async () => {
-    await cleanup();
+    await harness.cleanup();
   });
 
   test("refuses to rename a shared child before touching any runtime", async () => {
@@ -866,135 +629,91 @@ describe("WorkspaceService shared-checkout tasks and owner renames", () => {
 describe("WorkspaceService remove shared memory owner pinning", () => {
   const projectPath = "/tmp/proj-memory-pin";
   const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
-  interface Entry {
-    id: string;
-    name: string;
-    path: string;
-    runtimeConfig: typeof runtimeConfig;
-    parentWorkspaceId?: string;
-    memoryOwnerWorkspaceId?: string;
-  }
 
   /** owner → mid → grand: removing `mid` must keep `grand` on the owner's notebook. */
-  function buildTopology(): { projects: Map<string, { trusted: boolean; workspaces: Entry[] }> } {
-    return {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            trusted: true,
-            workspaces: [
-              { id: "ws-owner", name: "owner", path: `${projectPath}/owner`, runtimeConfig },
-              {
-                id: "ws-mid",
-                name: "mid",
-                path: `${projectPath}/mid`,
-                runtimeConfig,
-                parentWorkspaceId: "ws-owner",
-              },
-              {
-                id: "ws-grand",
-                name: "grand",
-                path: `${projectPath}/grand`,
-                runtimeConfig,
-                parentWorkspaceId: "ws-mid",
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-  }
-
-  function buildConfig(options: { persistPins: boolean }): {
-    config: Partial<Config>;
-    topology: ReturnType<typeof buildTopology>;
-  } {
-    const topology = buildTopology();
-    const config = {
-      rootDir: path.join(tmpdir(), "mux-memory-pin", `root-${crypto.randomUUID()}`),
-      srcDir: "/tmp/src",
-      sessionsDir: path.join(tmpdir(), "mux-memory-pin", `sessions-${crypto.randomUUID()}`),
-      removeWorkspace: mock(() => Promise.resolve()),
-      findWorkspace: mock(() => ({ workspacePath: `${projectPath}/mid`, projectPath })),
-      loadConfigOrDefault: mock(() => topology),
+  async function createPinHarness(options: {
+    persistPins: boolean;
+  }): Promise<WorkspaceServiceHarness> {
+    const harness = await createWorkspaceServiceHarness();
+    const { config } = harness;
+    await saveWorkspaces(config, projectPath, [
+      projectWorkspace(projectPath, "owner", "ws-owner", { runtimeConfig }),
+      projectWorkspace(projectPath, "mid", "ws-mid", {
+        runtimeConfig,
+        parentWorkspaceId: "ws-owner",
+      }),
+      projectWorkspace(projectPath, "grand", "ws-grand", {
+        runtimeConfig,
+        parentWorkspaceId: "ws-mid",
+      }),
+    ]);
+    if (!options.persistPins) {
       // Config swallows write failures: a pin that does not land must be
       // caught by the removal's verified read-back, so the no-persist variant
-      // applies the edit to a throwaway copy.
-      editConfig: mock((edit: (cfg: ReturnType<typeof buildTopology>) => unknown) => {
-        edit(options.persistPins ? topology : buildTopology());
-        return Promise.resolve();
-      }),
-    } as unknown as Partial<Config>;
-    return { config, topology };
-  }
-
-  function buildAiService(): AIService {
-    class FakeAIService extends EventEmitter {
-      isStreaming = mock(() => false);
-      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({
-          success: true as const,
-          data: { id: "ws-mid", name: "mid", projectPath, runtimeConfig },
-        })
+      // drops every memory-owner pin from the edits it writes.
+      const editConfig = config.editConfig.bind(config);
+      spyOn(config, "editConfig").mockImplementation((edit, editOptions) =>
+        editConfig((cfg) => {
+          const next = edit(cfg);
+          for (const project of next.projects.values()) {
+            for (const workspace of project.workspaces) delete workspace.memoryOwnerWorkspaceId;
+          }
+          return next;
+        }, editOptions)
       );
     }
-    return new FakeAIService() as unknown as AIService;
+    return harness;
   }
 
-  test("pins surviving descendants to the root owner before tearing the middle node down", async () => {
+  function findEntry(config: Config, workspaceId: string) {
+    return config
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((ws) => ws.id === workspaceId);
+  }
+
+  function mockDeleteWorkspace() {
     const deleteWorkspace = mock(() =>
       Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
     );
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       deleteWorkspace,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    const { config, topology } = buildConfig({ persistPins: true });
+    return { deleteWorkspace, createRuntimeSpy };
+  }
+
+  test("pins surviving descendants to the root owner before tearing the middle node down", async () => {
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        aiService: buildAiService(),
-      });
-      const result = await workspaceService.remove("ws-mid");
+      await using harness = await createPinHarness({ persistPins: true });
+      const { config } = harness;
+      const result = await harness.service.remove("ws-mid");
       expect(result.success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
-      const grand = topology.projects
-        .get(projectPath)!
-        .workspaces.find((ws) => ws.id === "ws-grand");
-      expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+      expect(findEntry(config, "ws-grand")?.memoryOwnerWorkspaceId).toBe("ws-owner");
       // Once ws-mid is gone the pin keeps ws-grand on the root's notebook.
-      topology.projects.get(projectPath)!.workspaces = topology.projects
-        .get(projectPath)!
-        .workspaces.filter((ws) => ws.id !== "ws-mid");
-      expect(resolveWorkspaceMemoryOwnerId(topology as never, "ws-grand")).toBe("ws-owner");
+      expect(findEntry(config, "ws-mid")).toBeUndefined();
+      expect(resolveWorkspaceMemoryOwnerId(config.loadConfigOrDefault(), "ws-grand")).toBe(
+        "ws-owner"
+      );
     } finally {
       createRuntimeSpy.mockRestore();
     }
   });
 
   test("aborts a non-forced removal (workspace intact) when the descendant pin does not persist", async () => {
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    const { config } = buildConfig({ persistPins: false });
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        aiService: buildAiService(),
-      });
-      const refused = await workspaceService.remove("ws-mid");
+      await using harness = await createPinHarness({ persistPins: false });
+      const refused = await harness.service.remove("ws-mid");
       expect(refused.success).toBe(false);
       if (!refused.success) expect(refused.error).toContain("retry the removal");
       // Nothing destructive ran: no checkout deletion, no deregistration.
       expect(deleteWorkspace).not.toHaveBeenCalled();
-      expect(config.removeWorkspace).not.toHaveBeenCalled();
+      expect(findEntry(harness.config, "ws-mid")).toBeDefined();
 
       // Forced removal accepts the loss and proceeds.
-      const forced = await workspaceService.remove("ws-mid", true);
+      const forced = await harness.service.remove("ws-mid", true);
       expect(forced.success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
     } finally {
@@ -1006,37 +725,40 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
     // An unreadable config.json: the lenient read yields an empty topology
     // (this workspace would look like its own owner — no pins, no handover),
     // the strict one throws. The removal must decide from the strict read.
-    const deleteWorkspace = mock(() =>
-      Promise.resolve({ success: true as const, deletedPath: `${projectPath}/mid` })
-    );
-    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      deleteWorkspace,
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    const { config } = buildConfig({ persistPins: true });
-    const loadConfigOrDefault = mock((options?: { throwOnError?: boolean }) => {
-      if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
-      return { projects: new Map() };
-    });
-    (config as { loadConfigOrDefault: unknown }).loadConfigOrDefault = loadConfigOrDefault;
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        aiService: buildAiService(),
-      });
-      const refused = await workspaceService.remove("ws-mid");
-      expect(refused.success).toBe(false);
-      if (!refused.success) {
-        expect(refused.error).toContain("config.json unreadable");
-        expect(refused.error).toContain("retry the removal");
-      }
-      expect(deleteWorkspace).not.toHaveBeenCalled();
-      expect(config.removeWorkspace).not.toHaveBeenCalled();
-      expect(config.editConfig).not.toHaveBeenCalled();
+      await using harness = await createPinHarness({ persistPins: true });
+      const { config, aiService } = harness;
+      // The workspace metadata was built before config.json became unreadable.
+      const midMetadata = await config.getWorkspaceMetadataById("ws-mid");
+      if (midMetadata == null) throw new Error("ws-mid metadata is missing");
+      spyOn(aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(midMetadata));
+      const loadConfigOrDefault = spyOn(config, "loadConfigOrDefault").mockImplementation(
+        (options?: { throwOnError?: boolean }) => {
+          if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
+          return { projects: new Map() };
+        }
+      );
+      const editConfig = spyOn(config, "editConfig");
+      const removeWorkspace = spyOn(config, "removeWorkspace");
+      try {
+        const refused = await harness.service.remove("ws-mid");
+        expect(refused.success).toBe(false);
+        if (!refused.success) {
+          expect(refused.error).toContain("config.json unreadable");
+          expect(refused.error).toContain("retry the removal");
+        }
+        expect(deleteWorkspace).not.toHaveBeenCalled();
+        expect(removeWorkspace).not.toHaveBeenCalled();
+        expect(editConfig).not.toHaveBeenCalled();
 
-      // Forced removal accepts the loss and proceeds.
-      const forced = await workspaceService.remove("ws-mid", true);
-      expect(forced.success).toBe(true);
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+        // Forced removal accepts the loss and proceeds.
+        const forced = await harness.service.remove("ws-mid", true);
+        expect(forced.success).toBe(true);
+        expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      } finally {
+        loadConfigOrDefault.mockRestore();
+      }
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -1046,89 +768,50 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
     // The phantom-cleanup path: no metadata, yet the config entry is removed
     // all the same — the pin is a config-only edit and must still land, or a
     // surviving child silently falls back to a private notebook.
-    class PhantomAiService extends EventEmitter {
-      isStreaming = mock(() => false);
-      stopStream = mock(() => Promise.resolve({ success: true as const, data: undefined }));
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({ success: false as const, error: "metadata unavailable" })
-      );
-    }
-    const { config, topology } = buildConfig({ persistPins: true });
-    const workspaceService = createWorkspaceServiceForTest({
-      config,
-      aiService: new PhantomAiService() as unknown as AIService,
-    });
-    const result = await workspaceService.remove("ws-mid");
+    await using harness = await createPinHarness({ persistPins: true });
+    spyOn(harness.aiService, "getWorkspaceMetadata").mockResolvedValue(Err("metadata unavailable"));
+    const result = await harness.service.remove("ws-mid");
     expect(result.success).toBe(true);
-    expect(config.removeWorkspace).toHaveBeenCalledTimes(1);
-    const grand = topology.projects.get(projectPath)!.workspaces.find((ws) => ws.id === "ws-grand");
-    expect(grand?.memoryOwnerWorkspaceId).toBe("ws-owner");
+    expect(findEntry(harness.config, "ws-mid")).toBeUndefined();
+    expect(findEntry(harness.config, "ws-grand")?.memoryOwnerWorkspaceId).toBe("ws-owner");
 
     // ...and a pin that does not persist still aborts the non-forced removal
     // on that path, before the config entry is dropped.
-    const unpersisted = buildConfig({ persistPins: false });
-    const refusing = createWorkspaceServiceForTest({
-      config: unpersisted.config,
-      aiService: new PhantomAiService() as unknown as AIService,
-    });
-    const refused = await refusing.remove("ws-mid");
+    await using unpersisted = await createPinHarness({ persistPins: false });
+    spyOn(unpersisted.aiService, "getWorkspaceMetadata").mockResolvedValue(
+      Err("metadata unavailable")
+    );
+    const refused = await unpersisted.service.remove("ws-mid");
     expect(refused.success).toBe(false);
-    expect(unpersisted.config.removeWorkspace).not.toHaveBeenCalled();
+    expect(findEntry(unpersisted.config, "ws-mid")).toBeDefined();
   });
 });
 
 describe("WorkspaceService remove desktop session cleanup", () => {
   const workspaceId = "ws-remove-desktop";
 
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
+  let config: Config;
   let workspaceService: WorkspaceService;
-  let removeWorkspaceMock: ReturnType<typeof mock>;
-  let tempRoot: string;
+  let projectPath: string;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-    tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-desktop-"));
-    removeWorkspaceMock = mock(() => Promise.resolve());
-
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      stopStream: mock(() => Promise.resolve(Ok(undefined))),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Err("not found"))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      // r63: removal serializes session-dir deletion with the memory target
-      // locks and removal tombstones under `<rootDir>/locks`.
-      rootDir: tempRoot,
-      sessionsDir: path.join(tempRoot, "sessions"),
-      removeWorkspace: removeWorkspaceMock,
-      findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-      // The descendant pin pass edits whatever topology a test installed.
-      editConfig: mock((edit: (cfg: unknown) => unknown) => {
-        edit(mockConfig.loadConfigOrDefault!());
-        return Promise.resolve();
-      }) as unknown as MockWorkspaceConfig["editConfig"],
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    // No workspace metadata, so removal takes the phantom-cleanup path.
+    harness = await createWorkspaceServiceHarness({
+      aiServiceOverrides: {
+        getWorkspaceMetadata: (id: string) =>
+          Promise.resolve(Err(`Workspace metadata not found for ${id}`)),
+      },
     });
+    ({ config, service: workspaceService } = harness);
+    projectPath = path.join(harness.rootDir, "project");
+    await saveWorkspaces(config, projectPath, [
+      projectWorkspace(projectPath, "child", workspaceId, { runtimeConfig: { type: "local" } }),
+    ]);
   });
 
   afterEach(async () => {
-    await fsPromises.rm(tempRoot, { recursive: true, force: true });
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("remove() closes desktop sessions on success", async () => {
@@ -1158,21 +841,20 @@ describe("WorkspaceService remove desktop session cleanup", () => {
   });
 
   test("remove() reopens the timeline when removal aborts with the workspace still configured", async () => {
-    await fsPromises.mkdir(path.join(tempRoot, "sessions", workspaceId), { recursive: true });
+    await fsPromises.mkdir(sessionDirOf(config, workspaceId), { recursive: true });
     const reopened: string[] = [];
     workspaceService.setTimelineRecorder({
       record: () => undefined,
       closeWorkspace: () => Promise.resolve(),
       reopenWorkspace: (id) => reopened.push(id),
     });
-    removeWorkspaceMock.mockImplementation(() => {
-      throw new Error("config write failed");
-    });
+    spyOn(config, "removeWorkspace").mockRejectedValueOnce(new Error("config write failed"));
 
     const result = await workspaceService.remove(workspaceId);
 
     expect(result.success).toBe(false);
     expect(reopened).toEqual([workspaceId]);
+    expect(config.findWorkspace(workspaceId)).not.toBeNull();
   });
 
   test("remove() lifts the consolidation teardown gate only when it aborts before committing", async () => {
@@ -1207,25 +889,17 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     // directory survives, so the gate is lifted too.
     descendants = false;
     calls.length = 0;
-    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    const sessionDir = sessionDirOf(config, workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });
-    const topology = {
-      projects: new Map([
-        [
-          "/tmp/src/project",
-          {
-            workspaces: [
-              { path: "/tmp/src/project/owner", id: "ws-owner" },
-              { path: "/tmp/src/project/child", id: workspaceId, parentWorkspaceId: "ws-owner" },
-            ],
-          },
-        ],
-      ]),
-    };
-    // The service holds its own copy of the mock config (createWorkspaceServiceForTest).
-    const config = (workspaceService as unknown as { config: MockWorkspaceConfig }).config;
-    const previousLoad = config.loadConfigOrDefault;
-    config.loadConfigOrDefault = (() => topology) as MockWorkspaceConfig["loadConfigOrDefault"];
+    const setOwner = (owned: boolean) =>
+      saveWorkspaces(config, projectPath, [
+        ...(owned ? [projectWorkspace(projectPath, "owner", "ws-owner")] : []),
+        projectWorkspace(projectPath, "child", workspaceId, {
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId: owned ? "ws-owner" : undefined,
+        }),
+      ]);
+    await setOwner(true);
     workspaceService.setSharedWorkspaceMemoryStore({
       adoptLegacyPrivateStoreForRemoval: () =>
         Promise.reject(new Error("1 legacy note could not be folded into the shared notebook")),
@@ -1239,7 +913,7 @@ describe("WorkspaceService remove desktop session cleanup", () => {
       expect(calls).toContain("release");
       expect(calls).not.toContain("finalize");
     } finally {
-      config.loadConfigOrDefault = previousLoad;
+      await setOwner(false);
       workspaceService.setSharedWorkspaceMemoryStore({
         adoptLegacyPrivateStoreForRemoval: () => Promise.resolve(),
       });
@@ -1267,18 +941,18 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     workspaceService.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
       if (event.metadata === null) removed.push(event.workspaceId);
     });
-    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    const sessionDir = sessionDirOf(config, workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });
     // Deregistration already committed: harvest bookkeeping is best-effort.
     const result = await workspaceService.remove(workspaceId);
     expect(result.success).toBe(true);
-    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);
+    expect(config.findWorkspace(workspaceId)).toBeNull();
     expect(removed).toEqual([workspaceId]);
     expect(existsSync(sessionDir)).toBe(false);
   });
 
   test("remove() flushes the timeline before deleting the session directory", async () => {
-    const sessionDir = path.join(tempRoot, "sessions", workspaceId);
+    const sessionDir = sessionDirOf(config, workspaceId);
     await fsPromises.mkdir(sessionDir, { recursive: true });
     const order: string[] = [];
     workspaceService.setTimelineRecorder({
@@ -1312,85 +986,56 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     expect(result.success).toBe(true);
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
-    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);
+    expect(config.findWorkspace(workspaceId)).toBeNull();
   });
 });
 
 describe("WorkspaceService deleteWorktree", () => {
   const workspaceId = "ws-delete-worktree";
-  const projectName = "proj";
   const projectPath = "/tmp/project";
   const workspaceName = "ws-delete-worktree";
 
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let tempSrcBaseDir: string;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+    harness = await createWorkspaceServiceHarness();
     tempSrcBaseDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-delete-worktree-"));
   });
 
   afterEach(async () => {
     mock.restore();
-    await cleanupHistory();
+    await harness.cleanup();
     await fsPromises.rm(tempSrcBaseDir, { recursive: true, force: true });
   });
 
-  function createHarness(options?: {
+  async function setUpWorkspace(options?: {
     archivedAt?: string;
     runtimeConfig?: FrontendWorkspaceMetadata["runtimeConfig"];
     taskIsolation?: FrontendWorkspaceMetadata["taskIsolation"];
-  }): {
+  }): Promise<{
     workspaceService: WorkspaceService;
     metadataEvents: Array<FrontendWorkspaceMetadata | null>;
     managedPath: string;
-  } {
+  }> {
     const runtimeConfig = options?.runtimeConfig ?? {
       type: "worktree",
       srcBaseDir: tempSrcBaseDir,
     };
     const managedPath = path.join(tempSrcBaseDir, "_workspaces", workspaceName);
-
-    const getCurrentMetadata = async (): Promise<FrontendWorkspaceMetadata> => {
-      const transcriptOnly = await fsPromises
-        .access(managedPath)
-        .then(() => false)
-        .catch(() => true);
-
-      return {
+    // The real config probes the checkout, so a missing managedPath reads as transcript-only.
+    await saveWorkspaces(harness.config, projectPath, [
+      {
         id: workspaceId,
         name: workspaceName,
-        projectName,
-        projectPath,
+        path: managedPath,
         runtimeConfig,
         archivedAt: options?.archivedAt,
         taskIsolation: options?.taskIsolation,
-        transcriptOnly,
-        namedWorkspacePath: managedPath,
-      };
-    };
+      },
+    ]);
 
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: tempSrcBaseDir,
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      getAllWorkspaceMetadata: mock(async () => [await getCurrentMetadata()]),
-    };
-
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-
-    const workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-    });
-
+    const workspaceService = harness.service;
     const metadataEvents: Array<FrontendWorkspaceMetadata | null> = [];
     workspaceService.on("metadata", (event: unknown) => {
       if (!event || typeof event !== "object") {
@@ -1406,7 +1051,7 @@ describe("WorkspaceService deleteWorktree", () => {
   }
 
   test("deletes an archived managed worktree and emits transcript-only metadata", async () => {
-    const { workspaceService, metadataEvents, managedPath } = createHarness({
+    const { workspaceService, metadataEvents, managedPath } = await setUpWorkspace({
       archivedAt: "2026-03-01T00:00:00.000Z",
     });
     await fsPromises.mkdir(managedPath, { recursive: true });
@@ -1431,7 +1076,7 @@ describe("WorkspaceService deleteWorktree", () => {
   });
 
   test("returns success when the managed worktree is already missing", async () => {
-    const { workspaceService, metadataEvents, managedPath } = createHarness({
+    const { workspaceService, metadataEvents, managedPath } = await setUpWorkspace({
       archivedAt: "2026-03-01T00:00:00.000Z",
     });
     const removeManagedGitWorktreeSpy = spyOn(
@@ -1447,7 +1092,7 @@ describe("WorkspaceService deleteWorktree", () => {
   });
 
   test("rejects deleting a worktree for a non-archived workspace", async () => {
-    const { workspaceService, managedPath } = createHarness({
+    const { workspaceService, managedPath } = await setUpWorkspace({
       archivedAt: undefined,
     });
     await fsPromises.mkdir(managedPath, { recursive: true });
@@ -1467,7 +1112,7 @@ describe("WorkspaceService deleteWorktree", () => {
   });
 
   test("rejects deleting the shared checkout for an isolation-none sub-agent", async () => {
-    const { workspaceService, managedPath } = createHarness({
+    const { workspaceService, managedPath } = await setUpWorkspace({
       archivedAt: "2026-03-01T00:00:00.000Z",
       taskIsolation: "none",
     });
@@ -1484,7 +1129,7 @@ describe("WorkspaceService deleteWorktree", () => {
   });
 
   test("rejects deleting a worktree for non-worktree runtimes", async () => {
-    const { workspaceService } = createHarness({
+    const { workspaceService } = await setUpWorkspace({
       archivedAt: "2026-03-01T00:00:00.000Z",
       runtimeConfig: { type: "local" },
     });
@@ -1508,22 +1153,10 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
     // settles, so that spend landed after the snapshot and was permanently
     // lost from parent accounting (the child is deleted with no second
     // rollup). Drains must complete before the snapshot is read.
-    const { config, historyService, cleanup } = await createTestHistoryService();
     const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-"));
     const parentId = "rollup-parent-ws";
     const childId = "rollup-child-ws";
     try {
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectDir, {
-          trusted: true,
-          workspaces: [
-            { path: projectDir, id: parentId, name: parentId },
-            { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
-          ],
-        });
-        return cfg;
-      });
-
       // Fake usage ledger: the draining refine pass records the child's
       // spend only when cancelInFlightRefinePass runs (modelling a settle-
       // time recordHeadlessUsage write).
@@ -1545,19 +1178,12 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         return Promise.resolve();
       });
 
-      const service = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        sessionUsageService,
-        aiService: createMockAIService({
-          getWorkspaceMetadata: (async (workspaceId: string) => {
-            const metadata = (await config.getAllWorkspaceMetadata()).find(
-              (m) => m.id === workspaceId
-            );
-            return metadata ? Ok(metadata) : Err("workspace not found");
-          }) as AIService["getWorkspaceMetadata"],
-        }),
-      });
+      await using harness = await createWorkspaceServiceHarness({ sessionUsageService });
+      const { config, service } = harness;
+      await saveWorkspaces(config, projectDir, [
+        { path: projectDir, id: parentId, name: parentId },
+        { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
+      ]);
       service.setRefinePassCanceller({ cancelInFlightRefinePass });
 
       const result = await service.remove(childId);
@@ -1571,7 +1197,6 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       expect(Object.keys(rollupCalls[0].byModel)).toContain("anthropic:claude-sonnet-4-5");
     } finally {
       await fsPromises.rm(projectDir, { recursive: true, force: true });
-      await cleanup();
     }
   });
 
@@ -1583,7 +1208,6 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
     // post-failure spend from parent accounting. Rollups must run only after
     // deletion can no longer fail, so a failed attempt rolls up nothing and
     // the retry captures the child's full (including post-failure) usage.
-    const { config, historyService, cleanup } = await createTestHistoryService();
     const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-retry-"));
     const parentId = "rollup-retry-parent-ws";
     const childId = "rollup-retry-child-ws";
@@ -1597,17 +1221,6 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
       deleteWorkspace: deleteWorkspaceMock,
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
     try {
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectDir, {
-          trusted: true,
-          workspaces: [
-            { path: projectDir, id: parentId, name: parentId },
-            { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
-          ],
-        });
-        return cfg;
-      });
-
       const childUsage: Record<string, unknown> = {
         "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
       };
@@ -1628,20 +1241,15 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         },
       } as unknown as SessionTimingService;
 
-      const service = createWorkspaceServiceForTest({
-        config,
-        historyService,
+      await using harness = await createWorkspaceServiceHarness({
         sessionUsageService,
         sessionTimingService,
-        aiService: createMockAIService({
-          getWorkspaceMetadata: (async (workspaceId: string) => {
-            const metadata = (await config.getAllWorkspaceMetadata()).find(
-              (m) => m.id === workspaceId
-            );
-            return metadata ? Ok(metadata) : Err("workspace not found");
-          }) as AIService["getWorkspaceMetadata"],
-        }),
       });
+      const { config, service } = harness;
+      await saveWorkspaces(config, projectDir, [
+        { path: projectDir, id: parentId, name: parentId },
+        { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
+      ]);
 
       // Non-forced removal fails at runtime deletion: the child stays usable,
       // so neither one-shot rollup may have been consumed.
@@ -1670,7 +1278,6 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
     } finally {
       createRuntimeSpy.mockRestore();
       await fsPromises.rm(projectDir, { recursive: true, force: true });
-      await cleanup();
     }
   });
 });
@@ -1682,7 +1289,8 @@ describe("WorkspaceService.remove checkout-deletion ordering", () => {
     // deletion — recreating .mux/skills inside the deleted tree (orphaned
     // state) or failing midway with the failure swallowed. The drain must
     // complete before any disk mutation.
-    const { config, historyService, cleanup } = await createTestHistoryService();
+    await using harness = await createWorkspaceServiceHarness();
+    const { config, service, aiService } = harness;
     const scratchId = "scratch-apply-race";
     const scratchDir = path.join(config.rootDir, "scratch", scratchId);
     try {
@@ -1717,14 +1325,7 @@ describe("WorkspaceService.remove checkout-deletion ordering", () => {
           "distilled\n"
         );
       });
-      const service = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        aiService: createMockAIService({
-          getWorkspaceMetadata: (() =>
-            Promise.resolve(Ok(scratchMetadata))) as AIService["getWorkspaceMetadata"],
-        }),
-      });
+      spyOn(aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(scratchMetadata));
       service.setRefinePassCanceller({ cancelInFlightRefinePass });
 
       const result = await service.remove(scratchId);
@@ -1740,7 +1341,6 @@ describe("WorkspaceService.remove checkout-deletion ordering", () => {
       expect(workdirExists).toBe(false);
     } finally {
       await fsPromises.rm(scratchDir, { recursive: true, force: true });
-      await cleanup();
     }
   });
 });

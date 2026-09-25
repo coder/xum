@@ -9,28 +9,22 @@ import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
-import type { ProjectsConfig } from "@/common/types/project";
+import type { Workspace } from "@/common/types/project";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import type { Config } from "@/node/config";
-import type { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import type { WorkspaceServiceArgs, MockWorkspaceConfig } from "./workspaceService.testHarness";
+import type { WorkspaceServiceArgs } from "./workspaceService.testHarness";
 import {
   addToArchivingWorkspaces,
   createDeferred,
-  mockInitStateManager,
-  createTestBackgroundProcessManager,
-  createWorkspaceServiceForTest,
   createMockAIService,
   createWorkspaceServiceHarness,
   type WorkspaceServiceHarness,
@@ -41,97 +35,63 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   const workspaceId = "ws-archive";
   const projectPath = "/tmp/project";
   const workspacePath = "/tmp/project/ws-archive";
-  const sessionsDir = "/tmp/test/sessions";
-  const externalEditorMarkerPath = path.join(sessionsDir, workspaceId, "external-editor-opened");
+  const runtimeConfig = { type: "local" as const, srcBaseDir: "/tmp" };
 
+  let harness: WorkspaceServiceHarness;
+  let config: Config;
   let workspaceService: WorkspaceService;
-  let mockAIService: AIService;
+  let aiService: AIService;
   let mockStreamManager: { getStreamInfo: ReturnType<typeof mock> };
-  let configState: ProjectsConfig;
-  let editConfigSpy: ReturnType<typeof mock>;
-  let historyService: HistoryService;
-  let historyConfig: Config;
-  let backgroundProcessManager: BackgroundProcessManager;
-  let cleanupHistory: () => Promise<void>;
+  let externalEditorMarkerPath: string;
 
-  const workspaceMetadata: WorkspaceMetadata = {
-    id: workspaceId,
-    name: "ws-archive",
-    projectName: "proj",
-    projectPath,
-    runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
-  };
+  /** Edits this suite's workspace entry in the real config. */
+  function editEntry(edit: (entry: Workspace) => void): Promise<void> {
+    return config.editConfig((cfg) => {
+      const entry = cfg.projects.get(projectPath)?.workspaces.find((w) => w.id === workspaceId);
+      if (!entry) throw new Error("workspace fixture must exist");
+      edit(entry);
+      return cfg;
+    });
+  }
+
+  function readEntry(): Workspace | undefined {
+    return config
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((w) => w.id === workspaceId);
+  }
 
   beforeEach(async () => {
-    configState = {
-      projects: new Map([
-        [
-          projectPath,
+    mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
+    harness = await createWorkspaceServiceHarness({
+      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
+    });
+    ({ config, service: workspaceService, aiService } = harness);
+    externalEditorMarkerPath = path.join(config.sessionsDir, workspaceId, "external-editor-opened");
+    // A complete entry (createdAt included), so metadata reads have no legacy fields to
+    // migrate via editConfig and the write assertions below see only archive's own writes.
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
           {
-            workspaces: [
-              {
-                path: workspacePath,
-                id: workspaceId,
-              },
-            ],
+            path: workspacePath,
+            id: workspaceId,
+            name: "ws-archive",
+            createdAt: "2020-01-01T00:00:00.000Z",
+            runtimeConfig,
           },
         ],
-      ]),
-    };
-
-    editConfigSpy = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-      configState = fn(configState);
-      return Promise.resolve();
-    });
-
-    ({
-      historyService,
-      config: historyConfig,
-      cleanup: cleanupHistory,
-    } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir,
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((id: string) => {
-        if (id !== workspaceId) {
-          return null;
-        }
-
-        return { projectPath, workspacePath };
-      }),
-      editConfig: editConfigSpy,
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      loadConfigOrDefault: mock(() => configState),
-    };
-    mockAIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
-    backgroundProcessManager = createTestBackgroundProcessManager();
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService: mockAIService,
-      initStateManager: mockInitStateManager as InitStateManager,
-      backgroundProcessManager,
-      streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
+      });
+      return cfg;
     });
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("archive refuses to hide a parent while descendant sub-agents remain active", async () => {
+    const editConfigCalls = spyOn(config, "editConfig");
     const hasActiveDescendantAgentTasksForWorkspace = mock(() => true);
     workspaceService.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({
@@ -147,7 +107,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(preflight).toEqual(Err(expectedError));
     expect(archive).toEqual(Err(expectedError));
     expect(hasActiveDescendantAgentTasksForWorkspace).toHaveBeenCalledWith(workspaceId);
-    expect(editConfigSpy).not.toHaveBeenCalled();
+    expect(editConfigCalls).not.toHaveBeenCalled();
+    expect(readEntry()?.archivedAt).toBeUndefined();
   });
 
   test.each([
@@ -156,21 +117,29 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   ] as const)(
     "archiving a %s queued child leaves its task status %s",
     async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
-      const project = configState.projects.get(projectPath);
-      if (!project) throw new Error("project fixture must exist");
-      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
-      Object.assign(project.workspaces[1], {
-        parentWorkspaceId: "owner",
-        taskStatus: "queued",
-        taskPrompt: "brief",
-        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)?.workspaces.unshift({
+          path: "/tmp/project/owner",
+          id: "owner",
+          name: "owner",
+          createdAt: "2020-01-01T00:00:00.000Z",
+        });
+        return cfg;
       });
+      await editEntry((entry) =>
+        Object.assign(entry, {
+          parentWorkspaceId: "owner",
+          taskStatus: "queued",
+          taskPrompt: "brief",
+          ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+        })
+      );
 
       expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
 
       // A shared child must not stay an active borrower of the owner's desktop while archived;
       // the queued brief survives for the reawaken path.
-      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      const entry = readEntry();
       expect(entry?.archivedAt).toBeTruthy();
       expect(entry?.taskStatus).toBe(expectedStatus);
       expect(entry?.taskPrompt).toBe("brief");
@@ -181,6 +150,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
+    const editConfigCalls = spyOn(config, "editConfig");
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -189,9 +159,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(result.error).toBe("hook failed");
     }
 
-    expect(editConfigSpy).toHaveBeenCalledTimes(0);
+    expect(editConfigCalls).toHaveBeenCalledTimes(0);
 
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeUndefined();
   });
 
@@ -200,11 +170,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
 
-    (mockAIService.isStreaming as ReturnType<typeof mock>).mockReturnValue(true);
+    spyOn(aiService, "isStreaming").mockReturnValue(true);
 
-    const interruptStreamSpy = mock(() => Promise.resolve(Ok(undefined)));
-    workspaceService.interruptStream =
-      interruptStreamSpy as unknown as typeof workspaceService.interruptStream;
+    const interruptStreamSpy = spyOn(workspaceService, "interruptStream").mockResolvedValue(
+      Ok(undefined)
+    );
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -225,14 +195,14 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const result = await workspaceService.archive(workspaceId);
 
     expect(result).toEqual(Ok({ kind: "archived" }));
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
   });
 
   test("archive() disposes a transient startup-recovery session once archivedAt is durable", async () => {
-    let editConfigCallsAtDispose = -1;
+    let archivedAtDispose: string | undefined;
     const dispose = mock(() => {
-      editConfigCallsAtDispose = editConfigSpy.mock.calls.length;
+      archivedAtDispose = readEntry()?.archivedAt;
     });
     const access = workspaceService as unknown as {
       transientStartupRecoverySessions: Map<string, AgentSession>;
@@ -245,7 +215,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     expect(result.success).toBe(true);
     expect(dispose).toHaveBeenCalledTimes(1);
-    expect(editConfigCallsAtDispose).toBe(1);
+    expect(archivedAtDispose).toBeTruthy();
     expect(access.transientStartupRecoverySessions.has(workspaceId)).toBe(false);
   });
 
@@ -297,16 +267,15 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     const archiving = workspaceService.archive(workspaceId);
     await started.promise;
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
     try {
-      expect(entry?.archivedAt).toBeUndefined();
+      expect(readEntry()?.archivedAt).toBeUndefined();
     } finally {
       released.resolve();
     }
     const result = await archiving;
 
     expect(result.success).toBe(true);
-    expect(entry?.archivedAt).toBeTruthy();
+    expect(readEntry()?.archivedAt).toBeTruthy();
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });
@@ -333,13 +302,14 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceLifecycleHooks(hooks);
+    const editConfigCalls = spyOn(config, "editConfig");
 
     const result = await workspaceService.archive(workspaceId);
 
     expect(result.success).toBe(true);
-    expect(editConfigSpy).toHaveBeenCalledTimes(1);
+    expect(editConfigCalls).toHaveBeenCalledTimes(1);
 
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
     expect(entry?.archivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
@@ -347,7 +317,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
 
     const afterHook = mock(() => {
-      const entry = configState.projects.get(projectPath)?.workspaces[0];
+      const entry = readEntry();
       expect(entry?.archivedAt).toBeTruthy();
       return Promise.resolve(Err("hook failed"));
     });
@@ -360,7 +330,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(result.success).toBe(true);
     expect(afterHook).toHaveBeenCalledTimes(1);
 
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
     expect(entry?.archivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
@@ -368,7 +338,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const removeWorkspaceData = mock((id: string) => {
       // devtools cleanup must run only once the archived state is durable
       expect(id).toBe(workspaceId);
-      const entry = configState.projects.get(projectPath)?.workspaces[0];
+      const entry = readEntry();
       expect(entry?.archivedAt).toBeTruthy();
       return Promise.resolve();
     });
@@ -392,28 +362,26 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const result = await workspaceService.archive(workspaceId);
 
     expect(result.success).toBe(true);
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
   });
 
   test("archive() honors the caller's pinned Coder policy over a flipped config read", async () => {
     // Dedicated (mux-created) Coder workspace: the remote-deletion guard only applies to these.
-    (mockAIService.getWorkspaceMetadata as ReturnType<typeof mock>).mockReturnValue(
-      Promise.resolve(
-        Ok({
-          ...workspaceMetadata,
-          runtimeConfig: {
-            type: "ssh",
-            host: "coder.example",
-            srcBaseDir: "/home/coder/src",
-            coder: { workspaceName: "mux-child", existingWorkspace: false },
-          },
-        })
-      )
-    );
+    await editEntry((entry) => {
+      entry.runtimeConfig = {
+        type: "ssh",
+        host: "coder.example",
+        srcBaseDir: "/home/coder/src",
+        coder: { workspaceName: "mux-child", existingWorkspace: false },
+      };
+    });
     // Simulate a keep → delete settings flip landing AFTER the caller read "keep" and committed
     // to the archive (e.g. by interrupting turns based on that read).
-    configState.coderWorkspaceArchiveBehavior = "delete";
+    await config.editConfig((cfg) => {
+      cfg.coderWorkspaceArchiveBehavior = "delete";
+      return cfg;
+    });
 
     const hooks = new WorkspaceLifecycleHooks();
     let hookBehavior: string | undefined;
@@ -585,7 +553,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   test("acquirePreInterruptionArchiveHold binds the stream exemption to the delegated turns", () => {
     const delegated = { taskHandleId: "wt-1", ownerWorkspaceId: "owner-1", turnId: "turn-1" };
     const streamMeta: Record<string, unknown> = { type: "workspace-turn-task", ...delegated };
-    Object.assign(mockAIService, { isStreaming: mock(() => true) });
+    spyOn(aiService, "isStreaming").mockReturnValue(true);
     // The delegated-turn correlation is read from the engine, not the AI facade.
     mockStreamManager.getStreamInfo = mock(() => ({ muxMetadata: streamMeta }));
 
@@ -613,9 +581,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // A stream with no correlation metadata (a plain user stream that replaced the ended
     // delegated stream) also refuses, even though a running delegated turn was collected —
     // the stale collection must not exempt whichever stream happens to be active now.
-    Object.assign(mockAIService, {
-      getStreamInfo: mock(() => ({ muxMetadata: undefined })),
-    });
+    mockStreamManager.getStreamInfo = mock(() => ({ muxMetadata: undefined }));
     const refusedPlain = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
       queuedDelegatedTurnCount: 0,
       expectedDelegatedTurnCorrelations: [delegated],
@@ -657,10 +623,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(releases).toBe(1);
 
     // A refused hold must not leak the admission block either.
-    Object.assign(mockAIService, {
-      isStreaming: mock(() => true),
-      getStreamInfo: mock(() => undefined),
-    });
+    spyOn(aiService, "isStreaming").mockReturnValue(true);
+    mockStreamManager.getStreamInfo = mock(() => undefined);
     const refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
       queuedDelegatedTurnCount: 0,
       expectedDelegatedTurnCorrelations: [],
@@ -746,10 +710,10 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       });
       return Promise.resolve(Ok(undefined));
     });
-    const harness = await createAgentSessionHarness({
+    const sessionHarness = await createAgentSessionHarness({
       workspaceId,
-      config: historyConfig,
-      historyService,
+      config,
+      historyService: harness.historyService,
       aiEmitter,
       aiServiceOverrides: {
         streamMessage: mock(async (request: Parameters<AIService["streamMessage"]>[0]) => {
@@ -767,12 +731,12 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     const internal = workspaceService as unknown as {
       sessions: Map<string, AgentSession>;
-      aiService: typeof harness.aiService;
+      aiService: typeof sessionHarness.aiService;
     };
-    internal.sessions.set(workspaceId, harness.session);
-    internal.aiService = harness.aiService;
+    internal.sessions.set(workspaceId, sessionHarness.session);
+    internal.aiService = sessionHarness.aiService;
     try {
-      const sent = harness.session.sendMessage(
+      const sent = sessionHarness.session.sendMessage(
         "Summarize",
         {
           model: "anthropic:claude-sonnet-4-5",
@@ -795,7 +759,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       if (!refused.success) {
         expect(refused.error).toContain("a message dispatching");
       }
-      expect(harness.session.isPreparingTurn()).toBe(true);
+      expect(sessionHarness.session.isPreparingTurn()).toBe(true);
 
       const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
         queuedDelegatedTurnCount: 0,
@@ -807,11 +771,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
         // What interruptWorkspaceTurn does for a running handle. The engine has aborted when
         // this resolves, but the session's aborted turn has not reached policy yet.
         expect((await stopStream()).success).toBe(true);
-        expect(harness.session.isPreparingTurn()).toBe(true);
+        expect(sessionHarness.session.isPreparingTurn()).toBe(true);
 
         await workspaceService.waitForIdle(workspaceId);
         expect((await sent).success).toBe(true);
-        expect(harness.session.hasActiveOrPendingTurnWork()).toBe(false);
+        expect(sessionHarness.session.hasActiveOrPendingTurnWork()).toBe(false);
         expect(
           await workspaceService.archive(workspaceId, undefined, { refuseLiveUserActivity: true })
         ).toEqual(Ok({ kind: "archived" }));
@@ -820,7 +784,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       }
     } finally {
       internal.sessions.delete(workspaceId);
-      await harness.session.dispose();
+      await sessionHarness.session.dispose();
     }
   });
 
@@ -858,9 +822,10 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // Simulates the post-unclean-restart state: the manager's in-memory map is empty but a
     // durable spawn record still points at a live nohup/setsid child (probe behavior itself
     // is covered in backgroundProcessManager.test.ts).
-    spyOn(backgroundProcessManager, "hasOrphanedRunningBackgroundProcesses").mockResolvedValueOnce(
-      true
-    );
+    spyOn(
+      harness.backgroundProcessManager,
+      "hasOrphanedRunningBackgroundProcesses"
+    ).mockResolvedValueOnce(true);
 
     const result = await workspaceService.archive(workspaceId, undefined, {
       refuseLiveUserActivity: true,
@@ -1069,7 +1034,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   test("rollbackAfterFailedLaunch preserves a marker that predates the recording", async () => {
     // An earlier session's editor may still be running behind a pre-existing marker; a later
     // failed launch must not delete the evidence protecting it.
-    await fsPromises.mkdir("/tmp/test/sessions", { recursive: true });
+    await fsPromises.mkdir(path.dirname(externalEditorMarkerPath), { recursive: true });
     await fsPromises.writeFile(externalEditorMarkerPath, "earlier session");
 
     const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
@@ -1142,11 +1107,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("resumeStream refuses archived workspaces", async () => {
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
-    expect(entry).toBeDefined();
-    if (entry) {
+    await editEntry((entry) => {
       entry.archivedAt = "2026-01-01T00:00:00.000Z";
-    }
+    });
 
     const result = await workspaceService.resumeStream(workspaceId, {
       model: "openai:gpt-4o-mini",
@@ -1705,90 +1668,62 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
   const projectPath = "/tmp/project-preflight";
   const workspacePath = "/tmp/project-preflight/ws-preflight-archive";
 
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let workspaceService: WorkspaceService;
 
-  const workspaceMetadata: WorkspaceMetadata = {
-    id: workspaceId,
-    name: "ws-preflight-archive",
-    projectName: "proj",
-    projectPath,
-    runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-  };
-
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const configState: ProjectsConfig = {
-      projects: new Map([
-        [
-          projectPath,
+    harness = await createWorkspaceServiceHarness();
+    workspaceService = harness.service;
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [
           {
-            workspaces: [
-              {
-                path: workspacePath,
-                id: workspaceId,
-                name: "ws-preflight-archive",
-                runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-              },
-            ],
+            path: workspacePath,
+            id: workspaceId,
+            name: "ws-preflight-archive",
+            createdAt: "2020-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
           },
         ],
-      ]),
-      worktreeArchiveBehavior: "snapshot",
-    };
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((id: string) => {
-        if (id !== workspaceId) return null;
-        return { projectPath, workspacePath };
-      }),
-      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        fn(configState);
-        return Promise.resolve();
-      }),
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      loadConfigOrDefault: mock(() => configState),
-    };
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+      });
+      cfg.worktreeArchiveBehavior = "snapshot";
+      return cfg;
     });
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
+
+  /** The metadata archive hands to the snapshot service, as read from the real config. */
+  async function readWorkspaceMetadata(): Promise<WorkspaceMetadata> {
+    const metadata = await harness.config.getWorkspaceMetadataById(workspaceId);
+    if (!metadata) throw new Error("workspace fixture must exist");
+    return metadata;
+  }
 
   test("preflightArchive returns ready for scratch workspaces under snapshot behavior", async () => {
     // Scratch chats run on the plain local runtime, so the worktree snapshot
     // preflight must short-circuit instead of consulting the snapshot service
     // (whose non-worktree path would reject and block archiving).
-    const scratchMetadata: WorkspaceMetadata = {
-      kind: "scratch",
-      id: workspaceId,
-      name: "ws-preflight-archive",
-      projectName: "Scratch",
-      projectPath: "/tmp/mux/scratch/ws-preflight-archive",
-      runtimeConfig: { type: "local" },
-    };
-    (workspaceService as unknown as { aiService: AIService }).aiService.getWorkspaceMetadata = mock(
-      () => Promise.resolve(Ok(scratchMetadata))
-    );
+    const scratchPath = path.join(harness.rootDir, "scratch", workspaceId);
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.delete(projectPath);
+      cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            kind: "scratch",
+            path: scratchPath,
+            id: workspaceId,
+            name: "ws-preflight-archive",
+            createdAt: "2020-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "local" },
+          },
+        ],
+      });
+      return cfg;
+    });
+    expect((await harness.config.getWorkspaceMetadataById(workspaceId))?.kind).toBe("scratch");
     const getUnsupportedUntrackedPaths = mock(() =>
       Promise.resolve(Err("Archive snapshots are only supported for worktree runtimes"))
     );
@@ -1885,6 +1820,7 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
       getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok(untrackedPaths))),
     });
 
+    const workspaceMetadata = await readWorkspaceMetadata();
     const result = await workspaceService.archive(workspaceId, untrackedPaths);
 
     expect(result).toEqual(Ok({ kind: "archived" }));
@@ -1912,6 +1848,7 @@ describe("WorkspaceService preflightArchive and acknowledged archive", () => {
       getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([".cache/", "temp.txt"]))),
     });
 
+    const workspaceMetadata = await readWorkspaceMetadata();
     const result = await workspaceService.archive(workspaceId, [".cache/", "temp.txt"]);
 
     expect(result).toEqual(
@@ -2103,15 +2040,10 @@ describe("WorkspaceService unarchive snapshot restore", () => {
 describe("WorkspaceService archiveMergedInProject", () => {
   const TARGET_PROJECT_PATH = "/tmp/project";
 
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
+  let harness: WorkspaceServiceHarness;
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   function createMetadata(
@@ -2174,50 +2106,38 @@ describe("WorkspaceService archiveMergedInProject", () => {
     return Promise.resolve(Ok({ kind: "archived" }));
   }
 
-  function createServiceHarness(
+  async function createServiceHarness(
     allMetadata: FrontendWorkspaceMetadata[],
     executeBashImpl: ExecuteBashFn,
     archiveImpl: ArchiveFn
-  ): {
-    workspaceService: WorkspaceService;
-    executeBashMock: ReturnType<typeof mock>;
-    archiveMock: ReturnType<typeof mock>;
-  } {
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-      getAllWorkspaceMetadata: mock(() => Promise.resolve(allMetadata)),
-    };
-
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as AIService;
-    const workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+  ) {
+    harness = await createWorkspaceServiceHarness();
+    // Register every workspace in the real config under its own project.
+    await harness.config.editConfig((cfg) => {
+      for (const metadata of allMetadata) {
+        const project = cfg.projects.get(metadata.projectPath) ?? { workspaces: [] };
+        project.workspaces.push({
+          path: metadata.namedWorkspacePath,
+          id: metadata.id,
+          name: metadata.name,
+          createdAt: "2020-01-01T00:00:00.000Z",
+          runtimeConfig: metadata.runtimeConfig,
+          archivedAt: metadata.archivedAt,
+          unarchivedAt: metadata.unarchivedAt,
+        });
+        cfg.projects.set(metadata.projectPath, project);
+      }
+      return cfg;
     });
+    const workspaceService = harness.service;
 
-    const executeBashMock = mock(executeBashImpl);
-    const archiveMock = mock(archiveImpl);
-
-    interface WorkspaceServiceTestAccess {
-      executeBash: typeof executeBashMock;
-      archive: typeof archiveMock;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.executeBash = executeBashMock;
-    svc.archive = archiveMock;
+    // executeBash would run `gh` in a real runtime and archive() has its own suites.
+    const executeBashMock = spyOn(workspaceService, "executeBash").mockImplementation(
+      executeBashImpl as unknown as WorkspaceService["executeBash"]
+    );
+    const archiveMock = spyOn(workspaceService, "archive").mockImplementation(
+      archiveImpl as unknown as WorkspaceService["archive"]
+    );
 
     return { workspaceService, executeBashMock, archiveMock };
   }
@@ -2238,7 +2158,7 @@ describe("WorkspaceService archiveMergedInProject", () => {
       "ws-merged-unarchived": bashOk('{"state":"MERGED"}'),
     };
 
-    const { workspaceService, executeBashMock, archiveMock } = createServiceHarness(
+    const { workspaceService, executeBashMock, archiveMock } = await createServiceHarness(
       allMetadata,
       (workspaceId) => {
         const result = ghResultsByWorkspaceId[workspaceId];
@@ -2282,7 +2202,7 @@ describe("WorkspaceService archiveMergedInProject", () => {
       "ws-no-pr": bashOk('{"no_pr":true}'),
     };
 
-    const { workspaceService, executeBashMock, archiveMock } = createServiceHarness(
+    const { workspaceService, executeBashMock, archiveMock } = await createServiceHarness(
       allMetadata,
       (workspaceId, script, options) => {
         expect(script).toContain("gh pr view --json state");
@@ -2327,7 +2247,7 @@ describe("WorkspaceService archiveMergedInProject", () => {
       "ws-no-pr": bashOk('{"no_pr":true}'),
     };
 
-    const { workspaceService, archiveMock } = createServiceHarness(
+    const { workspaceService, archiveMock } = await createServiceHarness(
       allMetadata,
       (workspaceId) => {
         const result = ghResultsByWorkspaceId[workspaceId];
@@ -2366,7 +2286,7 @@ describe("WorkspaceService archiveMergedInProject", () => {
       "ws-bash-failed": bashToolFailure("gh failed"),
     };
 
-    const { workspaceService, archiveMock } = createServiceHarness(
+    const { workspaceService, archiveMock } = await createServiceHarness(
       allMetadata,
       (workspaceId) => {
         const result = ghResultsByWorkspaceId[workspaceId];

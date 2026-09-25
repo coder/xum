@@ -1,72 +1,44 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
-import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
-import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import type { BashToolResult } from "@/common/types/tools";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as bashToolModule from "@/node/services/tools/bash";
 import * as runtimeExecHelpers from "@/node/utils/runtime/helpers";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   addToArchivingWorkspaces,
-  createWorkspaceServiceForTest,
+  createMockAIService,
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
 describe("WorkspaceService executeBash archive guards", () => {
+  let harness: WorkspaceServiceHarness;
   let workspaceService: WorkspaceService;
-  let waitForInitMock: ReturnType<typeof mock>;
+  let waitForInitMock: Mock<InitStateManager["waitForInit"]>;
   let getWorkspaceMetadataMock: ReturnType<typeof mock>;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
 
   beforeEach(async () => {
-    waitForInitMock = mock(() => Promise.resolve());
-
     getWorkspaceMetadataMock = mock(() =>
       Promise.resolve({ success: false as const, error: "not found" })
     );
-
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: getWorkspaceMetadataMock,
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-      waitForInit: waitForInitMock,
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: getWorkspaceMetadataMock,
+      }),
     });
+    workspaceService = harness.service;
+    // Real init manager (no init state, so waits resolve at once); the spy records whether
+    // executeBash reached init at all.
+    waitForInitMock = spyOn(harness.initStateManager, "waitForInit");
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("archived workspace => executeBash returns error mentioning archived", async () => {
@@ -179,11 +151,12 @@ describe("WorkspaceService executeBash archive guards", () => {
   test("getFileCompletions returns empty without touching the workspace while archiving", async () => {
     addToArchivingWorkspaces(workspaceService, "ws-completions");
 
-    // The sync entry guard must return before getInfo: this fixture's config has no
-    // getAllWorkspaceMetadata, so reaching metadata/runtime work would throw.
+    // The sync entry guard must return before getInfo reads workspace metadata.
+    const metadataSpy = spyOn(harness.config, "getAllWorkspaceMetadata");
     const result = await workspaceService.getFileCompletions("ws-completions", "src");
 
     expect(result.paths).toEqual([]);
+    expect(metadataSpy).not.toHaveBeenCalled();
   });
 
   test("in-flight staging and completion refreshes hold the archive gate", async () => {
@@ -193,25 +166,17 @@ describe("WorkspaceService executeBash archive guards", () => {
     const metadataGate = new Promise<never[]>((resolve) => {
       releaseMetadata = () => resolve([]);
     });
-    const service = createWorkspaceServiceForTest({
-      config: {
-        srcDir: "/tmp/test",
-        sessionsDir: "/tmp/test/sessions",
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-        getAllWorkspaceMetadata: mock(() => metadataGate),
-      } as unknown as Config,
-      historyService,
-    });
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockReturnValue(metadataGate);
 
-    const stagePromise = service.stageAttachment({
+    const stagePromise = workspaceService.stageAttachment({
       workspaceId: "ws-gate",
       filename: "notes.txt",
       sizeBytes: 1,
       dataBase64: Buffer.from("x").toString("base64"),
     });
-    const completionsPromise = service.getFileCompletions("ws-gate", "src");
+    const completionsPromise = workspaceService.getFileCompletions("ws-gate", "src");
 
-    const archiveResult = await service.archive("ws-gate", undefined, {
+    const archiveResult = await workspaceService.archive("ws-gate", undefined, {
       refuseLiveUserActivity: true,
     });
     expect(archiveResult.success).toBe(false);
@@ -229,66 +194,34 @@ describe("WorkspaceService executeBash archive guards", () => {
 });
 
 describe("WorkspaceService executeBash workspace path resolution", () => {
+  let harness: WorkspaceServiceHarness;
   let workspaceService: WorkspaceService;
-  let waitForInitMock: ReturnType<typeof mock>;
+  let waitForInitMock: Mock<InitStateManager["waitForInit"]>;
   let getWorkspaceMetadataMock: ReturnType<typeof mock>;
-  let findWorkspaceMock: ReturnType<typeof mock>;
   let createRuntimeSpy: Mock<typeof runtimeFactory.createRuntime>;
   let createBashToolSpy: Mock<typeof bashToolModule.createBashTool>;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
 
   beforeEach(async () => {
-    waitForInitMock = mock(() => Promise.resolve());
-    findWorkspaceMock = mock(() => ({
-      workspacePath: "/persisted/workspace-root",
+    const metadata = {
+      id: "ws-path",
+      name: "ws",
+      projectName: "proj",
       projectPath: "/tmp/proj",
-      workspaceName: "ws",
-    }));
-    getWorkspaceMetadataMock = mock(() =>
-      Promise.resolve(
-        Ok({
-          id: "ws-path",
-          name: "ws",
-          projectName: "proj",
-          projectPath: "/tmp/proj",
-          runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/runtime-src" },
-        } satisfies WorkspaceMetadata)
-      )
-    );
-
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: getWorkspaceMetadataMock,
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: findWorkspaceMock,
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-      waitForInit: waitForInitMock,
-    };
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
+      runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/runtime-src" },
+    } satisfies WorkspaceMetadata;
+    getWorkspaceMetadataMock = mock(() => Promise.resolve(Ok(metadata)));
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: getWorkspaceMetadataMock,
+      }),
+    });
+    workspaceService = harness.service;
+    waitForInitMock = spyOn(harness.initStateManager, "waitForInit");
+    // The persisted checkout root differs from where the runtime would derive it.
+    await harness.config.addWorkspace("/tmp/proj", {
+      ...metadata,
+      namedWorkspacePath: "/persisted/workspace-root",
     });
 
     createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
@@ -314,7 +247,7 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
   afterEach(async () => {
     createRuntimeSpy.mockRestore();
     createBashToolSpy.mockRestore();
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("uses persisted workspace root for path-addressable runtimes", async () => {
@@ -382,46 +315,16 @@ describe("WorkspaceService executeBash workspace path resolution", () => {
 });
 
 describe("WorkspaceService getFileCompletions", () => {
+  let harness: WorkspaceServiceHarness;
   let workspaceService: WorkspaceService;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
   let createRuntimeSpy: Mock<typeof runtimeFactory.createRuntime>;
   let execBufferedSpy: Mock<typeof runtimeExecHelpers.execBuffered>;
 
   beforeEach(async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      ),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-    };
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    workspaceService = harness.service;
 
     createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockImplementation(
       (_runtimeConfig, options) => {
@@ -446,7 +349,7 @@ describe("WorkspaceService getFileCompletions", () => {
   afterEach(async () => {
     createRuntimeSpy.mockRestore();
     execBufferedSpy.mockRestore();
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("keeps single-project completions unchanged", async () => {
@@ -500,8 +403,7 @@ describe("WorkspaceService getFileCompletions", () => {
         ],
       } satisfies FrontendWorkspaceMetadata)
     );
-    const config = (workspaceService as unknown as { config: Config }).config;
-    spyOn(config, "findWorkspace").mockReturnValue({
+    spyOn(harness.config, "findWorkspace").mockReturnValue({
       projectPath: "/tmp/project-a",
       workspacePath: "/tmp/src/project-a/ws",
     });
@@ -612,15 +514,12 @@ describe("WorkspaceService getFileCompletions", () => {
 });
 
 describe("WorkspaceService getProjectGitStatuses", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
+  const harnesses: WorkspaceServiceHarness[] = [];
 
   afterEach(async () => {
-    await cleanupHistory();
+    for (const harness of harnesses.splice(0)) {
+      await harness.cleanup();
+    }
   });
 
   function createGitStatusOutput(params?: {
@@ -661,7 +560,7 @@ describe("WorkspaceService getProjectGitStatuses", () => {
     };
   }
 
-  function createServiceHarness(params: {
+  async function createServiceHarness(params: {
     metadata: WorkspaceMetadata;
     executeBashImpl: (
       workspaceId: string,
@@ -672,40 +571,20 @@ describe("WorkspaceService getProjectGitStatuses", () => {
         repoRootProjectPath?: string | null;
       }
     ) => Promise<Result<BashToolResult>>;
-  }): {
+  }): Promise<{
     workspaceService: WorkspaceService;
     executeBashMock: ReturnType<typeof mock>;
     getWorkspaceMetadataMock: ReturnType<typeof mock>;
-  } {
+  }> {
     const getWorkspaceMetadataMock = mock(() => Promise.resolve(Ok(params.metadata)));
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: getWorkspaceMetadataMock,
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as AIService;
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-    };
-    const workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    const harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: getWorkspaceMetadataMock,
+      }),
     });
+    harnesses.push(harness);
+    const workspaceService = harness.service;
 
     const executeBashMock = mock(params.executeBashImpl);
 
@@ -728,7 +607,7 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       projectPath: "/tmp/mux/scratch/ws-scratch",
       runtimeConfig: { type: "local" },
     };
-    const { workspaceService, executeBashMock } = createServiceHarness({
+    const { workspaceService, executeBashMock } = await createServiceHarness({
       metadata,
       executeBashImpl: () => Promise.reject(new Error("git should not run")),
     });
@@ -746,10 +625,11 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       runtimeConfig: { type: "local" },
     };
 
-    const { workspaceService, executeBashMock, getWorkspaceMetadataMock } = createServiceHarness({
-      metadata,
-      executeBashImpl: () => Promise.resolve(bashOk(createGitStatusOutput({ dirtyCount: 2 }))),
-    });
+    const { workspaceService, executeBashMock, getWorkspaceMetadataMock } =
+      await createServiceHarness({
+        metadata,
+        executeBashImpl: () => Promise.resolve(bashOk(createGitStatusOutput({ dirtyCount: 2 }))),
+      });
 
     const result = await workspaceService.getProjectGitStatuses(metadata.id);
 
@@ -800,7 +680,7 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       ],
     };
 
-    const { workspaceService, executeBashMock } = createServiceHarness({
+    const { workspaceService, executeBashMock } = await createServiceHarness({
       metadata,
       executeBashImpl: (_workspaceId, _script, options) => {
         const repoRootProjectPath = options?.repoRootProjectPath;
@@ -856,7 +736,7 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       ],
     };
 
-    const { workspaceService } = createServiceHarness({
+    const { workspaceService } = await createServiceHarness({
       metadata,
       executeBashImpl: (_workspaceId, _script, options) => {
         if (options?.repoRootProjectPath === "/tmp/project-a") {
@@ -902,7 +782,7 @@ describe("WorkspaceService getProjectGitStatuses", () => {
       runtimeConfig: { type: "local" },
     };
 
-    const { workspaceService } = createServiceHarness({
+    const { workspaceService } = await createServiceHarness({
       metadata,
       executeBashImpl: () => Promise.resolve(bashOk("definitely not git status output")),
     });
