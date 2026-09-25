@@ -15,7 +15,6 @@ import { createStreamManagerForTests, fakeStreamText } from "./streamManager.tes
 import {
   installStreamManagerTestHistory,
   historyService,
-  appendPartialAssistantForTests,
   createStreamResultForTests,
   createTestLanguageModel,
   testStartOptions,
@@ -79,7 +78,8 @@ async function startTurnForTests(
   streamManager: StreamManager,
   options: Partial<TurnExecutionOptions> & { workspaceId: string; messageId: string }
 ) {
-  await appendPartialAssistantForTests(
+  await appendPlaceholderTurnForTests(
+    historyService,
     options.workspaceId,
     options.messageId,
     options.historySequence ?? 1
@@ -94,6 +94,26 @@ async function startTurnForTests(
   );
   if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result.error)}`);
   return result.data;
+}
+
+/**
+ * Seeds the turn's placeholder assistant row in the SAME HistoryService the manager writes, so
+ * stream end/abort update or delete that pre-seeded row (the suite helper always seeds the
+ * module-global instance, which per-test histories never read).
+ */
+async function appendPlaceholderTurnForTests(
+  history: HistoryService,
+  workspaceId: string,
+  messageId: string,
+  historySequence: number
+): Promise<void> {
+  const appendResult = await history.appendToHistory(workspaceId, {
+    id: messageId,
+    role: "assistant",
+    metadata: { historySequence, partial: true },
+    parts: [],
+  });
+  if (!appendResult.success) throw new Error(appendResult.error);
 }
 
 async function readHistoryMessage(history: HistoryService, workspaceId: string, messageId: string) {
@@ -113,6 +133,16 @@ async function readSidecarRecords(
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+/** The turn's only sidecar row: a duplicate write would double-count the spend. */
+async function readSingleSidecarRecord(
+  sessionsDir: string,
+  workspaceId: string
+): Promise<Record<string, unknown>> {
+  const records = await readSidecarRecords(sessionsDir, workspaceId);
+  expect(records).toHaveLength(1);
+  return records[0];
 }
 
 describe("StreamManager - TTFT metadata persistence", () => {
@@ -538,7 +568,7 @@ describe("StreamManager - aborted stream usage persistence", () => {
           : [{ chunks: heldChunks, holdUntilAbort: true }]
       ),
     });
-    await appendPartialAssistantForTests(params.workspaceId, params.messageId, 1);
+    await appendPlaceholderTurnForTests(history, params.workspaceId, params.messageId, 1);
     const result = await streamManager.startStream(
       testStartOptions({
         workspaceId: params.workspaceId,
@@ -784,7 +814,7 @@ describe("StreamManager - aborted stream usage persistence", () => {
         },
       ]),
     });
-    await appendPartialAssistantForTests(params.workspaceId, params.messageId, 1);
+    await appendPlaceholderTurnForTests(params.history, params.workspaceId, params.messageId, 1);
     const result = await streamManager.startStream(
       testStartOptions({
         workspaceId: params.workspaceId,
@@ -815,7 +845,7 @@ describe("StreamManager - aborted stream usage persistence", () => {
         error: "provider exploded",
       });
 
-      const [record] = await readSidecarRecords(config.sessionsDir, workspaceId);
+      const record = await readSingleSidecarRecord(config.sessionsDir, workspaceId);
       expect(record.source).toBe("errored_stream");
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(900);
     } finally {
@@ -844,7 +874,7 @@ describe("StreamManager - aborted stream usage persistence", () => {
         error: "stream truncated",
       });
 
-      const [record] = await readSidecarRecords(config.sessionsDir, workspaceId);
+      const record = await readSingleSidecarRecord(config.sessionsDir, workspaceId);
       expect(record.source).toBe("errored_stream");
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(900);
       // The partial keeps its content for retry/resume but carries no usage.
@@ -877,7 +907,7 @@ describe("StreamManager - aborted stream usage persistence", () => {
       // Partial untouched (the abandon contract) …
       expect(await hs.readPartial(workspaceId)).toBeNull();
       // … but the billed usage still reaches analytics via the sidecar.
-      const [record] = await readSidecarRecords(config.sessionsDir, workspaceId);
+      const record = await readSingleSidecarRecord(config.sessionsDir, workspaceId);
       expect(record.source).toBe("aborted_stream");
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(120);
     } finally {
