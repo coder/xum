@@ -487,6 +487,7 @@ function createWorkflowService(input: {
   const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
+    archiveAdmission: input.ctx.services.workspaceService,
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),
     runtimeFactory: new QuickJSRuntimeFactory(),
     evaluationAdapter: new WorkflowEvaluationAdapter({

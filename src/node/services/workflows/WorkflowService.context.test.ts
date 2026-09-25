@@ -16,7 +16,6 @@ import {
   type WorkflowServiceContext,
 } from "./WorkflowService";
 import { WorkflowArgsValidationError } from "./workflowArgs";
-import { setWorkflowArchiveAdmissionGuard } from "./workflowArchiveAdmission";
 import { WorkflowDeclaredPhasesValidationError } from "./workflowMetadata";
 
 interface TestWorkspaceService {
@@ -27,6 +26,7 @@ interface TestWorkspaceService {
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
   getWorkflowContinuationSendOptions: ReturnType<typeof mock>;
   sendMessage: ReturnType<typeof mock>;
+  getWorkflowArchiveRefusal: ReturnType<typeof mock>;
 }
 
 describe("WorkflowService request orchestration", () => {
@@ -35,11 +35,6 @@ describe("WorkflowService request orchestration", () => {
   let projectPath: string;
 
   beforeEach(async () => {
-    // The archive admission guard is process-global, and every WorkspaceService
-    // constructor installs one bound to its own config. A WorkspaceService test
-    // earlier in the same bun process (built on a partial config double) leaves
-    // that guard behind, so reset it to "admit everything" for these tests.
-    setWorkflowArchiveAdmissionGuard(() => null);
     temp = new DisposableTempDir("workflow-service-context");
     config = new Config(temp.path);
     projectPath = path.join(temp.path, "project");
@@ -77,6 +72,7 @@ describe("WorkflowService request orchestration", () => {
       isWorkflowInvocationCurrent: mock(async () => false),
       getWorkflowContinuationSendOptions: mock(async () => null),
       sendMessage: mock(async () => ({ success: true, data: undefined })),
+      getWorkflowArchiveRefusal: mock(() => null),
     };
     const waitForInit = mock(async () => undefined);
     const context = {
@@ -152,6 +148,30 @@ describe("WorkflowService request orchestration", () => {
         args: { topic: "direct" },
       })
     ).toMatchObject({ status: "completed", result: { reportMarkdown: "parent:direct" } });
+  });
+
+  test("start refuses through the owning WorkspaceService's archive gate before creating a run", async () => {
+    const { context, workspaceService } = createContext();
+    const refusal =
+      "Workspace is archived: workspace-1. Unarchive it before starting or resuming workflows.";
+    workspaceService.getWorkflowArchiveRefusal = mock(() => refusal);
+
+    let error: unknown;
+    try {
+      await startWorkflowRun(context, {
+        workspaceId: "workspace-1",
+        scriptPath: "./workflows/demo.js",
+        args: { topic: "refused" },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(String(error)).toContain(refusal);
+    expect(workspaceService.getWorkflowArchiveRefusal).toHaveBeenCalledWith("workspace-1");
+    const runStore = new WorkflowRunStore({
+      sessionDir: path.join(config.sessionsDir, "workspace-1"),
+    });
+    expect(await runStore.listRuns()).toEqual([]);
   });
 
   test("waits for idle and persists slash invocation inputs before starting", async () => {

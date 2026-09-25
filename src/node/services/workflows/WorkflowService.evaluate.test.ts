@@ -106,6 +106,7 @@ const EVALUATE_SOURCE = `export default function workflow({ evaluate }) {
 function createService(sessionDir: string, evaluation: WorkflowEvaluationPort, runId: string) {
   const runStore = new WorkflowRunStore({ sessionDir });
   const service = new WorkflowService({
+    archiveAdmission: { getWorkflowArchiveRefusal: () => null },
     runStore,
     runtimeFactory: new QuickJSRuntimeFactory(),
     taskAdapter: {

@@ -9,7 +9,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { beforeEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { EvaluationOutcome } from "@/node/services/evaluation/evaluationOutcome";
 import type { EvaluationCallResult } from "@/node/services/evaluation/evaluationService";
 import type { PinnedEvaluationModel } from "@/node/services/providerModelFactory";
@@ -19,7 +19,6 @@ import type { WorkflowEvaluationPort } from "./workflowEvaluationStep";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import type { WorkflowAgentSpec, WorkflowTaskAdapter } from "./WorkflowRunner";
 import { WorkflowService } from "./WorkflowService";
-import { setWorkflowArchiveAdmissionGuard } from "./workflowArchiveAdmission";
 import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
 
 const EXAMPLE_PATH = path.resolve(
@@ -134,6 +133,7 @@ async function createService(
     resolvedPath: EXAMPLE_PATH,
   };
   const service = new WorkflowService({
+    archiveAdmission: { getWorkflowArchiveRefusal: () => null },
     runStore,
     runtimeFactory: new QuickJSRuntimeFactory(),
     taskAdapter: agents,
@@ -146,14 +146,6 @@ async function createService(
 }
 
 describe("screen-github-issue example", () => {
-  beforeEach(() => {
-    // The archive admission guard is process-global, and every WorkspaceService constructor
-    // installs one bound to its own config. A WorkspaceService test earlier in the same bun
-    // process (built on a partial config double) leaves that guard behind, so reset it to
-    // "admit everything" for these tests (same fix as WorkflowService.context.test.ts).
-    setWorkflowArchiveAdmissionGuard(() => null);
-  });
-
   test("not_detected triages from the evaluator's answers, starts no agent and echoes only the digest", async () => {
     using tmp = new DisposableTempDir("screening-not-detected");
     const evaluation = createFakeEvaluation(() => screeningOutcome("not_detected"));

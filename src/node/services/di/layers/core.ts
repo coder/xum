@@ -637,6 +637,7 @@ export const CoreWiringLive: Layer.Layer<
     turnRequestBuilderBindings.onWorkflowRunStatusChanged = (event) =>
       workspaceService.emitWorkflowRunActivity(event);
     turnRequestBuilderBindings.workflowResultContinuationSender = workspaceService;
+    turnRequestBuilderBindings.workflowArchiveAdmission = workspaceService;
     // Tool-started workflows resolve/dispatch `evaluate()` through the same
     // service as ORPC-started ones; the ingest hook mirrors the headless usage
     // sidecar wiring in the desktop layer.
