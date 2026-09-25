@@ -634,7 +634,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Test PR readiness gates
-        run: make test-codex-comments test-pr-checks
+        run: make test-codex-comments test-pr-checks test-required-superseded
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # Codex starts reviewing the same push that started this job, so give it
@@ -663,11 +663,47 @@ jobs:
       - build-vscode
       - codex-comments
     runs-on: ubuntu-latest
+    # superseded: read this workflow's runs/jobs and check out the decision script.
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - run: |
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "Job results: $results"
-          for result in $results; do
+      # A cancelled duplicate run must not leave a red Required when another run for
+      # this PR will publish one (#4547). The script stands down only with proof and
+      # fails closed otherwise; see its header for the rules.
+      - if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/lib/required_superseded.sh
+          sparse-checkout-cone-mode: false
+      - id: superseded
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ./scripts/lib/required_superseded.sh; then
+            echo "value=true" >>"$GITHUB_OUTPUT"
+          fi
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          SUPERSEDED: ${{ steps.superseded.outputs.value }}
+        run: |
+          echo "Job results: $RESULTS"
+          if [[ "$SUPERSEDED" == "true" ]]; then
+            echo "⏭️ Superseded; a newer run for this commit reports Required"
+            exit 0
+          fi
+          for result in $RESULTS; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               echo "❌ CI failed"
               exit 1
