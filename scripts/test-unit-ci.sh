@@ -72,6 +72,10 @@ isolated_unit_tests=(
   # ModelsSection.discovery.test.tsx then times out on every test when it runs after
   # this file (reproduced with a two-import file). Surfaced by a shard reshuffle on #4469.
   src/browser/features/RightSidebar/Workflows/WorkflowTimeline.test.tsx
+  # The victim of leaks like the one above has more than one polluter
+  # (AutoModelRoutingExperimentConfig.test.tsx also breaks it; two-file repro on bun 1.3.5),
+  # so isolate it rather than chase each shard reshuffle (#4524).
+  src/browser/features/Settings/Sections/ModelsSection.discovery.test.tsx
 )
 
 # One process per file rather than one shared isolated process. Sharing it still

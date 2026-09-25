@@ -10,12 +10,20 @@ import {
   evaluateStepBudget,
   getContextBudgetHardCeiling,
   getContextBudgetHandoffPoint,
-  estimateFreshRequestTokens,
-  estimateAssembledRequestTokens,
   estimateToolResultSize,
-  checkAssembledRequestBudget,
+  prepareAssembledRequestTokenCount,
+  prepareFreshRequestTokenCount,
+  type AssembledRequestBudgetInput,
+  type FreshRequestBudgetInput,
   type StepBudgetInput,
 } from "./contextBudget";
+
+// Heuristic halves of the production counters; the real-encoding guards that
+// consume them are covered in contextBudgetCounting.test.ts.
+const estimateFreshRequestTokens = (input: FreshRequestBudgetInput) =>
+  prepareFreshRequestTokenCount(input).heuristicTokens;
+const estimateAssembledRequestTokens = (payload: AssembledRequestBudgetInput) =>
+  prepareAssembledRequestTokenCount(payload).heuristicTokens;
 
 function evaluate(overrides: Partial<StepBudgetInput> = {}) {
   return evaluateStepBudget({
@@ -190,24 +198,8 @@ describe("small-model context budgets", () => {
         decision: "continue",
         hardCeiling,
       });
-      const fitting = { system: "instructions", messages: [{ role: "user", content: "hello" }] };
-      expect(
-        checkAssembledRequestBudget(fitting, { model: "small-model", modelContextLimit })
-      ).toBeUndefined();
       const freshInput = { userText: "hello", modelContextLimit };
       expect(estimateFreshRequestTokens(freshInput)).toBeLessThan(hardCeiling);
-
-      const oversized = {
-        messages: [{ role: "user", content: "x".repeat(modelContextLimit * 4) }],
-      };
-      expect(
-        checkAssembledRequestBudget(oversized, { model: "small-model", modelContextLimit })
-      ).toEqual({
-        type: "context_budget_exceeded",
-        model: "small-model",
-        estimate: estimateAssembledRequestTokens(oversized),
-        hardCeiling,
-      });
       expect(
         estimateFreshRequestTokens({ ...freshInput, userText: "x".repeat(modelContextLimit * 4) })
       ).toBeGreaterThan(hardCeiling);
@@ -384,33 +376,5 @@ describe("request estimates", () => {
       });
       expect(estimate).toBeGreaterThanOrEqual(base + 4000);
     }
-  });
-
-  test("per-attempt preflight blocks smaller fallback windows and includes exact-ceiling semantics", () => {
-    const payload = {
-      system: "s".repeat(1000),
-      messages: [{ role: "user", content: "u".repeat(350_000) }],
-    };
-    const estimate = estimateAssembledRequestTokens(payload);
-    expect(
-      checkAssembledRequestBudget(payload, {
-        model: "large",
-        modelContextLimit: estimate + OUTPUT_RESERVE_TOKENS,
-      })
-    ).toBeUndefined();
-    expect(
-      checkAssembledRequestBudget(payload, {
-        model: "fallback",
-        modelContextLimit: estimate + OUTPUT_RESERVE_TOKENS - 1,
-      })
-    ).toEqual({
-      type: "context_budget_exceeded",
-      model: "fallback",
-      estimate,
-      hardCeiling: estimate - 1,
-    });
-    expect(
-      checkAssembledRequestBudget(payload, { model: "unknown", modelContextLimit: undefined })
-    ).toBeUndefined();
   });
 });

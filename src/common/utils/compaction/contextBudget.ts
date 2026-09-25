@@ -74,21 +74,6 @@ export function getContextBudgetHandoffPoint(modelContextLimit: number, threshol
   return Math.floor(modelContextLimit * threshold);
 }
 
-/** Heuristic-only check. Provider dispatch uses the node real-encoding adapter.
- * Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
-export function checkAssembledRequestBudget(
-  payload: Parameters<typeof estimateAssembledRequestTokens>[0],
-  options: { model: string; modelContextLimit: number | null | undefined }
-): ContextBudgetExceeded | undefined {
-  const limit = options.modelContextLimit;
-  if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
-  const hardCeiling = getContextBudgetHardCeiling(limit);
-  const estimate = estimateAssembledRequestTokens(payload);
-  return estimate > hardCeiling
-    ? { type: "context_budget_exceeded", model: options.model, estimate, hardCeiling }
-    : undefined;
-}
-
 export interface StepBudgetInput {
   contextTokens: number;
   outputTokens: number;
@@ -396,10 +381,6 @@ export function prepareFreshRequestTokenCount(
   };
 }
 
-export function estimateFreshRequestTokens(input: FreshRequestBudgetInput): number {
-  return prepareFreshRequestTokenCount(input).heuristicTokens;
-}
-
 export interface AssembledRequestBudgetInput {
   system?: unknown;
   tools?: Record<string, unknown>;
@@ -425,8 +406,4 @@ export function prepareAssembledRequestTokenCount(
     tokens += Math.ceil(schemaText.length / 3.5);
   }
   return { text: textParts.join("\n"), fixedTokens: content.fixedTokens, heuristicTokens: tokens };
-}
-
-export function estimateAssembledRequestTokens(payload: AssembledRequestBudgetInput): number {
-  return prepareAssembledRequestTokenCount(payload).heuristicTokens;
 }
