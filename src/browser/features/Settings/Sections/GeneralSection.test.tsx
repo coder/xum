@@ -1,19 +1,21 @@
+// Keep this first: tests/ui/dom installs a baseline DOM on import, and GeneralSection reads
+// `window` (browser vs Electron mode) when its module evaluates below.
+import { installDom } from "../../../../../tests/ui/dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { requireTestModule } from "@/browser/testUtils";
-import type * as APIModule from "@/browser/contexts/API";
-import type * as ExperimentsModule from "@/browser/contexts/ExperimentsContext";
-import type * as GeneralModule from "./GeneralSection";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
+import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
+import { GeneralSection } from "./GeneralSection";
 import {
   EXPERIMENT_IDS,
   getExperimentKey,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import { installDom } from "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
   DEFAULT_CODER_ARCHIVE_BEHAVIOR,
@@ -180,55 +182,19 @@ const mockSelectPrimitive = (() => {
   };
 })();
 
-let APIProvider: typeof APIModule.APIProvider;
-let ExperimentsProvider: typeof ExperimentsModule.ExperimentsProvider;
-let useExperiment: typeof ExperimentsModule.useExperiment;
-let GeneralSection: typeof GeneralModule.GeneralSection;
-let isolatedModuleDir: string;
-
-beforeAll(async () => {
-  // Isolate the real provider and its consumer from other suites' global hook mocks.
-  const root = join(process.cwd(), ".tmp");
-  await mkdir(root, { recursive: true });
-  isolatedModuleDir = await mkdtemp(join(root, "general-section-test-"));
-  await copyFile("src/browser/contexts/API.tsx", join(isolatedModuleDir, "API.tsx"));
-  for (const [sourcePath, filename] of [
-    ["src/browser/contexts/ExperimentsContext.tsx", "ExperimentsContext.tsx"],
-    ["src/browser/features/Settings/Sections/GeneralSection.tsx", "GeneralSection.tsx"],
-  ]) {
-    const source = await readFile(sourcePath, "utf8");
-    const isolatedSource = source
-      .replace('from "@/browser/contexts/API";', 'from "./API";')
-      .replace('from "@/browser/hooks/useTelemetry";', 'from "./Telemetry";')
-      .replace('from "@/browser/contexts/ExperimentsContext";', 'from "./ExperimentsContext";')
-      .replace('from "@/browser/components/SelectPrimitive/SelectPrimitive";', 'from "./Select";');
-    expect(isolatedSource).not.toBe(source);
-    await writeFile(join(isolatedModuleDir, filename), isolatedSource);
-  }
-  const selectPath = join(isolatedModuleDir, "Select.tsx");
-  await writeFile(selectPath, "export {};\n");
-  void mock.module(selectPath, () => mockSelectPrimitive);
-  const telemetryPath = join(isolatedModuleDir, "Telemetry.ts");
-  await writeFile(telemetryPath, "export {};\n");
-  void mock.module(telemetryPath, () => ({
-    useTelemetry: () => ({ experimentOverridden: experimentOverriddenMock }),
-  }));
-  ({ APIProvider } = requireTestModule<typeof APIModule>(join(isolatedModuleDir, "API.tsx")));
-  ({ ExperimentsProvider, useExperiment } = requireTestModule<typeof ExperimentsModule>(
-    join(isolatedModuleDir, "ExperimentsContext.tsx")
-  ));
-  ({ GeneralSection } = requireTestModule<typeof GeneralModule>(
-    join(isolatedModuleDir, "GeneralSection.tsx")
-  ));
-});
-
-afterAll(async () => {
-  await rm(isolatedModuleDir, { recursive: true, force: true });
-});
+// Snapshot the real exports before mocking so later suites get them back after this file.
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...RealSelectPrimitiveModule }],
+  ["@/browser/hooks/useTelemetry", { ...RealTelemetryModule }],
+]);
+void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () => mockSelectPrimitive);
+void mock.module("@/browser/hooks/useTelemetry", () => ({
+  useTelemetry: () => ({ experimentOverridden: experimentOverriddenMock }),
+}));
 
 function TestProviders(props: { children: React.ReactNode }) {
   return (
-    <APIProvider client={mockApi as APIModule.APIClient}>
+    <APIProvider client={mockApi as APIClient}>
       <ExperimentsProvider>
         <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
       </ExperimentsProvider>
@@ -668,6 +634,17 @@ describe("GeneralSection", () => {
     expect(window.localStorage.getItem(BASH_COLLAPSED_SUMMARY_MODE_KEY)).toBe(
       JSON.stringify("intent")
     );
+  });
+
+  test("loads the SSH host setting in browser mode", async () => {
+    // GeneralSection decides browser mode (no window.api) when its module evaluates, so this
+    // only passes if the DOM bootstrap import above ran before GeneralSection was loaded.
+    const { api, view } = renderGeneralSection();
+
+    await waitFor(() => {
+      expect(view.getByText("SSH Host")).toBeTruthy();
+    });
+    expect(api.server.getSshHost).toHaveBeenCalled();
   });
 
   test("loads and persists the full-width chat transcript toggle", async () => {

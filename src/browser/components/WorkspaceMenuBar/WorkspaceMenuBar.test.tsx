@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import * as RealExperimentsHookModule from "@/browser/hooks/useExperiments";
 import * as APIModule from "@/browser/contexts/API";
 import * as AgentContextModule from "@/browser/contexts/AgentContext";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -46,7 +47,13 @@ import {
 // The consent dialog integration test renders the REAL modal inside the menu bar. Radix
 // Dialog portals do not render in happy-dom, so the shell is inlined (same double as the
 // modal's own test) and restored after this suite so it cannot leak into later files.
-restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+// useExperiments re-exports useExperimentValue from ExperimentsContext, so the timeline-gate
+// stub below also patches that live binding; restore it so later ExperimentsContext consumers
+// (e.g. GeneralSection) do not keep reading the stub.
+restoreModulesAfterSuite([
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+  ["@/browser/hooks/useExperiments", { ...RealExperimentsHookModule }],
+]);
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: { open: boolean; children: ReactNode }) =>
     props.open ? <div>{props.children}</div> : null,

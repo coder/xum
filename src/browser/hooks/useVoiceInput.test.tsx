@@ -11,10 +11,7 @@ import {
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../tests/ui/dom";
-import { copyFile, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
-import { requireTestModule } from "@/browser/testUtils";
 import type * as VoiceInputModule from "./useVoiceInput";
 
 let useVoiceInput: typeof VoiceInputModule.useVoiceInput;
@@ -143,9 +140,8 @@ function renderVoiceInput(useRecordingKeybinds = false) {
 
 describe("useVoiceInput", () => {
   let cleanupDom: (() => void) | null = null;
-  let isolatedModulePath: string;
 
-  beforeEach(async () => {
+  beforeEach(() => {
     cleanupDom = installDom();
     stopTrack = mock(() => undefined);
     stream = createMediaStream();
@@ -153,15 +149,16 @@ describe("useVoiceInput", () => {
     sampleAudioFrame = null;
     getUserMedia.mockClear();
     installVoiceGlobals();
-    // Module-level key tracking must bind to this test's window, not a discarded DOM.
-    isolatedModulePath = fileURLToPath(
-      new URL(`./useVoiceInput.real.${randomUUID()}.ts`, import.meta.url)
-    );
-    await copyFile(
-      fileURLToPath(new URL("./useVoiceInput.ts", import.meta.url)),
-      isolatedModulePath
-    );
-    ({ useVoiceInput } = requireTestModule<typeof VoiceInputModule>(isolatedModulePath));
+    // Not a mock-leak workaround: useVoiceInput registers its Space-held listeners on
+    // `window` when the module evaluates. A static import binds them to whatever window
+    // existed when the module first loaded (often a discarded DOM from an earlier test
+    // file), so the held-at-start guard tests could never observe their key events.
+    // A unique query string makes Bun evaluate a fresh instance against this test's DOM
+    // without copying source into the tree (same `?real=1` technique as AgentListItem.test).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    ({ useVoiceInput } = require(
+      `./useVoiceInput?test=${randomUUID()}`
+    ) as typeof VoiceInputModule);
     setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
 
     window.setInterval = ((handler: () => void) => {
@@ -173,12 +170,11 @@ describe("useVoiceInput", () => {
     }) as typeof window.clearInterval;
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
     cleanupDom?.();
     cleanupDom = null;
     setSystemTime();
-    await rm(isolatedModulePath, { force: true });
   });
 
   afterAll(() => {

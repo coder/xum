@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { APIContext } from "@/browser/contexts/API";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
+import * as RealExperimentsHookModule from "@/browser/hooks/useExperiments";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
 import type * as ProjectContextModuleType from "@/browser/contexts/ProjectContext";
@@ -39,8 +40,13 @@ import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
 
 // Restore the provider contexts after the suite; partial row stubs must not
-// replace the real contexts used by later full Settings renders.
-restoreModulesAfterSuite([["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }]]);
+// replace the real contexts used by later full Settings renders. useExperiments re-exports
+// useExperimentValue from ExperimentsContext, so its stub also patches that live binding and
+// would pin every later ExperimentsContext consumer (e.g. GeneralSection) to the stub value.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }],
+  ["@/browser/hooks/useExperiments", { ...RealExperimentsHookModule }],
+]);
 
 let AgentListItem!: typeof AgentListItemComponent;
 

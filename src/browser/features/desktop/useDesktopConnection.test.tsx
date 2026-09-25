@@ -1,24 +1,13 @@
-import type { Context } from "react";
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  mock,
-  test,
-  type Mock,
-} from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test, type Mock } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import { readFile, writeFile, rm } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import type { APIClient, UseAPIResult } from "@/browser/contexts/API";
-import { requireTestModule, type RecursivePartial } from "@/browser/testUtils";
-import type * as DesktopModule from "./useDesktopConnection";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
+import type { RecursivePartial } from "@/browser/testUtils";
+import {
+  useDesktopConnection,
+  type UseDesktopConnectionOptions,
+  type UseDesktopConnectionResult,
+} from "./useDesktopConnection";
 import { wrapAsyncIterator } from "@orpc/shared";
 import { createAsyncMessageQueue } from "@/common/utils/asyncMessageQueue";
 import type { DesktopViewerEventSchema } from "@/common/orpc/schemas/api";
@@ -28,30 +17,12 @@ import DesktopRfbFixture from "./desktopRfb.test-fixture";
 
 type DesktopViewerEvent = z.infer<typeof DesktopViewerEventSchema>;
 
-// Bun's module mocks are process-wide. As in useAIViewKeybinds.test, load an isolated
-// hook/API pair instead of letting the RFB test double leak into other suites.
-const directory = dirname(fileURLToPath(import.meta.url));
-const suffix = randomUUID();
-const hookPath = join(directory, `useDesktopConnection.real.${suffix}.ts`);
-const apiPath = join(directory, `API.real.${suffix}.tsx`);
-let useDesktopConnection: typeof DesktopModule.useDesktopConnection;
-let APIContext: Context<UseAPIResult | null>;
-
-beforeAll(async () => {
-  const source = await readFile(join(directory, "useDesktopConnection.ts"), "utf8");
-  const isolatedSource = source
-    .replaceAll("@novnc/novnc/lib/rfb", "./desktopRfb.test-fixture")
-    .replace('from "@/browser/contexts/API"', `from "./API.real.${suffix}.tsx"`);
-  expect(isolatedSource).not.toBe(source);
-  await writeFile(hookPath, isolatedSource);
-  await writeFile(apiPath, await readFile(join(directory, "../../contexts/API.tsx"), "utf8"));
-  ({ useDesktopConnection } = requireTestModule<typeof DesktopModule>(hookPath));
-  ({ APIContext } = requireTestModule<{ APIContext: Context<UseAPIResult | null> }>(apiPath));
-});
-
-afterAll(async () => {
-  await Promise.all([rm(hookPath, { force: true }), rm(apiPath, { force: true })]);
-});
+// useDesktopConnection loads noVNC with a dynamic import at connect time, so registering the
+// fixture here (after the static hook import) still takes effect. This mock is not restored:
+// Bun cannot evaluate the real "@novnc/novnc/lib/rfb" (it touches `window` at load and
+// requires an ESM module with top-level await), so there are no real exports to restore and
+// no later suite can load the real module either. DesktopPanel.test registers its own double.
+void mock.module("@novnc/novnc/lib/rfb", () => ({ default: DesktopRfbFixture }));
 
 describe("useDesktopConnection control ownership", () => {
   const originals = {
@@ -128,8 +99,8 @@ describe("useDesktopConnection control ownership", () => {
     Object.assign(globalThis, originals);
   });
 
-  function mountConnection(options?: DesktopModule.UseDesktopConnectionOptions) {
-    let desktop!: DesktopModule.UseDesktopConnectionResult;
+  function mountConnection(options?: UseDesktopConnectionOptions) {
+    let desktop!: UseDesktopConnectionResult;
     function Harness() {
       desktop = useDesktopConnection("workspace-1", options);
       return <div ref={desktop.containerRef} />;
