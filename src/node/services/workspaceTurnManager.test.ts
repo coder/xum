@@ -420,7 +420,14 @@ describe("WorkspaceTurnManager", () => {
       return cfg;
     });
 
-    const workspaceMocks = createWorkspaceServiceMocks(options);
+    // WorkspaceTurnManager's lifecycle actions run under the task-tree lock, so the caller's
+    // archive/unarchive mocks back the WhileTaskTreeLocked sinks.
+    const { archive, unarchive, ...hostOverrides } = options;
+    const workspaceMocks = createWorkspaceServiceMocks({
+      ...hostOverrides,
+      ...(archive != null ? { archiveWhileTaskTreeLocked: archive } : {}),
+      ...(unarchive != null ? { unarchiveWhileTaskTreeLocked: unarchive } : {}),
+    });
     const { taskService, taskHost } = createWorkspaceTurnManagerHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
     });
@@ -443,6 +450,8 @@ describe("WorkspaceTurnManager", () => {
       taskHost,
       taskHandleStore,
       ...workspaceMocks,
+      archive: workspaceMocks.archiveWhileTaskTreeLocked,
+      unarchive: workspaceMocks.unarchiveWhileTaskTreeLocked,
     };
   }
 
@@ -1348,7 +1357,7 @@ describe("WorkspaceTurnManager", () => {
     expect(nested.success ? "" : nested.error).toMatch(/owner workspace was archived/);
     // The refused nested creation had already materialized its workspace; without an ownership
     // handle the archived owner could never manage it, so it must be removed, not leaked.
-    expect(harness.remove).toHaveBeenCalledWith("grandchildworkspace", true);
+    expect(harness.removeWhileTaskTreeLocked).toHaveBeenCalledWith("grandchildworkspace", true);
     const nestedHandles = await harness.taskService.listWorkspaceTurnTasks("childworkspace", {
       statuses: ["queued", "starting", "running"],
     });

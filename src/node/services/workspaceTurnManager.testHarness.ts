@@ -26,6 +26,7 @@ import {
   createAIServiceMocks,
   createMockInitStateManager,
   createWorkspaceServiceMocks,
+  runWithTaskTreeHold,
 } from "@/node/services/taskService.testHarness";
 
 type WorkspaceTurnManagerHostFake = WorkspaceTurnManagerHost & {
@@ -166,7 +167,7 @@ function createWorkspaceTurnManagerHost(
       if (waiters?.size === 0) foregroundWaiters.delete(workspaceId);
     },
     withTaskTreeLifecycleLock: (workspaceId, operation) =>
-      lifecycleLocks.withLock(workspaceId, operation),
+      lifecycleLocks.withLock(workspaceId, () => runWithTaskTreeHold(operation)),
   };
 }
 

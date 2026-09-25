@@ -301,7 +301,7 @@ describe("TaskService", () => {
       releaseGeneration = resolve;
     });
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
     const gitPatchArtifactService = (
       taskService as unknown as {
@@ -367,7 +367,7 @@ describe("TaskService", () => {
     });
 
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     expect(
@@ -558,7 +558,7 @@ describe("TaskService", () => {
       await removeWorkspaceFromTestConfig(config, workspaceId);
       return Ok(undefined);
     });
-    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
     let streaming = false;
     const { aiService } = createAIServiceMocks(config, {
       isStreaming: mock((id: string) => streaming && id === grandchild),
@@ -630,7 +630,7 @@ describe("TaskService", () => {
       await removeWorkspaceFromTestConfig(config, workspaceId);
       return Ok(undefined);
     });
-    const { workspaceService } = createWorkspaceServiceMocks({ remove });
+    const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     expect(

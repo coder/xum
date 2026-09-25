@@ -1,5 +1,6 @@
 import * as path from "path";
 import assert from "node:assert/strict";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { EventEmitter } from "node:events";
 import { mock } from "bun:test";
 import * as fsPromises from "fs/promises";
@@ -331,7 +332,42 @@ export function createAIServiceMocks(
 
 type WorkspaceHostMockOverrides = Partial<{
   [K in keyof WorkspaceHost]: ReturnType<typeof mock>;
-}> & { unarchive?: ReturnType<typeof mock> };
+}>;
+
+/**
+ * Task-tree lifecycle holds active in the current async context. TaskService stacks built by
+ * createTaskServiceStack (and the WorkspaceTurnManager test host) record their holds here, so
+ * the fake WorkspaceHost can tell whether ITS caller holds the lock; an unrelated concurrent
+ * holder does not count. A hold is marked released when its operation settles, so work the
+ * holder detached keeps no stale claim.
+ */
+const taskTreeHolds = new AsyncLocalStorage<ReadonlyArray<{ released: boolean }>>();
+
+export async function runWithTaskTreeHold<T>(operation: () => Promise<T>): Promise<T> {
+  const hold = { released: false };
+  try {
+    return await taskTreeHolds.run([...(taskTreeHolds.getStore() ?? []), hold], operation);
+  } finally {
+    hold.released = true;
+  }
+}
+
+function holdsTaskTreeLock(): boolean {
+  return (taskTreeHolds.getStore() ?? []).some((hold) => !hold.released);
+}
+
+function withoutTaskTreeLock<A extends unknown[], R>(
+  name: string,
+  sink: (...args: A) => R
+): (...args: A) => R {
+  return (...args: A) => {
+    assert(
+      !holdsTaskTreeLock(),
+      `workspaceService.${name} takes the task-tree lock itself; calling it under the lock deadlocks (use ${name}WhileTaskTreeLocked)`
+    );
+    return sink(...args);
+  };
+}
 
 export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverrides = {}) {
   const isWorkflowInvocationCurrent =
@@ -351,7 +387,6 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
     getQueueCutCutter: overrides.getQueueCutCutter ?? mock(() => undefined),
     remove:
       overrides.remove ??
-      overrides.removeWhileTaskTreeLocked ??
       mock(
         async (
           _workspaceId: string,
@@ -363,16 +398,20 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
           return Ok(undefined);
         }
       ),
+    removeWhileTaskTreeLocked:
+      overrides.removeWhileTaskTreeLocked ??
+      mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     updateTitle:
       overrides.updateTitle ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     emitChatEvent: overrides.emitChatEvent ?? mock(() => undefined),
     emit: overrides.emit ?? mock(() => true),
     archive:
       overrides.archive ??
+      mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))),
+    archiveWhileTaskTreeLocked:
       overrides.archiveWhileTaskTreeLocked ??
       mock((): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))),
-    unarchive:
-      overrides.unarchive ??
+    unarchiveWhileTaskTreeLocked:
       overrides.unarchiveWhileTaskTreeLocked ??
       mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined))),
     isWorkflowInvocationCurrent,
@@ -398,12 +437,9 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
     discardExtensionMetadataEntry:
       overrides.discardExtensionMetadataEntry ?? mock(() => Promise.resolve()),
   };
-  const { unarchive, ...hostMocks } = mocks;
-  // Same mocks for the locked sinks: the lifecycle path holds the (real) task-tree lock and
-  // calls the WhileTaskTreeLocked variants; assertions target one archive/remove surface.
   const workspaceService = makeWorkspaceHostFake({
     ...overrides,
-    ...hostMocks,
+    ...mocks,
     // The fake host has no session, so no turn can ever exist for a send it accepts: a
     // TurnAdmissionToken the send carried is disposed once the mock settled unless the test's
     // own mock already reported admission (a real WorkspaceService fires exactly one of these
@@ -418,9 +454,15 @@ export function createWorkspaceServiceMocks(overrides: WorkspaceHostMockOverride
         mocks.resumeStream(...args),
         args[2]?.turnAdmission
       )) as WorkspaceHost["resumeStream"],
-    archiveWhileTaskTreeLocked: mocks.archive,
-    unarchiveWhileTaskTreeLocked: unarchive,
-    removeWhileTaskTreeLocked: mocks.remove,
+    // Each lifecycle sink has its own mock. The unlocked variants acquire the (non-reentrant)
+    // task-tree lock themselves in the real WorkspaceService, so a caller already holding it
+    // would deadlock: they assert the caller holds no task-tree lock, and a call site that
+    // swaps in the unlocked variant under the lock fails here instead of passing against a
+    // shared mock. The WhileTaskTreeLocked variants take no lock and have callers that
+    // deliberately bypass it (see createWorkspaceTurn's owner-archived cleanup), so they are
+    // only kept separate.
+    remove: withoutTaskTreeLock("remove", mocks.remove) as WorkspaceHost["remove"],
+    archive: withoutTaskTreeLock("archive", mocks.archive) as WorkspaceHost["archive"],
   });
 
   return { workspaceService, ...mocks };
@@ -611,6 +653,7 @@ export function createTaskServiceStack(
     overrides.desktopInputCoordinator
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);
+  trackTaskTreeHolds(taskService);
   const events = overrides.aiEvents ?? aiServiceEvents.get(aiService);
   if (events != null) {
     taskServiceStreamEvents.set(taskService, events);
@@ -627,6 +670,19 @@ export function createTaskServiceStack(
     initStateManager,
     terminalAttentionStore,
   };
+}
+
+/** Record every task-tree hold this TaskService takes (see taskTreeHolds). */
+function trackTaskTreeHolds(taskService: TaskService): void {
+  const target = taskService as unknown as {
+    withTaskTreeLifecycleLocks: (
+      ids: readonly string[],
+      operation: () => Promise<unknown>
+    ) => Promise<unknown>;
+  };
+  const original = target.withTaskTreeLifecycleLocks.bind(taskService);
+  target.withTaskTreeLifecycleLocks = (ids, operation) =>
+    original(ids, () => runWithTaskTreeHold(operation));
 }
 
 /** Handler rejections keyed by the event object the listener handed to the handler. */
