@@ -33,6 +33,8 @@ import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget
 import {
   MAX_PLAN_SNAPSHOT_BYTES,
   PLAN_REVIEW_FEEDBACK_ROW_HEADROOM_BYTES,
+  PLAN_REVIEW_MAX_QUOTE_CHARS,
+  PLAN_REVIEW_MAX_REPLY_THREAD_COMMENT_CHARS,
   PLAN_REVIEW_METADATA_TYPE,
 } from "@/constants/planReview";
 import {
@@ -163,6 +165,16 @@ function deriveOptions(workspaceId: string) {
 
 function historyFailed(message: string): PlanReviewError {
   return { type: "history_failed", message };
+}
+
+/** Cut to at most `maxChars` UTF-16 units, marking the cut and never splitting a surrogate pair. */
+function truncatePlanReviewText(text: string, maxChars: number): string {
+  assert(maxChars > 1, "plan review truncation cap must leave room for the marker");
+  if (text.length <= maxChars) return text;
+  let end = maxChars - 1;
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${text.slice(0, end)}…`;
 }
 
 export function hashPlanSnapshotContent(content: string): string {
@@ -420,7 +432,7 @@ export async function preparePlanReviewFeedback(
       });
     }
   }
-  const knownThreads = new Set(state.threads.map((thread) => thread.threadId));
+  const knownThreads = new Map(state.threads.map((thread) => [thread.threadId, thread]));
   for (const reply of input.replies) {
     assert(reply.body.length > 0, "plan review reply body must be non-empty");
     if (!knownThreads.has(reply.threadId)) {
@@ -445,11 +457,24 @@ export async function preparePlanReviewFeedback(
       quote: comment.quote,
       body: comment.body,
     })),
-    replies: input.replies.map((reply) => ({
-      replyId: `rpl_${randomUUID()}`,
-      threadId: reply.threadId,
-      body: reply.body,
-    })),
+    replies: input.replies.map((reply) => {
+      const thread = knownThreads.get(reply.threadId);
+      assert(thread !== undefined, "plan review reply thread was validated above");
+      return {
+        replyId: `rpl_${randomUUID()}`,
+        threadId: reply.threadId,
+        body: reply.body,
+        // Threads are discovered from full history, but a thread opened before a context reset
+        // is no longer in the provider request; repeat its context so the reply stays
+        // meaningful. Always included (no boundary detection), and bounded: the thread comes
+        // from persisted rows, whose quote/body were never capped on replay.
+        thread: {
+          anchor: thread.anchor,
+          quote: truncatePlanReviewText(thread.quote, PLAN_REVIEW_MAX_QUOTE_CHARS),
+          comment: truncatePlanReviewText(thread.body, PLAN_REVIEW_MAX_REPLY_THREAD_COMMENT_CHARS),
+        },
+      };
+    }),
   };
   const text = formatPlanReviewEnvelope(record);
   const muxMetadata = buildPlanReviewMetadata(record);

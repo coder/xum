@@ -22,6 +22,15 @@ export const PLAN_REVIEW_MAX_SUMMARY_CHARS = 2_000;
 export const PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK = 50;
 export const PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK = 50;
 /**
+ * Each reply repeats its thread's quote (capped at PLAN_REVIEW_MAX_QUOTE_CHARS) and opening
+ * comment, truncated to this many chars, so a thread opened before a context reset still reaches
+ * the model with its context. Kept at the quote cap: a maximal plain-text submission (every
+ * comment, reply, and summary at its cap) then grows by about 50k chars per envelope copy and
+ * still fits the persisted feedback row budget (see preparePlanReviewFeedback); roughly 700 is
+ * the ceiling before such a submission would be refused as too large.
+ */
+export const PLAN_REVIEW_MAX_REPLY_THREAD_COMMENT_CHARS = 500;
+/**
  * Bytes reserved when judging the persisted feedback row against SESSION_HISTORY_MAX_LINE_BYTES.
  * The measured candidate already carries the send options the row will persist (toolPolicy and
  * the startup-retry snapshot); this covers the remaining send-time stamps prepare cannot see

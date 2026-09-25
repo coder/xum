@@ -54,6 +54,19 @@ export const PlanReviewFeedbackReplySchema = z.object({
   replyId: nonEmptyString,
   threadId: nonEmptyString,
   body: nonEmptyString,
+  /**
+   * Bounded copy of the replied-to thread's anchor, quote, and opening comment. The thread may
+   * have been opened before a context reset, so the provider request no longer carries the row
+   * that introduced it; without this the model would see only an opaque threadId. Informational
+   * only: replay keys replies on threadId. Optional so rows written before the field still parse.
+   */
+  thread: z
+    .object({
+      anchor: PlanReviewAnchorSchema,
+      quote: z.string(),
+      comment: z.string(),
+    })
+    .optional(),
 });
 
 export const PlanReviewFeedbackRecordSchema = z.object({
