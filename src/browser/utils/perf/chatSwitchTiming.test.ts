@@ -31,6 +31,7 @@ describe("chat switch timing", () => {
     markChatSwitchMilestone("ws-a", "caught-up");
     // Hidden before shown is an unmount from an earlier switch, not this one.
     markChatSwitchMilestone("ws-b", "skeleton-hidden");
+    expect(recordedMeasures()).toEqual([]);
     markChatSwitchMilestone("ws-b", "skeleton-shown");
     markChatSwitchMilestone("ws-b", "skeleton-shown");
     markChatSwitchMilestone("ws-b", "skeleton-hidden");
