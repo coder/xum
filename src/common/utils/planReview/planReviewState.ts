@@ -183,9 +183,21 @@ export function derivePlanReviewState(
           acceptedReplyIds: new Set<string>(),
         };
         const { feedback, acceptedReplyIds } = entry;
+        // Only an EARLIER copy's items are recovered (inert). An id repeated inside this row is
+        // a damaged item: it leaves the copy partial so an intact later copy can fill it in.
+        const earlierThreadIds = new Set(feedback.threadIds);
+        const earlierReplyIds = new Set(acceptedReplyIds);
+        const rowThreadIds = new Set<string>();
+        const rowReplyIds = new Set<string>();
         let complete = true;
         for (const comment of record.comments) {
-          if (feedback.threadIds.includes(comment.threadId)) continue;
+          if (rowThreadIds.has(comment.threadId)) {
+            skip("duplicate-thread", message.id);
+            complete = false;
+            continue;
+          }
+          rowThreadIds.add(comment.threadId);
+          if (earlierThreadIds.has(comment.threadId)) continue;
           if (threadsById.has(comment.threadId)) {
             skip("duplicate-thread", message.id);
             complete = false;
@@ -212,7 +224,13 @@ export function derivePlanReviewState(
           feedback.threadIds.push(thread.threadId);
         }
         for (const reply of record.replies) {
-          if (acceptedReplyIds.has(reply.replyId)) continue;
+          if (rowReplyIds.has(reply.replyId)) {
+            skip("duplicate-reply", message.id);
+            complete = false;
+            continue;
+          }
+          rowReplyIds.add(reply.replyId);
+          if (earlierReplyIds.has(reply.replyId)) continue;
           const thread = threadsById.get(reply.threadId);
           if (thread === undefined) {
             skip("dangling-reply-thread", message.id);

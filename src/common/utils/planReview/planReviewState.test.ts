@@ -381,6 +381,39 @@ describe("derivePlanReviewState partially accepted feedback", () => {
     ]);
   });
 
+  test("an id repeated inside one row leaves the copy partial for an intact later copy", () => {
+    const skipped: string[] = [];
+    // Damaged copy: the second comment and the second reply lost their own ids to a repeat of
+    // the first. Only the intact copy knows thr_2 and rpl_2.
+    const damaged: PlanReviewRecord = {
+      ...feedback1,
+      comments: [feedback1.comments[0], { ...feedback1.comments[1], threadId: "thr_1" }],
+      replies: [
+        { replyId: "rpl_1", threadId: "thr_1", body: "First" },
+        { replyId: "rpl_1", threadId: "thr_1", body: "Second" },
+      ],
+    };
+    const intact: PlanReviewRecord = {
+      ...feedback1,
+      replies: [
+        { replyId: "rpl_1", threadId: "thr_1", body: "First" },
+        { replyId: "rpl_2", threadId: "thr_1", body: "Second" },
+      ],
+    };
+    const state = derivePlanReviewState(
+      [recordRow(snapshotA), recordRow(damaged), recordRow(intact), recordRow(intact)],
+      { onSkip: (reason) => skipped.push(reason) }
+    );
+
+    expect(state.feedbacks.map((feedback) => feedback.threadIds)).toEqual([["thr_1", "thr_2"]]);
+    expect(state.threads.map((thread) => thread.threadId)).toEqual(["thr_1", "thr_2"]);
+    expect(state.threads[0].replies.map((reply) => [reply.replyId, reply.body])).toEqual([
+      ["rpl_1", "First"],
+      ["rpl_2", "Second"],
+    ]);
+    expect(skipped).toEqual(["duplicate-thread", "duplicate-reply", "duplicate-record"]);
+  });
+
   test("a copy that names another feedback or snapshot under the same record id is ignored", () => {
     const skipped: string[] = [];
     const partial: PlanReviewRecord = {
