@@ -5841,6 +5841,13 @@ export class TaskService implements AgentTaskIntegration {
           );
         }
         if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
+        // Waiters are keyed by the stable task id: once another writer re-admitted the row under
+        // its own attempt they are that attempt's (its task_await must not read this cancel).
+        // Rejected BEFORE the receipt write's await, which a successor's new waiter could
+        // otherwise register during and then be rejected as this attempt's.
+        if (!superseded) {
+          this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
+        }
         // Canceled before any launch was scheduled: nothing ran under the attempt.
         await this.persistOwnedAttemptSettlement(
           plan.taskId,
@@ -5848,11 +5855,6 @@ export class TaskService implements AgentTaskIntegration {
           "reservation-canceled",
           "reservation-canceled"
         );
-        // Waiters are keyed by the stable task id: once another writer re-admitted the row under
-        // its own attempt they are that attempt's (its task_await must not read this cancel).
-        if (!superseded) {
-          this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
-        }
         await this.emitWorkspaceMetadata(plan.taskId);
       }
       return interrupted();
@@ -6419,6 +6421,9 @@ export class TaskService implements AgentTaskIntegration {
       launch.sendAdmitted !== true &&
       launch.attemptId != null &&
       launch.attemptId === ownedAttempt?.attemptId;
+    // Before any await below (the receipt write, the metadata emit): a successor's waiter
+    // registered meanwhile must not be rejected as this attempt's.
+    this.rejectWaiters(taskId, new Error(message));
     if (neverSent) {
       await this.persistOwnedAttemptSettlement(
         taskId,
@@ -6430,7 +6435,6 @@ export class TaskService implements AgentTaskIntegration {
       this.settleOwnedTaskAttempt(taskId, ownedAttempt, "launch-failed");
     }
     await this.emitWorkspaceMetadata(taskId);
-    this.rejectWaiters(taskId, new Error(message));
     this.scheduleMaybeStartQueuedTasks();
   }
 
@@ -15825,6 +15829,9 @@ export class TaskService implements AgentTaskIntegration {
       this.workspaceService.clearQueue(workspaceId);
     }
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
+    // Before the receipt write's await: a successor's waiter registered meanwhile (another
+    // backend reawakening the now-interrupted task) must not be rejected as this attempt's.
+    this.rejectWaiters(workspaceId, new Error("Task interrupted"));
     // Verified idle inside the edit (no stream, no pending turn, no execution mirror).
     await this.persistOwnedAttemptSettlement(
       workspaceId,
@@ -15832,7 +15839,6 @@ export class TaskService implements AgentTaskIntegration {
       "idle-settled",
       "user-stop-idle"
     );
-    this.rejectWaiters(workspaceId, new Error("Task interrupted"));
     await this.emitWorkspaceMetadata(workspaceId);
     this.scheduleMaybeStartQueuedTasks();
   }
