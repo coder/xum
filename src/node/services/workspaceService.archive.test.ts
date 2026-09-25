@@ -31,6 +31,40 @@ import {
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
 
+describe("WorkspaceService workflow archive gate", () => {
+  // Archive side of the workflow admission pairing: WorkflowService entry points refuse
+  // admission on this answer (their consumer side is covered in WorkflowService tests).
+  test("refuses archived and archiving workspaces and admits everything else", async () => {
+    await using harness = await createWorkspaceServiceHarness();
+    const projectPath = path.join(harness.rootDir, "project");
+    await saveWorkspaces(harness.config, projectPath, [
+      { id: "ws-active", name: "active", path: path.join(projectPath, "active") },
+      {
+        id: "ws-archived",
+        name: "archived",
+        path: path.join(projectPath, "archived"),
+        archivedAt: "2026-09-01T00:00:00.000Z",
+      },
+      {
+        id: "ws-unarchived",
+        name: "unarchived",
+        path: path.join(projectPath, "unarchived"),
+        archivedAt: "2026-09-01T00:00:00.000Z",
+        unarchivedAt: "2026-09-02T00:00:00.000Z",
+      },
+    ]);
+    const service = harness.service;
+
+    expect(service.getWorkflowArchiveRefusal("ws-active")).toBeNull();
+    expect(service.getWorkflowArchiveRefusal("ws-unarchived")).toBeNull();
+    expect(service.getWorkflowArchiveRefusal("ws-unknown")).toBeNull();
+    expect(service.getWorkflowArchiveRefusal("ws-archived")).toContain("Workspace is archived");
+
+    addToArchivingWorkspaces(service, "ws-active");
+    expect(service.getWorkflowArchiveRefusal("ws-active")).toContain("being archived");
+  });
+});
+
 describe("WorkspaceService archive lifecycle hooks", () => {
   const workspaceId = "ws-archive";
   const projectPath = "/tmp/project";

@@ -15,9 +15,12 @@ import {
   acquireWorkflowArchiveAdmission,
   hasInProcessWorkflowWork,
   registerInProcessWorkflowRun,
-  setWorkflowArchiveAdmissionGuard,
+  type WorkflowArchiveAdmissionGuard,
 } from "./workflowArchiveAdmission";
 import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
+
+/** Archive gate of a workspace that is neither archived nor being archived. */
+const ADMIT_ALL: WorkflowArchiveAdmissionGuard = { getWorkflowArchiveRefusal: () => null };
 
 function createScript(
   source: string,
@@ -39,6 +42,10 @@ describe("WorkflowService archive admission", () => {
     using tmp = new DisposableTempDir("workflow-service-archive-admission");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: {
+        getWorkflowArchiveRefusal: (workspaceId) =>
+          workspaceId === "workspace-archiving" ? "Workspace is being archived: refuse" : null,
+      },
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -50,10 +57,7 @@ describe("WorkflowService archive admission", () => {
       runnerId: "runner-admission",
     });
 
-    setWorkflowArchiveAdmissionGuard((workspaceId) =>
-      workspaceId === "workspace-archiving" ? "Workspace is being archived: refuse" : null
-    );
-    try {
+    {
       await expectStartRefused(service, "workspace-archiving");
       // Background checkpoint retry is a run-starting entry point too: admission is acquired
       // at method entry, before the run lookup, so the refusal fires even for eligible runs.
@@ -70,15 +74,13 @@ describe("WorkflowService archive admission", () => {
       // No durable run may be created for a refused admission.
       expect(await runStore.listRuns()).toEqual([]);
       expect(hasInProcessWorkflowWork("workspace-archiving")).toBe(false);
-    } finally {
-      setWorkflowArchiveAdmissionGuard(() => null);
     }
   });
 
   test("admissions and in-process runs release their workspace work when disposed", () => {
     expect(hasInProcessWorkflowWork("workspace-admission")).toBe(false);
     {
-      using _admission = acquireWorkflowArchiveAdmission("workspace-admission");
+      using _admission = acquireWorkflowArchiveAdmission(ADMIT_ALL, "workspace-admission");
       expect(hasInProcessWorkflowWork("workspace-admission")).toBe(true);
       const release = registerInProcessWorkflowRun("workspace-admission");
       release();
@@ -113,6 +115,7 @@ describe("WorkflowService", () => {
 `;
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -168,6 +171,7 @@ describe("WorkflowService", () => {
     const virtualPath = `inline://workflow-${sourceHash.slice(0, 12)}.js`;
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -223,6 +227,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
 `;
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -256,6 +261,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
 `;
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -286,6 +292,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const statusEvents: Array<{ workspaceId: string; runId: string; status: string }> = [];
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       onRunStatusChanged: (event) => {
         statusEvents.push(event);
@@ -337,6 +344,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     using tmp = new DisposableTempDir("workflow-service-background-notify");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -379,6 +387,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     const reservationSignals: AbortSignal[] = [];
     const createdTaskIds: string[] = [];
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapterFactory: () => ({
@@ -455,6 +464,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     let agentCalls = 0;
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -535,6 +545,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     );
 
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -571,6 +582,7 @@ export default function workflow() { return { reportMarkdown: "done" }; }
     const abortController = new AbortController();
     let runnerFactoryCalls = 0;
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapterFactory: (_runId, workflowName) => {
@@ -643,6 +655,7 @@ export default function workflow({ args }) {
       resolvedPath: path.join(tmp.path, "project", "workflows", "child.js"),
     });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -738,6 +751,7 @@ export default function workflow({ args }) {
     await runStore.appendStatus("wfr_child_interrupt", "running", "2026-05-29T00:00:03.000Z");
     const interruptedRunIds: string[] = [];
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapterFactory: (runId) => ({
@@ -807,6 +821,7 @@ export default function workflow({ args }) {
       now: "2026-05-29T00:00:02.000Z",
     });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -838,6 +853,7 @@ export default function workflow({ args }) {
       now: "2026-05-29T00:00:00.000Z",
     });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -875,6 +891,7 @@ export default function workflow({ args }) {
       now: "2026-05-29T00:00:00.000Z",
     });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -904,6 +921,7 @@ describe("WorkflowRunStore.getRunStatusForLiveness", () => {
 `;
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {
@@ -956,6 +974,7 @@ describe("WorkflowRunStore.listActiveRunSummaries", () => {
     using tmp = new DisposableTempDir("workflow-service-active-summaries");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
     const service = new WorkflowService({
+      archiveAdmission: ADMIT_ALL,
       runStore,
       runtimeFactory: new QuickJSRuntimeFactory(),
       taskAdapter: {

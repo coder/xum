@@ -241,7 +241,7 @@ import {
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
   hasInProcessWorkflowWork,
-  setWorkflowArchiveAdmissionGuard,
+  type WorkflowArchiveAdmissionGuard,
 } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
@@ -1926,7 +1926,10 @@ function mintUnrelatedWorkspaceConsent(): string {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-export class WorkspaceService extends EventEmitter implements WorkspaceHost {
+export class WorkspaceService
+  extends EventEmitter
+  implements WorkspaceHost, WorkflowArchiveAdmissionGuard
+{
   private readonly sessions = new Map<string, AgentSession>();
   private shuttingDown = false;
   private readonly shutdownSessions = new Set<AgentSession>();
@@ -2536,26 +2539,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
-    // Archive admission pairing for workflow starts/resumes: WorkflowService instances are
-    // per-request, so the guard is registered at module scope (see workflowArchiveAdmission).
-    // Entry points check it in the same synchronous block that counts their admission, so
-    // whichever of {archive gate, workflow admission} runs first is observed by the other.
-    setWorkflowArchiveAdmissionGuard((workspaceId) => {
-      if (this.archivingWorkspaces.has(workspaceId)) {
-        return `Workspace is being archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
-      }
-      const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-      if (
-        workspaceEntry != null &&
-        isWorkspaceArchived(
-          workspaceEntry.workspace.archivedAt,
-          workspaceEntry.workspace.unarchivedAt
-        )
-      ) {
-        return `Workspace is archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
-      }
-      return null;
-    });
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // A cleared tombstone means a removed id was re-registered (downgraded
@@ -4574,6 +4557,29 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    * because recovery left a retry pending, or client-created ones housekeeping scheduled recovery
    * on) may own a live stream whose partial the next startup needs, so they only stop dispatching.
    */
+  /**
+   * Archive side of the workflow admission pairing (see workflowArchiveAdmission): workflow
+   * start/resume entry points call this in the same synchronous block that counts their
+   * admission, so whichever of {archive gate, workflow admission} runs first is observed by
+   * the other.
+   */
+  getWorkflowArchiveRefusal(workspaceId: string): string | null {
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return `Workspace is being archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
+    }
+    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (
+      workspaceEntry != null &&
+      isWorkspaceArchived(
+        workspaceEntry.workspace.archivedAt,
+        workspaceEntry.workspace.unarchivedAt
+      )
+    ) {
+      return `Workspace is archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
+    }
+    return null;
+  }
+
   beginShutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;

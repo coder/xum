@@ -186,6 +186,7 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import type { WorkflowArchiveAdmissionGuard } from "@/node/services/workflows/workflowArchiveAdmission";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import {
   WorkflowService,
@@ -587,6 +588,8 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   extraTools?: Record<string, Tool>;
   onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
   workflowResultContinuationSender?: WorkflowResultContinuationSender;
+  /** Archive gate for tool-started workflow admissions (the WorkspaceService). */
+  workflowArchiveAdmission?: WorkflowArchiveAdmissionGuard;
   /** Workflow `evaluate()` support for tool-started runs; absent ⇒ the step fails closed. */
   evaluationService?: EvaluationService;
   /** Wakes the analytics sidecar after a headless usage row (workflow evaluation) lands. */
@@ -594,6 +597,21 @@ export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
   analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
   desktopSessionManager?: DesktopSessionManager;
+}
+
+/**
+ * Tool-started workflow runs share the WorkspaceService's archive gate. Core wiring binds it in
+ * the same stage as taskService, so a missing gate next to a bound taskService is a wiring bug.
+ */
+function requireWorkflowArchiveAdmission(
+  bindings: TurnRequestBuilderBindings
+): WorkflowArchiveAdmissionGuard {
+  const guard = bindings.workflowArchiveAdmission;
+  assert(
+    guard != null,
+    "TurnRequestBuilder: workflowArchiveAdmission must be bound with taskService"
+  );
+  return guard;
 }
 
 interface TurnRequestBuilderDependencies {
@@ -2097,6 +2115,7 @@ export class TurnRequestBuilder {
     const workflowService =
       dynamicWorkflowsExperimentEnabled && this.dependencies.bindings.taskService != null
         ? new WorkflowService({
+            archiveAdmission: requireWorkflowArchiveAdmission(this.dependencies.bindings),
             runStore: new WorkflowRunStore({
               sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
             }),
