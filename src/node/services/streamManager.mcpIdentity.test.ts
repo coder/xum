@@ -1,15 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
-import { StreamManager, type TurnEngineEvent, type TurnExecutionOptions } from "./streamManager";
-import { fakeStreamText, noopTokenTracker } from "./streamManager.testHarness";
+import type { TurnExecutionOptions } from "./streamManager";
+import { installStreamManagerTestHistory, historyService } from "./streamManager.suite.testHarness";
 import {
-  installStreamManagerTestHistory,
-  historyService,
-  appendPartialAssistantForTests,
-  createStreamResultForTests,
-  createTestLanguageModel,
-  testStartOptions,
-} from "./streamManager.suite.testHarness";
+  createLiveStreamHarness,
+  eventsOfType,
+  type LiveStream,
+} from "./streamManager.liveStream.testHarness";
 import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 
 /**
@@ -21,124 +18,26 @@ import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayR
 
 installStreamManagerTestHistory();
 
-const END_OF_STREAM = Symbol("end-of-stream");
+type LiveStreamHarness = ReturnType<typeof createLiveStreamHarness>;
 
-/**
- * A provider fullStream the test feeds one chunk at a time. push() resolves only
- * after StreamManager finished processing each chunk and asked for the next one,
- * so tests observe (and replay) a live stream at an exact point.
- */
-function createChunkFeed() {
-  let deliver: ((chunk: unknown) => void) | undefined;
-  let signalWaiting!: () => void;
-  let waiting = new Promise<void>((resolve) => (signalWaiting = resolve));
-  async function* fullStream() {
-    while (true) {
-      const chunk = await new Promise<unknown>((resolve) => {
-        deliver = resolve;
-        signalWaiting();
-      });
-      if (chunk === END_OF_STREAM) return;
-      yield chunk;
-    }
-  }
-  const send = async (chunk: unknown) => {
-    await waiting;
-    waiting = new Promise<void>((resolve) => (signalWaiting = resolve));
-    const next = deliver;
-    deliver = undefined;
-    if (next == null) throw new Error("chunk feed has no waiting consumer");
-    next(chunk);
-  };
-  return {
-    fullStream: fullStream(),
-    waiting: () => waiting,
-    push: async (...chunks: unknown[]) => {
-      for (const chunk of chunks) {
-        await send(chunk);
-        await waiting;
-      }
-    },
-    end: () => send(END_OF_STREAM),
-  };
-}
-
-interface LiveStream {
-  push: (...chunks: unknown[]) => Promise<void>;
-  /** Ends the stream normally and waits for its completion. */
-  finish: () => Promise<void>;
-}
-
-function eventsOfType<T extends TurnEngineEvent["type"]>(
-  events: readonly TurnEngineEvent[],
-  type: T
-): Array<Extract<TurnEngineEvent, { type: T }>> {
-  return events.filter((event): event is Extract<TurnEngineEvent, { type: T }> => {
-    return event.type === type;
+/** Starts `scope`'s stream; the scope object is the ownership identity and its token must match. */
+async function startScope(
+  harness: LiveStreamHarness,
+  scope: ExecutionScope,
+  historySequence = 1
+): Promise<LiveStream> {
+  const live = await harness.start({
+    workspaceId: scope.workspaceId,
+    messageId: scope.messageId,
+    historySequence,
+    executionScope: scope,
+    providedStreamToken: scope.token as TurnExecutionOptions["providedStreamToken"],
   });
-}
-
-/**
- * A real StreamManager (sharing `registry` with the test, as the MCP tool
- * wrapper does in production) whose provider streams come from chunk feeds.
- * Every engine event lands in `events`.
- */
-function createLiveStreamHarness(registry = new ToolCallDisplayRegistry()) {
-  const events: TurnEngineEvent[] = [];
-  let feed: ReturnType<typeof createChunkFeed> | undefined;
-  const streamText = fakeStreamText(() => {
-    // Each started stream consumes its feed once; a retry would see an empty stream.
-    const fullStream =
-      feed?.fullStream ??
-      (async function* () {
-        // No feed left: an unexpected second request streams nothing.
-      })();
-    feed = undefined;
-    return createStreamResultForTests(fullStream);
-  });
-  const streamManager = new StreamManager(
-    historyService,
-    undefined,
-    undefined,
-    (event) => {
-      events.push(event);
-    },
-    undefined,
-    undefined,
-    registry,
-    { streamText, tokenTracker: noopTokenTracker }
-  );
   return {
-    streamManager,
-    events,
-    /** Starts `scope`'s stream and waits until StreamManager awaits its first chunk. */
-    async start(scope: ExecutionScope, historySequence = 1): Promise<LiveStream> {
-      const streamFeed = createChunkFeed();
-      feed = streamFeed;
-      await appendPartialAssistantForTests(scope.workspaceId, scope.messageId, historySequence);
-      const result = await streamManager.startStream(
-        testStartOptions({
-          workspaceId: scope.workspaceId,
-          messageId: scope.messageId,
-          historySequence,
-          model: createTestLanguageModel(),
-          providedRuntimeTempDir: "",
-          // The scope object is the ownership identity; the token must match it.
-          executionScope: scope,
-          providedStreamToken: scope.token as TurnExecutionOptions["providedStreamToken"],
-        })
-      );
-      if (!result.success) throw new Error("Expected stream to start");
-      await streamFeed.waiting();
-      return {
-        push: streamFeed.push,
-        finish: async () => {
-          await streamFeed.push({ type: "text-delta", text: "done" });
-          await streamFeed.push({ type: "finish", finishReason: "stop" });
-          await streamFeed.end();
-          await result.data.completion;
-        },
-      };
+    push: live.push,
+    finish: async () => {
+      await live.push({ type: "text-delta", text: "done" });
+      await live.finish();
     },
   };
 }
@@ -166,12 +65,12 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
 
   test("a top-level completion consumes only its own execution's snapshot, exactly once", async () => {
     const registry = new ToolCallDisplayRegistry();
-    const harness = createLiveStreamHarness(registry);
+    const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
     const ends = () => eventsOfType(harness.events, "tool-call-end");
 
     // The replaced execution still streams while the replacement's wrapper
     // published a snapshot under the same call id.
-    const staleStream = await harness.start(replaced);
+    const staleStream = await startScope(harness, replaced);
     registry.open(replacement);
     registry.set(replacement, "call-1", snapshot("replacement"));
     await staleStream.push(toolCall("call-1"), toolResult("call-1"));
@@ -186,7 +85,7 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
     // The owning execution consumes it: persisted with the part, carried by the
     // live event, then gone.
     registry.set(replacement, "call-1", snapshot("replacement"));
-    const ownStream = await harness.start(replacement, 2);
+    const ownStream = await startScope(harness, replacement, 2);
     await ownStream.push(toolCall("call-1"), toolResult("call-1"));
     const persisted = await historyService.readPartial(workspaceId);
     const persistedPart = persisted?.parts[0] as Record<string, unknown> | undefined;
@@ -199,13 +98,13 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
 
   test("a nested completion from a closed or mismatched originating scope cannot consume the replacement's snapshot", async () => {
     const registry = new ToolCallDisplayRegistry();
-    const harness = createLiveStreamHarness(registry);
+    const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
     const ends = () => eventsOfType(harness.events, "tool-call-end");
 
     // Run B replaced run A and owns the workspace stream. A's teardown has not
     // closed its registry scope yet, and A's wrapper published its own snapshot
     // under the same nested call id.
-    const stream = await harness.start(replacement);
+    const stream = await startScope(harness, replacement);
     registry.open(replaced);
     registry.set(replaced, "nested-1", snapshot("replaced"));
     registry.set(replacement, "nested-1", snapshot("replacement"));
@@ -259,8 +158,8 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
 
   test("replay carries persisted snapshots for top-level parts and nested records", async () => {
     const registry = new ToolCallDisplayRegistry();
-    const harness = createLiveStreamHarness(registry);
-    const stream = await harness.start(replacement);
+    const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
+    const stream = await startScope(harness, replacement);
     registry.set(replacement, "call-1", snapshot("top"));
     await stream.push(toolCall("call-1"), toolResult("call-1"));
     await stream.push(toolCall("code-exec", "code_execution"));
