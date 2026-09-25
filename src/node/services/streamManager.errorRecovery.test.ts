@@ -18,6 +18,7 @@ import {
   testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
+  prepareStepForTests,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -61,28 +62,6 @@ type Attempt = (
   options: StreamTextOptions,
   context: AttemptContext
 ) => AsyncGenerator<unknown, void, unknown>;
-
-/** Plays the SDK's per-step preparation so the engine records that step's transcript. */
-async function prepareStep(
-  options: StreamTextOptions,
-  messages: ModelMessage[],
-  stepNumber: number
-): Promise<void> {
-  const prepare = options.prepareStep;
-  if (!prepare) throw new Error("Expected StreamManager to pass prepareStep");
-  await prepare({
-    messages,
-    stepNumber,
-    model: options.model,
-    steps: [],
-    initialMessages: messages,
-    responseMessages: [],
-    instructions: undefined,
-    initialInstructions: undefined,
-    toolsContext: {},
-    runtimeContext: {},
-  });
-}
 
 function failingAttempt(error: unknown): Attempt {
   return async function* () {
@@ -282,7 +261,7 @@ describe("StreamManager - previousResponseId recovery", () => {
           yield { type: "start-step" };
           yield { type: "text-delta", text: "step one" };
           yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
-          await prepareStep(options, stepMessages, 1);
+          await prepareStepForTests(options, stepMessages, 1);
           yield {
             type: "error",
             error: createApiCallErrorForTests({
@@ -499,7 +478,7 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
         workspaceId: "replay-prepared-first",
         attempts: [
           async function* (options) {
-            await prepareStep(options, preparedMessages, 0);
+            await prepareStepForTests(options, preparedMessages, 0);
             yield { type: "error", error: rejection.error };
           },
           successfulAttempt,
@@ -686,7 +665,7 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
             type: "finish-step",
             usage: { inputTokens: 40, outputTokens: 9, totalTokens: 49 },
           };
-          await prepareStep(options, stepMessages, 1);
+          await prepareStepForTests(options, stepMessages, 1);
           yield { type: "error", error: openAIReasoningReplayRejections[0].error };
         },
         successfulAttempt,

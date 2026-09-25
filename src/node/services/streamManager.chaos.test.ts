@@ -16,7 +16,7 @@ import { closeScopeBounded } from "./di/appRuntime";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
-import type { LanguageModel } from "ai";
+import { createTestLanguageModel } from "./streamManager.suite.testHarness";
 import {
   mulberry32,
   randomHostileValue,
@@ -40,17 +40,6 @@ beforeEach(async () => {
 afterEach(async () => {
   await historyCleanup();
 });
-
-function createTestLanguageModel(): LanguageModel {
-  return {
-    specificationVersion: "v3",
-    provider: "test",
-    modelId: "chaos-model",
-    supportedUrls: {},
-    doGenerate: () => Promise.reject(new Error("doGenerate unused in chaos tests")),
-    doStream: () => Promise.reject(new Error("doStream unused in chaos tests")),
-  };
-}
 
 /** One random provider chunk. Mirrors the shapes a broken upstream can emit. */
 function randomChunk(rng: Rng): unknown {
@@ -152,7 +141,7 @@ describe("StreamManager chaos", () => {
         const result = await streamManager.startStream({
           workspaceId,
           messageId,
-          model: createTestLanguageModel(),
+          model: createTestLanguageModel("chaos-model"),
           messages: [{ role: "user", content: "hello" }],
           modelString: "openai:gpt-4.1-mini",
           historySequence: 1,
@@ -196,7 +185,7 @@ describe("StreamManager chaos", () => {
         const reuse = await streamManager.startStream({
           workspaceId,
           messageId: reuseMessageId,
-          model: createTestLanguageModel(),
+          model: createTestLanguageModel("chaos-model"),
           messages: [{ role: "user", content: "again" }],
           modelString: "openai:gpt-4.1-mini",
           historySequence: 2,
@@ -285,7 +274,7 @@ describe("StreamManager chaos", () => {
         const result = await streamManager.startStream({
           workspaceId,
           messageId,
-          model: createTestLanguageModel(),
+          model: createTestLanguageModel("chaos-model"),
           messages: [{ role: "user", content: "hello" }],
           modelString: "openai:gpt-4.1-mini",
           historySequence: 1,
@@ -367,7 +356,7 @@ describe("StreamManager chaos", () => {
     const result = await streamManager.startStream({
       workspaceId: "cyclic-error-ws",
       messageId: "cyclic-error-msg",
-      model: createTestLanguageModel(),
+      model: createTestLanguageModel("chaos-model"),
       messages: [{ role: "user", content: "hello" }],
       modelString: "openai:gpt-4.1-mini",
       historySequence: 1,

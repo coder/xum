@@ -6,6 +6,8 @@ import {
   createLiveStreamHarness,
   eventsOfType,
   type LiveStream,
+  toolCallChunk,
+  toolResultChunk,
 } from "./streamManager.liveStream.testHarness";
 import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 
@@ -50,13 +52,7 @@ function snapshot(name: string): MCPToolCallDisplay {
   };
 }
 
-function toolCall(toolCallId: string, toolName = "identity_identity_probe") {
-  return { type: "tool-call", toolCallId, toolName, input: {} };
-}
-
-function toolResult(toolCallId: string, toolName = "identity_identity_probe") {
-  return { type: "tool-result", toolCallId, toolName, output: { content: [] } };
-}
+const PROBE_TOOL = "identity_identity_probe";
 
 describe("StreamManager - MCP identity snapshot ownership", () => {
   const workspaceId = "mcp-identity-workspace";
@@ -73,7 +69,10 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
     const staleStream = await startScope(harness, replaced);
     registry.open(replacement);
     registry.set(replacement, "call-1", snapshot("replacement"));
-    await staleStream.push(toolCall("call-1"), toolResult("call-1"));
+    await staleStream.push(
+      toolCallChunk("call-1", PROBE_TOOL),
+      toolResultChunk("call-1", PROBE_TOOL)
+    );
     const staleParts = harness.streamManager.getStreamInfo(workspaceId)?.parts ?? [];
     expect(staleParts).toHaveLength(1);
     expect((staleParts[0] as { mcpServer?: unknown }).mcpServer).toBeUndefined();
@@ -86,7 +85,10 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
     // live event, then gone.
     registry.set(replacement, "call-1", snapshot("replacement"));
     const ownStream = await startScope(harness, replacement, 2);
-    await ownStream.push(toolCall("call-1"), toolResult("call-1"));
+    await ownStream.push(
+      toolCallChunk("call-1", PROBE_TOOL),
+      toolResultChunk("call-1", PROBE_TOOL)
+    );
     const persisted = await historyService.readPartial(workspaceId);
     const persistedPart = persisted?.parts[0] as Record<string, unknown> | undefined;
     expect(persistedPart?.mcpServer).toStrictEqual(snapshot("replacement"));
@@ -108,7 +110,7 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
     registry.open(replaced);
     registry.set(replaced, "nested-1", snapshot("replaced"));
     registry.set(replacement, "nested-1", snapshot("replacement"));
-    await stream.push(toolCall("code-exec", "code_execution"));
+    await stream.push(toolCallChunk("code-exec", "code_execution"));
     const startTime = Date.now();
     const nestedStart = {
       type: "tool-call-start" as const,
@@ -161,8 +163,8 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
     const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
     const stream = await startScope(harness, replacement);
     registry.set(replacement, "call-1", snapshot("top"));
-    await stream.push(toolCall("call-1"), toolResult("call-1"));
-    await stream.push(toolCall("code-exec", "code_execution"));
+    await stream.push(toolCallChunk("call-1", PROBE_TOOL), toolResultChunk("call-1", PROBE_TOOL));
+    await stream.push(toolCallChunk("code-exec", "code_execution"));
     const startTime = Date.now();
     const nested = {
       callId: "nested-1",
@@ -179,7 +181,7 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
       endTime: startTime + 1,
       result: { content: [] },
     });
-    await stream.push(toolResult("code-exec", "code_execution"));
+    await stream.push(toolResultChunk("code-exec", "code_execution"));
     const replayStart = harness.events.length;
 
     await harness.streamManager.replayStream(workspaceId);

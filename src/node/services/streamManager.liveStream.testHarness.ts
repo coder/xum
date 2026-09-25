@@ -197,3 +197,17 @@ export function eventsOfType<T extends TurnEngineEvent["type"]>(
     return event.type === type;
   });
 }
+
+/** A provider tool-call chunk for a live feed. */
+export function toolCallChunk(toolCallId: string, toolName = "bash", input: unknown = {}) {
+  return { type: "tool-call", toolCallId, toolName, input };
+}
+
+/** The matching provider tool-result chunk; the empty MCP-shaped output suits any tool. */
+export function toolResultChunk(
+  toolCallId: string,
+  toolName = "bash",
+  output: unknown = { content: [] }
+) {
+  return { type: "tool-result", toolCallId, toolName, output };
+}

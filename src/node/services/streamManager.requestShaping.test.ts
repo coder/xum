@@ -29,6 +29,8 @@ import {
   testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
+  prepareStepForTests,
+  type PreparedStepForTests,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -240,11 +242,7 @@ describe("StreamManager - call settings overrides", () => {
 // complex setup. StreamManager integrates those functions directly.
 
 describe("StreamManager - tool search activeTools scoping", () => {
-  // prepareStep only destructures `messages`; the remaining PrepareStepFunction
-  // fields are irrelevant to this behavior.
-  type CapturedPrepareStep = (options: {
-    messages: ModelMessage[];
-  }) => Promise<{ messages?: ModelMessage[]; activeTools?: string[] } | undefined>;
+  type CapturedPrepareStep = (input: { messages: ModelMessage[] }) => Promise<PreparedStepForTests>;
 
   const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
   const messages: ModelMessage[] = [{ role: "user", content: "hello" }];
@@ -252,14 +250,9 @@ describe("StreamManager - tool search activeTools scoping", () => {
   function capturePrepareStep(
     streamTextSpy: Awaited<ReturnType<typeof startStreamCapturingStreamTextForTests>>["streamText"]
   ): CapturedPrepareStep {
-    const prepareStep = streamTextSpy.mock.calls[0]?.[0]?.prepareStep as
-      | CapturedPrepareStep
-      | undefined;
-    expect(typeof prepareStep).toBe("function");
-    if (!prepareStep) {
-      throw new Error("Expected prepareStep to be captured");
-    }
-    return prepareStep;
+    const options = streamTextSpy.mock.calls[0]?.[0];
+    if (!options) throw new Error("Expected startStream to call streamText");
+    return (input) => prepareStepForTests(options, input.messages);
   }
 
   afterEach(() => {
@@ -316,10 +309,10 @@ describe("StreamManager - same-turn envelope lookalike neutralization", () => {
   // that path: the SDK feeds their inputs/results straight into the next step, so the
   // per-step prepareStep is the only seam before the provider. These tests capture the real
   // prepareStep closure and assert on the messages it hands back to the SDK.
-  type CapturedPrepareStep = (options: {
+  type CapturedPrepareStep = (input: {
     messages: ModelMessage[];
     stepNumber: number;
-  }) => Promise<{ messages?: ModelMessage[] } | undefined>;
+  }) => Promise<PreparedStepForTests>;
 
   const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
   const feedbackRecord: PlanReviewRecord = {
@@ -348,13 +341,9 @@ describe("StreamManager - same-turn envelope lookalike neutralization", () => {
     // Start one real turn through startStream (injected streamText) and keep the
     // prepareStep closure StreamManager built for it.
     const { streamText } = await startStreamCapturingStreamTextForTests({ model });
-    const prepareStep = streamText.mock.calls[0]?.[0]?.prepareStep as
-      | CapturedPrepareStep
-      | undefined;
-    if (typeof prepareStep !== "function") {
-      throw new Error("Expected prepareStep to be captured");
-    }
-    return prepareStep;
+    const options = streamText.mock.calls[0]?.[0];
+    if (!options) throw new Error("Expected startStream to call streamText");
+    return (input) => prepareStepForTests(options, input.messages, input.stepNumber);
   }
 
   afterEach(() => {
@@ -541,7 +530,6 @@ describe("StreamManager - same-turn envelope lookalike neutralization", () => {
 
 describe("StreamManager - mid-turn thinking override", () => {
   type StreamTextOptions = Parameters<typeof aiSdk.streamText>[0];
-  type StepResult = Awaited<ReturnType<NonNullable<StreamTextOptions["prepareStep"]>>>;
   type StreamEndEvent = Extract<TurnEngineEvent, { type: "stream-end" }>;
   type Attempt = (options: StreamTextOptions) => AsyncGenerator<unknown, void, unknown>;
 
@@ -554,28 +542,6 @@ describe("StreamManager - mid-turn thinking override", () => {
     requestedFallbackModel: "openai:gpt-4.1-mini",
   };
   const thinkingRouted = { ...routed, thinkingLevel: "low" as const };
-
-  /** Plays one SDK step preparation against the prepareStep StreamManager handed to streamText. */
-  async function prepareStep(
-    options: StreamTextOptions,
-    stepMessages: ModelMessage[],
-    stepNumber: number
-  ): Promise<StepResult> {
-    const prepare = options.prepareStep;
-    if (!prepare) throw new Error("Expected StreamManager to pass prepareStep");
-    return await prepare({
-      messages: stepMessages,
-      stepNumber,
-      model: options.model,
-      steps: [],
-      initialMessages: stepMessages,
-      responseMessages: [],
-      instructions: undefined,
-      initialInstructions: undefined,
-      toolsContext: {},
-      runtimeContext: {},
-    });
-  }
 
   async function* answer(): AsyncGenerator<unknown, void, unknown> {
     await Promise.resolve();
@@ -637,12 +603,12 @@ describe("StreamManager - mid-turn thinking override", () => {
    */
   function stepsThenAnswer(
     steps: Array<{ messages: ModelMessage[]; stepNumber?: number; before?: () => void }>,
-    results: StepResult[]
+    results: PreparedStepForTests[]
   ): Attempt {
     return async function* (options) {
       for (const step of steps) {
         step.before?.();
-        results.push(await prepareStep(options, step.messages, step.stepNumber ?? 1));
+        results.push(await prepareStepForTests(options, step.messages, step.stepNumber ?? 1));
       }
       yield* answer();
     };
@@ -658,7 +624,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     const rebuild = mock((level: string) =>
       level === "high" ? { effectiveLevel: "high" as const, providerOptions: rebuilt } : null
     );
-    const results: StepResult[] = [];
+    const results: PreparedStepForTests[] = [];
 
     const { calls, streamEnd } = await runTurn(
       {
@@ -688,7 +654,7 @@ describe("StreamManager - mid-turn thinking override", () => {
   test("clears pending without touching options when the rebuild reports not-applicable", async () => {
     const state: ActiveTurnThinkingOverride = { pending: "off" };
     const rebuild = mock(() => null);
-    const results: StepResult[] = [];
+    const results: PreparedStepForTests[] = [];
 
     const { calls, streamEnd } = await runTurn(
       {
@@ -768,7 +734,7 @@ describe("StreamManager - mid-turn thinking override", () => {
   test("a stuck Auto-set thinking level escalates through the rebuild and records provenance", async () => {
     const state: ActiveTurnThinkingOverride = {};
     const rebuild = escalatingRebuild();
-    const results: StepResult[] = [];
+    const results: PreparedStepForTests[] = [];
     const transcript = stuckTranscript();
 
     const { streamEnd } = await runTurn(
@@ -803,7 +769,7 @@ describe("StreamManager - mid-turn thinking override", () => {
 
   test("a slider move this turn disables Auto's escalation", async () => {
     const rebuild = mock(() => null);
-    const results: StepResult[] = [];
+    const results: PreparedStepForTests[] = [];
 
     const { streamEnd } = await runTurn(
       {
@@ -825,7 +791,7 @@ describe("StreamManager - mid-turn thinking override", () => {
     const state: ActiveTurnThinkingOverride = {};
     // The model offers low, high and xhigh: the requested medium lands on high.
     const rebuild = escalatingRebuild((level) => (level === "medium" ? "high" : level));
-    const results: StepResult[] = [];
+    const results: PreparedStepForTests[] = [];
 
     const { streamEnd } = await runTurn(
       {
@@ -859,7 +825,7 @@ describe("StreamManager - mid-turn thinking override", () => {
   test("a raise the model ceiling clamps away is not provenance and ends further attempts", async () => {
     // The model tops out at high: the rebuild reports the clamped level as a no-op.
     const rebuild = mock(() => null);
-    const results: StepResult[] = [];
+    const results: PreparedStepForTests[] = [];
 
     const { streamEnd } = await runTurn(
       {
@@ -1022,7 +988,7 @@ describe("StreamManager - mid-turn thinking override", () => {
       },
       [
         async function* (options) {
-          await prepareStep(options, stuckTranscript(), 3);
+          await prepareStepForTests(options, stuckTranscript(), 3);
           // A pending override that never got a next step on the refusing
           // stream: the fallback hop must not silently revert it.
           holder.pending = "high";
@@ -1036,7 +1002,7 @@ describe("StreamManager - mid-turn thinking override", () => {
           };
           // The next raise climbs from the level the fallback runs at, not the
           // refused model's, and the refused model's ceiling no longer retires it.
-          await prepareStep(options, longerStuckTranscript(), 6);
+          await prepareStepForTests(options, longerStuckTranscript(), 6);
           yield* answer();
         },
       ]
