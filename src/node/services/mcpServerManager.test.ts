@@ -3525,42 +3525,36 @@ describe("MCPServerManager", () => {
         plugin_existing: stdioConfig("existing"),
       };
       configService.listServers = mock(() => Promise.resolve({ ...configs }));
-      const started: Array<ReturnType<typeof testInstance>> = [];
-      // Keep the real startServers path; only the process boundary is injected.
-      access.startSingleServer = mock((name: unknown) => {
-        const instance = testInstance(String(name), {
-          tools: { echo: testTool() },
-          prompts: [{ name: "review" }],
-          refreshTools: mock(() => Promise.resolve()),
-        });
-        started.push(instance);
-        return Promise.resolve(instance);
-      });
+      const serveEcho = (command: string) => {
+        // Modern clients get background tools/list refreshes on cached serves.
+        const listTools = mock(() => Promise.resolve({ echo: testTool() }));
+        const close = mock(() => Promise.resolve(undefined));
+        servers.serve(command, { era: "modern", listTools, prompts: [{ name: "review" }], close });
+        return { listTools, close };
+      };
+      const ordinary = serveEcho("ordinary");
+      const existing = serveEcho("existing");
+      serveEcho("selected");
       const request = workspaceRequest(workspaceId, {
         overrides: { enabledServers: [pluginKey] },
       });
       const first = await manager.getToolsForWorkspace(request);
-      expect(started.map((instance) => instance.name)).toEqual(["ordinary", "plugin_existing"]);
+      expect(servers.connectCount("ordinary")).toBe(1);
+      expect(servers.connectCount("existing")).toBe(1);
+      expect(servers.connectCount("selected")).toBe(0);
+      expect(ordinary.listTools).toHaveBeenCalledTimes(1);
       if (leased) manager.acquireLease(workspaceId);
       try {
         // An old enable override only takes effect once the selected server exists.
         Object.assign(configs, { [pluginKey]: stdioConfig("selected", true) });
         const result = await manager.getToolsForWorkspace(request);
-        expect(started.map((instance) => instance.name)).toEqual([
-          "ordinary",
-          "plugin_existing",
-          pluginKey,
-        ]);
-        expect(started[0].close).not.toHaveBeenCalled();
-        expect(started[1].close).not.toHaveBeenCalled();
-        // Served tools are per-serve gate wrappers (see gateServedToolOnEnablement),
-        // so the retained clients show through the instance map, not tool identity.
+        // Only the addition starts; the existing clients are retained as-is.
+        expect(servers.connectCount("selected")).toBe(1);
+        expect(servers.connectCount("ordinary")).toBe(1);
+        expect(servers.connectCount("existing")).toBe(1);
+        expect(ordinary.close).not.toHaveBeenCalled();
+        expect(existing.close).not.toHaveBeenCalled();
         expect(Object.keys(first.tools).sort()).toEqual(["ordinary_echo", "plugin_existing_echo"]);
-        const retained = access.workspaceServers.get(workspaceId) as {
-          instances: Map<string, unknown>;
-        };
-        expect(retained.instances.get("plugin_existing")).toBe(started[1]);
-        expect(retained.instances.get("ordinary")).toBe(started[0]);
         expect(result.tools.plugin_existing_echo).toBeDefined();
         expect(result.tools.ordinary_echo).toBeDefined();
         expect(result.tools[`${pluginKey}_echo`]).toBeDefined();
@@ -3568,9 +3562,13 @@ describe("MCPServerManager", () => {
         expect(result.promptDescriptors.map((prompt) => prompt.serverName).sort()).toEqual(
           ["ordinary", "plugin_existing", pluginKey].sort()
         );
-        expect(started[0].refreshTools).toHaveBeenCalledTimes(1);
+        // The retained client got one background catalog refresh on top of
+        // its startup tools/list.
+        expect(ordinary.listTools).toHaveBeenCalledTimes(2);
         await manager.getToolsForWorkspace(request);
-        expect(started).toHaveLength(3);
+        expect(servers.connectCount("selected")).toBe(1);
+        expect(servers.connectCount("ordinary")).toBe(1);
+        expect(servers.connectCount("existing")).toBe(1);
       } finally {
         if (leased) manager.releaseLease(workspaceId);
       }
@@ -3581,87 +3579,91 @@ describe("MCPServerManager", () => {
     const request = workspaceRequest("ws-additive-retry");
     const configs = { stable: stdioConfig("stable"), slow: stdioConfig("slow") };
     configService.listServers = mock(() => Promise.resolve({ ...configs }));
-    const stable = testInstance("stable", { tools: { echo: testTool() } });
+    const stableClose = mock(() => Promise.resolve(undefined));
+    servers.serve("stable", { tools: { echo: testTool() }, close: stableClose });
+    servers.serve("slow", { hang: true });
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    elapseTimedOutRetryBackoff();
+
     const retryStarted = Promise.withResolvers<void>();
-    const retryFinished = Promise.withResolvers<ReturnType<typeof startResult>>();
-    const startup = mock()
-      .mockResolvedValueOnce({
-        instances: new Map([["stable", stable]]),
-        failedServerNames: ["slow"],
-        timedOutServerNames: ["slow"],
-      })
-      .mockImplementationOnce(() => {
+    const retryFinished = Promise.withResolvers<void>();
+    servers.serve("slow", {
+      tools: { echo: testTool() },
+      connect: () => {
         retryStarted.resolve();
         return retryFinished.promise;
-      })
-      .mockResolvedValueOnce(
-        startResult([], {
-          failedServerNames: ["addedSlow", "addedBroken"],
-          timedOutServerNames: ["addedSlow"],
-        })
-      );
-    access.startServers = startup;
-    await manager.getToolsForWorkspace(request);
-    elapseTimedOutRetryBackoff();
+      },
+    });
     const retry = manager.getToolsForWorkspace(request);
     await retryStarted.promise;
+    // "addedBroken" has no fake server, so its startup fails outright (a
+    // failed stdio connect is respawned once as legacy: two connections).
     Object.assign(configs, {
       addedSlow: stdioConfig("addedSlow"),
       addedBroken: stdioConfig("addedBroken"),
     });
-    await manager.getToolsForWorkspace(request);
-    retryFinished.resolve(startResult([["slow", { tools: { echo: testTool() } }]]));
+    servers.serve("addedSlow", { hang: true });
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    retryFinished.resolve();
     const result = await retry;
     expect(result.stats.enabledServerCount).toBe(4);
     expect(result.stats.failedServerNames.sort()).toEqual(["addedBroken", "addedSlow"]);
-    expect(stable.close).not.toHaveBeenCalled();
-    expect(startup.mock.calls.map((args) => Object.keys(args[0] as object))).toEqual([
-      ["stable", "slow"],
-      ["slow"],
-      ["addedBroken", "addedSlow"],
-    ]);
-    startup.mockResolvedValueOnce(startResult([["addedSlow"]]));
+    expect(Object.keys(result.tools).sort()).toEqual(["slow_echo", "stable_echo"]);
+    expect(stableClose).not.toHaveBeenCalled();
+    // Each server was started once: the initial start, the retry, and the
+    // additive startup never overlapped.
+    expect(servers.connectCount("stable")).toBe(1);
+    expect(servers.connectCount("slow")).toBe(1);
+    expect(servers.connectCount("addedSlow")).toBe(1);
+    expect(servers.connectCount("addedBroken")).toBe(2);
+
+    // The addition's timeout survived the retry's publication: it is retried
+    // after its window, while the hard failure is not.
+    servers.serve("addedSlow");
     elapseTimedOutRetryBackoff();
     await manager.getToolsForWorkspace(request);
-    expect(Object.keys(startup.mock.calls.at(-1)![0] as object)).toEqual(["addedSlow"]);
+    expect(servers.connectCount("addedSlow")).toBe(1);
+    expect(servers.connectCount("addedBroken")).toBe(2);
+    expect(servers.connectCount("slow")).toBe(1);
+    expect(servers.connectCount("stable")).toBe(1);
   });
 
   test("additive startup preserves a leased closed-client recovery", async () => {
     const request = workspaceRequest("ws-additive-recovery");
     const configs = { stable: stdioConfig("stable"), dead: stdioConfig("dead") };
     configService.listServers = mock(() => Promise.resolve({ ...configs }));
-    const stable = testInstance("stable");
-    const dead = testInstance("dead");
-    const recoveryStarted = Promise.withResolvers<void>();
-    const recoveryFinished = Promise.withResolvers<ReturnType<typeof startResult>>();
-    access.startServers = mock()
-      .mockResolvedValueOnce({
-        instances: new Map([
-          ["stable", stable],
-          ["dead", dead],
-        ]),
-        failedServerNames: [],
-      })
-      .mockImplementationOnce(() => {
-        recoveryStarted.resolve();
-        return recoveryFinished.promise;
-      })
-      .mockResolvedValueOnce(startResult([["added", { tools: { echo: testTool() } }]]));
+    const stableClose = mock(() => Promise.resolve(undefined));
+    const deadClose = mock(() => Promise.resolve(undefined));
+    servers.serve("stable", { close: stableClose });
+    servers.serve("dead", { close: deadClose });
+    servers.serve("added", { tools: { echo: testTool() } });
     await manager.getToolsForWorkspace(request);
     manager.acquireLease(request.workspaceId);
     try {
-      dead.isClosed = true;
+      const recoveryStarted = Promise.withResolvers<void>();
+      const recoveryFinished = Promise.withResolvers<void>();
+      await servers.crash("dead");
+      servers.serve("dead", {
+        tools: { echo: testTool() },
+        connect: () => {
+          recoveryStarted.resolve();
+          return recoveryFinished.promise;
+        },
+      });
       const recovery = manager.getToolsForWorkspace(request);
       await recoveryStarted.promise;
       Object.assign(configs, { added: stdioConfig("added") });
       await manager.getToolsForWorkspace(request);
-      recoveryFinished.resolve(startResult([["dead", { tools: { echo: testTool() } }]]));
+      recoveryFinished.resolve();
       const result = await recovery;
       expect(Object.keys(result.tools).sort()).toEqual(["added_echo", "dead_echo"]);
       expect(result.stats.startedServerCount).toBe(3);
       expect(result.stats.enabledServerCount).toBe(3);
-      expect(stable.close).not.toHaveBeenCalled();
-      expect(dead.close).toHaveBeenCalledTimes(1);
+      expect(stableClose).not.toHaveBeenCalled();
+      expect(deadClose).toHaveBeenCalledTimes(1);
+      expect(servers.connectCount("stable")).toBe(1);
+      expect(servers.connectCount("dead")).toBe(1);
+      expect(servers.connectCount("added")).toBe(1);
     } finally {
       manager.releaseLease(request.workspaceId);
     }
