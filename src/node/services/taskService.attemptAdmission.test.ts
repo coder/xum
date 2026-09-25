@@ -62,9 +62,10 @@ import type { TurnCompletion } from "@/node/services/streamManager";
 import { WorkspaceService } from "@/node/services/workspaceService";
 
 /**
- * G1 — attempt identity, lineage and the send-admission lifecycle (Changes 1, 2, 3a). No receipt
- * producer, classifier or claim is exercised here: "settled" reads as the in-process settlement
- * entry upgrading to `settled` and the stop record releasing.
+ * G1 — attempt identity, lineage and the send-admission lifecycle (Changes 1, 2, 3a). Receipt
+ * producers are covered in taskService.settlementReceipts.test.ts, and no classifier or claim is
+ * exercised here: "settled" reads as the in-process settlement entry upgrading to `settled` and
+ * the stop record releasing.
  */
 const rootId = "root-admission";
 const requesting = { requestingWorkspaceId: rootId };
@@ -339,6 +340,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(condition()).toBe(true);
+  }
+
+  /**
+   * A stop record whose owned attempt is receipt-eligible releases only after its settlement
+   * receipt write completes (asynchronously, after the cleanup that ended the stop).
+   */
+  async function waitForStopRelease(taskService: TaskService, taskId: string): Promise<void> {
+    await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
   }
 
   const entryOf = (config: Config, id: string) => findWorkspaceInConfig(config, id);
@@ -638,6 +647,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(entryOf(config, byReceipt)?.taskAttemptId).not.toBe(receiptAttempt);
       // An eligible attempt settled by this process proves the next successor too.
       await taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForStopRelease(taskService, byReceipt);
       expect(await taskService.markInterruptedTaskRunning(byReceipt)).toBe(true);
       expect(svc.ownedAttemptByTaskId.get(byReceipt)).toMatchObject({ receiptEligible: true });
       expect(entryOf(config, byReceipt)?.taskAttemptUnproven).toBeUndefined();
@@ -1746,7 +1756,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
 
         cleanupGate.resolve();
         await stop;
-        expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+        await waitForStopRelease(taskService, taskId);
         expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
         expect(entryOf(config, taskId)).toMatchObject({
           taskStatus: "interrupted",
@@ -1802,7 +1812,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
       gapSend.onDisposed("refused");
       await stop;
-      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      await waitForStopRelease(taskService, taskId);
       expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId: fresh,
         phase: "settled",
@@ -2025,6 +2035,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // A Stop settles the owned attempt (terminal without report) instead of only closing an
       // unowned id, and that settlement proves the next reawaken's lineage.
       await taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForStopRelease(taskService, spawnedId);
       expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
         kind: "terminal-no-report",
       });
@@ -2162,7 +2173,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           // Only the owner's actual settlement releases the record and settles the attempt.
           if (racing === "pending-outlives") racingToken?.onDisposed("refused");
           else settleRacingTurn(spawnedId);
-          expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+          await waitForStopRelease(taskService, spawnedId);
           expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
           expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
             phase: "settled",

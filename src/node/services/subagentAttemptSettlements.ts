@@ -20,9 +20,9 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
  * deleted. Concurrent writers of DIFFERENT attempts never touch the same file; the process-local
  * workspaceFileLocks used by the read-modify-write failure artifacts are therefore not needed.
  *
- * This module is receipt-independent plumbing: the producers that write receipts (settlement
- * paths in TaskService) and the classifier that consumes them are enabled by a later change.
- * Only reads (lineage proof at reawaken/reactivation) are wired at this point.
+ * Producers are TaskService's settlement paths (persistOwnedAttemptSettlement and the stop-record
+ * release). The only reader so far is the lineage proof at reawaken/reactivation; the classifier
+ * that would consume receipts for workflow replacement is enabled by a later change.
  */
 export const SUBAGENT_ATTEMPT_SETTLEMENT_RECEIPT_VERSION = 1 as const;
 const SUBAGENT_ATTEMPT_SETTLEMENTS_DIR_NAME = "subagent-attempt-settlements";

@@ -67,7 +67,11 @@ import {
   type AgentTaskIndex,
   type AgentTaskWorkspaceEntry,
 } from "@/node/services/agentTaskIndex";
-import { readSubagentAttemptSettlementReceiptStrict } from "@/node/services/subagentAttemptSettlements";
+import {
+  readSubagentAttemptSettlementReceiptStrict,
+  writeSubagentAttemptSettlementReceipt,
+  type SubagentAttemptSettlementSource,
+} from "@/node/services/subagentAttemptSettlements";
 import { assertTaskAttemptId, isTaskAttemptId, newTaskAttemptId } from "@/node/utils/taskAttemptId";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -1006,6 +1010,13 @@ interface WorkspaceStopRecord {
   ownedAttempt: OwnedTaskAttempt | undefined;
   /** Registered stream at capture; a later stop must not touch a replacement (expectedMessageId). */
   capturedStreamMessageId: string | undefined;
+  /**
+   * The owned attempt's settlement receipt (writeSettlementReceiptBeforeSettling), written once
+   * the release conditions hold and BEFORE the latch releases run: `writing` while it is awaited
+   * (a recheck meanwhile schedules no second write), then `written` (or no receipt authority) or
+   * `failed`. Unset when no write was needed.
+   */
+  receipt?: "writing" | "written" | "failed";
 }
 /**
  * Attempt compare-and-swap for a task-row write made on behalf of one attempt (stream end, report
@@ -2468,6 +2479,36 @@ export class TaskService implements AgentTaskIntegration {
       )
     )
       return;
+    // Execution-settlement producer: the receipt is durable before the latch releases, so nothing
+    // the latch holds back (a reawaken, a peer send, a queued launch) observes the stopped attempt
+    // as released while its receipt could still be missing. The record stays registered (latched)
+    // for the write; its completion rechecks, releasing the latch and recording the settlement in
+    // one step as before. A failed write still releases, with the attempt left `closing` (fail
+    // closed) instead of pinning the latch until restart.
+    if (record.receipt === "writing") return;
+    if (
+      record.receipt == null &&
+      this.attemptNeedsSettlementReceipt(workspaceId, record.ownedAttempt)
+    ) {
+      record.receipt = "writing";
+      void this.writeSettlementReceiptBeforeSettling(
+        workspaceId,
+        record.ownedAttempt,
+        "execution-settled",
+        "stop-settled"
+      )
+        .then(
+          (settle) => {
+            record.receipt = settle ? "written" : "failed";
+          },
+          (error: unknown) => {
+            log.error("Stop release: settlement receipt write threw", { workspaceId, error });
+            record.receipt = "failed";
+          }
+        )
+        .finally(() => this.recheckWorkspaceStopRelease(workspaceId));
+      return;
+    }
     this.workspaceStopRecords.delete(workspaceId);
     for (const release of record.releases) {
       release();
@@ -2478,7 +2519,10 @@ export class TaskService implements AgentTaskIntegration {
     if (record.ownedAttempt == null && record.attemptId != null) {
       this.closeAttemptAdmission(workspaceId, record.attemptId, undefined, "stop-settled");
     }
-    this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
+    // A failed receipt write leaves the attempt `closing` (never settled without its receipt).
+    if (record.receipt !== "failed") {
+      this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
+    }
   }
 
   /**
@@ -2651,6 +2695,146 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
     this.notifyAttemptSettlementListeners(taskId);
+  }
+
+  /**
+   * Only this process's CURRENT owned attempt, admitted with proven lineage under a persisted id
+   * the row still names, may produce a cross-process receipt. Anything else (unowned or
+   * prior-process attempt, marked lineage, pre-identity entry, an owner a reawakening or a durable
+   * report already replaced, a row another writer rotated) settles in memory only, exactly as
+   * before receipts existed.
+   */
+  private attemptNeedsSettlementReceipt(
+    taskId: string,
+    attempt: OwnedTaskAttempt | undefined
+  ): attempt is OwnedTaskAttempt & { attemptId: string } {
+    // The row check also keeps the closure below from replacing a closure another producer
+    // recorded for the attempt the row does name.
+    return (
+      attempt?.attemptId != null &&
+      attempt.receiptEligible &&
+      this.ownedAttemptByTaskId.get(taskId) === attempt &&
+      this.currentTaskAttemptId(taskId) === attempt.attemptId
+    );
+  }
+
+  /**
+   * Durable settlement for producers that established that no execution can still publish a
+   * report for `attempt` (idle stop, idle terminal failure, reservation canceled/failed, launch
+   * failed before its send): the receipt first, then the in-memory settlement (see
+   * writeSettlementReceiptBeforeSettling).
+   */
+  private async persistOwnedAttemptSettlement(
+    taskId: string,
+    attempt: OwnedTaskAttempt | undefined,
+    receiptSource: SubagentAttemptSettlementSource,
+    settlementSource: string
+  ): Promise<void> {
+    if (
+      await this.writeSettlementReceiptBeforeSettling(
+        taskId,
+        attempt,
+        receiptSource,
+        settlementSource
+      )
+    ) {
+      this.settleOwnedTaskAttempt(taskId, attempt, settlementSource);
+    }
+  }
+
+  /**
+   * The receipt half of a settlement: true when the caller may now record the in-memory
+   * settlement (receipt durable, or no receipt authority — see attemptNeedsSettlementReceipt —
+   * which keeps today's in-memory-only settlement). False when the write failed: the attempt
+   * stays `closing` — cleanup-pending in this process, indeterminate after a restart — and never
+   * becomes `settled`, so no successor can read it as settled without a durable receipt. The
+   * attempt is closed to sends first, so none can be admitted while the write is awaited.
+   */
+  private async writeSettlementReceiptBeforeSettling(
+    taskId: string,
+    attempt: OwnedTaskAttempt | undefined,
+    receiptSource: SubagentAttemptSettlementSource,
+    settlementSource: string
+  ): Promise<boolean> {
+    if (!this.attemptNeedsSettlementReceipt(taskId, attempt)) return true;
+    this.closeAttemptAdmission(taskId, attempt.attemptId, attempt, settlementSource);
+    const written = await this.writeOwnedAttemptSettlementReceipt(
+      taskId,
+      attempt.attemptId,
+      receiptSource
+    );
+    return written !== "failed";
+  }
+
+  /**
+   * Write the receipt for exactly `attemptId` into every owner session dir (the task's parent and
+   * its ancestors, from a strict config read). `skipped` — no receipt, not a failure — when the
+   * row is gone, has no parent, or names another attempt: a successor admitted by another writer
+   * (rowSupersedes) must never be vouched for by its predecessor's settlement. Never throws.
+   */
+  private async writeOwnedAttemptSettlementReceipt(
+    taskId: string,
+    attemptId: string,
+    source: SubagentAttemptSettlementSource
+  ): Promise<"written" | "skipped" | "failed"> {
+    let resolved: { parentWorkspaceId: string; owners: string[] } | undefined;
+    try {
+      const cfg = this.config.loadConfigOrDefault({ throwOnError: true });
+      const row = findWorkspaceEntry(cfg, taskId)?.workspace;
+      const parentWorkspaceId = coerceNonEmptyString(row?.parentWorkspaceId);
+      if (row == null || parentWorkspaceId == null || rowSupersedes(row, attemptId)) {
+        log.info("[task-attempt] settlement receipt skipped: the row no longer names the attempt", {
+          taskId,
+          attemptId,
+          current: row?.taskAttemptId,
+        });
+        return "skipped";
+      }
+      resolved = {
+        parentWorkspaceId,
+        owners: this.listAncestorWorkspaceIdsUsingParentById(
+          this.buildAgentTaskIndex(cfg).parentById,
+          taskId
+        ),
+      };
+    } catch (error: unknown) {
+      // Unreadable config (or a parent cycle): no owner dirs to vouch in; fail closed.
+      log.warn("[task-attempt] settlement receipt not written; attempt left closing", {
+        taskId,
+        attemptId,
+        error: getErrorMessage(error),
+      });
+      return "failed";
+    }
+    assert(
+      resolved.owners[0] === resolved.parentWorkspaceId,
+      "writeOwnedAttemptSettlementReceipt: the first owner must be the row's parent"
+    );
+    const receipt = {
+      taskId,
+      attemptId,
+      parentWorkspaceId: resolved.parentWorkspaceId,
+      source,
+      settledAt: new Date().toISOString(),
+    };
+    // Outermost ancestor first, the parent LAST, stopping at the first failure: the parent's copy
+    // (the one lineage proof reads) then exists only once every other owner holds one too.
+    for (const ownerWorkspaceId of [...resolved.owners].reverse()) {
+      const result = await writeSubagentAttemptSettlementReceipt({
+        ownerWorkspaceSessionDirs: [path.join(this.config.sessionsDir, ownerWorkspaceId)],
+        receipt,
+      });
+      if (!result.success) {
+        log.warn("[task-attempt] settlement receipt write failed; attempt left closing", {
+          taskId,
+          attemptId,
+          ownerWorkspaceId,
+          error: result.error,
+        });
+        return "failed";
+      }
+    }
+    return "written";
   }
 
   /**
@@ -5559,7 +5743,13 @@ export class TaskService implements AgentTaskIntegration {
           );
         }
         if (transitioned) this.recordTaskInterrupted(plan.taskId, plan.parentWorkspaceId);
-        this.settleOwnedTaskAttempt(plan.taskId, ownedAttempt, "reservation-canceled");
+        // Canceled before any launch was scheduled: nothing ran under the attempt.
+        await this.persistOwnedAttemptSettlement(
+          plan.taskId,
+          ownedAttempt,
+          "reservation-canceled",
+          "reservation-canceled"
+        );
         // Waiters are keyed by the stable task id: once another writer re-admitted the row under
         // its own attempt they are that attempt's (its task_await must not read this cancel).
         if (!superseded) {
@@ -5717,9 +5907,12 @@ export class TaskService implements AgentTaskIntegration {
           continue;
         }
       }
-      this.settleOwnedTaskAttempt(
+      // The pre-launch path failed before scheduling: nothing ran under the attempt. A row the
+      // failed commit never wrote gets no receipt (writeOwnedAttemptSettlementReceipt skips it).
+      await this.persistOwnedAttemptSettlement(
         plan.taskId,
         ownedAttempts.get(plan.taskId),
+        signal?.aborted ? "reservation-canceled" : "reservation-failed",
         "reservation-failed"
       );
     }
@@ -5745,7 +5938,7 @@ export class TaskService implements AgentTaskIntegration {
         { preservePhysicalWorkspace: materialized.preservePhysicalWorkspace }
       );
     }
-    await this.markTaskLaunchFailed(plan.taskId, TASK_RESERVATION_CANCELED_MESSAGE);
+    await this.markTaskLaunchFailed(plan.taskId, TASK_RESERVATION_CANCELED_MESSAGE, plan);
   }
 
   /**
@@ -6028,7 +6221,7 @@ export class TaskService implements AgentTaskIntegration {
     assert(plan.taskId.length > 0, "scheduleReservedTaskLaunch requires taskId");
     void this.enqueueReservedTaskLaunch(plan).catch((error: unknown) => {
       log.error("Failed to launch reserved task", { taskId: plan.taskId, error });
-      void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
+      void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
     });
   }
 
@@ -6052,7 +6245,17 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
-  private async markTaskLaunchFailed(taskId: string, message: string): Promise<void> {
+  private async markTaskLaunchFailed(
+    taskId: string,
+    message: string,
+    /**
+     * The failing launch's plan, when the caller has it. Receipt evidence is positive and
+     * captured, never a call-site whitelist: the plan names the owned attempt and its launch
+     * fence never admitted the send (sendAdmitted still false). Without it the attempt settles in
+     * memory only, as before receipts existed.
+     */
+    launch?: Pick<TaskLaunchPlan, "attemptId" | "sendAdmitted">
+  ): Promise<void> {
     assert(taskId.length > 0, "markTaskLaunchFailed requires taskId");
     // The launch owner gives up: settle exactly the attempt it owned when it decided. The
     // closure is recorded inside the updater, against the fresh row's id, before the write is
@@ -6088,7 +6291,27 @@ export class TaskService implements AgentTaskIntegration {
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(taskId, parentWorkspaceId);
     }
-    this.settleOwnedTaskAttempt(taskId, ownedAttempt, "launch-failed");
+    // Nothing admitted by this launch, and nothing else live under the task (a racing user or
+    // peer send admitted before the closure above): sampled after the closure, so authoritative.
+    const neverSent =
+      launch != null &&
+      launch.sendAdmitted !== true &&
+      launch.attemptId != null &&
+      launch.attemptId === ownedAttempt?.attemptId &&
+      this.workspaceService.getActiveTurnGeneration(taskId) == null &&
+      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) == null &&
+      !this.aiService.isStreaming(taskId) &&
+      !this.hasPendingAdmissions(taskId);
+    if (neverSent) {
+      await this.persistOwnedAttemptSettlement(
+        taskId,
+        ownedAttempt,
+        "launch-failed",
+        "launch-failed"
+      );
+    } else {
+      this.settleOwnedTaskAttempt(taskId, ownedAttempt, "launch-failed");
+    }
     await this.emitWorkspaceMetadata(taskId);
     this.rejectWaiters(taskId, new Error(message));
     this.scheduleMaybeStartQueuedTasks();
@@ -6123,7 +6346,7 @@ export class TaskService implements AgentTaskIntegration {
           { allowMissing: true }
         );
       } catch (error) {
-        await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
+        await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
         return;
       }
       await this.emitWorkspaceMetadata(plan.taskId);
@@ -6167,7 +6390,7 @@ export class TaskService implements AgentTaskIntegration {
           workspace.taskAttemptUnproven = true;
         });
       } catch (error) {
-        await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
+        await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
         return;
       }
       launchAttemptId =
@@ -14052,7 +14275,7 @@ export class TaskService implements AgentTaskIntegration {
           await this.enqueueReservedTaskLaunch(plan);
         } catch (error: unknown) {
           log.error("Failed to launch dequeued task", { taskId: plan.taskId, error });
-          await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
+          await this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
         }
       })
     );
@@ -15486,7 +15709,12 @@ export class TaskService implements AgentTaskIntegration {
     }
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
     // Verified idle inside the edit (no stream, no pending turn, no execution mirror).
-    this.settleOwnedTaskAttempt(workspaceId, ownedAttempt, "user-stop-idle");
+    await this.persistOwnedAttemptSettlement(
+      workspaceId,
+      ownedAttempt,
+      "idle-settled",
+      "user-stop-idle"
+    );
     this.rejectWaiters(workspaceId, new Error("Task interrupted"));
     await this.emitWorkspaceMetadata(workspaceId);
     this.scheduleMaybeStartQueuedTasks();
@@ -15772,7 +16000,13 @@ export class TaskService implements AgentTaskIntegration {
       });
     } else {
       this.workspaceService.clearQueue(workspaceId);
-      this.settleOwnedTaskAttempt(workspaceId, ownedAttempt, "terminal-failure");
+      // Idle terminal settlement: nothing live was admitted before the closure above.
+      await this.persistOwnedAttemptSettlement(
+        workspaceId,
+        ownedAttempt,
+        "idle-settled",
+        "terminal-failure"
+      );
     }
     await this.emitWorkspaceMetadata(workspaceId);
 
