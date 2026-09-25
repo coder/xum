@@ -67,7 +67,7 @@ interface TerminalFailureInternals {
 
 async function end(
   root: string,
-  outcome: "reported" | "no-report" | "refused" | "failed-checkpoint"
+  outcome: "reported" | "no-report" | "refused" | "failed-checkpoint" | "refused-failed-checkpoint"
 ) {
   const config = new Config(root);
   await fs.mkdir(config.srcDir, { recursive: true });
@@ -142,7 +142,7 @@ async function end(
         completedAt: new Date().toISOString(),
       });
     }
-  } else if (outcome === "refused") {
+  } else if (outcome === "refused" || outcome === "refused-failed-checkpoint") {
     // The real terminal-failure path: interrupted row, settlement receipt, failure artifact.
     const row = findWorkspaceInConfig(config, childId);
     if (row == null) throw new Error("reserved child row missing");
@@ -152,6 +152,18 @@ async function end(
       FIXTURE_REFUSAL,
       { expectedAttemptId: row.taskAttemptId ?? null }
     );
+    if (outcome === "refused-failed-checkpoint") {
+      // What the child's own runner records: the step failed with the refusal, the run failed.
+      await store.recordStepFailed(FIXTURE_RUN_ID, {
+        stepId: FIXTURE_STEP_ID,
+        inputHash: hashWorkflowStepInput(FIXTURE_STEP_ID, stepSpec),
+        taskId: childId,
+        error: FIXTURE_REFUSAL.errorMessage,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      await store.appendStatus(FIXTURE_RUN_ID, "failed", new Date().toISOString());
+    }
   } else {
     await upsertSubagentReportArtifact({
       workspaceId: FIXTURE_PARENT_ID,
@@ -165,7 +177,7 @@ async function end(
   return { childId, row: findWorkspaceInConfig(config, childId) };
 }
 
-async function resume(root: string) {
+async function resume(root: string, retryFromFailedCheckpoint: boolean) {
   const config = new Config(root);
   stubStableIds(config, ["replacement01"]);
   const taskService = stack(config);
@@ -194,7 +206,10 @@ async function resume(root: string) {
   let result: unknown;
   let error: string | undefined;
   try {
-    result = await runner.run(FIXTURE_RUN_ID);
+    result = await runner.run(
+      FIXTURE_RUN_ID,
+      retryFromFailedCheckpoint ? { allowRetryFromFailedCheckpoint: true } : undefined
+    );
   } catch (caught: unknown) {
     error = caught instanceof Error ? caught.message : String(caught);
   }
@@ -223,11 +238,14 @@ try {
     phase === "end"
       ? await end(
           root,
-          outcome === "reported" || outcome === "refused" || outcome === "failed-checkpoint"
+          outcome === "reported" ||
+            outcome === "refused" ||
+            outcome === "failed-checkpoint" ||
+            outcome === "refused-failed-checkpoint"
             ? outcome
             : "no-report"
         )
-      : await resume(root);
+      : await resume(root, outcome === "retry");
   process.stdout.write(`FIXTURE_RESULT ${JSON.stringify(output)}\n`);
   process.exit(0);
 } catch (error: unknown) {

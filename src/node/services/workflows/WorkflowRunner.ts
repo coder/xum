@@ -3192,6 +3192,9 @@ export class WorkflowRunner {
       case "terminal-no-report":
         // No row to retire (e.g. its reservation was canceled before the commit): fresh run.
         if (outcome.code === "no-record") return undefined;
+        // A terminal failure (e.g. a refusal under onRefusal: "fail") is the step's result, as in
+        // classifyPriorAttempt: it fails the step again, never retired and replaced.
+        if (outcome.failure != null) throw new Error(outcome.failure.errorMessage);
         return { taskId: step.taskId, attemptId: outcome.attemptId };
       case "reported":
         return undefined;
