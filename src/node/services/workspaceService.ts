@@ -12849,8 +12849,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await continuationSendState.onAcceptedPreStreamFailure?.(error);
       };
 
+      // Feedback text is a review envelope quoting plan content, not the objective a pending
+      // auto-title is generated from; leave the title for a later ordinary message.
       const shouldRunPendingAutoTitle =
         internal?.synthetic !== true &&
+        internal?.planReviewFeedback !== true &&
         normalizedOptions.editMessageId == null &&
         workspaceConfig.pendingAutoTitle === true &&
         !this.autoTitlingWorkspaces.has(workspaceId);
