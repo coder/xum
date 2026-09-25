@@ -1166,6 +1166,16 @@ export class ProviderService {
             }
           }
         }
+
+        // A pinned model of the removed provider would keep a reawakened sub-agent on a
+        // model that no longer resolves; unpin it so current defaults apply again.
+        if (
+          typeof workspace.taskAiPins?.model === "string" &&
+          modelStringStartsWithProvider(workspace.taskAiPins.model, provider)
+        ) {
+          const { model: _removedModel, ...remainingPins } = workspace.taskAiPins;
+          workspace.taskAiPins = remainingPins;
+        }
       }
     }
 

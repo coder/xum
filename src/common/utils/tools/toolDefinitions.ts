@@ -570,10 +570,10 @@ const taskToolBaseShape = {
     'Workspace target for kind="workspace". Omit for a new full workspace; use mode="existing" with workspaceId only for a workspace previously created by this caller.'
   ),
   model: TaskToolModelSchema.nullish().describe(
-    "Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. Do not assume any particular model is available. Use `models_list` to see valid values."
+    "Optional model override for the sub-agent, parsed with the same alias logic as the UI (an alias or a full 'provider:model' string). Omit this unless the user explicitly instructed a specific model — by default the sub-agent inherits the parent's model. An explicit value stays pinned when the sub-agent is later reawakened; omitting it follows the configured defaults. Do not assume any particular model is available. Use `models_list` to see valid values."
   ),
   thinking: TaskToolThinkingSchema.nullish().describe(
-    "Optional thinking/reasoning-level override for the sub-agent. Accepts a level name (off, low, medium, high, xhigh, max) or a numeric index (resolved against the chosen model). Omit this unless the user explicitly instructed a specific thinking level — by default the sub-agent inherits the parent's thinking level."
+    "Optional thinking/reasoning-level override for the sub-agent. Accepts a level name (off, low, medium, high, xhigh, max) or a numeric index (resolved against the chosen model). Omit this unless the user explicitly instructed a specific thinking level — by default the sub-agent inherits the parent's thinking level. An explicit value stays pinned when the sub-agent is later reawakened; omitting it follows the configured defaults."
   ),
 };
 

@@ -622,6 +622,11 @@ export interface ReadAgentDefinitionOptions {
    * we skip project scope to find the global/built-in exec, avoiding self-reference.
    */
   skipScopesAbove?: AgentDefinitionScope;
+  /**
+   * Cancels the underlying runtime stat/read work (e.g. SSH commands) and stops
+   * probing further candidates; readAgentDefinition then rejects with the abort reason.
+   */
+  abortSignal?: AbortSignal;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -673,7 +678,9 @@ async function loadAgentDefinition(
   // plugin(global) overrides built-in.
   const candidates = await buildScanCandidates(runtime, workspacePath, roots);
 
+  const abortSignal = options?.abortSignal;
   for (const candidate of candidates) {
+    abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
       continue;
     }
@@ -714,7 +721,7 @@ async function loadAgentDefinition(
         content = result.content;
         byteSize = result.byteSize;
       } else {
-        const stat = await candidate.runtime.stat(filePath);
+        const stat = await candidate.runtime.stat(filePath, abortSignal);
         if (stat.isDirectory) {
           continue;
         }
@@ -724,7 +731,7 @@ async function loadAgentDefinition(
           throw new Error(sizeValidation.error);
         }
 
-        content = await readFileString(candidate.runtime, filePath);
+        content = await readFileString(candidate.runtime, filePath, abortSignal);
         byteSize = stat.size;
       }
       const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
@@ -747,7 +754,9 @@ async function loadAgentDefinition(
       }
 
       return validated.data;
-    } catch {
+    } catch (error) {
+      // An aborted read is not a missing candidate: stop probing instead of falling through.
+      if (abortSignal?.aborted) throw error;
       continue;
     }
   }

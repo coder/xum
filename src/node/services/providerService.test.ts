@@ -1701,6 +1701,7 @@ describe("ProviderService custom provider mutations", () => {
                         exec: { model: `${provider}:workspace-agent`, thinkingLevel: "medium" },
                         plan: { model: "openai:gpt-5", thinkingLevel: "low" },
                       },
+                      taskAiPins: { model: `${provider}:pinned`, thinkingLevel: "high" },
                     },
                     {
                       path: "/tmp/project/workspace-b",
@@ -1719,6 +1720,7 @@ describe("ProviderService custom provider mutations", () => {
                       aiSettingsByAgent: {
                         exec: { model: "other-custom:model", thinkingLevel: "medium" },
                       },
+                      taskAiPins: { model: "other-custom:model" },
                     },
                   ],
                 },
@@ -1830,6 +1832,9 @@ describe("ProviderService custom provider mutations", () => {
       expect(project.workspaces[2].aiSettingsByAgent).toEqual({
         exec: { model: "other-custom:model", thinkingLevel: "medium" },
       });
+      // A pinned model of the removed provider is unpinned; other pins survive.
+      expect(project.workspaces[0].taskAiPins).toEqual({ thinkingLevel: "high" });
+      expect(project.workspaces[2].taskAiPins).toEqual({ model: "other-custom:model" });
     });
   });
 

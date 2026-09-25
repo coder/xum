@@ -30,6 +30,10 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
+import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+} from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -795,6 +799,48 @@ describe("WorkspaceContext", () => {
     expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
       "plan"
     );
+  });
+
+  test.each([
+    { name: "keeps a pending Exec pick", pickAgent: "exec", expectedModel: "openai:gpt-5.2" },
+    {
+      name: "reseeds over a Plan-scoped pick",
+      pickAgent: "plan",
+      expectedModel: "anthropic:claude-opus-4-6",
+    },
+  ])("child metadata reseed $name", async (row) => {
+    const workspaceId = "ws-pick-child";
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              parentWorkspaceId: "ws-parent",
+              agentId: "exec",
+              aiSettingsByAgent: {
+                exec: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+              },
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify(row.pickAgent),
+        [getModelKey(workspaceId)]: JSON.stringify("openai:gpt-5.2"),
+        [getThinkingLevelKey(workspaceId)]: JSON.stringify("low"),
+      },
+    });
+    // A deliberate, not yet sent pick made while the child's active agent was row.pickAgent.
+    resetAiSelectionIntentForTests();
+    markAiSelectionIntent(workspaceId, "model", "openai:gpt-5.2");
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    expect(readPersistedState(getModelKey(workspaceId), "")).toBe(row.expectedModel);
+    // Fields without a pending pick always follow the backend.
+    expect(readPersistedState(getThinkingLevelKey(workspaceId), "")).toBe("high");
+    resetAiSelectionIntentForTests();
   });
 
   test("loads workspace metadata on mount", async () => {

@@ -52,6 +52,8 @@ import {
   INSTANCE_DISCOVERY_MAX_LIMIT,
 } from "@/constants/agentMessaging";
 import {
+  formatReawakenChangedMessage,
+  formatReawakenCommitRefusedMessage,
   TASK_FAMILY_MESSAGE_MAX_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_MAX_TOTAL_MESSAGES,
@@ -61,6 +63,7 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { TaskService, ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import {
+  isActiveWorkspaceTurnTaskStatus,
   TaskHandleStore,
   type WorkspaceTurnTaskHandleRecord,
 } from "@/node/services/taskHandleStore";
@@ -79,6 +82,7 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
+import * as resolveNodeAgentAiSettingsModule from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -9002,7 +9006,7 @@ describe("TaskService", () => {
     );
   });
 
-  test("grouped Exec children keep creation-time settings through queueing, reload, and reactivation", async () => {
+  test("grouped Exec children keep creation-time settings through queueing and reload; reactivation re-resolves", async () => {
     const config = await createTestConfig(rootDir);
     const model = "openai:gpt-5.2";
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
@@ -9073,14 +9077,1076 @@ describe("TaskService", () => {
       "tool-end"
     );
     expect(reactivated).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+    // An ancestor reawakening re-resolves from current settings: the parent chat's Exec
+    // selection now outranks the base Exec default and the child's creation-time value.
     expect(sendMessage).toHaveBeenLastCalledWith(
       first.taskId,
       expect.any(String),
-      expect.objectContaining({ model, thinkingLevel: "high" }),
+      expect.objectContaining({
+        model: "openai:gpt-5.3-codex",
+        thinkingLevel: "medium",
+        skipAiSettingsPersistence: true,
+      }),
       expect.anything()
     );
+    // This mock never accepts the turn, so nothing was committed.
     expect(findWorkspaceInConfig(config, first.taskId)?.aiSettings?.model).toBe(model);
+    expect(findWorkspaceInConfig(config, first.taskId)?.taskModelString).toBe(model);
   }, 20_000);
+
+  describe("reawakened sub-agents follow current AI settings", () => {
+    const SPAWN_MODEL = "openai:gpt-5.2";
+    const MODEL_B = "openai:gpt-5.3-codex";
+    const MODEL_C = "anthropic:claude-haiku-4-5";
+
+    type AcceptingSend = ReturnType<typeof createAcceptingSendMessage>;
+
+    /** Accepts the turn like a real send: runs onAccepted, converting its throw to Err. */
+    function createAcceptingSendMessage(beforeAccept?: () => Promise<void>) {
+      return mock(async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+        const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+        await beforeAccept?.();
+        try {
+          await internal?.onAccepted?.();
+        } catch (error) {
+          return Err({
+            type: "unknown",
+            raw: error instanceof Error ? error.message : String(error),
+          });
+        }
+        return Ok(undefined);
+      });
+    }
+
+    function lastSendOptions(sendMessage: ReturnType<typeof mock>): Record<string, unknown> {
+      const options: unknown = sendMessage.mock.calls.at(-1)?.[2];
+      assert(options != null && typeof options === "object", "expected a dispatched send");
+      return options as Record<string, unknown>;
+    }
+
+    async function editEntry(
+      config: Config,
+      workspaceId: string,
+      mutate: (workspace: WorkspaceConfigEntry, cfg: ProjectsConfig) => void
+    ): Promise<void> {
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const workspace = project.workspaces.find((entry) => entry.id === workspaceId);
+          if (workspace) mutate(workspace, cfg);
+        }
+        return cfg;
+      });
+    }
+
+    async function setDelegatedExec(
+      config: Config,
+      subagent: { modelString?: string; thinkingLevel?: ThinkingLevel }
+    ): Promise<void> {
+      await config.editConfig((cfg) => {
+        const exec = cfg.agentAiDefaults?.exec ?? {};
+        cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { ...exec, subagent } };
+        return cfg;
+      });
+    }
+
+    async function spawnReportedChild(
+      options: {
+        spawn?: Partial<Parameters<TaskService["create"]>[0]>;
+        sendMessage?: AcceptingSend;
+        beforeSpawn?: (projectPath: string) => Promise<void>;
+      } = {}
+    ) {
+      const config = await createTestConfig(rootDir);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+        agentAiDefaults: { exec: { modelString: SPAWN_MODEL, thinkingLevel: "high" } },
+      });
+      await options.beforeSpawn?.(projectPath);
+      const sendMessage = options.sendMessage ?? createAcceptingSendMessage();
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const initStateManager = new RealInitStateManager(config);
+      const harness = createTaskServiceHarness(config, { workspaceService, initStateManager });
+      const created = await createAgentTask(harness.taskService, parentId, "child", {
+        agentType: "exec",
+        ...options.spawn,
+      });
+      assert(created.success, created.success ? "" : created.error);
+      const childId = created.data.taskId;
+      await initStateManager.waitForInit(childId);
+      await editEntry(config, childId, (workspace) => {
+        workspace.taskStatus = "reported";
+      });
+      sendMessage.mockClear();
+      return {
+        ...harness,
+        config,
+        parentId,
+        projectPath,
+        childId,
+        sendMessage,
+        workspaceService,
+        initStateManager,
+      };
+    }
+
+    function reawaken(taskService: TaskService, parentId: string, childId: string) {
+      return taskService.sendMessageToDescendantAgentTask(
+        parentId,
+        childId,
+        "continue",
+        "tool-end"
+      );
+    }
+
+    test("creation stores explicit task arguments as pins (always an object)", async () => {
+      const { config, taskService, parentId, childId, initStateManager } =
+        await spawnReportedChild();
+      expect(findWorkspaceInConfig(config, childId)?.taskAiPins).toEqual({});
+
+      const explicit = await createAgentTask(taskService, parentId, "pinned", {
+        agentType: "exec",
+        modelString: MODEL_B,
+        thinkingLevel: "low",
+      });
+      assert(explicit.success);
+      await initStateManager.waitForInit(explicit.data.taskId);
+      expect(findWorkspaceInConfig(config, explicit.data.taskId)?.taskAiPins).toEqual({
+        model: MODEL_B,
+        thinkingLevel: "low",
+      });
+
+      const many = await taskService.createMany([
+        {
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentId: "exec",
+          prompt: "workflow step",
+          title: "step",
+          modelString: MODEL_C,
+        },
+      ]);
+      assert(many.success);
+      expect(findWorkspaceInConfig(config, many.data[0].taskId)?.taskAiPins).toEqual({
+        model: MODEL_C,
+      });
+    }, 20_000);
+
+    test.each([
+      {
+        name: "Delegated override",
+        apply: (config: Config) => setDelegatedExec(config, { modelString: MODEL_B }),
+        expected: MODEL_B,
+      },
+      {
+        name: "direct parent's Exec selection",
+        apply: (config: Config, parentId: string) =>
+          editEntry(config, parentId, (workspace) => {
+            workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "high" } };
+          }),
+        expected: MODEL_C,
+      },
+      {
+        name: "base Exec default (masked by the parent's Exec selection)",
+        apply: async (config: Config, parentId: string) => {
+          await config.editConfig((cfg) => {
+            cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { modelString: MODEL_B } };
+            return cfg;
+          });
+          await editEntry(config, parentId, (workspace) => {
+            workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "high" } };
+          });
+        },
+        expected: MODEL_C,
+      },
+    ])(
+      "an ancestor reawakening follows the current $name",
+      async (row) => {
+        const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+        expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(SPAWN_MODEL);
+        await row.apply(config, parentId);
+
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+        expect(lastSendOptions(sendMessage)).toMatchObject({
+          model: row.expected,
+          skipAiSettingsPersistence: true,
+        });
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(row.expected);
+        expect(child?.aiSettings?.model).toBe(row.expected);
+        expect(child?.aiSettingsByAgent?.exec?.model).toBe(row.expected);
+        expect(child?.taskExecutionStatus).toBe("running");
+      },
+      20_000
+    );
+
+    test.each([false, true])(
+      "a declared definition ancestor's Settings reach an Exec-derived child (archived=%s)",
+      async (archived) => {
+        const { config, taskService, parentId, childId, sendMessage, workspaceService } =
+          await spawnReportedChild({
+            spawn: { agentType: "custom", agentId: "custom" },
+            beforeSpawn: (projectPath) => writeCustomAgentDefinition(projectPath),
+          });
+        if (archived) {
+          // Reawakening restores an archived child: its definition layers must still apply.
+          await editEntry(config, childId, (workspace) => {
+            workspace.archivedAt = new Date(Date.now() - 60_000).toISOString();
+          });
+          spyOn(workspaceService, "unarchiveWhileTaskTreeLocked").mockImplementation(
+            async (workspaceId: string) => {
+              await editEntry(config, workspaceId, (workspace) => {
+                workspace.unarchivedAt = new Date().toISOString();
+              });
+              return Ok(undefined);
+            }
+          );
+        }
+        await config.editConfig((cfg) => {
+          cfg.agentAiDefaults = { ...cfg.agentAiDefaults, exec: { modelString: MODEL_B } };
+          return cfg;
+        });
+
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result.success).toBe(true);
+        // Only the definition chain (custom -> exec) makes Exec's base model apply here.
+        expect(lastSendOptions(sendMessage)).toMatchObject({ model: MODEL_B });
+        expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(MODEL_B);
+      },
+      20_000
+    );
+
+    test("explicit task arguments stay pinned per field", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild({
+        spawn: { modelString: SPAWN_MODEL },
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
+
+      expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+      expect(lastSendOptions(sendMessage)).toMatchObject({
+        model: SPAWN_MODEL,
+        thinkingLevel: "xhigh",
+      });
+      expect(findWorkspaceInConfig(config, childId)?.taskAiPins).toEqual({ model: SPAWN_MODEL });
+    }, 20_000);
+
+    test("legacy children without taskAiPins keep creation-time settings", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      await editEntry(config, childId, (workspace) => {
+        delete workspace.taskAiPins;
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+
+      expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+      const options = lastSendOptions(sendMessage);
+      expect(options.model).toBe(SPAWN_MODEL);
+      expect(options.skipAiSettingsPersistence).toBeUndefined();
+      expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(SPAWN_MODEL);
+    }, 20_000);
+
+    test("bash-monitor wakes stay frozen and read no definitions", async () => {
+      const { config, taskService, childId } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const loader = spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers");
+      const wakeSend = createAcceptingSendMessage();
+      try {
+        const result = await taskService.reactivateInactiveAgentTaskFromBashMonitorWake(
+          childId,
+          "background process finished",
+          wakeSend as unknown as Parameters<
+            TaskService["reactivateInactiveAgentTaskFromBashMonitorWake"]
+          >[2]
+        );
+        expect(result).toEqual(Ok(undefined));
+        expect(lastSendOptions(wakeSend).model).toBe(SPAWN_MODEL);
+        expect(loader).not.toHaveBeenCalled();
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(SPAWN_MODEL);
+        // The normal reactivation lifecycle still ran.
+        expect(child?.taskExecutionStatus).toBe("running");
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+
+    test("guidance to a live child reads no definitions and keeps its model", async () => {
+      const { config, taskService, parentId, childId } = await spawnReportedChild();
+      await editEntry(config, childId, (workspace) => {
+        workspace.taskStatus = "running";
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const loader = spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers");
+      try {
+        await reawaken(taskService, parentId, childId);
+        expect(loader).not.toHaveBeenCalled();
+        expect(findWorkspaceInConfig(config, childId)?.taskModelString).toBe(SPAWN_MODEL);
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+
+    test("changes landing while definitions load are planned from fresh config", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      let signalLoadStarted!: () => void;
+      const loadStarted = new Promise<void>((resolve) => (signalLoadStarted = resolve));
+      let releaseLoad!: () => void;
+      const loadReleased = new Promise<void>((resolve) => (releaseLoad = resolve));
+      const loader = spyOn(
+        resolveNodeAgentAiSettingsModule,
+        "loadAgentDefinitionAiLayers"
+      ).mockImplementation(async () => {
+        signalLoadStarted();
+        await loadReleased;
+        return { ancestors: [] };
+      });
+      try {
+        const pending = reawaken(taskService, parentId, childId);
+        await loadStarted;
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        await editEntry(config, childId, (workspace) => {
+          workspace.taskAiPins = { thinkingLevel: "xhigh" };
+        });
+        releaseLoad();
+        expect((await pending).success).toBe(true);
+        expect(lastSendOptions(sendMessage)).toMatchObject({
+          model: MODEL_B,
+          thinkingLevel: "xhigh",
+        });
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+
+    test.each(["unavailable", "timeout", "not-prepared"] as const)(
+      "definition layers %s: still follows Settings and pins",
+      async (mode) => {
+        const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        await editEntry(config, childId, (workspace) => {
+          workspace.taskAiPins = { thinkingLevel: "xhigh" };
+        });
+        const originalLoader = resolveNodeAgentAiSettingsModule.loadAgentDefinitionAiLayers;
+        const seenSignals: Array<AbortSignal | undefined> = [];
+        const restores: Array<() => void> = [];
+        if (mode === "unavailable") {
+          const loader = spyOn(
+            resolveNodeAgentAiSettingsModule,
+            "loadAgentDefinitionAiLayers"
+          ).mockResolvedValue(null);
+          restores.push(() => loader.mockRestore());
+        } else if (mode === "timeout") {
+          // An already-expired timeout: the real loader must settle to null promptly.
+          const timeout = spyOn(AbortSignal, "timeout").mockImplementation(() =>
+            AbortSignal.abort(new Error("timed out"))
+          );
+          const loader = spyOn(
+            resolveNodeAgentAiSettingsModule,
+            "loadAgentDefinitionAiLayers"
+          ).mockImplementation(async (agentId, context, options) => {
+            seenSignals.push(options?.abortSignal);
+            const layers = await originalLoader(agentId, context, options);
+            expect(layers).toBeNull();
+            return layers;
+          });
+          restores.push(
+            () => timeout.mockRestore(),
+            () => loader.mockRestore()
+          );
+        } else {
+          const prepare = spyOn(
+            taskService as unknown as { prepareReawakenAi(taskId: string): Promise<unknown> },
+            "prepareReawakenAi"
+          ).mockResolvedValue(undefined);
+          restores.push(() => prepare.mockRestore());
+        }
+        try {
+          expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+          expect(lastSendOptions(sendMessage)).toMatchObject({
+            model: MODEL_B,
+            thinkingLevel: "xhigh",
+          });
+          if (mode === "timeout") {
+            expect(seenSignals).toHaveLength(1);
+            expect(seenSignals[0]?.aborted).toBe(true);
+          }
+        } finally {
+          for (const restore of restores) restore();
+        }
+      },
+      20_000
+    );
+
+    test("a reload between spawn and reawakening still re-resolves and keeps pins", async () => {
+      const { config, parentId, childId, sendMessage, workspaceService, initStateManager } =
+        await spawnReportedChild({ spawn: { thinkingLevel: "xhigh" } });
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "high" });
+      const reloaded = createTaskServiceHarness(config, { workspaceService, initStateManager });
+
+      expect((await reawaken(reloaded.taskService, parentId, childId)).success).toBe(true);
+      expect(lastSendOptions(sendMessage)).toMatchObject({
+        model: MODEL_B,
+        thinkingLevel: "xhigh",
+      });
+      expect(findWorkspaceInConfig(config, childId)?.taskAiPins).toEqual({
+        thinkingLevel: "xhigh",
+      });
+    }, 20_000);
+
+    test("a stale prepared context refuses retryably without any writes", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const before = JSON.stringify(findWorkspaceInConfig(config, childId));
+      const prepare = spyOn(
+        taskService as unknown as { prepareReawakenAi(taskId: string): Promise<unknown> },
+        "prepareReawakenAi"
+      ).mockResolvedValue({ taskId: childId, agentId: "exec", contextKey: "moved", layers: null });
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        // Pre-acceptance refusal: nothing was written, so resending the message is safe.
+        expect(result.error).toEqual({
+          code: "send_failed",
+          message: formatReawakenChangedMessage(childId),
+        });
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(JSON.stringify(findWorkspaceInConfig(config, childId))).toBe(before);
+      } finally {
+        prepare.mockRestore();
+      }
+    }, 20_000);
+
+    test.each([
+      {
+        name: "a manual pin",
+        commitRefusal: true,
+        mutate: (config: Config, childId: string) =>
+          editEntry(config, childId, (workspace) => {
+            workspace.taskAiPins = { model: MODEL_C };
+          }),
+        survived: (child: WorkspaceConfigEntry | undefined) =>
+          expect(child?.taskAiPins).toEqual({ model: MODEL_C }),
+      },
+      {
+        name: "an agentAiDefaults change",
+        commitRefusal: true,
+        mutate: (config: Config) => setDelegatedExec(config, { modelString: MODEL_C }),
+        survived: (_child: WorkspaceConfigEntry | undefined, config: Config) =>
+          expect(config.loadConfigOrDefault().agentAiDefaults?.exec?.subagent?.modelString).toBe(
+            MODEL_C
+          ),
+      },
+      {
+        name: "a child bucket change",
+        commitRefusal: true,
+        mutate: (config: Config, childId: string) =>
+          editEntry(config, childId, (workspace) => {
+            workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "low" } };
+          }),
+        survived: (child: WorkspaceConfigEntry | undefined) =>
+          expect(child?.aiSettingsByAgent?.exec).toEqual({ model: MODEL_C, thinkingLevel: "low" }),
+      },
+      {
+        name: "the entry's deletion",
+        commitRefusal: false,
+        mutate: (config: Config, childId: string) =>
+          config.editConfig((cfg) => {
+            for (const project of cfg.projects.values()) {
+              project.workspaces = project.workspaces.filter((entry) => entry.id !== childId);
+            }
+            return cfg;
+          }),
+        survived: (child: WorkspaceConfigEntry | undefined) => expect(child).toBeUndefined(),
+      },
+    ])(
+      "$name between resolution and acceptance refuses with no claim or settings",
+      async (row) => {
+        const target: { config?: Config; childId?: string; armed: boolean } = { armed: false };
+        const sendMessage = createAcceptingSendMessage(async () => {
+          if (!target.armed || target.config == null || target.childId == null) return;
+          // Lands after TaskService planned the snapshot, before acceptance commits it.
+          await row.mutate(target.config, target.childId);
+        });
+        const fixture = await spawnReportedChild({ sendMessage });
+        const { config, childId } = fixture;
+        target.config = config;
+        target.childId = childId;
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        const before = findWorkspaceInConfig(config, childId);
+        target.armed = true;
+
+        const result = await reawaken(fixture.taskService, fixture.parentId, childId);
+        expect(result.success).toBe(false);
+        if (result.success) return;
+        expect(result.error.code).toBe("send_failed");
+        if (row.commitRefusal) {
+          // Commit-point refusal: the prompt row is already durable, so the parent gets the
+          // retryable no-resend message rather than the pre-acceptance "send again" one.
+          const message = "message" in result.error ? result.error.message : "";
+          expect(message).toContain(formatReawakenCommitRefusedMessage(childId));
+          expect(message).not.toContain(formatReawakenChangedMessage(childId));
+        }
+        const child = findWorkspaceInConfig(config, childId);
+        row.survived(child, config);
+        if (child == null) return;
+        // Neither the planned settings nor the claim were written.
+        expect(child.taskModelString).toBe(SPAWN_MODEL);
+        expect(child.aiSettings).toEqual(before?.aiSettings);
+        expect(isActiveWorkspaceTurnTaskStatus(child.taskExecutionStatus)).toBe(false);
+      },
+      20_000
+    );
+
+    test("a send refused before acceptance leaves the AI-settings snapshot unchanged", async () => {
+      let refuse = false;
+      const refusingSend = mock(
+        (): Promise<Result<void, SendMessageError>> =>
+          Promise.resolve(
+            refuse ? Err({ type: "unknown", raw: "requireIdle: busy" }) : Ok(undefined)
+          )
+      );
+      const { config, taskService, parentId, childId } = await spawnReportedChild({
+        sendMessage: refusingSend as unknown as AcceptingSend,
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      refuse = true;
+      const result = await reawaken(taskService, parentId, childId);
+      expect(result.success).toBe(false);
+      const child = findWorkspaceInConfig(config, childId);
+      expect(child?.taskModelString).toBe(SPAWN_MODEL);
+      expect(child?.aiSettings?.model).toBe(SPAWN_MODEL);
+    }, 20_000);
+
+    test("a post-commit failure keeps the snapshot and settles the claimed mirror", async () => {
+      const { config, taskService, parentId, childId } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const host = taskService as unknown as {
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+      };
+      const originalEdit = host.editWorkspaceEntry.bind(taskService);
+      let committed = false;
+      let failedAfterCommit = false;
+      const edit = spyOn(host, "editWorkspaceEntry").mockImplementation(async (...args) => {
+        if (committed && !failedAfterCommit) {
+          // The taskPrompt cleanup right after the claim-and-settings write.
+          failedAfterCommit = true;
+          throw new Error("disk full");
+        }
+        const updated = await originalEdit(...args);
+        const child = findWorkspaceInConfig(config, childId);
+        committed ||= child?.taskModelString === MODEL_B && child.taskExecutionStatus === "running";
+        return updated;
+      });
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(failedAfterCommit).toBe(true);
+        expect(result.success).toBe(false);
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(MODEL_B);
+        expect(child?.taskExecutionStatus).not.toBe("running");
+      } finally {
+        edit.mockRestore();
+      }
+    }, 20_000);
+
+    test("a snapshot for another agent identity is refused before any write", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      const before = JSON.stringify(findWorkspaceInConfig(config, childId));
+      const result = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "continue",
+        title: "Sub-agent",
+        workspace: { mode: "existing", workspaceId: childId },
+        allowAgentWorkspace: true,
+        agentTaskAi: {
+          snapshot: {
+            agentId: "plan",
+            taskModelString: MODEL_B,
+            canonicalModel: MODEL_B,
+            thinkingLevel: "high",
+            reasoningMode: "standard",
+          },
+          inputsKey: "inputs",
+          contextKey: "context",
+        },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain(formatReawakenChangedMessage(childId));
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(JSON.stringify(findWorkspaceInConfig(config, childId))).toBe(before);
+    }, 20_000);
+
+    test("a metadata publication failure after the commit does not fail the turn", async () => {
+      const { config, taskService, parentId, childId } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const host = taskService as unknown as {
+        emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+      };
+      const originalEmit = host.emitWorkspaceMetadata.bind(taskService);
+      let rejectedAfterCommit = false;
+      const emit = spyOn(host, "emitWorkspaceMetadata").mockImplementation(async (workspaceId) => {
+        const child = findWorkspaceInConfig(config, childId);
+        if (workspaceId === childId && child?.taskModelString === MODEL_B) {
+          rejectedAfterCommit = true;
+          throw new Error("metadata bus closed");
+        }
+        return originalEmit(workspaceId);
+      });
+      const warn = spyOn(log, "warn");
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result.success).toBe(true);
+        expect(rejectedAfterCommit).toBe(true);
+        expect(findWorkspaceInConfig(config, childId)?.taskExecutionStatus).toBe("running");
+        expect(warn.mock.calls.some((call) => String(call[0]).includes("publish reawakened"))).toBe(
+          true
+        );
+      } finally {
+        emit.mockRestore();
+        warn.mockRestore();
+      }
+    }, 20_000);
+
+    /**
+     * Copies the durable state (config, sessions, handle store) of a frozen run into an
+     * isolated root and starts a fresh instance there WITHOUT cleanup, like a crash.
+     */
+    async function restartFromCrashCut(parentId: string, childId: string) {
+      const crashRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-cut-"));
+      await fsPromises.cp(rootDir, crashRoot, { recursive: true });
+      const restartedConfig = new Config(crashRoot);
+      const cutChild = findWorkspaceInConfig(restartedConfig, childId);
+      const recoverySend = createAcceptingSendMessage();
+      const { workspaceService, resumeStream } = createWorkspaceServiceMocks({
+        sendMessage: recoverySend,
+      });
+      const restarted = createTaskServiceHarness(restartedConfig, { workspaceService });
+      await restarted.taskService.initialize();
+      const executionId = cutChild?.taskExecutionId;
+      assert(executionId != null, "the cut must leave an execution mirror behind");
+      const handle = await (
+        restarted.taskService as unknown as { taskHandleStore: TaskHandleStore }
+      ).taskHandleStore.getWorkspaceTurn(parentId, executionId);
+      return {
+        crashRoot,
+        cutChild,
+        handle,
+        recoveredChild: findWorkspaceInConfig(restartedConfig, childId),
+        childSends: recoverySend.mock.calls.filter((call) => call[0] === childId),
+        childResumes: resumeStream.mock.calls.filter((call) => call[0] === childId),
+      };
+    }
+
+    test("a crash cut after the commit settles the claimed execution with the new snapshot", async () => {
+      let armed = false;
+      let signalCut!: () => void;
+      const cutReached = new Promise<void>((resolve) => (signalCut = resolve));
+      const fixture = await spawnReportedChild();
+      const { config, childId } = fixture;
+      const host = fixture.taskService as unknown as {
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+      };
+      const originalEdit = host.editWorkspaceEntry.bind(fixture.taskService);
+      const edit = spyOn(host, "editWorkspaceEntry").mockImplementation(async (...args) => {
+        const child = findWorkspaceInConfig(config, childId);
+        if (armed && child?.taskModelString === MODEL_B) {
+          // The claim-and-settings write is durable: freeze here, before any later step.
+          signalCut();
+          await new Promise(() => undefined);
+        }
+        return originalEdit(...args);
+      });
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      armed = true;
+      void reawaken(fixture.taskService, fixture.parentId, childId);
+      await cutReached;
+      edit.mockRestore();
+
+      const cut = await restartFromCrashCut(fixture.parentId, childId);
+      try {
+        // The cut captured the committed claim and settings together.
+        expect(cut.cutChild?.taskModelString).toBe(MODEL_B);
+        expect(cut.cutChild?.aiSettings?.model).toBe(MODEL_B);
+        expect(cut.cutChild?.taskExecutionStatus).toBe("running");
+        // Startup settles the interrupted continuation instead of replaying it (child
+        // sessions skip startup auto-retry); the committed snapshot stays the new one.
+        expect(cut.handle).toMatchObject({
+          status: "interrupted",
+          error: "Workspace turn interrupted after restart",
+          modelString: MODEL_B,
+        });
+        expect(cut.childSends).toHaveLength(0);
+        expect(cut.childResumes).toHaveLength(0);
+        expect(cut.recoveredChild?.taskExecutionStatus).toBe("interrupted");
+        expect(cut.recoveredChild?.taskModelString).toBe(MODEL_B);
+        expect(cut.recoveredChild?.aiSettings?.model).toBe(MODEL_B);
+        expect(cut.recoveredChild?.aiSettingsByAgent?.exec?.model).toBe(MODEL_B);
+      } finally {
+        await fsPromises.rm(cut.crashRoot, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    test("a crash cut before the commit settles interrupted with the old snapshot and no replay", async () => {
+      let armed = false;
+      let signalCut!: () => void;
+      const cutReached = new Promise<void>((resolve) => (signalCut = resolve));
+      // Freezes inside the send before onAccepted: the reservation already wrote an
+      // active mirror, but the claim-and-settings commit never ran.
+      const sendMessage = createAcceptingSendMessage(async () => {
+        if (!armed) return;
+        signalCut();
+        await new Promise(() => undefined);
+      });
+      const fixture = await spawnReportedChild({ sendMessage });
+      const { config, childId } = fixture;
+      const before = findWorkspaceInConfig(config, childId);
+      assert(before != null, "spawned child must exist");
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "low" });
+      armed = true;
+      void reawaken(fixture.taskService, fixture.parentId, childId);
+      await cutReached;
+
+      const cut = await restartFromCrashCut(fixture.parentId, childId);
+      try {
+        expect(isActiveWorkspaceTurnTaskStatus(cut.cutChild?.taskExecutionStatus)).toBe(true);
+        expect(cut.cutChild?.taskModelString).toBe(SPAWN_MODEL);
+        expect(cut.handle).toMatchObject({
+          status: "interrupted",
+          error: "Workspace turn interrupted after restart",
+        });
+        expect(cut.childSends).toHaveLength(0);
+        expect(cut.childResumes).toHaveLength(0);
+        expect(isActiveWorkspaceTurnTaskStatus(cut.recoveredChild?.taskExecutionStatus)).toBe(
+          false
+        );
+        expect(cut.recoveredChild?.taskModelString).toBe(before.taskModelString);
+        expect(cut.recoveredChild?.taskThinkingLevel).toBe(before.taskThinkingLevel);
+        expect(cut.recoveredChild?.aiSettings).toEqual(before.aiSettings);
+        expect(cut.recoveredChild?.aiSettingsByAgent).toEqual(before.aiSettingsByAgent);
+      } finally {
+        await fsPromises.rm(cut.crashRoot, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    interface AttemptLedger {
+      taskHandleStore: TaskHandleStore;
+      beginOwnedTaskAttempt(
+        taskId: string,
+        source: string,
+        identity: { attemptId: string | undefined; receiptEligible: boolean }
+      ): unknown;
+      settleOwnedTaskAttempt(taskId: string, attempt: unknown, source: string): void;
+      ownedAttemptByTaskId: Map<string, unknown>;
+      attemptSettlementByTaskId: Map<string, { attempt: unknown; source: string }>;
+    }
+
+    /** Queued admission: returns at once and hands onAccepted to the test once armed. */
+    function createDeferredAcceptSendMessage() {
+      const deferred: { armed: boolean; accept?: () => Promise<void> | void } = { armed: false };
+      const sendMessage = mock(
+        async (...args: unknown[]): Promise<Result<void, SendMessageError>> => {
+          const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+          if (deferred.armed) {
+            deferred.accept = internal?.onAccepted;
+            return Ok(undefined);
+          }
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      return { sendMessage: sendMessage as unknown as AcceptingSend, deferred };
+    }
+
+    /** A busy child admits the reawakening queued: the handle is upserted to running at acceptance. */
+    function admitQueued(workspaceService: WorkspaceHost, childId: string) {
+      return spyOn(workspaceService, "isBusyForMessage").mockImplementation(
+        (workspaceId: string) => workspaceId === childId
+      );
+    }
+
+    test.each(["no settlement", "settled meanwhile", "successor meanwhile"] as const)(
+      "a handle-upsert rejection after a queued commit keeps the snapshot and settles the mirror (%s)",
+      async (variant) => {
+        const { config, taskService, parentId, childId, workspaceService } =
+          await spawnReportedChild();
+        await setDelegatedExec(config, { modelString: MODEL_B });
+        const busy = admitQueued(workspaceService, childId);
+        const ledger = taskService as unknown as AttemptLedger;
+        const previousAttempt = ledger.ownedAttemptByTaskId.get(childId);
+        const store = ledger.taskHandleStore;
+        const originalUpsert = store.upsertWorkspaceTurn.bind(store);
+        let reactivationAttempt: unknown;
+        let successor: unknown;
+        const upsert = spyOn(store, "upsertWorkspaceTurn").mockImplementation(async (record) => {
+          const child = findWorkspaceInConfig(config, childId);
+          if (
+            reactivationAttempt == null &&
+            record.status === "running" &&
+            child?.taskModelString === MODEL_B &&
+            child.taskExecutionStatus === "running"
+          ) {
+            // The claim-and-settings write is committed; the next acceptance step fails.
+            reactivationAttempt = ledger.ownedAttemptByTaskId.get(childId);
+            if (variant === "settled meanwhile") {
+              ledger.settleOwnedTaskAttempt(childId, reactivationAttempt, "test-settlement");
+            } else if (variant === "successor meanwhile") {
+              successor = ledger.beginOwnedTaskAttempt(childId, "test-successor", {
+                attemptId: undefined,
+                receiptEligible: false,
+              });
+            }
+            throw new Error("handle store disk full");
+          }
+          return originalUpsert(record);
+        });
+        try {
+          const result = await reawaken(taskService, parentId, childId);
+          expect(reactivationAttempt).toBeDefined();
+          expect(result).toMatchObject({ success: false, error: { code: "send_failed" } });
+          const child = findWorkspaceInConfig(config, childId);
+          expect(child?.taskModelString).toBe(MODEL_B);
+          expect(child?.aiSettings?.model).toBe(MODEL_B);
+          // Existing settlement settled the claimed mirror to a terminal status.
+          expect(child?.taskExecutionStatus).toBeDefined();
+          expect(isActiveWorkspaceTurnTaskStatus(child?.taskExecutionStatus)).toBe(false);
+          const owned = ledger.ownedAttemptByTaskId.get(childId);
+          if (variant === "no settlement") {
+            // A published attempt is never rolled back (#4308): the refused reactivation's
+            // attempt stays owned until a Stop settles it.
+            expect(reactivationAttempt).not.toBe(previousAttempt);
+            expect(owned).toBe(reactivationAttempt);
+          } else if (variant === "settled meanwhile") {
+            expect(owned).toBe(reactivationAttempt);
+            expect(ledger.attemptSettlementByTaskId.get(childId)?.attempt).toBe(
+              reactivationAttempt
+            );
+          } else {
+            expect(owned).toBe(successor);
+          }
+        } finally {
+          upsert.mockRestore();
+          busy.mockRestore();
+        }
+      },
+      20_000
+    );
+
+    test("a queued acceptance commits only when its deferred onAccepted runs", async () => {
+      const { sendMessage, deferred } = createDeferredAcceptSendMessage();
+      const { config, taskService, parentId, childId, workspaceService } = await spawnReportedChild(
+        { sendMessage }
+      );
+      const before = findWorkspaceInConfig(config, childId);
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
+      const busy = admitQueued(workspaceService, childId);
+      deferred.armed = true;
+      try {
+        const result = await reawaken(taskService, parentId, childId);
+        expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+        assert(deferred.accept != null, "the queued send must defer its acceptance");
+        const queued = findWorkspaceInConfig(config, childId);
+        expect(queued?.taskExecutionStatus).toBe("queued");
+        expect(queued?.taskModelString).toBe(before?.taskModelString);
+        expect(queued?.taskThinkingLevel).toBe(before?.taskThinkingLevel);
+        expect(queued?.aiSettings).toEqual(before?.aiSettings);
+        expect(queued?.aiSettingsByAgent).toEqual(before?.aiSettingsByAgent);
+
+        await deferred.accept();
+        const accepted = findWorkspaceInConfig(config, childId);
+        expect(accepted?.taskExecutionStatus).toBe("running");
+        expect(accepted?.taskModelString).toBe(MODEL_B);
+        expect(accepted?.taskThinkingLevel).toBe("xhigh");
+        expect(accepted?.aiSettingsByAgent?.exec).toMatchObject({
+          model: MODEL_B,
+          thinkingLevel: "xhigh",
+        });
+      } finally {
+        busy.mockRestore();
+      }
+    }, 20_000);
+
+    test("the commit lands claim and settings in one write and publishes metadata once after it", async () => {
+      const { sendMessage, deferred } = createDeferredAcceptSendMessage();
+      const { config, taskService, parentId, childId, workspaceService } = await spawnReportedChild(
+        { sendMessage }
+      );
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      const busy = admitQueued(workspaceService, childId);
+      deferred.armed = true;
+      const host = taskService as unknown as {
+        editWorkspaceEntry: (...args: unknown[]) => Promise<boolean>;
+        emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+      };
+      const originalEdit = host.editWorkspaceEntry.bind(taskService);
+      const originalEmit = host.emitWorkspaceMetadata.bind(taskService);
+      const events: Array<{ kind: "edit" | "emit"; model?: string; status?: string }> = [];
+      const observe = (kind: "edit" | "emit") => {
+        const child = findWorkspaceInConfig(config, childId);
+        events.push({ kind, model: child?.taskModelString, status: child?.taskExecutionStatus });
+      };
+      try {
+        expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+        assert(deferred.accept != null, "the queued send must defer its acceptance");
+        observe("edit");
+        const edit = spyOn(host, "editWorkspaceEntry").mockImplementation(async (...args) => {
+          const updated = await originalEdit(...args);
+          if (args[0] === childId) observe("edit");
+          return updated;
+        });
+        const emit = spyOn(host, "emitWorkspaceMetadata").mockImplementation(
+          async (workspaceId) => {
+            if (workspaceId === childId) observe("emit");
+            return originalEmit(workspaceId);
+          }
+        );
+        try {
+          await deferred.accept();
+        } finally {
+          edit.mockRestore();
+          emit.mockRestore();
+        }
+      } finally {
+        busy.mockRestore();
+      }
+      // Queued on the old model until acceptance.
+      expect(events[0]).toEqual({ kind: "edit", model: SPAWN_MODEL, status: "queued" });
+      // The first write showing the new settings also shows the running claim: one write.
+      const commitIndex = events.findIndex(
+        (event) => event.kind === "edit" && event.model === MODEL_B
+      );
+      expect(commitIndex).toBeGreaterThan(0);
+      expect(events[commitIndex].status).toBe("running");
+      expect(
+        events
+          .slice(0, commitIndex)
+          .every((event) => event.model === SPAWN_MODEL && event.status === "queued")
+      ).toBe(true);
+      // Published exactly once for this acceptance, after the commit.
+      const emits = events.filter((event) => event.kind === "emit");
+      expect(emits).toEqual([{ kind: "emit", model: MODEL_B, status: "running" }]);
+      expect(events.indexOf(emits[0])).toBeGreaterThan(commitIndex);
+    }, 20_000);
+
+    test("a grandparent's reawakening resolves from the child's direct parent Exec bucket", async () => {
+      const config = await createTestConfig(rootDir);
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir, {
+        agentAiDefaults: { exec: { modelString: SPAWN_MODEL, thinkingLevel: "high" } },
+      });
+      const sendMessage = createAcceptingSendMessage();
+      const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+      const initStateManager = new RealInitStateManager(config);
+      const { taskService } = createTaskServiceHarness(config, {
+        workspaceService,
+        initStateManager,
+      });
+      const child = await createAgentTask(taskService, parentId, "child", { agentType: "exec" });
+      assert(child.success, child.success ? "" : child.error);
+      await initStateManager.waitForInit(child.data.taskId);
+      const grandchild = await createAgentTask(taskService, child.data.taskId, "grandchild", {
+        agentType: "exec",
+      });
+      assert(grandchild.success, grandchild.success ? "" : grandchild.error);
+      const grandchildId = grandchild.data.taskId;
+      await initStateManager.waitForInit(grandchildId);
+      await editEntry(config, grandchildId, (workspace) => {
+        workspace.taskStatus = "reported";
+      });
+      // The root (trigger) and the direct parent carry different Exec selections.
+      await editEntry(config, parentId, (workspace) => {
+        workspace.aiSettingsByAgent = { exec: { model: MODEL_B, thinkingLevel: "high" } };
+      });
+      await editEntry(config, child.data.taskId, (workspace) => {
+        workspace.aiSettingsByAgent = { exec: { model: MODEL_C, thinkingLevel: "high" } };
+      });
+      sendMessage.mockClear();
+
+      const result = await reawaken(taskService, parentId, grandchildId);
+      expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+      expect(lastSendOptions(sendMessage)).toMatchObject({ model: MODEL_C });
+      expect(findWorkspaceInConfig(config, grandchildId)?.taskModelString).toBe(MODEL_C);
+    }, 20_000);
+
+    test("recovery prompts and report metadata inside a reawakened execution use the committed values", async () => {
+      const { config, taskService, parentId, childId, sendMessage } = await spawnReportedChild();
+      await setDelegatedExec(config, { modelString: MODEL_B, thinkingLevel: "xhigh" });
+      expect((await reawaken(taskService, parentId, childId)).success).toBe(true);
+      expect(findWorkspaceInConfig(config, childId)).toMatchObject({
+        taskModelString: MODEL_B,
+        taskThinkingLevel: "xhigh",
+      });
+      // Settings drift after the commit must not reach this execution.
+      await setDelegatedExec(config, { modelString: MODEL_C, thinkingLevel: "medium" });
+      await editEntry(config, childId, (workspace) => {
+        workspace.taskStatus = "awaiting_report";
+      });
+      sendMessage.mockClear();
+      const internal = taskService as unknown as {
+        promptTaskForRequiredCompletionTool(
+          workspaceId: string,
+          options: { expectedAttemptId: null }
+        ): Promise<boolean>;
+        finalizeAgentTaskReport(
+          childWorkspaceId: string,
+          childEntry: ReturnType<typeof findWorkspaceEntry>,
+          report: { reportMarkdown: string },
+          attempt: unknown
+        ): Promise<unknown>;
+        ownedAttemptByTaskId: Map<string, unknown>;
+      };
+
+      expect(
+        await internal.promptTaskForRequiredCompletionTool(childId, { expectedAttemptId: null })
+      ).toBe(true);
+      const recovery = sendMessage.mock.calls.filter((call) => call[0] === childId);
+      expect(recovery).toHaveLength(1);
+      expect(recovery[0][2]).toMatchObject({ model: MODEL_B, thinkingLevel: "xhigh" });
+
+      await internal.finalizeAgentTaskReport(
+        childId,
+        findWorkspaceEntry(config.loadConfigOrDefault(), childId),
+        { reportMarkdown: "done" },
+        internal.ownedAttemptByTaskId.get(childId)
+      );
+      const report = await readSubagentReportArtifact(
+        path.join(config.sessionsDir, parentId),
+        childId
+      );
+      expect(report).toMatchObject({ model: MODEL_B, thinkingLevel: "xhigh" });
+    }, 20_000);
+
+    test("sibling-family reactivation keeps the frozen settings and reads no definitions", async () => {
+      const { config, taskService, parentId, childId, sendMessage, initStateManager } =
+        await spawnReportedChild();
+      const sibling = await createAgentTask(taskService, parentId, "sibling", {
+        agentType: "exec",
+      });
+      assert(sibling.success, sibling.success ? "" : sibling.error);
+      await initStateManager.waitForInit(sibling.data.taskId);
+      await setDelegatedExec(config, { modelString: MODEL_B });
+      sendMessage.mockClear();
+      const loader = spyOn(resolveNodeAgentAiSettingsModule, "loadAgentDefinitionAiLayers");
+      try {
+        const result = await taskService.sendMessageToSiblingAgentTask(
+          sibling.data.taskId,
+          childId,
+          "the fixture moved",
+          "tool-end"
+        );
+        expect(result).toMatchObject({ success: true, data: { delivery: "reactivated" } });
+        const childSends = sendMessage.mock.calls.filter((call) => call[0] === childId);
+        expect(childSends).toHaveLength(1);
+        const options = childSends[0][2] as Record<string, unknown>;
+        expect(options.model).toBe(SPAWN_MODEL);
+        expect(options.skipAiSettingsPersistence).toBeUndefined();
+        expect(loader).not.toHaveBeenCalled();
+        const child = findWorkspaceInConfig(config, childId);
+        expect(child?.taskModelString).toBe(SPAWN_MODEL);
+        // The normal reactivation lifecycle still ran.
+        expect(child?.taskExecutionStatus).toBe("running");
+      } finally {
+        loader.mockRestore();
+      }
+    }, 20_000);
+  });
 
   test("nested Exec delegation inherits the immediate child rather than the root chat", async () => {
     const config = await createTestConfig(rootDir);
@@ -25587,6 +26653,31 @@ describe("TaskService", () => {
       .find((workspace) => workspace.id === childId);
     expect(updatedTask?.agentId).toBe("exec");
     expect(updatedTask?.taskRecoveryAttempts).toBeUndefined();
+  });
+
+  test.each([
+    { name: "new-style", pins: { model: "openai:gpt-5.2", thinkingLevel: "high" as const } },
+    { name: "legacy", pins: undefined },
+  ])("plan-to-exec auto-handoff clears plan-phase pins ($name)", async (row) => {
+    const { config, childId, internal } = await setupPlanModeStreamEndHarness();
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((ws) => ws.id === childId);
+        if (workspace) {
+          workspace.taskAiPins = row.pins;
+        }
+      }
+      return cfg;
+    });
+
+    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+
+    const updatedTask = Array.from(config.loadConfigOrDefault().projects.values())
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === childId);
+    expect(updatedTask?.agentId).toBe("exec");
+    // The Exec phase starts unpinned but stays refreshable; legacy tasks stay legacy.
+    expect(updatedTask?.taskAiPins).toEqual(row.pins == null ? undefined : {});
   });
 
   test("plan task stream-end with final assistant text still requires propose_plan", async () => {

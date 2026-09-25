@@ -978,6 +978,18 @@ export const SendMessageOptionsSchema = z.object({
    * When true, skip persisting AI settings (e.g., for one-shot or compaction sends).
    */
   skipAiSettingsPersistence: z.boolean().optional(),
+  /**
+   * Fields the user deliberately picked (model/thinking/reasoning pickers) before this
+   * manual send. Pins those sent values on agent-task workspaces so they survive
+   * reawakenings. Renderer-origin only; stripped before queueing and dispatch.
+   */
+  aiSelectionIntent: z
+    .object({
+      model: z.literal(true).optional(),
+      thinkingLevel: z.literal(true).optional(),
+      reasoningMode: z.literal(true).optional(),
+    })
+    .optional(),
   experiments: ExperimentsSchema.optional(),
   /**
    * Composer model set to "Auto" (auto-model-routing experiment): classify the prompt's

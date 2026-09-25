@@ -92,6 +92,14 @@ import {
   resolveNodeAgentAiSettings,
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
+import {
+  AgentTaskAiInputsChangedError,
+  applyAgentTaskTurnAiSnapshot,
+  buildReawakenContextKey,
+  computeReawakenInputsKey,
+  type AgentTaskTurnAi,
+} from "@/node/services/agentTaskReawakenAi";
+import { formatReawakenChangedMessage } from "@/constants/taskMessages";
 import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -222,6 +230,39 @@ interface WorkspaceTurnAgentContext {
   runtimeConfig: RuntimeConfig;
 }
 
+export interface WorkspaceAgentContextParams {
+  runtimeConfig: RuntimeConfig;
+  projectPath: string;
+  workspaceName: string;
+  persistedWorkspacePath?: string;
+  subProjectPath?: string;
+  includeAgentPlugins: boolean;
+}
+
+/**
+ * Agent-discovery context for a workspace checkout. Uses
+ * createRuntimeContextForWorkspace — the same helper the stream uses in
+ * aiService — so definitions resolve from the exact discovery path that will
+ * stream (Docker container-side paths, subproject directories included).
+ * Shared with TaskService, which reads a reawakened child's definition chain.
+ */
+export function buildWorkspaceAgentContext(
+  params: WorkspaceAgentContextParams
+): WorkspaceTurnAgentContext {
+  const context = createRuntimeContextForWorkspace({
+    runtimeConfig: params.runtimeConfig,
+    projectPath: params.projectPath,
+    name: params.workspaceName,
+    namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
+    subProjectPath: coerceNonEmptyString(params.subProjectPath),
+  });
+  return {
+    ...context,
+    includeAgentPlugins: params.includeAgentPlugins,
+    runtimeConfig: params.runtimeConfig,
+  };
+}
+
 /**
  * Whether agent discovery for both runtime configs reads the same host filesystem,
  * i.e. the owner's global/plugin agent roots are literally the target's roots.
@@ -278,6 +319,13 @@ export interface WorkspaceTurnCreateArgs {
    */
   /** Internal-only: allow a persistent descendant agent workspace as an existing target. */
   allowAgentWorkspace?: boolean;
+  /**
+   * Internal-only (ancestor reawakening of a new-style sub-agent): AI settings TaskService
+   * already planned for this turn. Replaces this manager's frozen resolution, dispatches
+   * without send-time AI-settings persistence, and commits the snapshot inside the same
+   * config write that claims the execution at acceptance, only if its inputs are unchanged.
+   */
+  agentTaskAi?: AgentTaskTurnAi;
   attentionPolicy?: BackgroundWorkAttentionPolicy;
   /**
    * Internal-only: dispatch the prompt through this sender instead of
@@ -665,25 +713,13 @@ export class WorkspaceTurnManager {
    * aiService — so validation resolves agents from the exact discovery path that
    * will stream (Docker container-side paths, subproject directories included).
    */
-  private buildWorkspaceTurnAgentContext(params: {
-    runtimeConfig: RuntimeConfig;
-    projectPath: string;
-    workspaceName: string;
-    persistedWorkspacePath?: string;
-    subProjectPath?: string;
-  }): WorkspaceTurnAgentContext {
-    const context = createRuntimeContextForWorkspace({
-      runtimeConfig: params.runtimeConfig,
-      projectPath: params.projectPath,
-      name: params.workspaceName,
-      namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
-      subProjectPath: coerceNonEmptyString(params.subProjectPath),
-    });
-    return {
-      ...context,
+  private buildWorkspaceTurnAgentContext(
+    params: Omit<WorkspaceAgentContextParams, "includeAgentPlugins">
+  ): WorkspaceTurnAgentContext {
+    return buildWorkspaceAgentContext({
+      ...params,
       includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
-      runtimeConfig: params.runtimeConfig,
-    };
+    });
   }
 
   /**
@@ -1294,6 +1330,19 @@ export class WorkspaceTurnManager {
       workspaceTurnAgentId = requestedAgentId ?? workspaceTurnAgentId;
     }
 
+    const agentTaskAi = args.agentTaskAi;
+    if (agentTaskAi != null) {
+      assert(
+        requestedAgentId == null,
+        "createWorkspaceTurn: agentTaskAi excludes agentId overrides"
+      );
+      // The planned snapshot belongs to the agent identity TaskService read; any other
+      // target (or identity) means the child changed meanwhile: refuse retryably.
+      if (!targetIsAgentWorkspace || agentTaskAi.snapshot.agentId !== workspaceTurnAgentId) {
+        return Err(formatReawakenChangedMessage(targetWorkspaceId));
+      }
+    }
+
     // Unified per-field precedence (see resolveAgentAiSettings): explicit
     // per-launch override → target workspace's own persisted settings
     // (mode="existing" follow-ups, plus task-frozen settings for resumed agent
@@ -1314,40 +1363,47 @@ export class WorkspaceTurnManager {
     let thinkingLevel: ThinkingLevel;
     let reasoningMode: OpenAIReasoningMode | undefined;
     try {
-      const resolved = await resolveNodeAgentAiSettings({
-        agentId: workspaceTurnAgentId,
-        profile: "interactive",
-        cfg,
-        providersConfig: this.aiService.getProvidersConfig(),
-        explicit: {
-          model: coerceNonEmptyString(args.modelString) ?? undefined,
-          thinkingLevel: args.thinkingLevel ?? undefined,
-        },
-        targetWorkspaceSettings: targetLayer,
-        parentRuntime: args.parentRuntimeAiSettings
-          ? {
-              model: coerceNonEmptyString(args.parentRuntimeAiSettings.modelString) ?? undefined,
-              thinkingLevel: args.parentRuntimeAiSettings.thinkingLevel,
-            }
-          : undefined,
-        fallbacks: this.taskHost.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
-        // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
-        // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
-        // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
-        // rewrites the agent's `ai` frontmatter does not retroactively change the model/thinking
-        // already selected here (waiting for init is not an option under the service-wide mutex).
-        // This is bounded to convenience defaults: callers wanting determinism pass explicit
-        // model/thinking, the send path re-clamps thinking and re-gates reasoning per model at
-        // request time, and the authoritative prompt/tool policy is always resolved at stream
-        // time (after init) with strictAgentResolution guarding agent identity.
-        ...(agentDefinitionContext != null ? { definitionContext: agentDefinitionContext } : {}),
-      });
-      // Selected (not effective) values: sendMessage persists what it
-      // receives, and the send path re-clamps thinking and re-gates reasoning
-      // per model/route at request time.
-      model = resolved.selected.model;
-      thinkingLevel = resolved.selected.thinkingLevel;
-      reasoningMode = resolved.selected.reasoningMode;
+      if (agentTaskAi != null) {
+        // Reawakening: TaskService resolved current defaults + pins; do not re-freeze here.
+        model = agentTaskAi.snapshot.taskModelString;
+        thinkingLevel = agentTaskAi.snapshot.thinkingLevel;
+        reasoningMode = agentTaskAi.snapshot.reasoningMode;
+      } else {
+        const resolved = await resolveNodeAgentAiSettings({
+          agentId: workspaceTurnAgentId,
+          profile: "interactive",
+          cfg,
+          providersConfig: this.aiService.getProvidersConfig(),
+          explicit: {
+            model: coerceNonEmptyString(args.modelString) ?? undefined,
+            thinkingLevel: args.thinkingLevel ?? undefined,
+          },
+          targetWorkspaceSettings: targetLayer,
+          parentRuntime: args.parentRuntimeAiSettings
+            ? {
+                model: coerceNonEmptyString(args.parentRuntimeAiSettings.modelString) ?? undefined,
+                thinkingLevel: args.parentRuntimeAiSettings.thinkingLevel,
+              }
+            : undefined,
+          fallbacks: this.taskHost.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
+          // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
+          // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
+          // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
+          // rewrites the agent's `ai` frontmatter does not retroactively change the model/thinking
+          // already selected here (waiting for init is not an option under the service-wide mutex).
+          // This is bounded to convenience defaults: callers wanting determinism pass explicit
+          // model/thinking, the send path re-clamps thinking and re-gates reasoning per model at
+          // request time, and the authoritative prompt/tool policy is always resolved at stream
+          // time (after init) with strictAgentResolution guarding agent identity.
+          ...(agentDefinitionContext != null ? { definitionContext: agentDefinitionContext } : {}),
+        });
+        // Selected (not effective) values: sendMessage persists what it
+        // receives, and the send path re-clamps thinking and re-gates reasoning
+        // per model/route at request time.
+        model = resolved.selected.model;
+        thinkingLevel = resolved.selected.thinkingLevel;
+        reasoningMode = resolved.selected.reasoningMode;
+      }
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.createWorkspaceTurn: ${error.message}`);
@@ -1501,7 +1557,14 @@ export class WorkspaceTurnManager {
         }
         if (targetIsAgentWorkspace) {
           const claimed = await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, () =>
-            this.persistAgentTaskExecutionState(targetWorkspaceId, handleId, "running", true)
+            this.persistAgentTaskExecutionState(
+              targetWorkspaceId,
+              handleId,
+              "running",
+              true,
+              undefined,
+              agentTaskAi
+            )
           );
           if (!claimed) throw new Error("Workspace turn was superseded before stream start");
         }
@@ -1528,6 +1591,18 @@ export class WorkspaceTurnManager {
           ownerWorkspaceId,
           accepted: true,
         });
+        if (agentTaskAi != null) {
+          // The claim write skipped its own publication (see persistAgentTaskExecutionState).
+          // Publication is the only post-commit step whose failure must not fail the turn.
+          try {
+            await this.taskHost.emitWorkspaceMetadata(targetWorkspaceId);
+          } catch (error) {
+            log.warn("createWorkspaceTurn: failed to publish reawakened sub-agent metadata", {
+              workspaceId: targetWorkspaceId,
+              error: getErrorMessage(error),
+            });
+          }
+        }
       });
     };
 
@@ -1547,7 +1622,8 @@ export class WorkspaceTurnManager {
         // A per-turn agent override on an existing workspace must not overwrite the target's
         // saved agent/settings (maybePersistAISettingsFromOptions persists them on every
         // ordinary send). New workspaces still persist: the requested agent IS their default.
-        ...(mode === "existing" && requestedAgentId != null
+        // A reawakening snapshot persists only at acceptance, with the execution claim.
+        ...((mode === "existing" && requestedAgentId != null) || agentTaskAi != null
           ? { skipAiSettingsPersistence: true }
           : {}),
         // Explicit overrides were validated pre-dispatch, but that validation races init
@@ -5375,8 +5451,14 @@ export class WorkspaceTurnManager {
     handleId: string,
     status: WorkspaceTurnTaskStatus | null,
     allowNewExecution = false,
-    reconciledPreviousExecutionId?: string
+    reconciledPreviousExecutionId?: string,
+    /** Acceptance of a reawakening: commit these AI settings atomically with the claim. */
+    agentTaskAi?: AgentTaskTurnAi
   ): Promise<boolean> {
+    assert(
+      agentTaskAi == null || status === "running",
+      "persistAgentTaskExecutionState: agentTaskAi commits only with a running claim"
+    );
     // editWorkspaceEntry reports `updated` for a mere existing workspace, so a queued/stale
     // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
     // points at — track whether the matching mirror was actually mutated.
@@ -5422,6 +5504,27 @@ export class WorkspaceTurnManager {
           // commits so a competing controller published meanwhile rejects the active mirror
           // (terminal/clear branches stay ungated: releasing must always be allowed).
           this.desktopInputCoordinator.assertAdmission(config, workspaceId);
+          if (agentTaskAi != null) {
+            // Commit point of a reawakening: the planned settings land in this same write,
+            // only if nothing they were derived from changed. Throwing aborts the whole
+            // write, so a refusal persists neither the claim nor the settings.
+            const freshEntry = findWorkspaceEntry(config, workspaceId);
+            const freshContextKey =
+              freshEntry != null
+                ? buildReawakenContextKey(
+                    freshEntry,
+                    this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)
+                  )
+                : null;
+            if (
+              freshContextKey !== agentTaskAi.contextKey ||
+              computeReawakenInputsKey(config, workspaceId, freshContextKey) !==
+                agentTaskAi.inputsKey
+            ) {
+              throw new AgentTaskAiInputsChangedError(workspaceId);
+            }
+            applyAgentTaskTurnAiSnapshot(workspace, agentTaskAi.snapshot);
+          }
           return;
         }
         if (workspace.taskExecutionId === handleId) {
@@ -5452,7 +5555,11 @@ export class WorkspaceTurnManager {
         }
         this.taskHost.releaseRetainedStopLatches(workspaceId);
       }
-      await this.taskHost.emitWorkspaceMetadata(workspaceId);
+      // A reawakening's acceptance hook publishes after its remaining steps, tolerating
+      // publication failure (the settings are already committed).
+      if (agentTaskAi == null) {
+        await this.taskHost.emitWorkspaceMetadata(workspaceId);
+      }
     }
     return claimedActiveMirror || settledMatchingMirror;
   }

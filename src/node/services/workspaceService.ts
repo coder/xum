@@ -90,7 +90,12 @@ import {
   resolveNodeAgentAiSettings,
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
-import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
+import {
+  applyAiSelectionIntentToPins,
+  targetWorkspaceBucketToLayer,
+  type AiSelectionIntent,
+  type TaskAiPins,
+} from "@/common/types/agentAiSettings";
 import { lookupMinThinkingLevelOverride } from "@/common/utils/thinking/policy";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
@@ -358,6 +363,7 @@ import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycle
 import {
   areArchiveUntrackedPathListsEqual,
   normalizeArchiveUntrackedPaths,
+  resolveTaskAgentIdForResume,
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
@@ -10739,7 +10745,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private async maybePersistAISettingsFromOptions(
     workspaceId: string,
-    options: SendMessageOptions | undefined
+    options: SendMessageOptions | undefined,
+    pinIntent?: AiSelectionIntent,
+    pinsOnly?: boolean
   ): Promise<void> {
     if (options?.skipAiSettingsPersistence) {
       // One-shot/compaction sends shouldn't overwrite workspace defaults.
@@ -10758,6 +10766,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // Save the selected agent so heartbeats can reuse it after reloads and reconnects.
         persistSelectedAgentId: true,
         ...(options?.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
+        ...(pinIntent != null ? { pinIntent } : {}),
+        ...(pinsOnly === true ? { pinsOnly: true } : {}),
       }
     );
     if (!persistResult.success) {
@@ -10776,6 +10786,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       emitMetadata?: boolean;
       disableWorkspaceAgents?: boolean;
       persistSelectedAgentId?: boolean;
+      /** Deliberate user picks sent with this message: pin them on new-style agent tasks. */
+      pinIntent?: AiSelectionIntent;
+      /**
+       * Write only the pins (at message acceptance): the bucket and selected agent were
+       * already persisted at send preflight and may have moved on since.
+       */
+      pinsOnly?: boolean;
     }
   ): Promise<Result<boolean, string>> {
     const found = this.config.findWorkspace(workspaceId);
@@ -10794,6 +10811,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // settings bucket. Persist whatever agent ID the caller chose so legacy Ask
     // settings can fade out naturally instead of being mixed into Auto.
 
+    // Pins apply only to new-style agent tasks (taskAiPins present; legacy tasks stay
+    // frozen) and only for the task's own agent. Same reference = nothing to pin.
+    const computeNextPins = (entry: Workspace): TaskAiPins | undefined => {
+      const pinIntent = options?.pinIntent;
+      if (
+        pinIntent == null ||
+        aiSettings == null ||
+        entry.taskAiPins == null ||
+        normalizedAgentId !== resolveTaskAgentIdForResume(entry)
+      ) {
+        return entry.taskAiPins;
+      }
+      return applyAiSelectionIntentToPins(entry.taskAiPins, pinIntent, aiSettings);
+    };
+
     // Hot path: this runs on every message send, so skip the queued write when a
     // snapshot read already shows no change. Skipping is race-safe — it is equivalent
     // to a serialized write of the identical value landing first, and not writing can
@@ -10809,6 +10841,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       const prev = snapshotEntry.aiSettingsByAgent?.[normalizedAgentId];
       const aiSettingsChanged =
+        options?.pinsOnly !== true &&
         aiSettings != null &&
         (prev?.model !== aiSettings.model ||
           prev?.thinkingLevel !== aiSettings.thinkingLevel ||
@@ -10816,8 +10849,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // so only an explicit different value counts as a change.
           (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
       const selectedAgentChanged =
-        options?.persistSelectedAgentId === true && snapshotEntry.agentId !== normalizedAgentId;
-      if (!aiSettingsChanged && !selectedAgentChanged) {
+        options?.pinsOnly !== true &&
+        options?.persistSelectedAgentId === true &&
+        snapshotEntry.agentId !== normalizedAgentId;
+      const pinsChanged = computeNextPins(snapshotEntry) !== snapshotEntry.taskAiPins;
+      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
         return Ok(false);
       }
     }
@@ -10839,18 +10875,27 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       const prev = workspaceEntry.aiSettingsByAgent?.[normalizedAgentId];
       const aiSettingsChanged =
+        options?.pinsOnly !== true &&
         aiSettings != null &&
         (prev?.model !== aiSettings.model ||
           prev?.thinkingLevel !== aiSettings.thinkingLevel ||
           (aiSettings.reasoningMode != null && prev?.reasoningMode !== aiSettings.reasoningMode));
       const selectedAgentChanged =
-        options?.persistSelectedAgentId === true && workspaceEntry.agentId !== normalizedAgentId;
-      if (!aiSettingsChanged && !selectedAgentChanged) {
+        options?.pinsOnly !== true &&
+        options?.persistSelectedAgentId === true &&
+        workspaceEntry.agentId !== normalizedAgentId;
+      const nextPins = computeNextPins(workspaceEntry);
+      const pinsChanged = nextPins !== workspaceEntry.taskAiPins;
+      if (!aiSettingsChanged && !selectedAgentChanged && !pinsChanged) {
         writeResult = Ok(false);
         return freshConfig;
       }
 
-      if (aiSettings != null) {
+      if (pinsChanged) {
+        workspaceEntry.taskAiPins = nextPins;
+      }
+
+      if (aiSettings != null && options?.pinsOnly !== true) {
         // Callers that omit reasoningMode (older clients, thinking-only updates)
         // must not wipe a previously persisted value — self-healing merge.
         const mergedReasoningMode = aiSettings.reasoningMode ?? prev?.reasoningMode;
@@ -10863,7 +10908,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         };
       }
 
-      if (options?.persistSelectedAgentId === true) {
+      if (options?.persistSelectedAgentId === true && options?.pinsOnly !== true) {
         workspaceEntry.agentId = normalizedAgentId;
       }
 
@@ -11975,6 +12020,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // the user authored before a goal became visible as an intervention
     // against it, pausing the fresh goal.
     const authoredAtMs = Date.now();
+    // Deliberate picker intent pins agent-task AI fields; only a person's own send may carry
+    // it. Strip it here so it never reaches the queue, AgentSession, or persisted options.
+    const { aiSelectionIntent, ...optionsWithoutAiSelectionIntent } = options;
+    options = optionsWithoutAiSelectionIntent;
+    const pinIntent =
+      (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.agentInitiated !== true
+        ? aiSelectionIntent
+        : undefined;
 
     let resumedInterruptedTask = false;
     // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
@@ -12212,6 +12265,44 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const normalizedOptions = this.normalizeSendMessageAgentId(options);
+      // Pins commit when the workspace takes this send: at session acceptance for a direct
+      // send (a later admission refusal — stale epoch, a Stop winning — must not pin), and
+      // at enqueue for a queued one, because the renderer consumes the pick on IPC success
+      // and a queued entry that is later cleared would otherwise lose the pick entirely.
+      // A failed pin write is logged and never fails the send.
+      // Eligibility is decided NOW, before preflight persistence records this send's agent as
+      // the selected one: only a send for the task's own agent may pin (legacy tasks never).
+      const pinTaskEntry =
+        pinIntent != null
+          ? findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          : undefined;
+      const pinEligible =
+        pinTaskEntry?.taskAiPins != null &&
+        internal?.synthetic !== true &&
+        normalizeAgentId(normalizedOptions.agentId, WORKSPACE_DEFAULTS.agentId) ===
+          resolveTaskAgentIdForResume(pinTaskEntry);
+      const commitAiSelectionPins = async (): Promise<void> => {
+        if (!pinEligible) return;
+        try {
+          await this.maybePersistAISettingsFromOptions(
+            workspaceId,
+            normalizedOptions,
+            pinIntent,
+            true
+          );
+        } catch (error) {
+          log.warn("sendMessage: failed to persist AI selection pins", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      };
+      const onAccepted = pinEligible
+        ? async () => {
+            await commitAiSelectionPins();
+            await internal?.onAccepted?.();
+          }
+        : internal?.onAccepted;
       const normalizedMuxMetadata = normalizedOptions.muxMetadata as MuxMessageMetadata | undefined;
       const workspaceTurnContinuationMetadata =
         normalizedMuxMetadata?.type === "workspace-turn-task" ? normalizedMuxMetadata : undefined;
@@ -12293,7 +12384,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             cancelSignal: internal?.cancelSignal,
             withdrawAcceptedOnCancel: internal?.withdrawAcceptedOnCancel,
             onCanceled: internal?.onCanceled,
-            onAccepted: internal?.onAccepted,
+            onAccepted,
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
@@ -12510,6 +12601,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         if (effectiveQueueDispatchMode != null) taskTurnHandedToQueue = true;
         else taskTurnAdmission?.onDisposed("no-work");
+        if (effectiveQueueDispatchMode != null) await commitAiSelectionPins();
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
@@ -12643,7 +12735,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // goal visible after the user hit enter but before this dispatch.
         enqueuedAtMs: authoredAtMs,
         onCanceled: continuationSendState.onCanceled,
-        onAccepted: internal?.onAccepted,
+        onAccepted,
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,

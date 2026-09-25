@@ -223,7 +223,13 @@ Each agent has one defaults entry (`agentAiDefaults`), configured in **Settings 
 
 Delegated overrides inherit per field from the base fields; base fields inherit per field from the agent's frontmatter `ai` block. You can override one field (e.g. only `thinkingLevel`) and leave the others inherited.
 
-Subagent settings are resolved at task creation and frozen on the child workspace. Changing defaults later only affects future spawns.
+Subagents resolve their settings when spawned and again whenever an agent reawakens them (for example with `task_send_message` after the subagent reported), so a Settings change applies from the next reawakened turn. A subagent keeps its model until its current work ends.
+
+- **Pins:** values passed to `task` (`model`, `thinking`), and choices you pick in the subagent's chat and then send, stay pinned until a plan subagent hands off to Exec.
+- **Precedence for unpinned fields:** **Delegated** overrides outrank both the parent chat's Exec selection and the base defaults; an Exec subagent prefers the parent chat's Exec selection over the base Exec default. A field that no setting configures keeps its current value.
+- **Definition defaults are best effort at reawakening:** if the agent definition can't be read, the other settings still apply.
+
+**Subagents created before this behavior shipped keep their creation-time settings.** Recreate them to get the new behavior.
 
 ## Examples
 

@@ -45,3 +45,28 @@ export const TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS = 1024 * 1024;
  * complete rendered payload length, so accounting stays exact regardless.
  */
 export const TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS = 256;
+
+/**
+ * Upper bound for reading a sub-agent's definition chain before an ancestor
+ * reawakens it. The read runs outside the task locks; on timeout the read is
+ * aborted (cancelling runtime work where supported) and the reawakening
+ * resolves AI settings without definition layers (best effort).
+ */
+export const REAWAKEN_DEFINITION_READ_TIMEOUT_MS = 5_000;
+
+/**
+ * Retryable refusal when a reawakening's inputs changed BEFORE the child accepted the
+ * turn: nothing was written, so resending the same message is safe.
+ */
+export function formatReawakenChangedMessage(taskId: string): string {
+  return `Sub-agent ${taskId} changed while it was being reawakened; send the message again.`;
+}
+
+/**
+ * Retryable refusal at the commit point (turn acceptance): the child already made the
+ * prompt row durable, so resending the same message would duplicate it. Ask for a short
+ * follow-up that resumes the child instead.
+ */
+export function formatReawakenCommitRefusedMessage(taskId: string): string {
+  return `Sub-agent ${taskId}'s settings changed while it was starting. Your message may already be in its history; send a short follow-up to resume it instead of repeating the message.`;
+}

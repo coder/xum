@@ -27,6 +27,7 @@ import {
 } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import {
+  buildWorkspaceAgentContext,
   workspaceTurnTerminalAttentionSuppressed,
   type WorkspaceTurnManager,
 } from "@/node/services/workspaceTurnManager";
@@ -85,7 +86,11 @@ import {
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   retiredAttemptMessage,
 } from "@/constants/agentMessaging";
-import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
+import {
+  formatReawakenChangedMessage,
+  REAWAKEN_DEFINITION_READ_TIMEOUT_MS,
+  TASK_FAMILY_MESSAGE_MAX_CHARS,
+} from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -165,7 +170,6 @@ import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "@/node/services/t
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
 import {
   coerceOpenAIReasoningMode,
-  coerceThinkingLevel,
   type OpenAIReasoningMode,
   type ParsedThinkingInput,
   type ThinkingLevel,
@@ -173,9 +177,19 @@ import {
 import {
   targetWorkspaceBucketToLayer,
   type AgentAiSettingsLayerValues,
+  type TaskAiPins,
 } from "@/common/types/agentAiSettings";
+import {
+  buildParentAiSettingsFallbacks,
+  buildReawakenContextKey,
+  planReawakenAi,
+  resolveParentWorkspaceExecSettings,
+  type AgentTaskTurnAi,
+  type PreparedReawakenAi,
+} from "@/node/services/agentTaskReawakenAi";
 import { InvalidExplicitAiSettingError } from "@/common/utils/ai/resolveAgentAiSettings";
 import {
+  loadAgentDefinitionAiLayers,
   resolveNodeAgentAiSettings,
   type NodeAgentDefinitionContext,
 } from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
@@ -586,6 +600,8 @@ interface TaskLaunchPlan {
   canonicalModel: string;
   effectiveThinkingLevel?: ThinkingLevel;
   effectiveReasoningMode?: OpenAIReasoningMode;
+  /** New reservations only (always an object); relaunches of existing entries keep theirs. */
+  taskAiPins?: TaskAiPins;
   skipInitHook: boolean;
   preferredTrunkBranch?: string;
   workflowTask?: TaskCreateArgs["workflowTask"];
@@ -710,6 +726,7 @@ interface PreparedTaskReservation {
   canonicalModel: string;
   effectiveThinkingLevel: ThinkingLevel;
   effectiveReasoningMode: OpenAIReasoningMode | undefined;
+  taskAiPins: TaskAiPins;
   inputs: string;
   /** pinParentMetaForReservation(parentMeta) at preparation time. */
   parentMetaJson: string;
@@ -3837,20 +3854,7 @@ export class TaskService implements AgentTaskIntegration {
     parentMeta: TaskParentAiMeta,
     targetAgentId: string
   ): AgentAiSettingsLayerValues[] {
-    const layers: AgentAiSettingsLayerValues[] = [];
-    const push = (settings: ResolvedWorkspaceAiSettings | undefined) => {
-      if (!settings) return;
-      layers.push({
-        model: settings.model,
-        thinkingLevel: coerceThinkingLevel(settings.thinkingLevel),
-        reasoningMode: coerceOpenAIReasoningMode(settings.reasoningMode),
-      });
-    };
-    const normalizedTarget = normalizeAgentId(targetAgentId, "");
-    push(normalizedTarget ? parentMeta.aiSettingsByAgent?.[normalizedTarget] : undefined);
-    push(parentMeta.aiSettingsByAgent?.[normalizeAgentId(parentMeta.agentId)]);
-    push(parentMeta.aiSettings);
-    return layers;
+    return buildParentAiSettingsFallbacks(parentMeta, targetAgentId);
   }
 
   /**
@@ -3881,15 +3885,10 @@ export class TaskService implements AgentTaskIntegration {
     canonicalModel: string;
     effectiveThinkingLevel: ThinkingLevel;
     effectiveReasoningMode?: OpenAIReasoningMode;
+    /** Fields set by explicit arguments; persisted as taskAiPins (always an object). */
+    pins: TaskAiPins;
   }> {
-    // Display metadata synthesizes Exec/Plan buckets from legacy aiSettings.
-    // Only raw persisted Exec choices may outrank global Exec defaults.
     const parent = findWorkspaceEntry(params.cfg, params.parentWorkspaceId)?.workspace;
-    const parentWorkspaceExecSettings =
-      parent?.aiSettingsByAgent?.exec ??
-      (normalizeAgentId(parent?.agentId ?? parent?.agentType, "") === "exec"
-        ? parent?.aiSettings
-        : undefined);
     const resolved = await resolveNodeAgentAiSettings({
       agentId: params.agentId,
       profile: "subagent",
@@ -3899,10 +3898,7 @@ export class TaskService implements AgentTaskIntegration {
         model: coerceNonEmptyString(params.modelString) ?? undefined,
         thinkingLevel: params.thinkingLevel ?? undefined,
       },
-      // A saved workspace's omitted reasoning mode means Standard, not inheritance.
-      parentWorkspaceExecSettings: parentWorkspaceExecSettings
-        ? targetWorkspaceBucketToLayer(parentWorkspaceExecSettings)
-        : undefined,
+      parentWorkspaceExecSettings: resolveParentWorkspaceExecSettings(parent),
       parentRuntime: params.parentRuntimeAiSettings
         ? {
             model: coerceNonEmptyString(params.parentRuntimeAiSettings.modelString) ?? undefined,
@@ -3913,6 +3909,18 @@ export class TaskService implements AgentTaskIntegration {
       definitionContext: params.definitionContext,
     });
 
+    // Explicit task arguments stay pinned when an ancestor later reawakens the task.
+    const pins: TaskAiPins = {
+      ...(resolved.sources.model.tier === "explicit" ? { model: resolved.selected.model } : {}),
+      ...(resolved.sources.thinkingLevel.tier === "explicit"
+        ? { thinkingLevel: resolved.selected.thinkingLevel }
+        : {}),
+      ...(resolved.sources.reasoningMode?.tier === "explicit" &&
+      resolved.selected.reasoningMode != null
+        ? { reasoningMode: resolved.selected.reasoningMode }
+        : {}),
+    };
+
     return {
       taskModelString: resolved.selected.model,
       canonicalModel: resolved.effective.model,
@@ -3920,6 +3928,7 @@ export class TaskService implements AgentTaskIntegration {
       ...(resolved.selected.reasoningMode != null
         ? { effectiveReasoningMode: resolved.selected.reasoningMode }
         : {}),
+      pins,
     };
   }
 
@@ -5199,6 +5208,7 @@ export class TaskService implements AgentTaskIntegration {
     let canonicalModel: string;
     let effectiveThinkingLevel: ThinkingLevel;
     let effectiveReasoningMode: OpenAIReasoningMode | undefined;
+    let taskAiPins: TaskAiPins;
     try {
       const aiSettingsRead = await this.readCancellable(
         this.resolveTaskAISettings({
@@ -5218,8 +5228,13 @@ export class TaskService implements AgentTaskIntegration {
         signal
       );
       if (aiSettingsRead.kind !== "ok") return Err(progress.interruptedError());
-      ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
-        aiSettingsRead.value);
+      ({
+        taskModelString,
+        canonicalModel,
+        effectiveThinkingLevel,
+        effectiveReasoningMode,
+        pins: taskAiPins,
+      } = aiSettingsRead.value);
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.createMany: ${error.message}`);
@@ -5251,6 +5266,7 @@ export class TaskService implements AgentTaskIntegration {
       canonicalModel,
       effectiveThinkingLevel,
       effectiveReasoningMode,
+      taskAiPins,
       inputs: this.snapshotReservationInputs(
         cfg,
         args,
@@ -5399,6 +5415,7 @@ export class TaskService implements AgentTaskIntegration {
         canonicalModel: plan.canonicalModel,
         effectiveThinkingLevel: plan.effectiveThinkingLevel,
         effectiveReasoningMode: plan.effectiveReasoningMode,
+        taskAiPins: plan.taskAiPins,
         skipInitHook: plan.skipInitHook,
         workflowTask: plan.args.workflowTask,
         bestOf: plan.normalizedBestOf,
@@ -5617,6 +5634,7 @@ export class TaskService implements AgentTaskIntegration {
           taskTrunkBranch: trunkBranch,
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
+          taskAiPins: plan.taskAiPins ?? {},
           taskOnRefusal: plan.onRefusal,
           taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
@@ -6726,25 +6744,31 @@ export class TaskService implements AgentTaskIntegration {
     let canonicalModel: string;
     let effectiveThinkingLevel: ThinkingLevel;
     let effectiveReasoningMode: OpenAIReasoningMode | undefined;
+    let taskAiPins: TaskAiPins;
     try {
-      ({ taskModelString, canonicalModel, effectiveThinkingLevel, effectiveReasoningMode } =
-        await this.resolveTaskAISettings({
-          cfg,
-          parentWorkspaceId,
-          parentMeta,
-          agentId,
-          modelString: args.modelString,
-          thinkingLevel: args.thinkingLevel,
-          parentRuntimeAiSettings: args.parentRuntimeAiSettings,
-          definitionContext: {
-            runtime,
-            workspacePath: parentWorkspacePath,
-            workspaceId: parentWorkspaceId,
-            includeAgentPlugins: this.workspaceService.isExperimentEnabled(
-              EXPERIMENT_IDS.AGENT_PLUGINS
-            ),
-          },
-        }));
+      ({
+        taskModelString,
+        canonicalModel,
+        effectiveThinkingLevel,
+        effectiveReasoningMode,
+        pins: taskAiPins,
+      } = await this.resolveTaskAISettings({
+        cfg,
+        parentWorkspaceId,
+        parentMeta,
+        agentId,
+        modelString: args.modelString,
+        thinkingLevel: args.thinkingLevel,
+        parentRuntimeAiSettings: args.parentRuntimeAiSettings,
+        definitionContext: {
+          runtime,
+          workspacePath: parentWorkspacePath,
+          workspaceId: parentWorkspaceId,
+          includeAgentPlugins: this.workspaceService.isExperimentEnabled(
+            EXPERIMENT_IDS.AGENT_PLUGINS
+          ),
+        },
+      }));
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.create: ${error.message}`);
@@ -6830,6 +6854,7 @@ export class TaskService implements AgentTaskIntegration {
               taskTrunkBranch: trunkBranch,
               taskModelString,
               taskThinkingLevel: effectiveThinkingLevel,
+              taskAiPins,
               taskOnRefusal: args.onRefusal,
               taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
               taskIsolation: useSharedWorkspace ? "none" : undefined,
@@ -7158,6 +7183,7 @@ export class TaskService implements AgentTaskIntegration {
           taskBaseCommitShaByProjectPath,
           taskModelString,
           taskThinkingLevel: effectiveThinkingLevel,
+          taskAiPins,
           taskOnRefusal: args.onRefusal,
           taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
           taskIsolation: useSharedWorkspace ? "none" : undefined,
@@ -7396,6 +7422,11 @@ export class TaskService implements AgentTaskIntegration {
     preTurnMessages?: MuxMessage[];
     onPreTurnPersisted?: () => void;
     sendMessage?: WorkspaceTurnHost["sendMessage"];
+    /**
+     * Ancestor-triggered reawakening only: re-resolve AI settings from current defaults
+     * and pins (new-style children). Absent (bash-monitor wakes) keeps the frozen path.
+     */
+    aiRefresh?: { prepared: PreparedReawakenAi | undefined };
   }): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { ancestorWorkspaceId, taskId } = params;
     const unarchiveResult = await this.unarchiveAgentTaskAncestry(ancestorWorkspaceId, taskId);
@@ -7413,6 +7444,33 @@ export class TaskService implements AgentTaskIntegration {
         code: "send_failed" as const,
         message: `Cannot reawaken sub-agent ${taskId}: its checkout is unavailable (${checkoutError}). Spawn a fresh sub-agent instead.`,
       });
+    }
+    // Plan (no awaits, no writes) before any family rows or attempt ownership change, so a
+    // refusal here leaves the task untouched. The settings commit later, with the claim.
+    let agentTaskAi: AgentTaskTurnAi | undefined;
+    if (params.aiRefresh != null) {
+      const planConfig = this.config.loadConfigOrDefault();
+      const planEntry = findWorkspaceEntry(planConfig, taskId);
+      if (planEntry == null) {
+        return Err({ code: "not_found" as const });
+      }
+      const contextKey = buildReawakenContextKey(
+        planEntry,
+        this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)
+      );
+      const plan = planReawakenAi({
+        config: planConfig,
+        taskId,
+        prepared: params.aiRefresh.prepared,
+        freshContextKey: contextKey,
+        providersConfig: this.aiService.getProvidersConfig(),
+      });
+      if (plan.kind === "stale") {
+        return Err({ code: "send_failed" as const, message: formatReawakenChangedMessage(taskId) });
+      }
+      if (plan.kind === "resolved") {
+        agentTaskAi = { snapshot: plan.snapshot, inputsKey: plan.inputsKey, contextKey };
+      }
     }
     // Verified by the caller: not streaming and no active continuation, and
     // concurrent task-machinery sends serialize on the lifecycle + event
@@ -7523,6 +7581,7 @@ export class TaskService implements AgentTaskIntegration {
       allowAgentWorkspace: true,
       attentionPolicy: "notify_on_terminal",
       ...(params.sendMessage != null ? { sendMessage: params.sendMessage } : {}),
+      ...(agentTaskAi != null ? { agentTaskAi } : {}),
     });
     if (!execution.success) {
       // The fresh attempt is already published (config and memory) and stays: it reads as an
@@ -7539,6 +7598,65 @@ export class TaskService implements AgentTaskIntegration {
       delivery: "reactivated" as const,
       executionTaskId: execution.data.taskId,
     });
+  }
+
+  /**
+   * Reads a reawakening candidate's definition layers before the task locks are taken.
+   * The config snapshot is only a hint: planReawakenAi re-checks agent and checkout
+   * context under the locks. Live, legacy and non-inactive children return undefined, so
+   * guidance to a running child does no definition reads. Archived children are read too:
+   * reawakening restores them, and a missing checkout just fails the (bounded) read, which
+   * falls back to resolving without layers. Never mutates.
+   */
+  private async prepareReawakenAi(taskId: string): Promise<PreparedReawakenAi | undefined> {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    if (entry == null) return undefined;
+    const workspace = entry.workspace;
+    if (
+      workspace.taskAiPins == null ||
+      (workspace.taskStatus !== "reported" && workspace.taskStatus !== "interrupted") ||
+      isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus) ||
+      this.aiService.isStreaming(taskId)
+    ) {
+      return undefined;
+    }
+    const workspaceName = coerceNonEmptyString(workspace.name);
+    if (workspace.runtimeConfig == null || workspaceName == null) {
+      return undefined;
+    }
+    const includeAgentPlugins = this.workspaceService.isExperimentEnabled(
+      EXPERIMENT_IDS.AGENT_PLUGINS
+    );
+    const agentId = resolveTaskAgentIdForResume(workspace);
+    const contextKey = buildReawakenContextKey(entry, includeAgentPlugins);
+    let context: ReturnType<typeof buildWorkspaceAgentContext>;
+    try {
+      context = buildWorkspaceAgentContext({
+        runtimeConfig: workspace.runtimeConfig,
+        projectPath: entry.projectPath,
+        workspaceName,
+        persistedWorkspacePath: workspace.path,
+        subProjectPath: workspace.subProjectPath,
+        includeAgentPlugins,
+      });
+    } catch (error) {
+      log.debug("prepareReawakenAi: definition context unavailable", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return { taskId, agentId, contextKey, layers: null };
+    }
+    const layers = await loadAgentDefinitionAiLayers(
+      agentId,
+      {
+        runtime: context.runtime,
+        workspacePath: context.workspacePath,
+        workspaceId: taskId,
+        includeAgentPlugins,
+      },
+      { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
+    );
+    return { taskId, agentId, contextKey, layers };
   }
 
   async reactivateInactiveAgentTaskFromBashMonitorWake(
@@ -7607,6 +7725,12 @@ export class TaskService implements AgentTaskIntegration {
     taskId: string,
     trimmedMessage: string,
     queueDispatchMode: TaskMessageQueueDispatchMode,
+    /**
+     * Who reawakens an inactive child: only an ancestor re-resolves its AI settings.
+     * Sibling-family messages ride this trusted path too but keep the frozen settings
+     * (plan D1), so they skip definition reads and the refresh policy entirely.
+     */
+    sender: "ancestor" | "sibling",
     options?: TrustedDescendantMessageOptions
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
@@ -7679,6 +7803,11 @@ export class TaskService implements AgentTaskIntegration {
       return Ok(queuedUpdateResult.data);
     }
 
+    // Definition I/O never runs under the event or tree lifecycle lock: read the child's
+    // definition layers first (inactive candidates only), then plan under the locks.
+    const preparedReawakenAi =
+      sender === "ancestor" ? await this.prepareReawakenAi(taskId) : undefined;
+
     // Event lock first, then the task-tree lock: the order every path holding both follows (see
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.
     return this.workspaceEventLocks.withLock(taskId, async () =>
@@ -7730,6 +7859,7 @@ export class TaskService implements AgentTaskIntegration {
             queueDispatchMode,
             preTurnMessages: options?.preTurnMessages,
             onPreTurnPersisted: options?.onPreTurnPersisted,
+            ...(sender === "ancestor" ? { aiRefresh: { prepared: preparedReawakenAi } } : {}),
           });
         }
 
@@ -8096,6 +8226,7 @@ export class TaskService implements AgentTaskIntegration {
         spec.targetId,
         prepared.triggerContent,
         spec.queueDispatchMode,
+        "sibling",
         {
           messageLabel: triggerLabel,
           preTurnMessages: [payloadRow],
@@ -8168,6 +8299,7 @@ export class TaskService implements AgentTaskIntegration {
         spec.targetId,
         message,
         spec.queueDispatchMode,
+        "ancestor",
         spec.options
       );
     }
@@ -16205,6 +16337,9 @@ export class TaskService implements AgentTaskIntegration {
         };
         workspace.taskModelString = taskModelString;
         workspace.taskThinkingLevel = effectiveThinkingLevel;
+        // The handoff starts a fresh Exec phase and ignores explicit spawn arguments, so
+        // plan-phase pins end here. Keep the marker: the task stays new-style (refreshable).
+        if (workspace.taskAiPins != null) workspace.taskAiPins = {};
         // A successful propose_plan is a successful completion-tool outcome: the
         // exec phase starts with a fresh recovery budget rather than inheriting
         // whatever the plan phase consumed.
