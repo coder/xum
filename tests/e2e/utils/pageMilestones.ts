@@ -124,3 +124,137 @@ export async function readPageMilestones(page: Page): Promise<PageMilestones> {
   }
   return milestones;
 }
+
+/**
+ * In-page DOM timing for a chat switch, measured from the sidebar row's click event.
+ *
+ * startPageMilestones cannot time a switch: the message window of the chat being left is
+ * already loaded. This recorder instead starts at the click event's own timestamp and treats
+ * a row as "first row" only when its message id was not on screen before the click.
+ */
+export interface SwitchMilestones {
+  /** Click event timestamp on the page's performance timeline (ms since timeOrigin). */
+  clickAt: number | null;
+  /** ms from the click until the transcript hydration skeleton appeared; null if it never did. */
+  skeletonShownMs: number | null;
+  /** ms from the click until the skeleton was removed again; null if it was never shown. */
+  skeletonHiddenMs: number | null;
+  /** ms from the click until a transcript row of the target chat exists. */
+  firstRowMs: number | null;
+  /** Longest main-thread task after the click, in ms (0 when none exceeded 50 ms). */
+  longestTaskMs: number;
+}
+
+const SWITCH_STATE_KEY = "__xumPerfSwitchMilestones";
+const SKELETON_SELECTOR = '[data-testid="transcript-hydration-placeholder"]';
+
+interface SwitchMilestoneState extends SwitchMilestones {
+  stop: () => void;
+}
+
+/** Arm the recorder; the next click inside `rowSelector` is time zero. */
+export async function startSwitchMilestones(page: Page, rowSelector: string): Promise<void> {
+  await page.evaluate(
+    ({ stateKey, rowSelector, rowsSelector, skeletonSelector }) => {
+      const host = window as unknown as Record<string, SwitchMilestoneState | undefined>;
+      if (host[stateKey]) {
+        throw new Error("Switch milestones already started; call readSwitchMilestones first");
+      }
+      const previousRowIds = new Set(
+        Array.from(document.querySelectorAll(rowsSelector), (row) =>
+          row.getAttribute("data-message-id")
+        )
+      );
+      const state: SwitchMilestoneState = {
+        clickAt: null,
+        skeletonShownMs: null,
+        skeletonHiddenMs: null,
+        firstRowMs: null,
+        longestTaskMs: 0,
+        stop: () => undefined,
+      };
+
+      const sample = () => {
+        if (state.clickAt === null) return;
+        const elapsed = performance.now() - state.clickAt;
+        const skeletonVisible = document.querySelector(skeletonSelector) !== null;
+        if (state.skeletonShownMs === null && skeletonVisible) {
+          state.skeletonShownMs = elapsed;
+        }
+        if (state.skeletonShownMs !== null && state.skeletonHiddenMs === null && !skeletonVisible) {
+          state.skeletonHiddenMs = elapsed;
+        }
+        if (state.firstRowMs === null) {
+          for (const row of document.querySelectorAll(rowsSelector)) {
+            const id = row.getAttribute("data-message-id");
+            if (id !== null && !previousRowIds.has(id)) {
+              state.firstRowMs = elapsed;
+              break;
+            }
+          }
+        }
+      };
+      // Capture phase: runs before React's handler starts the switch.
+      const onClick = (event: MouseEvent) => {
+        if (state.clickAt !== null) return;
+        if (event.target instanceof Element && event.target.closest(rowSelector)) {
+          state.clickAt = event.timeStamp;
+        }
+      };
+      document.addEventListener("click", onClick, true);
+      const mutationObserver = new MutationObserver(sample);
+      mutationObserver.observe(document.body, { subtree: true, childList: true });
+
+      const recordLongTasks = (entries: PerformanceEntryList) => {
+        for (const entry of entries) {
+          if (state.clickAt !== null && entry.startTime >= state.clickAt) {
+            state.longestTaskMs = Math.max(state.longestTaskMs, entry.duration);
+          }
+        }
+      };
+      const longTaskObserver = new PerformanceObserver((list) =>
+        recordLongTasks(list.getEntries())
+      );
+      longTaskObserver.observe({ type: "longtask" });
+
+      state.stop = () => {
+        document.removeEventListener("click", onClick, true);
+        mutationObserver.disconnect();
+        recordLongTasks(longTaskObserver.takeRecords());
+        longTaskObserver.disconnect();
+      };
+      host[stateKey] = state;
+    },
+    {
+      stateKey: SWITCH_STATE_KEY,
+      rowSelector,
+      rowsSelector: `${FIRST_MESSAGE_SELECTOR}[data-message-id]`,
+      skeletonSelector: SKELETON_SELECTOR,
+    }
+  );
+}
+
+/** Stop recording and return the switch milestones. */
+export async function readSwitchMilestones(page: Page): Promise<SwitchMilestones> {
+  const milestones = await page.evaluate((stateKey) => {
+    const host = window as unknown as Record<string, SwitchMilestoneState | undefined>;
+    const state = host[stateKey];
+    if (!state) {
+      throw new Error("Switch milestones were not started");
+    }
+    state.stop();
+    delete host[stateKey];
+    return {
+      clickAt: state.clickAt,
+      skeletonShownMs: state.skeletonShownMs,
+      skeletonHiddenMs: state.skeletonHiddenMs,
+      firstRowMs: state.firstRowMs,
+      longestTaskMs: state.longestTaskMs,
+    };
+  }, SWITCH_STATE_KEY);
+
+  if (milestones.clickAt === null) {
+    throw new Error("Switch milestones never saw the row click");
+  }
+  return milestones;
+}

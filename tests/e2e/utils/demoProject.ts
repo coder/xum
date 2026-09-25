@@ -30,6 +30,18 @@ function assertHistoryLines(lines: unknown): asserts lines is string[] | undefin
   }
 }
 
+// Initialize git repos with an initial commit so git commands work properly.
+// Empty repos cause errors like "fatal: ref HEAD is not a symbolic ref" when
+// detecting the default branch.
+function initGitRepo(repoPath: string): void {
+  spawnSync("git", ["init", "-q"], { cwd: repoPath });
+  // Avoid hanging when developers have global commit signing enabled.
+  spawnSync("git", ["config", "commit.gpgsign", "false"], { cwd: repoPath });
+  spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repoPath });
+  spawnSync("git", ["config", "user.name", "Test"], { cwd: repoPath });
+  spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: repoPath });
+}
+
 export function prepareDemoProject(
   rootDir: string,
   options: DemoProjectOptions = {}
@@ -50,16 +62,8 @@ export function prepareDemoProject(
   fs.mkdirSync(workspacePath, { recursive: true });
   fs.mkdirSync(sessionsDir, { recursive: true });
 
-  // Initialize git repos with an initial commit so git commands work properly.
-  // Empty repos cause errors like "fatal: ref HEAD is not a symbolic ref" when
-  // detecting the default branch.
   for (const repoPath of [projectPath, workspacePath]) {
-    spawnSync("git", ["init", "-q"], { cwd: repoPath });
-    // Avoid hanging when developers have global commit signing enabled.
-    spawnSync("git", ["config", "commit.gpgsign", "false"], { cwd: repoPath });
-    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repoPath });
-    spawnSync("git", ["config", "user.name", "Test"], { cwd: repoPath });
-    spawnSync("git", ["commit", "--allow-empty", "-q", "-m", "init"], { cwd: repoPath });
+    initGitRepo(repoPath);
   }
 
   // E2E tests use legacy workspace ID format to test backward compatibility.
@@ -101,4 +105,55 @@ export function prepareDemoProject(
     historyPath,
     sessionsDir,
   };
+}
+
+/**
+ * Register one more workspace in the demo project. Call before the app launches: the backend
+ * reads config.json and the session metadata at startup. Returns a config shaped like the demo
+ * workspace's so history helpers (seedWorkspaceHistoryProfile) work on it unchanged.
+ */
+export function addDemoWorkspace(
+  rootDir: string,
+  demoProject: DemoProjectConfig,
+  workspaceBranch: string
+): DemoProjectConfig {
+  const branch = workspaceBranch.trim();
+  if (!branch) {
+    throw new Error("workspaceBranch must be non-empty");
+  }
+  const projectName = path.basename(demoProject.projectPath);
+  const workspacePath = path.join(path.dirname(demoProject.workspacePath), branch);
+  if (fs.existsSync(workspacePath)) {
+    throw new Error(`Workspace path already exists: ${workspacePath}`);
+  }
+  fs.mkdirSync(workspacePath, { recursive: true });
+  initGitRepo(workspacePath);
+
+  const workspaceId = new Config(rootDir).generateLegacyId(demoProject.projectPath, workspacePath);
+  const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
+    projects: Array<[string, { workspaces: Array<{ path: string }> }]>;
+  };
+  const projectEntry = configPayload.projects.find(
+    ([projectPath]) => projectPath === demoProject.projectPath
+  );
+  if (!projectEntry) {
+    throw new Error(`Demo project ${demoProject.projectPath} is missing from config.json`);
+  }
+  projectEntry[1].workspaces.push({ path: workspacePath });
+  fs.writeFileSync(demoProject.configPath, JSON.stringify(configPayload, null, 2));
+
+  const workspaceSessionDir = path.join(demoProject.sessionsDir, workspaceId);
+  fs.mkdirSync(workspaceSessionDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(workspaceSessionDir, "metadata.json"),
+    JSON.stringify(
+      { id: workspaceId, name: branch, projectName, projectPath: demoProject.projectPath },
+      null,
+      2
+    )
+  );
+  const historyPath = path.join(workspaceSessionDir, "chat.jsonl");
+  fs.writeFileSync(historyPath, "");
+
+  return { ...demoProject, workspacePath, workspaceId, historyPath };
 }
