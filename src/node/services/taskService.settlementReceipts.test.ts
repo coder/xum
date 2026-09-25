@@ -632,6 +632,94 @@ describe("TaskService settlement receipt producers (G2)", () => {
     }
   );
 
+  test("idle Stop rejects its own waiters, never a successor's registered during the receipt write", async () => {
+    const taskId = "waiterrace";
+    const successor = "att_00000000000000b3";
+    const { config } = await setupTree([
+      {
+        id: taskId,
+        overrides: {
+          taskStatus: "interrupted",
+          taskAttemptId: PREDECESSOR,
+          taskDesktopOwnerWorkspaceId: rootId,
+        },
+      },
+    ]);
+    const { taskService, svc } = createHarness(config);
+    await ownEligibleAttempt(config, taskService, taskId);
+    const pendingWaiters = () =>
+      (
+        svc as unknown as { pendingWaitersByTaskId: Map<string, unknown[]> }
+      ).pendingWaitersByTaskId.get(taskId)?.length ?? 0;
+    const settledOf = (promise: Promise<unknown>) => {
+      const state: { settled?: "resolved" | "rejected"; error?: unknown } = {};
+      promise.then(
+        () => (state.settled = "resolved"),
+        (error: unknown) => {
+          state.settled = "rejected";
+          state.error = error;
+        }
+      );
+      return state;
+    };
+    // A waiter of the attempt being stopped.
+    const stoppedAttemptWaiter = settledOf(
+      taskService.waitForAgentReport(taskId, { timeoutMs: 10_000 })
+    );
+    await waitForCondition(() => pendingWaiters() === 1);
+
+    // Hold the idle Stop's receipt write.
+    const gate = Promise.withResolvers<void>();
+    let writing = false;
+    const write = svc.writeSettlementReceipt.bind(taskService);
+    spyOn(svc, "writeSettlementReceipt").mockImplementation(async (...args: unknown[]) => {
+      writing = true;
+      await gate.promise;
+      return write(...args);
+    });
+    const stop = svc.releaseSharedDesktopTaskOnUserStop(
+      taskId,
+      svc.resolveStreamAttemptAtEvent(taskId)
+    );
+    await waitForCondition(() => writing);
+
+    // Meanwhile another backend re-admits the interrupted row as a successor, and a new
+    // task_await registers for it.
+    await (
+      await createTestConfig(rootDir)
+    ).editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const ws = project.workspaces.find((w) => w.id === taskId);
+        if (ws) {
+          ws.taskStatus = "running";
+          ws.taskAttemptId = successor;
+          ws.taskAttemptUnproven = true;
+        }
+      }
+      return cfg;
+    });
+    const waitersBefore = pendingWaiters();
+    const abortSuccessorWait = new AbortController();
+    const successorWaiter = settledOf(
+      taskService.waitForAgentReport(taskId, {
+        timeoutMs: 10_000,
+        abortSignal: abortSuccessorWait.signal,
+      })
+    );
+    await waitForCondition(() => pendingWaiters() === waitersBefore + 1);
+
+    gate.resolve();
+    await stop;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(stoppedAttemptWaiter.settled).toBe("rejected");
+    expect(String(stoppedAttemptWaiter.error)).toContain("Task interrupted");
+    // The successor's waiter is untouched by the stopped attempt's settlement.
+    expect(successorWaiter.settled).toBeUndefined();
+    expect(pendingWaiters()).toBe(1);
+    abortSuccessorWait.abort();
+    await waitForCondition(() => successorWaiter.settled != null);
+  });
+
   test("a successor another backend admitted never receives the predecessor's receipt", async () => {
     const taskId = "rotated";
     const successor = "att_00000000000000b2";
