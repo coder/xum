@@ -34,6 +34,7 @@ const RUN = { runId: "wfr_retire", stepId: "summarize", inputHash: "hash-1" };
 
 interface Internals {
   startReservedAgentTask: (plan: unknown) => Promise<void>;
+  markTaskLaunchFailed: (...args: unknown[]) => Promise<void>;
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
   cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
 }
@@ -279,6 +280,9 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
         workspaceService,
       });
       const svc = taskService as unknown as Internals;
+      // Real launch, observed: the test awaits it so its cleanup never outlives the temp root.
+      const launch = spyOn(svc, "startReservedAgentTask");
+      const markFailed = spyOn(svc, "markTaskLaunchFailed");
       spyOn(svc, "cleanupMaterializedTaskWorkspace").mockImplementation(() => Promise.resolve());
       spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
         Promise.resolve({
@@ -319,6 +323,11 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       expect(settled()).toBe(true);
+      expect(launch).toHaveBeenCalledTimes(1);
+      await (launch.mock.results[0]?.value as Promise<void>).catch(() => undefined);
+      // A rejected launch is then marked failed by the dispatcher; wait for that write too.
+      await Promise.all(markFailed.mock.results.map((result) => result.value as Promise<void>));
+      expect(markFailed).toHaveBeenCalledTimes(sanitizeResult === undefined ? 0 : 1);
 
       expect(calls).toEqual(
         sanitizeResult === undefined

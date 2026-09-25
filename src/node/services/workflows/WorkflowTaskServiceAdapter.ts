@@ -147,6 +147,23 @@ export interface WorkflowTaskServiceAdapterOptions {
   getProjectTrusted?: () => boolean | Promise<boolean>;
 }
 
+/**
+ * The adapter production wires (the WorkflowService and turnRequestBuilder task adapter
+ * factories). Replacement capabilities stay optional on the adapter so test stubs need not grow
+ * them, and the runner treats their absence as "never replace" (the step stays unresolved). A real
+ * backend missing them would silently strand every no-report step instead, so fail at wiring.
+ */
+export function createProductionWorkflowTaskAdapter(
+  options: WorkflowTaskServiceAdapterOptions
+): WorkflowTaskServiceAdapter {
+  const adapter = new WorkflowTaskServiceAdapter(options);
+  assert(
+    adapter.claimRetiredAttempt != null && options.taskService.createMany != null,
+    "createProductionWorkflowTaskAdapter: the task service must retire attempts (claimRetiredAttempt) and publish replacements (createMany)"
+  );
+  return adapter;
+}
+
 export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
   private readonly taskService: WorkflowTaskServiceLike;
   private readonly parentWorkspaceId: string;

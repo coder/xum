@@ -3742,6 +3742,13 @@ export class TaskService implements AgentTaskIntegration {
    * nonce (a stale runner holding the old nonce can then no longer publish). Every admission
    * already refuses a retired attempt. Confirmed by a strict re-read, since a config edit that
    * fails to write is not always surfaced to its caller.
+   *
+   * A spent claim is never re-granted, even when its replacementTaskId names a row that is gone
+   * (a replacement whose launch failed sanitization is unpublished). That is safe because the
+   * workflow checkpoints the replacement (createMany's onTaskReserved) BEFORE the publishing
+   * commit that sets replacementTaskId: once it is set, the journal already names the
+   * replacement, so no runner classifies this attempt again. Recovery is retry-from-checkpoint's
+   * fresh reservation (WorkflowRunner.replacementRace.test.ts).
    */
   async claimRetiredAttempt(
     taskId: string,
