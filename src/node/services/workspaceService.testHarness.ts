@@ -225,9 +225,12 @@ export async function createWorkspaceServiceHarness(
   const extensionMetadata =
     options.extensionMetadata ??
     new ExtensionMetadataService(path.join(tempDir, "extensionMetadata.json"));
+  const ownedBackgroundProcessManager =
+    options.backgroundProcessManager == null
+      ? new BackgroundProcessManager(path.join(tempDir, "background-processes"))
+      : undefined;
   const backgroundProcessManager =
-    options.backgroundProcessManager ??
-    new BackgroundProcessManager(path.join(tempDir, "background-processes"));
+    options.backgroundProcessManager ?? ownedBackgroundProcessManager!;
   const service = createWorkspaceServiceForTest({
     ...options,
     config,
@@ -237,6 +240,12 @@ export async function createWorkspaceServiceHarness(
     extensionMetadata,
     backgroundProcessManager,
   });
+  // Stop processes a test spawned through the owned manager before deleting the root that
+  // holds their output files; a surviving child could outlive the test run.
+  const disposeHarness = async () => {
+    await ownedBackgroundProcessManager?.terminateAll();
+    await cleanup();
+  };
   return {
     service,
     config,
@@ -246,8 +255,8 @@ export async function createWorkspaceServiceHarness(
     extensionMetadata,
     backgroundProcessManager,
     rootDir: tempDir,
-    cleanup,
-    [Symbol.asyncDispose]: cleanup,
+    cleanup: disposeHarness,
+    [Symbol.asyncDispose]: disposeHarness,
   };
 }
 
