@@ -69,7 +69,8 @@ export const Desktop: AppStory = {
   play: async ({ canvasElement }) => {
     const dialog = await openConsentDialog(canvasElement);
     const toggle = within(dialog).getByRole("switch");
-    // Off by default: a fresh workspace has never consented.
+    // A workspace without a generation (created before the on-by-default change, or turned off)
+    // starts off.
     if (toggle.getAttribute("aria-checked") !== "false") {
       throw new Error("consent switch must start off for a workspace without a generation");
     }

@@ -1232,8 +1232,10 @@ export class WorkspaceTurnManager {
         false,
         tags,
         // The agentId validation below reads the target checkout under the task mutex, so
-        // a local worktree must be populated before create() resolves.
-        { awaitMaterialization: true }
+        // a local worktree must be populated before create() resolves. Delegated targets are
+        // not opted in to unrelated messaging yet: their default needs a finalization point
+        // tied to this turn's lifecycle (#4453).
+        { awaitMaterialization: true, skipDefaultUnrelatedWorkspaceConsent: true }
       );
       if (!createResult.success) {
         return Err(`Task.createWorkspaceTurn: workspace create failed (${createResult.error})`);

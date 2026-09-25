@@ -2071,6 +2071,34 @@ describe("WorkspaceTurnManager", () => {
     });
   });
 
+  test("createWorkspaceTurn creates delegated targets without default unrelated-messaging consent", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+    const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize the repo",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    // Delegated targets need a default tied to this turn's lifecycle (#4453);
+    // until then create() must not opt them in.
+    const createCall = createWorkspace.mock.calls[0] as unknown[];
+    expect(createCall[8]).toMatchObject({
+      awaitMaterialization: true,
+      skipDefaultUnrelatedWorkspaceConsent: true,
+    });
+  });
+
   test("createWorkspaceTurn launches a new workspace with an explicit agent id", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);

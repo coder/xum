@@ -4167,9 +4167,9 @@ export class Config {
         aiSettings: metadata.aiSettings,
         heartbeat: metadata.heartbeat,
         goalDefaults: metadata.goalDefaults,
-        // Carried only when the caller's metadata carries it: create/fork/child paths assemble
-        // metadata without consent, so a new entry never inherits it, while a re-add of an
-        // existing consented entry does not silently revoke it.
+        // Carried only when the caller's metadata carries it: fork mints a fresh generation
+        // (never the source's) and other callers assemble metadata without consent, while a
+        // re-add of an existing consented entry does not silently revoke it.
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
         ),
