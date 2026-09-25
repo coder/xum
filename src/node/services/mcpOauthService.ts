@@ -35,6 +35,16 @@ const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_SERVER_TIMEOUT_MS = 10 * 60 * 1000;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 const STORE_FILE_NAME = "mcp-oauth.json";
+// RFC 6749 §4.1.2.1 authorization-response error codes (safe to display).
+const RFC6749_AUTHORIZATION_ERROR_CODES = new Set([
+  "invalid_request",
+  "unauthorized_client",
+  "access_denied",
+  "unsupported_response_type",
+  "invalid_scope",
+  "server_error",
+  "temporarily_unavailable",
+]);
 
 interface McpOauthStoreFileV1 {
   version: 1;
@@ -1448,10 +1458,17 @@ export class McpOauthService {
     }
   ): Promise<Result<void, string>> {
     if (input.error) {
-      const message = input.errorDescription
-        ? `${input.error}: ${input.errorDescription}`
-        : input.error;
-      return Err(`MCP OAuth error: ${message}`);
+      // Callback error fields are attacker-controllable in a mix-up attack and
+      // arrive before the SDK can check `iss`, so the SDK says not to display
+      // them. Show only a standard RFC 6749 error code; keep the rest in logs.
+      log.warn("[MCP OAuth] Authorization server returned an error", {
+        error: input.error,
+        errorDescription: input.errorDescription,
+      });
+      const code = RFC6749_AUTHORIZATION_ERROR_CODES.has(input.error)
+        ? input.error
+        : "unknown_error";
+      return Err(`MCP OAuth error: ${code}`);
     }
 
     if (!input.code) {

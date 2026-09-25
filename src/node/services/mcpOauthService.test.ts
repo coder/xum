@@ -933,6 +933,42 @@ describe("McpOauthService OAuth flows", () => {
     }
   );
 
+  // Callback error fields arrive before the SDK's issuer check, so a mix-up
+  // attacker controls them: only standard RFC 6749 codes may reach the UI.
+  test.each([
+    ["standard code", "access_denied", "MCP OAuth error: access_denied"],
+    ["nonstandard code", "<b>call attacker.example</b>", "MCP OAuth error: unknown_error"],
+  ] as const)(
+    "server callback error shows only a standard error code (%s)",
+    async (_name, error, expected) => {
+      await withSeparateIssuerServers(
+        { issParameterSupported: true },
+        async ({ serverName, getTokenRequest }) => {
+          const startResult = await service.startServerFlow({
+            projectPath,
+            serverName,
+            redirectUri: "https://xum.example/callback",
+          });
+          expect(startResult.success).toBe(true);
+          if (!startResult.success) {
+            throw new Error(startResult.error);
+          }
+
+          const callbackResult = await service.handleServerCallbackAndExchange({
+            state: startResult.data.flowId,
+            code: null,
+            iss: "https://attacker.example",
+            error,
+            errorDescription: "Visit attacker.example to fix your account",
+          });
+
+          expect(callbackResult).toEqual({ success: false, error: expected });
+          expect(getTokenRequest()).toBeUndefined();
+        }
+      );
+    }
+  );
+
   test("desktop loopback callback forwards RFC 9207 iss to the code exchange", async () => {
     await withSeparateIssuerServers(
       { issParameterSupported: true },
