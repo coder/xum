@@ -11,6 +11,7 @@ import {
 } from "@/common/utils/planReview/planReviewEnvelope";
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import type { CompactionMonitor } from "./compactionMonitor";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { HistoryService } from "./historyService";
 import { getPlanReviewState, hashPlanSnapshotContent } from "./planReviewService";
 import {
@@ -523,5 +524,47 @@ describe("plan-review feedback whose snapshot or threads leave history before it
     expect(planReviewThreads(await getPlanReviewState(h.historyService, workspaceId))).toEqual([
       "thr_1",
     ]);
+  });
+});
+
+describe("plan-review feedback refused before it streams", () => {
+  test("a pricing-gate refusal persists nothing instead of an editable plain-text copy", async () => {
+    // planReviewSubmitFeedback reports send_failed and the client keeps its drafts to resend. A
+    // preserved plain-text copy (the metadata is not kept) would duplicate the visible turn on
+    // that retry and put conflicting review context in front of the model.
+    const workspaceGoalService = new Proxy(
+      {
+        assertPricedModelForBudgetedGoal: () =>
+          Promise.resolve(Err({ type: "unknown" as const, raw: "unpriced model" })),
+      } as Record<PropertyKey, unknown>,
+      { get: (target, prop) => target[prop] ?? (() => Promise.resolve(undefined)) }
+    ) as unknown as WorkspaceGoalService;
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      workspaceGoalService,
+    });
+    fixtures.push(h);
+    const stream = spyOn(h.aiService, "streamMessage");
+    await seedSnapshot(h as Awaited<ReturnType<typeof fixture>>);
+
+    const sent = await h.session.sendMessage(feedbackText, {
+      ...options,
+      muxMetadata: feedbackMeta,
+    });
+
+    expect(sent).toMatchObject({
+      success: false,
+      error: { type: "unknown", raw: "unpriced model" },
+    });
+    expect(stream).not.toHaveBeenCalled();
+    const rows: MuxMessage[] = [];
+    const scanned = await h.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
+      rows.push(...chunk);
+    });
+    assert(scanned.success);
+    expect(rows.map((row) => row.id)).toEqual(["pr-snapshot"]);
+    // The refusal is still surfaced in the transcript as a stream error.
+    expect(h.events.some((event) => event.type === "stream-error")).toBe(true);
   });
 });
