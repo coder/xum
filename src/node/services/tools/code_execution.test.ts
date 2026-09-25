@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { createCodeExecutionTool, clearTypeCaches, type MountRunner } from "./code_execution";
+import { createCodeExecutionTool, type MountRunner } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import { extractAttachmentsFromToolOutput } from "@/node/utils/messages/toolResultAttachments";
@@ -729,8 +729,6 @@ describe("createCodeExecutionTool", () => {
 
   describe("type caching", () => {
     it("returns consistent types for same tool set", async () => {
-      clearTypeCaches();
-
       const mockTools: Record<string, Tool> = {
         file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
           content: "test",
@@ -748,8 +746,6 @@ describe("createCodeExecutionTool", () => {
     });
 
     it("regenerates types when tool set changes", async () => {
-      clearTypeCaches();
-
       const tools1: Record<string, Tool> = {
         file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
           content: "test",
@@ -942,24 +938,6 @@ describe("createCodeExecutionTool", () => {
       expect(recovered.success).toBe(true);
       expect(recovered.result).toEqual({ state: "durable", self: "undefined" });
       await host.disposeScope("ws-cyclic-vars");
-    });
-
-    it("clearTypeCaches forces regeneration", async () => {
-      const mockTools: Record<string, Tool> = {
-        file_read: createMockTool("file_read", z.object({ filePath: z.string() }), () => ({
-          content: "test",
-        })),
-      };
-
-      // First call to populate cache
-      await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
-
-      // Clear and verify new generation works
-      clearTypeCaches();
-
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(mockTools));
-      const desc = (tool as { description?: string }).description ?? "";
-      expect(desc).toContain("function file_read");
     });
   });
 
