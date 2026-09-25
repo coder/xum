@@ -53,6 +53,22 @@ describe("workflow step replacement across a backend restart (G2)", () => {
     });
   }, 60_000);
 
+  test("a child that failed terminally is never replaced: the next process fails the step", async () => {
+    const ended = await runFixture(["end", root.path, "refused"]);
+    expect(ended).toMatchObject({ childId: "priorchild01", row: { taskStatus: "interrupted" } });
+
+    const resumed = await runFixture(["resume", root.path]);
+    // The persisted failure, not an unresolved-attempt or "ended without a report" error.
+    expect(String(resumed.error)).toContain("fixture: the model refused");
+    expect(resumed).toMatchObject({
+      runStatus: "failed",
+      children: ["priorchild01"],
+      journal: "priorchild01",
+      journalStatus: "failed",
+    });
+    expect(resumed.priorRetiredBy).toBeUndefined();
+  }, 60_000);
+
   test("a child that reported is never replaced: the next process uses its report", async () => {
     await runFixture(["end", root.path, "reported"]);
 

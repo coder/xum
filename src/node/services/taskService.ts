@@ -251,6 +251,7 @@ import {
 import {
   readSubagentFailureArtifact,
   readSubagentFailureArtifactsFile,
+  readSubagentFailureArtifactStrict,
   upsertSubagentFailureArtifact,
 } from "@/node/services/subagentFailureArtifacts";
 import { secretsToRecord } from "@/common/types/secrets";
@@ -3831,6 +3832,7 @@ export class TaskService implements AgentTaskIntegration {
       coerceNonEmptyString(options?.requestingWorkspaceId) ??
       coerceNonEmptyString(entry?.workspace.parentWorkspaceId);
     let reportPositivelyAbsent = false;
+    let failure: { errorMessage: string } | undefined;
     if (reportOwnerWorkspaceId != null) {
       const read = await readSubagentReportArtifactStrict(
         path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
@@ -3856,6 +3858,21 @@ export class TaskService implements AgentTaskIntegration {
         );
       }
       reportPositivelyAbsent = true;
+      // A terminal failure (failAgentTaskTerminally) settles like a no-report stop and leaves a
+      // receipt too, so its failure artifact is read next, as strictly as the report: a found
+      // failure marks the outcome (never replaced), an unreadable one proves nothing.
+      const failureRead = await readSubagentFailureArtifactStrict(
+        path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
+        taskId
+      );
+      if (failureRead.kind === "unreadable") {
+        return indeterminate(
+          `failure artifact unreadable in ${reportOwnerWorkspaceId}: ${failureRead.error}`
+        );
+      }
+      if (failureRead.kind === "found") {
+        failure = { errorMessage: failureRead.artifact.errorMessage };
+      }
       // The artifact read awaited: another backend may have re-admitted the row meanwhile, so
       // the classification below must not decide from the snapshot taken before it (#4414).
       entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
@@ -3890,7 +3907,11 @@ export class TaskService implements AgentTaskIntegration {
       if (reportPositivelyAbsent) {
         const proof = await this.readUnownedSettlementProof(taskId);
         if (proof.kind === "proven") {
-          return { kind: "terminal-no-report", attemptId: proof.attemptId };
+          return {
+            kind: "terminal-no-report",
+            attemptId: proof.attemptId,
+            ...(failure != null ? { failure } : {}),
+          };
         }
         return indeterminate(
           `task status ${status ?? "running"} without an attempt owned by this process: ${proof.reason}`
@@ -3922,6 +3943,7 @@ export class TaskService implements AgentTaskIntegration {
       return {
         kind: "terminal-no-report",
         ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
+        ...(failure != null ? { failure } : {}),
       };
     }
     if (status != null && ACTIVE_AGENT_TASK_STATUSES.has(status)) {

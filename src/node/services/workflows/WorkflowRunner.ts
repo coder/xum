@@ -3155,8 +3155,12 @@ export class WorkflowRunner {
           runId,
           sequence,
           attempt,
-          `agent ${attempt.stepId} task ${attempt.taskId} ended without a report`
+          outcome.failure?.errorMessage ??
+            `agent ${attempt.stepId} task ${attempt.taskId} ended without a report`
         );
+        // A terminal failure (e.g. a model refusal under onRefusal: "fail") is the step's
+        // result: it fails the step as it would have in the child's own process, never replaced.
+        if (outcome.failure != null) throw new Error(outcome.failure.errorMessage);
         return { kind: "replace", attemptId: outcome.attemptId };
       case "indeterminate":
         await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
@@ -3254,7 +3258,9 @@ export class WorkflowRunner {
           attempt,
           `agent ${attempt.stepId} task ${attempt.taskId} ended without a report: ${getErrorMessage(error)}`
         );
-        return options.allowReplacement && shouldRestartUnrecoverableStartedTask(error)
+        return options.allowReplacement &&
+          outcome.failure == null &&
+          shouldRestartUnrecoverableStartedTask(error)
           ? { kind: "replace", attemptId: outcome.attemptId }
           : { kind: "rethrow" };
       case "indeterminate":

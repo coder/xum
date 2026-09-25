@@ -11,7 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { spyOn } from "bun:test";
-import { Config } from "@/node/config";
+import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { TaskService } from "@/node/services/taskService";
@@ -53,7 +53,19 @@ function stack(config: Config): TaskService {
 
 const sessionDir = (config: Config) => path.join(config.sessionsDir, FIXTURE_PARENT_ID);
 
-async function end(root: string, outcome: "reported" | "no-report") {
+/** The refusal a terminally failed child persists (failAgentTaskTerminally, onRefusal: "fail"). */
+const FIXTURE_REFUSAL = { errorType: "model_refusal", errorMessage: "fixture: the model refused" };
+
+interface TerminalFailureInternals {
+  failAgentTaskTerminally: (
+    workspaceId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    failure: { errorType: string; errorMessage: string },
+    options: { expectedAttemptId: string | null }
+  ) => Promise<void>;
+}
+
+async function end(root: string, outcome: "reported" | "no-report" | "refused") {
   const config = new Config(root);
   await fs.mkdir(config.srcDir, { recursive: true });
   const projectPath = await createTestProject(root, "repo", { initGit: false });
@@ -115,6 +127,16 @@ async function end(root: string, outcome: "reported" | "no-report") {
     for (let i = 0; i < 400 && taskService.isWorkspaceStopInProgress(childId); i++) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
+  } else if (outcome === "refused") {
+    // The real terminal-failure path: interrupted row, settlement receipt, failure artifact.
+    const row = findWorkspaceInConfig(config, childId);
+    if (row == null) throw new Error("reserved child row missing");
+    await (taskService as unknown as TerminalFailureInternals).failAgentTaskTerminally(
+      childId,
+      { projectPath, workspace: row },
+      FIXTURE_REFUSAL,
+      { expectedAttemptId: row.taskAttemptId ?? null }
+    );
   } else {
     await upsertSubagentReportArtifact({
       workspaceId: FIXTURE_PARENT_ID,
@@ -154,7 +176,13 @@ async function resume(root: string) {
     }),
     runnerId: `workflow-runner:${FIXTURE_PARENT_ID}:${FIXTURE_RUN_ID}:process2`,
   });
-  const result = await runner.run(FIXTURE_RUN_ID);
+  let result: unknown;
+  let error: string | undefined;
+  try {
+    result = await runner.run(FIXTURE_RUN_ID);
+  } catch (caught: unknown) {
+    error = caught instanceof Error ? caught.message : String(caught);
+  }
   const children: string[] = [];
   for (const project of config.loadConfigOrDefault().projects.values()) {
     for (const ws of project.workspaces) {
@@ -162,10 +190,14 @@ async function resume(root: string) {
     }
   }
   const run = await store.getRun(FIXTURE_RUN_ID);
+  const lastStep = run.steps.filter((step) => step.stepId === FIXTURE_STEP_ID).at(-1);
   return {
     result,
+    error,
+    runStatus: run.status,
     children: children.sort(),
-    journal: run.steps.filter((step) => step.stepId === FIXTURE_STEP_ID).at(-1)?.taskId,
+    journal: lastStep?.taskId,
+    journalStatus: lastStep?.status,
     priorRetiredBy: findWorkspaceInConfig(config, "priorchild01")?.taskAttemptRetiredBy,
   };
 }
@@ -174,7 +206,7 @@ const [phase, root, outcome] = process.argv.slice(2);
 try {
   const output =
     phase === "end"
-      ? await end(root, outcome === "reported" ? "reported" : "no-report")
+      ? await end(root, outcome === "reported" || outcome === "refused" ? outcome : "no-report")
       : await resume(root);
   process.stdout.write(`FIXTURE_RESULT ${JSON.stringify(output)}\n`);
   process.exit(0);

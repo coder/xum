@@ -8,6 +8,10 @@ import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { retiredAttemptMessage } from "@/constants/agentMessaging";
 import { Ok, type Result } from "@/common/types/result";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
+import {
+  getSubagentFailureArtifactsFilePath,
+  upsertSubagentFailureArtifact,
+} from "@/node/services/subagentFailureArtifacts";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { TaskService } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
@@ -131,6 +135,31 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       expect(await read(otherProcess(config), "reportedtoo")).toMatchObject({
         kind: "reported",
         report: { reportMarkdown: "done after all" },
+      });
+    });
+
+    test("a terminal failure's artifact marks the outcome, and a damaged one proves nothing", async () => {
+      const config = await setupChild("refused");
+      await writeReceipt(config, midId, "refused");
+      const failures = getSubagentFailureArtifactsFilePath(path.join(config.sessionsDir, midId));
+      await fsPromises.writeFile(failures, "{ not json", "utf-8");
+      expect(await read(otherProcess(config), "refused")).toMatchObject({
+        kind: "indeterminate",
+      });
+      await fsPromises.rm(failures);
+      await upsertSubagentFailureArtifact({
+        workspaceId: midId,
+        workspaceSessionDir: path.join(config.sessionsDir, midId),
+        childTaskId: "refused",
+        parentWorkspaceId: midId,
+        ancestorWorkspaceIds: [midId, rootId],
+        errorType: "model_refusal",
+        errorMessage: "refused by the model",
+      });
+      expect(await read(otherProcess(config), "refused")).toEqual({
+        kind: "terminal-no-report",
+        attemptId: ATTEMPT,
+        failure: { errorMessage: "refused by the model" },
       });
     });
 
