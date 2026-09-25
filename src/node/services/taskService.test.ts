@@ -7756,6 +7756,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
 
     expect(sendMessage).not.toHaveBeenCalled();
 
@@ -17673,6 +17674,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).not.toHaveBeenCalled();
