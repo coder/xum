@@ -4672,45 +4672,25 @@ describe("MCPServerManager", () => {
     const closeA1 = mock(() => Promise.resolve(undefined));
     const closeA2 = mock(() => Promise.resolve(undefined));
     const closeB1 = mock(() => Promise.resolve(undefined));
-
-    let startCount = 0;
-    const startServersMock = mock(() => {
-      startCount += 1;
-
-      if (startCount === 1) {
-        return Promise.resolve(
-          startResult([
-            ["serverA", { close: closeA1 }],
-            ["serverB", { close: closeB1 }],
-          ])
-        );
-      }
-
-      return Promise.resolve(startResult([["serverA", { close: closeA2 }]]));
-    });
-
-    access.startServers = startServersMock;
+    servers.serve("cmd-a", (attempt) => ({ close: attempt === 1 ? closeA1 : closeA2 }));
+    servers.serve("cmd-b", { close: closeB1 });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     // Simulate an active stream lease.
     manager.acquireLease(workspaceId);
 
-    const cached = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, { isClosed: boolean }>;
-    };
-
-    const instanceA = cached.instances.get("serverA");
-    expect(instanceA).toBeTruthy();
-    if (instanceA) {
-      instanceA.isClosed = true;
-    }
+    await servers.crash("cmd-a");
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    // Restart should only close the dead instance.
+    // Restart should only close (and reconnect) the dead instance.
     expect(closeA1).toHaveBeenCalledTimes(1);
+    expect(closeA2).toHaveBeenCalledTimes(0);
     expect(closeB1).toHaveBeenCalledTimes(0);
+    expect(servers.connectCount("cmd-a")).toBe(2);
+    expect(servers.connectCount("cmd-b")).toBe(1);
+    manager.releaseLease(workspaceId);
   });
 
   test("getToolsForWorkspace does not return tools from newly-disabled servers while leased", async () => {
@@ -4722,16 +4702,8 @@ describe("MCPServerManager", () => {
       })
     );
 
-    const startServersMock = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["serverA", { tools: { tool: testTool() } }],
-          ["serverB", { tools: { tool: testTool() } }],
-        ])
-      )
-    );
-
-    access.startServers = startServersMock;
+    servers.serve("cmd-a", { tools: { tool: testTool() } });
+    servers.serve("cmd-b", { tools: { tool: testTool() } });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -4755,17 +4727,19 @@ describe("MCPServerManager", () => {
         serverC: stdioConfig("cmd-c"),
       })
     );
-    const refreshB = mock(() => new Promise<void>(() => undefined));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["serverA", { tools: { tool: testTool() }, refreshTools: mock(() => Promise.resolve()) }],
-          ["serverB", { tools: { tool: testTool() }, refreshTools: refreshB }],
-          ["serverC", { tools: { tool: testTool() } }],
-        ])
-      )
+    // Modern-era connections refresh tools/list in the background on cached
+    // serves; B answers its startup listing, then every refresh hangs.
+    const listToolsB = mock(
+      (): Promise<Record<string, Tool>> =>
+        listToolsB.mock.calls.length === 1
+          ? Promise.resolve({ tool: testTool() })
+          : new Promise(() => undefined)
     );
+    servers.serve("cmd-a", { era: "modern", tools: { tool: testTool() } });
+    servers.serve("cmd-b", { era: "modern", listTools: listToolsB });
+    servers.serve("cmd-c", { tools: { tool: testTool() } });
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(listToolsB).toHaveBeenCalledTimes(1);
     manager.acquireLease(workspaceId);
 
     // Signature change while leased → deferred restart path. B's refresh
@@ -4774,7 +4748,8 @@ describe("MCPServerManager", () => {
     const served = await manager.getToolsForWorkspace(
       workspaceRequest(workspaceId, { overrides: { disabledServers: ["serverC"] } })
     );
-    expect(refreshB).toHaveBeenCalledTimes(1);
+    // Startup listing plus the one (hung) background refresh.
+    expect(listToolsB).toHaveBeenCalledTimes(2);
     expect(Object.keys(served.tools).sort()).toEqual(["servera_tool", "serverb_tool"]);
   });
 
@@ -4787,19 +4762,13 @@ describe("MCPServerManager", () => {
       })
     );
 
-    const startServersMock = mock(() =>
-      Promise.resolve(
-        startResult([["serverA", { tools: { tool: testTool() } }]], {
-          failedServerNames: ["serverB"],
-        })
-      )
-    );
-
-    access.startServers = startServersMock;
+    servers.serve("cmd-a", { tools: { tool: testTool() } });
+    servers.serve("cmd-b", { connect: () => Promise.reject(new Error("boom")) });
 
     const initial = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     expect(initial.stats.failedServerCount).toBe(1);
+    const failedAttempts = servers.connectCount("cmd-b");
 
     manager.acquireLease(workspaceId);
 
@@ -4807,7 +4776,9 @@ describe("MCPServerManager", () => {
       workspaceRequest(workspaceId, { overrides: { disabledServers: ["serverB"] } })
     );
 
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    // No restart: neither server is contacted again.
+    expect(servers.connectCount("cmd-a")).toBe(1);
+    expect(servers.connectCount("cmd-b")).toBe(failedAttempts);
     expect(leased.stats.failedServerCount).toBe(0);
     expect(Object.keys(leased.tools)).toEqual(["servera_tool"]);
   });
@@ -4826,17 +4797,14 @@ describe("MCPServerManager", () => {
       )
     );
 
-    const startServersMock = mock((servers: Record<string, unknown>) =>
-      Promise.resolve(
-        startResult(Object.keys(servers).map((name) => [name, { tools: { tool: testTool() } }]))
-      )
-    );
-
-    access.startServers = startServersMock as unknown as typeof access.startServers;
+    servers.serve("global-cmd", { tools: { tool: testTool() } });
+    servers.serve("repo-cmd", { tools: { tool: testTool() } });
 
     const untrustedResult = await manager.getToolsForWorkspace(
       workspaceRequest("ws-untrusted-mcp", { trusted: false })
     );
+    // The repo-defined server is never launched for the untrusted project.
+    expect(servers.connectCount("repo-cmd")).toBe(0);
 
     const trustedResult = await manager.getToolsForWorkspace(
       workspaceRequest("ws-trusted-mcp", { trusted: true })
@@ -4850,68 +4818,42 @@ describe("MCPServerManager", () => {
     });
     expect(Object.keys(untrustedResult.tools)).toEqual(["global_tool"]);
     expect(Object.keys(trustedResult.tools).sort()).toEqual(["global_tool", "repo_tool"]);
-
-    const firstStartedServers = startServersMock.mock.calls[0]?.[0];
-    const secondStartedServers = startServersMock.mock.calls[1]?.[0];
-    expect(Object.keys(firstStartedServers ?? {})).toEqual(["global"]);
-    expect(Object.keys(secondStartedServers ?? {}).sort()).toEqual(["global", "repo"]);
+    expect(servers.connectCount("global-cmd")).toBe(2);
+    expect(servers.connectCount("repo-cmd")).toBe(1);
   });
   test("prompt discovery retries when an ordinary serve replaces the entry during prompts/list", async () => {
     // A direct edit of the override document is picked up by a concurrent
     // send's serve, which replaces the published entry without moving either
     // mutation counter. Descriptors must come from the current entry.
+    let command = "cmd";
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig(command) }));
     const request = workspaceRequest("workspace");
-    access.lastWorkspaceRequestOptions.set("workspace", request);
-    const replaced = { enabledServerNames: new Set<string>(), instances: new Map() };
-    const stale = testInstance("coder", {
-      prompts: [{ name: "stale" }],
-      refreshPrompts: mock(() => {
-        access.workspaceServers.set("workspace", replaced);
-        return Promise.resolve([{ name: "stale" }]);
-      }),
+    // While prompts/list is in flight, a concurrent send's serve with the same
+    // authorization picks up a reconfigured server (no generation bump) and
+    // replaces the published entry.
+    const staleListPrompts = mock(async () => {
+      command = "cmd-2";
+      await manager.getToolsForWorkspace(request);
+      return [{ name: "stale" }];
     });
-    let serves = 0;
-    spyOn(access, "ensureWorkspaceServers").mockImplementation(() => {
-      serves += 1;
-      if (serves === 1) {
-        access.workspaceServers.set("workspace", {
-          enabledServerNames: new Set(["coder"]),
-          instances: new Map([["coder", stale]]),
-        });
-      }
-      return Promise.resolve({ tools: {}, stats: cachedStats(), enablementDerivedFrom: request });
-    });
+    servers.serve("cmd", { listPrompts: staleListPrompts });
+    servers.serve("cmd-2", { prompts: [{ name: "fresh" }] });
 
     const descriptors = await manager.getPromptsForWorkspace(request);
-    expect(descriptors).toEqual([]);
-    expect(serves).toBe(2);
+    expect(descriptors.map((d) => d.promptName)).toEqual(["fresh"]);
+    expect(staleListPrompts).toHaveBeenCalledTimes(1);
   });
 
   test("lists namespaced prompt descriptors from connected instances", async () => {
-    // Mirrors a real serve: the options it derived enablement from are recorded.
-    access.lastWorkspaceRequestOptions.set("workspace", workspaceRequest("workspace"));
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockResolvedValue({
-      tools: {},
-      stats: cachedStats(),
-      // Mirrors serveResult: a serve that vouches for its enablement.
-      enablementDerivedFrom: workspaceRequest("workspace"),
-    });
-    access.workspaceServers.set("workspace", {
-      enabledServerNames: new Set(["Coder Server"]),
-      instances: new Map([
-        [
-          "Coder Server",
-          testInstance("Coder Server", {
-            prompts: [
-              {
-                name: "Code Review",
-                description: "Review code",
-                arguments: [{ name: "path", required: true }],
-              },
-            ],
-          }),
-        ],
-      ]),
+    configService.listServers = mock(() => Promise.resolve({ "Coder Server": stdioConfig("cmd") }));
+    servers.serve("cmd", {
+      prompts: [
+        {
+          name: "Code Review",
+          description: "Review code",
+          arguments: [{ name: "path", required: true }],
+        },
+      ],
     });
 
     const listed = await manager.getPromptsForWorkspace(workspaceRequest("workspace"));
@@ -4925,7 +4867,6 @@ describe("MCPServerManager", () => {
       description: "Review code",
       arguments: [{ name: "path", required: true }],
     });
-    getToolsSpy.mockRestore();
   });
 
   test("forwards prompt arguments and flattens supported content", async () => {
@@ -4948,11 +4889,9 @@ describe("MCPServerManager", () => {
         ],
       })
     );
-    access.workspaceServers.set("workspace", {
-      enabledServers: { coder: stdioConfig("cmd") },
-      enabledServerNames: new Set(["coder"]),
-      instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
-    });
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    servers.serve("cmd", { getPrompt });
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
 
     expect(await manager.getPrompt("workspace", "coder", "review", { path: "src" })).toEqual({
       description: "Expanded review",
@@ -4967,11 +4906,9 @@ describe("MCPServerManager", () => {
         messages: [{ role: "user", content: { type: "text", text: "   \n\n  " } }],
       })
     );
-    access.workspaceServers.set("workspace", {
-      enabledServers: { coder: stdioConfig("cmd") },
-      enabledServerNames: new Set(["coder"]),
-      instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
-    });
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    servers.serve("cmd", { getPrompt });
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
 
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt("workspace", "coder", "review", {})).rejects.toThrow(
@@ -4980,21 +4917,13 @@ describe("MCPServerManager", () => {
   });
 
   test("suffixes every member of a colliding prompt key group, independent of order", async () => {
-    // Mirrors a real serve: the options it derived enablement from are recorded.
-    access.lastWorkspaceRequestOptions.set("workspace", workspaceRequest("workspace"));
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockResolvedValue({
-      tools: {},
-      stats: cachedStats(),
-      // Mirrors serveResult: a serve that vouches for its enablement.
-      enablementDerivedFrom: workspaceRequest("workspace"),
-    });
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    // Discovery re-polls prompts/list on every call, so each call below
+    // observes the catalog set just before it.
+    let catalog: Array<{ name: string }> = [];
+    servers.serve("cmd", { listPrompts: () => Promise.resolve(catalog) });
     const collectKeys = async (promptNames: string[]) => {
-      access.workspaceServers.set("workspace", {
-        enabledServerNames: new Set(["coder"]),
-        instances: new Map([
-          ["coder", testInstance("coder", { prompts: promptNames.map((name) => ({ name })) })],
-        ]),
-      });
+      catalog = promptNames.map((name) => ({ name }));
       const descriptors = await manager.getPromptsForWorkspace(workspaceRequest("workspace"));
       return new Map(descriptors.map((d) => [d.promptName, d.commandKey]));
     };
@@ -5008,70 +4937,54 @@ describe("MCPServerManager", () => {
     expect(reversedKeys).toEqual(keys);
     expect(keys.get("status")).toBe("mcp__coder__status");
 
-    const soloDescriptors = await (async () => {
-      access.workspaceServers.set("workspace", {
-        enabledServerNames: new Set(["coder"]),
-        instances: new Map([
-          ["coder", testInstance("coder", { prompts: [{ name: "code_review" }] })],
-        ]),
-      });
-      return manager.getPromptsForWorkspace(workspaceRequest("workspace"));
-    })();
+    catalog = [{ name: "code_review" }];
+    const soloDescriptors = await manager.getPromptsForWorkspace(workspaceRequest("workspace"));
     expect(soloDescriptors[0]?.commandKey).toBe("mcp__coder__code_review");
     expect(soloDescriptors[0]?.stableKey).toBe(keys.get("code_review") ?? "");
-    getToolsSpy.mockRestore();
+    // One server connection served every catalog.
+    expect(servers.connectCount("cmd")).toBe(1);
   });
 
   test("excludes disabled servers from prompt discovery and getPrompt", async () => {
-    // Mirrors a real serve: the options it derived enablement from are recorded.
-    access.lastWorkspaceRequestOptions.set("workspace", workspaceRequest("workspace"));
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockResolvedValue({
-      tools: {},
-      stats: cachedStats(),
-      // Mirrors serveResult: a serve that vouches for its enablement.
-      enablementDerivedFrom: workspaceRequest("workspace"),
-    });
-    access.workspaceServers.set("workspace", {
-      enabledServers: { enabled: stdioConfig("cmd"), disabled: stdioConfig("cmd", true) },
-      enabledServerNames: new Set(["enabled"]),
-      instances: new Map([
-        ["enabled", testInstance("enabled", { prompts: [{ name: "status" }] })],
-        ["disabled", testInstance("disabled", { prompts: [{ name: "review" }] })],
-      ]),
-    });
+    configService.listServers = mock(() =>
+      Promise.resolve({ enabled: stdioConfig("cmd-e"), disabled: stdioConfig("cmd-d") })
+    );
+    const disabledGetPrompt = mock(() => Promise.resolve({ messages: [] }));
+    servers.serve("cmd-e", { prompts: [{ name: "status" }] });
+    servers.serve("cmd-d", { prompts: [{ name: "review" }], getPrompt: disabledGetPrompt });
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+    // Disabling while leased keeps the disabled client cached (deferred restart).
+    manager.acquireLease("workspace");
+    await manager.getToolsForWorkspace(
+      workspaceRequest("workspace", { overrides: { disabledServers: ["disabled"] } })
+    );
 
     const descriptors = await manager.getPromptsForWorkspace(workspaceRequest("workspace"));
     expect(descriptors.map((d) => d.commandKey)).toEqual(["mcp__enabled__status"]);
-    expect(manager.getPrompt("workspace", "disabled", "review", {})).rejects.toThrow("disabled");
-    getToolsSpy.mockRestore();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(manager.getPrompt("workspace", "disabled", "review", {})).rejects.toThrow(
+      "disabled"
+    );
+    expect(disabledGetPrompt).not.toHaveBeenCalled();
+    manager.releaseLease("workspace");
   });
 
   test("getPrompt revives reaped servers from the last workspace request options", async () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    const request = workspaceRequest("workspace");
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation(() => {
-      access.workspaceServers.set("workspace", {
-        enabledServers: { coder: stdioConfig("cmd") },
-        enabledServerNames: new Set(["coder"]),
-        // Mirrors a real serve: the inventory is as new as the current config.
-        enabledServersGeneration: configService.configGeneration,
-        instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
-      });
-      return Promise.resolve({
-        tools: {},
-        stats: cachedStats(),
-        enablementDerivedFrom: access.lastWorkspaceRequestOptions.get("workspace"),
-      });
-    });
-    access.lastWorkspaceRequestOptions.set("workspace", request);
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    const close = mock(() => Promise.resolve(undefined));
+    servers.serve("cmd", { getPrompt, close });
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+    // Reaped (like idle cleanup): the servers stop, the request options stay.
+    await manager.stopServers("workspace", { retainRestartOptions: true });
+    expect(close).toHaveBeenCalledTimes(1);
 
     expect(await manager.getPrompt("workspace", "coder", "status", {})).toEqual({
       text: "Status",
     });
-    expect(getToolsSpy).toHaveBeenCalledWith(request, false, undefined);
-    getToolsSpy.mockRestore();
+    expect(servers.connectCount("cmd")).toBe(2);
   });
 
   test("getPrompt fails when the server is gone and no restart options are cached", () => {
@@ -5084,14 +4997,11 @@ describe("MCPServerManager", () => {
     const startGate = new Promise<void>((resolve) => {
       releaseStart = resolve;
     });
-    const startServersMock = mock(async () => {
-      if (startServersMock.mock.calls.length > 1) await startGate;
-      return startResult([["coder"]]);
-    });
-    access.startServers = startServersMock;
+    servers.serve("cmd-a");
+    servers.serve("cmd-b", { connect: () => startGate });
 
     await manager.getToolsForWorkspace(workspaceRequest("workspace"));
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount("cmd-a")).toBe(1);
 
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd-b") }));
     const first = manager.getToolsForWorkspace(workspaceRequest("workspace"));
@@ -5099,7 +5009,9 @@ describe("MCPServerManager", () => {
     releaseStart();
     await Promise.all([first, second]);
 
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    // One restart onto the new config, shared by both requests.
+    expect(servers.connectCount("cmd-a")).toBe(1);
+    expect(servers.connectCount("cmd-b")).toBe(1);
   });
 
   test("serializes cold-start server startup across concurrent workspace requests", async () => {
@@ -5108,18 +5020,14 @@ describe("MCPServerManager", () => {
     const startGate = new Promise<void>((resolve) => {
       releaseStart = resolve;
     });
-    const startServersMock = mock(async () => {
-      await startGate;
-      return startResult([["coder"]]);
-    });
-    access.startServers = startServersMock;
+    servers.serve("cmd", { connect: () => startGate });
 
     const first = manager.getToolsForWorkspace(workspaceRequest("workspace"));
     const second = manager.getToolsForWorkspace(workspaceRequest("workspace"));
     releaseStart();
     await Promise.all([first, second]);
 
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount("cmd")).toBe(1);
   });
 
   test("getPrompt re-evaluates current config before invoking a cached prompt", async () => {
@@ -5127,14 +5035,7 @@ describe("MCPServerManager", () => {
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock((servers: unknown) => {
-      const names = Object.keys(servers as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(
-          names.map((name) => [name, { getPrompt }] as [string, { getPrompt: typeof getPrompt }])
-        )
-      );
-    });
+    servers.serve("cmd", { getPrompt });
 
     await manager.getToolsForWorkspace(workspaceRequest("workspace"));
     expect(await manager.getPrompt("workspace", "coder", "status", {})).toEqual({ text: "Status" });
@@ -5158,7 +5059,7 @@ describe("MCPServerManager", () => {
       })
     );
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    servers.serve("cmd", { getPrompt });
     await manager.getToolsForWorkspace(workspaceRequest("workspace"));
 
     const result = await manager.getPrompt("workspace", "coder", "status", {});
@@ -5182,7 +5083,7 @@ describe("MCPServerManager", () => {
       })
     );
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    servers.serve("cmd", { getPrompt });
     await manager.getToolsForWorkspace(workspaceRequest("workspace"));
 
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
@@ -5203,7 +5104,7 @@ describe("MCPServerManager", () => {
       })
     );
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    servers.serve("cmd", { getPrompt });
     await manager.getToolsForWorkspace(workspaceRequest("workspace"));
     const fromSpy = spyOn(Buffer, "from");
 
@@ -5234,7 +5135,7 @@ describe("MCPServerManager", () => {
       })
     );
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() => Promise.resolve(startResult([["coder", { getPrompt }]])));
+    servers.serve("cmd", { getPrompt });
     await manager.getToolsForWorkspace(workspaceRequest("workspace"));
 
     const result = await manager.getPrompt("workspace", "coder", "status", {});
@@ -5252,110 +5153,111 @@ describe("MCPServerManager", () => {
       projectPath: "/tmp/other-project",
       trusted: true,
     });
-    access.lastWorkspaceRequestOptions.set("workspace", request);
-    access.lastWorkspaceRequestOptions.set("other-workspace", otherRequest);
-
+    // `coder` is project-local: listed only for trusted projects.
+    configService.listServers = mock((_projectPath: string, trusted?: boolean) =>
+      Promise.resolve(trusted ? { coder: stdioConfig("cmd") } : {})
+    );
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
-      const workspaceId = (options as { workspaceId: string }).workspaceId;
-      access.workspaceServers.set(workspaceId, {
-        enabledServers: { coder: stdioConfig("cmd") },
-        enabledServerNames: new Set(["coder"]),
-        // Mirrors a real serve: the inventory is as new as the current config.
-        enabledServersGeneration: configService.configGeneration,
-        instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
-      });
-      // Mirrors serveResult: enablement derived from the options recorded now.
-      return Promise.resolve({
-        tools: {},
-        stats: cachedStats(),
-        enablementDerivedFrom: access.lastWorkspaceRequestOptions.get(workspaceId),
-      });
-    });
+    servers.serve("cmd", { getPrompt });
+    await manager.getToolsForWorkspace(request);
+    await manager.getToolsForWorkspace(otherRequest);
+    expect(await manager.getPrompt("workspace", "coder", "status", {})).toEqual({ text: "Status" });
 
     manager.applyProjectTrust([
       { projectPath: `${PROJECT_PATH}/`, trusted: false },
       { projectPath: "/tmp/other-project", trusted: true },
     ]);
-    await manager.getPrompt("workspace", "coder", "status", {});
-
-    expect(getToolsSpy).toHaveBeenCalledWith({ ...request, trusted: false }, false, undefined);
-    expect(access.lastWorkspaceRequestOptions.get("other-workspace")).toBe(otherRequest);
-    getToolsSpy.mockRestore();
+    configService.listServers.mockClear();
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(manager.getPrompt("workspace", "coder", "status", {})).rejects.toThrow("disabled");
+    expect(configService.listServers).toHaveBeenCalledWith(PROJECT_PATH, false, expect.anything());
+    expect(configService.listServers).not.toHaveBeenCalledWith(
+      PROJECT_PATH,
+      true,
+      expect.anything()
+    );
+    // The other project's (unchanged) trust still serves its prompt.
+    expect(await manager.getPrompt("other-workspace", "coder", "status", {})).toEqual({
+      text: "Status",
+    });
+    expect(getPrompt).toHaveBeenCalledTimes(2);
   });
+
+  const SECRET_URL = "https://mcp.test/secret-headers";
+  type FakeServerGetPrompt = (...args: unknown[]) => Promise<unknown>;
+
+  /** Serve an http server whose Authorization header comes from project secret TOKEN. */
+  function serveSecretHeaderServer(getPrompt: FakeServerGetPrompt) {
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        coder: {
+          transport: "http" as const,
+          url: SECRET_URL,
+          headers: { Authorization: { secret: "TOKEN" } },
+          disabled: false,
+        },
+      })
+    );
+    servers.serve(SECRET_URL, { getPrompt });
+  }
+
+  /**
+   * Authorization header of every connection attempt to SECRET_URL, read from
+   * the harness's createMCPClient spy (installed by servers.serve).
+   */
+  function authorizationHeadersSent(): unknown[] {
+    const connects = mcpSdk.createMCPClient as unknown as {
+      mock: { calls: Array<[mcpSdk.MCPClientConfig]> };
+    };
+    return connects.mock.calls.flatMap(([config]) => {
+      const transport = config.transport as { url?: string; headers?: Record<string, string> };
+      return transport.url === SECRET_URL ? [transport.headers?.Authorization] : [];
+    });
+  }
 
   test("getPrompt refreshes with resolver-provided secrets instead of the recorded snapshot", async () => {
     const request = workspaceRequest("workspace", { projectSecrets: { TOKEN: "old" } });
-    access.lastWorkspaceRequestOptions.set("workspace", request);
-    manager.setSecretsResolver(() => Promise.resolve({ TOKEN: "new" }));
-
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
-      const workspaceId = (options as { workspaceId: string }).workspaceId;
-      access.workspaceServers.set(workspaceId, {
-        enabledServers: { coder: stdioConfig("cmd") },
-        enabledServerNames: new Set(["coder"]),
-        // Mirrors a real serve: the inventory is as new as the current config.
-        enabledServersGeneration: configService.configGeneration,
-        instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
-      });
-      // Mirrors serveResult: enablement derived from the options recorded now.
-      return Promise.resolve({
-        tools: {},
-        stats: cachedStats(),
-        enablementDerivedFrom: access.lastWorkspaceRequestOptions.get(workspaceId),
-      });
-    });
+    serveSecretHeaderServer(getPrompt);
+    await manager.getToolsForWorkspace(request);
+    expect(authorizationHeadersSent()).toEqual(["old"]);
+    manager.setSecretsResolver(() => Promise.resolve({ TOKEN: "new" }));
 
-    await manager.getPrompt("workspace", "coder", "status", {});
+    expect(await manager.getPrompt("workspace", "coder", "status", {})).toEqual({ text: "Status" });
 
-    expect(getToolsSpy).toHaveBeenCalledWith(
-      { ...request, projectSecrets: { TOKEN: "new" } },
-      false,
-      undefined
-    );
-    getToolsSpy.mockRestore();
+    // The rotated credential changed the signature: reconnected with it.
+    expect(authorizationHeadersSent()).toEqual(["old", "new"]);
   });
 
   test("getPrompt falls back to the recorded secrets snapshot when the resolver fails", async () => {
     const request = workspaceRequest("workspace", { projectSecrets: { TOKEN: "old" } });
-    access.lastWorkspaceRequestOptions.set("workspace", request);
-    manager.setSecretsResolver(() => Promise.reject(new Error("config unavailable")));
-
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
-      const workspaceId = (options as { workspaceId: string }).workspaceId;
-      access.workspaceServers.set(workspaceId, {
-        enabledServers: { coder: stdioConfig("cmd") },
-        enabledServerNames: new Set(["coder"]),
-        // Mirrors a real serve: the inventory is as new as the current config.
-        enabledServersGeneration: configService.configGeneration,
-        instances: new Map([["coder", testInstance("coder", { getPrompt })]]),
-      });
-      // Mirrors serveResult: enablement derived from the options recorded now.
-      return Promise.resolve({
-        tools: {},
-        stats: cachedStats(),
-        enablementDerivedFrom: access.lastWorkspaceRequestOptions.get(workspaceId),
-      });
-    });
+    serveSecretHeaderServer(getPrompt);
+    await manager.getToolsForWorkspace(request);
+    manager.setSecretsResolver(() => Promise.reject(new Error("config unavailable")));
 
     expect(await manager.getPrompt("workspace", "coder", "status", {})).toEqual({ text: "Status" });
-    expect(getToolsSpy).toHaveBeenCalledWith(request, false, undefined);
-    getToolsSpy.mockRestore();
+    // The recorded snapshot still matches the live client: no reconnect.
+    expect(authorizationHeadersSent()).toEqual(["old"]);
   });
 
   test("getPrompt rejects promptly when aborted during refresh startup", async () => {
-    access.lastWorkspaceRequestOptions.set("workspace", workspaceRequest("workspace"));
-    const getToolsSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation(
-      () => new Promise<never>(() => undefined)
-    );
+    configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
+    servers.serve("cmd");
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+    await manager.stopServers("workspace", { retainRestartOptions: true });
+    // The revival's startup never finishes on its own.
+    let releaseStartup!: () => void;
+    const startupGate = new Promise<void>((resolve) => {
+      releaseStartup = resolve;
+    });
+    servers.serve("cmd", { connect: () => startupGate });
     const controller = new AbortController();
     const promptPromise = manager.getPrompt(
       "workspace",
@@ -5367,7 +5269,7 @@ describe("MCPServerManager", () => {
     controller.abort();
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(promptPromise).rejects.toThrow("was aborted");
-    getToolsSpy.mockRestore();
+    releaseStartup();
   });
 
   test("flattens audio and binary resources as omission markers", () => {
