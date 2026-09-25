@@ -4263,6 +4263,11 @@ describe("MCPServerManager", () => {
       "is not connected"
     );
     expect(getPrompt).not.toHaveBeenCalled();
+    // No (empty) entry was cached either: the next serve starts the server afresh.
+    servers.serve("cmd-1", { tools: { echo: testTool() } });
+    const next = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd-1")).toBe(1);
+    expect(Object.keys(next.tools)).toEqual(["server_echo"]);
   });
 
   test("prompt discovery refreshes with resolver-provided secrets and retries on mid-flight rotation", async () => {
@@ -4293,6 +4298,11 @@ describe("MCPServerManager", () => {
     // Connection 2 used the resolver's "old" token; the rotation forced
     // connection 3 with "new", whose catalog is the one returned.
     expect(servers.connectCount(url)).toBe(3);
+    expect(servers.headersSent(url).map((headers) => headers?.Authorization)).toEqual([
+      "recorded",
+      "old",
+      "new",
+    ]);
     expect(descriptors.map((descriptor) => descriptor.promptName)).toEqual(["status-3"]);
   });
 

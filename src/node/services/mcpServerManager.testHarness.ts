@@ -69,6 +69,7 @@ export class FakeMcpServers {
   private readonly processes: FakeProcess[] = [];
   private nextNonce = 0;
   private hungConnects = 0;
+  private readonly remoteHeaders = new Map<string, Array<Record<string, string> | undefined>>();
   private clientSpy: ReturnType<typeof spyOn<typeof mcpSdk, "createMCPClient">> | null = null;
 
   /** Stable runtime whose exec spawns a fake process (pass it in workspace requests). */
@@ -86,11 +87,17 @@ export class FakeMcpServers {
     this.install();
     this.behaviors.set(key, behavior);
     this.attempts.delete(key);
+    this.remoteHeaders.delete(key);
   }
 
   /** Connection attempts (successful or failed) against `key` since it was last served. */
   connectCount(key: string): number {
     return this.attempts.get(key) ?? 0;
+  }
+
+  /** Headers each remote connection attempt to `url` sent, in order, since `url` was last served. */
+  headersSent(url: string): ReadonlyArray<Record<string, string> | undefined> {
+    return this.remoteHeaders.get(url) ?? [];
   }
 
   /**
@@ -143,6 +150,7 @@ export class FakeMcpServers {
     this.clientSpy = null;
     this.behaviors.clear();
     this.attempts.clear();
+    this.remoteHeaders.clear();
     this.processesByNonce.clear();
     this.processes.length = 0;
     this.hungConnects = 0;
@@ -235,6 +243,11 @@ export class FakeMcpServers {
     const key = await this.identify(config.transport);
     const attempt = (this.attempts.get(key) ?? 0) + 1;
     this.attempts.set(key, attempt);
+    if ("type" in config.transport && config.transport.type !== undefined) {
+      const sent = this.remoteHeaders.get(key) ?? [];
+      sent.push(config.transport.headers);
+      this.remoteHeaders.set(key, sent);
+    }
     const source = this.behaviors.get(key);
     if (source === undefined) throw new Error(`no fake MCP server for ${key}`);
     const behavior = typeof source === "function" ? await source(attempt) : source;
