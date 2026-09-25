@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import {
   TASK_CREATE_WAIT_WARNING_MS,
@@ -62,12 +62,18 @@ import {
 import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
-  registerTaskServiceTestRoot,
-  rootDir,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   describe("continuation-aware stream end", () => {
     const model = "openai:gpt-5.5-pro";

@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
@@ -48,15 +48,21 @@ import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
   getTaskToolPart,
-  registerTaskServiceTestRoot,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
-  rootDir,
   upsertTestSubagentReports,
   writePendingBestOfParentPartial,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("parent stream-end rechecks cleanup for reported best-of children", async () => {
     const config = await createTestConfig(rootDir);
@@ -1400,6 +1406,7 @@ describe("TaskService", () => {
     const createdAt = new Date(partialTimestamp + 60_000).toISOString();
 
     const { config, partialService, taskService } = await createBestOfTaskServiceTestHarness({
+      rootDir,
       parentId,
       children: [
         {

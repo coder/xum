@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
@@ -38,9 +38,9 @@ import {
 import {
   createTaskServiceHarness,
   registerLiveWorkspaceTurnHandle,
-  registerTaskServiceTestRoot,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   reserveFamilyMessageTargetSlots,
-  rootDir,
 } from "@/node/services/taskService.shared.testHarness";
 
 /**
@@ -75,7 +75,13 @@ function simulateAcceptedFamilySends(
 }
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   describe("listInstanceWorkspaces", () => {
     test.each([undefined, null, "", " padded ", 42])(

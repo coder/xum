@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { existsSync } from "fs";
 import type { Config } from "@/node/config";
@@ -29,12 +29,18 @@ import {
   createAgentTask,
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
-  registerTaskServiceTestRoot,
-  rootDir,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("resolveTaskAISettings preserves explicit gateway model identities", async () => {
     const config = await createTestConfig(rootDir);

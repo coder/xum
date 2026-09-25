@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { existsSync } from "fs";
 import { execSync } from "node:child_process";
@@ -50,15 +50,21 @@ import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
   getTaskToolPart,
-  registerTaskServiceTestRoot,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
-  rootDir,
   upsertTestSubagentReports,
   writePendingBestOfParentPartial,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   describe("backgroundForegroundWaitsForWorkspace", () => {
     test("rejects opted-in foreground waiters with ForegroundWaitBackgroundedError", async () => {
@@ -1417,6 +1423,7 @@ describe("TaskService", () => {
 
     const { config, historyService, partialService, taskService, remove } =
       await createBestOfTaskServiceTestHarness({
+        rootDir,
         parentId,
         children: [
           {
@@ -1494,6 +1501,7 @@ describe("TaskService", () => {
 
     const { config, historyService, partialService, taskService } =
       await createBestOfTaskServiceTestHarness({
+        rootDir,
         parentId,
         children: [
           {
@@ -1601,6 +1609,7 @@ describe("TaskService", () => {
 
     const { config, historyService, partialService, taskService } =
       await createBestOfTaskServiceTestHarness({
+        rootDir,
         parentId,
         children: [
           {
@@ -1728,6 +1737,7 @@ describe("TaskService", () => {
 
       const { config, historyService, partialService, taskService, remove } =
         await createBestOfTaskServiceTestHarness({
+          rootDir,
           parentId,
           children: [
             {
@@ -1807,6 +1817,7 @@ describe("TaskService", () => {
 
     const { config, historyService, partialService, taskService } =
       await createBestOfTaskServiceTestHarness({
+        rootDir,
         parentId,
         children: [
           {
