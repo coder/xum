@@ -33,8 +33,8 @@ describe("Known Models Integration", () => {
     ["opus", /^anthropic:claude-opus-/],
     ["sonnet", /^anthropic:claude-sonnet-/],
     ["haiku", /^anthropic:claude-haiku-/],
-    // The flagship alias stays off the pricier Astra tier (Astra is additive).
-    ["gpt", /^openai:gpt-(?!.*astra)/],
+    ["gpt", /^openai:gpt-[\d.]+-sol$/],
+    ["gpt-pro", /^openai:gpt-[\d.]+-pro$/],
     // GPT tier names users type with /model (tier, not version, so they survive releases).
     ["sol", /^openai:gpt-[\d.]+-sol$/],
     ["terra", /^openai:gpt-[\d.]+-terra$/],
@@ -50,6 +50,11 @@ describe("Known Models Integration", () => {
     ["glm-flash", /^zai:glm-.*flash/],
   ])("user-facing alias %s resolves within its model family", (alias, family) => {
     expect(MODEL_ABBREVIATIONS[alias]).toMatch(family);
+  });
+
+  // The flagship alias follows the Sol tier, never the pricier Astra tier (Astra is additive).
+  test("gpt alias tracks the same model as sol", () => {
+    expect(MODEL_ABBREVIATIONS.gpt).toBe(MODEL_ABBREVIATIONS.sol);
   });
 
   // Exact-id lookup for retired-but-documented custom model strings must keep
