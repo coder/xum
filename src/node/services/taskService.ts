@@ -17377,6 +17377,19 @@ export class TaskService implements AgentTaskIntegration {
         };
       }
 
+      // A rejected report is no terminal report: the attempt continues. Decide the reporting
+      // stream's pending decision before the completion prompt, as handleStreamEnd does for any
+      // other non-report end: the prompt's admission reads a still-pending decision for its
+      // attempt as stale and is refused, leaving the workflow step awaiting a report forever.
+      this.resolveStreamEndDecision(
+        childWorkspaceId,
+        this.findPendingStreamEndDecision(
+          childWorkspaceId,
+          reportedAttempt,
+          reportedAttempt == null ? (reportedAttemptId ?? undefined) : undefined
+        ),
+        "nonreport"
+      );
       await this.editActiveWorkspaceEntry(
         childWorkspaceId,
         (ws) => {
