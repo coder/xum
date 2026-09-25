@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { MuxMessage } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import assert from "@/common/utils/assert";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -93,6 +94,10 @@ function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
   }
 
   for (const message of messages) {
+    // Model-hidden rows (plan-review snapshot/resolve/reopen records) never reach provider
+    // requests; this direct streamText path must not forward their repository/model-influenced
+    // content to the Dream model and into persistent memory either.
+    if (isModelHiddenMessage(message)) continue;
     const formatted = formatMessageForHarvest(message);
     const nextMessages = [...currentMessages, formatted];
     const nextTranscript = JSON.stringify(nextMessages, null, 2);
