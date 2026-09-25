@@ -6,6 +6,8 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 import type { APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
+import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import * as ActualModelPreferenceRepairModule from "@/browser/utils/modelPreferenceRepair";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
@@ -35,6 +37,15 @@ function installTestDoubles() {
 let repairRemovedProviderMock = mock(
   (_provider: string, _workspaceIds: Iterable<string>) => undefined
 );
+
+// Snapshot the real exports before any mock below replaces them: the namespace import is a live
+// binding, so restoring from it would republish the mock into later test files.
+const actualSelectPrimitiveModule = { ...ActualSelectPrimitiveModule };
+restoreModulesAfterSuite([
+  ["@/browser/components/SelectPrimitive/SelectPrimitive", actualSelectPrimitiveModule],
+  ["@/browser/utils/modelPreferenceRepair", { ...ActualModelPreferenceRepairModule }],
+  ["@/browser/hooks/useProvidersConfig", { ...ActualProvidersConfigModule }],
+]);
 
 // Radix Select portals its dropdown content, which happy-dom cannot render;
 // swap in the conditional-rendering double so option clicks work.
@@ -252,7 +263,7 @@ describe("ProvidersSection", () => {
     // restore the real SelectPrimitive for other test files.
     void mock.module(
       "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
+      () => actualSelectPrimitiveModule
     );
     providersConfigMock = null;
     restoreDom?.();

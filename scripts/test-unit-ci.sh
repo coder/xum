@@ -76,15 +76,6 @@ isolated_unit_tests=(
   # fail", exit 133) as this file started on main run 35782976621, with zero
   # failing assertions; isolation gets it the signal-exit retry below.
   src/node/services/mcpIconDecodeClient.test.ts
-  # Its file-scope mock.module overlays WorkspaceStore's subscribeDerived with a local
-  # listener set, and Bun keeps module mocks for every later file in the process:
-  # ModelsSection.discovery.test.tsx then times out on every test when it runs after
-  # this file (reproduced with a two-import file). Surfaced by a shard reshuffle on #4469.
-  src/browser/features/RightSidebar/Workflows/WorkflowTimeline.test.tsx
-  # The victim of leaks like the one above has more than one polluter
-  # (AutoModelRoutingExperimentConfig.test.tsx also breaks it; two-file repro on bun 1.3.5),
-  # so isolate it rather than chase each shard reshuffle (#4524).
-  src/browser/features/Settings/Sections/ModelsSection.discovery.test.tsx
   # Guards the DOM harness itself by deliberately poisoning process globals
   # (document/window set to undefined, a replaced baseline window), which would
   # perturb later suites in a shared process.

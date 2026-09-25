@@ -28,6 +28,7 @@ const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
 let mockProvidersConfig: ProvidersConfigMap | null = null;
 const actualModelSelectorModule = { ...ActualModelSelectorModule };
 const actualWorkspaceContextModule = { ...ActualWorkspaceContextModule };
+const actualSelectPrimitiveModule = { ...ActualSelectPrimitiveModule };
 // Settings renders inside the workspace shell; the panel resolves the billed workspace through
 // its metadata map. selectedWorkspace is null on /settings, as in the app.
 const SETTINGS_WORKSPACE = {
@@ -164,7 +165,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     );
     await mock.module(
       "@/browser/components/SelectPrimitive/SelectPrimitive",
-      () => ActualSelectPrimitiveModule
+      () => actualSelectPrimitiveModule
     );
   });
 

@@ -5,10 +5,22 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { APIContext } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import * as OriginalWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as OriginalWorkflowToolSharedModule from "@/browser/features/Tools/WorkflowToolShared";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 import { installDom } from "../../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+
+// Restore the real modules once this suite ends: the overlay below otherwise stays registered
+// for every later file in the bun process (ModelsSection.discovery timed out behind it).
+// Spread before mocking; the namespace imports are live bindings the mocks would replace.
+restoreModulesAfterSuite([
+  ["@/browser/stores/WorkspaceStore", { ...OriginalWorkspaceStoreModule }],
+  ["@/browser/features/Tools/WorkflowToolShared", { ...OriginalWorkflowToolSharedModule }],
+]);
+
 void mock.module("@/browser/features/Tools/WorkflowToolShared", () => ({
   WorkflowJsonBlock: (props: { value: unknown; ariaLabel: string }) => (
     <pre aria-label={props.ariaLabel}>{JSON.stringify(props.value)}</pre>
@@ -24,11 +36,8 @@ const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
-// Spread the real module and overlay (not replace) the raw store: bun evaluates every test
-// file before running tests and static import bindings freeze at eval time, so this
-// file-scope mock is what any later-evaluated file in the same bun process gets forever.
-// Replacing the whole module (or exposing a bare fake missing store methods) breaks those
-// files' cleanup and cascades into unrelated CI failures.
+// Spread the real module and overlay (not replace) the raw store, so code this suite does not
+// control keeps working against a complete store while the mock is registered.
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useWorkspaceStoreRaw: () =>
