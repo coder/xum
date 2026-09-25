@@ -137,6 +137,14 @@ interface HistoryPublicationObserver {
   onCommitted: () => undefined;
 }
 
+/** Timing hooks for onChat replay instrumentation (#4504). Observes only; never alters the read. */
+export interface HistoryReadObserver {
+  /** Called first thing inside the workspace file-lock critical section. */
+  onLockAcquired?: () => void;
+  /** Raw bytes of the active epoch read from disk (called once per file read). */
+  onBytesRead?: (bytes: number) => void;
+}
+
 interface HistoryRewriteRow {
   raw: Buffer;
   message: MuxMessage | undefined;
@@ -1427,9 +1435,11 @@ export class HistoryService {
 
   private async withRecoveredHistoryLock<T>(
     workspaceId: string,
-    operation: () => Promise<T>
+    operation: () => Promise<T>,
+    onLockAcquired?: () => void
   ): Promise<T> {
     return this.fileLocks.withLock(workspaceId, async () => {
+      onLockAcquired?.();
       await this.recoverTruncateTransactionForReads(workspaceId);
       return operation();
     });
@@ -2521,10 +2531,16 @@ export class HistoryService {
    * Prefer this over iterateFullHistory() for provider-request assembly and any path
    * that only needs the active compaction epoch.
    */
-  async getHistoryFromLatestBoundary(workspaceId: string, skip = 0): Promise<Result<MuxMessage[]>> {
+  async getHistoryFromLatestBoundary(
+    workspaceId: string,
+    skip = 0,
+    observer?: HistoryReadObserver
+  ): Promise<Result<MuxMessage[]>> {
     try {
-      return await this.withRecoveredHistoryLock(workspaceId, () =>
-        this.getHistoryFromLatestBoundaryUnlocked(workspaceId, skip)
+      return await this.withRecoveredHistoryLock(
+        workspaceId,
+        () => this.getHistoryFromLatestBoundaryUnlocked(workspaceId, skip, observer?.onBytesRead),
+        observer?.onLockAcquired
       );
     } catch (error) {
       const message = getErrorMessage(error);
@@ -2556,7 +2572,8 @@ export class HistoryService {
 
   private async getHistoryFromLatestBoundaryUnlocked(
     workspaceId: string,
-    skip: number
+    skip: number,
+    onBytesRead?: (bytes: number) => void
   ): Promise<Result<MuxMessage[]>> {
     // One-time lazy migration: seal any pre-boundary prefix left in chat.jsonl
     // by older builds so this read (and every later one) stays O(active epoch).
@@ -2570,7 +2587,8 @@ export class HistoryService {
           chat: this.getChatHistoryPath(workspaceId),
           archive: this.getChatArchivePath(workspaceId),
         },
-        skip
+        skip,
+        { onBytesRead }
       )
     );
   }

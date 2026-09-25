@@ -348,7 +348,8 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
   skip: number,
   project?: (value: unknown) => Row | null,
   includeReadableResetFloor = false,
-  clampToOldest = true
+  clampToOldest = true,
+  onBytesRead?: (bytes: number) => void
 ): Promise<{ messages: Row[]; boundary: PendingBoundary; boundaryPublicationId?: string }> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
@@ -382,6 +383,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
       const buffer = Buffer.alloc(file.size - offset);
       const read = await file.handle.read(buffer, 0, buffer.length, offset);
       if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
+      onBytesRead?.(read.bytesRead);
       const messages: Row[] = [];
       for (const line of buffer.toString("utf8").split("\n")) {
         if (!line.trim()) continue;
@@ -441,13 +443,17 @@ export function readProviderHistoryFromLatestBoundary(
   options?: {
     /** Mutation classification needs the excluded floor itself; provider requests leave this off. */
     includeReadableResetFloor?: boolean;
+    /** Replay timing (#4504): raw tail bytes read from disk, reported per file read. */
+    onBytesRead?: (bytes: number) => void;
   }
 ): Promise<MuxMessage[]> {
   return readHistoryProjectionFromLatestBoundary(
     paths,
     skip,
     (value) => (isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null),
-    options?.includeReadableResetFloor
+    options?.includeReadableResetFloor,
+    undefined,
+    options?.onBytesRead
   ).then((view) => view.messages);
 }
 
