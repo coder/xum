@@ -53,12 +53,12 @@ import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
 import type { AvailableModel } from "@/common/types/tools";
 import type { SendMessageError } from "@/common/types/errors";
-import type {
+import {
   StreamManager,
-  TurnCompletion,
-  TurnEngineEvent,
-  TurnExecutionOptions,
-  TurnStreamHandle,
+  type TurnCompletion,
+  type TurnEngineEvent,
+  type TurnExecutionOptions,
+  type TurnStreamHandle,
 } from "./streamManager";
 import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
@@ -85,8 +85,21 @@ interface BasicAIServiceParts {
   initStateManager: InitStateManager;
   providerService: ProviderService;
   providersConfigStore: ProvidersConfigStore;
+  streamManager: StreamManager;
   service: AIService;
 }
+
+/**
+ * Captured before any test spies on the prototype, so a test can route a
+ * spied resolveAndCreateModel back to real model creation.
+ */
+const realResolveAndCreateModel: (
+  this: ProviderModelFactory,
+  ...args: Parameters<ProviderModelFactory["resolveAndCreateModel"]>
+) => ReturnType<ProviderModelFactory["resolveAndCreateModel"]> =
+  // Deliberately unbound: bun invokes spy implementations with the instance as `this`.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  ProviderModelFactory.prototype.resolveAndCreateModel;
 
 type GeneratePrompt = Array<{
   role: "system" | "user";
@@ -118,6 +131,8 @@ function createBasicAIService(
     devToolsService?: DevToolsService;
     experimentsService?: ExperimentsService;
     policyService?: PolicyService;
+    /** Called with the engine before AIService wires its event sink into it. */
+    onStreamManager?: (streamManager: StreamManager) => void;
   }
 ): BasicAIServiceParts {
   const config = new Config(root);
@@ -125,6 +140,11 @@ function createBasicAIService(
   const initStateManager = new InitStateManager(config);
   const providersConfigStore = new ProvidersConfigStore(config.rootDir);
   const providerService = new ProviderService(config, undefined, providersConfigStore);
+  // Same construction as AIService's default engine, injected so tests reach it publicly.
+  const streamManager = new StreamManager(historyService, options?.sessionUsageService, () =>
+    providerService.getConfig()
+  );
+  options?.onStreamManager?.(streamManager);
   const service = new AIService(
     config,
     historyService,
@@ -137,7 +157,7 @@ function createBasicAIService(
     undefined,
     options?.devToolsService,
     options?.experimentsService,
-    undefined,
+    streamManager,
     undefined,
     providersConfigStore
   );
@@ -147,6 +167,7 @@ function createBasicAIService(
     initStateManager,
     providerService,
     providersConfigStore,
+    streamManager,
     service,
   };
 }
@@ -302,8 +323,13 @@ function modelIdFromModelString(modelString: string): string {
   return modelString.includes(":") ? (modelString.split(":").at(1) ?? modelString) : modelString;
 }
 
+type ResolveAndCreateModelSpy = ReturnType<
+  typeof spyOn<ProviderModelFactory, "resolveAndCreateModel">
+>;
+
 function stubCommonStreamMessageDependencies(args: {
   service: AIService;
+  streamManager: StreamManager;
   config: Config;
   historyService: HistoryService;
   initStateManager: InitStateManager;
@@ -329,7 +355,13 @@ function stubCommonStreamMessageDependencies(args: {
   onResolveAgentForStream?: (
     args: Parameters<typeof agentResolution.resolveAgentForStream>[0]
   ) => void;
-}): ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">> {
+  /** Model the stubbed factory returns (default: an inert object). */
+  model?: LanguageModel;
+}): {
+  getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
+  /** Prototype spy (AIService builds its factory internally); tests may re-point it. */
+  resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
+} {
   spyOn(agentResolution, "resolveAgentForStream").mockImplementation((resolveArgs) => {
     args.onResolveAgentForStream?.(resolveArgs);
     return Promise.resolve(resolvedAgentResultFor(args.metadata));
@@ -375,34 +407,31 @@ function stubCommonStreamMessageDependencies(args: {
     return {};
   });
 
-  const providerModelFactory = Reflect.get(args.service, "providerModelFactory") as
-    | ProviderModelFactory
-    | undefined;
-  if (!providerModelFactory) {
-    throw new Error("Expected AIService.providerModelFactory in streamMessage test harness");
-  }
-  spyOn(providerModelFactory, "resolveAndCreateModel").mockImplementation(
-    (requestedModelString) => {
-      const canonicalModelString = args.useRequestedModelString
-        ? requestedModelString
-        : (args.effectiveModelString ?? "openai:gpt-5.2");
-      return Promise.resolve({
-        success: true,
-        data: {
-          model: Object.create(null) as LanguageModel,
-          effectiveModelString: canonicalModelString,
-          canonicalModelString,
-          canonicalProviderName:
-            args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
-          canonicalModelId: args.canonicalModelId ?? modelIdFromModelString(canonicalModelString),
-          wireProviderName:
-            args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
-          routedThroughGateway: false,
-          ...(args.routeProvider != null ? { routeProvider: args.routeProvider } : {}),
-        },
-      });
-    }
-  );
+  // AIService constructs its ProviderModelFactory internally, so the stub goes on
+  // the prototype; each describe's afterEach mock.restore() removes it.
+  const resolveAndCreateModelSpy = spyOn(
+    ProviderModelFactory.prototype,
+    "resolveAndCreateModel"
+  ).mockImplementation((requestedModelString) => {
+    const canonicalModelString = args.useRequestedModelString
+      ? requestedModelString
+      : (args.effectiveModelString ?? "openai:gpt-5.2");
+    return Promise.resolve({
+      success: true,
+      data: {
+        model: args.model ?? (Object.create(null) as LanguageModel),
+        effectiveModelString: canonicalModelString,
+        canonicalModelString,
+        canonicalProviderName:
+          args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
+        canonicalModelId: args.canonicalModelId ?? modelIdFromModelString(canonicalModelString),
+        wireProviderName:
+          args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
+        routedThroughGateway: false,
+        ...(args.routeProvider != null ? { routeProvider: args.routeProvider } : {}),
+      },
+    });
+  });
   spyOn(args.service, "getWorkspaceMetadata").mockResolvedValue({
     success: true,
     data: args.metadata,
@@ -418,7 +447,7 @@ function stubCommonStreamMessageDependencies(args: {
     return Promise.resolve({ success: true, data: undefined });
   });
 
-  const streamManager = (args.service as unknown as { streamManager: StreamManager }).streamManager;
+  const streamManager = args.streamManager;
   const streamToken = "stream-token" as ReturnType<StreamManager["generateStreamToken"]>;
   spyOn(streamManager, "generateStreamToken").mockReturnValue(streamToken);
   spyOn(streamManager, "createTempDirForStream").mockResolvedValue(
@@ -443,7 +472,7 @@ function stubCommonStreamMessageDependencies(args: {
   };
   spyOn(streamManager, "startStream").mockImplementation(stubStartStream);
 
-  return getToolsForModelSpy;
+  return { getToolsForModelSpy, resolveAndCreateModelSpy };
 }
 
 describe("AIService workspace metadata lookup", () => {
@@ -482,33 +511,79 @@ describe("AIService workspace metadata lookup", () => {
 });
 
 describe("AIService turn engine events", () => {
-  interface ForwardingInternals {
-    emitEngineEvent: (event: TurnEngineEvent) => void | Promise<void>;
-    pendingDevToolsRunMetadataByMessageId: Map<string, { workspaceId: string; metadataId: string }>;
-  }
+  const workspaceId = "workspace-1";
 
-  function createForwardingHarness(tempDirName: string): {
+  async function createForwardingHarness(tempDirName: string): Promise<{
     historyService: HistoryService;
     service: AIService;
-    internals: ForwardingInternals;
+    /** The sink AIService installed on its engine (production wiring, not a private hook). */
+    emitEngineEvent: (event: TurnEngineEvent) => void | Promise<void>;
+    /** Message id of a turn whose DevTools run metadata AIService is tracking. */
+    trackedMessageId: string;
     clearPendingRunMetadataSpy: ReturnType<typeof mock>;
     [Symbol.dispose]: () => void;
-  } {
+  }> {
     const xumHome = new DisposableTempDir(tempDirName);
     const clearPendingRunMetadataSpy = mock(
       (_workspaceId: string, _metadataId?: string) => undefined
     );
     const devToolsService = {
       enabled: true,
+      setPendingRunMetadata: mock(() => undefined),
       clearPendingRunMetadata: clearPendingRunMetadataSpy,
     } as unknown as DevToolsService;
-    const { historyService, service } = createBasicAIService(xumHome.path, { devToolsService });
+    let setEventSinkSpy: ReturnType<typeof spyOn<StreamManager, "setEventSink">> | undefined;
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHome.path, {
+        devToolsService,
+        onStreamManager: (engine) => {
+          setEventSinkSpy = spyOn(engine, "setEventSink");
+        },
+      });
+    const sink = setEventSinkSpy?.mock.calls[0]?.[0];
+    if (!sink) throw new Error("Expected AIService to install its engine event sink");
+
+    // Track run metadata through a real turn: DevTools correlation is queued only
+    // for a LanguageModelV4 model, keyed by the turn's assistant message id.
+    const startStreamCalls: TurnExecutionOptions[] = [];
+    stubCommonStreamMessageDependencies({
+      service,
+      streamManager,
+      config,
+      historyService,
+      initStateManager,
+      metadata: createLocalWorkspaceMetadata(workspaceId, xumHome.path),
+      startStreamCalls,
+      model: { specificationVersion: "v4" } as unknown as LanguageModel,
+    });
+    const result = await service.streamMessage({
+      messages: [createMuxMessage("user-message", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+    const trackedMessageId = startStreamCalls[0]?.messageId;
+    if (!trackedMessageId) throw new Error("Expected the turn to start a stream");
+    expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
+
     return {
       historyService,
       service,
-      internals: service as unknown as ForwardingInternals,
+      emitEngineEvent: sink,
+      trackedMessageId,
       clearPendingRunMetadataSpy,
       [Symbol.dispose]: () => xumHome[Symbol.dispose](),
+    };
+  }
+
+  function laterStreamEnd(messageId: string): StreamEndEvent {
+    return {
+      type: "stream-end",
+      workspaceId,
+      messageId,
+      metadata: { model: "openai:gpt-5.2" },
+      parts: [],
     };
   }
 
@@ -517,97 +592,103 @@ describe("AIService turn engine events", () => {
   });
 
   it("forwards stream-abort without mutating a workspace partial", async () => {
-    using harness = createForwardingHarness("ai-service-stream-abort-forwarding");
-    const { historyService, service, internals, clearPendingRunMetadataSpy } = harness;
+    using harness = await createForwardingHarness("ai-service-stream-abort-forwarding");
+    const { historyService, service, emitEngineEvent, trackedMessageId } = harness;
+    const { clearPendingRunMetadataSpy } = harness;
     const cleanupError = new Error("disk full");
     const deletePartialSpy = spyOn(historyService, "deletePartial").mockImplementation(() =>
       Promise.reject(cleanupError)
     );
     const abortEvent: StreamAbortEvent = {
       type: "stream-abort",
-      workspaceId: "workspace-1",
-      messageId: "message-1",
+      workspaceId,
+      messageId: trackedMessageId,
       abandonPartial: true,
     };
-    internals.pendingDevToolsRunMetadataByMessageId.set(abortEvent.messageId, {
-      workspaceId: abortEvent.workspaceId,
-      metadataId: "metadata-1",
-    });
 
     const forwardedAbortPromise = new Promise<StreamAbortEvent>((resolve) => {
       service.once("stream-abort", (event) => resolve(event as StreamAbortEvent));
     });
-    await internals.emitEngineEvent(abortEvent);
+    await emitEngineEvent(abortEvent);
 
     expect(await forwardedAbortPromise).toEqual(abortEvent);
     expect(deletePartialSpy).not.toHaveBeenCalled();
-    expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(abortEvent.workspaceId, "metadata-1");
-    expect(internals.pendingDevToolsRunMetadataByMessageId.has(abortEvent.messageId)).toBe(false);
+    expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(workspaceId, "stream-token");
+    // The tracked entry is gone: a later terminal event clears nothing more.
+    await emitEngineEvent(laterStreamEnd(trackedMessageId));
+    expect(clearPendingRunMetadataSpy).toHaveBeenCalledTimes(1);
   });
 
   it.each([
     {
       name: "stream error clears tracked metadata",
       eventName: "error" as const,
-      event: {
-        type: "error" as const,
-        workspaceId: "workspace-1",
-        messageId: "message-1",
-        error: "request failed",
-        errorType: "rate_limit" as const,
-      } satisfies ErrorEvent,
+      event: (messageId: string) =>
+        ({
+          type: "error" as const,
+          workspaceId,
+          messageId,
+          error: "request failed",
+          errorType: "rate_limit" as const,
+        }) satisfies ErrorEvent,
       expectCleared: true,
     },
     {
       name: "stream-end clears tracked metadata",
       eventName: "stream-end" as const,
-      event: {
-        type: "stream-end" as const,
-        workspaceId: "workspace-1",
-        messageId: "message-1",
-        metadata: { model: "anthropic:claude-opus-4-1" },
-        parts: [],
-      } satisfies StreamEndEvent,
+      event: (messageId: string) => laterStreamEnd(messageId),
       expectCleared: true,
     },
     {
       name: "stream-abort with empty messageId leaves unrelated metadata",
       eventName: "stream-abort" as const,
-      event: {
-        type: "stream-abort" as const,
-        workspaceId: "workspace-1",
-        messageId: "",
-        abandonPartial: true,
-      } satisfies StreamAbortEvent,
+      event: () =>
+        ({
+          type: "stream-abort" as const,
+          workspaceId,
+          messageId: "",
+          abandonPartial: true,
+        }) satisfies StreamAbortEvent,
       expectCleared: false,
     },
   ])("devtools run metadata: $name", async ({ eventName, event, expectCleared }) => {
-    using harness = createForwardingHarness(`ai-service-${eventName}-devtools-cleanup`);
-    const { service, internals, clearPendingRunMetadataSpy } = harness;
-    const trackedMessageId = event.messageId || "message-1";
-    internals.pendingDevToolsRunMetadataByMessageId.set(trackedMessageId, {
-      workspaceId: event.workspaceId,
-      metadataId: "metadata-1",
-    });
+    using harness = await createForwardingHarness(`ai-service-${eventName}-devtools-cleanup`);
+    const { service, emitEngineEvent, trackedMessageId, clearPendingRunMetadataSpy } = harness;
+    const engineEvent = event(trackedMessageId);
 
-    const forwardedPromise = new Promise<typeof event>((resolve) => {
-      service.once(eventName, (forwarded) => resolve(forwarded as typeof event));
+    const forwardedPromise = new Promise<typeof engineEvent>((resolve) => {
+      service.once(eventName, (forwarded) => resolve(forwarded as typeof engineEvent));
     });
-    await internals.emitEngineEvent(event);
+    await emitEngineEvent(engineEvent);
 
-    expect(await forwardedPromise).toEqual(event);
+    expect(await forwardedPromise).toEqual(engineEvent);
     if (expectCleared) {
-      expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(event.workspaceId, "metadata-1");
+      expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(workspaceId, "stream-token");
     } else {
       expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
     }
-    expect(internals.pendingDevToolsRunMetadataByMessageId.has(trackedMessageId)).toBe(
-      !expectCleared
-    );
+    // A later terminal event for the tracked message clears only a still-tracked entry.
+    await emitEngineEvent(laterStreamEnd(trackedMessageId));
+    expect(clearPendingRunMetadataSpy).toHaveBeenCalledTimes(1);
+    expect(clearPendingRunMetadataSpy).toHaveBeenLastCalledWith(workspaceId, "stream-token");
   });
 });
 
 describe("AIService.resolveGatewayModelString", () => {
+  // resolveGatewayModelString is public on ProviderModelFactory, which AIService
+  // builds privately; build one from the same collaborators AIService wires in.
+  function createGatewayResolver(root: string): ProviderModelFactory {
+    const { config, providerService, providersConfigStore, service } = createBasicAIService(root);
+    return new ProviderModelFactory(
+      config,
+      providerService,
+      undefined,
+      service.turnRequestBuilderBindings,
+      undefined,
+      providersConfigStore
+    );
+  }
+
   it("routes allowlisted models when gateway is enabled + configured", async () => {
     using xumHome = new DisposableTempDir("gateway-routing");
 
@@ -619,10 +700,9 @@ describe("AIService.resolveGatewayModelString", () => {
       "mux-gateway": { couponCode: "test-coupon" },
     });
 
-    const service = createBasicAIService(xumHome.path).service;
+    const factory = createGatewayResolver(xumHome.path);
 
-    // @ts-expect-error - accessing private field for testing
-    const resolved = service.providerModelFactory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+    const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
 
     expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.SONNET.id));
   });
@@ -641,10 +721,9 @@ describe("AIService.resolveGatewayModelString", () => {
       },
     });
 
-    const service = createBasicAIService(xumHome.path).service;
+    const factory = createGatewayResolver(xumHome.path);
 
-    // @ts-expect-error - accessing private field for testing
-    const resolved = service.providerModelFactory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+    const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
 
     expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
   });
@@ -657,10 +736,9 @@ describe("AIService.resolveGatewayModelString", () => {
       muxGatewayModels: [KNOWN_MODELS.SONNET.id],
     });
 
-    const service = createBasicAIService(xumHome.path).service;
+    const factory = createGatewayResolver(xumHome.path);
 
-    // @ts-expect-error - accessing private field for testing
-    const resolved = service.providerModelFactory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+    const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
 
     expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
   });
@@ -677,10 +755,9 @@ describe("AIService.resolveGatewayModelString", () => {
       "mux-gateway": { couponCode: "test-coupon" },
     });
 
-    const service = createBasicAIService(xumHome.path).service;
+    const factory = createGatewayResolver(xumHome.path);
 
-    // @ts-expect-error - accessing private field for testing
-    const resolved = service.providerModelFactory.resolveGatewayModelString(modelString);
+    const resolved = factory.resolveGatewayModelString(modelString);
 
     expect(resolved).toBe(modelString);
   });
@@ -697,13 +774,9 @@ describe("AIService.resolveGatewayModelString", () => {
       "mux-gateway": { couponCode: "test-coupon" },
     });
 
-    const service = createBasicAIService(xumHome.path).service;
+    const factory = createGatewayResolver(xumHome.path);
 
-    // @ts-expect-error - accessing private field for testing
-    const resolved = service.providerModelFactory.resolveGatewayModelString(
-      variant,
-      "xai:grok-4-1-fast"
-    );
+    const resolved = factory.resolveGatewayModelString(variant, "xai:grok-4-1-fast");
 
     expect(resolved).toBe(toGatewayModelString(variant));
   });
@@ -719,14 +792,9 @@ describe("AIService.resolveGatewayModelString", () => {
       "mux-gateway": { couponCode: "test-coupon" },
     });
 
-    const service = createBasicAIService(xumHome.path).service;
+    const factory = createGatewayResolver(xumHome.path);
 
-    // @ts-expect-error - accessing private field for testing
-    const resolved = service.providerModelFactory.resolveGatewayModelString(
-      KNOWN_MODELS.GPT.id,
-      undefined,
-      true
-    );
+    const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.GPT.id, undefined, true);
 
     expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.GPT.id));
   });
@@ -978,6 +1046,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     streamSystemContextDefinitionCaches: unknown[];
     startStreamCalls: TurnExecutionOptions[];
     getToolsForModelSpy: ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">>;
+    resolveAndCreateModelSpy: ResolveAndCreateModelSpy;
+    streamManager: StreamManager;
+    providerService: ProviderService;
   }
 
   function initialMetadataFromStartStreamCall(
@@ -1007,14 +1078,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       policyService?: PolicyService;
     }
   ): StreamMessageHarness {
-    const { config, historyService, initStateManager, service } = createBasicAIService(
-      xumHomePath,
-      {
+    const { config, historyService, initStateManager, providerService, streamManager, service } =
+      createBasicAIService(xumHomePath, {
         sessionUsageService: options?.sessionUsageService,
         experimentsService: options?.experimentsService,
         policyService: options?.policyService,
-      }
-    );
+      });
     const planPayloadMessageIds: string[][] = [];
     const preparedPayloadMessageIds: string[][] = [];
     const preparedToolNamesForSentinel: string[][] = [];
@@ -1030,8 +1099,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const streamSystemContextDefinitionCaches: unknown[] = [];
     const startStreamCalls: TurnExecutionOptions[] = [];
 
-    const getToolsForModelSpy = stubCommonStreamMessageDependencies({
+    const { getToolsForModelSpy, resolveAndCreateModelSpy } = stubCommonStreamMessageDependencies({
       service,
+      streamManager,
       config,
       historyService,
       initStateManager,
@@ -1091,6 +1161,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       streamSystemContextDefinitionCaches,
       startStreamCalls,
       getToolsForModelSpy,
+      resolveAndCreateModelSpy,
+      streamManager,
+      providerService,
     };
   }
 
@@ -2122,11 +2195,13 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(result.success).toBe(true);
       const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1]?.intuitionRuntime;
       if (!runtime) throw new Error("Expected Intuition runtime");
-      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-      const resolve = spyOn(factory, "resolveAndCreateModel").mockImplementation((...args) => {
+      const resolve = harness.resolveAndCreateModelSpy.mockImplementation(function (
+        this: ProviderModelFactory,
+        ...args
+      ) {
         // A concurrent config change must not replace the tool's creation-time snapshot.
         providersStore.saveProvidersConfig({ xai: { enabled: false } });
-        return ProviderModelFactory.prototype.resolveAndCreateModel.apply(factory, args);
+        return realResolveAndCreateModel.apply(this, args);
       });
       const created = await runtime.createModel(runtime.modelString);
       expect(typeof created.model).not.toBe("string");
@@ -2568,10 +2643,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig(providersConfig);
 
     // Use real model creation so authentication participates in the pricing regression.
-    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-    spyOn(factory, "resolveAndCreateModel").mockImplementation(
-      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
-    );
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
     const result = await harness.service.streamMessage({
       messages: [createMuxMessage("latest-user", "user", "continue")],
       workspaceId,
@@ -2758,10 +2830,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     await startAdvisorStream(harness, workspaceId);
     const runtime = harness.getToolsForModelSpy.mock.calls[0]?.[1].advisorRuntime;
     if (!runtime) throw new Error("Expected advisor runtime");
-    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-    spyOn(factory, "resolveAndCreateModel").mockImplementation(
-      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
-    );
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
     const created = await runtime.createModel(testCase.model);
     providersStore.saveProvidersConfig({
       openai: { apiKey: "changed-key", wireFormat: "responses" },
@@ -2814,8 +2883,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       await startAdvisorStream(harness, workspaceId);
       // Avoid an OAuth exchange; the real option/route adapter below must retain
       // the selected instance instead of re-resolving the unrelated "openai" instance.
-      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-      spyOn(factory, "resolveAndCreateModel").mockImplementation(
+      harness.resolveAndCreateModelSpy.mockImplementation(
         (_model, _thinking, options, creation) => {
           expect(creation?.providersConfig?.coder).toMatchObject({
             discoveredProviders: [
@@ -2906,8 +2974,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       // The factory's wire snapshot for a Mantle instance: OpenAI-namespaced
       // models are created as provider.responses(), so tool assembly must key
       // on the Responses wire rather than the instance type's Anthropic default.
-      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-      spyOn(factory, "resolveAndCreateModel").mockResolvedValue({
+      harness.resolveAndCreateModelSpy.mockResolvedValue({
         success: true,
         data: {
           model: Object.create(null) as LanguageModel,
@@ -2971,9 +3038,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         createLocalWorkspaceMetadata(workspaceId, projectPath),
         { useRequestedModelString: true }
       );
-      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
       const requestedModels: string[] = [];
-      spyOn(factory, "resolveAndCreateModel").mockImplementation((requested) => {
+      harness.resolveAndCreateModelSpy.mockImplementation((requested) => {
         requestedModels.push(requested);
         if (failing.has(requested)) {
           return Promise.resolve({ success: false, error: tierModelDenied });
@@ -3395,14 +3461,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     const tools = harness.getToolsForModelSpy.mock.calls[0]?.[1];
     if (!tools?.advisorRuntime || !tools.intuitionRuntime || !tools.reportModelUsage)
       throw new Error("Expected both tool runtimes");
-    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-    spyOn(factory, "resolveAndCreateModel").mockImplementation(
-      ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
-    );
+    harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
     const advisor = await tools.advisorRuntime.createModel(model);
     const intuition = await tools.intuitionRuntime.createModel(model);
-    const streamManager = Reflect.get(harness.service, "streamManager") as StreamManager;
-    const record = spyOn(streamManager, "recordToolModelUsage");
+    const record = spyOn(harness.streamManager, "recordToolModelUsage");
     for (const [toolName, created] of [
       ["advisor", advisor],
       ["intuition", intuition],
@@ -3494,10 +3556,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       const runtime =
         toolName === "advisor" ? toolConfig.advisorRuntime : toolConfig.intuitionRuntime;
       if (!runtime) throw new Error(`Expected ${toolName} runtime`);
-      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
-      const resolveModel = spyOn(factory, "resolveAndCreateModel").mockImplementation(
-        ProviderModelFactory.prototype.resolveAndCreateModel.bind(factory)
-      );
+      const resolveModel =
+        harness.resolveAndCreateModelSpy.mockImplementation(realResolveAndCreateModel);
       const created = await runtime.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
       const creationOptions = resolveModel.mock.calls.at(-1)?.[3];
       expect(creationOptions).toMatchObject({
@@ -3664,7 +3724,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       throw new Error("Expected listAvailableModels on the production tool configuration");
     }
 
-    const providerService = Reflect.get(harness.service, "providerService") as ProviderService;
+    const providerService = harness.providerService;
     const configured = { apiKeySet: true, isEnabled: true, isConfigured: true };
     let providersConfig: ProvidersConfigMap = { anthropic: configured, bedrock: configured };
     spyOn(providerService, "getConfig").mockImplementation(() => providersConfig);
@@ -3768,14 +3828,11 @@ describe("AIService.streamMessage multi-project trust gating", () => {
         ? multiProjectExperimentEnabled
         : false
     );
-    const { config, historyService, initStateManager, service } = createBasicAIService(
-      xumHomePath,
-      {
-        experimentsService,
-      }
-    );
-    const getToolsForModelSpy = stubCommonStreamMessageDependencies({
+    const { config, historyService, initStateManager, streamManager, service } =
+      createBasicAIService(xumHomePath, { experimentsService });
+    const { getToolsForModelSpy } = stubCommonStreamMessageDependencies({
       service,
+      streamManager,
       config,
       historyService,
       initStateManager,
@@ -3913,11 +3970,18 @@ describe("AIService.streamMessage turn envelope", () => {
     metadata: WorkspaceMetadata,
     options?: { allTools?: Record<string, Tool> }
   ): TurnEnvelopeHarness {
-    const { config, historyService, initStateManager, providersConfigStore, service } =
-      createBasicAIService(xumHomePath);
+    const {
+      config,
+      historyService,
+      initStateManager,
+      providersConfigStore,
+      streamManager,
+      service,
+    } = createBasicAIService(xumHomePath);
     const startStreamCalls: TurnExecutionOptions[] = [];
     stubCommonStreamMessageDependencies({
       service,
+      streamManager,
       config,
       historyService,
       initStateManager,
