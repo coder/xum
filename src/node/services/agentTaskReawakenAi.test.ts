@@ -138,6 +138,19 @@ describe("planReawakenAi", () => {
     expect(result.snapshot.thinkingLevel).toBe("low");
   });
 
+  it("keeps the persisted reasoning mode when the task has no active-agent bucket yet", () => {
+    const result = plan(
+      makeConfig({
+        child: {
+          aiSettingsByAgent: undefined,
+          aiSettings: { model: MODEL_A, thinkingLevel: "medium", reasoningMode: "pro" },
+        },
+      })
+    );
+    if (result.kind !== "resolved") throw new Error(`unexpected ${result.kind}`);
+    expect(result.snapshot.reasoningMode).toBe("pro");
+  });
+
   it("keeps pinned fields over configured defaults", () => {
     const result = plan(
       makeConfig({

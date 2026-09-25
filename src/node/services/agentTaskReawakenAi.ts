@@ -249,8 +249,12 @@ export function planReawakenAi(params: {
     model: coerceNonEmptyString(bucket?.model) ?? coerceNonEmptyString(child.taskModelString),
     thinkingLevel:
       coerceThinkingLevel(bucket?.thinkingLevel) ?? coerceThinkingLevel(child.taskThinkingLevel),
+    // Without an active-agent bucket (the task went inactive before its first send), the
+    // creation-time choice lives only in the persisted aiSettings.
     reasoningMode:
-      bucket != null ? (coerceOpenAIReasoningMode(bucket.reasoningMode) ?? "standard") : undefined,
+      bucket != null
+        ? (coerceOpenAIReasoningMode(bucket.reasoningMode) ?? "standard")
+        : coerceOpenAIReasoningMode(child.aiSettings?.reasoningMode),
   };
   const pinsLayer = taskAiPinsToLayer(child.taskAiPins);
   const layers = prepared?.layers ?? null;
