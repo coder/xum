@@ -548,27 +548,4 @@ describe("Auto-follow-up and compaction notification behavior (mock AI router)",
       await cleanup();
     }
   }, 60_000);
-
-  // Note: Force compaction interrupts an active stream. In the real backend, this would send
-  // a stream-abort event and the interrupted stream would NOT trigger a notification.
-  // However, the mock AI completes streams normally (no mid-stream abort simulation),
-  // so the "interrupted" stream's completion still fires a notification.
-  test.skip("force compaction with auto-continue should fire only ONE notification", async () => {
-    const { app, countAfterSeed, cleanup } = await setupNotificationTest(
-      "Seed for force compaction"
-    );
-
-    try {
-      // Force compaction auto-generates a "Continue" message
-      await app.chat.send("[force] Trigger force compaction");
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
-      await app.chat.expectTranscriptContains("Mock response: Continue", 60_000);
-
-      const { newCount, last } = await waitForNewNotifications(countAfterSeed);
-      expect(newCount).toBe(1);
-      expect(last.body).toBe("Mock response: Continue");
-    } finally {
-      await cleanup();
-    }
-  }, 60_000);
 });

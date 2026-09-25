@@ -493,36 +493,4 @@ git diff HEAD -- tiny-file.ts | grep -q "MODIFIED"`,
       });
     });
   }, 180_000);
-
-  // Skip: happy-dom cleanup issue with React state updates after unmount
-  // The persistence is tested via Storybook stories which use real browser
-  test.skip("expansion state persists across tab switches", async () => {
-    await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
-      await withReviewPanel({ apiClient: env.orpc, metadata }, async (view) => {
-        const container = await setupReviewPanelWithDiff(view, metadata, workspaceId, env.orpc);
-
-        const expandUpButton = await waitForButton(container, "Show more context above");
-        fireEvent.click(expandUpButton);
-        await waitForNotLoading(container, 10_000);
-
-        // Switch away from review tab - use costs tab which is always available
-        const costsTab = container.querySelector('[role="tab"][aria-controls*="costs"]');
-        if (costsTab) fireEvent.click(costsTab);
-
-        // Give time for tab switch
-        await new Promise((r) => setTimeout(r, 500));
-
-        // Switch back to review tab
-        const reviewTab = container.querySelector('[role="tab"][aria-controls*="review"]');
-        if (reviewTab) fireEvent.click(reviewTab);
-
-        await waitFor(
-          () => {
-            expect(getHunk(container)).not.toBeNull();
-          },
-          { timeout: 15_000 }
-        );
-      });
-    });
-  }, 180_000);
 });
