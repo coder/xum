@@ -2,11 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { INSTRUCTION_SCOPE } from "@/common/types/instructions";
-import {
-  gatherInstructionSets,
-  readClaudeCompatGlobalInstructionSet,
-  readInstructionSet,
-} from "./instructionFiles";
+import { readClaudeCompatGlobalInstructionSet, readInstructionSet } from "./instructionFiles";
 
 describe("instructionFiles", () => {
   let tempDir: string;
@@ -218,86 +214,6 @@ describe("instructionFiles", () => {
       const result = await readClaudeCompatGlobalInstructionSet(tempDir);
 
       expect(result?.files.map((file) => file.content)).toEqual(["claude instructions"]);
-    });
-  });
-
-  describe("gatherInstructionSets", () => {
-    it("should return empty array when no instructions exist", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
-
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-      ]);
-      expect(result).toEqual([]);
-    });
-
-    it("should gather instructions from multiple directories", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
-
-      await fs.writeFile(path.join(dir1, "AGENTS.md"), "global instructions");
-      await fs.writeFile(path.join(dir2, "AGENTS.md"), "workspace instructions");
-
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-      ]);
-      expect(result).toHaveLength(2);
-      expect(result[0]?.combinedContent).toBe("global instructions");
-      expect(result[0]?.scope).toBe(INSTRUCTION_SCOPE.GLOBAL);
-      expect(result[1]?.combinedContent).toBe("workspace instructions");
-      expect(result[1]?.scope).toBe(INSTRUCTION_SCOPE.WORKSPACE);
-    });
-
-    it("should include local files in gathered instructions", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
-
-      await fs.writeFile(path.join(dir1, "AGENTS.md"), "global base");
-      await fs.writeFile(path.join(dir1, "AGENTS.local.md"), "global local");
-      await fs.writeFile(path.join(dir2, "AGENTS.md"), "workspace base");
-      await fs.writeFile(path.join(dir2, "AGENTS.local.md"), "workspace local");
-
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-      ]);
-      expect(result.map((s) => s.combinedContent)).toEqual([
-        "global base\n\nglobal local",
-        "workspace base\n\nworkspace local",
-      ]);
-      expect(result[0]?.files).toHaveLength(2);
-      expect(result[1]?.files).toHaveLength(2);
-    });
-
-    it("should skip directories without instruction files", async () => {
-      const dir1 = path.join(tempDir, "dir1");
-      const dir2 = path.join(tempDir, "dir2");
-      const dir3 = path.join(tempDir, "dir3");
-      await fs.mkdir(dir1);
-      await fs.mkdir(dir2);
-      await fs.mkdir(dir3);
-
-      await fs.writeFile(path.join(dir1, "AGENTS.md"), "dir1 content");
-      await fs.writeFile(path.join(dir3, "AGENTS.md"), "dir3 content");
-      // dir2 has no instruction files
-
-      const result = await gatherInstructionSets([
-        { directory: dir1, scope: INSTRUCTION_SCOPE.GLOBAL },
-        { directory: dir2, scope: INSTRUCTION_SCOPE.WORKSPACE },
-        { directory: dir3, scope: INSTRUCTION_SCOPE.PROJECT, projectName: "p3" },
-      ]);
-      expect(result.map((s) => s.combinedContent)).toEqual(["dir1 content", "dir3 content"]);
-      expect(result[1]?.scope).toBe(INSTRUCTION_SCOPE.PROJECT);
-      expect(result[1]?.projectName).toBe("p3");
     });
   });
 });

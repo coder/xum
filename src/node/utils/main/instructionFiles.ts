@@ -304,31 +304,3 @@ export async function readInstructionSetFromRuntime(
 ): Promise<InstructionSet | null> {
   return readInstructionSetWith(createRuntimeFileReader(runtime), directory, scope, projectName);
 }
-
-/**
- * Searches for instruction files across multiple directories in priority order.
- *
- * Each directory is searched for a complete instruction set (base + local).
- * All found instruction sets are returned as separate entries.
- *
- * This allows for layered instructions where:
- * - Global instructions (~/.xum/AGENTS.md) apply to all projects
- * - Project instructions (workspace/AGENTS.md) add project-specific context
- *
- * @param directories - List of (directory, scope, projectName?) tuples in priority order
- * @returns Array of instruction sets (one per directory with instructions)
- */
-export async function gatherInstructionSets(
-  directories: ReadonlyArray<{
-    directory: string;
-    scope: InstructionScope;
-    projectName?: string;
-  }>
-): Promise<InstructionSet[]> {
-  const sets: InstructionSet[] = [];
-  for (const { directory, scope, projectName } of directories) {
-    const set = await readInstructionSet(directory, scope, projectName);
-    if (set) sets.push(set);
-  }
-  return sets;
-}
