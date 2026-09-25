@@ -10032,8 +10032,6 @@ export class AgentSession {
     const proposedContent = this.proposedPlanContents.get(proposalToolCallId);
     this.proposedPlanContents.delete(proposalToolCallId);
     try {
-      // Guard for test mocks that may not implement getWorkspaceMetadata.
-      if (typeof this.aiService.getWorkspaceMetadata !== "function") return;
       const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
       if (captureSignal.aborted) {
         log.debug("plan review: snapshot capture abandoned before the plan read", {

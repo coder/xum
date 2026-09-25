@@ -7,6 +7,7 @@ import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
 import tailwindcss from "eslint-plugin-tailwindcss";
 import tseslint from "typescript-eslint";
+import ts from "typescript";
 
 /**
  * Shared helpers for the rules ported from anti-slop
@@ -271,6 +272,95 @@ function functionBoundary(node) {
  */
 const localPlugin = {
   rules: {
+    "no-required-member-typeof-guard": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            'Disallow `typeof x.member === "function"` guards on members the type declares as required methods',
+        },
+        messages: {
+          required:
+            "`{{member}}` is a required method of `{{owner}}`, so this typeof guard can only fire for an incomplete test double. Complete the double (or make the member optional in the interface if it really is optional).",
+        },
+      },
+      create(context) {
+        // Production code gets real instances through DI; a typeof guard on a member the type
+        // requires is dead there and hides wiring bugs by silently skipping work. Such guards
+        // kept reappearing to tolerate partial test doubles (#4531, #4557).
+        const services = context.sourceCode.parserServices;
+        if (services?.program == null || services.esTreeNodeToTSNodeMap == null) {
+          return {};
+        }
+        const checker = services.program.getTypeChecker();
+        const isAlwaysCallable = (type) => {
+          const parts = type.isUnion() ? type.types : [type];
+          return parts.every(
+            (part) =>
+              (part.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)) ===
+                0 && part.getCallSignatures().length > 0
+          );
+        };
+        return {
+          BinaryExpression(node) {
+            if (!["===", "!==", "==", "!="].includes(node.operator)) return;
+            const typeofSide = node.left.type === "UnaryExpression" ? node.left : node.right;
+            const literalSide = typeofSide === node.left ? node.right : node.left;
+            if (typeofSide.type !== "UnaryExpression" || typeofSide.operator !== "typeof") return;
+            if (literalSide.type !== "Literal" || literalSide.value !== "function") return;
+            const member = typeofSide.argument;
+            if (
+              member.type !== "MemberExpression" ||
+              member.computed ||
+              member.optional ||
+              member.property.type !== "Identifier"
+            ) {
+              return;
+            }
+            // Only injected dependencies (`this.<dep>[.<dep>...].<method>`): feature detection on
+            // runtime/library objects (timers, fetch, streams) stays legitimate.
+            // Also covers the widening-cast alias `const maybe = this.<dep> as Dep & { m?: ... }`.
+            const isThisRooted = (expression) => {
+              let current = expression;
+              while (current.type === "MemberExpression" && !current.computed) {
+                current = current.object;
+              }
+              return current.type === "ThisExpression" && expression.type !== "ThisExpression";
+            };
+            let receiverRooted = isThisRooted(member.object);
+            if (!receiverRooted && member.object.type === "Identifier") {
+              const variable = context.sourceCode
+                .getScope(node)
+                .references.concat(context.sourceCode.getScope(node).through)
+                .find((reference) => reference.identifier === member.object)?.resolved;
+              const init = variable?.defs[0]?.node?.init;
+              receiverRooted = init?.type === "TSAsExpression" && isThisRooted(init.expression);
+            }
+            if (!receiverRooted) return;
+            const objectType = checker.getTypeAtLocation(
+              services.esTreeNodeToTSNodeMap.get(member.object)
+            );
+            // Untyped or loose receivers (any/unknown/index signatures) make the check meaningful.
+            if (objectType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return;
+            const symbol = checker.getPropertyOfType(objectType, member.property.name);
+            if (symbol == null || (symbol.flags & ts.SymbolFlags.Optional) !== 0) return;
+            const memberType = checker.getTypeOfSymbolAtLocation(
+              symbol,
+              services.esTreeNodeToTSNodeMap.get(member.property)
+            );
+            if (!isAlwaysCallable(memberType)) return;
+            context.report({
+              node,
+              messageId: "required",
+              data: {
+                member: member.property.name,
+                owner: checker.typeToString(objectType),
+              },
+            });
+          },
+        };
+      },
+    },
     "no-unsafe-child-process": {
       meta: {
         type: "problem",
@@ -1482,6 +1572,15 @@ export default defineConfig([
     ],
     rules: {
       "no-restricted-syntax": "off",
+    },
+  },
+  {
+    // Backend production code: required-member typeof guards only exist to tolerate partial
+    // test doubles; tests must complete the doubles instead (see the rule's docs).
+    files: ["src/node/services/**/*.ts"],
+    ignores: ["**/*.test.ts", "**/*.testHarness.ts", "**/*.testUtils.ts", "**/test*/**"],
+    rules: {
+      "local/no-required-member-typeof-guard": "error",
     },
   },
   {
