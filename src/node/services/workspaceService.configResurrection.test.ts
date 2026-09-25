@@ -1,17 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { EventEmitter } from "events";
-import * as fs from "fs";
-import * as os from "os";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as path from "path";
 import type { Workspace } from "@/common/types/project";
 import { Config } from "@/node/config";
-import type { AIService } from "./aiService";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { HistoryService } from "./historyService";
-import type { InitStateManager } from "./initStateManager";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
+import {
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
+} from "./workspaceService.testHarness";
 
 /**
  * Regression coverage for the config lost-update resurrection race.
@@ -34,7 +29,7 @@ import { WorkspaceService } from "./workspaceService";
  */
 describe("WorkspaceService config resurrection regression", () => {
   const PROJECT_PATH = "/test/project";
-  let tempDir: string;
+  let harness: WorkspaceServiceHarness;
   let config: Config;
   let service: WorkspaceService;
 
@@ -57,45 +52,17 @@ describe("WorkspaceService config resurrection regression", () => {
 
   /** Re-read the persisted state through a fresh Config so assertions hit disk. */
   function readPersistedWorkspaces(): Workspace[] {
-    const persisted = new Config(tempDir).loadConfigOrDefault();
+    const persisted = new Config(harness.rootDir).loadConfigOrDefault();
     return persisted.projects.get(PROJECT_PATH)?.workspaces ?? [];
   }
 
-  beforeEach(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-resurrection-"));
-    config = new Config(tempDir);
-
-    const historyService = {} as unknown as HistoryService;
-    const aiService = new EventEmitter() as unknown as AIService;
-    service = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      new EventEmitter() as unknown as InitStateManager,
-      {
-        updateRecency: mock(() =>
-          Promise.resolve({
-            recency: Date.now(),
-            streaming: false,
-            lastModel: null,
-            lastThinkingLevel: null,
-            agentStatus: null,
-          })
-        ),
-      } as unknown as ExtensionMetadataService,
-      {} as BackgroundProcessManager
-    );
-    (
-      service as unknown as { emitCurrentWorkspaceMetadata: () => Promise<void> }
-    ).emitCurrentWorkspaceMetadata = mock(() => Promise.resolve());
-    (service as unknown as { updateRecencyTimestamp: () => Promise<void> }).updateRecencyTimestamp =
-      mock(() => Promise.resolve());
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    ({ config, service } = harness);
   });
 
-  afterEach(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    mock.restore();
+  afterEach(async () => {
+    await harness.cleanup();
   });
 
   test("removeWorkspace cannot be resurrected by a concurrent heartbeat write", async () => {

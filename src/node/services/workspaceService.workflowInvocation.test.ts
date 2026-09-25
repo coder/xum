@@ -22,6 +22,12 @@ import {
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
 
+// Partial-truncation fixtures: truncateHistory(0.5) sizes its cut by token counts of the whole
+// serialized rows, so two near-equal rows can round either way and remove both. A clearly
+// larger first row makes 50% remove exactly that row.
+const LONGER_FIRST_ROW_TEXT =
+  "before the cut: this first row is deliberately several times longer than the row kept after it";
+
 describe("WorkspaceService workflow invocation events", () => {
   test("emits workflow slash invocation rows through the active session chat stream", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
@@ -1114,7 +1120,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
       await historyService.appendToHistory(
         workspaceId,
-        createMuxMessage("manual-user", "user", "before truncation", { timestamp: 1_200 })
+        createMuxMessage("manual-user", "user", LONGER_FIRST_ROW_TEXT, { timestamp: 1_200 })
       );
       await historyService.appendToHistory(
         workspaceId,
@@ -1176,7 +1182,7 @@ describe("WorkspaceService workflow invocation events", () => {
       });
       await historyService.appendToHistory(
         workspaceId,
-        createMuxMessage("manual-user", "user", "before truncation", { timestamp: 1_200 })
+        createMuxMessage("manual-user", "user", LONGER_FIRST_ROW_TEXT, { timestamp: 1_200 })
       );
       await historyService.appendToHistory(
         workspaceId,
