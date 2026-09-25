@@ -50,7 +50,10 @@ import {
   createControllableAsyncIterable,
   type ControllableAsyncIterable,
 } from "@/browser/testUtils";
-import type { ResponseCompleteEvent } from "@/browser/utils/messages/responseCompletionMetadata";
+import {
+  shouldNotifyOnResponseComplete,
+  type ResponseCompleteEvent,
+} from "@/browser/utils/messages/responseCompletionMetadata";
 
 interface LoadMoreResponse {
   messages: WorkspaceChatMessage[];
@@ -5383,6 +5386,123 @@ describe("WorkspaceStore", () => {
         finalText: "",
         completion: { kind: "compaction" },
         completedAt: expect.any(Number),
+      });
+    });
+
+    // Regression for #4482: force compaction interrupts the running stream (stream-abort), runs the
+    // compaction turn, then auto-continues. Only the continue turn is a user-facing completion;
+    // the interrupted stream and the compaction boundary must not notify.
+    it("notifies exactly once for a force-compaction interrupt followed by auto-continue", async () => {
+      const workspaceId = "active-workspace-force-compaction-continue";
+      const timestamp = Date.now();
+      const compactionRequest = compactionRequestEvent(
+        "force-compaction-request",
+        compactionFollowUp(),
+        timestamp
+      );
+      mockChatStreamFor(workspaceId, function* () {
+        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
+        yield streamStartEvent(workspaceId, "interrupted-stream", {
+          startTime: timestamp,
+          agentId: "exec",
+        });
+        yield {
+          type: "stream-delta",
+          workspaceId,
+          messageId: "interrupted-stream",
+          delta: "partial answer",
+          timestamp: timestamp + 1,
+        };
+        yield {
+          ...compactionRequest,
+          metadata: { ...compactionRequest.metadata, historySequence: 2 },
+        } as WorkspaceChatMessage;
+        yield {
+          type: "stream-abort",
+          workspaceId,
+          messageId: "interrupted-stream",
+          abortReason: "system",
+          metadata: {},
+        };
+        yield streamStartEvent(workspaceId, "compaction-stream", {
+          historySequence: 3,
+          startTime: timestamp + 2,
+          mode: "compact",
+          agentId: "compact",
+        });
+        yield queuedFollowUpEvent(workspaceId, "continue after compaction");
+        yield {
+          type: "stream-end",
+          workspaceId,
+          messageId: "compaction-stream",
+          metadata: { model: TEST_MODEL },
+          parts: [],
+        };
+        // Compaction replaces history with its summary, then the backend dispatches the queued
+        // continue message as a real user row and drains the queue.
+        yield {
+          type: "message",
+          id: "compaction-summary",
+          role: "assistant",
+          parts: [{ type: "text", text: "Compacted summary" }],
+          metadata: {
+            historySequence: 4,
+            timestamp: timestamp + 3,
+            compacted: "user",
+            compactionBoundary: true,
+            compactionEpoch: 1,
+          },
+        };
+        yield {
+          type: "message",
+          id: "continue-request",
+          role: "user",
+          parts: [{ type: "text", text: "continue after compaction" }],
+          metadata: { historySequence: 5, timestamp: timestamp + 4 },
+        };
+        yield { type: "queued-message-changed", workspaceId, queuedMessages: [], displayText: "" };
+        yield streamStartEvent(workspaceId, "continue-stream", {
+          historySequence: 6,
+          startTime: timestamp + 5,
+          agentId: "exec",
+        });
+        yield {
+          type: "stream-delta",
+          workspaceId,
+          messageId: "continue-stream",
+          delta: "continued answer",
+          timestamp: timestamp + 6,
+        };
+        yield {
+          type: "stream-end",
+          workspaceId,
+          messageId: "continue-stream",
+          metadata: { model: TEST_MODEL },
+          parts: [],
+        };
+      });
+      const onResponseComplete = createResponseCompleteSpy();
+
+      recreateStore(onResponseComplete);
+      createAndAddWorkspace(store, workspaceId);
+      expect(
+        await waitUntil(() =>
+          onResponseComplete.mock.calls.some(([event]) => event.messageId === "continue-stream")
+        )
+      ).toBe(true);
+      // Let any trailing duplicate surface before counting.
+      await tick(10);
+
+      const events = onResponseComplete.mock.calls.map(([event]) => event);
+      expect(events.some((event) => event.messageId === "interrupted-stream")).toBe(false);
+      // Same predicate App.tsx uses to decide whether to show the notification.
+      const notified = events.filter((event) => shouldNotifyOnResponseComplete(event.completion));
+      expect(notified).toHaveLength(1);
+      expect(notified[0]).toMatchObject({
+        workspaceId,
+        messageId: "continue-stream",
+        isFinal: true,
+        finalText: "continued answer",
       });
     });
 
