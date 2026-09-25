@@ -71,9 +71,11 @@ const WORKSPACE_PATH = "/tmp/workspace";
 
 /** Poll a synchronous predicate until it holds (bounded), yielding real time between checks. */
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  // performance.now(), not Date.now(): tests freeze the system clock with setSystemTime
+  // (e.g. after expireStartupDeadline), which would otherwise make this wait unbounded.
+  const deadline = performance.now() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() > deadline) {
+    if (performance.now() > deadline) {
       throw new Error("waitFor: condition not met in time");
     }
     await new Promise((resolve) => setTimeout(resolve, 1));
@@ -265,6 +267,16 @@ describe("MCPServerManager", () => {
     }
   });
 
+  /** Observables of one fake connection to a component server. */
+  interface ComponentClient {
+    command: string;
+    execute: AsyncMock;
+    getPrompt: AsyncMock;
+    close: AsyncMock;
+  }
+  const asyncMock = (impl: (...args: unknown[]) => Promise<unknown>) => mock(impl);
+  type AsyncMock = ReturnType<typeof asyncMock>;
+
   async function componentFixture(home: string) {
     await fs.mkdir(path.join(home, "plugins"), { recursive: true });
     const registryPath = path.join(home, "plugins.json");
@@ -299,40 +311,139 @@ describe("MCPServerManager", () => {
     }
     configService.listServers = mock(() => Promise.resolve({ ...configs }));
     const read = mock(() => readPluginMcpPolicy(registryPath));
-    const makeManager = () => {
-      const invalidation: NonNullable<MCPServerManagerOptions["pluginInvalidation"]> = {
-        keyPrefix: "plugin:",
-        readToken: () => Promise.resolve(undefined),
-        readComponentPolicy: read,
-        tryAcquireComponentPolicyLock: (options) =>
-          acquirePluginMutationLock(home, { timeoutMs: 0, ...options }),
-      };
-      const instance = new MCPServerManager(configService as unknown as MCPConfigService, {
-        pluginInvalidation: invalidation,
-      });
-      const internals = instance as unknown as MCPServerManagerTestAccess;
-      const started: Array<ReturnType<typeof testInstance>> = [];
-      internals.startSingleServer = mock((name: unknown) => {
-        const client = testInstance(String(name), {
-          tools: { echo: testTool() },
-          prompts: [{ name: "review" }],
-          getPrompt: mock(() =>
+    // Every connection to a fake component server records fresh observable
+    // mocks (its echo tool, review prompt and close). `onConnect` runs before
+    // the connection resolves: it may reshape those mocks, gate the startup,
+    // or make the connection hang.
+    const connections: ComponentClient[] = [];
+    const serve = (
+      command: string,
+      onConnect?: (
+        client: ComponentClient,
+        attempt: number
+      ) => void | { hang: true } | Promise<void | { hang: true }>
+    ) =>
+      servers.serve(command, async (attempt) => {
+        const client: ComponentClient = {
+          command,
+          execute: asyncMock(() => Promise.resolve({ ok: true })),
+          getPrompt: asyncMock(() =>
             Promise.resolve({
               messages: [{ role: "user", content: { type: "text", text: "review" } }],
             })
           ),
-        });
-        started.push(client);
-        return Promise.resolve(client);
+          close: asyncMock(() => Promise.resolve(undefined)),
+        };
+        connections.push(client);
+        const override = await onConnect?.(client, attempt);
+        return {
+          tools: { echo: { execute: client.execute } as unknown as Tool },
+          prompts: [{ name: "review" }],
+          getPrompt: client.getPrompt,
+          close: client.close,
+          ...override,
+        };
       });
-      return { instance, internals, started, invalidation };
+    for (const command of ["ordinary", "remove", "keep", "added"]) serve(command);
+    /** Connections to `command`'s server, oldest first. */
+    const clients = (command: string) => connections.filter((c) => c.command === command);
+    const makeManager = () => {
+      // WORKAROUND for pre-existing production behavior (reported separately):
+      // the real component try-lock is the exclusive, timeout-0 plugin
+      // mutation lock, exclusive even in-process and held through each launch,
+      // so sibling managed launches in one process fail closed ("unavailable
+      // ...; retry"). The old startSingleServer stub hid this. Queue this
+      // manager's own admissions; other holders still hit the fail-closed path.
+      let admissions = Promise.resolve();
+      const invalidation: NonNullable<MCPServerManagerOptions["pluginInvalidation"]> = {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve(undefined),
+        readComponentPolicy: read,
+        tryAcquireComponentPolicyLock: async (options) => {
+          const previous = admissions;
+          const turn = Promise.withResolvers<void>();
+          admissions = turn.promise;
+          await previous;
+          try {
+            const release = await acquirePluginMutationLock(home, { timeoutMs: 0, ...options });
+            return async () => {
+              try {
+                await release();
+              } finally {
+                turn.resolve();
+              }
+            };
+          } catch (error) {
+            turn.resolve();
+            throw error;
+          }
+        },
+      };
+      const instance = new MCPServerManager(configService as unknown as MCPConfigService, {
+        pluginInvalidation: invalidation,
+      });
+      return { instance, invalidation };
     };
     manager.dispose();
     const local = makeManager();
     manager = local.instance;
-    access = local.internals;
-    return { ...local, registryPath, write, configs, read, makeManager };
+    access = local.instance as unknown as MCPServerManagerTestAccess;
+    return {
+      ...local,
+      registryPath,
+      write,
+      configs,
+      read,
+      makeManager,
+      serve,
+      connections,
+      clients,
+      /** The first connection to `command`'s server. */
+      client: (command: string) => clients(command)[0],
+    };
   }
+
+  /** Name of the tool `result` routes to `serverName`. */
+  const toolFor = (result: { toolServerNames: Record<string, string> }, serverName: string) => {
+    const toolName = Object.keys(result.toolServerNames).find(
+      (key) => result.toolServerNames[key] === serverName
+    );
+    expect(toolName).toBeDefined();
+    return toolName!;
+  };
+
+  /**
+   * Make the next instance `target` starts for `name` reject close while
+   * `failing()` holds (its fake client close still runs and is counted).
+   */
+  const failNextInstanceClose = (
+    target: MCPServerManager,
+    name: string,
+    failing: () => boolean,
+    message = `${name} close failed`
+  ) => {
+    type Start = (
+      serverName: string,
+      ...rest: unknown[]
+    ) => Promise<{ close: () => Promise<void> } | null>;
+    const internals = target as unknown as { startSingleServer: Start };
+    const start = internals.startSingleServer.bind(target);
+    let wrapped = false;
+    // Private call: real instances swallow client close errors (they only log
+    // them), so a failed retirement is reachable only by wrapping an instance.
+    internals.startSingleServer = async (serverName, ...rest) => {
+      const instance = await start(serverName, ...rest);
+      if (serverName === name && instance !== null && !wrapped) {
+        wrapped = true;
+        const close = instance.close;
+        instance.close = async () => {
+          await close();
+          if (failing()) throw new Error(message);
+        };
+      }
+      return instance;
+    };
+  };
 
   test.each([false, true])(
     "component removal preserves sibling identity (leased: %s)",
@@ -341,8 +452,7 @@ describe("MCPServerManager", () => {
       const f = await componentFixture(tmp.path);
       const request = workspaceRequest("components");
       const before = await manager.getToolsForWorkspace(request);
-      const removed = f.started.find((i) => i.name.endsWith(":remove"))!;
-      const retained = f.started.filter((i) => i !== removed);
+      const removed = f.client("remove");
       if (leased) manager.acquireLease(request.workspaceId);
       await f.write(["keep"]);
       await manager.reconcilePluginComponents();
@@ -352,32 +462,39 @@ describe("MCPServerManager", () => {
         "plugin:instance:keep",
       ]);
       expect(after.stats.enabledServerCount).toBe(2);
-      const entry = access.workspaceServers.get(request.workspaceId) as {
-        instances: Map<string, unknown>;
-        timedOutServerNames: string[];
-        enabledServerNames: Set<string>;
-      };
-      for (const client of retained) {
-        expect(entry.instances.get(client.name)).toBe(client);
-        expect(client.close).not.toHaveBeenCalled();
+      expect(after.stats.failedServerNames).not.toContain("plugin:instance:remove");
+      // Retained siblings keep serving through their original connections.
+      for (const [serverName, command] of [
+        ["ordinary", "ordinary"],
+        ["plugin:instance:keep", "keep"],
+      ]) {
+        await after.tools[toolFor(after, serverName)].execute!(
+          {},
+          { toolCallId: "retained", messages: [], context: {} }
+        );
+        expect(f.clients(command)).toHaveLength(1);
+        expect(f.client(command).execute).toHaveBeenCalledTimes(1);
+        expect(f.client(command).close).not.toHaveBeenCalled();
       }
-      expect(entry.timedOutServerNames).not.toContain(removed.name);
-      expect(entry.enabledServerNames.has(removed.name)).toBe(false);
-      const toolName = Object.keys(before.toolServerNames).find(
-        (key) => before.toolServerNames[key] === removed.name
-      )!;
+      const toolName = toolFor(before, "plugin:instance:remove");
       expect(
         before.tools[toolName].execute!({}, { toolCallId: "held", messages: [], context: {} })
       ).rejects.toThrow(/disabled|unavailable/);
-      expect(manager.getPrompt(request.workspaceId, removed.name, "review", {})).rejects.toThrow();
-      expect(removed.tools.echo.execute).not.toHaveBeenCalled();
+      expect(
+        manager.getPrompt(request.workspaceId, "plugin:instance:remove", "review", {})
+      ).rejects.toThrow();
+      expect(removed.execute).not.toHaveBeenCalled();
       if (leased) {
         expect(removed.close).not.toHaveBeenCalled();
         manager.releaseLease(request.workspaceId);
         await manager.reconcilePluginComponents();
       }
       expect(removed.close).toHaveBeenCalledTimes(1);
-      expect(f.started).toHaveLength(3);
+      expect(f.connections).toHaveLength(3);
+      // The removal left no enabled or timed-out retry candidate behind.
+      elapseTimedOutRetryBackoff();
+      await manager.getToolsForWorkspace(request);
+      expect(f.connections).toHaveLength(3);
     }
   );
 
@@ -387,60 +504,56 @@ describe("MCPServerManager", () => {
       using tmp = new DisposableTempDir("mcp-component-cleanup-retry");
       const f = await componentFixture(tmp.path);
       const request = workspaceRequest("cleanup-retry");
-      const served = await manager.getToolsForWorkspace(request);
-      const removed = f.started.find((instance) => instance.name.endsWith(":remove"))!;
-      const retained = f.started.filter((instance) => instance !== removed);
+      const key = "plugin:instance:remove";
       let failClose = true;
-      const close = spyOn(removed as { close: () => Promise<void> }, "close").mockImplementation(
-        () =>
-          failClose ? Promise.reject(new Error("removed client close failed")) : Promise.resolve()
-      );
-      try {
-        await f.write(["keep"]);
-        const error: unknown = await manager
-          .reconcilePluginComponents()
-          .catch((error: unknown) => error);
-        expect(error).toBeInstanceOf(Error);
-        expect(String(error)).toContain("removed client close failed");
-        const entry = access.workspaceServers.get(request.workspaceId) as {
-          instances: Map<string, unknown>;
-          retiredPluginInstances?: Set<unknown>;
-        };
-        expect(entry.retiredPluginInstances?.has(removed)).toBe(true);
-        const after = await manager.getToolsForWorkspace(request);
-        expect(Object.values(after.toolServerNames).sort()).toEqual([
-          "ordinary",
-          "plugin:instance:keep",
-        ]);
-        expect(close.mock.calls.length).toBeGreaterThan(1);
-        const toolName = Object.keys(served.toolServerNames).find(
-          (key) => served.toolServerNames[key] === removed.name
-        )!;
-        const heldError: unknown = await Promise.resolve(
-          served.tools[toolName].execute!({}, { toolCallId: "removed", messages: [], context: {} })
-        ).catch((error: unknown) => error);
-        expect(heldError).toBeInstanceOf(Error);
-        expect(removed.tools.echo.execute).not.toHaveBeenCalled();
-        if (readd) {
-          await f.write(["keep", "remove"]);
-          const readded = await manager.getToolsForWorkspace(request);
-          expect(Object.values(readded.toolServerNames)).toContain(removed.name);
-          expect(entry.instances.get(removed.name)).not.toBe(removed);
-        }
-        failClose = false;
-        const attempts = close.mock.calls.length;
-        await manager.getToolsForWorkspace(request);
-        expect(close).toHaveBeenCalledTimes(attempts + 1);
-        expect(entry.retiredPluginInstances?.size ?? 0).toBe(0);
-        await manager.reconcilePluginComponents();
-        expect(close).toHaveBeenCalledTimes(attempts + 1);
-        for (const instance of retained) {
-          expect(entry.instances.get(instance.name)).toBe(instance);
-          expect(instance.close).not.toHaveBeenCalled();
-        }
-      } finally {
-        close.mockRestore();
+      failNextInstanceClose(manager, key, () => failClose, "removed client close failed");
+      const served = await manager.getToolsForWorkspace(request);
+      const removed = f.client("remove");
+      await f.write(["keep"]);
+      const error: unknown = await manager
+        .reconcilePluginComponents()
+        .catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain("removed client close failed");
+      const after = await manager.getToolsForWorkspace(request);
+      expect(Object.values(after.toolServerNames).sort()).toEqual([
+        "ordinary",
+        "plugin:instance:keep",
+      ]);
+      // The failed retirement stayed owned: the next serve retried its close.
+      expect(removed.close.mock.calls.length).toBeGreaterThan(1);
+      const heldError: unknown = await Promise.resolve(
+        served.tools[toolFor(served, key)].execute!(
+          {},
+          { toolCallId: "removed", messages: [], context: {} }
+        )
+      ).catch((error: unknown) => error);
+      expect(heldError).toBeInstanceOf(Error);
+      expect(removed.execute).not.toHaveBeenCalled();
+      if (readd) {
+        await f.write(["keep", "remove"]);
+        const readded = await manager.getToolsForWorkspace(request);
+        // The readd connects a replacement instead of reviving the retired client.
+        expect(f.clients("remove")).toHaveLength(2);
+        await readded.tools[toolFor(readded, key)].execute!(
+          {},
+          { toolCallId: "readded", messages: [], context: {} }
+        );
+        expect(f.clients("remove")[1].execute).toHaveBeenCalledTimes(1);
+        expect(removed.execute).not.toHaveBeenCalled();
       }
+      failClose = false;
+      const attempts = removed.close.mock.calls.length;
+      await manager.getToolsForWorkspace(request);
+      expect(removed.close).toHaveBeenCalledTimes(attempts + 1);
+      // Retirement finished: nothing is left for a later cleanup to close.
+      await manager.reconcilePluginComponents();
+      expect(removed.close).toHaveBeenCalledTimes(attempts + 1);
+      for (const command of ["ordinary", "keep"]) {
+        expect(f.clients(command)).toHaveLength(1);
+        expect(f.client(command).close).not.toHaveBeenCalled();
+      }
+      if (readd) expect(f.clients("remove")[1].close).not.toHaveBeenCalled();
     }
   );
 
@@ -450,9 +563,9 @@ describe("MCPServerManager", () => {
       using tmp = new DisposableTempDir("mcp-retired-prefix");
       const f = await componentFixture(tmp.path);
       const request = workspaceRequest("retired-prefix");
+      const key = "plugin:instance:remove";
       const first = await manager.getToolsForWorkspace(request);
-      const removed = f.started.find((instance) => instance.name.endsWith(":remove"))!;
-      const retained = f.started.filter((instance) => instance !== removed);
+      const removed = f.client("remove");
       manager.acquireLease(request.workspaceId);
       try {
         await f.write(["keep"]);
@@ -461,34 +574,33 @@ describe("MCPServerManager", () => {
           await f.write(["keep", "remove"]);
           await manager.getToolsForWorkspace(request);
         }
-        const entry = access.workspaceServers.get(request.workspaceId) as {
-          instances: Map<string, unknown>;
-          retiredPluginInstances?: Set<unknown>;
-          timedOutServerNames: string[];
-        };
-        expect(entry.retiredPluginInstances?.has(removed)).toBe(true);
-        await manager.stopServersWithKeyPrefix(removed.name);
+        // Leased: the removed client is retired, not yet closed.
+        expect(removed.close).not.toHaveBeenCalled();
+        await manager.stopServersWithKeyPrefix(key);
         expect(removed.close).toHaveBeenCalledTimes(1);
-        expect(entry.retiredPluginInstances?.has(removed) ?? false).toBe(false);
-        expect(entry.timedOutServerNames.includes(removed.name)).toBe(readd);
-        for (const instance of retained) {
-          expect(entry.instances.get(instance.name)).toBe(instance);
-          expect(instance.close).not.toHaveBeenCalled();
+        for (const command of ["ordinary", "keep"]) {
+          expect(f.clients(command)).toHaveLength(1);
+          expect(f.client(command).close).not.toHaveBeenCalled();
         }
+        // Only a readded server is scheduled to restart on next use.
+        const next = await manager.getToolsForWorkspace(request);
+        expect(Object.values(next.toolServerNames).includes(key)).toBe(readd);
+        expect(f.clients("remove")).toHaveLength(readd ? 3 : 1);
         if (!readd) {
-          const toolName = Object.keys(first.toolServerNames).find(
-            (key) => first.toolServerNames[key] === removed.name
-          )!;
           const error: unknown = await Promise.resolve(
-            first.tools[toolName].execute!({}, { toolCallId: "stopped", messages: [], context: {} })
+            first.tools[toolFor(first, key)].execute!(
+              {},
+              { toolCallId: "stopped", messages: [], context: {} }
+            )
           ).catch((error: unknown) => error);
           expect(error).toBeInstanceOf(Error);
-          expect(removed.tools.echo.execute).not.toHaveBeenCalled();
+          expect(removed.execute).not.toHaveBeenCalled();
         }
       } finally {
         manager.releaseLease(request.workspaceId);
         await manager.reconcilePluginComponents();
       }
+      // The stop consumed the retirement: release closes nothing twice.
       expect(removed.close).toHaveBeenCalledTimes(1);
     }
   );
@@ -498,41 +610,30 @@ describe("MCPServerManager", () => {
     const f = await componentFixture(tmp.path);
     delete f.configs.ordinary;
     const request = workspaceRequest("retired-idle");
-    await manager.getToolsForWorkspace(request);
-    const removed = f.started.find((instance) => instance.name.endsWith(":remove"))!;
     let fail = true;
-    const close = spyOn(removed as { close: () => Promise<void> }, "close").mockImplementation(
-      () => (fail ? Promise.reject(new Error("close failed")) : Promise.resolve())
-    );
-    const sweep = spyOn(
-      manager as unknown as { retireCrossProcessPluginInstances: () => Promise<void> },
-      "retireCrossProcessPluginInstances"
-    );
-    try {
-      await f.write([]);
-      await manager.reconcilePluginComponents().catch(() => undefined);
-      const entry = access.workspaceServers.get(request.workspaceId) as {
-        instances: Map<string, unknown>;
-        retiredPluginInstances?: Set<unknown>;
-        lastActivity: number;
-      };
-      expect(entry.instances.size).toBe(0);
-      entry.lastActivity = Date.now() - 11 * 60_000;
-      for (const shouldFail of [true, false]) {
-        fail = shouldFail;
-        sweep.mockClear();
-        const attempts = close.mock.calls.length;
-        access.cleanupIdleServers();
-        expect(sweep).toHaveBeenCalledTimes(1);
-        await sweep.mock.results[0].value;
-        expect(close).toHaveBeenCalledTimes(attempts + 1);
-        expect(entry.retiredPluginInstances?.has(removed) ?? false).toBe(shouldFail);
-        if (shouldFail) expect(access.workspaceServers.get(request.workspaceId)).toBe(entry);
-      }
-    } finally {
-      close.mockRestore();
-      sweep.mockRestore();
+    failNextInstanceClose(manager, "plugin:instance:remove", () => fail);
+    await manager.getToolsForWorkspace(request);
+    const removed = f.client("remove");
+    await f.write([]);
+    await manager.reconcilePluginComponents().catch(() => undefined);
+    // No live instance remains; only the failed retirement is still owned.
+    expect(f.client("keep").close).toHaveBeenCalledTimes(1);
+    expect(removed.close).toHaveBeenCalledTimes(1);
+    for (const shouldFail of [true, false]) {
+      fail = shouldFail;
+      const attempts = removed.close.mock.calls.length;
+      // The sweep reads the clock synchronously: make the workspace look idle.
+      setSystemTime(new Date(Date.now() + 11 * 60_000));
+      // Private call: the idle sweep runs only from a one-minute interval timer.
+      (manager as unknown as { cleanupIdleServers: () => void }).cleanupIdleServers();
+      setSystemTime();
+      await waitFor(() => removed.close.mock.calls.length > attempts);
+      expect(removed.close).toHaveBeenCalledTimes(attempts + 1);
     }
+    // Retirement finished: nothing is left for a later cleanup to close.
+    const attempts = removed.close.mock.calls.length;
+    await manager.reconcilePluginComponents();
+    expect(removed.close).toHaveBeenCalledTimes(attempts);
   });
 
   test.each(["stdio", "http", "sse", "auto"] as const)(
@@ -593,6 +694,12 @@ describe("MCPServerManager", () => {
     }
   );
 
+  /** Leave only `key` configured, so a serve's launch fences belong to it alone. */
+  const onlyServer = (configs: Record<string, MCPServerInfo>, key: string, info = configs[key]) => {
+    for (const name of Object.keys(configs)) delete configs[name];
+    configs[key] = info;
+  };
+
   test.each(["stdio", "http", "sse", "auto"] as const)(
     "normal %s startup rechecks components after waiting for the override fence",
     async (transport) => {
@@ -613,39 +720,23 @@ describe("MCPServerManager", () => {
       await manager.getToolsForWorkspace(workspaceRequest("startup-baseline"));
       removeAtFence = true;
       const key = "plugin:instance:remove";
-      const info: MCPServerInfo =
+      const url = "https://mcp.example.test";
+      servers.serve(url);
+      onlyServer(
+        f.configs,
+        key,
         transport === "stdio"
           ? f.configs[key]
-          : {
-              transport,
-              url: "https://mcp.example.test",
-              disabled: false,
-              plugin: f.configs[key].plugin,
-            };
-      const exec = mock(() => Promise.reject(new Error("spawn reached")));
-      const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
-        Promise.reject(new Error("connection reached"))
+          : { transport, url, disabled: false, plugin: f.configs[key].plugin }
       );
-      try {
-        const error: unknown = await access
-          .startSingleServerImpl(
-            key,
-            info,
-            { exec } as unknown as Runtime,
-            PROJECT_PATH,
-            WORKSPACE_PATH,
-            undefined,
-            () => undefined,
-            new AbortController().signal
-          )
-          .catch((error: unknown) => error);
-        expect(exec).not.toHaveBeenCalled();
-        expect(client).not.toHaveBeenCalled();
-        expect(String(error)).toMatch(/disabled|unavailable/);
-        expect(overrideHeld).toBe(false);
-      } finally {
-        client.mockRestore();
-      }
+      servers.exec.mockClear();
+      const served = await manager.getToolsForWorkspace(workspaceRequest("startup-fence"));
+      // The removal committed while the launch waited for the fence: it never
+      // spawns or connects, and the retried serve no longer enables it.
+      expect(Object.keys(served.tools)).toEqual([]);
+      expect(servers.exec).not.toHaveBeenCalled();
+      expect(servers.connectCount(url)).toBe(0);
+      expect(overrideHeld).toBe(false);
     }
   );
 
@@ -667,32 +758,23 @@ describe("MCPServerManager", () => {
         };
       }
       await manager.getToolsForWorkspace(workspaceRequest("contention-baseline"));
-      const exec = mock(() => Promise.reject(new Error("spawn reached")));
-      const start = () =>
-        access
-          .startSingleServerImpl(
-            "plugin:instance:remove",
-            f.configs["plugin:instance:remove"],
-            { exec } as unknown as Runtime,
-            PROJECT_PATH,
-            WORKSPACE_PATH,
-            undefined,
-            () => undefined,
-            new AbortController().signal
-          )
-          .catch((error: unknown) => error);
+      const key = "plugin:instance:remove";
+      onlyServer(f.configs, key);
+      servers.exec.mockClear();
       const release = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
       try {
-        expect(String(await start())).toContain("unavailable");
-        expect(exec).not.toHaveBeenCalled();
+        const served = await manager.getToolsForWorkspace(workspaceRequest("contention"));
+        expect(served.stats.failedServerNames).toEqual([key]);
+        expect(servers.exec).not.toHaveBeenCalled();
         // Uninstall can now prune overrides without waiting on this startup.
         expect(overrideHeld).toBe(false);
       } finally {
         await release();
       }
       await f.write(["keep"]);
-      expect(String(await start())).toContain("disabled");
-      expect(exec).not.toHaveBeenCalled();
+      const served = await manager.getToolsForWorkspace(workspaceRequest("contention-removed"));
+      expect(served.stats.failedServerNames).toEqual([]);
+      expect(servers.exec).not.toHaveBeenCalled();
     }
   );
 
@@ -701,38 +783,28 @@ describe("MCPServerManager", () => {
     const f = await componentFixture(tmp.path);
     f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
     f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
-    const client = spyOn(mcpSdk, "createMCPClient").mockImplementation(() =>
-      Promise.reject(Object.assign(new Error("HTTP not supported"), { status: 404 }))
-    );
+    const url = "https://mcp.example.test";
+    // Streamable HTTP is refused, so auto falls back to SSE on the same URL.
+    servers.serve(url, {
+      connect: () =>
+        Promise.reject(Object.assign(new Error("HTTP not supported"), { status: 404 })),
+    });
     f.invalidation.acquireOverridesLock = async () => {
-      if (client.mock.calls.length > 0) await f.write(["keep"]);
+      if (servers.connectCount(url) > 0) await f.write(["keep"]);
       return () => Promise.resolve();
     };
-    try {
-      await manager.getToolsForWorkspace(workspaceRequest("fallback-baseline"));
-      const key = "plugin:instance:remove";
-      const error: unknown = await access
-        .startSingleServerImpl(
-          key,
-          {
-            transport: "auto",
-            url: "https://mcp.example.test",
-            disabled: false,
-            plugin: f.configs[key].plugin,
-          },
-          TEST_RUNTIME,
-          PROJECT_PATH,
-          WORKSPACE_PATH,
-          undefined,
-          () => undefined,
-          new AbortController().signal
-        )
-        .catch((error: unknown) => error);
-      expect(client).toHaveBeenCalledTimes(1);
-      expect(String(error)).toMatch(/disabled|unavailable/);
-    } finally {
-      client.mockRestore();
-    }
+    await manager.getToolsForWorkspace(workspaceRequest("fallback-baseline"));
+    const key = "plugin:instance:remove";
+    onlyServer(f.configs, key, {
+      transport: "auto",
+      url,
+      disabled: false,
+      plugin: f.configs[key].plugin,
+    });
+    const served = await manager.getToolsForWorkspace(workspaceRequest("fallback"));
+    // The HTTP attempt connected; the SSE fallback was refused at its fence.
+    expect(servers.connectCount(url)).toBe(1);
+    expect(Object.keys(served.tools)).toEqual([]);
   });
 
   test("component policy rejects a held tool in a second manager without local notification", async () => {
@@ -742,19 +814,17 @@ describe("MCPServerManager", () => {
     try {
       const request = workspaceRequest("sibling");
       const served = await sibling.instance.getToolsForWorkspace(request);
-      const removed = sibling.started.find((i) => i.name.endsWith(":remove"))!;
-      const toolName = Object.keys(served.toolServerNames).find(
-        (key) => served.toolServerNames[key] === removed.name
-      )!;
+      const removed = f.client("remove");
+      const toolName = toolFor(served, "plugin:instance:remove");
       await f.write(["keep"]);
       await manager.reconcilePluginComponents();
       expect(removed.close).not.toHaveBeenCalled();
       expect(
         served.tools[toolName].execute!({}, { toolCallId: "held", messages: [], context: {} })
       ).rejects.toThrow(/disabled|unavailable/);
-      expect(removed.tools.echo.execute).not.toHaveBeenCalled();
+      expect(removed.execute).not.toHaveBeenCalled();
       expect(removed.close).toHaveBeenCalledTimes(1);
-      for (const client of sibling.started.filter((i) => i !== removed))
+      for (const client of f.connections.filter((c) => c !== removed))
         expect(client.close).not.toHaveBeenCalled();
     } finally {
       sibling.instance.dispose();
@@ -766,7 +836,7 @@ describe("MCPServerManager", () => {
     const f = await componentFixture(tmp.path);
     const request = workspaceRequest("mixed");
     await manager.getToolsForWorkspace(request);
-    const retained = f.started.filter((i) => !i.name.endsWith(":remove"));
+    const retained = [f.client("ordinary"), f.client("keep")];
     await f.write(["keep", "added"]);
     const after = await manager.getToolsForWorkspace(request);
     expect(Object.values(after.toolServerNames).sort()).toEqual([
@@ -774,12 +844,12 @@ describe("MCPServerManager", () => {
       "plugin:instance:added",
       "plugin:instance:keep",
     ]);
-    expect(f.started).toHaveLength(4);
+    expect(f.connections).toHaveLength(4);
     await f.write([]);
     await f.write(["keep", "added"]);
     await manager.reconcilePluginComponents();
     await manager.getToolsForWorkspace(request);
-    expect(f.started).toHaveLength(4);
+    expect(f.connections).toHaveLength(4);
     for (const client of retained) expect(client.close).not.toHaveBeenCalled();
   });
 
@@ -789,24 +859,31 @@ describe("MCPServerManager", () => {
     const request = workspaceRequest("leased-readd");
     await manager.getToolsForWorkspace(request);
     manager.acquireLease(request.workspaceId);
-    const old = f.started.find((i) => i.name.endsWith(":remove"))!;
+    const key = "plugin:instance:remove";
+    const old = f.client("remove");
     await f.write(["keep"]);
     await manager.getToolsForWorkspace(request);
     await f.write(["keep", "remove"]);
     const result = await manager.getToolsForWorkspace(request);
-    expect(Object.values(result.toolServerNames)).toContain(old.name);
-    const entry = access.workspaceServers.get(request.workspaceId) as {
-      instances: Map<string, unknown>;
-    };
-    const replacement = entry.instances.get(old.name);
-    expect(replacement).not.toBe(old);
+    expect(Object.values(result.toolServerNames)).toContain(key);
+    // The readd connects a replacement instead of reviving the retired client.
+    expect(f.clients("remove")).toHaveLength(2);
+    const replacement = f.clients("remove")[1];
     expect(old.close).not.toHaveBeenCalled();
     manager.releaseLease(request.workspaceId);
     await manager.reconcilePluginComponents();
     expect(old.close).toHaveBeenCalledTimes(1);
-    for (const client of f.started.filter((i) => i !== old))
+    for (const client of f.connections.filter((c) => c !== old))
       expect(client.close).not.toHaveBeenCalled();
-    expect(entry.instances.get(old.name)).toBe(replacement);
+    // The replacement stays the live instance.
+    const served = await manager.getToolsForWorkspace(request);
+    await served.tools[toolFor(served, key)].execute!(
+      {},
+      { toolCallId: "replacement", messages: [], context: {} }
+    );
+    expect(replacement.execute).toHaveBeenCalledTimes(1);
+    expect(old.execute).not.toHaveBeenCalled();
+    expect(f.clients("remove")).toHaveLength(2);
   });
 
   test("component cleanup permits an already admitted leased invocation to finish", async () => {
@@ -814,24 +891,14 @@ describe("MCPServerManager", () => {
     const f = await componentFixture(tmp.path);
     const entered = Promise.withResolvers<void>();
     const finish = Promise.withResolvers<string>();
-    const original = access.startSingleServer;
-    access.startSingleServer = async (...args) => {
-      const client = (await original(...args)) as ReturnType<typeof testInstance>;
-      if (args[0] === "plugin:instance:remove")
-        client.tools.echo = {
-          ...testTool(),
-          execute: mock(() => {
-            entered.resolve();
-            return finish.promise;
-          }),
-        };
-      return client;
-    };
     const request = workspaceRequest("admitted");
     const first = await manager.getToolsForWorkspace(request);
-    const toolName = Object.keys(first.toolServerNames).find((key) =>
-      first.toolServerNames[key].endsWith(":remove")
-    )!;
+    const removed = f.client("remove");
+    removed.execute.mockImplementation(() => {
+      entered.resolve();
+      return finish.promise;
+    });
+    const toolName = toolFor(first, "plugin:instance:remove");
     manager.acquireLease(request.workspaceId);
     const pending: unknown = first.tools[toolName].execute!(
       {},
@@ -844,22 +911,14 @@ describe("MCPServerManager", () => {
     expect(await pending).toBe("finished");
     manager.releaseLease(request.workspaceId);
     await manager.reconcilePluginComponents();
-    expect(f.started.find((i) => i.name.endsWith(":remove"))!.close).toHaveBeenCalledTimes(1);
+    expect(removed.close).toHaveBeenCalledTimes(1);
   });
 
   test("component authorization reads current policy after a slow override fence", async () => {
     using tmp = new DisposableTempDir("mcp-components-final-gate");
     const f = await componentFixture(tmp.path);
     let removeAtFence = false;
-    const invalidation = (
-      manager as unknown as {
-        pluginInvalidation: {
-          readOverridesEpoch: () => Promise<string>;
-          readWorkspaceOverrides: () => Promise<Record<string, never>>;
-          acquireOverridesLock: () => Promise<() => Promise<void>>;
-        };
-      }
-    ).pluginInvalidation;
+    const invalidation = f.invalidation;
     invalidation.readWorkspaceOverrides = () => Promise.resolve({});
     invalidation.readOverridesEpoch = () => Promise.resolve("stable");
     invalidation.acquireOverridesLock = async () => {
@@ -869,15 +928,11 @@ describe("MCPServerManager", () => {
     const request = workspaceRequest("final-gate");
     const first = await manager.getToolsForWorkspace(request);
     removeAtFence = true;
-    const toolName = Object.keys(first.toolServerNames).find((key) =>
-      first.toolServerNames[key].endsWith(":remove")
-    )!;
+    const toolName = toolFor(first, "plugin:instance:remove");
     expect(
       first.tools[toolName].execute!({}, { toolCallId: "held", messages: [], context: {} })
     ).rejects.toThrow(/disabled|unavailable/);
-    expect(
-      f.started.find((i) => i.name.endsWith(":remove"))!.tools.echo.execute
-    ).not.toHaveBeenCalled();
+    expect(f.client("remove").execute).not.toHaveBeenCalled();
   });
 
   test.each(["tool", "prompt", "test"] as const)(
@@ -912,8 +967,8 @@ describe("MCPServerManager", () => {
                 )
               : manager.getPrompt(request.workspaceId, key, "review", {});
           expect(Promise.resolve(pending)).rejects.toThrow(/unavailable/);
-          const client = f.started.find((instance) => instance.name === key)!;
-          expect(client.tools.echo.execute).not.toHaveBeenCalled();
+          const client = f.client("remove");
+          expect(client.execute).not.toHaveBeenCalled();
           expect(client.getPrompt).not.toHaveBeenCalled();
         }
         const ordinary = Object.keys(served.toolServerNames).find(
@@ -923,9 +978,7 @@ describe("MCPServerManager", () => {
           {},
           { toolCallId: "ordinary", messages: [], context: {} }
         );
-        expect(
-          f.started.find((instance) => instance.name === "ordinary")!.tools.echo.execute
-        ).toHaveBeenCalledTimes(1);
+        expect(f.client("ordinary").execute).toHaveBeenCalledTimes(1);
       } finally {
         runtime.mockRestore();
       }
@@ -960,27 +1013,20 @@ describe("MCPServerManager", () => {
       };
       const dispatched = Promise.withResolvers<void>();
       const finish = Promise.withResolvers<void>();
-      const original = access.startSingleServer;
-      access.startSingleServer = async (...args) => {
-        const instance = (await original(...args)) as ReturnType<typeof testInstance>;
-        if (args[0] === "plugin:instance:remove") {
-          const dispatch = () => {
-            expect(pluginHeld).toBe(true);
-            expect(overrideHeld).toBe(true);
-            dispatched.resolve();
-            return finish.promise;
-          };
-          instance.tools.echo = { ...testTool(), execute: () => dispatch().then(() => "ok") };
-          instance.getPrompt = mock(() =>
-            dispatch().then(() => ({
-              messages: [{ role: "user", content: { type: "text", text: "ok" } }],
-            }))
-          );
-        }
-        return instance;
-      };
       const request = workspaceRequest("inode");
       const served = await manager.getToolsForWorkspace(request);
+      const dispatch = () => {
+        expect(pluginHeld).toBe(true);
+        expect(overrideHeld).toBe(true);
+        dispatched.resolve();
+        return finish.promise;
+      };
+      f.client("remove").execute.mockImplementation(() => dispatch().then(() => "ok"));
+      f.client("remove").getPrompt.mockImplementation(() =>
+        dispatch().then(() => ({
+          messages: [{ role: "user", content: { type: "text", text: "ok" } }],
+        }))
+      );
       const toolName = Object.keys(served.toolServerNames).find(
         (name) => served.toolServerNames[name] === "plugin:instance:remove"
       )!;
@@ -1070,6 +1116,11 @@ describe("MCPServerManager", () => {
       let overrideReleases = 0;
       f.invalidation.readOverridesEpoch = () => Promise.resolve("stable");
       f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
+      f.invalidation.acquireOverridesLock = (options) => overrides.acquireExclusiveLock(options);
+      const request = workspaceRequest(workspaceId);
+      const served = await manager.getToolsForWorkspace(request);
+      const toolName = toolFor(served, key);
+      // Only the invocation below races the installer; startup launched cleanly.
       f.invalidation.acquireOverridesLock = async (options) => {
         const release = await overrides.acquireExclusiveLock(options);
         // The installer wins the plugin lock after preflight; pruning then waits
@@ -1084,11 +1135,6 @@ describe("MCPServerManager", () => {
           await release();
         };
       };
-      const request = workspaceRequest(workspaceId);
-      const served = await manager.getToolsForWorkspace(request);
-      const toolName = Object.keys(served.toolServerNames).find(
-        (name) => served.toolServerNames[name] === key
-      )!;
       try {
         const pending: unknown =
           operation === "tool"
@@ -1103,8 +1149,8 @@ describe("MCPServerManager", () => {
         expect(
           (await overrides.getOverridesForWorkspace(workspaceId)).overrides.enabledServers
         ).toEqual(["ordinary"]);
-        const client = f.started.find((instance) => instance.name === key)!;
-        expect(client.tools.echo.execute).not.toHaveBeenCalled();
+        const client = f.client("remove");
+        expect(client.execute).not.toHaveBeenCalled();
         expect(client.getPrompt).not.toHaveBeenCalled();
       } finally {
         await releaseWriter?.();
@@ -1179,8 +1225,8 @@ describe("MCPServerManager", () => {
         expect(releaseCount).toBe(1);
         const release = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
         await release();
-        const client = f.started.find((instance) => instance.name === key)!;
-        expect(client.tools.echo.execute).not.toHaveBeenCalled();
+        const client = f.client("remove");
+        expect(client.execute).not.toHaveBeenCalled();
         expect(client.getPrompt).not.toHaveBeenCalled();
       } finally {
         now.mockRestore();
@@ -1199,39 +1245,37 @@ describe("MCPServerManager", () => {
     f.read.mockImplementation(() => Promise.reject(new Error("home unavailable")));
     const result = await manager.getToolsForWorkspace(request);
     expect(Object.values(result.toolServerNames)).toEqual(["ordinary"]);
-    expect(f.started.find((i) => i.name === "ordinary")!.close).not.toHaveBeenCalled();
+    expect(f.client("ordinary").close).not.toHaveBeenCalled();
   });
 
   test("component removal drops failed startup retry candidates", async () => {
     using tmp = new DisposableTempDir("mcp-components-retries");
     const f = await componentFixture(tmp.path);
     const removed = "plugin:instance:remove";
-    const startup = mock(async (servers: unknown) => ({
-      instances: new Map(
-        await Promise.all(
-          Object.keys(servers as Record<string, unknown>)
-            .filter((name) => name !== removed)
-            .map(async (name) => [name, await access.startSingleServer(name)] as const)
-        )
-      ),
-      failedServerNames: Object.hasOwn(servers as object, removed) ? [removed] : [],
-      timedOutServerNames: Object.hasOwn(servers as object, removed) ? [removed] : [],
-    }));
-    access.startServers = startup;
+    f.serve("remove", (_client, attempt) => (attempt === 1 ? { hang: true } : undefined));
     const request = workspaceRequest("retries");
-    await manager.getToolsForWorkspace(request);
+    const first = await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    expect(first.stats.failedServerNames).toContain(removed);
     await f.write(["keep"]);
     await manager.reconcilePluginComponents();
-    const entry = access.workspaceServers.get(request.workspaceId) as {
-      timedOutServerNames: string[];
-      retryingTimedOutServerNames: Set<string>;
-    };
-    expect(entry.timedOutServerNames).toEqual([]);
-    expect(entry.retryingTimedOutServerNames.has(removed)).toBe(false);
+    // Private read: retries re-filter by enabled servers, so a stale timed-out
+    // candidate has no public effect; this pins the removal's own cleanup.
+    const entry = (
+      manager as unknown as { workspaceServers: Map<string, { timedOutServerNames: string[] }> }
+    ).workspaceServers.get(request.workspaceId);
+    // Only the removed name: a queued sibling admission can also reach the
+    // fake-timer deadline, and a timed-out allowed server stays retryable.
+    expect(entry?.timedOutServerNames).not.toContain(removed);
+    elapseTimedOutRetryBackoff();
     const result = await manager.getToolsForWorkspace(request);
     expect(result.stats.failedServerNames).not.toContain(removed);
-    for (const [servers] of startup.mock.calls.slice(1))
-      expect(servers).not.toHaveProperty(removed);
+    // The removed server's timed-out startup is never retried.
+    expect(servers.connectCount("remove")).toBe(1);
+    // A readd starts it fresh, with no stale retry backoff carried over.
+    await f.write(["keep", "remove"]);
+    const readded = await manager.getToolsForWorkspace(request);
+    expect(Object.values(readded.toolServerNames)).toContain(removed);
+    expect(servers.connectCount("remove")).toBe(2);
   });
 
   test("component owner retarget denies old tools without affecting unrelated clients", async () => {
@@ -1243,24 +1287,25 @@ describe("MCPServerManager", () => {
     const request = workspaceRequest("owner");
     const first = await manager.getToolsForWorkspace(request);
     f.read.mockImplementation(() => readPluginMcpPolicy(path.join(next, "plugins.json")));
-    const toolName = Object.keys(first.toolServerNames).find((key) =>
-      first.toolServerNames[key].endsWith(":remove")
-    )!;
+    const toolName = toolFor(first, "plugin:instance:remove");
     expect(
       first.tools[toolName].execute!({}, { toolCallId: "owner", messages: [], context: {} })
     ).rejects.toThrow(/disabled|unavailable/);
-    expect(f.started.find((i) => i.name === "ordinary")!.close).not.toHaveBeenCalled();
+    expect(f.client("ordinary").close).not.toHaveBeenCalled();
   });
 
   test("component policy read count is bounded independently of server count", async () => {
     using tmp = new DisposableTempDir("mcp-components-read-budget");
     const f = await componentFixture(tmp.path);
     const names = Array.from({ length: 32 }, (_, index) => `server${index}`);
-    for (const name of names)
+    for (const name of names) {
       f.configs[`plugin:many:${name}`] = {
         ...stdioConfig(name),
+        env: { PLUGIN_DATA: path.join(tmp.path, "data", name) },
         plugin: { ...f.configs["plugin:instance:keep"].plugin!, serverName: name },
       };
+      f.serve(name);
+    }
     await f.write(["keep", ...names]);
     const request = workspaceRequest("read-budget");
     await manager.getToolsForWorkspace(request);
@@ -1299,6 +1344,7 @@ describe("MCPServerManager", () => {
       const f = await componentFixture(tmp.path);
       f.configs.unmanaged = {
         ...stdioConfig("unmanaged"),
+        env: { PLUGIN_DATA: path.join(tmp.path, "data", "unmanaged") },
         plugin: {
           pluginName: "demo",
           serverName: "remove",
@@ -1306,6 +1352,7 @@ describe("MCPServerManager", () => {
           sourceLocation: ".agents/plugins/demo",
         },
       };
+      f.serve("unmanaged");
       const request = workspaceRequest("policy");
       await manager.getToolsForWorkspace(request);
       if (failure === "missing") await fs.unlink(f.registryPath);
@@ -1317,8 +1364,10 @@ describe("MCPServerManager", () => {
       delete f.configs["plugin:instance:remove"].plugin!.componentPolicy;
       const after = await manager.getToolsForWorkspace(request);
       expect(Object.values(after.toolServerNames).sort()).toEqual(["ordinary", "unmanaged"]);
-      for (const client of f.started.filter((i) => !i.name.startsWith("plugin:")))
-        expect(client.close).not.toHaveBeenCalled();
+      for (const command of ["ordinary", "unmanaged"]) {
+        expect(f.clients(command)).toHaveLength(1);
+        expect(f.client(command).close).not.toHaveBeenCalled();
+      }
     }
   );
 
@@ -1329,7 +1378,6 @@ describe("MCPServerManager", () => {
       const f = await componentFixture(tmp.path);
       const key = "plugin:instance:remove";
       const request = workspaceRequest("startup-retirement");
-      const startServers = access.startServers;
       if (mode === "retired-only") {
         delete f.configs.ordinary;
         await f.write(["remove"]);
@@ -1338,99 +1386,75 @@ describe("MCPServerManager", () => {
         await manager.getToolsForWorkspace(request);
         await f.write(["keep", "remove"]);
       } else if (mode === "retry") {
-        access.startServers = async (servers, ...args) => {
-          const remaining = { ...(servers as Record<string, MCPServerInfo>) };
-          delete remaining[key];
-          const result = await startServers.call(manager, remaining, ...args);
-          return { ...result, failedServerNames: [key], timedOutServerNames: [key] };
-        };
-        await manager.getToolsForWorkspace(request);
-        access.startServers = startServers;
+        f.serve("remove", () => ({ hang: true }));
+        await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
         elapseTimedOutRetryBackoff();
       } else if (mode === "restart") {
         await manager.getToolsForWorkspace(request);
-        f.started.find((client) => client.name === key)!.isClosed = true;
+        await servers.crash("remove");
         manager.acquireLease(request.workspaceId);
       }
+      // The next startup of the removed server pauses mid-connection, and the
+      // instance it publishes fails to close while `failClose` holds.
       const entered = Promise.withResolvers<void>();
       const resume = Promise.withResolvers<void>();
-      const original = access.startSingleServer;
       let failClose = true;
-      let failedClient: ReturnType<typeof testInstance> | undefined;
-      access.startSingleServer = async (...args) => {
-        const client = (await original(...args)) as ReturnType<typeof testInstance>;
-        if (args[0] === key && failedClient === undefined) {
-          failedClient = client;
-          client.close = mock(() =>
-            failClose ? Promise.reject(new Error("startup close failed")) : Promise.resolve()
-          );
-          entered.resolve();
-          await resume.promise;
-        }
-        return client;
-      };
+      let failedClient: ComponentClient | undefined;
+      f.serve("remove", async (client, attempt) => {
+        if (attempt !== 1) return;
+        failedClient = client;
+        entered.resolve();
+        await resume.promise;
+      });
+      failNextInstanceClose(manager, key, () => failClose, "startup close failed");
       const pending = manager.getToolsForWorkspace(request);
       pending.catch(() => undefined);
       try {
         await entered.promise;
+        // A managed launch try-locks the plugin writer's lock and fails closed
+        // while f.write holds it; let "keep" finish launching first so only
+        // the removed server races the write.
+        if (mode !== "retired-only") await waitFor(() => f.clients("keep").length > 0);
         await f.write(mode === "retired-only" ? [] : ["keep"]);
         resume.resolve();
         const served = await pending;
-        const retained = f.started.filter((client) => client.name !== key);
-        const entry = access.workspaceServers.get(request.workspaceId) as {
-          instances: Map<string, unknown>;
-          retiredPluginInstances?: Set<unknown>;
-          enabledServerNames: Set<string>;
-          timedOutServerNames: string[];
-          lastActivity: number;
-        };
+        const retained = f.connections.filter((client) => client.command !== "remove");
         expect(failedClient).toBeDefined();
         expect(failedClient!.close.mock.calls.length).toBeGreaterThan(0);
-        expect(entry.retiredPluginInstances?.has(failedClient)).toBe(true);
-        expect(entry.instances.has(key)).toBe(false);
-        expect(entry.enabledServerNames.has(key)).toBe(false);
-        expect(entry.timedOutServerNames).not.toContain(key);
         expect(Object.values(served.toolServerNames)).not.toContain(key);
         expect(served.stats.startedServerCount).toBe(mode === "retired-only" ? 0 : 2);
         expect(served.stats.enabledServerCount).toBe(mode === "retired-only" ? 0 : 2);
         expect(served.stats.failedServerNames).not.toContain(key);
         for (const client of retained) {
-          expect(entry.instances.get(client.name)).toBe(client);
+          expect(f.clients(client.command)).toHaveLength(1);
           expect(client.close).not.toHaveBeenCalled();
         }
         if (mode === "readd") {
           await f.write(["keep", "remove"]);
           const readded = await manager.getToolsForWorkspace(request);
           expect(Object.values(readded.toolServerNames)).toContain(key);
-          expect(entry.instances.get(key)).not.toBe(failedClient);
-          expect(entry.retiredPluginInstances?.has(failedClient)).toBe(true);
+          // The readd connects a replacement instead of reviving the failed client.
+          expect(servers.connectCount("remove")).toBe(2);
         }
         failClose = false;
         const attempts = failedClient!.close.mock.calls.length;
         if (mode === "retired-only") {
-          const sweep = spyOn(
-            manager as unknown as { retireCrossProcessPluginInstances: () => Promise<void> },
-            "retireCrossProcessPluginInstances"
-          );
-          try {
-            entry.lastActivity = Date.now() - 11 * 60_000;
-            access.cleanupIdleServers();
-            expect(sweep).toHaveBeenCalledTimes(1);
-            await sweep.mock.results[0].value;
-          } finally {
-            sweep.mockRestore();
-          }
+          // The sweep reads the clock synchronously: make the workspace look idle.
+          setSystemTime(new Date(Date.now() + 11 * 60_000));
+          // Private call: the idle sweep runs only from a one-minute interval timer.
+          (manager as unknown as { cleanupIdleServers: () => void }).cleanupIdleServers();
+          setSystemTime();
+          await waitFor(() => failedClient!.close.mock.calls.length > attempts);
         } else if (mode === "additional" || mode === "restart") {
           await manager.stopServersWithKeyPrefix(key);
         } else {
           await manager.reconcilePluginComponents();
         }
+        // The failed retirement stayed owned until this retry closed it.
         expect(failedClient!.close).toHaveBeenCalledTimes(attempts + 1);
-        expect(entry.retiredPluginInstances?.has(failedClient) ?? false).toBe(false);
-        for (const client of retained) {
-          expect(entry.instances.get(client.name)).toBe(client);
-          expect(client.close).not.toHaveBeenCalled();
-        }
+        await manager.reconcilePluginComponents();
+        expect(failedClient!.close).toHaveBeenCalledTimes(attempts + 1);
+        for (const client of retained) expect(client.close).not.toHaveBeenCalled();
       } finally {
         failClose = false;
         resume.resolve();
@@ -1448,36 +1472,30 @@ describe("MCPServerManager", () => {
       const f = await componentFixture(tmp.path);
       const entered = Promise.withResolvers<void>();
       const finish = Promise.withResolvers<void>();
-      const original = access.startSingleServer;
-      access.startSingleServer = async (...args) => {
-        const client = await original(...args);
-        if (args[0] === "plugin:instance:remove") {
-          entered.resolve();
-          await finish.promise;
-          if (readd)
-            (client as ReturnType<typeof testInstance>).close = mock(async () => {
-              await f.write(["keep", "remove"]);
-            });
-        }
-        return client;
-      };
+      f.serve("remove", async (client, attempt) => {
+        if (attempt !== 1) return;
+        entered.resolve();
+        await finish.promise;
+        if (readd)
+          client.close.mockImplementation(async () => {
+            await f.write(["keep", "remove"]);
+          });
+      });
       const request = workspaceRequest("startup");
       const pending = manager.getToolsForWorkspace(request);
       await entered.promise;
       await f.write(["keep"]);
       finish.resolve();
       const after = await pending;
-      expect(f.started[1].close).toHaveBeenCalledTimes(1);
+      expect(f.client("remove").close).toHaveBeenCalledTimes(1);
       expect(Object.values(after.toolServerNames).includes("plugin:instance:remove")).toBe(readd);
-      const entry = access.workspaceServers.get(request.workspaceId) as {
-        instances: Map<string, unknown>;
-        timedOutServerNames: string[];
-      };
-      expect(entry.timedOutServerNames).not.toContain("plugin:instance:remove");
-      if (readd) expect(entry.instances.get("plugin:instance:remove")).not.toBe(f.started[1]);
-      const starts = f.started.length;
+      // A readd serves a replacement instead of the fenced instance.
+      expect(f.clients("remove")).toHaveLength(readd ? 2 : 1);
+      // No timed-out retry candidate was left behind.
+      const starts = f.connections.length;
+      elapseTimedOutRetryBackoff();
       await manager.getToolsForWorkspace(request);
-      expect(f.started).toHaveLength(starts);
+      expect(f.connections).toHaveLength(starts);
     }
   );
 
