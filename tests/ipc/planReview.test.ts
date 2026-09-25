@@ -643,6 +643,36 @@ describeIntegration("workspace.planReview", () => {
       type: "unknown",
       raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE,
     });
+    // Doubly nested: compaction recovery redispatches each follow-up past the generic guard, so
+    // a plan-review row two compactions deep must be refused up front as well.
+    const doublyNested = await client().workspace.sendMessage({
+      workspaceId,
+      message: "/compact",
+      options: {
+        ...options,
+        agentId: "compact",
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: {
+            followUpContent: {
+              text: "/compact",
+              model: MODEL,
+              agentId: "compact",
+              muxMetadata: {
+                type: "compaction-request",
+                rawCommand: "/compact",
+                parsed: { followUpContent: { text, muxMetadata, model: MODEL, agentId: "plan" } },
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(!doublyNested.success && doublyNested.error).toEqual({
+      type: "unknown",
+      raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE,
+    });
 
     expect(fixture.requests.length).toBe(requestsBefore);
     expect(await getState()).toEqual(before);

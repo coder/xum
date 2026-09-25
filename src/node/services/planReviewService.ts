@@ -117,16 +117,21 @@ export const PLAN_REVIEW_METADATA_RESERVED_MESSAGE =
  * options carry muxMetadata as an unvalidated black box.
  */
 export function carriesPlanReviewMetadata(muxMetadata: unknown): boolean {
-  if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
-  const metadata = muxMetadata as MuxMessageMetadata;
-  if (metadata.type === PLAN_REVIEW_METADATA_TYPE) return true;
-  const followUp: unknown = getCompactionFollowUpContent(metadata)?.muxMetadata;
-  return (
-    typeof followUp === "object" &&
-    followUp !== null &&
-    (followUp as { type?: unknown }).type === PLAN_REVIEW_METADATA_TYPE
-  );
+  // Compaction recovery redispatches each nested follow-up straight through AgentSession, past
+  // this guard, so the whole follow-up chain is inspected. A chain deeper than any real one
+  // (or a cycle) fails closed: it is refused as if it carried the discriminator.
+  let current: unknown = muxMetadata;
+  for (let depth = 0; depth <= PLAN_REVIEW_FOLLOW_UP_MAX_DEPTH; depth++) {
+    if (typeof current !== "object" || current === null) return false;
+    const metadata = current as MuxMessageMetadata;
+    if (metadata.type === PLAN_REVIEW_METADATA_TYPE) return true;
+    current = getCompactionFollowUpContent(metadata)?.muxMetadata;
+  }
+  return true;
 }
+
+/** Nesting bound for carriesPlanReviewMetadata; real follow-up chains are one level deep. */
+const PLAN_REVIEW_FOLLOW_UP_MAX_DEPTH = 8;
 
 function isPlanReviewRow(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE;
