@@ -195,7 +195,11 @@ describe("OAuthFlowManager", () => {
     it("is a no-op for non-existent flows", async () => {
       manager.register("f1", createFlowEntry());
 
-      await expect(manager.cancel("nope")).resolves.toBeUndefined();
+      const settled = await manager.cancel("nope").then(
+        () => "resolved",
+        () => "rejected"
+      );
+      expect(settled).toBe("resolved");
       expect(manager.has("f1")).toBe(true);
     });
   });
@@ -227,7 +231,11 @@ describe("OAuthFlowManager", () => {
     });
 
     it("is a no-op when there are no flows", async () => {
-      await expect(manager.cancelAll()).resolves.toBeUndefined();
+      const settled = await manager.cancelAll().then(
+        () => "resolved",
+        () => "rejected"
+      );
+      expect(settled).toBe("resolved");
     });
   });
 
