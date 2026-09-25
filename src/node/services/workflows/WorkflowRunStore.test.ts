@@ -4,7 +4,8 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { isPathSafeWorkspaceId, WorkflowRunStore } from "./WorkflowRunStore";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import { isPathSafeWorkspaceId, KeyedFifoLock, WorkflowRunStore } from "./WorkflowRunStore";
 
 const definition = {
   name: "deep-research",
@@ -14,6 +15,43 @@ const definition = {
 };
 
 const source = "export default async function workflow() { return 'ok'; }\n";
+
+/**
+ * Hold a store lock the way another live process would: this process's live crossProcessLock
+ * record, taken without the store's in-process queue.
+ */
+async function holdStoreLock(lockPath: string): Promise<() => Promise<void>> {
+  return await acquireCrossProcessLock({
+    lockPath,
+    acquireTimeoutMs: 0,
+    staleMs: 1_000,
+    timeoutMessage: "test lock busy",
+  });
+}
+
+/**
+ * One-shot pause on a store's next call of private method `method` (a real mutation, holding its
+ * locks). In-process holders wake waiters at once, unlike crossProcessLock's 250 ms retry.
+ */
+function pauseNext(store: WorkflowRunStore, method: "getRunUnlocked" | "writeRunFile") {
+  let signalEntered!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    signalEntered = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const internals = store as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
+  const original = internals[method].bind(store);
+  internals[method] = async (...args: unknown[]) => {
+    internals[method] = original;
+    signalEntered();
+    await released;
+    return await original(...args);
+  };
+  return { entered, release };
+}
 
 async function createStore(sessionDir: string, staleLeaseMs = 10) {
   const store = new WorkflowRunStore({ sessionDir, staleLeaseMs });
@@ -1037,23 +1075,20 @@ describe("WorkflowRunStore", () => {
     using tmp = new DisposableTempDir("workflow-runs-active-writer-snapshot");
     const store = await createStore(tmp.path);
     await store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z");
-    const lockDir = path.join(tmp.path, "workflows", "wfr_123", "events.jsonl.lock");
-    await fs.mkdir(lockDir);
-    await fs.appendFile(
-      path.join(tmp.path, "workflows", "wfr_123", "events.jsonl"),
-      `${JSON.stringify({
-        sequence: 2,
-        type: "status",
-        at: "2026-05-29T00:00:02.000Z",
-        status: "completed",
-      })}\n`,
-      "utf-8"
-    );
+    // A real writer, paused after its journal append and before its run.json rewrite: only its
+    // held events lock tells readers that the journal is ahead of the snapshot.
+    const pause = pauseNext(store, "writeRunFile");
+    const writer = store.appendStatus("wfr_123", "completed", "2026-05-29T00:00:02.000Z");
+    await pause.entered;
 
-    await expect(store.getRun("wfr_123")).resolves.toMatchObject({ status: "running" });
+    const whileWriting = (await store.getRun("wfr_123")).status;
+    pause.release();
+    await writer;
 
-    await fs.rm(lockDir, { recursive: true, force: true });
-    await expect(store.getRun("wfr_123")).resolves.toMatchObject({ status: "completed" });
+    expect({ whileWriting, after: (await store.getRun("wfr_123")).status }).toEqual({
+      whileWriting: "running",
+      after: "completed",
+    });
   });
 
   test("does not overwrite terminal runs with later interrupt status", async () => {
@@ -1129,12 +1164,13 @@ describe("WorkflowRunStore", () => {
     const store = await createStore(tmp.path);
 
     await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
-    const lockDir = path.join(tmp.path, "workflows", "wfr_123", "lease.json.lock");
-    await fs.mkdir(lockDir);
+    const releaseLock = await holdStoreLock(
+      path.join(tmp.path, "workflows", "wfr_123", "lease.json.xlock")
+    );
 
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(false);
 
-    await fs.rm(lockDir, { recursive: true, force: true });
+    await releaseLock();
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
   });
 
@@ -1145,12 +1181,17 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
     const runDir = path.join(tmp.path, "workflows", "wfr_123");
     const leaseFile = path.join(runDir, "lease.json");
-    const lockDir = `${leaseFile}.lock`;
-    await fs.mkdir(lockDir);
+    // A fenced journal write holds the lease lock while paused.
+    const holder = pauseNext(store, "getRunUnlocked");
+    const fencedWrite = store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", {
+      expectedLeaseOwnerId: "runner-a",
+    });
+    await holder.entered;
 
     const renewal = store.renewLease("wfr_123", "runner-a", 1005);
     await fs.writeFile(leaseFile, JSON.stringify({ ownerId: "runner-b", acquiredAtMs: 1004 }));
-    await fs.rm(lockDir, { recursive: true, force: true });
+    holder.release();
+    await fencedWrite;
 
     await expect(renewal).resolves.toBe(false);
     await expect(fs.readFile(leaseFile, "utf-8")).resolves.toContain("runner-b");
@@ -1162,17 +1203,49 @@ describe("WorkflowRunStore", () => {
 
     await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
     const leaseFile = path.join(tmp.path, "workflows", "wfr_123", "lease.json");
-    const lockDir = `${leaseFile}.lock`;
-    await fs.mkdir(lockDir);
+    const holder = pauseNext(store, "getRunUnlocked");
+    const fencedWrite = store.appendStatus("wfr_123", "running", "2026-05-29T00:00:01.000Z", {
+      expectedLeaseOwnerId: "runner-a",
+    });
+    await holder.entered;
 
     const release = store.releaseLease("wfr_123", "runner-a");
     await new Promise((resolve) => setTimeout(resolve, 5));
     await expect(fs.readFile(leaseFile, "utf-8")).resolves.toContain("runner-a");
 
-    await fs.rm(lockDir, { recursive: true, force: true });
+    holder.release();
+    await fencedWrite;
     await release;
 
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(true);
+  });
+
+  test("late lock-taking operations never recreate a deleted run directory", async () => {
+    using tmp = new DisposableTempDir("workflow-runs-deleted-run-dir");
+    const store = await createStore(tmp.path);
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    const runDir = path.join(tmp.path, "workflows", "wfr_123");
+    // Workspace/run cleanup removes the run directory under a live runner.
+    await fs.rm(runDir, { recursive: true, force: true });
+
+    const late = {
+      renew: await store.renewLease("wfr_123", "runner-a", 1005),
+      release: await store.releaseLease("wfr_123", "runner-a").then(
+        () => "resolved",
+        (error: unknown) => (error as { code?: string }).code
+      ),
+      append: await store
+        .appendStatus("wfr_123", "failed", "2026-05-29T00:00:02.000Z", {
+          expectedLeaseOwnerId: "runner-a",
+        })
+        .then(
+          () => "resolved",
+          (error: unknown) => (error as { code?: string }).code
+        ),
+    };
+
+    expect(late).toEqual({ renew: false, release: "ENOENT", append: "ENOENT" });
+    expect(await fs.readdir(path.join(tmp.path, "workflows"))).toEqual([]);
   });
 
   test("prevents concurrent runners while allowing stale lease recovery", async () => {
@@ -1183,6 +1256,66 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
+  });
+});
+
+describe("KeyedFifoLock", () => {
+  test("hands the key over in arrival order", async () => {
+    const lock = new KeyedFifoLock();
+    const releaseFirst = lock.tryAcquire("key");
+    expect(releaseFirst).not.toBeNull();
+    const order: number[] = [];
+    const waiters = [1, 2, 3].map(async (id) => {
+      const release = await lock.acquire("key", Date.now() + 5_000);
+      order.push(id);
+      release?.();
+    });
+    releaseFirst?.();
+    await Promise.all(waiters);
+    expect({ order, waiters: lock.waiterCount("key") }).toEqual({ order: [1, 2, 3], waiters: 0 });
+    // Released with nobody waiting: the key is free again.
+    expect(lock.tryAcquire("key")).not.toBeNull();
+  });
+
+  test("try-lock refuses while the key is held or has waiters; other keys are independent", async () => {
+    const lock = new KeyedFifoLock();
+    const releaseHolder = lock.tryAcquire("key");
+    const waiter = lock.acquire("key", Date.now() + 5_000);
+    const refusedWhileQueued = lock.tryAcquire("key");
+    const otherKey = lock.tryAcquire("other");
+    releaseHolder?.();
+    // Handed straight to the waiter: still refused.
+    const refusedAfterHandoff = lock.tryAcquire("key");
+    (await waiter)?.();
+    expect({
+      refusedWhileQueued,
+      otherKeyTaken: otherKey != null,
+      refusedAfterHandoff,
+      freeAtEnd: lock.tryAcquire("key") != null,
+    }).toEqual({
+      refusedWhileQueued: null,
+      otherKeyTaken: true,
+      refusedAfterHandoff: null,
+      freeAtEnd: true,
+    });
+  });
+
+  test("timed-out waiters behind a hung holder leave the queue and are never granted", async () => {
+    const lock = new KeyedFifoLock();
+    const releaseHolder = lock.tryAcquire("key");
+    const timedOut = await Promise.all(
+      Array.from({ length: 5 }, () => lock.acquire("key", Date.now() + 10))
+    );
+    // Nothing is retained for them while the holder still holds the key.
+    const whileHung = { waiters: lock.waiterCount("key"), tryLock: lock.tryAcquire("key") };
+    releaseHolder?.();
+    const next = await lock.acquire("key", Date.now());
+    next?.();
+    expect({ timedOut, whileHung, nextEntered: next != null }).toEqual({
+      timedOut: [null, null, null, null, null],
+      whileHung: { waiters: 0, tryLock: null },
+      nextEntered: true,
+    });
   });
 });
 

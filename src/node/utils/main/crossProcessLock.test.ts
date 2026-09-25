@@ -162,6 +162,54 @@ describe("acquireCrossProcessLock", () => {
     await expectAcquired(lockPath);
   });
 
+  test("createParentDirectory: false rejects a missing parent with ENOENT and creates nothing", async () => {
+    const root = await fsPromises.mkdtemp(path.join(os.tmpdir(), "cross-process-lock-parent-"));
+    const parent = path.join(root, "run");
+    const lockPath = path.join(parent, "test.lock");
+
+    const error: unknown = await acquireCrossProcessLock({
+      lockPath,
+      ...baseOptions,
+      createParentDirectory: false,
+    }).then(
+      () => null,
+      (rejection: unknown) => rejection
+    );
+
+    expect(error).toMatchObject({ code: "ENOENT" });
+    expect(await pathExists(parent)).toBe(false);
+    expect(await fsPromises.readdir(root)).toEqual([]);
+    // The failed attempt retired its token: the lock is takeable once the parent exists.
+    await fsPromises.mkdir(parent);
+    await expectAcquired(lockPath);
+    // The default still creates a missing parent.
+    await fsPromises.rm(parent, { recursive: true });
+    await expectAcquired(lockPath);
+    expect(await pathExists(parent)).toBe(true);
+    await fsPromises.rm(root, { recursive: true, force: true });
+  });
+
+  test("a parent deleted while held is not recreated by renewal or release", async () => {
+    const root = await fsPromises.mkdtemp(path.join(os.tmpdir(), "cross-process-lock-parent-"));
+    const parent = path.join(root, "run");
+    await fsPromises.mkdir(parent);
+    const lockPath = path.join(parent, "test.lock");
+    // staleMs 1s => a renewal tick every 250 ms while held.
+    const release = await acquireCrossProcessLock({
+      lockPath,
+      ...baseOptions,
+      staleMs: 1_000,
+      createParentDirectory: false,
+    });
+
+    await fsPromises.rm(parent, { recursive: true, force: true });
+    await sleep(600); // At least two renewal ticks against the missing parent.
+    await release();
+
+    expect(await fsPromises.readdir(root)).toEqual([]);
+    await fsPromises.rm(root, { recursive: true, force: true });
+  });
+
   test("release is idempotent and concurrent calls share one sequence", async () => {
     const lockPath = await tempLockPath();
     const release = await acquireCrossProcessLock({ lockPath, ...baseOptions });

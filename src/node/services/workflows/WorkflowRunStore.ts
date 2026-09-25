@@ -30,6 +30,10 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isErrnoException, isErrnoWithCode } from "@/node/utils/fs";
+import {
+  acquireCrossProcessLock,
+  CrossProcessLockTimeoutError,
+} from "@/node/utils/main/crossProcessLock";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 
 const WorkflowRunStatusSnapshotSchema = WorkflowRunRecordSchema.pick({
@@ -103,6 +107,8 @@ export async function listActiveWorkflowRunsForOwners(
 export interface WorkflowRunStoreOptions {
   sessionDir: string;
   staleLeaseMs?: number;
+  /** Test seam: how long a journal/lease mutation waits for its locks before timing out. */
+  mutationLockWaitTimeoutMs?: number;
 }
 
 export interface CreateWorkflowRunInput {
@@ -195,6 +201,7 @@ interface WorkflowStepLookup {
 export class WorkflowRunStore {
   private readonly sessionDir: string;
   private readonly staleLeaseMs: number;
+  private readonly mutationLockWaitTimeoutMs: number | undefined;
   /** Live draining-owner capabilities by run id; see WorkflowCancellationSettlement. */
   private readonly cancellationSettlements = new Map<string, WorkflowCancellationSettlement>();
 
@@ -202,6 +209,11 @@ export class WorkflowRunStore {
     assert(options.sessionDir.length > 0, "WorkflowRunStore: sessionDir is required");
     this.sessionDir = options.sessionDir;
     this.staleLeaseMs = options.staleLeaseMs ?? 30_000;
+    assert(
+      options.mutationLockWaitTimeoutMs == null || options.mutationLockWaitTimeoutMs > 0,
+      "WorkflowRunStore: mutationLockWaitTimeoutMs must be positive"
+    );
+    this.mutationLockWaitTimeoutMs = options.mutationLockWaitTimeoutMs;
   }
 
   async createRun(input: CreateWorkflowRunInput): Promise<WorkflowRunRecord> {
@@ -247,54 +259,51 @@ export class WorkflowRunStore {
 
     const runDir = this.runDir(input.id);
     await fs.mkdir(this.workflowsDir(), { recursive: true });
-    const lockDir = `${runDir}.create.lock`;
-    await acquireWorkflowMutationLock(
-      lockDir,
-      this.leaseMutationLockStaleMs(),
-      this.leaseMutationWaitTimeoutMs()
-    );
-    try {
-      const existing = await this.getRunIfFullyCreated(input.id);
-      if (existing != null) {
-        assertSameWorkflowRunIdentity(existing, input);
-        return existing;
-      }
+    // Outside runDir on purpose: an incomplete create below removes runDir recursively.
+    return await withWorkflowFileLock(
+      `${runDir}.create${WORKFLOW_LOCK_FILE_SUFFIX}`,
+      this.workflowLockOptions(),
+      async () => {
+        const existing = await this.getRunIfFullyCreated(input.id);
+        if (existing != null) {
+          assertSameWorkflowRunIdentity(existing, input);
+          return existing;
+        }
 
-      // A deterministic child run ID must be recoverable after a crash between mkdir and
-      // run.json. Treat an unreadable run directory as an incomplete create, not identity.
-      await fs.rm(runDir, { recursive: true, force: true });
-      await fs.mkdir(runDir, { recursive: false });
-      try {
-        await fs.writeFile(path.join(runDir, WORKFLOW_SOURCE_FILENAME), input.source, "utf-8");
-        await fs.writeFile(path.join(runDir, "events.jsonl"), "", { flag: "a" });
-        await fs.writeFile(path.join(runDir, "steps.jsonl"), "", { flag: "a" });
-
-        const run = WorkflowRunRecordSchema.parse({
-          id: input.id,
-          workspaceId: input.workspaceId,
-          workflow: input.workflow,
-          source: input.source,
-          sourceHash: hashSource(input.source),
-          args: input.args,
-          agentOutputSchemaRequired: input.agentOutputSchemaRequired ?? true,
-          agentTypeAliasAllowed: input.agentTypeAliasAllowed ?? false,
-          ...(input.parentWorkflow != null ? { parentWorkflow: input.parentWorkflow } : {}),
-          status: "pending",
-          createdAt: input.now,
-          updatedAt: input.now,
-          events: [],
-          steps: [],
-        });
-
-        await this.writeRunFile(input.id, run);
-        return run;
-      } catch (error) {
+        // A deterministic child run ID must be recoverable after a crash between mkdir and
+        // run.json. Treat an unreadable run directory as an incomplete create, not identity.
         await fs.rm(runDir, { recursive: true, force: true });
-        throw error;
+        await fs.mkdir(runDir, { recursive: false });
+        try {
+          await fs.writeFile(path.join(runDir, WORKFLOW_SOURCE_FILENAME), input.source, "utf-8");
+          await fs.writeFile(path.join(runDir, "events.jsonl"), "", { flag: "a" });
+          await fs.writeFile(path.join(runDir, "steps.jsonl"), "", { flag: "a" });
+
+          const run = WorkflowRunRecordSchema.parse({
+            id: input.id,
+            workspaceId: input.workspaceId,
+            workflow: input.workflow,
+            source: input.source,
+            sourceHash: hashSource(input.source),
+            args: input.args,
+            agentOutputSchemaRequired: input.agentOutputSchemaRequired ?? true,
+            agentTypeAliasAllowed: input.agentTypeAliasAllowed ?? false,
+            ...(input.parentWorkflow != null ? { parentWorkflow: input.parentWorkflow } : {}),
+            status: "pending",
+            createdAt: input.now,
+            updatedAt: input.now,
+            events: [],
+            steps: [],
+          });
+
+          await this.writeRunFile(input.id, run);
+          return run;
+        } catch (error) {
+          await fs.rm(runDir, { recursive: true, force: true });
+          throw error;
+        }
       }
-    } finally {
-      await fs.rm(lockDir, { recursive: true, force: true });
-    }
+    );
   }
 
   private async getRunIfFullyCreated(runId: string): Promise<WorkflowRunRecord | null> {
@@ -1007,23 +1016,20 @@ export class WorkflowRunStore {
   async acquireLease(runId: string, ownerId: string, nowMs = Date.now()): Promise<boolean> {
     assert(ownerId.length > 0, "WorkflowRunStore.acquireLease: ownerId is required");
     const leaseFile = this.leaseFile(runId);
-    const lockDir = `${leaseFile}.lock`;
-    if (!(await acquireLeaseMutationLock(lockDir, Date.now(), this.leaseMutationLockStaleMs()))) {
-      return false;
-    }
-
-    try {
-      const existing = await readLease(leaseFile);
-      if (existing != null && nowMs - existing.acquiredAtMs <= this.staleLeaseMs) {
-        return false;
+    // Single attempt, as before: a busy lease lock reads as "another runner is active".
+    const attempt = await tryWithWorkflowFileLock(
+      this.leaseLockFile(runId),
+      this.leaseMutationLockStaleMs(),
+      async () => {
+        const existing = await readLease(leaseFile);
+        if (existing != null && nowMs - existing.acquiredAtMs <= this.staleLeaseMs) {
+          return false;
+        }
+        await writeJsonAtomic(leaseFile, { ownerId, acquiredAtMs: nowMs } satisfies LeaseRecord);
+        return true;
       }
-
-      await fs.mkdir(this.runDir(runId), { recursive: true });
-      await writeJsonAtomic(leaseFile, { ownerId, acquiredAtMs: nowMs } satisfies LeaseRecord);
-      return true;
-    } finally {
-      await fs.rm(lockDir, { recursive: true, force: true });
-    }
+    );
+    return attempt.acquired && attempt.value;
   }
 
   async getLeaseRetryDelayMs(runId: string, nowMs = Date.now()): Promise<number> {
@@ -1045,67 +1051,56 @@ export class WorkflowRunStore {
 
   private leaseMutationWaitTimeoutMs(): number {
     // Journal and lease mutations are short, but CI coverage and busy filesystems can stall
-    // waiters for longer than test-sized stale leases; stale age still controls reclaim safety.
-    return Math.max(30_000, this.leaseMutationLockStaleMs() * 4);
+    // waiters for longer than test-sized stale leases.
+    return this.mutationLockWaitTimeoutMs ?? Math.max(30_000, this.leaseMutationLockStaleMs() * 4);
+  }
+
+  private workflowLockOptions(): { staleMs: number; acquireTimeoutMs: number } {
+    return {
+      staleMs: this.leaseMutationLockStaleMs(),
+      acquireTimeoutMs: this.leaseMutationWaitTimeoutMs(),
+    };
   }
 
   async renewLease(runId: string, ownerId: string, nowMs = Date.now()): Promise<boolean> {
     assert(ownerId.length > 0, "WorkflowRunStore.renewLease: ownerId is required");
     const leaseFile = this.leaseFile(runId);
-    const lockDir = `${leaseFile}.lock`;
     try {
-      await acquireWorkflowMutationLock(
-        lockDir,
-        this.leaseMutationLockStaleMs(),
-        this.leaseMutationWaitTimeoutMs()
+      return await withWorkflowFileLock(
+        this.leaseLockFile(runId),
+        this.workflowLockOptions(),
+        async () => {
+          const existing = await readLease(leaseFile);
+          if (existing?.ownerId !== ownerId) {
+            return false;
+          }
+          await writeJsonAtomic(leaseFile, { ownerId, acquiredAtMs: nowMs } satisfies LeaseRecord);
+          return true;
+        }
       );
     } catch {
+      // A lock that cannot be taken reads as a lost renewal, as before. A failed lease write now
+      // does too instead of rejecting; the runner marks the lease lost on either outcome.
       return false;
-    }
-
-    try {
-      const existing = await readLease(leaseFile);
-      if (existing?.ownerId !== ownerId) {
-        return false;
-      }
-      await writeJsonAtomic(leaseFile, { ownerId, acquiredAtMs: nowMs } satisfies LeaseRecord);
-      return true;
-    } finally {
-      await fs.rm(lockDir, { recursive: true, force: true });
     }
   }
 
   async releaseLease(runId: string, ownerId: string): Promise<void> {
     const leaseFile = this.leaseFile(runId);
-    const lockDir = `${leaseFile}.lock`;
-    await acquireWorkflowMutationLock(
-      lockDir,
-      this.leaseMutationLockStaleMs(),
-      this.leaseMutationWaitTimeoutMs()
-    );
-
-    try {
+    await withWorkflowFileLock(this.leaseLockFile(runId), this.workflowLockOptions(), async () => {
       const existing = await readLease(leaseFile);
       if (existing?.ownerId === ownerId) {
         await fs.rm(leaseFile, { force: true });
       }
-    } finally {
-      await fs.rm(lockDir, { recursive: true, force: true });
-    }
+    });
   }
 
   private async withWorkflowMutationLock<T>(runId: string, mutation: () => Promise<T>): Promise<T> {
-    const lockDir = `${this.eventsFile(runId)}.lock`;
-    await acquireWorkflowMutationLock(
-      lockDir,
-      this.leaseMutationLockStaleMs(),
-      this.leaseMutationWaitTimeoutMs()
+    return await withWorkflowFileLock(
+      this.eventsLockFile(runId),
+      this.workflowLockOptions(),
+      mutation
     );
-    try {
-      return await mutation();
-    } finally {
-      await fs.rm(lockDir, { recursive: true, force: true });
-    }
   }
 
   private async withExpectedLeaseOwner<T>(
@@ -1121,26 +1116,30 @@ export class WorkflowRunStore {
       "WorkflowRunStore: expected lease owner id must be non-empty"
     );
     const leaseFile = this.leaseFile(runId);
-    const lockDir = `${leaseFile}.lock`;
-    await acquireWorkflowMutationLock(
-      lockDir,
-      this.leaseMutationLockStaleMs(),
-      this.leaseMutationWaitTimeoutMs()
-    );
-    try {
-      const lease = await readLease(leaseFile);
-      if (lease?.ownerId !== expectedLeaseOwnerId) {
-        throw new Error(`Workflow run lease lost: ${runId}`);
+    // Held across the owner check AND the awaited write (#4452 gap 1): no other runner can take
+    // the lease between them, because the lock is never taken from a live holder.
+    return await withWorkflowFileLock(
+      this.leaseLockFile(runId),
+      this.workflowLockOptions(),
+      async () => {
+        const lease = await readLease(leaseFile);
+        if (lease?.ownerId !== expectedLeaseOwnerId) {
+          throw new Error(`Workflow run lease lost: ${runId}`);
+        }
+        return await mutation();
       }
-      return await mutation();
-    } finally {
-      await fs.rm(lockDir, { recursive: true, force: true });
-    }
+    );
   }
 
+  /**
+   * Whether a writer appears to be mid-mutation, so reads should prefer the atomic run.json
+   * snapshot. A holder's crossProcessLock re-publishes its record (temp file + rename, so a fresh
+   * mtime) every staleMs/4 while held, so a fresh mtime still means "a live holder is renewing"; a
+   * record leaked by a crashed holder ages out and reads fall back to the journal, as before.
+   */
   private async hasActiveWorkflowMutationLock(runId: string): Promise<boolean> {
     try {
-      const stat = await fs.stat(`${this.eventsFile(runId)}.lock`);
+      const stat = await fs.stat(this.eventsLockFile(runId));
       return Date.now() - stat.mtimeMs <= this.leaseMutationLockStaleMs();
     } catch {
       return false;
@@ -1410,6 +1409,14 @@ export class WorkflowRunStore {
   private leaseFile(runId: string): string {
     return path.join(this.runDir(runId), "lease.json");
   }
+
+  private eventsLockFile(runId: string): string {
+    return `${this.eventsFile(runId)}${WORKFLOW_LOCK_FILE_SUFFIX}`;
+  }
+
+  private leaseLockFile(runId: string): string {
+    return `${this.leaseFile(runId)}${WORKFLOW_LOCK_FILE_SUFFIX}`;
+  }
 }
 
 function normalizeWorkflowRunRecord(rawRun: unknown): unknown {
@@ -1599,51 +1606,188 @@ function isTerminalRunStatus(status: WorkflowRunStatus): boolean {
   return status === "completed" || status === "failed";
 }
 
-async function acquireWorkflowMutationLock(
-  lockDir: string,
-  staleLeaseMs: number,
-  timeoutMs = staleLeaseMs
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    if (await acquireLeaseMutationLock(lockDir, Date.now(), staleLeaseMs)) {
-      return;
+/**
+ * Lock FILES taken through crossProcessLock. New names on purpose: the pre-#4452 locks were
+ * directories at `<file>.lock`, and crossProcessLock treats a directory left at its path (by an
+ * older build or a crash) as an unreadable holder that it never takes over, which would block the
+ * run forever. The cost matches #4415's mixed-version caveat: an older build running at the same
+ * time on the same root still uses the old directories, so the two builds do not exclude each
+ * other.
+ */
+const WORKFLOW_LOCK_FILE_SUFFIX = ".xlock";
+
+/**
+ * In-process FIFO lock per key (a lock path). A key is present in `queues` exactly while it is
+ * held; its array lists the waiters in arrival order, and release hands the key straight to the
+ * first one. A waiter that gives up at its deadline is spliced out, so a hung holder retains
+ * nothing for it (a promise chain would keep every abandoned place, and its closure, alive until
+ * the holder released). Exported for tests only.
+ */
+export class KeyedFifoLock {
+  private readonly queues = new Map<string, Array<() => void>>();
+
+  /** Takes `key` only if nobody holds it (and so nobody waits); otherwise null. */
+  tryAcquire(key: string): (() => void) | null {
+    if (this.queues.has(key)) {
+      return null;
     }
-    // Jittered backoff: a fixed sleep can phase-lock with the periodic lease renewal (whose
-    // interval is also a small constant when staleLeaseMs is short, e.g. in tests), so every
-    // retry lands while a renewal holds the lock and waiters starve for hundreds of ms.
-    await new Promise((resolve) => setTimeout(resolve, 2 + Math.random() * 6));
+    this.queues.set(key, []);
+    return this.releaser(key);
   }
-  throw new Error(`Timed out acquiring workflow mutation lock: ${lockDir}`);
+
+  /**
+   * Waits in FIFO order for `key` until `deadline` (epoch ms). Returns the release, or null when
+   * the deadline passed first; giving up only leaves the queue, the holder keeps the key.
+   */
+  async acquire(key: string, deadline: number): Promise<(() => void) | null> {
+    const immediate = this.tryAcquire(key);
+    if (immediate != null) {
+      return immediate;
+    }
+    const waiters = this.queues.get(key);
+    assert(waiters != null, "KeyedFifoLock: a held key has a waiter list");
+    return await new Promise((resolve) => {
+      const grant = () => {
+        clearTimeout(timer);
+        resolve(this.releaser(key));
+      };
+      const timer = setTimeout(
+        () => {
+          const index = waiters.indexOf(grant);
+          if (index !== -1) {
+            waiters.splice(index, 1);
+            resolve(null);
+          }
+        },
+        Math.max(0, deadline - Date.now())
+      );
+      timer.unref?.();
+      waiters.push(grant);
+    });
+  }
+
+  /** Test seam: waiters currently queued for `key`. */
+  waiterCount(key: string): number {
+    return this.queues.get(key)?.length ?? 0;
+  }
+
+  private releaser(key: string): () => void {
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const waiters = this.queues.get(key);
+      assert(waiters != null, "KeyedFifoLock: released a key that is not held");
+      const next = waiters.shift();
+      if (next != null) {
+        next();
+      } else {
+        this.queues.delete(key);
+      }
+    };
+  }
 }
 
-async function acquireLeaseMutationLock(
-  lockDir: string,
-  nowMs: number,
-  staleLeaseMs: number
-): Promise<boolean> {
+/**
+ * In-process queue in front of the cross-process lock, keyed by lock path and shared by every
+ * store instance in this process: without it, same-process contenders would find each other's
+ * live record and wait out crossProcessLock's 250 ms retry sleep. Different paths are different
+ * keys, so the nested events -> lease acquisition cannot deadlock against itself.
+ */
+const workflowLockQueue = new KeyedFifoLock();
+
+/**
+ * crossProcessLock without parent creation: the former mkdir lock failed with ENOENT when the run
+ * directory was gone, and so must this. Otherwise a late operation (a runner's lease release after
+ * its workspace was deleted) would recreate the removed run or session directory. Letting the
+ * acquire itself fail leaves no window between an existence check and the publication.
+ */
+async function acquireWorkflowCrossProcessLock(
+  lockPath: string,
+  acquireTimeoutMs: number,
+  staleMs: number,
+  timeoutMessage: string
+): Promise<() => Promise<void>> {
+  return await acquireCrossProcessLock({
+    lockPath,
+    acquireTimeoutMs,
+    staleMs,
+    timeoutMessage,
+    createParentDirectory: false,
+  });
+}
+
+/**
+ * #4452 gap 1: the former mkdir locks were reclaimed once their mtime aged past the stale window,
+ * which a live holder stalled inside its owner-check-then-write section never refreshed, and every
+ * finally removed the lock unconditionally, deleting a successor's. crossProcessLock never takes a
+ * lock from a live holder and its release removes only its own record.
+ */
+async function withWorkflowFileLock<T>(
+  lockPath: string,
+  options: { staleMs: number; acquireTimeoutMs: number },
+  operation: () => Promise<T>
+): Promise<T> {
+  // One budget covers the in-process queue and the cross-process acquire. A waiter behind a hung
+  // in-process holder gives up its place at the deadline with the same timeout error as before;
+  // it never takes the lock, and the holder keeps it.
+  const timeoutMessage = `Timed out acquiring workflow mutation lock: ${lockPath}`;
+  const deadline = Date.now() + options.acquireTimeoutMs;
+  const releaseQueue = await workflowLockQueue.acquire(lockPath, deadline);
+  if (releaseQueue == null) {
+    throw new Error(timeoutMessage);
+  }
   try {
-    await fs.mkdir(lockDir);
-    return true;
-  } catch (error) {
-    if (!isErrno(error, "EEXIST")) {
+    const release = await acquireWorkflowCrossProcessLock(
+      lockPath,
+      Math.max(0, deadline - Date.now()),
+      options.staleMs,
+      timeoutMessage
+    );
+    try {
+      return await operation();
+    } finally {
+      await release();
+    }
+  } finally {
+    releaseQueue();
+  }
+}
+
+/** One attempt, in-process and cross-process; `{ acquired: false }` while anyone holds the lock. */
+async function tryWithWorkflowFileLock<T>(
+  lockPath: string,
+  staleMs: number,
+  operation: () => Promise<T>
+): Promise<{ acquired: true; value: T } | { acquired: false }> {
+  const releaseQueue = workflowLockQueue.tryAcquire(lockPath);
+  if (releaseQueue == null) {
+    return { acquired: false };
+  }
+  try {
+    let release: () => Promise<void>;
+    try {
+      release = await acquireWorkflowCrossProcessLock(
+        lockPath,
+        0,
+        staleMs,
+        `Workflow mutation lock is busy: ${lockPath}`
+      );
+    } catch (error) {
+      if (error instanceof CrossProcessLockTimeoutError) {
+        return { acquired: false };
+      }
       throw error;
     }
-  }
-
-  try {
-    const stat = await fs.stat(lockDir);
-    if (nowMs - stat.mtimeMs <= staleLeaseMs) {
-      return false;
+    try {
+      return { acquired: true, value: await operation() };
+    } finally {
+      await release();
     }
-    await fs.rm(lockDir, { recursive: true, force: true });
-    await fs.mkdir(lockDir);
-    return true;
-  } catch (error) {
-    if (isErrno(error, "EEXIST") || isErrno(error, "ENOENT")) {
-      return false;
-    }
-    throw error;
+  } finally {
+    releaseQueue();
   }
 }
 

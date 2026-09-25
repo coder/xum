@@ -48,8 +48,15 @@ import {
  * cross-version exclusion entirely).
  */
 export interface CrossProcessLockOptions {
-  /** Absolute path of the lock file. Its parent directory must exist. */
+  /** Absolute path of the lock file. */
   lockPath: string;
+  /**
+   * Create the lock's parent directory when missing (default true). Pass false when the parent
+   * is owned state that must not be recreated once deleted (a workflow run directory): the
+   * acquire then rejects with ENOENT and publishes nothing, with no window between an existence
+   * check and the acquire.
+   */
+  createParentDirectory?: boolean;
   /** How long an acquire waits on a live holder before failing. */
   acquireTimeoutMs: number;
   /**
@@ -414,7 +421,10 @@ export async function acquireCrossProcessLock(
   options: CrossProcessLockOptions
 ): Promise<() => Promise<void>> {
   const { lockPath, acquireTimeoutMs, staleMs, timeoutMessage, signal } = options;
-  await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
+  if (options.createParentDirectory !== false) {
+    await fsPromises.mkdir(path.dirname(lockPath), { recursive: true });
+  }
+  // Otherwise a missing parent surfaces as ENOENT from the first temp-file write in tryTake.
   const deadline = Date.now() + acquireTimeoutMs;
 
   // RENEWAL exists for builds predating #4415 only (see staleMs). No mutex:
