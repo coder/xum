@@ -136,18 +136,25 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     })();
   }
 
-  async function waitForPartialText(workspaceId: string, text: string): Promise<void> {
-    const deadline = Date.now() + 5_000;
-    while (Date.now() < deadline) {
-      const partial = await historyService.readPartial(workspaceId);
+  /**
+   * Spies on partial writes; `written` resolves once a completed write for
+   * `workspaceId` contains `text`. Install before the stream starts so the
+   * first (immediate) write cannot slip past it.
+   */
+  function watchPartialWrites(workspaceId: string, text: string) {
+    const written = Promise.withResolvers<void>();
+    const writePartial = historyService.writePartial.bind(historyService);
+    const spy = spyOn(historyService, "writePartial").mockImplementation(async (id, message) => {
+      const result = await writePartial(id, message);
       if (
-        partial?.parts.some((part) => part.type === "text" && part.text.includes(text)) === true
+        id === workspaceId &&
+        message.parts.some((part) => part.type === "text" && part.text.includes(text))
       ) {
-        return;
+        written.resolve();
       }
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
-    throw new Error(`partial for ${workspaceId} never contained ${JSON.stringify(text)}`);
+      return result;
+    });
+    return { spy, written: written.promise };
   }
 
   function terminalEvents(events: TurnEngineEvent[]): TurnEngineEvent[] {
@@ -158,9 +165,9 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     const workspaceId = "supervised-flowing-workspace";
     const { streamManager, events, engineScope } =
       createSupervisedStreamManagerForTests(flowingThenBlockedStream);
-    const writePartialSpy = spyOn(historyService, "writePartial");
+    const { spy: writePartialSpy, written } = watchPartialWrites(workspaceId, "hello");
     const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
-    await waitForPartialText(workspaceId, "hello");
+    await written;
     expect(streamManager.isStreaming(workspaceId)).toBe(true);
 
     // What ServiceContainer.dispose() does at step 2: interrupt + await.
@@ -529,8 +536,9 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     const workspaceId = "supervised-stop-vs-close-workspace";
     const { streamManager, events, engineScope } =
       createSupervisedStreamManagerForTests(flowingThenBlockedStream);
+    const { written } = watchPartialWrites(workspaceId, "hello");
     const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
-    await waitForPartialText(workspaceId, "hello");
+    await written;
     let settleCount = 0;
     void handle.completion.then(() => {
       settleCount += 1;
@@ -573,6 +581,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       const envelopeWritten = new Promise<void>((resolve) => {
         releaseEnvelope = resolve;
       });
+      const registered = Promise.withResolvers<void>();
       const captured = await historyService.captureCompactionReplacement(workspaceId);
       if (!captured.success) throw new Error(captured.error);
       const startPromise = streamManager.startStream(
@@ -582,7 +591,14 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
           model: createTestLanguageModel(),
           tools: {},
           providedRuntimeTempDir: "",
-          onStreamConstructed: held === "envelope" ? () => envelopeWritten : undefined,
+          // Both holds run right after registration: signal it there.
+          onStreamConstructed:
+            held === "envelope"
+              ? () => {
+                  registered.resolve();
+                  return envelopeWritten;
+                }
+              : undefined,
           withAdmissionCurrent:
             held === "construction fence"
               ? async (construct) => {
@@ -592,16 +608,14 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
                     construct
                   );
                   if (!result.success) throw new Error(result.error);
+                  registered.resolve();
                   await envelopeWritten;
                 }
               : undefined,
         })
       );
-      const deadline = Date.now() + 5_000;
-      while (!streamManager.getActiveStreams().includes(workspaceId)) {
-        if (Date.now() > deadline) throw new Error("stream never registered");
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
+      await registered.promise;
+      expect(streamManager.getActiveStreams()).toContain(workspaceId);
 
       await closeScopeBounded(engineScope);
 
@@ -643,8 +657,9 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
         })(),
       { supervised: false }
     );
+    const { written } = watchPartialWrites(workspaceId, "hello");
     const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
-    await waitForPartialText(workspaceId, "hello");
+    await written;
 
     expect(await streamManager.stopStream(workspaceId, { abortReason: "user" })).toEqual(
       Ok(undefined)
@@ -1069,6 +1084,8 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     // rapid starts would overlap here without it.
     spyOn(streamManager, "createTempDirForStream").mockImplementation(async () => {
       operations.push("tempdir-start");
+      // A fixed hold, not a wait for a condition: it widens the window in which
+      // unlocked starts would overlap, and cannot make locked starts reorder.
       await new Promise((resolve) => setTimeout(resolve, 20));
       operations.push("tempdir-end");
       // "" skips temp-dir cleanup.

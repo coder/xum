@@ -32,14 +32,6 @@ import {
 
 installStreamManagerTestHistory();
 
-async function waitUntil(condition: () => boolean): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error("condition never became true");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
 function createExecStreamForTests(): ExecStream {
   return {
     stdout: new ReadableStream<Uint8Array>({
@@ -247,11 +239,19 @@ describe("StreamManager - stream resource scope", () => {
   }) {
     const secondDeltaProcessed = Promise.withResolvers<number>();
     const writePartial = historyService.writePartial.bind(historyService);
+    // One resolver per write, settled once that write completed on disk.
+    const writesCompleted: Array<{ promise: Promise<void>; resolve: () => void }> = [];
+    const writeResolver = (count: number) => {
+      while (writesCompleted.length < count) writesCompleted.push(Promise.withResolvers<void>());
+      return writesCompleted[count - 1];
+    };
+    const writeCompleted = (count: number): Promise<void> => writeResolver(count).promise;
     let completedWrites = 0;
     const writePartialSpy = spyOn(historyService, "writePartial").mockImplementation(
       async (...args) => {
         const result = await writePartial(...args);
         completedWrites += 1;
+        writeResolver(completedWrites).resolve();
         return result;
       }
     );
@@ -261,8 +261,10 @@ describe("StreamManager - stream resource scope", () => {
         createStreamResultForTests(
           (async function* () {
             yield { type: "text-delta", text: "first" };
-            // Past this macrotask the completed write has stamped the throttle clock.
-            await waitUntil(() => completedWrites > 0);
+            await writeCompleted(1);
+            // flushPartialWrite stamps the throttle clock in a microtask
+            // continuation of that write; one macrotask hop drains it.
+            await new Promise((resolve) => setImmediate(resolve));
             input.aroundSecondDelta?.before();
             yield { type: "text-delta", text: "second" };
             // The consumer fully processed "second" before pulling the next part.
@@ -295,7 +297,8 @@ describe("StreamManager - stream resource scope", () => {
       streamManager,
       handle: result.data,
       writePartialSpy,
-      completedWrites: () => completedWrites,
+      // Resolves once the count-th partial write completed.
+      writeCompleted,
       // Resolves with the partial-write count right after "second" was processed.
       writesAfterSecondDelta: secondDeltaProcessed.promise,
     };
@@ -364,7 +367,7 @@ describe("StreamManager - stream resource scope", () => {
       return timers.length as unknown as ReturnType<typeof setTimeout>;
     }) as unknown as typeof setTimeout);
     const workspaceId = "default-runner-debounce-workspace";
-    const { streamManager, writePartialSpy, completedWrites, writesAfterSecondDelta } =
+    const { streamManager, writePartialSpy, writeCompleted, writesAfterSecondDelta } =
       await startDebouncedPartialStream({
         workspaceId,
         tail: "open",
@@ -385,7 +388,7 @@ describe("StreamManager - stream resource scope", () => {
 
       timers[0].fire();
       // The flush's Effect.promise settles asynchronously.
-      await waitUntil(() => completedWrites() > 1);
+      await writeCompleted(2);
       expect(writePartialSpy).toHaveBeenCalledTimes(2);
       expect(await partialText(workspaceId)).toBe("firstsecond");
     } finally {
@@ -400,7 +403,7 @@ describe("StreamManager - stream resource scope", () => {
     // runner fires the flush only when the test clock advances.
     const testRunner = makeTestEffectRunner();
     const workspaceId = "runner-debounce-workspace";
-    const { streamManager, writePartialSpy, completedWrites, writesAfterSecondDelta } =
+    const { streamManager, writePartialSpy, writeCompleted, writesAfterSecondDelta } =
       await startDebouncedPartialStream({
         workspaceId,
         tail: "open",
@@ -409,7 +412,8 @@ describe("StreamManager - stream resource scope", () => {
     try {
       expect(streamManager.effectRunner).toBe(testRunner.runner);
       expect(await writesAfterSecondDelta).toBe(1);
-      // Real time passes; the virtual clock has not, so nothing flushes.
+      // Real time passes; the virtual clock has not, so nothing flushes. A fixed
+      // negative window, not a wait: the adjust below is the positive signal.
       await new Promise((resolve) => setTimeout(resolve, 20));
       expect(writePartialSpy).toHaveBeenCalledTimes(1);
 
@@ -418,7 +422,7 @@ describe("StreamManager - stream resource scope", () => {
       // before a real-clock sleep could have elapsed.
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(writePartialSpy).toHaveBeenCalledTimes(2);
-      await waitUntil(() => completedWrites() > 1);
+      await writeCompleted(2);
       expect(await partialText(workspaceId)).toBe("firstsecond");
     } finally {
       await streamManager.stopStream(workspaceId);
