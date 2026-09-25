@@ -72,6 +72,10 @@ jobs:
               - 'vite*.ts'
               - 'Makefile'
               - 'electron-builder.yml'
+              # Pixel's default matrix and the Storybook config decide which snapshots exist,
+              # so the snapshot-budget step (Test / Storybook) must run when they change.
+              - 'pixel.jsonc'
+              - '.storybook/**'
             nix_deps:
               - 'package.json'
               - 'bun.lock'
