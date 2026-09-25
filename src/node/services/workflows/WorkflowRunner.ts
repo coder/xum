@@ -3190,6 +3190,8 @@ export class WorkflowRunner {
     options.leaseGuard.throwIfLost();
     switch (outcome.kind) {
       case "terminal-no-report":
+        // No row to retire (e.g. its reservation was canceled before the commit): fresh run.
+        if (outcome.code === "no-record") return undefined;
         return { taskId: step.taskId, attemptId: outcome.attemptId };
       case "reported":
         return undefined;

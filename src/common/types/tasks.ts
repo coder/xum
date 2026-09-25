@@ -26,7 +26,13 @@ export type TaskAttemptOutcome<Report> =
    * `failure`: the attempt failed terminally (persisted failure artifact, e.g. model_refusal). It
    * ended, but its failure is the step's result: never replaced, the failure propagates.
    */
-  | { kind: "terminal-no-report"; attemptId?: string; failure?: { errorMessage: string } };
+  | {
+      kind: "terminal-no-report";
+      attemptId?: string;
+      failure?: { errorMessage: string };
+      /** Same strict-read meaning as on `indeterminate`: the ended attempt has no row. */
+      code?: "no-record";
+    };
 
 /** A bounded settlement wait never turns unresolved cleanup into permission to replace a child. */
 export type TaskAttemptSettlement<Report> = TaskAttemptOutcome<Report> | { kind: "timeout" };
