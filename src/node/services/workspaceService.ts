@@ -421,6 +421,8 @@ import { getErrorMessage } from "@/common/utils/errors";
 import type { PlanReviewError } from "@/common/types/errors";
 import type { PlanReviewState } from "@/common/utils/planReview/planReviewState";
 import {
+  PLAN_REVIEW_METADATA_RESERVED_MESSAGE,
+  carriesPlanReviewMetadata,
   ensurePlanSnapshot,
   getPlanReviewState,
   preparePlanReviewFeedback,
@@ -11823,7 +11825,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         muxMetadata: prepared.data.muxMetadata,
       },
       // Never queue feedback (see above): requireIdle refuses instead of queueing when busy.
-      { requireIdle: true }
+      { requireIdle: true, planReviewFeedback: true }
     );
     if (!sent.success) {
       return Err({
@@ -12175,6 +12177,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.agentInitiated !== true
         ? aiSelectionIntent
         : undefined;
+    // Plan-review rows may only come from the dedicated endpoints, which validate them first.
+    // Every generic send (oRPC/UI, CLI, ACP prompts, workflow continuations) enters here, and so
+    // does anything it later queues or defers behind compaction; refuse before any side effect.
+    if (internal?.planReviewFeedback !== true && carriesPlanReviewMetadata(options.muxMetadata)) {
+      return Err({ type: "unknown", raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE });
+    }
 
     let resumedInterruptedTask = false;
     // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.

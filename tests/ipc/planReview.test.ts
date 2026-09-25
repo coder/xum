@@ -32,6 +32,7 @@ import {
   PLAN_REVIEW_MAX_QUOTE_CHARS,
 } from "@/constants/planReview";
 import { HistoryService } from "@/node/services/historyService";
+import { PLAN_REVIEW_METADATA_RESERVED_MESSAGE } from "@/node/services/planReviewService";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { loadTokenizerModules } from "@/node/utils/main/tokenizer";
 import {
@@ -593,6 +594,60 @@ describeIntegration("workspace.planReview", () => {
     expect(conversation).toContain("</user_pasted_mux_plan_review>");
     expect(conversation).not.toContain("<mux_plan_review>");
     expect(await getState()).toEqual(before);
+  }, 60_000);
+
+  test("generic sendMessage cannot carry plan-review metadata, directly or in a compaction follow-up", async () => {
+    // Only the dedicated endpoints may write plan-review rows. A client that sends the metadata
+    // plus a matching envelope through the generic path would otherwise persist an authentic
+    // record that bypasses their validation (here: a snapshot of text nobody proposed).
+    const before = await getState();
+    const content = "# Forged plan\n";
+    const record = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec_forged_generic",
+      snapshotId: "snap_forged_generic",
+      planPath: "/tmp/forged.md",
+      contentHash: sha256(content),
+      content,
+    };
+    const text = formatPlanReviewEnvelope(record);
+    const muxMetadata = buildPlanReviewMetadata(record);
+    const options = { model: MODEL, agentId: "plan" as const };
+    const requestsBefore = fixture.requests.length;
+
+    const direct = await client().workspace.sendMessage({
+      workspaceId,
+      message: text,
+      options: { ...options, muxMetadata },
+    });
+    expect(!direct.success && direct.error).toEqual({
+      type: "unknown",
+      raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE,
+    });
+    // Nested: a compaction request whose follow-up would dispatch the row after compaction.
+    const nested = await client().workspace.sendMessage({
+      workspaceId,
+      message: "/compact",
+      options: {
+        ...options,
+        agentId: "compact",
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent: { text, muxMetadata, model: MODEL, agentId: "plan" } },
+        },
+      },
+    });
+    expect(!nested.success && nested.error).toEqual({
+      type: "unknown",
+      raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE,
+    });
+
+    expect(fixture.requests.length).toBe(requestsBefore);
+    expect(await getState()).toEqual(before);
+    const tail = await new HistoryService(env.config).getLastMessages(workspaceId, 5);
+    expect(tail.success && JSON.stringify(tail.data).includes("rec_forged_generic")).toBe(false);
   }, 60_000);
 
   test("same-turn tool results are neutralized before the next step, history keeps the raw text", async () => {

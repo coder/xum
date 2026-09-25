@@ -104,6 +104,30 @@ export interface PreparedPlanReviewFeedback {
   muxMetadata: MuxMessageMetadata;
 }
 
+/** Refusal for plan-review metadata on a generic send (see carriesPlanReviewMetadata). */
+export const PLAN_REVIEW_METADATA_RESERVED_MESSAGE =
+  "Plan review records can only be created through the plan review actions, not sent as a message.";
+
+/**
+ * Whether send options' muxMetadata would persist a plan-review row: directly, or as the nested
+ * follow-up of a compaction request that dispatches after compaction. Only the dedicated
+ * endpoints (planReviewSubmitFeedback and the record appends in this module) may write such
+ * rows; a generic send carrying the discriminator plus a matching envelope would otherwise
+ * persist an authentic record that skipped their validation. Accepts any value: generic send
+ * options carry muxMetadata as an unvalidated black box.
+ */
+export function carriesPlanReviewMetadata(muxMetadata: unknown): boolean {
+  if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
+  const metadata = muxMetadata as MuxMessageMetadata;
+  if (metadata.type === PLAN_REVIEW_METADATA_TYPE) return true;
+  const followUp: unknown = getCompactionFollowUpContent(metadata)?.muxMetadata;
+  return (
+    typeof followUp === "object" &&
+    followUp !== null &&
+    (followUp as { type?: unknown }).type === PLAN_REVIEW_METADATA_TYPE
+  );
+}
+
 function isPlanReviewRow(message: MuxMessage): boolean {
   return message.metadata?.muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE;
 }
