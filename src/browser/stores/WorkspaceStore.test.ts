@@ -2109,6 +2109,72 @@ describe("WorkspaceStore", () => {
         expect(streamRows()).toMatchObject([{ content: "hello world", isStreaming: true }]);
         expect(state().canInterrupt).toBe(true);
       });
+
+      // StreamManager writes the finalized row to chat.jsonl (and deletes partial.json) before
+      // it leaves the STREAMING state and emits stream-end. A replay that lands in that window
+      // sends the finalized row AND replays the stream (stream-start plus the parts after the
+      // stream cursor), then the live stream-end. #4505 UAT: the reply's tail showed twice.
+      const finalizedRow = (): WorkspaceChatMessage => ({
+        type: "message",
+        id: streamId,
+        role: "assistant",
+        parts: [{ type: "text", text: "hello world" }],
+        metadata: { historySequence: 2, timestamp: 2_500, model: TEST_MODEL },
+      });
+      const replayedStream = (deltas: Array<[text: string, timestamp: number]>) => [
+        streamStartEvent(workspaceId, streamId, {
+          historySequence: 2,
+          startTime: 2_000,
+          replay: true,
+        }),
+        ...deltas.map(
+          ([delta, timestamp]): WorkspaceChatMessage => ({
+            type: "stream-delta",
+            workspaceId,
+            messageId: streamId,
+            delta,
+            tokens: 1,
+            timestamp,
+            replay: true,
+          })
+        ),
+        streamEndEvent(workspaceId, streamId, {
+          metadata: { model: TEST_MODEL, historySequence: 2, timestamp: 2_500 },
+          parts: [{ type: "text", text: "hello world" }],
+        }),
+      ];
+
+      it("shows the reply once when the since replay races the stream's finalization", async () => {
+        const attempt = await leaveMidStream();
+        attempt.push(createHistoryMessageEvent("history-1", 1));
+        attempt.push(finalizedRow());
+        // The stream cursor applied: only the delta after it is replayed.
+        for (const event of replayedStream([["world", 2_200]])) attempt.push(event);
+        attempt.push(sinceCaughtUpEvent(2, streamId));
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+
+        expect(displayedHistoryIds()).toEqual(["history-1", streamId]);
+        expect(streamRows()).toMatchObject([{ content: "hello world", isStreaming: false }]);
+      });
+
+      it("shows the reply once when a full replay races the stream's finalization", async () => {
+        const attempt = await leaveMidStream();
+        // The server downgrades the since request to a full replay, which applies no stream
+        // cursor: every part is replayed after the finalized row.
+        attempt.push(createHistoryMessageEvent("history-1", 1));
+        attempt.push(finalizedRow());
+        for (const event of replayedStream([
+          ["hello ", 2_100],
+          ["world", 2_200],
+        ])) {
+          attempt.push(event);
+        }
+        attempt.push(fullCaughtUpEvent(2, streamId));
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+
+        expect(displayedHistoryIds()).toEqual(["history-1", streamId]);
+        expect(streamRows()).toMatchObject([{ content: "hello world", isStreaming: false }]);
+      });
     });
 
     /** Swap in a store with a short stale-skeleton deadline and a fresh activity feed. */

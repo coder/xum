@@ -553,6 +553,21 @@ function getBufferedActiveStreamStart(
   };
 }
 
+/**
+ * Message whose content the buffered stream replay rebuilds: the server replays stream-start
+ * (replay: true) and then the parts after the stream cursor, or every part when it applied no
+ * cursor. A replayed history row for the same message must not seed that rebuild.
+ */
+function getBufferedReplayedStreamMessageId(events: WorkspaceChatMessage[]): string | undefined {
+  let messageId: string | undefined;
+  for (const event of events) {
+    if ("type" in event && event.type === "stream-start" && event.replay === true) {
+      messageId = event.messageId;
+    }
+  }
+  return messageId;
+}
+
 function appendAdvisorLiveText(
   liveTextByToolCallId: Map<string, AdvisorLiveTextState>,
   toolCallId: string,
@@ -4898,6 +4913,20 @@ export class WorkspaceStore {
       const pendingEvents = transient.pendingStreamEvents;
       const hasActiveStream = getBufferedActiveStreamStart(pendingEvents) !== null;
 
+      // StreamManager persists the finalized row before it leaves STREAMING and emits
+      // stream-end, so a replay in that window carries both the finalized row and a stream
+      // replay of the same message. The stream replay's parts start after the stream cursor
+      // (the local assembly) or from nothing (no cursor applied), never after the finalized
+      // row: seeding the rebuild with that row showed the reply's tail twice (#4505 UAT).
+      // Drop the row; the replayed parts plus the buffered stream-end rebuild the message.
+      const replayedStreamMessageId = getBufferedReplayedStreamMessageId(pendingEvents);
+      const replayedHistoryMessages =
+        replayedStreamMessageId === undefined
+          ? transient.historicalMessages
+          : transient.historicalMessages.filter(
+              (message) => message.id !== replayedStreamMessageId
+            );
+
       const serverActiveStreamMessageId = data.cursor?.stream?.messageId;
       const localActiveStreamMessageId = aggregator.getActiveStreamMessageId();
       const streamContextMismatched =
@@ -4979,29 +5008,32 @@ export class WorkspaceStore {
         // the active stream only when the server-confirmed stream matches the local
         // stream the attempt's cursor was built from; otherwise replayed rows plus
         // subsequently replayed stream events rebuild the stream message (stale local
-        // contexts were already cleared above).
+        // contexts were already cleared above). A replayed stream-start for the local stream
+        // also confirms the match: the server applied this attempt's stream cursor, and the
+        // stream may have ended before caught-up (so the caught-up carries no stream cursor).
+        const localStreamMessageId = sinceContext.localActiveStreamMessageId;
         const preservedActiveStreamMessageId =
-          serverActiveStreamMessageId !== undefined &&
-          serverActiveStreamMessageId === sinceContext.localActiveStreamMessageId
-            ? serverActiveStreamMessageId
+          localStreamMessageId !== undefined &&
+          (serverActiveStreamMessageId === localStreamMessageId ||
+            replayedStreamMessageId === localStreamMessageId)
+            ? localStreamMessageId
             : undefined;
         aggregator.reconcileSinceReplay({
           requestedAnchorSequence: sinceContext.requestedAnchorSequence,
-          messages: transient.historicalMessages,
+          messages: replayedHistoryMessages,
           preservedActiveStreamMessageId,
           hasActiveStream,
         });
-        transient.historicalMessages.length = 0;
-      } else if (transient.historicalMessages.length > 0) {
+      } else if (replayedHistoryMessages.length > 0) {
         const loadMode = replay === "full" ? "replace" : "append";
-        aggregator.loadHistoricalMessages(transient.historicalMessages, hasActiveStream, {
+        aggregator.loadHistoricalMessages(replayedHistoryMessages, hasActiveStream, {
           mode: loadMode,
         });
-        transient.historicalMessages.length = 0;
       } else if (replay === "full") {
         // Full replay can legitimately contain zero messages (e.g. compacted to empty).
         aggregator.loadHistoricalMessages([], hasActiveStream, { mode: "replace" });
       }
+      transient.historicalMessages.length = 0;
 
       // Store the server-issued cursor for the next reconnect (full and since replays
       // both refresh it). A caught-up without a cursor means the server could not
