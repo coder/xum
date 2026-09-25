@@ -3508,13 +3508,16 @@ export class HistoryService {
    *
    * `generation` is the context generation (see captureCompactionReplacement) read under the
    * same lock, so `derive` can refuse work that was prepared before a destructive mutation.
+   * `derive` may await a short check that must hold at the append (it runs under the lock).
    */
   async appendDerivedFromFullHistory<T>(
     workspaceId: string,
     derive: (
       messages: MuxMessage[],
       lockState: { generation: string | undefined }
-    ) => { message: MuxMessage | null; value: T }
+    ) =>
+      | { message: MuxMessage | null; value: T }
+      | Promise<{ message: MuxMessage | null; value: T }>
   ): Promise<Result<T>> {
     return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
@@ -3531,7 +3534,7 @@ export class HistoryService {
           await this.getContinuousCompactionJournal(
             workspaceId
           ).captureGenerationUnderHistoryLock();
-        const derived = derive(messages, { generation });
+        const derived = await derive(messages, { generation });
         if (derived.message !== null) {
           const appended = await this.appendToHistoryUnderWriteLock(workspaceId, derived.message);
           if (!appended.success) return appended;

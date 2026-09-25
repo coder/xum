@@ -14,7 +14,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "./aiService";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { createMuxMessage } from "@/common/types/message";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
@@ -1205,17 +1205,17 @@ describe("WorkspaceService disposal ownership", () => {
 });
 
 /**
- * #4420: a full clear commits its history change and deletes the plan file afterwards. Another
- * backend on the same workspace (XUM_ALLOW_MULTIPLE_INSTANCES=1, or the desktop app beside
+ * #4420: a full clear, and a destructive replaceHistory with deletePlanFile, discard the plan.
+ * Another backend on the same workspace (XUM_ALLOW_MULTIPLE_INSTANCES=1, or the desktop app beside
  * `xum server`) shares the session directory and the cross-process history lock but none of the
- * clearing backend's in-memory fencing. It is modelled as a second HistoryService over the same
- * config that runs an on-demand snapshot capture. A destructive replaceHistory with deletePlanFile
- * has the same commit-then-delete shape and is covered here too.
+ * discarding backend's in-memory fencing. It is modelled as a second HistoryService over the same
+ * config that runs an on-demand snapshot capture. The plan is deleted before the history commit
+ * and ensurePlanSnapshot re-checks its existence at the locked append, so no capture that read
+ * the discarded plan can land it in the new history.
  */
 describe("WorkspaceService full clear vs another backend's plan snapshot capture", () => {
   const projectName = `plan-clear-window-${process.pid}-${Date.now()}`;
   const planDir = expandTilde(path.dirname(getPlanFilePath("x", projectName)));
-  const legacyDir = expandTilde(path.dirname(getLegacyPlanFilePath("x", "~/.xum")));
   const legacyPlans: string[] = [];
 
   afterEach(async () => {
@@ -1223,7 +1223,11 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     for (const file of legacyPlans.splice(0)) await fsPromises.rm(file, { force: true });
   });
 
-  async function setup(workspaceId: string, location: "canonical" | "legacy" = "canonical") {
+  async function setup(
+    workspaceId: string,
+    location: "canonical" | "legacy" = "canonical",
+    seeded = true
+  ) {
     const harness = await createWorkspaceServiceHarness({
       aiServiceOverrides: { stopStream: mock(() => Promise.resolve(Ok(undefined))) },
     });
@@ -1239,11 +1243,13 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     };
     await config.addWorkspace(projectPath, metadata);
     const other = new HistoryService(config);
-    const seeded = await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("user-1", "user", "please plan", {})
-    );
-    expect(seeded.success).toBe(true);
+    if (seeded) {
+      const appended = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("user-1", "user", "please plan", {})
+      );
+      expect(appended.success).toBe(true);
+    }
     const planPath =
       location === "canonical"
         ? expandTilde(getPlanFilePath(workspaceId, projectName))
@@ -1252,25 +1258,23 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     await fsPromises.mkdir(path.dirname(planPath), { recursive: true });
     await fsPromises.writeFile(planPath, "# Plan\n\nBefore the clear.\n");
     const internals = clearer as unknown as {
-      deletePlanFilesForWorkspace: (id: string, meta: FrontendWorkspaceMetadata) => Promise<void>;
+      deletePlanFilesForWorkspace: (id: string) => Promise<Result<void>>;
       clearHistoryThroughCompactionCancellation: (
         id: string,
         percentage: number,
         onCancellationFailure: (error: string) => void
       ) => Promise<Result<number[]>>;
-    };
-    /** Plan files moved aside for this workspace and not restored or removed. */
-    const asideFiles = async () => {
-      const names = [
-        ...(await fsPromises.readdir(planDir).catch(() => [])),
-        ...(await fsPromises.readdir(legacyDir).catch(() => [])),
-      ];
-      return names.filter((name) => name.startsWith(`${workspaceId}.md.`));
+      bashMonitorWakeReconciler: { finishFullHistoryClear: (token: unknown) => Promise<void> };
     };
     const snapshotCount = async () => {
       const state = await getPlanReviewState(other, workspaceId);
       expect(state.success).toBe(true);
       return state.success ? state.data.snapshots.length : -1;
+    };
+    const historyIds = async () => {
+      const history = await other.getLastMessages(workspaceId, 10);
+      expect(history.success).toBe(true);
+      return history.success ? history.data.map((message) => message.id) : [];
     };
     const capture = () =>
       ensurePlanSnapshot(
@@ -1280,229 +1284,220 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
           metadata,
         }
       );
+    /** A capture that runs `discard` after its plan read, right before its locked append. */
+    const inFlightCapture = async (discard: () => Promise<unknown>) => {
+      const original = other.appendDerivedFromFullHistory.bind(other);
+      const spy = spyOn(other, "appendDerivedFromFullHistory").mockImplementation(
+        async (id, derive) => {
+          await discard();
+          return original(id, derive);
+        }
+      );
+      try {
+        return await capture();
+      } finally {
+        spy.mockRestore();
+      }
+    };
     const teardown = async () => {
       await clearer.disposeSession(workspaceId);
       await harness.cleanup();
     };
     return {
+      workspaceId,
       clearer,
+      historyService,
       internals,
       planPath,
-      asideFiles,
       snapshotCount,
+      historyIds,
       capture,
+      inFlightCapture,
       teardown,
-      other: () => other,
     };
   }
 
-  for (const location of ["canonical", "legacy"] as const) {
-    test(`a capture between the history commit and the plan deletion does not append (${location} plan path)`, async () => {
-      const t = await setup(`plan-clear-window-${location}`, location);
-      try {
-        const original = t.internals.deletePlanFilesForWorkspace.bind(t.clearer);
-        let captured: Awaited<ReturnType<typeof t.capture>> | undefined;
-        spyOn(t.internals, "deletePlanFilesForWorkspace").mockImplementation(async (id, meta) => {
-          // The history is already cleared and the generation already advanced, so the capture's
-          // frontier matches at its append; only the plan read can refuse it.
-          captured = await t.capture();
-          return original(id, meta);
-        });
-        const cleared = await t.clearer.truncateHistory(`plan-clear-window-${location}`, 1.0);
-        expect(cleared.success).toBe(true);
-        expect(captured).toBeDefined();
-        expect(captured?.success === false && captured.error.type).toBe("plan_missing");
-        expect(await t.snapshotCount()).toBe(0);
-        expect(existsSync(t.planPath)).toBe(false);
-        expect(await t.asideFiles()).toEqual([]);
-      } finally {
-        await t.teardown();
-      }
-    });
-  }
-
-  test("a failed clear keeps the plan file", async () => {
-    const t = await setup("plan-clear-failed");
-    try {
-      spyOn(t.internals, "clearHistoryThroughCompactionCancellation").mockImplementationOnce(
-        async () => {
-          // At the commit point the plan is already aside, so it has to be put back.
-          expect(existsSync(t.planPath)).toBe(false);
-          expect(await t.asideFiles()).toHaveLength(1);
-          return Err("history write failed");
-        }
-      );
-      const cleared = await t.clearer.truncateHistory("plan-clear-failed", 1.0);
-      expect(cleared.success).toBe(false);
-      expect(await fsPromises.readFile(t.planPath, "utf8")).toBe("# Plan\n\nBefore the clear.\n");
-      expect(await t.asideFiles()).toEqual([]);
-    } finally {
-      await t.teardown();
-    }
-  });
-
-  test("a failed clear keeps a plan written while it ran instead of the older one", async () => {
-    const t = await setup("plan-clear-failed-rewritten");
-    try {
-      spyOn(t.internals, "clearHistoryThroughCompactionCancellation").mockImplementationOnce(
-        async () => {
-          await fsPromises.writeFile(t.planPath, "# Plan\n\nWritten during the clear.\n");
-          return Err("history write failed");
-        }
-      );
-      const cleared = await t.clearer.truncateHistory("plan-clear-failed-rewritten", 1.0);
-      expect(cleared.success).toBe(false);
-      expect(await fsPromises.readFile(t.planPath, "utf8")).toBe(
-        "# Plan\n\nWritten during the clear.\n"
-      );
-      expect(await t.asideFiles()).toEqual([]);
-    } finally {
-      await t.teardown();
-    }
-  });
-
-  test("a clear that fails after its history commit does not bring the plan back", async () => {
-    const t = await setup("plan-clear-post-commit-failure");
-    try {
-      // Bookkeeping after the deletion receipt can still throw; the clear has committed, so the
-      // moved-aside plan must be removed, not restored for a later capture to read.
-      const reconciler = (
-        t.clearer as unknown as {
-          bashMonitorWakeReconciler: { finishFullHistoryClear: (token: unknown) => Promise<void> };
-        }
-      ).bashMonitorWakeReconciler;
-      spyOn(reconciler, "finishFullHistoryClear").mockRejectedValueOnce(
-        new Error("monitor bookkeeping failed")
-      );
-      let thrown: unknown;
-      try {
-        await t.clearer.truncateHistory("plan-clear-post-commit-failure", 1.0);
-      } catch (error) {
-        thrown = error;
-      }
-      expect(thrown).toBeInstanceOf(Error);
-      const history = await t.other().getLastMessages("plan-clear-post-commit-failure", 5);
-      expect(history.success && history.data).toEqual([]);
-      expect(existsSync(t.planPath)).toBe(false);
-      expect(await t.asideFiles()).toEqual([]);
-      const captured = await t.capture();
-      expect(captured.success === false && captured.error.type).toBe("plan_missing");
-    } finally {
-      await t.teardown();
-    }
-  });
-
-  test("a normal clear deletes the plan file and leaves nothing aside", async () => {
-    const t = await setup("plan-clear-normal");
-    try {
-      const cleared = await t.clearer.truncateHistory("plan-clear-normal", 1.0);
-      expect(cleared.success).toBe(true);
-      expect(existsSync(t.planPath)).toBe(false);
-      expect(await t.asideFiles()).toEqual([]);
-      // With the plan gone, a later capture has nothing to snapshot.
-      const captured = await t.capture();
-      expect(captured.success === false && captured.error.type).toBe("plan_missing");
-    } finally {
-      await t.teardown();
-    }
-  });
-
-  // A destructive, non-compaction replacement row ("start here" style).
-  const replacementSummary = () =>
-    createMuxMessage("replacement-summary", "assistant", "Replacement summary", {});
-
-  for (const location of ["canonical", "legacy"] as const) {
-    test(`a capture between a destructive replacement's commit and its plan deletion does not append (${location} plan path)`, async () => {
-      const workspaceId = `plan-replace-window-${location}`;
-      const t = await setup(workspaceId, location);
-      try {
-        const original = t.internals.deletePlanFilesForWorkspace.bind(t.clearer);
-        let captured: Awaited<ReturnType<typeof t.capture>> | undefined;
-        spyOn(t.internals, "deletePlanFilesForWorkspace").mockImplementation(async (id, meta) => {
-          // The replacement has committed and advanced the generation, so only the plan read can
-          // refuse the capture.
-          captured = await t.capture();
-          return original(id, meta);
-        });
-        const replaced = await t.clearer.replaceHistory(workspaceId, replacementSummary(), {
+  type Setup = Awaited<ReturnType<typeof setup>>;
+  const summary = (compacted: boolean) =>
+    createMuxMessage(
+      "replacement-summary",
+      "assistant",
+      "Replacement summary",
+      compacted ? { compacted: "user" } : {}
+    );
+  // Every history mutation that discards the plan. Where it leaves the context generation alone
+  // (a compaction-boundary replace, or a compaction replace over already-empty history), the
+  // plan's existence at the append is the whole fence, so an in-flight capture is refused as
+  // plan_missing instead of capture_aborted.
+  const discards = [
+    {
+      name: "full clear",
+      run: (t: Setup) => t.clearer.truncateHistory(t.workspaceId, 1.0),
+      seeded: true,
+      clearsRows: true,
+      inFlightError: "capture_aborted",
+    },
+    {
+      name: "destructive replace",
+      run: (t: Setup) =>
+        t.clearer.replaceHistory(t.workspaceId, summary(false), { deletePlanFile: true }),
+      seeded: true,
+      clearsRows: true,
+      inFlightError: "capture_aborted",
+    },
+    {
+      name: "compaction replace",
+      run: (t: Setup) =>
+        t.clearer.replaceHistory(t.workspaceId, summary(true), { deletePlanFile: true }),
+      seeded: true,
+      clearsRows: true,
+      inFlightError: "capture_aborted",
+    },
+    {
+      name: "compaction replace over empty history",
+      run: (t: Setup) =>
+        t.clearer.replaceHistory(t.workspaceId, summary(true), { deletePlanFile: true }),
+      seeded: false,
+      clearsRows: true,
+      inFlightError: "plan_missing",
+    },
+    {
+      name: "compaction-boundary replace",
+      run: (t: Setup) =>
+        t.clearer.replaceHistory(t.workspaceId, summary(true), {
+          mode: "append-compaction-boundary",
           deletePlanFile: true,
-        });
-        expect(replaced.success).toBe(true);
-        expect(captured).toBeDefined();
-        expect(captured?.success === false && captured.error.type).toBe("plan_missing");
-        expect(await t.snapshotCount()).toBe(0);
-        const history = await t.other().getLastMessages(workspaceId, 5);
-        expect(history.success && history.data.map((message) => message.id)).toEqual([
-          "replacement-summary",
-        ]);
-        expect(existsSync(t.planPath)).toBe(false);
-        expect(await t.asideFiles()).toEqual([]);
+        }),
+      seeded: true,
+      clearsRows: false,
+      inFlightError: "plan_missing",
+    },
+  ] as const;
+  const slug = (name: string) => name.replaceAll(" ", "-");
+
+  for (const discard of discards) {
+    const locations =
+      discard.inFlightError === "plan_missing"
+        ? (["canonical", "legacy"] as const)
+        : (["canonical"] as const);
+    for (const location of locations) {
+      test(`an in-flight capture that read the plan before a ${discard.name} is refused at its append (${location} plan path)`, async () => {
+        const t = await setup(
+          `plan-in-flight-${slug(discard.name)}-${location}`,
+          location,
+          discard.seeded
+        );
+        try {
+          let discarded: Result<void> | undefined;
+          const captured = await t.inFlightCapture(async () => {
+            discarded = await discard.run(t);
+          });
+          expect(discarded?.success).toBe(true);
+          expect(captured.success === false && captured.error.type).toBe(discard.inFlightError);
+          expect(await t.snapshotCount()).toBe(0);
+          expect(existsSync(t.planPath)).toBe(false);
+        } finally {
+          await t.teardown();
+        }
+      });
+    }
+
+    // The plan is deleted before the history commit, so a capture there lands before the commit
+    // and the commit discards its row; deleting after the commit would let it survive. (A
+    // boundary replace keeps earlier rows, so a capture before it legitimately survives.)
+    if (discard.clearsRows) {
+      test(`a capture at the plan deletion of a ${discard.name} does not survive it`, async () => {
+        const t = await setup(
+          `plan-at-deletion-${slug(discard.name)}`,
+          "canonical",
+          discard.seeded
+        );
+        try {
+          const original = t.internals.deletePlanFilesForWorkspace.bind(t.clearer);
+          spyOn(t.internals, "deletePlanFilesForWorkspace").mockImplementation(async (id) => {
+            await t.capture();
+            return original(id);
+          });
+          const discarded = await discard.run(t);
+          expect(discarded.success).toBe(true);
+          expect(await t.snapshotCount()).toBe(0);
+          expect(existsSync(t.planPath)).toBe(false);
+        } finally {
+          await t.teardown();
+        }
+      });
+    }
+
+    test(`a failed plan deletion refuses the ${discard.name} before it commits`, async () => {
+      const t = await setup(`plan-delete-fails-${slug(discard.name)}`, "canonical", discard.seeded);
+      try {
+        // A non-empty directory at the plan path makes the real deletion fail.
+        await fsPromises.rm(t.planPath);
+        await fsPromises.mkdir(t.planPath);
+        await fsPromises.writeFile(path.join(t.planPath, "keep"), "x");
+        const discarded = await discard.run(t);
+        expect(discarded.success).toBe(false);
+        expect(discarded.success ? "" : discarded.error).toContain(
+          "Failed to delete the plan file"
+        );
+        expect(await t.historyIds()).toEqual(discard.seeded ? ["user-1"] : []);
       } finally {
         await t.teardown();
       }
     });
+
+    if (discard.clearsRows) {
+      test(`a ${discard.name} that fails after its commit does not bring the plan back`, async () => {
+        const t = await setup(
+          `plan-post-commit-failure-${slug(discard.name)}`,
+          "canonical",
+          discard.seeded
+        );
+        try {
+          // Bookkeeping after the commit can still throw (a full clear rethrows, a replace returns
+          // Err); the plan was deleted before the commit and nothing restores it.
+          spyOn(
+            t.internals.bashMonitorWakeReconciler,
+            "finishFullHistoryClear"
+          ).mockRejectedValueOnce(new Error("monitor bookkeeping failed"));
+          const outcome = await discard.run(t).catch((error: unknown) => error);
+          expect(outcome instanceof Error || (outcome as Result<void>).success === false).toBe(
+            true
+          );
+          expect(await t.historyIds()).toEqual([]);
+          expect(existsSync(t.planPath)).toBe(false);
+          const captured = await t.capture();
+          expect(captured.success === false && captured.error.type).toBe("plan_missing");
+        } finally {
+          await t.teardown();
+        }
+      });
+    }
   }
 
-  test("a destructive replacement that fails before its commit keeps the plan file", async () => {
-    const workspaceId = "plan-replace-failed";
-    const t = await setup(workspaceId);
+  test("a full clear whose commit fails after the plan deletion keeps history without the plan", async () => {
+    // The one accepted "plan gone, history kept" case: the user asked for the deletion, and the
+    // plan is never put back for a later capture to read.
+    const t = await setup("plan-clear-commit-fails");
     try {
-      spyOn(t.internals, "clearHistoryThroughCompactionCancellation").mockImplementationOnce(
-        async () => {
-          // At the commit point the plan is already aside, so it has to be put back.
-          expect(existsSync(t.planPath)).toBe(false);
-          expect(await t.asideFiles()).toHaveLength(1);
-          return Err("history write failed");
-        }
+      spyOn(t.internals, "clearHistoryThroughCompactionCancellation").mockResolvedValueOnce(
+        Err("history write failed")
       );
-      const replaced = await t.clearer.replaceHistory(workspaceId, replacementSummary(), {
-        deletePlanFile: true,
-      });
-      expect(replaced.success).toBe(false);
-      expect(await fsPromises.readFile(t.planPath, "utf8")).toBe("# Plan\n\nBefore the clear.\n");
-      expect(await t.asideFiles()).toEqual([]);
-    } finally {
-      await t.teardown();
-    }
-  });
-
-  test("a destructive replacement that fails after its commit does not bring the plan back", async () => {
-    const workspaceId = "plan-replace-post-commit-failure";
-    const t = await setup(workspaceId);
-    try {
-      // Bookkeeping after the deletion receipt can still throw; the replacement has committed,
-      // so the moved-aside plan must be removed, not restored for a later capture to read.
-      const reconciler = (
-        t.clearer as unknown as {
-          bashMonitorWakeReconciler: { finishFullHistoryClear: (token: unknown) => Promise<void> };
-        }
-      ).bashMonitorWakeReconciler;
-      spyOn(reconciler, "finishFullHistoryClear").mockRejectedValueOnce(
-        new Error("monitor bookkeeping failed")
-      );
-      const replaced = await t.clearer.replaceHistory(workspaceId, replacementSummary(), {
-        deletePlanFile: true,
-      });
-      expect(replaced.success).toBe(false);
-      const history = await t.other().getLastMessages(workspaceId, 5);
-      expect(history.success && history.data).toEqual([]);
+      const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
+      expect(cleared.success).toBe(false);
+      expect(await t.historyIds()).toEqual(["user-1"]);
       expect(existsSync(t.planPath)).toBe(false);
-      expect(await t.asideFiles()).toEqual([]);
-      const captured = await t.capture();
-      expect(captured.success === false && captured.error.type).toBe("plan_missing");
     } finally {
       await t.teardown();
     }
   });
 
   test("a destructive replacement without deletePlanFile keeps the plan file in place", async () => {
-    const workspaceId = "plan-replace-keeps-plan";
-    const t = await setup(workspaceId);
+    const t = await setup("plan-replace-keeps-plan");
     try {
-      const replaced = await t.clearer.replaceHistory(workspaceId, replacementSummary());
+      const replaced = await t.clearer.replaceHistory(t.workspaceId, summary(false));
       expect(replaced.success).toBe(true);
       expect(await fsPromises.readFile(t.planPath, "utf8")).toBe("# Plan\n\nBefore the clear.\n");
-      expect(await t.asideFiles()).toEqual([]);
     } finally {
       await t.teardown();
     }

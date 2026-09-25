@@ -2254,15 +2254,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // pre-admission awaits (e.g. branch-summary generation).
   private readonly contextMutationEpochs = new Map<string, number>();
 
-  // On-demand plan-review snapshot captures in flight, per workspace. A context mutation
-  // aborts them when it acquires its admission guard, and a capture that starts while a
-  // mutation holds the guard is refused up front. ensurePlanSnapshot's generation frontier
-  // already refuses bytes read before a clear commits, and both a full clear and a destructive
-  // replaceHistory with deletePlanFile move the plan aside before their commit
-  // (stagePlanFilesForClear), which closes the commit-to-plan-deletion window for every backend.
-  // This registry only stops this process's captures early.
-  private readonly onDemandPlanSnapshotCaptures = new Map<string, Set<AbortController>>();
-
   // r41: sends currently between the entry check and their settled outcome
   // (queued, refused, or admitted — PREPARING is set before any early
   // background-start return). Refine publication must not interleave with a
@@ -3564,10 +3555,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
       guard[Symbol.dispose]();
       return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
-    }
-    // Only once the mutation is certain to proceed (see onDemandPlanSnapshotCaptures).
-    for (const capture of this.onDemandPlanSnapshotCaptures.get(workspaceId) ?? []) {
-      capture.abort();
     }
     return Ok(guard);
   }
@@ -11727,26 +11714,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     if (!metadata) {
       return Err({ type: "plan_missing", message: `Workspace not found: ${workspaceId}` });
     }
-    const capture = new AbortController();
-    // A mutation already holding its guard never aborts later registrations; refuse up front.
-    if (this.contextMutationWorkspaces.has(workspaceId)) capture.abort();
-    let captures = this.onDemandPlanSnapshotCaptures.get(workspaceId);
-    if (captures === undefined) {
-      captures = new Set();
-      this.onDemandPlanSnapshotCaptures.set(workspaceId, captures);
-    }
-    captures.add(capture);
-    try {
-      return await ensurePlanSnapshot(this.planReviewHistoryDeps, {
-        workspaceId,
-        metadata,
-        signal: capture.signal,
-        ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
-      });
-    } finally {
-      captures.delete(capture);
-      if (captures.size === 0) this.onDemandPlanSnapshotCaptures.delete(workspaceId);
-    }
+    // No in-process fencing needed: ensurePlanSnapshot re-checks the generation and the plan
+    // file's existence under the history write lock (see its admission contract).
+    return ensurePlanSnapshot(this.planReviewHistoryDeps, {
+      workspaceId,
+      metadata,
+      ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
+    });
   }
 
   planReviewSetThreadResolved(
@@ -14107,14 +14081,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Best-effort delete of plan files (new + legacy paths) for a workspace.
+   * Delete a workspace's plan files (new + legacy paths) before a history commit that discards
+   * them (full clear, replaceHistory with deletePlanFile). Missing files are fine; any other
+   * failure is returned so the caller refuses the mutation before committing it.
    *
-   * Why best-effort: plan files may not exist yet, or deletion may fail due to permissions.
+   * Why before the commit: ensurePlanSnapshot re-checks at its append, under the history write
+   * lock, that the plan still exists, so a capture (in this or a sibling backend) that read the
+   * plan earlier cannot land it in the new history. The deletion itself needs no history lock:
+   * the commit takes that lock afterwards, so an append ordered after the commit sees no plan and
+   * one ordered before it lands in the old history. Nothing ever restores the plan: when the
+   * commit then fails, history is kept without its plan. The user asked for the deletion, and
+   * snapshot rows already in history keep the reviewed content.
    */
-  private async deletePlanFilesForWorkspace(
-    workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
-  ): Promise<void> {
+  private async deletePlanFilesForWorkspace(workspaceId: string): Promise<Result<void>> {
+    const metadata = await this.getInfo(workspaceId);
+    // No metadata: no plan path to derive, so there is nothing to delete.
+    if (!metadata) return Ok(undefined);
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
     const xumHome = runtime.getXumHome();
@@ -14138,8 +14120,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         ? expandTildeForSSH(legacyPlanPath)
         : shellQuote(expandTilde(legacyPlanPath));
 
-    if (isDocker || isSSH) {
-      try {
+    try {
+      if (isDocker || isSSH) {
         // Use exec to delete files since runtime doesn't have a deleteFile method.
         // Use runtime workspace path (not host projectPath) for Docker containers.
         const workspacePath = runtime.getWorkspacePath(metadata.projectPath, metadata.name);
@@ -14154,97 +14136,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // Ignore stdin-close errors (e.g. already closed).
         }
 
-        await execStream.exitCode.catch(() => {
-          // Best-effort: ignore failures.
-        });
-      } catch {
-        // Plan files don't exist or can't be deleted - ignore
+        const exitCode = await execStream.exitCode;
+        if (exitCode !== 0) return Err(`Failed to delete the plan file (rm exited ${exitCode})`);
+        return Ok(undefined);
       }
 
-      return;
+      // Local runtimes: delete directly on the local filesystem (force: a missing file is fine).
+      await Promise.all([
+        fsPromises.rm(expandTilde(planPath), { force: true }),
+        fsPromises.rm(expandTilde(legacyPlanPath), { force: true }),
+      ]);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to delete the plan file: ${getErrorMessage(error)}`);
     }
-
-    // Local runtimes: delete directly on the local filesystem.
-    const planPathAbs = expandTilde(planPath);
-    const legacyPlanPathAbs = expandTilde(legacyPlanPath);
-
-    await Promise.allSettled([
-      fsPromises.rm(planPathAbs, { force: true }),
-      fsPromises.rm(legacyPlanPathAbs, { force: true }),
-    ]);
-  }
-
-  /**
-   * Move a full clear's plan files (current and legacy path) aside to a unique name in the same
-   * directory, before its history commit (see the call sites in truncateHistory and, for a
-   * destructive replacement that deletes the plan, replaceHistory). `restore`
-   * puts them back when the clear does not commit, unless a plan was written in the meantime
-   * (that newer plan wins); `discard` removes them after the commit.
-   *
-   * Best effort, like deletePlanFilesForWorkspace: a failed move only leaves the old window
-   * open, and the post-commit deletion still removes the plan. A crash between the move and the
-   * commit leaves the plan under the aside name with history intact. The user asked to clear,
-   * which deletes the plan anyway, and the bytes stay recoverable, so nothing sweeps them back.
-   */
-  private async stagePlanFilesForClear(
-    workspaceId: string
-  ): Promise<{ restore: () => Promise<void>; discard: () => Promise<void> } | null> {
-    const metadata = await this.getInfo(workspaceId).catch((error: unknown) => {
-      log.warn("Plan files not moved aside for a full clear: metadata unavailable", {
-        workspaceId,
-        error,
-      });
-      return null;
-    });
-    if (!metadata) return null;
-    const runtime = createRuntimeForWorkspace(metadata);
-    const xumHome = runtime.getXumHome();
-    const plan = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
-    const legacy = getLegacyPlanFilePath(workspaceId, xumHome);
-    // Not ending in ".md", so it can never be read as any workspace's plan.
-    const suffix = `.clearing-${crypto.randomUUID()}`;
-    // pathEnv canonicalizes per runtime (tilde, SSH home, container paths), as readPlanFile does.
-    const pathEnv = {
-      XUM_PLAN: plan,
-      XUM_PLAN_ASIDE: `${plan}${suffix}`,
-      XUM_LEGACY_PLAN: legacy,
-      XUM_LEGACY_PLAN_ASIDE: `${legacy}${suffix}`,
-    };
-    const run = async (step: string, script: string) => {
-      try {
-        const result = await execBuffered(runtime, script, { cwd: "/tmp", pathEnv, timeout: 10 });
-        if (result.exitCode !== 0) {
-          log.warn(`Plan file ${step} for a full clear failed`, {
-            workspaceId,
-            exitCode: result.exitCode,
-            stderr: result.stderr,
-          });
-        }
-      } catch (error) {
-        log.warn(`Plan file ${step} for a full clear failed`, { workspaceId, error });
-      }
-    };
-    const exists = 'exists() { [ -e "$1" ] || [ -L "$1" ]; }';
-    // Legacy first: readPlanFile migrates a legacy plan to the current path when the current
-    // path is missing, so moving the current path first could let that migration recreate it.
-    await run(
-      "move-aside",
-      `${exists}; aside() { if exists "$1"; then mv -f "$1" "$2"; fi; }; s=0; ` +
-        'aside "$XUM_LEGACY_PLAN" "$XUM_LEGACY_PLAN_ASIDE" || s=1; ' +
-        'aside "$XUM_PLAN" "$XUM_PLAN_ASIDE" || s=1; exit $s'
-    );
-    return {
-      // mv -n never replaces a plan written meanwhile; that newer plan wins and the older copy
-      // is dropped. If the move back fails for another reason, the copy stays for recovery.
-      restore: () =>
-        run(
-          "restore",
-          `${exists}; back() { if exists "$2"; then mv -n "$2" "$1"; ` +
-            'if exists "$2" && exists "$1"; then rm -f "$2"; fi; fi; }; ' +
-            'back "$XUM_PLAN" "$XUM_PLAN_ASIDE"; back "$XUM_LEGACY_PLAN" "$XUM_LEGACY_PLAN_ASIDE"'
-        ),
-      discard: () => run("cleanup", 'rm -f "$XUM_PLAN_ASIDE" "$XUM_LEGACY_PLAN_ASIDE"'),
-    };
   }
 
   private async clearHistoryThroughCompactionCancellation(
@@ -14433,49 +14338,32 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // becoming a real cut skips reference retirement; a full clear leaving survivors would
     // apply full-clear-only discards while rows remain).
     let cancellationError: string | undefined;
-    // Set only from the deletion receipt: clearHistoryThroughCompactionCancellation returns Ok
-    // exactly when the history deletion committed.
-    const fullClear = { committed: false };
-    const truncate = async () => {
+    const truncate = async (): Promise<Result<number[]>> => {
       if (!isFullClear) {
         return this.historyService.truncateHistory(workspaceId, effectivePercentage, {
           refuseFullDelete: truncationScope === "partial",
           refuseRowRemoval: truncationScope === "none",
         });
       }
-      const cleared = await this.clearHistoryThroughCompactionCancellation(
+      // After every refusal check above, right before the commit (#4420): see
+      // deletePlanFilesForWorkspace. A failed deletion refuses the clear with nothing committed.
+      const deleted = await this.deletePlanFilesForWorkspace(workspaceId);
+      if (!deleted.success) return Err(deleted.error);
+      return this.clearHistoryThroughCompactionCancellation(
         workspaceId,
         effectivePercentage,
         (error) => {
           cancellationError = error;
         }
       );
-      fullClear.committed = cleared.success;
-      return cleared;
     };
-    // A full clear deletes the plan file only after its history commit. Another backend on this
-    // workspace (#4420) could start a snapshot capture in between, read the discarded plan with
-    // a post-clear generation, and append it. Moving the plan aside BEFORE the commit closes that
-    // gap: a capture reads either before the move (its pre-commit generation refuses the append
-    // afterwards) or finds no plan. Only a clear without a deletion receipt puts the plan back;
-    // bookkeeping that fails after the commit must not resurrect it.
-    const planStaging = isFullClear ? await this.stagePlanFilesForClear(workspaceId) : null;
-    const settlePlanStaging = () =>
-      fullClear.committed ? planStaging?.discard() : planStaging?.restore();
-    let truncateResult: Result<number[]>;
-    try {
-      truncateResult =
-        effectivePercentage > 0
-          ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
-              discardUnacceptedOnSuccess: isFullClear,
-            })
-          : await truncate();
-    } catch (error) {
-      await settlePlanStaging();
-      throw error;
-    }
+    const truncateResult =
+      effectivePercentage > 0
+        ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
+            discardUnacceptedOnSuccess: isFullClear,
+          })
+        : await truncate();
     if (!truncateResult.success) {
-      await settlePlanStaging();
       return Err(truncateResult.error);
     }
 
@@ -14514,13 +14402,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
     }
 
-    // On full clear, also delete plan file and clear file change tracking
+    // On full clear (the plan file is already deleted), also clear file change tracking
     if (isFullClear) {
-      const metadata = await this.getInfo(workspaceId);
-      if (metadata) {
-        await this.deletePlanFilesForWorkspace(workspaceId, metadata);
-      }
-      await planStaging?.discard();
       // A full chat clear removes the context the goal loop was using; require
       // one user re-engagement before later continuation slices resume it.
       try {
@@ -14765,10 +14648,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     using _admissionGuard = admissionGuard;
 
     const replaceMode = options?.mode ?? "destructive";
-    // Plan files a destructive replacement with deletePlanFile moved aside before its commit,
-    // settled by the deletion receipt on every exit (see the finally below).
-    let planStaging: Awaited<ReturnType<typeof this.stagePlanFilesForClear>> = null;
-    const replacement = { committed: false };
+    // deletePlanFile deletes the plan right before this replacement's history commit, after its
+    // refusal checks (see deletePlanFilesForWorkspace); a failed deletion refuses it with nothing
+    // committed. Where the replacement keeps the context generation (compaction-boundary mode, or
+    // a compaction clear of empty history), this deletion plus ensurePlanSnapshot's existence
+    // check is the whole fence against an earlier plan read landing in the new history.
+    const deletePlanBeforeCommit = (): Promise<Result<void>> =>
+      options?.deletePlanFile === true
+        ? this.deletePlanFilesForWorkspace(workspaceId)
+        : Promise.resolve(Ok(undefined));
 
     try {
       let messageToAppend = summaryMessage;
@@ -14825,6 +14713,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           isPositiveInteger(messageToAppend.metadata?.compactionEpoch),
           "append-compaction-boundary replace mode must persist a positive compactionEpoch"
         );
+        // This mode's commit is the boundary append below.
+        const deleted = await deletePlanBeforeCommit();
+        if (!deleted.success) return Err(deleted.error);
       } else {
         assert(
           replaceMode === "destructive",
@@ -14889,30 +14780,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
         }
         this.sessions.get(workspaceId)?.clearUsageState();
-        // Same window as a full clear (#4420): the plan is deleted only after this commit, which
-        // advances the generation, so another backend's capture in between would read the
-        // pre-replacement plan and append it. Move it aside BEFORE the commit instead. Compaction
-        // replaces leave the generation alone, so the snapshot fence never applies to them.
-        if (!isCompaction && options?.deletePlanFile === true) {
-          planStaging = await this.stagePlanFilesForClear(workspaceId);
-        }
         let cancellationError: string | undefined;
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
           async () => {
-            if (isCompaction) {
-              return this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false });
-            }
-            const cleared = await this.clearHistoryThroughCompactionCancellation(
-              workspaceId,
-              1,
-              (error) => {
-                cancellationError = error;
-              }
-            );
-            // Set only from the deletion receipt: Ok exactly when the history deletion committed.
-            replacement.committed = cleared.success;
-            return cleared;
+            const deleted = await deletePlanBeforeCommit();
+            if (!deleted.success) return Err(deleted.error);
+            return isCompaction
+              ? this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false })
+              : this.clearHistoryThroughCompactionCancellation(workspaceId, 1, (error) => {
+                  cancellationError = error;
+                });
           },
           { discardUnacceptedOnSuccess: true }
         );
@@ -15012,14 +14890,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.emit("chat", { workspaceId, message: typedSummaryMessage });
       }
 
-      // Optional cleanup: delete plan file when caller explicitly requests it.
-      // Note: the propose_plan UI keeps the plan file on disk; this flag is reserved for
-      // explicit reset flows and backwards compatibility.
+      // Optional cleanup when the caller explicitly requests it (the plan file itself was
+      // deleted before the commit). Note: the propose_plan UI keeps the plan file on disk; this
+      // flag is reserved for explicit reset flows and backwards compatibility.
       if (options?.deletePlanFile === true) {
-        const metadata = await this.getInfo(workspaceId);
-        if (metadata) {
-          await this.deletePlanFilesForWorkspace(workspaceId, metadata);
-        }
         this.sessions.get(workspaceId)?.clearFileState();
       }
 
@@ -15027,10 +14901,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to replace history: ${message}`);
-    } finally {
-      // Only a replacement without a deletion receipt puts the plan back; bookkeeping that fails
-      // after the commit must not resurrect it for a later capture to read.
-      await (replacement.committed ? planStaging?.discard() : planStaging?.restore());
     }
   }
 

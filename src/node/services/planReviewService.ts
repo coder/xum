@@ -41,7 +41,7 @@ import {
   createRuntimeForWorkspace,
   type WorkspaceMetadataForRuntime,
 } from "@/node/runtime/runtimeHelpers";
-import { getPlanFilePath } from "@/common/utils/planStorage";
+import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 
 import type { HistoryService } from "./historyService";
@@ -242,14 +242,27 @@ export async function ensurePlanSnapshot(
   args: EnsurePlanSnapshotArgs
 ): Promise<Result<EnsurePlanSnapshotResult, PlanReviewError>> {
   if (args.signal?.aborted) return Err(captureAborted());
-  // Admission contract: the plan bytes read below may only land if no destructive history
-  // mutation committed since the capture's frontier. The frontier is the context generation that
-  // every full clear (empty history included, via the Stop publication it runs through), reset
-  // and destructive replace advances under the cross-process history write lock, while ordinary
-  // appends and compaction leave it alone (a Stop or an active-context cut also advances it,
-  // which only refuses conservatively). Comparing it again under that lock at the append fences
-  // sibling backends too (XUM_ALLOW_MULTIPLE_INSTANCES), whose in-memory fencing this process
-  // cannot see. Never hold the lock across the (possibly remote) plan read itself.
+  // Admission contract, re-checked at the append under the history write lock. That lock is an
+  // in-process mutex plus a cross-process lockfile every backend on this Xum home takes
+  // (acquireProcessFileLock; a live holder is never reclaimed), so it also fences sibling
+  // backends (XUM_ALLOW_MULTIPLE_INSTANCES) whose in-memory state this process cannot see.
+  // 1. Generation: no destructive history mutation committed since the capture's frontier. Every
+  //    full clear and non-compaction destructive replace (empty history included, via the Stop
+  //    publication they run through), reset, and compaction replace of non-empty history
+  //    advances it under that lock; ordinary appends and compaction boundaries leave it alone (a
+  //    Stop or an active-context cut also advances it, which only refuses conservatively).
+  // 2. Existence: the plan file must still exist. A full clear and every replaceHistory with
+  //    deletePlanFile unlink the plan BEFORE their history commit, so bytes read earlier cannot
+  //    land after it. This is the whole fence where the generation stays put: a
+  //    compaction-boundary replace, or a compaction replace over already-empty history.
+  //    Existence, not equality: a proposal capture keeps the proposed bytes by design, even when
+  //    the plan was edited after the proposal.
+  // Accepted residual: where the generation stays put, a NEW plan written after the replace lets
+  // a capture that read the old plan before it append a snapshot of the old bytes beside the new
+  // plan. Snapshot rows are hidden from the model (isPlanReviewRecordMessage); only the review
+  // panel shows it.
+  // Never hold the lock across the (possibly remote) plan read itself; the existence check is a
+  // stat of the two plan paths.
   let frontier: { readonly generation: string | undefined };
   if (args.frontier !== undefined) {
     frontier = args.frontier;
@@ -312,22 +325,40 @@ export async function ensurePlanSnapshot(
     });
   }
 
+  const xumHome = runtime.getXumHome();
+  const planPaths = [
+    getPlanFilePath(args.metadata.name, args.metadata.projectName, xumHome),
+    // readPlanFile falls back to (and migrates) the legacy path, so it still counts as the plan.
+    getLegacyPlanFilePath(args.workspaceId, xumHome),
+  ];
+  const planStillExists = async (): Promise<boolean> => {
+    for (const planPath of planPaths) {
+      try {
+        if (!(await runtime.stat(planPath)).isDirectory) return true;
+      } catch {
+        // Missing (or unreachable): not a plan.
+      }
+    }
+    return false;
+  };
+
   let priorRows: MuxMessage[] = [];
   const appended = await deps.historyService.appendDerivedFromFullHistory(
     args.workspaceId,
-    (
+    async (
       messages,
       lockState
-    ): {
+    ): Promise<{
       message: MuxMessage | null;
-      value: { snapshotId: string; message: MuxMessage | null } | "aborted";
-    } => {
+      value: { snapshotId: string; message: MuxMessage | null } | "aborted" | "plan_missing";
+    }> => {
       // Admission check under the lock: the read above may have taken long enough for the
       // owning turn to settle or stop, and a late row must not be published after that.
       if (args.signal?.aborted) return { message: null, value: "aborted" };
       if (lockState.generation !== frontier.generation) {
         return { message: null, value: "aborted" };
       }
+      if (!(await planStillExists())) return { message: null, value: "plan_missing" };
       priorRows = messages.filter(isPlanReviewRow);
       const state = derivePlanReviewState(priorRows, deriveOptions(args.workspaceId));
       const existing = state.snapshots.find((snapshot) => snapshot.contentHash === contentHash);
@@ -339,6 +370,9 @@ export async function ensurePlanSnapshot(
   );
   if (!appended.success) return Err(historyFailed(appended.error));
   if (appended.data === "aborted") return Err(captureAborted());
+  if (appended.data === "plan_missing") {
+    return Err({ type: "plan_missing", message: `Plan file was deleted: ${plan.path}` });
+  }
 
   const { snapshotId, message } = appended.data;
   if (message !== null) {

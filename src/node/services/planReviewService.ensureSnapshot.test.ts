@@ -92,7 +92,10 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
   }
 
   /** Run `mutate` in the sibling after the plan read, right before the locked append. */
-  async function captureWithSiblingMutation(mutate: () => Promise<unknown>) {
+  async function captureWithSiblingMutation(
+    mutate: () => Promise<unknown>,
+    proposedContent?: string
+  ) {
     const original = handle.historyService.appendDerivedFromFullHistory.bind(handle.historyService);
     const spy = spyOn(handle.historyService, "appendDerivedFromFullHistory").mockImplementation(
       async <T>(id: string, derive: Derive<T>) => {
@@ -106,12 +109,14 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
           historyService: handle.historyService,
           emitChatEvent: (_id, message) => emitted.push(message),
         },
-        { workspaceId, metadata }
+        { workspaceId, metadata, ...(proposedContent !== undefined ? { proposedContent } : {}) }
       );
     } finally {
       spy.mockRestore();
     }
   }
+
+  const deletePlan = () => fs.rm(expandTilde(getPlanFilePath(workspaceId, projectName)));
 
   async function snapshotCount(): Promise<number> {
     const state = await getPlanReviewState(handle.historyService, workspaceId);
@@ -139,6 +144,30 @@ describe("on-demand ensurePlanSnapshot against a sibling backend's history mutat
   test("a capture over empty history with no concurrent mutation still appends", async () => {
     const captured = await captureWithSiblingMutation(() => Promise.resolve());
     expect(captured.success && captured.data.created).toBe(true);
+    expect(await snapshotCount()).toBe(1);
+  });
+
+  test("a capture is refused when the plan was deleted after the read, even without a generation change", async () => {
+    // A compaction-boundary replace (or a clear of empty history) with deletePlanFile keeps the
+    // generation; deleting the plan before its commit is what keeps these bytes out.
+    await seedRow();
+    const captured = await captureWithSiblingMutation(deletePlan);
+    expect(!captured.success && captured.error.type).toBe("plan_missing");
+    expect(emitted).toHaveLength(0);
+    expect(await snapshotCount()).toBe(0);
+  });
+
+  test("a proposal capture is refused once the plan file is deleted, not once it is edited", async () => {
+    await seedRow();
+    // Existence, not equality: the proposed bytes still land after a later edit...
+    const edited = await captureWithSiblingMutation(
+      () => fs.writeFile(expandTilde(getPlanFilePath(workspaceId, projectName)), "# Edited\n"),
+      "# Plan\n\nProposed\n"
+    );
+    expect(edited.success && edited.data.created).toBe(true);
+    // ...but not after the plan was deleted.
+    const deleted = await captureWithSiblingMutation(deletePlan, "# Plan\n\nProposed again\n");
+    expect(!deleted.success && deleted.error.type).toBe("plan_missing");
     expect(await snapshotCount()).toBe(1);
   });
 
