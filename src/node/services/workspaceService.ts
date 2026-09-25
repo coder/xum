@@ -2475,8 +2475,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config),
     private readonly effectRunner: EffectRunner = defaultEffectRunner,
     private readonly appFiberScope?: Scope.Scope,
-    // Test doubles construct WorkspaceService directly; the core graph provides the
-    // shared router (AutoModelRouterLive).
+    // The core graph injects the shared router (AutoModelRouterLive); a standalone
+    // construction builds its own from the stores above, like the other defaults.
     private readonly autoModelRouter: Pick<AutoModelRouter, "classify"> = new AutoModelRouter({
       providersConfigStore,
       policyService,
