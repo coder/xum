@@ -6,6 +6,7 @@ import * as fsPromises from "fs/promises";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import {
   auth,
+  IssuerMismatchError,
   type OAuthClientProvider,
   type OAuthDiscoveryState,
 } from "@modelcontextprotocol/client";
@@ -1479,6 +1480,15 @@ export class McpOauthService {
 
       return Ok(undefined);
     } catch (error) {
+      // The received `iss` is attacker-controllable in a mix-up attack and the
+      // SDK says callers must not display it; keep it in logs only (the SDK
+      // JSON-encodes it in the message) and show just the trusted expected issuer.
+      if (error instanceof IssuerMismatchError && error.kind === "authorization_response") {
+        log.warn("[MCP OAuth] Authorization response issuer mismatch", { error: error.message });
+        return Err(
+          `Issuer mismatch in authorization response (RFC 9207): the response did not come from the expected authorization server ${JSON.stringify(error.expected)}`
+        );
+      }
       const message = getErrorMessage(error);
       return Err(message);
     }

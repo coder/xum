@@ -919,7 +919,8 @@ describe("McpOauthService OAuth flows", () => {
             expect(callbackResult.success).toBe(false);
             if (callbackResult.success) return;
             expect(callbackResult.error).toContain("Issuer mismatch");
-            expect(callbackResult.error).toContain("https://attacker.example");
+            // The attacker-controlled issuer must never reach the user-visible error.
+            expect(callbackResult.error).not.toContain("attacker.example");
             expect(getTokenRequest()).toBeUndefined();
             return;
           }
