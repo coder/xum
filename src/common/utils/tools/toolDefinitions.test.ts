@@ -803,6 +803,11 @@ describe("TOOL_DEFINITIONS", () => {
     };
     const violations: string[] = [];
     const visit = (schema: unknown, at: string): void => {
+      // Draft-7 tuples list their member schemas as an `items` array.
+      if (Array.isArray(schema)) {
+        schema.forEach((member, index) => visit(member, `${at}[${index}]`));
+        return;
+      }
       if (schema == null || typeof schema !== "object") return;
       const node = schema as JsonSchema;
       const required = new Set((node.required as string[] | undefined) ?? []);
@@ -814,6 +819,7 @@ describe("TOOL_DEFINITIONS", () => {
         if (Array.isArray(branches)) for (const branch of branches) visit(branch, at);
       }
       visit(node.items, `${at}[]`);
+      visit(node.additionalItems, `${at}[]`);
       visit(node.additionalProperties, `${at}{}`);
     };
 
