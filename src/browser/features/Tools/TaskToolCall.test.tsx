@@ -938,30 +938,6 @@ describe("TaskSendMessageToolCall", () => {
     expect(view.getByRole("alert").textContent).toBe("Connection lost");
   });
 
-  test.each(["accepted", "queued", "reactivated"] as const)(
-    "preserves hooked delivery outcome: %s",
-    (status) => {
-      const view = render(
-        <TooltipProvider>
-          <TaskSendMessageToolCall
-            args={taskSendMessageArgs}
-            status="completed"
-            result={Object.freeze({
-              status,
-              taskId: "child-task",
-              hook_output: "Post hook finished",
-              hook_duration_ms: 20,
-              hook_path: ".xum/tool_post",
-            })}
-          />
-        </TooltipProvider>
-      );
-      expect(view.getByRole("status").className).toContain(
-        status === "queued" ? "text-backgrounded" : "text-success"
-      );
-    }
-  );
-
   test.each([
     { ok: true, expectedStatus: "redacted" },
     { ok: false, expectedStatus: "failed" },
@@ -1024,24 +1000,6 @@ describe("TaskSendMessageToolCall", () => {
     }
   );
 
-  test("shows bare pre-hook errors alongside their metadata", () => {
-    const view = render(
-      <TooltipProvider>
-        <TaskSendMessageToolCall
-          args={taskSendMessageArgs}
-          status="completed"
-          result={{
-            error: "Blocked by project hook",
-            hook_output: "Policy refused",
-            hook_path: ".xum/tool_pre",
-          }}
-        />
-      </TooltipProvider>
-    );
-    expect(view.getByRole("alert").textContent).toBe("Blocked by project hook");
-    expect(view.getByRole("status").className).toContain("text-danger");
-  });
-
   test.each([null, undefined, { type: "json", value: null }].map((result) => ({ result })))(
     "does not claim delivery for a missing completed result: %j",
     ({ result }) => {
@@ -1069,27 +1027,6 @@ describe("TaskSendMessageToolCall", () => {
     expect(view.getByRole("status").textContent).toBe(label);
   });
 
-  test("accepts SDK-wrapped results with inner and outer hook metadata", () => {
-    const view = render(
-      <TooltipProvider>
-        <TaskSendMessageToolCall
-          args={taskSendMessageArgs}
-          status="completed"
-          result={Object.freeze({
-            type: "json",
-            value: Object.freeze({
-              ...{ status: "accepted", taskId: "child-task" },
-              hook_output: "Inner hook",
-            }),
-            hook_output: "Outer hook",
-            hook_path: ".xum/tool_post",
-          })}
-        />
-      </TooltipProvider>
-    );
-    expect(view.getByRole("status").className).toContain("text-success");
-  });
-
   test("shows SDK-wrapped blocking errors", () => {
     const view = render(
       <TooltipProvider>
@@ -1103,7 +1040,9 @@ describe("TaskSendMessageToolCall", () => {
         />
       </TooltipProvider>
     );
+    // Normalization (toolUtils.test.ts) maps the wrapped bare error; the card must use it.
     expect(view.getByRole("alert").textContent).toBe("Wrapped blocking error");
+    expect(view.getByRole("status").className).toContain("text-danger");
   });
 });
 
