@@ -6,7 +6,7 @@ import type { ToolCallEndEvent } from "@/common/types/stream";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import type { HistoryService } from "./historyService";
 import { StreamManager } from "./streamManager";
-import { onTurnEngineEvent } from "./streamManager.testHarness";
+import { engineInternals, onTurnEngineEvent } from "./streamManager.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 
@@ -98,7 +98,7 @@ function registerStream(
     stepStartIndices: [0],
     stepTracker: {},
   };
-  const streams: unknown = Reflect.get(streamManager, "workspaceStreams");
+  const streams: unknown = engineInternals(streamManager).workspaceStreams;
   if (!(streams instanceof Map)) throw new Error("Expected StreamManager.workspaceStreams");
   streams.set(scope.workspaceId, streamInfo);
   return streamInfo;
@@ -114,7 +114,7 @@ type CompleteToolCall = (
 ) => Promise<void>;
 
 function completeToolCallFor(streamManager: StreamManager): CompleteToolCall {
-  const method: unknown = Reflect.get(streamManager, "completeToolCall");
+  const method: unknown = engineInternals(streamManager).completeToolCall;
   if (typeof method !== "function") throw new Error("Expected StreamManager.completeToolCall");
   return (method as CompleteToolCall).bind(streamManager);
 }

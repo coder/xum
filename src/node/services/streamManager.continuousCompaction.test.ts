@@ -19,6 +19,7 @@ import {
   type ContinuousCompactionJournal,
 } from "@/common/orpc/schemas/continuousCompaction";
 import { StreamManager } from "./streamManager";
+import { engineInternals } from "./streamManager.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import {
   exactJson,
@@ -118,11 +119,7 @@ function prepareHarness(
   requestOptions: Record<string, unknown> = {}
 ) {
   const spy = spyOn(ai, "streamText").mockReturnValue({} as ReturnType<typeof ai.streamText>);
-  const create = Reflect.get(manager, "createStreamResult") as (
-    request: { model: ai.LanguageModel; messages: ai.ModelMessage[] },
-    controller: AbortController,
-    tracker: Tracker
-  ) => unknown;
+  const create = engineInternals(manager).createStreamResult;
   const controller = new AbortController();
   create.call(
     manager,
@@ -697,7 +694,7 @@ describe("continuous prefix prepareStep and journal", () => {
   it("rejects a prefix whose prepared thinking level is stale at activation or consumption", async () => {
     const { manager, tracker, store, swap } = await setup();
     swap.journal.preparation.effectiveThinkingLevel = "high";
-    const streams = Reflect.get(manager, "workspaceStreams") as Map<string, unknown>;
+    const streams = engineInternals(manager).workspaceStreams;
     streams.set(workspaceId, {
       messageId: swap.journal.streamMessageId,
       model: swap.journal.parentModel,
@@ -842,11 +839,7 @@ describe("continuous prefix prepareStep and journal", () => {
         currentStepStartIndex: 1,
         partialWritePromise: undefined,
       };
-      const reset = Reflect.get(manager, "resetStreamStateForRetry") as (
-        id: string,
-        info: unknown,
-        options: { preserveParts: boolean }
-      ) => Promise<void>;
+      const reset = engineInternals(manager).resetStreamStateForRetry;
       await reset.call(manager, workspaceId, stream, { preserveParts: true });
       expect(tracker.pendingPrefixSwap).toBeUndefined();
       expect(tracker.consumedPrefixSwap).toBe(consumed ? swap : undefined);
@@ -1040,26 +1033,15 @@ describe("continuous prefix prepareStep and journal", () => {
             },
           },
         };
-        const reset = Reflect.get(manager, "resetStreamStateForRetry") as (
-          id: string,
-          info: unknown,
-          options: unknown
-        ) => Promise<void>;
-        Reflect.set(
-          manager,
-          "resetStreamStateForRetry",
-          async (...args: Parameters<typeof reset>) => {
-            await reset.call(manager, ...args);
-            expect(events).toEqual([]);
-            resetFinished = true;
-          }
-        );
-        const fallback = Reflect.get(manager, "tryModelFallbackAfterRefusal") as (
-          id: string,
-          stream: unknown,
-          reason: string,
-          options: { preserveParts: boolean }
-        ) => Promise<{ kind: string }>;
+        const reset = engineInternals(manager).resetStreamStateForRetry;
+        engineInternals(manager).resetStreamStateForRetry = async (
+          ...args: Parameters<typeof reset>
+        ) => {
+          await reset.call(manager, ...args);
+          expect(events).toEqual([]);
+          resetFinished = true;
+        };
+        const fallback = engineInternals(manager).tryModelFallbackAfterRefusal;
         if (mode === "journal-failure" && family === "anthropic") {
           spyOn(atomicWrite, "default").mockImplementationOnce(
             Object.assign(() => Promise.reject(new Error("fallback journal disk full")), {
