@@ -745,10 +745,8 @@ describe("TaskService", () => {
       )
     );
 
-    const internal = taskService as unknown as {
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-    };
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(resumeStream).toHaveBeenCalledTimes(1);
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
@@ -804,10 +802,8 @@ describe("TaskService", () => {
       )
     );
 
-    const internal = taskService as unknown as {
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-    };
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(resumeStream).toHaveBeenCalledTimes(1);
   });
@@ -837,11 +833,9 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ resumeStream });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const internal = taskService as unknown as {
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-    };
 
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(resumeStream).not.toHaveBeenCalled();
     expect(await terminalAttentionStore.get(parentId, `agent_task:${taskId}`)).toMatchObject({
@@ -886,10 +880,8 @@ describe("TaskService", () => {
       )
     );
 
-    const internal = taskService as unknown as {
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-    };
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(resumeStream).toHaveBeenCalledTimes(1);
     expect(waitForIdleAndNoQueuedMessages).not.toHaveBeenCalled();
@@ -1045,9 +1037,7 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).not.toHaveBeenCalled();
 
-    (
-      taskService as unknown as { scheduleTerminalAttentionDrain(id: string): void }
-    ).scheduleTerminalAttentionDrain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const run = await runStore.getRun(runId);
@@ -1134,11 +1124,8 @@ describe("TaskService", () => {
     });
     assert(legacy, "legacy workflow attention must enqueue");
 
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     // Deleted outright rather than superseded: workflow wakes are re-derived from run
     // records now, so a pre-reconciler pending record is dead state that would otherwise
@@ -1473,15 +1460,11 @@ describe("TaskService", () => {
       parentId,
       createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
     );
-    (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
-
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentId);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
     await flushTerminalAttentionDrains(taskService);
 
     // Only the rejected idle-only attempt: the fallback aborts on the currentness reread and
@@ -1621,11 +1604,7 @@ describe("TaskService", () => {
     ).pendingWorkflowRunAttention;
     pending.set(parentId, new Set([runId]));
 
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
     // Only the rejected idle-only attempt: the fallback's settlement-marker recheck sees the
@@ -1679,7 +1658,6 @@ describe("TaskService", () => {
     const internal = taskService as unknown as {
       terminalAttentionStore: TerminalAttentionStore;
       pendingWorkflowRunAttention: Map<string, Set<string>>;
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
     };
     const generationMarkerId = TerminalAttentionStore.notificationId(
       "workflow_run",
@@ -1706,7 +1684,7 @@ describe("TaskService", () => {
         createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
       );
       internal.pendingWorkflowRunAttention.set(parentId, new Set([runId]));
-      await internal.drainTerminalAttention(parentId);
+      taskService.scheduleTerminalAttentionDrain(parentId);
       await flushTerminalAttentionDrains(taskService);
     } finally {
       getSpy.mockRestore();
@@ -2093,11 +2071,6 @@ describe("TaskService", () => {
         Promise.resolve("current")
       );
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -2107,11 +2080,12 @@ describe("TaskService", () => {
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
     });
-    (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
 
-    await drain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
     // The pre-clear result must not wake the freshly cleared conversation; the run settles
@@ -2174,11 +2148,6 @@ describe("TaskService", () => {
       cleared = true;
       return resolved;
     };
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -2188,11 +2157,12 @@ describe("TaskService", () => {
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       runId,
     });
-    (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
 
-    await drain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
     // The pre-clear result must not wake the freshly cleared conversation.
@@ -2248,11 +2218,6 @@ describe("TaskService", () => {
         return Promise.resolve(runId === newRunId ? "indeterminate" : "current");
       });
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -2274,7 +2239,7 @@ describe("TaskService", () => {
       taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
     ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
 
-    await drain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -2410,11 +2375,7 @@ describe("TaskService", () => {
       taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
     ).pendingWorkflowRunAttention.set(parentId, new Set([oldRunId, newRunId]));
 
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
     await flushTerminalAttentionDrains(taskService);
 
     // First attempt selects the newest group and is rejected; the re-poked drain skips the
@@ -3003,11 +2964,6 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -3034,7 +2990,8 @@ describe("TaskService", () => {
     (
       taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
     ).pendingWorkflowRunAttention.set(parentId, new Set(["wfr_split_plan", "wfr_split_exec"]));
-    await drain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     // The newest launch's group delivers first, alone, under its own agent.
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -3046,7 +3003,8 @@ describe("TaskService", () => {
     });
 
     // The deferred group delivers on a later drain under its own agent.
-    await drain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(2);
     const secondPrompt = String(sendMessage.mock.calls[1]?.[1]);
     expect(secondPrompt).toContain("wfr_split_exec");
@@ -3089,11 +3047,6 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -3125,7 +3078,8 @@ describe("TaskService", () => {
       parentId,
       new Set(["wfr_pin_split_pinned", "wfr_pin_split_unpinned"])
     );
-    await drain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     // The newest launch delivers first, alone, without the other launch's pin.
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -3137,7 +3091,8 @@ describe("TaskService", () => {
     expect(firstOptions.strictAgentResolution).toBeUndefined();
 
     // The pinned launch delivers on the retry drain under its own recorded pin.
-    await drain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(2);
     const secondPrompt = String(sendMessage.mock.calls[1]?.[1]);
     expect(secondPrompt).toContain("wfr_pin_split_pinned");
