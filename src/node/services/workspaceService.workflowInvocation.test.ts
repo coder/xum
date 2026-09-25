@@ -5,7 +5,6 @@ import * as fsPromises from "fs/promises";
 import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
-import type { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
@@ -16,11 +15,7 @@ import {
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
-import {
-  mockInitStateManager,
-  createMockAIService,
-  createWorkspaceServiceForTest,
-} from "./workspaceService.testHarness";
+import { createMockAIService, createWorkspaceServiceForTest } from "./workspaceService.testHarness";
 
 // Partial-truncation fixtures: truncateHistory(0.5) sizes its cut by token counts of the whole
 // serialized rows, so two near-equal rows can round either way and remove both. A clearly
@@ -50,10 +45,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
       const session = workspaceService.getOrCreateSession(workspaceId);
       const events: WorkspaceChatMessage[] = [];
@@ -118,10 +109,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -183,10 +170,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -273,10 +256,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       // mux.workflow_run inside code_execution leaves no workflow_run tool part in history; the
@@ -381,10 +360,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       // A full clear (truncateHistory) removes every row without appending a reset boundary
@@ -427,10 +402,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       // A kernel launch from a synthetic turn in a new (or fully cleared) workspace records a
@@ -491,10 +462,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       // Launched from a decision-free history: the verified-empty snapshot delivers.
@@ -548,10 +515,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -612,10 +575,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -688,10 +647,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -744,10 +699,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -816,10 +767,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -885,10 +832,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -962,10 +905,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
       for (let i = 0; i < 6; i++) {
         await historyService.appendToHistory(
@@ -1037,10 +976,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
       for (let i = 0; i < 6; i++) {
         await historyService.appendToHistory(
@@ -1106,10 +1041,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -1168,10 +1099,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -1247,10 +1174,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -1302,10 +1225,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -1364,10 +1283,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -1433,10 +1348,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await recordAgentWorkflowRunReference({
@@ -1515,10 +1426,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -1573,10 +1480,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -1636,10 +1539,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -1708,10 +1607,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -1779,10 +1674,6 @@ describe("WorkspaceService workflow invocation events", () => {
           extensionMetadata: new ExtensionMetadataService(
             path.join(config.rootDir, "extensionMetadata.json")
           ),
-          initStateManager: {
-            ...mockInitStateManager,
-            off: mock(() => undefined as unknown as InitStateManager),
-          } as unknown as InitStateManager,
         });
 
         await historyService.appendToHistory(
@@ -1836,10 +1727,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -1905,10 +1792,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -1967,10 +1850,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       const persisted = await workspaceService.appendWorkflowRunInvocation({
@@ -2020,10 +1899,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -2078,10 +1953,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
@@ -2186,10 +2057,6 @@ describe("WorkspaceService workflow invocation events", () => {
         extensionMetadata: new ExtensionMetadataService(
           path.join(config.rootDir, "extensionMetadata.json")
         ),
-        initStateManager: {
-          ...mockInitStateManager,
-          off: mock(() => undefined as unknown as InitStateManager),
-        } as unknown as InitStateManager,
       });
 
       await historyService.appendToHistory(
