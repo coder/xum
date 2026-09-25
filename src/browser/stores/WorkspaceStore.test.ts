@@ -707,7 +707,8 @@ function queuedFollowUpEvent(workspaceId: string, text: string): WorkspaceChatMe
 function compactionRequestEvent(
   id: string,
   followUpContent?: CompactionFollowUpRequest,
-  timestamp = Date.now()
+  timestamp = Date.now(),
+  historySequence = 1
 ): WorkspaceChatMessage {
   return {
     type: "message",
@@ -715,7 +716,7 @@ function compactionRequestEvent(
     role: "user",
     parts: [{ type: "text", text: "/compact" }],
     metadata: {
-      historySequence: 1,
+      historySequence,
       timestamp,
       muxMetadata: {
         type: "compaction-request",
@@ -5395,11 +5396,6 @@ describe("WorkspaceStore", () => {
     it("notifies exactly once for a force-compaction interrupt followed by auto-continue", async () => {
       const workspaceId = "active-workspace-force-compaction-continue";
       const timestamp = Date.now();
-      const compactionRequest = compactionRequestEvent(
-        "force-compaction-request",
-        compactionFollowUp(),
-        timestamp
-      );
       mockChatStreamFor(workspaceId, function* () {
         yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false };
         yield streamStartEvent(workspaceId, "interrupted-stream", {
@@ -5411,12 +5407,15 @@ describe("WorkspaceStore", () => {
           workspaceId,
           messageId: "interrupted-stream",
           delta: "partial answer",
+          tokens: 2,
           timestamp: timestamp + 1,
         };
-        yield {
-          ...compactionRequest,
-          metadata: { ...compactionRequest.metadata, historySequence: 2 },
-        } as WorkspaceChatMessage;
+        yield compactionRequestEvent(
+          "force-compaction-request",
+          compactionFollowUp(),
+          timestamp,
+          2
+        );
         yield {
           type: "stream-abort",
           workspaceId,
@@ -5471,6 +5470,7 @@ describe("WorkspaceStore", () => {
           workspaceId,
           messageId: "continue-stream",
           delta: "continued answer",
+          tokens: 2,
           timestamp: timestamp + 6,
         };
         yield {
