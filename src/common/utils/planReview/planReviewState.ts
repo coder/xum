@@ -97,9 +97,17 @@ export function derivePlanReviewState(
   // not known yet, a thread id already taken). Its record id stays open so a later copy of the
   // same record (e.g. the intact half of a crash-duplicated archive/active pair) can fill in the
   // missing items; items already accepted from an earlier copy are inert, never duplicated.
+  // Items any copy carried but that were rejected stay tracked until some copy accepts them, so a
+  // later valid copy that merely omits one cannot seal the record before an intact copy that has
+  // it arrives.
   const partialFeedbacks = new Map<
     string,
-    { feedback: PlanReviewFeedback; acceptedReplyIds: Set<string> }
+    {
+      feedback: PlanReviewFeedback;
+      acceptedReplyIds: Set<string>;
+      missingThreadIds: Set<string>;
+      missingReplyIds: Set<string>;
+    }
   >();
   let index = -1;
 
@@ -181,8 +189,10 @@ export function derivePlanReviewState(
             historySequence,
           },
           acceptedReplyIds: new Set<string>(),
+          missingThreadIds: new Set<string>(),
+          missingReplyIds: new Set<string>(),
         };
-        const { feedback, acceptedReplyIds } = entry;
+        const { feedback, acceptedReplyIds, missingThreadIds, missingReplyIds } = entry;
         // Only an EARLIER copy's items are recovered (inert). An id repeated inside this row is
         // a damaged item: it leaves the copy partial so an intact later copy can fill it in.
         const earlierThreadIds = new Set(feedback.threadIds);
@@ -201,11 +211,13 @@ export function derivePlanReviewState(
           if (threadsById.has(comment.threadId)) {
             skip("duplicate-thread", message.id);
             complete = false;
+            missingThreadIds.add(comment.threadId);
             continue;
           }
           if (!isAnchorWithinSnapshot(comment.anchor, snapshot.content)) {
             skip("anchor-out-of-range", message.id);
             complete = false;
+            missingThreadIds.add(comment.threadId);
             continue;
           }
           const thread: PlanReviewThread = {
@@ -222,6 +234,7 @@ export function derivePlanReviewState(
           threadsById.set(thread.threadId, thread);
           state.threads.push(thread);
           feedback.threadIds.push(thread.threadId);
+          missingThreadIds.delete(thread.threadId);
         }
         for (const reply of record.replies) {
           if (rowReplyIds.has(reply.replyId)) {
@@ -235,6 +248,7 @@ export function derivePlanReviewState(
           if (thread === undefined) {
             skip("dangling-reply-thread", message.id);
             complete = false;
+            missingReplyIds.add(reply.replyId);
             continue;
           }
           thread.replies.push({
@@ -244,9 +258,10 @@ export function derivePlanReviewState(
             historySequence: feedback.historySequence,
           });
           acceptedReplyIds.add(reply.replyId);
+          missingReplyIds.delete(reply.replyId);
         }
         if (partial === undefined) state.feedbacks.push(feedback);
-        if (complete) {
+        if (complete && missingThreadIds.size === 0 && missingReplyIds.size === 0) {
           partialFeedbacks.delete(record.recordId);
           seenRecordIds.add(record.recordId);
         } else {

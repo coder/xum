@@ -381,6 +381,36 @@ describe("derivePlanReviewState partially accepted feedback", () => {
     ]);
   });
 
+  test("a later copy that omits a rejected item does not seal the record before an intact copy", () => {
+    const skipped: string[] = [];
+    // First copy rejects thr_2 (bad anchor); the second is valid but lacks thr_2 entirely.
+    const damaged: PlanReviewRecord = {
+      ...feedback1,
+      comments: [
+        feedback1.comments[0],
+        { ...feedback1.comments[1], anchor: { startLine: 99, endLine: 99 } },
+      ],
+    };
+    const truncated: PlanReviewRecord = { ...feedback1, comments: [feedback1.comments[0]] };
+    const state = derivePlanReviewState(
+      [
+        recordRow(snapshotA),
+        recordRow(damaged),
+        recordRow(truncated),
+        recordRow(feedback1),
+        // Every observed item is now accepted, so the record is sealed.
+        recordRow(feedback1),
+      ],
+      { onSkip: (reason) => skipped.push(reason) }
+    );
+    expect(state.feedbacks.map((feedback) => feedback.threadIds)).toEqual([["thr_1", "thr_2"]]);
+    expect(state.threads.map((thread) => [thread.threadId, thread.anchor.startLine])).toEqual([
+      ["thr_1", 3],
+      ["thr_2", 4],
+    ]);
+    expect(skipped).toEqual(["anchor-out-of-range", "duplicate-record"]);
+  });
+
   test("an id repeated inside one row leaves the copy partial for an intact later copy", () => {
     const skipped: string[] = [];
     // Damaged copy: the second comment and the second reply lost their own ids to a repeat of
