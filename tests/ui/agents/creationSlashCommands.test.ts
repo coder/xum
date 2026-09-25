@@ -24,6 +24,7 @@ import {
 import { ChatHarness } from "../harness";
 
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { HistoryService } from "@/node/services/historyService";
 import { getDraftScopeId, getModelKey, getProjectScopeId } from "@/common/constants/storage";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
@@ -113,16 +114,19 @@ describeIntegration("Creation slash commands", () => {
     try {
       await chat.send("/haiku hello from creation");
 
-      const createdWorkspaceId = await waitFor(
+      const created = await waitFor(
         async () => {
           const workspaces = await env.orpc.workspace.list({ archived: false });
-          const created = workspaces.find((workspace) => workspace.projectPath === projectPath);
-          if (!created) throw new Error("Created workspace not found yet");
-          return created.id;
+          const workspace = workspaces.find((candidate) => candidate.projectPath === projectPath);
+          if (!workspace) throw new Error("Created workspace not found yet");
+          return workspace;
         },
         { timeout: 20_000 }
       );
+      const createdWorkspaceId = created.id;
       workspaceId = createdWorkspaceId;
+      // The workspace is named from the request, not the /haiku modifier.
+      expect(created.name).not.toContain("haiku");
 
       // The command prefix is stripped from the sent text and the one-shot model is used...
       await waitFor(
@@ -136,6 +140,12 @@ describeIntegration("Creation slash commands", () => {
       );
       // ...without changing the project's model preference.
       expect(readPersistedState(modelKey, "")).toBe(projectModelBefore);
+      // The durable user row carries the one-shot model for the starting indicator.
+      const history = await new HistoryService(env.config).getHistoryFromLatestBoundary(
+        createdWorkspaceId
+      );
+      const userRow = (history.success ? history.data : []).find((m) => m.role === "user");
+      expect(userRow?.metadata?.muxMetadata?.requestedModel).toBe(KNOWN_MODELS.HAIKU.id);
     } finally {
       if (workspaceId) {
         await env.orpc.workspace.remove({ workspaceId, options: { force: true } });

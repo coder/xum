@@ -1,7 +1,12 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { FilePart, HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
+import type {
+  FilePart,
+  HistoryEditPrecondition,
+  ProvidersConfigMap,
+  SendMessageOptions,
+} from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -23,7 +28,9 @@ export function getModelOneShotOverrides(
   modelOneShot: ModelOneShot,
   messageText: string,
   attachments: ChatAttachment[],
-  policyModel: string
+  policyModel: string,
+  // Resolves mapped model aliases so numeric levels index the real thinking ladder.
+  providersConfig: ProvidersConfigMap | null
 ) {
   const trimmedMessageText = messageText.trim();
   const commandPrefix = trimmedMessageText
@@ -31,7 +38,7 @@ export function getModelOneShotOverrides(
     .trimEnd();
   const thinkingLevel =
     modelOneShot.thinkingLevel != null
-      ? resolveThinkingInput(modelOneShot.thinkingLevel, policyModel)
+      ? resolveThinkingInput(modelOneShot.thinkingLevel, policyModel, providersConfig)
       : undefined;
   return {
     // rawCommand keeps the typed command for transcript display and draft restoration.
@@ -52,8 +59,9 @@ export function getModelOneShotOverrides(
   };
 }
 
+type ModelOneShotOverrides = ReturnType<typeof getModelOneShotOverrides>;
+
 interface PrepareMessagePayloadInput {
-  messageText: string;
   messageTextForSend: string;
   attachments: ChatAttachment[];
   fileParts?: FilePart[];
@@ -69,8 +77,7 @@ interface PrepareMessagePayloadInput {
   compactionOptions?: Partial<SendMessageOptions>;
   compactionMessageText?: string;
   appendStagedNotice?: boolean;
-  modelOneShot?: ModelOneShot;
-  policyModel: string;
+  oneShot?: ModelOneShotOverrides;
   transferredDraftProjectDiscovery: boolean;
   additionalSystemContextHydrated: boolean;
   additionalSystemContext: { enabled: boolean; content: string };
@@ -123,19 +130,11 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
     compactionOptions.additionalSystemInstructions ??
     input.sendMessageOptions.additionalSystemInstructions;
   const effectiveModel =
-    input.modelOneShot?.modelString ?? compactionOptions.model ?? input.sendMessageOptions.model;
-  const oneShot = input.modelOneShot
-    ? getModelOneShotOverrides(
-        input.modelOneShot,
-        input.messageText,
-        input.attachments,
-        input.policyModel
-      )
-    : undefined;
+    input.oneShot?.options.model ?? compactionOptions.model ?? input.sendMessageOptions.model;
   metadata = {
     ...(prepared.metadata ?? { type: "normal" }),
     requestedModel: effectiveModel,
-    ...oneShot?.metadata,
+    ...input.oneShot?.metadata,
   };
 
   return {
@@ -148,7 +147,7 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ...(input.transferredDraftProjectDiscovery && hasProjectScopedSkillRef(input.agentSkillRefs)
         ? { disableWorkspaceAgents: true }
         : {}),
-      ...oneShot?.options,
+      ...input.oneShot?.options,
       ...(input.goalInterventionPolicy
         ? { goalInterventionPolicy: input.goalInterventionPolicy }
         : {}),

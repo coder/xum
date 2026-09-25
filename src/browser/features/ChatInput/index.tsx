@@ -823,6 +823,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           if (parsedCreationCommand?.type === "goal-set") {
             return parsedCreationCommand.objective;
           }
+          // Name the workspace from the request, not the one-shot model/thinking modifier.
+          if (parsedCreationCommand?.type === "model-oneshot") {
+            return parsedCreationCommand.message;
+          }
           if (input.trim().length === 0 && attachments.length > 0) {
             const filenames = attachments
               .map((attachment) => attachment.filename)
@@ -2116,11 +2120,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
       const oneShot =
         modelOneShot &&
-        getModelOneShotOverrides(modelOneShot, messageText, attachments, policyModel);
-      // Parsing makes a one-shot and a slash skill mutually exclusive, so the one-shot's
-      // metadata only ever combines with inline skill refs below.
+        getModelOneShotOverrides(
+          modelOneShot,
+          messageText,
+          attachments,
+          policyModel,
+          providersConfig
+        );
+      // Parsing makes a one-shot and a slash skill mutually exclusive, so this only ever combines
+      // with inline skill refs below. requestedModel keeps the new workspace's starting indicator
+      // on the one-shot model once the durable user row replaces the optimistic one.
       const oneShotMetadata: MuxMessageMetadata | undefined = oneShot && {
         type: "normal",
+        requestedModel: policyModel,
         ...oneShot.metadata,
       };
       let creationMessageTextForSend =
@@ -2408,7 +2420,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
 
         const preparedMessage = prepareMessagePayload({
-          messageText,
           messageTextForSend,
           attachments: sendAttachments,
           fileParts,
@@ -2426,8 +2437,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           compactionOptions,
           compactionMessageText: actualMessageText,
           appendStagedNotice: appendStagedNoticeToUserMessage,
-          modelOneShot,
-          policyModel,
+          oneShot:
+            modelOneShot &&
+            getModelOneShotOverrides(
+              modelOneShot,
+              messageText,
+              sendAttachments,
+              policyModel,
+              providersConfig
+            ),
           transferredDraftProjectDiscovery,
           additionalSystemContextHydrated,
           additionalSystemContext,
