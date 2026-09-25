@@ -9,12 +9,19 @@ import { buildDisplayedMessagesForMessage } from "@/browser/utils/messages/displ
 import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
+import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 let workspaceContextMock: {
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
   setSelectedWorkspace?: (selection: unknown) => void;
 } | null = null;
 
+// Restore the real WorkspaceContext after this suite so the partial stub cannot leak into
+// later suites that render the real provider (e.g. AgentContext.test).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/WorkspaceContext", { ...RealWorkspaceContextModule }],
+]);
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useOptionalWorkspaceContext: () => workspaceContextMock,
   toWorkspaceSelection: (workspace: FrontendWorkspaceMetadata) => workspace,

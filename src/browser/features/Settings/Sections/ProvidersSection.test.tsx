@@ -8,6 +8,9 @@ import type { APIClient } from "@/browser/contexts/API";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
+import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
+import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
@@ -82,6 +85,12 @@ void mock.module("@/browser/hooks/useRouting", () => ({
   }),
 }));
 
+// Restore the real contexts after this suite; the stubs below would otherwise leak into later
+// suites that render the real PolicyProvider/WorkspaceProvider (PolicyContext/AgentContext tests).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/PolicyContext", { ...ActualPolicyContextModule }],
+  ["@/browser/contexts/WorkspaceContext", { ...ActualWorkspaceContextModule }],
+]);
 void mock.module("@/browser/contexts/PolicyContext", () => ({
   usePolicy: () => ({
     status: { state: "disabled" as const },

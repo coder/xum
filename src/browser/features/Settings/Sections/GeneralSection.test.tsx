@@ -1,3 +1,6 @@
+// Keep this first: tests/ui/dom installs a baseline DOM on import, and GeneralSection reads
+// `window` (browser vs Electron mode) when its module evaluates below.
+import { installDom } from "../../../../../tests/ui/dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -12,7 +15,6 @@ import {
   getExperimentKey,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { BASH_COLLAPSED_SUMMARY_MODE_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 import {
@@ -632,6 +634,17 @@ describe("GeneralSection", () => {
     expect(window.localStorage.getItem(BASH_COLLAPSED_SUMMARY_MODE_KEY)).toBe(
       JSON.stringify("intent")
     );
+  });
+
+  test("loads the SSH host setting in browser mode", async () => {
+    // GeneralSection decides browser mode (no window.api) when its module evaluates, so this
+    // only passes if the DOM bootstrap import above ran before GeneralSection was loaded.
+    const { api, view } = renderGeneralSection();
+
+    await waitFor(() => {
+      expect(view.getByText("SSH Host")).toBeTruthy();
+    });
+    expect(api.server.getSshHost).toHaveBeenCalled();
   });
 
   test("loads and persists the full-width chat transcript toggle", async () => {
