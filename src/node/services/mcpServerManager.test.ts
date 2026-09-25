@@ -3024,14 +3024,8 @@ describe("MCPServerManager", () => {
       })
     );
 
-    const close = mock(() => Promise.resolve(undefined));
-    access.startSingleServerImpl = mock((name: unknown) => {
-      if (name === "broken-server") {
-        return Promise.reject(new Error("invalid MCP server config"));
-      }
-
-      return Promise.resolve(testInstance(String(name), { close }));
-    });
+    servers.serve("ok");
+    servers.serve("bad", { connect: () => Promise.reject(new Error("invalid MCP server config")) });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3042,11 +3036,7 @@ describe("MCPServerManager", () => {
   test("getToolsForWorkspace suffixes MCP tools that collide with built-in tool names", async () => {
     const workspaceId = "ws-builtin-collision";
     configService.listServers = mock(() => Promise.resolve({ mcp: stdioConfig("cmd") }));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([["mcp", { tools: { prompt_get: testTool(), other_tool: testTool() } }]])
-      )
-    );
+    servers.serve("cmd", { tools: { prompt_get: testTool(), other_tool: testTool() } });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3060,28 +3050,19 @@ describe("MCPServerManager", () => {
   test("getToolsForWorkspace drops prompts whose argument names cannot round-trip", async () => {
     const workspaceId = "ws-oversized-arg-name";
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          [
-            "coder",
-            {
-              prompts: [
-                { name: "usable", arguments: [{ name: "pr", required: true }] },
-                { name: "stuck", arguments: [{ name: "a".repeat(5_000), required: true }] },
-                {
-                  name: "partial",
-                  arguments: [
-                    { name: "ok", required: true },
-                    { name: "b".repeat(5_000), required: false },
-                  ],
-                },
-              ],
-            },
+    servers.serve("cmd", {
+      prompts: [
+        { name: "usable", arguments: [{ name: "pr", required: true }] },
+        { name: "stuck", arguments: [{ name: "a".repeat(5_000), required: true }] },
+        {
+          name: "partial",
+          arguments: [
+            { name: "ok", required: true },
+            { name: "b".repeat(5_000), required: false },
           ],
-        ])
-      )
-    );
+        },
+      ],
+    });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3094,25 +3075,16 @@ describe("MCPServerManager", () => {
   test("getToolsForWorkspace drops oversized prompt names and clamps descriptions at refresh", async () => {
     const workspaceId = "ws-oversized-prompt-fields";
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          [
-            "coder",
-            {
-              prompts: [
-                { name: "n".repeat(1024 * 1024) },
-                {
-                  name: "wordy",
-                  description: "d".repeat(1024 * 1024),
-                  arguments: [{ name: "pr", description: "a".repeat(1024 * 1024), required: true }],
-                },
-              ],
-            },
-          ],
-        ])
-      )
-    );
+    servers.serve("cmd", {
+      prompts: [
+        { name: "n".repeat(1024 * 1024) },
+        {
+          name: "wordy",
+          description: "d".repeat(1024 * 1024),
+          arguments: [{ name: "pr", description: "a".repeat(1024 * 1024), required: true }],
+        },
+      ],
+    });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3128,14 +3100,8 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() =>
       Promise.resolve({ [hugeName]: stdioConfig("cmd-huge"), coder: stdioConfig("cmd") })
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          [hugeName, { prompts: [{ name: "hidden" }] }],
-          ["coder", { prompts: [{ name: "visible" }] }],
-        ])
-      )
-    );
+    servers.serve("cmd-huge", { prompts: [{ name: "hidden" }] });
+    servers.serve("cmd", { prompts: [{ name: "visible" }] });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3180,9 +3146,7 @@ describe("MCPServerManager", () => {
         : new Promise<never>(() => undefined);
     });
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() =>
-      Promise.resolve(startResult([["coder", { refreshPrompts: oneShotRefresh }]]))
-    );
+    servers.serve("cmd", { listPrompts: oneShotRefresh });
 
     const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     // The over-cap prompt is dropped by the length gate without reading a
@@ -3203,24 +3167,15 @@ describe("MCPServerManager", () => {
   test("getToolsForWorkspace returns prompt descriptors alongside tools", async () => {
     const workspaceId = "ws-tool-prompts";
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          [
-            "coder",
-            {
-              prompts: [
-                {
-                  name: "review",
-                  description: "Review a PR",
-                  arguments: [{ name: "pr", required: true }],
-                },
-              ],
-            },
-          ],
-        ])
-      )
-    );
+    servers.serve("cmd", {
+      prompts: [
+        {
+          name: "review",
+          description: "Review a PR",
+          arguments: [{ name: "pr", required: true }],
+        },
+      ],
+    });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3236,68 +3191,53 @@ describe("MCPServerManager", () => {
   test("a client closed during catalog refresh is excluded from the returned tools", async () => {
     const workspaceId = "closed-during-refresh";
     configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd") }));
-    const instance = testInstance("server", { tools: { work: testTool() } });
-    access.startServers = mock(() =>
-      Promise.resolve({
-        instances: new Map([["server", instance]]),
-        failedServerNames: [],
-      })
-    );
-    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    expect(Object.keys(first.tools)).toEqual(["server_work"]);
-    const refreshTools = mock(() => {
-      instance.isClosed = true;
-      return Promise.resolve();
+    // The process exits while the serve awaits the startup prompt-catalog
+    // refresh, after the instance was published as healthy.
+    const listPrompts = mock(async () => {
+      await servers.crash("cmd");
+      return [];
     });
-    (instance as { refreshTools?: typeof refreshTools }).refreshTools = refreshTools;
-    const next = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    expect(refreshTools).toHaveBeenCalledTimes(1);
-    expect(next.tools).toEqual({});
-    expect(next.toolServerNames).toEqual({});
+    servers.serve("cmd", { tools: { work: testTool() }, listPrompts });
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(listPrompts).toHaveBeenCalledTimes(1);
+    expect(result.tools).toEqual({});
+    expect(result.toolServerNames).toEqual({});
   });
 
   test("getToolsForWorkspace serves the cached tool catalog and refreshes it in the background", async () => {
     const workspaceId = "ws-tools-stale-while-revalidate";
     configService.listServers = mock(() => Promise.resolve({ modern: stdioConfig("cmd") }));
-    const instance = testInstance("modern", { tools: { alpha: testTool() } });
     const heldRefresh = Promise.withResolvers<void>();
-    let refreshCalls = 0;
-    const refreshTools = mock(() => {
-      refreshCalls += 1;
-      if (refreshCalls !== 1) return Promise.resolve();
-      return heldRefresh.promise.then(() => {
-        instance.tools = { alpha: testTool(), beta: testTool() };
-      });
+    // tools/list: call 1 is the startup fetch, call 2 the first (held)
+    // background refresh that grows the catalog.
+    const listTools = mock(async (): Promise<Record<string, Tool>> => {
+      const call = listTools.mock.calls.length;
+      if (call === 1) return { alpha: testTool() };
+      if (call === 2) await heldRefresh.promise;
+      return { alpha: testTool(), beta: testTool() };
     });
-    (instance as { refreshTools?: typeof refreshTools }).refreshTools = refreshTools;
-    access.startServers = mock(() =>
-      Promise.resolve({
-        instances: new Map([["modern", instance]]),
-        failedServerNames: [],
-        timedOutServerNames: [],
-      })
-    );
+    servers.serve("cmd", { era: "modern", listTools });
 
     const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(first.tools)).toEqual(["modern_alpha"]);
-    expect(refreshTools).toHaveBeenCalledTimes(0);
+    expect(listTools).toHaveBeenCalledTimes(1);
 
     // The refresh is held open: an awaited tools/list would hang this send.
     const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(second.tools)).toEqual(["modern_alpha"]);
-    expect(refreshTools).toHaveBeenCalledTimes(1);
+    expect(listTools).toHaveBeenCalledTimes(2);
 
     // Deduped per instance while the first refresh is still in flight.
     const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(third.tools)).toEqual(["modern_alpha"]);
-    expect(refreshTools).toHaveBeenCalledTimes(1);
+    expect(listTools).toHaveBeenCalledTimes(2);
 
     heldRefresh.resolve();
     await Bun.sleep(0);
 
     const fourth = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(fourth.tools).sort()).toEqual(["modern_alpha", "modern_beta"]);
-    expect(refreshTools).toHaveBeenCalledTimes(2);
+    expect(listTools).toHaveBeenCalledTimes(3);
   });
 
   test("timed-out server retries back off exponentially and reset on a config change", async () => {
