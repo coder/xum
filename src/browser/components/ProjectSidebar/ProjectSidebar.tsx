@@ -84,10 +84,7 @@ import {
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { SidebarCollapseButton } from "../SidebarCollapseButton/SidebarCollapseButton";
 import { ConfirmationModal } from "../ConfirmationModal/ConfirmationModal";
-import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
-} from "@/browser/utils/archiveConfirmation";
+import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 import { ProjectDeleteConfirmationModal } from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 
@@ -695,18 +692,6 @@ interface ProjectSidebarProps {
   workspaceRecency: Record<string, number>;
 }
 
-function didUntrackedPathSetChange(
-  acknowledgedUntrackedPaths: string[],
-  latestUntrackedPaths: string[]
-): boolean {
-  if (acknowledgedUntrackedPaths.length !== latestUntrackedPaths.length) {
-    return true;
-  }
-
-  const acknowledgedSet = new Set(acknowledgedUntrackedPaths);
-  return latestUntrackedPaths.some((path) => !acknowledgedSet.has(path));
-}
-
 const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   collapsed,
   onToggleCollapsed,
@@ -959,15 +944,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const workspaceForkError = usePopoverError();
   const workspaceStopRuntimeError = usePopoverError();
   const workspaceRemoveError = usePopoverError();
-  const [archiveConfirmation, setArchiveConfirmation] = useState<{
-    workspaceId: string;
-    displayTitle: string;
-    buttonElement?: HTMLElement;
-    /** When set, the confirmation warns about permanent deletion of untracked files. */
-    untrackedPaths?: string[];
-    /** Whether the workspace has an active stream that will be interrupted. */
-    isStreaming?: boolean;
-  } | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<{
     projectPath: string;
     projectName: string;
@@ -1145,82 +1121,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [api, runtimeStatusStore, workspaceStopRuntimeError]
   );
 
-  const performArchiveWorkspace = useCallback(
-    async (
-      workspaceId: string,
-      buttonElement?: HTMLElement,
-      acknowledgedUntrackedPaths?: string[]
-    ) => {
-      const result = await onArchiveWorkspace(
-        workspaceId,
-        acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
-      );
-      if (result.success && result.data?.kind === "confirm-lossy-untracked-files") {
-        const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-        const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-        const aggregator = workspaceStore.getAggregator(workspaceId);
-        const hasActiveStreams = aggregator?.hasInterruptibleActiveStream() ?? false;
-        const pendingStreamStartTime = aggregator?.getPendingStreamStartTime();
-        const isStarting = pendingStreamStartTime != null && !hasActiveStreams;
-        const awaitingUserQuestion = aggregator?.hasAwaitingUserQuestion() ?? false;
-        const isStreaming = (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-        setArchiveConfirmation({
-          workspaceId,
-          displayTitle,
-          buttonElement,
-          untrackedPaths: result.data.paths,
-          // The retry path already handled any earlier streaming warning. Only surface the
-          // interruption warning again when the archive attempt has not yet been confirmed.
-          isStreaming: acknowledgedUntrackedPaths == null ? isStreaming : false,
-        });
-        return false;
-      }
-      if (!result.success) {
-        if (acknowledgedUntrackedPaths != null) {
-          // Archive may fail if new untracked files appear between confirmation and capture.
-          // Re-run preflight so we can reopen the modal with the latest paths.
-          const preflight = await preflightArchiveWorkspace(workspaceId);
-          if (preflight.success && preflight.data?.kind === "confirm-lossy-untracked-files") {
-            const pathsChanged = didUntrackedPathSetChange(
-              acknowledgedUntrackedPaths,
-              preflight.data.paths
-            );
-            if (pathsChanged) {
-              const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-              const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-              setArchiveConfirmation({
-                workspaceId,
-                displayTitle,
-                buttonElement,
-                untrackedPaths: preflight.data.paths,
-                isStreaming: (() => {
-                  const aggregator = workspaceStore.getAggregator(workspaceId);
-                  if (!aggregator) return false;
-                  const hasActiveStreams = aggregator.hasInterruptibleActiveStream();
-                  const isStarting =
-                    aggregator.getPendingStreamStartTime() !== null && !hasActiveStreams;
-                  const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
-                  return (hasActiveStreams || isStarting) && !awaitingUserQuestion;
-                })(),
-              });
-              return false;
-            }
-          }
-        }
-
-        const error = result.error ?? "Failed to archive chat";
-        // Archive failures can be long-lived workflow errors (for example, untracked-file safety
-        // checks) that users should notice near the active workspace content, not pinned beside a
-        // left-sidebar row that may be far from their current focus. Use the shared toast fallback
-        // position so archive errors match other top-right UI error surfaces.
-        workspaceArchiveError.showError(workspaceId, error);
-        return false;
-      }
-      return true;
-    },
-    [onArchiveWorkspace, preflightArchiveWorkspace, workspaceArchiveError, workspaceStore]
-  );
-
   const hasActiveStream = useCallback(
     (workspaceId: string) => {
       const aggregator = workspaceStore.getAggregator(workspaceId);
@@ -1268,68 +1168,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [archivingWorkspaceIds, selectedWorkspace?.workspaceId, workspaceRecency, workspaceStore]
   );
 
-  const handleArchiveWorkspace = useCallback(
-    async (workspaceId: string, buttonElement?: HTMLElement) => {
-      // The keyboard shortcut bypasses the row's disabled state, so guard here as well.
-      if (archivingWorkspaceIds.has(workspaceId)) return;
+  const archiveFlow = useArchiveWorkspaceConfirmation({
+    preflightArchiveWorkspace,
+    archiveWorkspace: onArchiveWorkspace,
+    isArchiving: (workspaceId) => archivingWorkspaceIds.has(workspaceId),
+    isStreaming: hasActiveStream,
+    getDisplayTitle: (workspaceId) => {
       const metadata = workspaceStore.getWorkspaceMetadata(workspaceId);
-      const displayTitle = metadata?.title ?? metadata?.name ?? workspaceId;
-      const isStreaming = hasActiveStream(workspaceId);
-
-      // Run preflight to check for untracked files that can't be preserved.
-      const preflight = await preflightArchiveWorkspace(workspaceId);
-      if (!preflight.success) {
-        workspaceArchiveError.showError(
-          workspaceId,
-          preflight.error ?? "Failed to check archive readiness"
-        );
-        return;
-      }
-
-      const untrackedPaths =
-        preflight.data?.kind === "confirm-lossy-untracked-files" ? preflight.data.paths : undefined;
-
-      if (isStreaming || untrackedPaths) {
-        // Show a single combined confirmation dialog for streaming + untracked-file warnings.
-        setArchiveConfirmation({
-          workspaceId,
-          displayTitle,
-          buttonElement,
-          untrackedPaths,
-          isStreaming,
-        });
-        return;
-      }
-
-      await performArchiveWorkspace(workspaceId, buttonElement);
+      return metadata?.title ?? metadata?.name ?? workspaceId;
     },
-    [
-      archivingWorkspaceIds,
-      hasActiveStream,
-      performArchiveWorkspace,
-      preflightArchiveWorkspace,
-      workspaceArchiveError,
-      workspaceStore,
-    ]
-  );
-
-  const handleArchiveWorkspaceConfirm = useCallback(async () => {
-    if (!archiveConfirmation) {
-      return;
-    }
-
-    const confirmation = archiveConfirmation;
-    setArchiveConfirmation(null);
-    await performArchiveWorkspace(
-      confirmation.workspaceId,
-      confirmation.buttonElement,
-      confirmation.untrackedPaths
-    );
-  }, [archiveConfirmation, performArchiveWorkspace]);
-
-  const handleArchiveWorkspaceCancel = useCallback(() => {
-    setArchiveConfirmation(null);
-  }, []);
+    // Archive failures can be long-lived workflow errors (for example, untracked-file safety
+    // checks) that users should notice near the active workspace content, not pinned beside a
+    // left-sidebar row that may be far from their current focus. Use the shared toast fallback
+    // position so archive errors match other top-right UI error surfaces.
+    showError: (workspaceId, error) => workspaceArchiveError.showError(workspaceId, error),
+  });
+  const handleArchiveWorkspace = archiveFlow.requestArchive;
 
   const showProjectRemoveError = useCallback(
     (
@@ -2167,9 +2021,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     movePinnedWorkspace,
     workspaceStore,
   ]);
-
-  const archiveConfirmationUntrackedPaths = archiveConfirmation?.untrackedPaths;
-  const archiveConfirmationIsStreaming = archiveConfirmation?.isStreaming ?? false;
 
   // ── Shared coalesced list pipeline ──────────────────────────────────────
   // One rendering pipeline for every workspace list (grouped project sections
@@ -3855,30 +3706,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             />
           </PositionedMenu>
 
-          <ConfirmationModal
-            isOpen={archiveConfirmation !== null}
-            title={
-              archiveConfirmationUntrackedPaths
-                ? "Archive workspace with untracked files?"
-                : archiveConfirmation
-                  ? `Archive "${archiveConfirmation.displayTitle}" while streaming?`
-                  : "Archive chat?"
-            }
-            description={buildArchiveConfirmDescription(
-              archiveConfirmationIsStreaming,
-              archiveConfirmationUntrackedPaths
-            )}
-            warning={buildArchiveConfirmWarning(
-              archiveConfirmationIsStreaming,
-              archiveConfirmationUntrackedPaths
-            )}
-            confirmLabel={
-              archiveConfirmationUntrackedPaths ? "Archive and delete files" : "Archive"
-            }
-            confirmVariant="destructive"
-            onConfirm={handleArchiveWorkspaceConfirm}
-            onCancel={handleArchiveWorkspaceCancel}
-          />
+          <ConfirmationModal {...archiveFlow.modalProps} />
           <ProjectDeleteConfirmationModal
             isOpen={deleteConfirmation !== null}
             projectName={deleteConfirmation?.projectName ?? ""}

@@ -83,10 +83,7 @@ interface WorkspaceMenuBarProps {
   onOpenTerminal?: (options?: TerminalSessionCreateOptions) => void;
 }
 
-import {
-  buildArchiveConfirmDescription,
-  buildArchiveConfirmWarning,
-} from "@/browser/utils/archiveConfirmation";
+import { useArchiveWorkspaceConfirmation } from "@/browser/hooks/useArchiveWorkspaceConfirmation";
 
 const COLLAPSED_LEFT_SIDEBAR_MENU_BAR_STYLE = {
   paddingLeft: `${WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX}px`,
@@ -165,12 +162,6 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const [archiveConfirmOpen, setArchiveConfirmOpen] = useState(false);
-  // Untracked paths from archive preflight that the user needs to acknowledge.
-  // When set, the confirmation dialog warns about permanent file deletion.
-  const [archiveUntrackedPaths, setArchiveUntrackedPaths] = useState<string[] | null>(null);
-  // Whether the confirmation includes an active-stream interruption warning.
-  const [archiveConfirmIsStreaming, setArchiveConfirmIsStreaming] = useState(false);
   const archiveError = usePopoverError();
   const forkError = usePopoverError();
   const stopRuntimeError = usePopoverError();
@@ -330,77 +321,24 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     }
   }, [workspaceId, namedWorkspacePath, openInEditor, runtimeConfig]);
 
-  // Mirror sidebar archive behavior so the workspace menu bar matches existing actions.
-  /**
-   * Execute the archive call (optionally with acknowledged untracked paths).
-   * Callers are responsible for the isArchiving guard — this function only does the RPC
-   * and error display. Called from handleArchiveChat (no-confirmation path) and from
-   * the confirmation modal's onConfirm.
-   */
-  const executeArchive = useCallback(
-    async (anchorEl?: HTMLElement, acknowledgedUntrackedPaths?: string[]) => {
-      const res = await archiveWorkspace(
-        workspaceId,
-        acknowledgedUntrackedPaths ? { acknowledgedUntrackedPaths } : undefined
+  // Same archive flow as the sidebar rows so the two entry points cannot drift apart.
+  const archiveFlow = useArchiveWorkspaceConfirmation({
+    preflightArchiveWorkspace,
+    archiveWorkspace,
+    isArchiving: () => isArchiving,
+    isStreaming: () => isWorking,
+    getDisplayTitle: () => workspaceTitle,
+    showError: (errorWorkspaceId, error, anchorEl) => {
+      const rect = anchorEl?.getBoundingClientRect();
+      archiveError.showError(
+        errorWorkspaceId,
+        error,
+        rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
       );
-      if (res.success && res.data?.kind === "confirm-lossy-untracked-files") {
-        setArchiveUntrackedPaths(res.data.paths);
-        // The retry path already handled any earlier streaming warning. Only surface the
-        // interruption warning again when the archive attempt has not yet been confirmed.
-        setArchiveConfirmIsStreaming(acknowledgedUntrackedPaths == null ? isWorking : false);
-        setArchiveConfirmOpen(true);
-        return;
-      }
-      if (!res.success) {
-        const rect = anchorEl?.getBoundingClientRect();
-        archiveError.showError(
-          workspaceId,
-          res.error ?? "Failed to archive chat",
-          rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-        );
-      }
     },
-    [workspaceId, archiveWorkspace, archiveError, isWorking]
-  );
-
-  /**
-   * Entry point for the archive action. Runs a preflight check and either:
-   * - archives immediately (no warnings),
-   * - opens a combined confirmation dialog (streaming / untracked-file warnings), or
-   * - shows an error popover (unexpected backend failures).
-   */
-  const handleArchiveChat = useCallback(
-    async (anchorEl?: HTMLElement) => {
-      if (isArchiving) return;
-
-      // Run preflight to check for untracked files that can't be preserved.
-      const preflight = await preflightArchiveWorkspace(workspaceId);
-      if (!preflight.success) {
-        const rect = anchorEl?.getBoundingClientRect();
-        archiveError.showError(
-          workspaceId,
-          preflight.error ?? "Failed to check archive readiness",
-          rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined
-        );
-        return;
-      }
-
-      const preflightData = preflight.data;
-      const untrackedPaths =
-        preflightData?.kind === "confirm-lossy-untracked-files" ? preflightData.paths : null;
-      const streamingNow = isWorking;
-
-      if (untrackedPaths || streamingNow) {
-        // Show a single combined confirmation dialog for all warnings.
-        setArchiveUntrackedPaths(untrackedPaths);
-        setArchiveConfirmIsStreaming(streamingNow);
-        setArchiveConfirmOpen(true);
-      } else {
-        await executeArchive(anchorEl);
-      }
-    },
-    [workspaceId, preflightArchiveWorkspace, archiveError, isWorking, isArchiving, executeArchive]
-  );
+  });
+  const handleArchiveChat = (anchorEl?: HTMLElement) =>
+    archiveFlow.requestArchive(workspaceId, anchorEl);
 
   const handleForkChat = useCallback(
     async (anchorEl: HTMLElement) => {
@@ -967,35 +905,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         onOpenChange={setDebugLlmRequestOpen}
       />
       {/* Combined confirmation for archive warnings (streaming + untracked files). */}
-      <ConfirmationModal
-        isOpen={archiveConfirmOpen}
-        title={
-          archiveUntrackedPaths
-            ? "Archive workspace with untracked files?"
-            : workspaceTitle
-              ? `Archive "${workspaceTitle}" while streaming?`
-              : "Archive chat?"
-        }
-        description={buildArchiveConfirmDescription(
-          archiveConfirmIsStreaming,
-          archiveUntrackedPaths
-        )}
-        warning={buildArchiveConfirmWarning(archiveConfirmIsStreaming, archiveUntrackedPaths)}
-        confirmLabel={archiveUntrackedPaths ? "Archive and delete files" : "Archive"}
-        confirmVariant="destructive"
-        onConfirm={() => {
-          const paths = archiveUntrackedPaths;
-          setArchiveConfirmOpen(false);
-          setArchiveUntrackedPaths(null);
-          setArchiveConfirmIsStreaming(false);
-          void executeArchive(undefined, paths ?? undefined);
-        }}
-        onCancel={() => {
-          setArchiveConfirmOpen(false);
-          setArchiveUntrackedPaths(null);
-          setArchiveConfirmIsStreaming(false);
-        }}
-      />
+      <ConfirmationModal {...archiveFlow.modalProps} />
       <PopoverError
         error={stopRuntimeError.error}
         prefix="Failed to stop container"
