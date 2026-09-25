@@ -295,8 +295,20 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       taskService.markParentWorkspaceInterrupted("stopped");
       const release = taskService.latchWorkspaceStopsInProgress(["stopping"]);
-      await registerLiveWorkspaceTurnHandle(taskService, "pending", "wst_pending", "owner", false);
-      await registerLiveWorkspaceTurnHandle(taskService, "accepted", "wst_accepted", "owner", true);
+      await registerLiveWorkspaceTurnHandle(
+        taskService,
+        "pending",
+        "wst_pending",
+        "owner",
+        "reserved"
+      );
+      await registerLiveWorkspaceTurnHandle(
+        taskService,
+        "accepted",
+        "wst_accepted",
+        "owner",
+        "accepted"
+      );
       try {
         const result = taskService.listInstanceWorkspaces("available", { limit: 1 });
         expect(result.rows.map((row) => row.workspaceId)).toEqual(["available"]);

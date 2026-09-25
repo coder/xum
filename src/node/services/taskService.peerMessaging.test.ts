@@ -1127,7 +1127,7 @@ describe("TaskService", () => {
           "target",
           "wst_foreign",
           "sender",
-          accepted
+          accepted ? "accepted" : "reserved"
         );
         try {
           const result = await taskService.sendAgentTreeMessage(
@@ -1198,7 +1198,7 @@ describe("TaskService", () => {
                 "target",
                 "wst_race",
                 "owner",
-                false
+                "reserved"
               );
               return { model: defaultModel, agentId: "plan" };
             });
@@ -1221,7 +1221,7 @@ describe("TaskService", () => {
               "target",
               "wst_race",
               "owner",
-              false
+              "reserved"
             );
             const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
               WorkspaceHost["sendMessage"]

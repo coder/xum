@@ -8,6 +8,7 @@ import { expect, mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
+import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
@@ -64,28 +65,48 @@ export async function collectFullHistory(service: HistoryService, workspaceId: s
   return messages;
 }
 
+/**
+ * Where a seeded live workspace-turn registration comes from in production:
+ * - "recovered": the startup restart path. The handle record goes through the real store and
+ *   reconcileAgentTaskExecutionIds() registers it (fail-closed, unaccepted) together with the
+ *   task's execution mirror; the helper asserts that the restart path really did.
+ * - "reserved" / "accepted": createWorkspaceTurn's registration before / after the owner's send
+ *   passed turn admission. That path generates the handle and turn IDs and sends through the
+ *   host, which these admission tests assert against, so these seeds (a documented residual)
+ *   write the owner's registration map directly after the same real-store record write.
+ */
+export type LiveWorkspaceTurnSource = "recovered" | "reserved" | "accepted";
+
 export async function registerLiveWorkspaceTurnHandle(
   taskService: TaskService,
   workspaceId: string,
   handleId: string,
   ownerWorkspaceId = "tree-root",
-  // Admission additionally requires the registration to be ACCEPTED (creation-time
-  // reservations are registered before the owner's send passes turn admission); pass false to
-  // model that pre-acceptance window.
-  accepted = true
+  source: LiveWorkspaceTurnSource = "accepted",
+  recordOverrides: Partial<WorkspaceTurnTaskHandleRecord> = {}
 ): Promise<void> {
+  const manager = workspaceTurnManagerFor(taskService);
   const internals = workspaceTurnManagerInternals(taskService);
   await internals.taskHandleStore.upsertWorkspaceTurn(
     workspaceTurnRecord(ownerWorkspaceId, workspaceId, handleId, "running", {
       turnId: `${handleId}-turn`,
       createdAt: "2026-08-24T00:00:00.000Z",
       updatedAt: "2026-08-24T00:00:00.000Z",
+      ...recordOverrides,
     })
   );
+  if (source === "recovered") {
+    await manager.reconcileAgentTaskExecutionIds();
+    assert(
+      manager.getLiveWorkspaceTurnRegistration(workspaceId)?.handleId === handleId,
+      `reconcileAgentTaskExecutionIds did not register ${handleId} for ${workspaceId}`
+    );
+    return;
+  }
   internals.activeWorkspaceTurnHandleByWorkspaceId.set(workspaceId, {
     handleId,
     ownerWorkspaceId,
-    accepted,
+    accepted: source === "accepted",
   });
 }
 
