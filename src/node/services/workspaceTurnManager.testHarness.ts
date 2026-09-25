@@ -1,7 +1,16 @@
 import * as path from "path";
-import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
+import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import { HistoryService } from "@/node/services/historyService";
+import {
+  buildAgentTaskIndex,
+  countActiveAgentTasks,
+  hasActiveDescendantAgentTasksUsingIndex,
+  isDescendantAgentTaskUsingParentById,
+  listAgentTaskWorkspaces,
+  resolveWorkspaceAISettings,
+} from "@/node/services/agentTaskIndex";
+import { buildParentAiSettingsFallbacks } from "@/node/services/agentTaskReawakenAi";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
@@ -32,37 +41,19 @@ function createWorkspaceTurnManagerHost(
   const lifecycleLocks = new MutexMap<string>();
   const foregroundWaiters = new Map<string, Set<BackgroundableForegroundWaiter>>();
   const foregroundAwaitCounts = new Map<string, number>();
-  const agentTasks = (cfg: ReturnType<Config["loadConfigOrDefault"]>) =>
-    Array.from(cfg.projects.values())
-      .flatMap((project) => project.workspaces)
-      .filter((workspace) => workspace.id != null && workspace.parentWorkspaceId != null);
-  const isActiveAgentTask = (workspace: WorkspaceConfigEntry) => {
-    if (
-      workspace.archivedAt != null &&
-      (workspace.unarchivedAt == null || workspace.unarchivedAt < workspace.archivedAt)
-    ) {
-      return workspace.id != null && aiService.isStreaming(workspace.id);
-    }
-    return (
-      ["starting", "running", "awaiting_report"].includes(workspace.taskStatus ?? "running") ||
-      ["starting", "running"].includes(workspace.taskExecutionStatus ?? "")
-    );
-  };
+  // Tree and activity rules come from the production predicates so this host cannot drift from
+  // TaskService (queued tasks, archived streams, the streaming fallback, agent-ID normalization).
+  const isStreaming = (workspaceId: string) => aiService.isStreaming(workspaceId);
   const isDescendant = (
     cfg: ReturnType<Config["loadConfigOrDefault"]>,
     ancestorWorkspaceId: string,
     taskId: string
-  ) => {
-    const parents = new Map(
-      agentTasks(cfg).map((workspace) => [workspace.id, workspace.parentWorkspaceId])
+  ) =>
+    isDescendantAgentTaskUsingParentById(
+      buildAgentTaskIndex(cfg).parentById,
+      ancestorWorkspaceId,
+      taskId
     );
-    let current: string | undefined = taskId;
-    for (let depth = 0; depth < 32 && current != null; depth++) {
-      current = parents.get(current);
-      if (current === ancestorWorkspaceId) return true;
-    }
-    return false;
-  };
   const backgroundForegroundWaitsForWorkspace = (workspaceId: string) => {
     let signaled = 0;
     for (const waiter of foregroundWaiters.get(workspaceId) ?? []) {
@@ -87,24 +78,13 @@ function createWorkspaceTurnManagerHost(
       backgroundForegroundWaitsForWorkspace(workspaceId);
     },
     backgroundForegroundWaitsForWorkspace,
-    buildParentAiSettingsFallbacks: (parent, targetAgentId) =>
-      [
-        parent.aiSettingsByAgent?.[targetAgentId],
-        parent.agentId == null ? undefined : parent.aiSettingsByAgent?.[parent.agentId],
-        parent.aiSettings,
-      ].filter((settings) => settings != null),
+    buildParentAiSettingsFallbacks,
     bumpWorkspaceStopEpoch: () => undefined,
     countActiveAgentTasks: (cfg) =>
-      agentTasks(cfg).filter(
-        (workspace) =>
-          isActiveAgentTask(workspace) &&
-          workspace.id != null &&
-          !foregroundAwaitCounts.has(workspace.id) &&
-          !(
-            workspace.taskExecutionId?.startsWith("wst_") === true &&
-            ["starting", "running"].includes(workspace.taskExecutionStatus ?? "")
-          )
-      ).length,
+      countActiveAgentTasks(listAgentTaskWorkspaces(cfg), {
+        isStreaming,
+        isForegroundAwaiting: (workspaceId) => foregroundAwaitCounts.has(workspaceId),
+      }),
     editWorkspaceEntry: async (workspaceId, updater, options) => {
       let found = false;
       await config.editConfig((cfg) => {
@@ -127,12 +107,7 @@ function createWorkspaceTurnManagerHost(
       await terminalAttentionStore.enqueueIfAbsent(params);
     },
     hasActiveDescendantAgentTasks: (cfg, workspaceId) =>
-      agentTasks(cfg).some(
-        (workspace) =>
-          workspace.id != null &&
-          isActiveAgentTask(workspace) &&
-          isDescendant(cfg, workspaceId, workspace.id)
-      ),
+      hasActiveDescendantAgentTasksUsingIndex(buildAgentTaskIndex(cfg), workspaceId, isStreaming),
     isDescendantAgentTaskInConfig: isDescendant,
     isForegroundAwaiting: (workspaceId) => foregroundAwaitCounts.has(workspaceId),
     latchWorkspaceStopsInProgress: () => () => undefined,
@@ -165,7 +140,7 @@ function createWorkspaceTurnManagerHost(
         .map((run) => run.id);
     },
     listAgentReferencedWorkflowRunIds: () => Promise.resolve([]),
-    listAgentTaskExecutionEntries: agentTasks,
+    listAgentTaskExecutionEntries: listAgentTaskWorkspaces,
     markTaskForegroundRelevant: () => undefined,
     maybeStartPatchGenerationForReportedTask: () => Promise.resolve(),
     registerBackgroundableForegroundWaiter: (workspaceId, waiter) => {
@@ -174,9 +149,7 @@ function createWorkspaceTurnManagerHost(
       foregroundWaiters.set(workspaceId, waiters);
     },
     releaseRetainedStopLatches: () => undefined,
-    resolveWorkspaceAISettings: (workspace, agentId) =>
-      (agentId != null ? workspace.aiSettingsByAgent?.[agentId] : undefined) ??
-      workspace.aiSettings,
+    resolveWorkspaceAISettings,
     scheduleMaybeStartQueuedTasks: () => undefined,
     scheduleTerminalAttentionDrain: () => undefined,
     startForegroundAwait: (workspaceId) => {
