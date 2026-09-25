@@ -11,7 +11,9 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
     clearQueue: () => Ok(undefined),
     replaceHistory: () => Promise.resolve(Ok(undefined)),
     waitForIdleAndNoQueuedMessages: () => Promise.resolve(),
-    waitForPendingCompactionCompletionDecision: () => Promise.resolve(true),
+    // No session behind the fake, so no compaction decision (WorkspaceService without a session).
+    // Tests that model a compaction handing completion to its durable follow-up override this.
+    waitForPendingCompactionCompletionDecision: () => Promise.resolve(undefined),
     waitForPendingStreamErrorRecoveryDecision: () => Promise.resolve(undefined),
     getStartupRecoveryState: () => Promise.resolve("interrupted"),
     dispatchPendingCompactionFollowUp: () => Promise.resolve(Ok(false)),
