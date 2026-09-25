@@ -2994,11 +2994,14 @@ describe("TaskService", () => {
       spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() =>
         Promise.resolve(undefined)
       );
+      // Observe (not replace) the background launch so the assertion runs after its tail: a fixed
+      // sleep raced the cascade under load and read the row while it was still "starting".
+      const launch = spyOn(internals, "startReservedAgentTask");
       const created = await taskService.createMany([spawnArgs(rootId)]);
       expect(created.success).toBe(true);
-      await waitUntil(() => sendMessage.mock.calls.length === 1, "the send to be admitted");
-      // Let the launch's tail run after the cascade persisted "interrupted".
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await waitUntil(() => launch.mock.calls.length === 1, "the reserved launch to start");
+      await launch.mock.results[0]?.value;
+      expect(sendMessage).toHaveBeenCalledTimes(1);
       expect(findWorkspaceInConfig(config, spawnedId)?.taskStatus).toBe("interrupted");
       // Coherent readback: the stopped attempt is settled, not a stale "running" live child.
       await waitForOutcomeKind(taskService, spawnedId, "terminal-no-report");
