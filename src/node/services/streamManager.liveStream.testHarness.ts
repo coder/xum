@@ -5,7 +5,12 @@
  * instead of seeding private engine state.
  */
 import type { Tool } from "ai";
-import { StreamManager, type TurnEngineEvent, type TurnExecutionOptions } from "./streamManager";
+import {
+  StreamManager,
+  type TurnCompletion,
+  type TurnEngineEvent,
+  type TurnExecutionOptions,
+} from "./streamManager";
 import {
   fakeStreamText,
   noopTokenTracker,
@@ -25,24 +30,38 @@ const END_OF_STREAM = Symbol("end-of-stream");
 /**
  * A provider fullStream the test feeds one chunk at a time. push() resolves only
  * after StreamManager finished processing each chunk and asked for the next one,
- * so tests observe (and replay) a live stream at an exact point.
+ * so tests observe (and replay) a live stream at an exact point. If the consumer
+ * stops iterating (a chunk threw, or the stream exited early), push() rejects
+ * instead of waiting for a next pull that never comes.
  */
 export function createChunkFeed() {
   let deliver: ((chunk: unknown) => void) | undefined;
   let signalWaiting!: () => void;
   let waiting = new Promise<void>((resolve) => (signalWaiting = resolve));
+  let closed = false;
   async function* fullStream() {
-    while (true) {
-      const chunk = await new Promise<unknown>((resolve) => {
-        deliver = resolve;
-        signalWaiting();
-      });
-      if (chunk === END_OF_STREAM) return;
-      yield chunk;
+    try {
+      while (true) {
+        const chunk = await new Promise<unknown>((resolve) => {
+          deliver = resolve;
+          signalWaiting();
+        });
+        if (chunk === END_OF_STREAM) return;
+        yield chunk;
+      }
+    } finally {
+      // Also runs when the consumer returns early (for-await exits on a throw or
+      // break); wake a pending push() so it reports the closed stream.
+      closed = true;
+      signalWaiting();
     }
   }
+  const assertOpen = (when: string) => {
+    if (closed) throw new Error(`chunk feed: the stream stopped consuming ${when}`);
+  };
   const send = async (chunk: unknown) => {
     await waiting;
+    assertOpen("before this chunk");
     waiting = new Promise<void>((resolve) => (signalWaiting = resolve));
     const next = deliver;
     deliver = undefined;
@@ -56,6 +75,7 @@ export function createChunkFeed() {
       for (const chunk of chunks) {
         await send(chunk);
         await waiting;
+        assertOpen("after a chunk");
       }
     },
     end: () => send(END_OF_STREAM),
@@ -64,7 +84,7 @@ export function createChunkFeed() {
 
 export interface LiveStream {
   push: (...chunks: unknown[]) => Promise<void>;
-  /** Ends the stream normally and waits for its completion. */
+  /** Ends the stream normally and asserts that it completed (not failed or aborted). */
   finish: () => Promise<void>;
 }
 
@@ -134,16 +154,39 @@ export function createLiveStreamHarness(deps: LiveStreamHarnessDeps = {}) {
       );
       if (!result.success) throw new Error("Expected stream to start");
       await streamFeed.waiting();
+      const { completion } = result.data;
+      // The handle settles for failed/aborted streams too; a push() racing it
+      // fails with the terminal status instead of hanging until the test timeout.
+      const settledEarly = completion.then((settled) => {
+        throw new Error(`stream settled while the test was feeding it: ${describe(settled)}`);
+      });
+      settledEarly.catch(() => undefined);
       return {
-        push: streamFeed.push,
+        push: async (...chunks) => {
+          try {
+            await Promise.race([streamFeed.push(...chunks), settledEarly]);
+          } catch (error) {
+            const settled = await completion;
+            throw new Error(`live stream push failed (${describe(settled)})`, { cause: error });
+          }
+        },
         finish: async () => {
           await streamFeed.push({ type: "finish", finishReason: "stop" });
           await streamFeed.end();
-          await result.data.completion;
+          const settled = await completion;
+          if (settled.status !== "completed") {
+            throw new Error(`expected the stream to complete, got ${describe(settled)}`);
+          }
         },
       };
     },
   };
+}
+
+function describe(completion: TurnCompletion): string {
+  return completion.status === "failed"
+    ? `failed: ${completion.streamError.error}`
+    : completion.status;
 }
 
 export function eventsOfType<T extends TurnEngineEvent["type"]>(

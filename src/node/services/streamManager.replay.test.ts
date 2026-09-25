@@ -157,11 +157,19 @@ describe("StreamManager - replayStream", () => {
     const replayedUsage = eventsOfType(harness.events.slice(replayStart), "usage-delta");
     expect(replayedUsage).toHaveLength(1);
     expect(replayedUsage[0]?.replay).toBe(true);
-    expect(replayedUsage[0]?.usage).toMatchObject({ inputTokens: 21, outputTokens: 3 });
+    expect(replayedUsage[0]?.usage).toMatchObject({
+      inputTokens: 21,
+      outputTokens: 3,
+      totalTokens: 24,
+    });
     expect(replayedUsage[0]?.providerMetadata).toMatchObject({
       anthropic: { cacheReadInputTokens: 2 },
     });
-    expect(replayedUsage[0]?.cumulativeUsage).toMatchObject({ inputTokens: 55, outputTokens: 11 });
+    expect(replayedUsage[0]?.cumulativeUsage).toMatchObject({
+      inputTokens: 55,
+      outputTokens: 11,
+      totalTokens: 66,
+    });
     expect(replayedUsage[0]?.cumulativeProviderMetadata).toMatchObject({
       anthropic: { cacheCreationInputTokens: 9 },
       mux: { costsIncluded: true },
