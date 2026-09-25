@@ -5,6 +5,7 @@ import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 
 const workspaceId = "plan-review-follow-up";
@@ -145,5 +146,53 @@ describe("manual resume with a hidden plan-review row at the tail", () => {
     expect(resumed.success).toBe(true);
     await h.session.waitForIdle();
     expect(h.stream).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("resume after a completed assistant with a hidden plan-review row at the tail", () => {
+  test("appends the [CONTINUE] sentinel so the request does not end with the assistant", async () => {
+    const h = await fixture();
+    const seeded = [
+      createMuxMessage("user-work", "user", "Draft the plan", { timestamp: Date.now() - 2_000 }),
+      createMuxMessage("assistant-done", "assistant", "Here is the plan.", {
+        timestamp: Date.now() - 1_000,
+      }),
+    ];
+    for (const message of seeded) {
+      expect((await h.historyService.appendToHistory(workspaceId, message)).success).toBe(true);
+    }
+    // A snapshot/resolve/reopen row after the assistant is the raw tail, but request assembly
+    // drops it, so the model-visible tail is still the completed assistant.
+    const resolve = {
+      v: 1 as const,
+      kind: "resolve" as const,
+      recordId: "rec_after_assistant",
+      threadId: "thr_after_assistant",
+    };
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("plan-review-resolve-tail", "user", formatPlanReviewEnvelope(resolve), {
+            timestamp: Date.now(),
+            synthetic: true,
+            muxMetadata: buildPlanReviewMetadata(resolve),
+          })
+        )
+      ).success
+    ).toBe(true);
+
+    const resumed = await h.session.resumeStream(options);
+    expect(resumed.success).toBe(true);
+    await h.session.waitForIdle();
+    expect(h.stream).toHaveBeenCalledTimes(1);
+    const visible = h.stream.mock.calls[0][0].messages.filter(
+      (message) => !isModelHiddenMessage(message)
+    );
+    const last = visible.at(-1);
+    expect(last?.role).toBe("user");
+    expect(last?.parts.map((part) => (part.type === "text" ? part.text : part.type))).toEqual([
+      "[CONTINUE]",
+    ]);
   });
 });

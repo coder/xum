@@ -7490,7 +7490,10 @@ export class AgentSession {
       // Non-partial trailing assistants indicate a missing user message upstream — inject a
       // [CONTINUE] sentinel so the model has a valid conversation to respond to. This is
       // defense-in-depth; callers should prefer sendMessage() which persists a real user message.
-      const lastMsg = requestMessages[requestMessages.length - 1];
+      // Judge the model-visible tail (same projection as the resume target above): request
+      // assembly drops model-hidden records, so a plan-review row after a completed assistant
+      // would otherwise suppress the sentinel and the request would end with the assistant.
+      const lastMsg = requestMessages.findLast((message) => !isModelHiddenMessage(message));
       if (lastMsg?.role === "assistant" && !lastMsg.metadata?.partial) {
         log.warn(
           "streamWithHistory: trailing non-partial assistant detected, injecting [CONTINUE]",
