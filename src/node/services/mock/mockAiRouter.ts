@@ -142,14 +142,14 @@ function buildForceCompactionReply(): MockAiRouterReply {
 }
 
 /**
- * ~45 s at the adapter's default pacing (24 chars / 25 ms) so perf scenarios can leave and
- * return to chats that are still mid-stream (#4504, perf.chatSwitch.spec.ts), while earlier
- * rounds' streams finish instead of piling up. Paragraph breaks keep the growing reply shaped
+ * ~18 s at the adapter's default pacing (24 chars / 25 ms): long enough for perf scenarios to
+ * leave and return to chats that are still mid-stream (#4504, perf.chatSwitch.spec.ts), short
+ * enough that waiting for a round's streams to finish keeps the scenario quick. Paragraph breaks keep the growing reply shaped
  * like real prose instead of one giant line.
  */
 function buildLongStreamReply(): MockAiRouterReply {
   const paragraph = Array.from({ length: 40 }, () => "Streaming response...").join(" ");
-  return { assistantText: Array.from({ length: 50 }, () => paragraph).join("\n\n") };
+  return { assistantText: Array.from({ length: 20 }, () => paragraph).join("\n\n") };
 }
 
 function buildListProgrammingLanguagesReply(): MockAiRouterReply {

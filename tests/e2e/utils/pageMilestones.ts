@@ -141,7 +141,7 @@ export interface SwitchMilestones {
   skeletonHiddenMs: number | null;
   /** ms from the click until a transcript row of the target chat exists. */
   firstRowMs: number | null;
-  /** Longest main-thread task after the click, in ms (0 when none exceeded 50 ms). */
+  /** Longest main-thread task that ran at or after the click, in ms (0 when none exceeded 50 ms). */
   longestTaskMs: number;
 }
 
@@ -207,7 +207,9 @@ export async function startSwitchMilestones(page: Page, rowSelector: string): Pr
 
       const recordLongTasks = (entries: PerformanceEntryList) => {
         for (const entry of entries) {
-          if (state.clickAt !== null && entry.startTime >= state.clickAt) {
+          // Overlap, not start time: the task that dispatches the click can begin before
+          // event.timeStamp, and it is the task a synchronous switch would make long.
+          if (state.clickAt !== null && entry.startTime + entry.duration > state.clickAt) {
             state.longestTaskMs = Math.max(state.longestTaskMs, entry.duration);
           }
         }

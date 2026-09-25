@@ -153,6 +153,11 @@ function readServerReplays(logsDir: string, workspaceId: string): ChatSwitchServ
   return replays;
 }
 
+/** The backend keeps partial.json only while the chat's stream is running. */
+function partialPath(chat: SeededChat): string {
+  return path.join(path.dirname(chat.config.historyPath), "partial.json");
+}
+
 function rotationIndex(fileName: string): number {
   const match = /^mux\.(\d+)\.log$/.exec(fileName);
   return match ? Number(match[1]) : 0;
@@ -227,10 +232,12 @@ test.describe("chat switch performance profiling", () => {
         (await readRendererTimings(page, workspaceId, null)).measured;
 
       if (targetMidStream) {
-        // Inactive rows show server-side activity, so this proves the chat is still streaming
-        // right before the switch. (After the switch the mock's missing replay makes the
-        // chat look interrupted; see the file comment.)
+        // Inactive rows show server-side activity, and partial.json exists only while the
+        // backend stream runs, so the chat is still streaming right before the switch. (After
+        // the switch the mock's missing replay makes the chat look interrupted; see the file
+        // comment.)
         await expect(page.locator(`div[role="button"]${rowSelector}`)).toContainText("streaming");
+        expect(fs.existsSync(partialPath(chat)), `${leg} target is still streaming`).toBe(true);
       }
       await startSwitchMilestones(page, rowSelector);
       await ui.projects.openWorkspaceById(workspaceId);
@@ -285,6 +292,13 @@ test.describe("chat switch performance profiling", () => {
         await switchTo(chats.small, round, "switch-back-small", true);
         await page.waitForTimeout(dwellMs);
         await switchTo(chats.large, round, "switch-back-large", true);
+        // Let this round's streams finish so every round is measured under the same backend
+        // load (two streams) instead of piling up behind earlier rounds' streams.
+        await expect
+          .poll(() => [chats.small, chats.large].some((chat) => fs.existsSync(partialPath(chat))), {
+            timeout: 60_000,
+          })
+          .toBe(false);
       }
     });
 
