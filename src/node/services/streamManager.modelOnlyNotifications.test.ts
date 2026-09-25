@@ -2,8 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import type { LanguageModel } from "ai";
 
-import { StreamManager } from "./streamManager";
-import { onTurnEngineEvent } from "./streamManager.testHarness";
+import { createStreamManagerForTests, onTurnEngineEvent } from "./streamManager.testHarness";
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -30,19 +29,12 @@ describe("StreamManager - model-only tool notifications", () => {
   });
 
   test("strips __mux_notifications before emitting tool-call-end", async () => {
-    const streamManager = new StreamManager(historyService);
+    // The default no-op token tracker avoids tokenizer workers in unit tests.
+    const streamManager = createStreamManagerForTests(historyService);
     let completed = false;
     onTurnEngineEvent(streamManager, "stream-end", () => {
       completed = true;
     });
-
-    // Avoid tokenizer worker usage in unit tests.
-    (streamManager as unknown as { tokenTracker: unknown }).tokenTracker = {
-      // eslint-disable-next-line @typescript-eslint/require-await
-      setModel: async () => undefined,
-      // eslint-disable-next-line @typescript-eslint/require-await
-      countTokens: async () => 0,
-    };
 
     const events: Array<{ toolName?: string; result?: unknown }> = [];
     onTurnEngineEvent(
@@ -124,19 +116,12 @@ describe("StreamManager - model-only tool notifications", () => {
   });
 
   test("persists orphan web_search tool-result when tool-call mapping is missing", async () => {
-    const streamManager = new StreamManager(historyService);
+    // The default no-op token tracker avoids tokenizer workers in unit tests.
+    const streamManager = createStreamManagerForTests(historyService);
     let completed = false;
     onTurnEngineEvent(streamManager, "stream-end", () => {
       completed = true;
     });
-
-    // Avoid tokenizer worker usage in unit tests.
-    (streamManager as unknown as { tokenTracker: unknown }).tokenTracker = {
-      // eslint-disable-next-line @typescript-eslint/require-await
-      setModel: async () => undefined,
-      // eslint-disable-next-line @typescript-eslint/require-await
-      countTokens: async () => 0,
-    };
 
     const events: Array<{
       toolName?: string;

@@ -953,6 +953,19 @@ interface MockStreamLifecycle {
   replayStream(workspaceId: string): Promise<void>;
 }
 
+/** The token-counting surface StreamManager uses for live streaming stats. */
+export type StreamManagerTokenTracker = Pick<StreamingTokenTracker, "setModel" | "countTokens">;
+
+/**
+ * Optional collaborators for StreamManager. Production omits both; tests
+ * inject a fake stream factory (so the real request/prepareStep wiring still
+ * runs) and a no-op token tracker (so no tokenizer worker loads).
+ */
+export interface StreamManagerOptions {
+  streamText?: typeof streamText;
+  tokenTracker?: StreamManagerTokenTracker;
+}
+
 export class StreamManager {
   private workspaceStreams = new Map<WorkspaceId, WorkspaceStreamInfo>();
   private readonly pendingStreamStarts = new Map<
@@ -994,7 +1007,10 @@ export class StreamManager {
    */
   private readonly engineScope?: Scope.Closeable;
   // Token tracker for live streaming statistics
-  private tokenTracker = new StreamingTokenTracker();
+  private readonly tokenTracker: StreamManagerTokenTracker;
+  // Injected stream factory; undefined uses the AI SDK's streamText, resolved at
+  // call time so the default stays the live module export.
+  private readonly streamTextOverride?: typeof streamText;
   // Track OpenAI previousResponseIds that have been invalidated
   // When frontend retries, buildProviderOptions will omit these IDs
   //
@@ -1011,7 +1027,8 @@ export class StreamManager {
     eventSink: TurnEngineEventSink = () => undefined,
     runner: EffectRunner = defaultEffectRunner,
     engineScope?: Scope.Closeable,
-    private readonly toolCallDisplayRegistry = new ToolCallDisplayRegistry()
+    private readonly toolCallDisplayRegistry = new ToolCallDisplayRegistry(),
+    options: StreamManagerOptions = {}
   ) {
     this.historyService = historyService;
     this.sessionUsageService = sessionUsageService;
@@ -1019,6 +1036,8 @@ export class StreamManager {
     this.eventSink = eventSink;
     this.effectRunner = runner;
     this.engineScope = engineScope;
+    this.tokenTracker = options.tokenTracker ?? new StreamingTokenTracker();
+    this.streamTextOverride = options.streamText;
   }
 
   setEventSink(eventSink: TurnEngineEventSink): void {
@@ -2740,7 +2759,7 @@ export class StreamManager {
     // Explicit <ToolSet> pins RUNTIME_CONTEXT to its default: mux tools use
     // Tool's `any` context, which would otherwise infect the inferred result
     // type (no-unsafe-return).
-    return streamText<ToolSet>({
+    return (this.streamTextOverride ?? streamText)<ToolSet>({
       model: request.model,
       messages: request.messages,
       system: request.system,

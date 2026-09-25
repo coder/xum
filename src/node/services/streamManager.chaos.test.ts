@@ -10,7 +10,8 @@
  */
 import { describe, test, expect, afterEach, beforeEach } from "bun:test";
 import { Scope } from "effect";
-import { StreamManager, type TurnEngineEvent } from "./streamManager";
+import type { TurnEngineEvent } from "./streamManager";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import { closeScopeBounded } from "./di/appRuntime";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -126,20 +127,18 @@ describe("StreamManager chaos", () => {
       for (let iter = 0; iter < ITERATIONS; iter++) {
         const workspaceId = `chaos-ws-${iter}`;
         const events: TurnEngineEvent[] = [];
-        const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
-          events.push(event);
+        const streamManager = createStreamManagerForTests(historyService, {
+          eventSink: (event) => {
+            events.push(event);
+          },
+          streamText: fakeStreamText(() => ({
+            fullStream: randomFullStream(rng),
+            totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
+            usage: Promise.resolve(undefined),
+            providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
+            steps: Promise.resolve([]),
+          })),
         });
-        Reflect.set(streamManager, "tokenTracker", {
-          setModel: () => Promise.resolve(),
-          countTokens: () => Promise.resolve(0),
-        });
-        Reflect.set(streamManager, "createStreamResult", () => ({
-          fullStream: randomFullStream(rng),
-          totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
-          usage: Promise.resolve(undefined),
-          providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
-          steps: Promise.resolve([]),
-        }));
 
         const messageId = `chaos-msg-${iter}`;
         const appendResult = await historyService.appendToHistory(workspaceId, {
@@ -243,33 +242,21 @@ describe("StreamManager chaos", () => {
       const stopRacesClose = rng() < 0.5;
       const engineScope = Scope.makeUnsafe("parallel");
       const events: TurnEngineEvent[] = [];
-      const streamManager = new StreamManager(
-        historyService,
-        undefined,
-        undefined,
-        (event) => {
-          events.push(event);
-        },
-        undefined,
-        engineScope
-      );
-      Reflect.set(streamManager, "tokenTracker", {
-        setModel: () => Promise.resolve(),
-        countTokens: () => Promise.resolve(0),
-      });
       let nextFullStream: (signal: AbortSignal) => AsyncGenerator<unknown, void, unknown> = () =>
         randomFullStream(rng);
-      Reflect.set(
-        streamManager,
-        "createStreamResult",
-        (_request: unknown, abortController: AbortController) => ({
-          fullStream: nextFullStream(abortController.signal),
+      const streamManager = createStreamManagerForTests(historyService, {
+        eventSink: (event) => {
+          events.push(event);
+        },
+        engineScope,
+        streamText: fakeStreamText((request) => ({
+          fullStream: nextFullStream(request.abortSignal!),
           totalUsage: Promise.resolve(rng() < 0.7 ? undefined : randomHostileValue(rng)),
           usage: Promise.resolve(undefined),
           providerMetadata: Promise.resolve(rng() < 0.8 ? undefined : randomHostileValue(rng)),
           steps: Promise.resolve([]),
-        })
-      );
+        })),
+      });
 
       const started: Array<{ messageId: string; completion: Promise<{ status: string }> }> = [];
       for (let iter = 0; iter < ITERATIONS; iter++) {
@@ -353,23 +340,21 @@ describe("StreamManager chaos", () => {
     cyclic.self = cyclic;
 
     const events: TurnEngineEvent[] = [];
-    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
-      events.push(event);
+    const streamManager = createStreamManagerForTests(historyService, {
+      eventSink: (event) => {
+        events.push(event);
+      },
+      streamText: fakeStreamText(() => ({
+        fullStream: (async function* () {
+          await Promise.resolve();
+          yield { type: "error", error: cyclic };
+        })(),
+        totalUsage: Promise.resolve(undefined),
+        usage: Promise.resolve(undefined),
+        providerMetadata: Promise.resolve(undefined),
+        steps: Promise.resolve([]),
+      })),
     });
-    Reflect.set(streamManager, "tokenTracker", {
-      setModel: () => Promise.resolve(),
-      countTokens: () => Promise.resolve(0),
-    });
-    Reflect.set(streamManager, "createStreamResult", () => ({
-      fullStream: (async function* () {
-        await Promise.resolve();
-        yield { type: "error", error: cyclic };
-      })(),
-      totalUsage: Promise.resolve(undefined),
-      usage: Promise.resolve(undefined),
-      providerMetadata: Promise.resolve(undefined),
-      steps: Promise.resolve([]),
-    }));
 
     const appendResult = await historyService.appendToHistory("cyclic-error-ws", {
       id: "cyclic-error-msg",
