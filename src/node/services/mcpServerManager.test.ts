@@ -4310,10 +4310,13 @@ describe("MCPServerManager", () => {
       )
     );
 
-    // Revoke inside prompts/list: the pre-mutation enabled-instance copy was
-    // already taken when the mutation lands, so only a post-refresh counter
-    // recheck can drop the now-disabled server's descriptors.
-    let revokeOnFirstRefresh = true;
+    // Revoke inside discovery's prompts/list: the pre-mutation enabled-instance
+    // copy was already taken when the mutation lands. Two guards drop the
+    // now-disabled server's descriptors (the trust change's enablement repair
+    // and the post-refresh counter recheck); this fails only if both are lost.
+    // Armed only after the warm-up serve: its own awaited prompts/list would otherwise
+    // revoke trust before prompt discovery starts.
+    let revokeOnFirstRefresh = false;
     const revokingRefresh = (list: Array<{ name: string }>) =>
       mock(() => {
         if (revokeOnFirstRefresh) {
@@ -4326,10 +4329,13 @@ describe("MCPServerManager", () => {
     servers.serve("cmd-stable", { listPrompts: revokingRefresh([{ name: "status" }]) });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
+    revokeOnFirstRefresh = true;
 
     const descriptors = await manager.getPromptsForWorkspace(
       workspaceRequest(workspaceId, { trusted: true })
     );
+    // The revocation landed inside discovery's own refresh.
+    expect(revokeOnFirstRefresh).toBe(false);
     expect(descriptors.map((descriptor) => descriptor.serverName)).toEqual(["stable"]);
   });
 
@@ -5174,9 +5180,12 @@ describe("MCPServerManager", () => {
     );
     serveSecretHeaderServer(getPrompt);
     await manager.getToolsForWorkspace(request);
-    manager.setSecretsResolver(() => Promise.reject(new Error("config unavailable")));
+    const failingResolver = mock(() => Promise.reject(new Error("config unavailable")));
+    manager.setSecretsResolver(failingResolver);
 
     expect(await manager.getPrompt("workspace", "coder", "status", {})).toEqual({ text: "Status" });
+    // The fallback branch ran: the resolver was consulted and failed.
+    expect(failingResolver).toHaveBeenCalled();
     // The recorded snapshot still matches the live client: no reconnect.
     expect(authorizationHeadersSent()).toEqual(["old"]);
   });
