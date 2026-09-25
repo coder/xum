@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import * as fs from "node:fs/promises";
-import * as childProcess from "node:child_process";
-import * as credentials from "@aws-sdk/credential-provider-node";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type * as fs from "node:fs/promises";
+import { createRequire } from "node:module";
+import type * as childProcess from "node:child_process";
+import type * as credentials from "@aws-sdk/credential-provider-node";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool, EnvHttpProxyAgent } from "undici/index.js";
@@ -22,6 +23,13 @@ const pair = { accessKeyId: "CONFIGKEY", secretAccessKey: "config-secret" };
 function save(extra: BaseProviderConfig = {}) {
   service.providersConfigStore.saveProvidersConfig({ bedrock: { region: "us-east-1", ...extra } });
 }
+// The AWS SDK reaches files, processes and its default chain through CommonJS `require`. In
+// bun those module objects are distinct from the ESM namespaces, so spies on the namespaces
+// never see SDK calls. Spy on the objects the SDK actually calls.
+const requireCjs = createRequire(import.meta.url);
+const sdkFsPromises = requireCjs("node:fs/promises") as typeof fs;
+const sdkChildProcess = requireCjs("node:child_process") as typeof childProcess;
+const sdkCredentials = requireCjs("@aws-sdk/credential-provider-node") as typeof credentials;
 function watch<T extends object, K extends keyof T>(object: T, key: K) {
   const spy = spyOn(object, key);
   cleanups.push(() => spy.mockRestore());
@@ -267,12 +275,16 @@ it.each(["us-east-1", "cn-north-1", "us-gov-west-1", "sigv4"])(
       AWS_MAX_ATTEMPTS: "9",
       AWS_SDK_UA_APP_ID: "ambient",
     });
-    const files = watch(fs, "readFile"),
-      processes = watch(childProcess, "exec"),
-      chain = watch(credentials, "defaultProvider");
+    const files = watch(sdkFsPromises, "readFile"),
+      processes = watch(sdkChildProcess, "exec"),
+      chain = watch(sdkCredentials, "defaultProvider");
     expect(await service.discoverModels("bedrock")).toEqual({ status: "ok", modelIds: [] });
-    expect(files).not.toHaveBeenCalled();
-    expect(processes).not.toHaveBeenCalled();
+    // These spies are process-wide, and other suites sharing the bun process (a CI shard) can
+    // read files or spawn commands meanwhile. Count only calls that reach this test's own AWS
+    // config file or its credential_process, which only the SDK under test can touch.
+    expect(files.mock.calls.filter(([path]) => path === awsFile)).toEqual([]);
+    expect(processes.mock.calls.filter(([command]) => String(command).includes(root))).toEqual([]);
+    expect(existsSync(join(root, "forbidden"))).toBe(false);
     expect(chain).not.toHaveBeenCalled();
     expect(origins).toEqual(
       Array.from(
