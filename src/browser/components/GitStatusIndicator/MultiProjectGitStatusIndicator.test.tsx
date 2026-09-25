@@ -23,7 +23,6 @@ void mock.module("@/browser/stores/GitStatusStore", () => ({
   useMultiProjectGitSummary: () => currentSummary,
   useGitStatusRefreshing: () => currentRefreshing,
   useGitStatus: () => null,
-  useProjectGitStatuses: () => null,
   useGitStatusStoreRaw: () => ({
     invalidateWorkspace: () => undefined,
   }),

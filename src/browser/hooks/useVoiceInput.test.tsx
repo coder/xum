@@ -11,10 +11,7 @@ import {
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../tests/ui/dom";
-import { randomUUID } from "node:crypto";
-import type * as VoiceInputModule from "./useVoiceInput";
-
-let useVoiceInput: typeof VoiceInputModule.useVoiceInput;
+import { useVoiceInput } from "./useVoiceInput";
 
 let sampleByte = 128;
 let sampleAudioFrame: (() => void) | null = null;
@@ -149,16 +146,6 @@ describe("useVoiceInput", () => {
     sampleAudioFrame = null;
     getUserMedia.mockClear();
     installVoiceGlobals();
-    // Not a mock-leak workaround: useVoiceInput registers its Space-held listeners on
-    // `window` when the module evaluates. A static import binds them to whatever window
-    // existed when the module first loaded (often a discarded DOM from an earlier test
-    // file), so the held-at-start guard tests could never observe their key events.
-    // A unique query string makes Bun evaluate a fresh instance against this test's DOM
-    // without copying source into the tree (same `?real=1` technique as AgentListItem.test).
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    ({ useVoiceInput } = require(
-      `./useVoiceInput?test=${randomUUID()}`
-    ) as typeof VoiceInputModule);
     setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
 
     window.setInterval = ((handler: () => void) => {
