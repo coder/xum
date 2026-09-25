@@ -29,7 +29,6 @@ import type { EvaluationAdmission } from "@/common/types/evaluation";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isErrnoException, isErrnoWithCode } from "@/node/utils/fs";
 import {
   acquireCrossProcessLock,
@@ -1618,12 +1617,107 @@ function isTerminalRunStatus(status: WorkflowRunStatus): boolean {
 const WORKFLOW_LOCK_FILE_SUFFIX = ".xlock";
 
 /**
+ * In-process FIFO lock per key (a lock path). A key is present in `queues` exactly while it is
+ * held; its array lists the waiters in arrival order, and release hands the key straight to the
+ * first one. A waiter that gives up at its deadline is spliced out, so a hung holder retains
+ * nothing for it (a promise chain would keep every abandoned place, and its closure, alive until
+ * the holder released). Exported for tests only.
+ */
+export class KeyedFifoLock {
+  private readonly queues = new Map<string, Array<() => void>>();
+
+  /** Takes `key` only if nobody holds it (and so nobody waits); otherwise null. */
+  tryAcquire(key: string): (() => void) | null {
+    if (this.queues.has(key)) {
+      return null;
+    }
+    this.queues.set(key, []);
+    return this.releaser(key);
+  }
+
+  /**
+   * Waits in FIFO order for `key` until `deadline` (epoch ms). Returns the release, or null when
+   * the deadline passed first; giving up only leaves the queue, the holder keeps the key.
+   */
+  async acquire(key: string, deadline: number): Promise<(() => void) | null> {
+    const immediate = this.tryAcquire(key);
+    if (immediate != null) {
+      return immediate;
+    }
+    const waiters = this.queues.get(key);
+    assert(waiters != null, "KeyedFifoLock: a held key has a waiter list");
+    return await new Promise((resolve) => {
+      const grant = () => {
+        clearTimeout(timer);
+        resolve(this.releaser(key));
+      };
+      const timer = setTimeout(
+        () => {
+          const index = waiters.indexOf(grant);
+          if (index !== -1) {
+            waiters.splice(index, 1);
+            resolve(null);
+          }
+        },
+        Math.max(0, deadline - Date.now())
+      );
+      timer.unref?.();
+      waiters.push(grant);
+    });
+  }
+
+  /** Test seam: waiters currently queued for `key`. */
+  waiterCount(key: string): number {
+    return this.queues.get(key)?.length ?? 0;
+  }
+
+  private releaser(key: string): () => void {
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const waiters = this.queues.get(key);
+      assert(waiters != null, "KeyedFifoLock: released a key that is not held");
+      const next = waiters.shift();
+      if (next != null) {
+        next();
+      } else {
+        this.queues.delete(key);
+      }
+    };
+  }
+}
+
+/**
  * In-process queue in front of the cross-process lock, keyed by lock path and shared by every
  * store instance in this process: without it, same-process contenders would find each other's
  * live record and wait out crossProcessLock's 250 ms retry sleep. Different paths are different
  * keys, so the nested events -> lease acquisition cannot deadlock against itself.
  */
-const workflowLockQueue = new MutexMap<string>();
+const workflowLockQueue = new KeyedFifoLock();
+
+/**
+ * crossProcessLock without parent creation: the former mkdir lock failed with ENOENT when the run
+ * directory was gone, and so must this. Otherwise a late operation (a runner's lease release after
+ * its workspace was deleted) would recreate the removed run or session directory. Letting the
+ * acquire itself fail leaves no window between an existence check and the publication.
+ */
+async function acquireWorkflowCrossProcessLock(
+  lockPath: string,
+  acquireTimeoutMs: number,
+  staleMs: number,
+  timeoutMessage: string
+): Promise<() => Promise<void>> {
+  return await acquireCrossProcessLock({
+    lockPath,
+    acquireTimeoutMs,
+    staleMs,
+    timeoutMessage,
+    createParentDirectory: false,
+  });
+}
 
 /**
  * #4452 gap 1: the former mkdir locks were reclaimed once their mtime aged past the stale window,
@@ -1641,37 +1735,25 @@ async function withWorkflowFileLock<T>(
   // it never takes the lock, and the holder keeps it.
   const timeoutMessage = `Timed out acquiring workflow mutation lock: ${lockPath}`;
   const deadline = Date.now() + options.acquireTimeoutMs;
-  const result = await workflowLockQueue.withLockBounded(
-    lockPath,
-    async () => {
-      await assertLockParentExists(lockPath);
-      const release = await acquireCrossProcessLock({
-        lockPath,
-        acquireTimeoutMs: Math.max(0, deadline - Date.now()),
-        staleMs: options.staleMs,
-        timeoutMessage,
-      });
-      try {
-        return await operation();
-      } finally {
-        await release();
-      }
-    },
-    deadline
-  );
-  if (result.kind === "timeout") {
+  const releaseQueue = await workflowLockQueue.acquire(lockPath, deadline);
+  if (releaseQueue == null) {
     throw new Error(timeoutMessage);
   }
-  return result.value;
-}
-
-/**
- * acquireCrossProcessLock creates missing parent directories; the former mkdir lock failed with
- * ENOENT instead. Keep failing, so a late writer (e.g. a runner's lease release after its
- * workspace was deleted) cannot recreate a removed run or session directory.
- */
-async function assertLockParentExists(lockPath: string): Promise<void> {
-  await fs.access(path.dirname(lockPath));
+  try {
+    const release = await acquireWorkflowCrossProcessLock(
+      lockPath,
+      Math.max(0, deadline - Date.now()),
+      options.staleMs,
+      timeoutMessage
+    );
+    try {
+      return await operation();
+    } finally {
+      await release();
+    }
+  } finally {
+    releaseQueue();
+  }
 }
 
 /** One attempt, in-process and cross-process; `{ acquired: false }` while anyone holds the lock. */
@@ -1680,32 +1762,33 @@ async function tryWithWorkflowFileLock<T>(
   staleMs: number,
   operation: () => Promise<T>
 ): Promise<{ acquired: true; value: T } | { acquired: false }> {
-  const attempt = await workflowLockQueue.tryWithLock(
-    lockPath,
-    async (): Promise<{ acquired: true; value: T } | { acquired: false }> => {
-      await assertLockParentExists(lockPath);
-      let release: () => Promise<void>;
-      try {
-        release = await acquireCrossProcessLock({
-          lockPath,
-          acquireTimeoutMs: 0,
-          staleMs,
-          timeoutMessage: `Workflow mutation lock is busy: ${lockPath}`,
-        });
-      } catch (error) {
-        if (error instanceof CrossProcessLockTimeoutError) {
-          return { acquired: false };
-        }
-        throw error;
+  const releaseQueue = workflowLockQueue.tryAcquire(lockPath);
+  if (releaseQueue == null) {
+    return { acquired: false };
+  }
+  try {
+    let release: () => Promise<void>;
+    try {
+      release = await acquireWorkflowCrossProcessLock(
+        lockPath,
+        0,
+        staleMs,
+        `Workflow mutation lock is busy: ${lockPath}`
+      );
+    } catch (error) {
+      if (error instanceof CrossProcessLockTimeoutError) {
+        return { acquired: false };
       }
-      try {
-        return { acquired: true, value: await operation() };
-      } finally {
-        await release();
-      }
+      throw error;
     }
-  );
-  return attempt.acquired ? attempt.value : attempt;
+    try {
+      return { acquired: true, value: await operation() };
+    } finally {
+      await release();
+    }
+  } finally {
+    releaseQueue();
+  }
 }
 
 function isErrno(error: unknown, code: string): boolean {

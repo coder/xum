@@ -288,9 +288,12 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
     });
     await pause.entered;
 
-    // Same timeout error the mkdir locks raised; the waiter only leaves the queue.
-    const timedOut = impatient.appendNextEvent(RUN_ID, logEvent("timed-out write"));
-    await expect(timedOut).rejects.toThrow("Timed out acquiring workflow mutation lock");
+    // Same timeout error the mkdir locks raised; each waiter only leaves the queue.
+    for (const attempt of [1, 2, 3]) {
+      await expect(
+        impatient.appendNextEvent(RUN_ID, logEvent(`timed-out write ${attempt}`))
+      ).rejects.toThrow("Timed out acquiring workflow mutation lock");
+    }
     const holderLocksAfterTimeout = {
       events: await pathExists(eventsLock),
       lease: await pathExists(leaseLock),
@@ -306,7 +309,7 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
       journal: logMessages(await storeA.getRun(RUN_ID)),
     }).toEqual({
       holderLocksAfterTimeout: { events: true, lease: true, otherProcessGetsEvents: false },
-      // The abandoned place never ran its write.
+      // The abandoned places never ran their writes.
       journal: ["A write", "later write"],
     });
   });
