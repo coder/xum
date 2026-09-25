@@ -23,6 +23,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # path<TAB>where it runs / why it is excluded
 other_routes=(
   $'scripts/check-startup-imports.test.ts\tmake check-startup-imports (static-check), right before its analyzer'
+  $'scripts/check-test-seam-comments.test.ts\tmake check-test-seam-comments (static-check), right before its checker'
   $'tests/ui/domIsolation.radixOrder.child.test.tsx\tspawned in a fresh process by tests/ui/domIsolation.test.ts'
   $'vscode/src/api/orpcConnection.integration.test.ts\tnot in CI: needs a live xum server; run with TEST_INTEGRATION=1 bun test ./vscode/src/api/'
 )
