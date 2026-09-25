@@ -21,25 +21,8 @@ import { MemoryMetaService } from "./memoryMeta";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
-import type {
-  WorkspaceServiceHarness,
-  WorkspaceServiceHarnessOptions,
-} from "./workspaceService.testHarness";
-import { createMockAIService, createWorkspaceServiceHarness } from "./workspaceService.testHarness";
-
-/** Real-dependency harness whose AI fake answers workspace metadata from the real config. */
-async function createHarness(
-  options: WorkspaceServiceHarnessOptions = {}
-): Promise<WorkspaceServiceHarness> {
-  const harness = await createWorkspaceServiceHarness(options);
-  spyOn(harness.aiService, "getWorkspaceMetadata").mockImplementation(
-    async (workspaceId: string) => {
-      const metadata = await harness.config.getWorkspaceMetadataById(workspaceId);
-      return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
-    }
-  );
-  return harness;
-}
+import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
+import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
 
 function sessionDirOf(config: Config, workspaceId: string): string {
   return path.join(config.sessionsDir, workspaceId);
@@ -178,7 +161,7 @@ describe("WorkspaceService remove timing rollup", () => {
     let rollUpSawAbort = false;
 
     const aiEmitter = new EventEmitter();
-    const aiService = createMockAIService({
+    const aiServiceOverrides: Partial<AIService> = {
       on: aiEmitter.on.bind(aiEmitter) as unknown as AIService["on"],
       off: aiEmitter.off.bind(aiEmitter) as unknown as AIService["off"],
       isStreaming: mock(() => true),
@@ -196,7 +179,7 @@ describe("WorkspaceService remove timing rollup", () => {
         });
         return Ok(undefined);
       }),
-    });
+    };
 
     const timingService: Partial<SessionTimingService> = {
       waitForIdle: mock(() => Promise.resolve()),
@@ -206,8 +189,8 @@ describe("WorkspaceService remove timing rollup", () => {
       }),
     };
 
-    await using harness = await createHarness({
-      aiService,
+    await using harness = await createWorkspaceServiceHarness({
+      aiServiceOverrides,
       sessionTimingService: timingService as SessionTimingService,
     });
     const { config, service: workspaceService, initStateManager } = harness;
@@ -250,7 +233,7 @@ describe("WorkspaceService remove sub-agent handover ordering", () => {
   const runtimeConfig = { type: "worktree" as const, srcBaseDir: "/tmp/src" };
 
   async function createHandoverHarness(): Promise<WorkspaceServiceHarness> {
-    const harness = await createHarness();
+    const harness = await createWorkspaceServiceHarness();
     await saveWorkspaces(harness.config, projectPath, [
       projectWorkspace(projectPath, "owner-ws", ownerId, { name: "owner", runtimeConfig }),
       projectWorkspace(projectPath, "child-ws", workspaceId, {
@@ -419,7 +402,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   async function createChildHarness(
     taskIsolation?: "none" | "fork"
   ): Promise<WorkspaceServiceHarness> {
-    const harness = await createHarness();
+    const harness = await createWorkspaceServiceHarness();
     await saveWorkspaces(harness.config, projectPath, [
       projectWorkspace(projectPath, "parent-ws", workspaceId, {
         name: "agent_explore_child",
@@ -471,7 +454,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   async function createParentHarness(
     childTaskStatus: "running" | "queued" | "reported"
   ): Promise<WorkspaceServiceHarness> {
-    const harness = await createHarness();
+    const harness = await createWorkspaceServiceHarness();
     await saveWorkspaces(harness.config, projectPath, [
       projectWorkspace(projectPath, "parent-ws", "parent-ws-id", { runtimeConfig }),
       projectWorkspace(projectPath, "parent-ws", workspaceId, {
@@ -538,7 +521,7 @@ describe("WorkspaceService shared-checkout tasks and owner renames", () => {
   let ownerPath: string;
 
   beforeEach(async () => {
-    harness = await createHarness();
+    harness = await createWorkspaceServiceHarness();
     ({ config, service: workspaceService } = harness);
     projectPath = await createTestProject(config.rootDir);
     const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
@@ -651,7 +634,7 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
   async function createPinHarness(options: {
     persistPins: boolean;
   }): Promise<WorkspaceServiceHarness> {
-    const harness = await createHarness();
+    const harness = await createWorkspaceServiceHarness();
     const { config } = harness;
     await saveWorkspaces(config, projectPath, [
       projectWorkspace(projectPath, "owner", "ws-owner", { runtimeConfig }),
@@ -813,8 +796,13 @@ describe("WorkspaceService remove desktop session cleanup", () => {
   let projectPath: string;
 
   beforeEach(async () => {
-    // Default AI fake: no workspace metadata, so removal takes the phantom-cleanup path.
-    harness = await createWorkspaceServiceHarness();
+    // No workspace metadata, so removal takes the phantom-cleanup path.
+    harness = await createWorkspaceServiceHarness({
+      aiServiceOverrides: {
+        getWorkspaceMetadata: (id: string) =>
+          Promise.resolve(Err(`Workspace metadata not found for ${id}`)),
+      },
+    });
     ({ config, service: workspaceService } = harness);
     projectPath = path.join(harness.rootDir, "project");
     await saveWorkspaces(config, projectPath, [
@@ -1190,7 +1178,7 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         return Promise.resolve();
       });
 
-      await using harness = await createHarness({ sessionUsageService });
+      await using harness = await createWorkspaceServiceHarness({ sessionUsageService });
       const { config, service } = harness;
       await saveWorkspaces(config, projectDir, [
         { path: projectDir, id: parentId, name: parentId },
@@ -1253,7 +1241,10 @@ describe("WorkspaceService.remove usage-rollup ordering", () => {
         },
       } as unknown as SessionTimingService;
 
-      await using harness = await createHarness({ sessionUsageService, sessionTimingService });
+      await using harness = await createWorkspaceServiceHarness({
+        sessionUsageService,
+        sessionTimingService,
+      });
       const { config, service } = harness;
       await saveWorkspaces(config, projectDir, [
         { path: projectDir, id: parentId, name: parentId },

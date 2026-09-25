@@ -1,6 +1,6 @@
 // Shared fixtures for the workspaceService.*.test.ts suites (split from workspaceService.test.ts).
 import { expect, mock } from "bun:test";
-import { Err } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 import { createStreamLifecycleMocks } from "./agentSession.testHarness";
@@ -205,7 +205,13 @@ export function createWorkspaceServiceForTest(
 export type WorkspaceServiceHarnessOptions = Omit<
   WorkspaceServiceForTestOptions,
   "config" | "historyService"
->;
+> & {
+  /**
+   * Members layered over the default AI fake (ignored when `aiService` is passed). The
+   * default answers getWorkspaceMetadata from the harness's real Config, as AIService does.
+   */
+  aiServiceOverrides?: Partial<AIService>;
+};
 
 export interface WorkspaceServiceHarness extends AsyncDisposable {
   service: WorkspaceService;
@@ -232,7 +238,16 @@ export async function createWorkspaceServiceHarness(
   options: WorkspaceServiceHarnessOptions = {}
 ): Promise<WorkspaceServiceHarness> {
   const { config, historyService, tempDir, cleanup } = await createTestHistoryService();
-  const aiService = options.aiService ?? createMockAIService();
+  const { aiServiceOverrides, ...serviceOptions } = options;
+  const aiService =
+    options.aiService ??
+    createMockAIService({
+      getWorkspaceMetadata: mock(async (workspaceId: string) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
+      }),
+      ...aiServiceOverrides,
+    });
   const initStateManager = options.initStateManager ?? new InitStateManager(config);
   const extensionMetadata =
     options.extensionMetadata ??
@@ -244,7 +259,7 @@ export async function createWorkspaceServiceHarness(
   const backgroundProcessManager =
     options.backgroundProcessManager ?? ownedBackgroundProcessManager!;
   const service = createWorkspaceServiceForTest({
-    ...options,
+    ...serviceOptions,
     config,
     historyService,
     aiService,

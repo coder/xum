@@ -3,7 +3,7 @@ import type { WorkspaceService } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import path from "path";
-import { Err, Ok } from "@/common/types/result";
+import { Ok } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { AIService } from "./aiService";
@@ -96,11 +96,6 @@ describe("WorkspaceService rename lock", () => {
       projectName: "project",
       runtimeConfig: { type: "ssh", host: "example.invalid", srcBaseDir: "/srv" },
       namedWorkspacePath: "/srv/project/old-name",
-    });
-    // Answer from the real config, as the real AIService does.
-    spyOn(harness.aiService, "getWorkspaceMetadata").mockImplementation(async (id: string) => {
-      const metadata = await harness.config.getWorkspaceMetadataById(id);
-      return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${id}`);
     });
     const acquireWorkspaceLock = mock((_workspaceId: string) =>
       Promise.reject(new Error("Another Mux process is currently updating workspace MCP settings"))

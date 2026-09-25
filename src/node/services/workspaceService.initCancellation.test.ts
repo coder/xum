@@ -10,29 +10,11 @@ import type { SecretsStore } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
-import type {
-  WorkspaceServiceArgs,
-  WorkspaceServiceHarness,
-  WorkspaceServiceHarnessOptions,
-} from "./workspaceService.testHarness";
+import type { WorkspaceServiceArgs, WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   createWorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
-
-/** Real-dependency harness whose AI fake answers workspace metadata from the real config. */
-async function createHarness(
-  options: WorkspaceServiceHarnessOptions = {}
-): Promise<WorkspaceServiceHarness> {
-  const harness = await createWorkspaceServiceHarness(options);
-  spyOn(harness.aiService, "getWorkspaceMetadata").mockImplementation(
-    async (workspaceId: string) => {
-      const metadata = await harness.config.getWorkspaceMetadataById(workspaceId);
-      return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
-    }
-  );
-  return harness;
-}
 
 function mockCreateWorkspace(workspacePath: string) {
   const createWorkspace = mock(() => Promise.resolve({ success: true as const, workspacePath }));
@@ -56,7 +38,7 @@ function mockDeleteWorkspace(
 
 describe("WorkspaceService init cancellation", () => {
   test("scratch workspace deletion preserves shared workdirs until the last reference", async () => {
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const parentId = "1111111111";
     const childId = "2222222222";
@@ -97,7 +79,7 @@ describe("WorkspaceService init cancellation", () => {
   });
 
   test("new scratch workspaces opt in with distinct generations and a later opt-out persists", async () => {
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
 
     const first = await workspaceService.createScratch("First scratch");
@@ -131,7 +113,7 @@ describe("WorkspaceService init cancellation", () => {
   test("scratch removal refuses to delete a workdir the workspace does not own", async () => {
     // A stale or hand-edited config entry can point at another chat's dir
     // under the scratch root; removal must not recursively delete it.
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const victimId = "3333333333";
     const malformedId = "4444444444";
@@ -172,7 +154,7 @@ describe("WorkspaceService init cancellation", () => {
       isEnforced: mock(() => true),
       isRuntimeAllowed: mock(() => false),
     } as unknown as WorkspaceServiceArgs[8];
-    await using harness = await createHarness({ policyService });
+    await using harness = await createWorkspaceServiceHarness({ policyService });
     const { config, service: workspaceService } = harness;
 
     const result = await workspaceService.createScratch("Blocked scratch");
@@ -186,7 +168,7 @@ describe("WorkspaceService init cancellation", () => {
   });
 
   test("create() rejects untrusted projects", async () => {
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     await config.editConfig((cfg) => {
@@ -209,7 +191,7 @@ describe("WorkspaceService init cancellation", () => {
   });
 
   test("create() rejects slash branches whose sanitized workspace name already exists", async () => {
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     await saveWorkspaces(config, projectPath, [
@@ -237,7 +219,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("archive() aborts init and still archives when init is running", async () => {
     const workspaceId = "ws-init-running";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService, initStateManager } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     await saveWorkspaces(config, projectPath, [
@@ -259,7 +241,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("archive() uses normal archive flow when init is complete", async () => {
     const workspaceId = "ws-init-complete";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService, initStateManager } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     await saveWorkspaces(config, projectPath, [
@@ -282,7 +264,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("list() includes isInitializing when init state is running", async () => {
     const workspaceId = "ws-list-initializing";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService, initStateManager } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     await saveWorkspaces(config, projectPath, [
@@ -301,7 +283,7 @@ describe("WorkspaceService init cancellation", () => {
     const secretsStore = {
       getEffectiveSecrets: mock(() => [{ key: "GH_TOKEN", value: "token" }]),
     } as unknown as SecretsStore;
-    await using harness = await createHarness({ secretsStore });
+    await using harness = await createWorkspaceServiceHarness({ secretsStore });
     const { config, service: workspaceService, initStateManager } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     const workspacePath = path.join(projectPath, branchName);
@@ -376,7 +358,7 @@ describe("WorkspaceService init cancellation", () => {
     // workspace name. The backend should derive the next "workspace-N" slot
     // and persist `pendingAutoTitle` so the first message can title the workspace.
     const workspaceId = "ws-auto-named";
-    const harness = await createHarness();
+    const harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const projectPath = path.join(harness.rootDir, "proj-auto");
     // Two pre-existing workspaces — auto-naming should skip past them.
@@ -544,7 +526,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("remove() aborts init and clears state before teardown", async () => {
     const workspaceId = "ws-remove-aborts";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { service: workspaceService, initStateManager } = harness;
     initStateManager.startInit(workspaceId, harness.rootDir);
 
@@ -564,7 +546,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("remove() does not clear init state when runtime deletion fails with force=false", async () => {
     const workspaceId = "ws-remove-runtime-delete-fails";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService, initStateManager } = harness;
     const projectPath = await seedLocalWorkspace(harness, workspaceId);
     initStateManager.startInit(workspaceId, projectPath);
@@ -591,7 +573,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("remove() holds turn admission on the session until removal settles", async () => {
     const workspaceId = "ws-remove-holds-admission";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const workspaceService = harness.service;
     await seedLocalWorkspace(harness, workspaceId);
 
@@ -634,7 +616,7 @@ describe("WorkspaceService init cancellation", () => {
 
   test("remove() calls runtime.deleteWorkspace when force=true", async () => {
     const workspaceId = "ws-remove-runtime-delete";
-    await using harness = await createHarness();
+    await using harness = await createWorkspaceServiceHarness();
     const { config, service: workspaceService } = harness;
     const projectPath = path.join(harness.rootDir, "proj");
     // addWorkspace registers the project without a trust decision.
