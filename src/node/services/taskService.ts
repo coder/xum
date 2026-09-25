@@ -1002,6 +1002,16 @@ function rowSupersedes(
  */
 type AttemptFence = string | null;
 
+/**
+ * Who a stream event belongs to, read in the event's own tick (resolveStreamAttemptAtEvent):
+ * this process's owned attempt, else the attempt the stream's turn was admitted under (or the
+ * persisted id). Both undefined = captured without an identity (a pre-identity row).
+ */
+interface StreamAttemptOrigin {
+  ownedAttempt: OwnedTaskAttempt | undefined;
+  unownedAttemptId: string | undefined;
+}
+
 function toAgentTaskReport(source: AgentTaskReport): AgentTaskReport {
   return {
     reportMarkdown: source.reportMarkdown,
@@ -1823,6 +1833,11 @@ export class TaskService implements AgentTaskIntegration {
       continuationEntryId: string;
       executionId: string | undefined;
       stopEpoch: number;
+      /**
+       * The cut stream's attempt: a row another writer re-admitted since drops the deferral, and
+       * its recovery is CAS'd on this attempt (#4414).
+       */
+      attemptId: AttemptFence;
     }
   >();
   /**
@@ -2853,10 +2868,7 @@ export class TaskService implements AgentTaskIntegration {
    * its report/recovery as superseded. Without an admitted obligation (legacy turns) the owner,
    * else the persisted id, applies as before.
    */
-  private resolveStreamAttemptAtEvent(taskId: string): {
-    ownedAttempt: OwnedTaskAttempt | undefined;
-    unownedAttemptId: string | undefined;
-  } {
+  private resolveStreamAttemptAtEvent(taskId: string): StreamAttemptOrigin {
     const owned = this.ownedAttemptByTaskId.get(taskId);
     const turn = this.workspaceService.getActiveTurnGeneration(taskId);
     // The turn's DIRECT admission decides; an obligation rebound from a superseded predecessor
@@ -3301,7 +3313,7 @@ export class TaskService implements AgentTaskIntegration {
     if (cached) {
       return { kind: "reported", report: toAgentTaskReport(cached) };
     }
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    let entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (entry != null && !entry.workspace.parentWorkspaceId) {
       return indeterminate("workspace is not an agent task");
     }
@@ -3334,6 +3346,9 @@ export class TaskService implements AgentTaskIntegration {
         );
       }
       reportPositivelyAbsent = true;
+      // The artifact read awaited: another backend may have re-admitted the row meanwhile, so
+      // the classification below must not decide from the snapshot taken before it (#4414).
+      entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     }
 
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
@@ -3362,6 +3377,15 @@ export class TaskService implements AgentTaskIntegration {
         entry == null
           ? "no task record and no attempt owned by this process"
           : `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
+      );
+    }
+    // The row names another writer's attempt (a second backend sharing this Xum root re-admitted
+    // it): this process's ownership is stale, so its settlement says nothing about the task's
+    // current attempt — never report it as ended (#4414).
+    const rowAttemptId = entry?.workspace.taskAttemptId;
+    if (rowAttemptId != null && owned.attemptId != null && rowAttemptId !== owned.attemptId) {
+      return indeterminate(
+        `row moved to attempt ${rowAttemptId}; this process owns ${owned.attemptId}`
       );
     }
     const settlement = this.attemptSettlementByTaskId.get(taskId);
@@ -3710,9 +3734,12 @@ export class TaskService implements AgentTaskIntegration {
     this.aiService.on("stream-abort", (payload: unknown) => {
       if (!isStreamAbortEvent(payload)) return;
 
+      // The aborted stream's attempt, captured in the event's own tick (before the lock wait lets
+      // another writer re-admit the row): the abort's cleanup acts for that attempt only.
+      const abortOrigin = this.resolveStreamAttemptAtEvent(payload.workspaceId);
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
-          await this.handleStreamAbort(payload);
+          await this.handleStreamAbort(payload, abortOrigin);
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleStreamAbort failed", { error });
@@ -14461,13 +14488,32 @@ export class TaskService implements AgentTaskIntegration {
       const model = entry.workspace.taskModelString ?? defaultModel;
       const agentId = resolveTaskAgentIdForResume(entry.workspace);
       const startedAt = Date.now();
-      // Admission classification: recovery prompt = same-attempt continuation (no rotation); a
+      const recoveryMessage = this.buildTaskCompletionRecoveryMessage(
+        completionKind,
+        requiresStructuredOutput,
+        options
+      );
+      // Admission classification: recovery prompt = same-attempt continuation (no rotation). A
       // fenced one rides the caller's token as its obligation and staleness probe (the handoff then
-      // mints none of its own — see WorkspaceService.sendMessage).
+      // mints none of its own — see WorkspaceService.sendMessage). A prompt decided for one attempt
+      // (expectedAttemptId) is bound to that attempt here, synchronously before the handoff: left
+      // to the handoff it would bind to whichever attempt holds the row then, e.g. a successor
+      // another backend admitted after the budget CAS above (#4414).
+      let sendToken = fence?.turnAdmission;
+      if (fence == null && options.expectedAttemptId != null) {
+        const admission = this.admitTaskWorkspaceTurn(workspaceId, {
+          acceptanceOrigin: "automatic",
+          expectedAttemptId: options.expectedAttemptId,
+        });
+        // An expected attempt makes the row a task with that id, so anything but an admission
+        // (refused, or an impossible not-a-task) means the decision is stale: no prompt.
+        if (admission.kind !== "admitted") return withoutSend(false);
+        sendToken = admission.token;
+      }
       fenceDisposition = "handed-off";
       const sendResult = await this.workspaceService.sendMessage(
         workspaceId,
-        this.buildTaskCompletionRecoveryMessage(completionKind, requiresStructuredOutput, options),
+        recoveryMessage,
         {
           model,
           agentId,
@@ -14487,10 +14533,10 @@ export class TaskService implements AgentTaskIntegration {
           agentInitiated: true,
           queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
           removableQueueDedupeKey: true,
-          ...(fence != null
+          ...(sendToken != null
             ? {
-                turnAdmission: fence.turnAdmission,
-                admissionStale: () => fence.turnAdmission.admissionStale(),
+                turnAdmission: sendToken,
+                admissionStale: () => sendToken.admissionStale(),
               }
             : {}),
         }
@@ -15111,6 +15157,19 @@ export class TaskService implements AgentTaskIntegration {
         });
         return;
       }
+      // A non-workflow plan task's propose_plan is no terminal report: the attempt continues in
+      // exec. Decide (and wake the held queue) before the handoff, as for any other non-report
+      // end above: the kickoff's admission reads a still-pending decision for its attempt as
+      // stale and would be refused, leaving the task running with no exec turn.
+      this.resolveStreamEndDecision(
+        workspaceId,
+        this.findPendingStreamEndDecision(
+          workspaceId,
+          taskOrigin.ownedAttempt,
+          taskOrigin.unownedAttemptId
+        ),
+        "nonreport"
+      );
       await this.handleSuccessfulProposePlanAutoHandoff({
         workspaceId,
         entry,
@@ -15159,6 +15218,7 @@ export class TaskService implements AgentTaskIntegration {
             continuationEntryId,
             executionId: taskOrigin.executionId ?? undefined,
             stopEpoch: taskOrigin.stopEpoch,
+            attemptId: streamAttemptId,
           });
           // The successor may have been withdrawn between the cut and this classification.
           await this.reconcileDeferredTaskStreamEnd(workspaceId);
@@ -15203,6 +15263,7 @@ export class TaskService implements AgentTaskIntegration {
     if (
       entry?.workspace.parentWorkspaceId == null ||
       entry.workspace.taskStatus !== "running" ||
+      rowSupersedes(entry.workspace, deferral.attemptId) ||
       entry.workspace.taskExecutionId !== deferral.executionId ||
       this.getWorkspaceStopEpoch(workspaceId) !== deferral.stopEpoch
     ) {
@@ -15231,12 +15292,21 @@ export class TaskService implements AgentTaskIntegration {
       continuationEntryId: deferral.continuationEntryId,
       successor: receipt.successor,
     });
-    // The deferral records no attempt: its recovery keeps today's unconditional writes.
-    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, entry.workspace.taskStatus, null);
+    // Recovery acts for the cut stream's attempt only (its writes and prompt are CAS'd on it).
+    await this.recoverTaskFromIncompleteStreamEnd(
+      workspaceId,
+      entry.workspace.taskStatus,
+      deferral.attemptId
+    );
     return true;
   }
 
-  private async handleStreamAbort(event: StreamAbortEvent): Promise<void> {
+  private async handleStreamAbort(
+    event: StreamAbortEvent,
+    /** Captured by the production listener at event time; the entry-time read is for tests. */
+    eventAbortOrigin?: StreamAttemptOrigin
+  ): Promise<void> {
+    const abortOrigin = eventAbortOrigin ?? this.resolveStreamAttemptAtEvent(event.workspaceId);
     if (event.abortReason === "user") {
       // Explicit Stop withdraws the execution, not just its continuation. A later queue
       // notification or delayed source event must not turn that Stop into automatic recovery.
@@ -15250,7 +15320,7 @@ export class TaskService implements AgentTaskIntegration {
     // either active source as control, so the stable status must be released independently.
     await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamAbort(event);
     if (event.abortReason === "user") {
-      await this.releaseSharedDesktopTaskOnUserStop(event.workspaceId);
+      await this.releaseSharedDesktopTaskOnUserStop(event.workspaceId, abortOrigin);
     }
   }
 
@@ -15263,19 +15333,35 @@ export class TaskService implements AgentTaskIntegration {
    * desktop and fails the parent's wait fast, while a user resume re-admits the child onto the
    * same desktop via markInterruptedTaskRunning.
    */
-  private async releaseSharedDesktopTaskOnUserStop(workspaceId: string): Promise<void> {
+  private async releaseSharedDesktopTaskOnUserStop(
+    workspaceId: string,
+    /** The aborted stream's attempt, captured at the abort event (see StreamAttemptOrigin). */
+    abortOrigin: StreamAttemptOrigin
+  ): Promise<void> {
     // Cheap bound only; every release decision below is re-evaluated inside the serialized edit.
     const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
     if (workspace?.parentWorkspaceId == null || workspace.taskDesktopOwnerWorkspaceId == null) {
       return;
     }
-    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
+    // Act only for the attempt whose stream the user aborted, never for whoever holds the row
+    // after the awaits since (#4414): another backend sharing this Xum root, or a local send, may
+    // have re-admitted it as a successor, whose status, admission and settlement are its own.
+    // Only as strong as cross-process config exclusion (#4415).
+    const ownedAttempt = abortOrigin.ownedAttempt;
+    const abortedAttemptId = ownedAttempt?.attemptId ?? abortOrigin.unownedAttemptId;
     let transitionedToInterrupted = false;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
       workspaceId,
       (ws) => {
         if (ws.taskDesktopOwnerWorkspaceId == null) return;
+        // Captured without an identity (pre-identity row): a row that gained one since belongs
+        // to a newer admission, not to the aborted stream.
+        if (
+          abortedAttemptId == null ? ws.taskAttemptId != null : rowSupersedes(ws, abortedAttemptId)
+        ) {
+          return;
+        }
         if (ws.taskStatus !== "running" && ws.taskStatus !== "awaiting_report") return;
         // Evaluated against the fresh config inside the FIFO config edit: a successor that
         // claimed the execution mirror, queued a turn, started streaming, or was admitted but has
@@ -16026,6 +16112,19 @@ export class TaskService implements AgentTaskIntegration {
         }
       );
 
+      // The metadata and plan-file reads above awaited: another backend sharing this Xum root may
+      // have re-admitted the row meanwhile, and the compaction boundary must not land in its
+      // history (#4414). MITIGATION ONLY: this check is not atomic with the history write, so a
+      // re-admission during replaceHistory's own awaits still gets the boundary. Closing that
+      // needs a history write serialized with attempt rotation (tracked on #4414).
+      if (
+        rowSupersedes(
+          findWorkspaceEntry(this.config.loadConfigOrDefault(), args.workspaceId)?.workspace,
+          args.streamAttemptId
+        )
+      ) {
+        return;
+      }
       const replaceHistoryResult = await this.workspaceService.replaceHistory(
         args.workspaceId,
         summaryMessage,
@@ -16076,13 +16175,36 @@ export class TaskService implements AgentTaskIntegration {
       // Another writer re-admitted the row meanwhile: the handoff belongs to its attempt now.
       if (handoffSuperseded) return;
 
-      await this.setTaskStatus(args.workspaceId, "running", {
-        expectedAttemptId: args.streamAttemptId,
-      });
+      // A lost status write means another writer took the row after the edit above: the kickoff
+      // is not this handoff's to send (#4414).
+      if (
+        !(await this.setTaskStatus(args.workspaceId, "running", {
+          expectedAttemptId: args.streamAttemptId,
+        }))
+      ) {
+        return;
+      }
 
       try {
-        // Admission classification: plan→exec kickoff continues the owned attempt (no rotation);
-        // the fence at the WorkspaceService handoff binds it to the current attempt id.
+        // Admission classification: plan→exec kickoff continues the handoff's attempt (no
+        // rotation). With a captured attempt it is bound to that attempt here, synchronously
+        // before the handoff: left to the handoff it would bind to whichever attempt holds the row
+        // then, e.g. a successor another backend admitted after the status write (#4414). Without
+        // one (pre-identity) the fence at the WorkspaceService handoff binds it as before.
+        let kickoffToken: TurnAdmissionToken | undefined;
+        if (args.streamAttemptId != null) {
+          const admission = this.admitTaskWorkspaceTurn(args.workspaceId, {
+            acceptanceOrigin: "automatic",
+            expectedAttemptId: args.streamAttemptId,
+          });
+          if (admission.kind !== "admitted") {
+            log.info("[task-attempt] plan-handoff kickoff refused: decided for a stale attempt", {
+              workspaceId: args.workspaceId,
+            });
+            return;
+          }
+          kickoffToken = admission.token;
+        }
         const sendKickoffResult = await this.workspaceService.sendMessage(
           args.workspaceId,
           "Implement the plan.",
@@ -16097,6 +16219,12 @@ export class TaskService implements AgentTaskIntegration {
             acceptanceOrigin: "automatic",
             synthetic: true,
             agentInitiated: true,
+            ...(kickoffToken != null
+              ? {
+                  turnAdmission: kickoffToken,
+                  admissionStale: () => kickoffToken.admissionStale(),
+                }
+              : {}),
           }
         );
         if (!sendKickoffResult.success) {
