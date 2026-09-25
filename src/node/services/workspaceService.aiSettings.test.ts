@@ -25,12 +25,18 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
   // resolved agent/model/thinking as send options. The remembered selection must survive such a
   // send unchanged while an otherwise identical user-authored send still updates it. The status
   // clearing suite above only proves the persistence hook is skipped; this reads the real config.
-  test.each([true, false])(
-    "persists agent and AI settings only for non-synthetic sends (synthetic=%s)",
-    async (synthetic) => {
+  // agentId: a different built-in, a custom agent, and the already-selected agent.
+  test.each([
+    [true, "plan"],
+    [false, "plan"],
+    [false, "reviewer"],
+    [false, "exec"],
+  ] as const)(
+    "persists agent and AI settings only for non-synthetic sends (synthetic=%s, agentId=%s)",
+    async (synthetic, agentId) => {
       const { config, historyService, cleanup } = await createTestHistoryService();
       try {
-        const workspaceId = `settings-persistence-${synthetic ? "synthetic" : "manual"}`;
+        const workspaceId = `settings-persistence-${synthetic ? "synthetic" : "manual"}-${agentId}`;
         const projectPath = "/tmp/settings-persistence-project";
         const remembered = {
           agentId: "exec",
@@ -72,7 +78,7 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
         const result = await workspaceService.sendMessage(
           workspaceId,
           "hello",
-          { agentId: "plan", model: "openai:gpt-5.2", thinkingLevel: "high" },
+          { agentId, model: "openai:gpt-5.2", thinkingLevel: "high" },
           synthetic ? { synthetic: true } : undefined
         );
 
@@ -92,13 +98,13 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
           synthetic
             ? remembered
             : {
-                agentId: "plan",
+                agentId,
                 // The legacy root bucket is never rewritten by a send; only the per-agent
                 // bucket of the selected agent changes.
                 aiSettings: remembered.aiSettings,
                 aiSettingsByAgent: {
                   ...remembered.aiSettingsByAgent,
-                  plan: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+                  [agentId]: { model: "openai:gpt-5.2", thinkingLevel: "high" },
                 },
               }
         );
@@ -409,46 +415,6 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(persistSpy).toHaveBeenCalledTimes(1);
-  });
-
-  test("persists agent AI settings for custom agent", async () => {
-    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
-
-    interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
-      persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.persistWorkspaceAISettingsForAgent = persistSpy;
-
-    await svc.maybePersistAISettingsFromOptions("ws", {
-      agentId: "reviewer",
-      model: "openai:gpt-4o-mini",
-      thinkingLevel: "off",
-    });
-
-    expect(persistSpy).toHaveBeenCalledTimes(1);
-  });
-
-  test("persists agent AI settings when agentId matches", async () => {
-    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
-
-    interface WorkspaceServiceTestAccess {
-      maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
-      persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.persistWorkspaceAISettingsForAgent = persistSpy;
-
-    await svc.maybePersistAISettingsFromOptions("ws", {
-      agentId: "exec",
-      model: "openai:gpt-4o-mini",
-      thinkingLevel: "off",
-    });
-
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
 
