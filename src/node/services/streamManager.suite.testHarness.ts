@@ -3,7 +3,9 @@
  */
 import { expect, afterEach, beforeEach } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { type TurnExecutionOptions, type WorkspaceStreamInfo } from "./streamManager";
+import type { StreamManager, TurnExecutionOptions, WorkspaceStreamInfo } from "./streamManager";
+import { fakeStreamText } from "./streamManager.testHarness";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { type LanguageModel } from "ai";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -149,4 +151,124 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
     stepTracker: {},
   } satisfies StreamInfoFixture;
   return { ...defaults, ...overrides };
+}
+
+/** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
+export type ScriptedChunk = Record<string, unknown> | (() => unknown);
+
+/** One provider attempt served by the injected streamText (the primary turn, then each fallback). */
+export interface ScriptedAttempt {
+  chunks: ScriptedChunk[];
+  /** streamResult usage/totalUsage for the attempt; omitted means TEST_USAGE. */
+  usage?: Record<string, number>;
+  providerMetadata?: Record<string, unknown>;
+  /** Keep the stream open after the chunks until the turn's abort signal fires. */
+  holdUntilAbort?: boolean;
+}
+
+export const STOP_FINISH = { type: "finish", finishReason: "stop" };
+export const REFUSAL_FINISH = {
+  type: "finish",
+  finishReason: "content-filter",
+  rawFinishReason: "refusal",
+};
+
+/**
+ * The scripted fake provider: serves attempts in order, one per streamText call
+ * (the turn's own stream, then each internal retry or fallback hop). An Error
+ * entry makes that streamText call throw; an extra call fails the test.
+ */
+export function scriptedStreamText(attempts: Array<ScriptedAttempt | Error>) {
+  const queue = [...attempts];
+  return fakeStreamText((request) => {
+    const attempt = queue.shift();
+    if (attempt === undefined) throw new Error("unexpected extra streamText call");
+    if (attempt instanceof Error) throw attempt;
+    const signal = request.abortSignal!;
+    return createStreamResultForTests(
+      (async function* () {
+        await Promise.resolve();
+        for (const chunk of attempt.chunks) {
+          if (typeof chunk === "function") await chunk();
+          else yield chunk;
+        }
+        if (attempt.holdUntilAbort && !signal.aborted) {
+          await new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true })
+          );
+        }
+      })(),
+      attempt.usage,
+      attempt.providerMetadata
+    );
+  });
+}
+
+/**
+ * Starts one turn through startStream (Anthropic model string by default),
+ * appends its placeholder partial first, and waits for the terminal outcome.
+ */
+export async function runTurnForTests(
+  streamManager: StreamManager,
+  options: Partial<TurnExecutionOptions> & Pick<TurnExecutionOptions, "workspaceId">
+) {
+  const messageId = options.messageId ?? `${options.workspaceId}-message`;
+  const historySequence = options.historySequence ?? 1;
+  await appendPartialAssistantForTests(options.workspaceId, messageId, historySequence);
+  const result = await streamManager.startStream(
+    testStartOptions({
+      model: createTestLanguageModel(),
+      modelString: KNOWN_MODELS.SONNET.id,
+      providedRuntimeTempDir: "",
+      ...options,
+      messageId,
+      historySequence,
+    })
+  );
+  if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result.error)}`);
+  return { messageId, completion: await result.data.completion };
+}
+
+export interface RecordedExecCall {
+  command: string;
+  options: ExecOptions;
+}
+
+function createExecStreamForTests(): ExecStream {
+  return {
+    stdout: new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    }),
+    stderr: new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    }),
+    stdin: new WritableStream<Uint8Array>({
+      write(_chunk) {
+        return Promise.resolve();
+      },
+      close() {
+        return Promise.resolve();
+      },
+    }),
+    exitCode: Promise.resolve(0),
+    duration: Promise.resolve(0),
+  };
+}
+
+/** The local test runtime with exec recorded instead of run (temp-dir cleanup uses exec). */
+export function createExecRecordingRuntimeForTests(): {
+  runtime: Runtime;
+  execCalls: RecordedExecCall[];
+} {
+  const execCalls: RecordedExecCall[] = [];
+  const runtime = Object.create(LOCAL_TEST_RUNTIME) as Runtime;
+  runtime.exec = (command: string, options: ExecOptions) => {
+    execCalls.push({ command, options });
+    return Promise.resolve(createExecStreamForTests());
+  };
+  return { runtime, execCalls };
 }

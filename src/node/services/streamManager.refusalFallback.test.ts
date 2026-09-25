@@ -6,86 +6,24 @@ import type {
   ModelFallbackOptions,
   ModelFallbackPrepareOptions,
   StreamManager,
-  TurnExecutionOptions,
 } from "./streamManager";
 import type { SessionUsageService } from "./sessionUsageService";
-import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { createStreamManagerForTests } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
   createTestLanguageModel,
-  appendPartialAssistantForTests,
-  createStreamResultForTests,
-  testStartOptions,
+  REFUSAL_FINISH,
+  STOP_FINISH,
+  runTurnForTests,
+  scriptedStreamText,
+  type ScriptedAttempt,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
 
-/** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
-type ScriptedChunk = Record<string, unknown> | (() => unknown);
-
-/** One provider attempt served by the injected streamText (the primary turn, then each fallback). */
-interface ScriptedAttempt {
-  chunks: ScriptedChunk[];
-  /** streamResult usage/totalUsage for the attempt. */
-  usage?: { inputTokens: number; outputTokens: number; totalTokens: number };
-  providerMetadata?: Record<string, unknown>;
-  /** Keep the stream open after the chunks until the turn's abort signal fires. */
-  holdUntilAbort?: boolean;
-}
-
-const REFUSAL_FINISH = {
-  type: "finish",
-  finishReason: "content-filter",
-  rawFinishReason: "refusal",
-};
-const STOP_FINISH = { type: "finish", finishReason: "stop" };
-
-/** Serves scripted attempts in order; an Error entry makes that streamText call throw. */
-function scriptedStreamText(attempts: Array<ScriptedAttempt | Error>) {
-  const queue = [...attempts];
-  return fakeStreamText((request) => {
-    const attempt = queue.shift();
-    if (attempt === undefined) throw new Error("unexpected extra streamText call");
-    if (attempt instanceof Error) throw attempt;
-    const signal = request.abortSignal!;
-    return createStreamResultForTests(
-      (async function* () {
-        await Promise.resolve();
-        for (const chunk of attempt.chunks) {
-          if (typeof chunk === "function") await chunk();
-          else yield chunk;
-        }
-        if (attempt.holdUntilAbort && !signal.aborted) {
-          await new Promise<void>((resolve) =>
-            signal.addEventListener("abort", () => resolve(), { once: true })
-          );
-        }
-      })(),
-      attempt.usage ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-      attempt.providerMetadata
-    );
-  });
-}
-
-/** Starts a public turn and waits for its terminal completion. */
-async function runTurnForTests(
-  streamManager: StreamManager,
-  options: Partial<TurnExecutionOptions> & { workspaceId: string; modelString: string }
-) {
-  const messageId = `${options.workspaceId}-message`;
-  await appendPartialAssistantForTests(options.workspaceId, messageId, 1);
-  const result = await streamManager.startStream(
-    testStartOptions({
-      messageId,
-      model: createTestLanguageModel(),
-      providedRuntimeTempDir: "",
-      ...options,
-    })
-  );
-  if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result.error)}`);
-  return { messageId, completion: await result.data.completion };
-}
+/** These attempts bill nothing unless they say so. */
+const NO_USAGE = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
 
 /** A one-hop chain whose fallback cannot start: the refused hop is recorded, then the turn fails. */
 function unstartableFallback(): ModelFallbackOptions {
@@ -182,7 +120,7 @@ describe("StreamManager - refusal usage attribution", () => {
     const streamManager = createStreamManagerForTests(historyService, {
       sessionUsageService: usage.sessionUsageService,
       // No billed usage anywhere: neither live-tracked nor via streamResult.
-      streamText: scriptedStreamText([{ chunks: [REFUSAL_FINISH] }]),
+      streamText: scriptedStreamText([{ chunks: [REFUSAL_FINISH], usage: NO_USAGE }]),
     });
 
     const { completion } = await runTurnForTests(streamManager, {
@@ -254,7 +192,7 @@ describe("StreamManager - refusal usage attribution", () => {
     const abortedManager: StreamManager = createStreamManagerForTests(historyService, {
       sessionUsageService: aborted.sessionUsageService,
       streamText: scriptedStreamText([
-        { chunks: [REFUSAL_FINISH] },
+        { chunks: [REFUSAL_FINISH], usage: NO_USAGE },
         {
           chunks: [
             stepUsage,
@@ -267,6 +205,7 @@ describe("StreamManager - refusal usage attribution", () => {
               toolUsageRecorded.resolve();
             },
           ],
+          usage: NO_USAGE,
           holdUntilAbort: true,
         },
       ]),
@@ -366,7 +305,7 @@ describe("StreamManager - refusal usage attribution", () => {
   ])("message metadata for %s records model %s", async (modelString, expectedModel) => {
     const workspaceId = `ws-metadata-${expectedModel.replace(/[^a-z0-9]/gi, "-")}`;
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: scriptedStreamText([{ chunks: [REFUSAL_FINISH] }]),
+      streamText: scriptedStreamText([{ chunks: [REFUSAL_FINISH], usage: NO_USAGE }]),
     });
 
     // The terminal refusal persists the partial assistant message built for the turn.
@@ -397,7 +336,7 @@ describe("StreamManager - fallback construction callbacks", () => {
       getProvidersConfig: () => eligibleProvidersConfig,
       streamText: scriptedStreamText([
         refusedAttempt,
-        { chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH] },
+        { chunks: [{ type: "text-delta", text: "fallback answer" }, STOP_FINISH], usage: NO_USAGE },
       ]),
     });
     const succeeded = await runTurnForTests(successManager, {

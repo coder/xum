@@ -8,7 +8,7 @@ import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
@@ -28,50 +28,11 @@ import {
   appendPartialAssistantForTests,
   createStreamResultForTests,
   createStreamInfoForTests,
+  createExecRecordingRuntimeForTests,
+  type RecordedExecCall,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
-
-function createExecStreamForTests(): ExecStream {
-  return {
-    stdout: new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.close();
-      },
-    }),
-    stderr: new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.close();
-      },
-    }),
-    stdin: new WritableStream<Uint8Array>({
-      write(_chunk) {
-        return Promise.resolve();
-      },
-      close() {
-        return Promise.resolve();
-      },
-    }),
-    exitCode: Promise.resolve(0),
-    duration: Promise.resolve(0),
-  };
-}
-
-interface RecordedExecCall {
-  command: string;
-  options: ExecOptions;
-}
-
-/** The local test runtime with exec recorded instead of run (temp-dir cleanup uses exec). */
-function createExecRecordingRuntimeForTests(): { runtime: Runtime; execCalls: RecordedExecCall[] } {
-  const execCalls: RecordedExecCall[] = [];
-  const runtime = Object.create(LOCAL_TEST_RUNTIME) as Runtime;
-  runtime.exec = (command: string, options: ExecOptions) => {
-    execCalls.push({ command, options });
-    return Promise.resolve(createExecStreamForTests());
-  };
-  return { runtime, execCalls };
-}
 
 describe("StreamManager - createTempDirForStream", () => {
   test("creates ~/.xum-tmp/<token> under the runtime's home", async () => {

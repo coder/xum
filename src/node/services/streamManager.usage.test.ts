@@ -11,66 +11,26 @@ import { SessionUsageService } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { HistoryService } from "./historyService";
 import { countTokens } from "@/node/utils/main/tokenizer";
-import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { createStreamManagerForTests } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
-  createStreamResultForTests,
   createTestLanguageModel,
   testStartOptions,
+  REFUSAL_FINISH,
+  STOP_FINISH,
+  scriptedStreamText,
+  type ScriptedAttempt,
+  type ScriptedChunk,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
-
-/** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
-type ScriptedChunk = Record<string, unknown> | (() => unknown);
-
-/** One provider attempt served by the injected streamText (the primary turn, then each fallback). */
-interface ScriptedAttempt {
-  chunks: ScriptedChunk[];
-  /** streamResult usage/totalUsage for the attempt. */
-  usage?: Record<string, number>;
-  /** Keep the stream open after the chunks until the turn's abort signal fires. */
-  holdUntilAbort?: boolean;
-}
-
-const STOP_FINISH = { type: "finish", finishReason: "stop" };
-const REFUSAL_FINISH = {
-  type: "finish",
-  finishReason: "content-filter",
-  rawFinishReason: "refusal",
-};
 
 function finishStep(
   usage: Record<string, number>,
   providerMetadata?: Record<string, unknown>
 ): Record<string, unknown> {
   return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
-}
-
-/** Serves scripted attempts in order: one per streamText call. */
-function scriptedStreamText(attempts: ScriptedAttempt[]) {
-  const queue = [...attempts];
-  return fakeStreamText((request) => {
-    const attempt = queue.shift();
-    if (attempt === undefined) throw new Error("unexpected extra streamText call");
-    const signal = request.abortSignal!;
-    return createStreamResultForTests(
-      (async function* () {
-        await Promise.resolve();
-        for (const chunk of attempt.chunks) {
-          if (typeof chunk === "function") await chunk();
-          else yield chunk;
-        }
-        if (attempt.holdUntilAbort && !signal.aborted) {
-          await new Promise<void>((resolve) =>
-            signal.addEventListener("abort", () => resolve(), { once: true })
-          );
-        }
-      })(),
-      attempt.usage
-    );
-  });
 }
 
 /** Starts a public turn; callers await `completion` (or stop the stream first). */
