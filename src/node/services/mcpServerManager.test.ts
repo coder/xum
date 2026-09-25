@@ -4467,22 +4467,20 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    let startCount = 0;
-    access.startServers = mock(async () => {
-      startCount += 1;
-      if (startCount === 2) {
-        // Settings mutation lands while the revival startup is in flight.
-        await manager.applyWorkspaceOverrides(workspaceId, { disabledServers: ["server"] });
-      }
-      return startResult([
-        ["server", { getPrompt }],
-        ["stable", { getPrompt }],
-      ]);
-    });
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", (attempt) => ({
+      getPrompt,
+      // Settings mutation lands while the revival startup is in flight.
+      connect: async () => {
+        if (attempt === 2) {
+          await manager.applyWorkspaceOverrides(workspaceId, { disabledServers: ["server"] });
+        }
+      },
+    }));
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    // Simulate an idle reap that retains recorded request options.
-    access.workspaceServers.delete(workspaceId);
+    // Idle reap: stop the servers but retain recorded request options.
+    await manager.stopServers(workspaceId, { retainRestartOptions: true });
 
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "server", "review", {})).rejects.toThrow(
@@ -4505,27 +4503,24 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    let startCount = 0;
-    access.startServers = mock(() => {
-      startCount += 1;
-      if (startCount === 2) {
-        // Global mcp.setEnabled(false) completes while the revival startup is
-        // in flight: it bumps the config generation but never replaces the
-        // recorded per-workspace request options.
-        globallyDisabled = true;
-        configService.configGeneration += 1;
-      }
-      return Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      );
-    });
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", (attempt) => ({
+      getPrompt,
+      connect: () => {
+        if (attempt === 2) {
+          // Global mcp.setEnabled(false) completes while the revival startup
+          // is in flight: it bumps the config generation but never replaces
+          // the recorded per-workspace request options.
+          globallyDisabled = true;
+          configService.configGeneration += 1;
+        }
+        return Promise.resolve();
+      },
+    }));
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    // Simulate an idle reap that retains recorded request options.
-    access.workspaceServers.delete(workspaceId);
+    // Idle reap: stop the servers but retain recorded request options.
+    await manager.stopServers(workspaceId, { retainRestartOptions: true });
 
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "server", "review", {})).rejects.toThrow(
@@ -4541,34 +4536,32 @@ describe("MCPServerManager", () => {
       Promise.resolve({ server: stdioConfig(command), stable: stdioConfig("cmd-stable") })
     );
 
-    const getPrompt = mock(() =>
-      Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
-    );
-    let startCount = 0;
-    access.startServers = mock(() => {
-      startCount += 1;
-      if (startCount === 2) {
-        // Settings edits the server command while the revival startup is in
-        // flight: the enabled set is unchanged, so only the start-config
-        // signature reveals that the just-started instance is stale.
-        command = "cmd-2";
-        configService.configGeneration += 1;
-      }
-      return Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
+    const promptReturning = (text: string) =>
+      mock(() =>
+        Promise.resolve({ messages: [{ role: "user", content: { type: "text", text } }] })
       );
-    });
+    servers.serve("cmd-1", { getPrompt: promptReturning("stale") });
+    servers.serve("cmd-2", { getPrompt: promptReturning("hi") });
+    servers.serve("cmd-stable", (attempt) => ({
+      connect: () => {
+        if (attempt === 2) {
+          // Settings edits the server command while the revival startup is
+          // in flight: the enabled set is unchanged, so only the start-config
+          // signature reveals that the just-started instance is stale.
+          command = "cmd-2";
+          configService.configGeneration += 1;
+        }
+        return Promise.resolve();
+      },
+    }));
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    // Simulate an idle reap that retains recorded request options.
-    access.workspaceServers.delete(workspaceId);
+    // Idle reap: stop the servers but retain recorded request options.
+    await manager.stopServers(workspaceId, { retainRestartOptions: true });
 
+    // Served by the edited command's server, not the stale instance.
     expect(await manager.getPrompt(workspaceId, "server", "review", {})).toEqual({ text: "hi" });
-    const entry = access.workspaceServers.get(workspaceId) as { configSignature: string };
-    expect(entry.configSignature).toContain("cmd-2");
+    expect(servers.connectCount("cmd-2")).toBe(1);
   });
 
   test("blocks prompt invocation when project trust is revoked during cold startup", async () => {
@@ -4584,22 +4577,20 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    let startCount = 0;
-    access.startServers = mock(() => {
-      startCount += 1;
-      if (startCount === 2) {
-        manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
-      }
-      return Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      );
-    });
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", (attempt) => ({
+      getPrompt,
+      connect: () => {
+        if (attempt === 2) {
+          manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
+        }
+        return Promise.resolve();
+      },
+    }));
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
-    access.workspaceServers.delete(workspaceId);
+    // Idle reap: stop the servers but retain recorded request options.
+    await manager.stopServers(workspaceId, { retainRestartOptions: true });
 
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "server", "review", {})).rejects.toThrow(
@@ -4620,17 +4611,21 @@ describe("MCPServerManager", () => {
           : { stable: stdioConfig("cmd-stable") }
       )
     );
-    access.startServers = mock(() => {
-      manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
-      return Promise.resolve(startResult([["server"], ["stable"]]));
+    servers.serve("cmd-1", {
+      tools: { echo: testTool() },
+      connect: () => {
+        manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
+        return Promise.resolve();
+      },
     });
+    servers.serve("cmd-stable", { tools: { echo: testTool() } });
 
     const result = await manager.getToolsForWorkspace(
       workspaceRequest(workspaceId, { trusted: true, overrides: {}, overridesAuthoritative: true })
     );
     expect(result.overridesUsed).toEqual({});
     expect(Object.keys(result.serversUsed ?? {})).toEqual(["stable"]);
-    expect(Object.keys(result.tools).every((name) => name.startsWith("stable_"))).toBe(true);
+    expect(Object.keys(result.tools)).toEqual(["stable_echo"]);
   });
 
   test("getToolsForWorkspace restarts when cached instances are marked closed", async () => {
@@ -4644,35 +4639,25 @@ describe("MCPServerManager", () => {
     const close1 = mock(() => Promise.resolve(undefined));
     const close2 = mock(() => Promise.resolve(undefined));
 
-    let startCount = 0;
-    const startServersMock = mock(() => {
-      startCount += 1;
-      return Promise.resolve(
-        startResult([["server", { close: startCount === 1 ? close1 : close2 }]])
-      );
-    });
-
-    access.startServers = startServersMock;
+    servers.serve("cmd", (attempt) => ({
+      tools: { echo: testTool() },
+      close: attempt === 1 ? close1 : close2,
+    }));
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     // Simulate an active stream lease.
     manager.acquireLease(workspaceId);
 
-    const cached = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, { isClosed: boolean }>;
-    };
+    // The server process exits, so the cached instance is marked closed.
+    await servers.crash("cmd");
 
-    const instance = cached.instances.get("server");
-    expect(instance).toBeTruthy();
-    if (instance) {
-      instance.isClosed = true;
-    }
+    const restarted = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount("cmd")).toBe(2);
     expect(close1).toHaveBeenCalledTimes(1);
+    expect(close2).not.toHaveBeenCalled();
+    expect(Object.keys(restarted.tools)).toEqual(["server_echo"]);
   });
 
   test("getToolsForWorkspace does not close healthy instances when restarting closed ones while leased", async () => {
