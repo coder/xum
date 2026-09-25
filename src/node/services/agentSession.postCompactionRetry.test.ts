@@ -1,22 +1,18 @@
 import { describe, expect, test, mock, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
-import * as os from "os";
 import * as path from "path";
 
-import type { Config } from "@/node/config";
+import { Err } from "@/common/types/result";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
 import {
+  createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
 } from "./agentSession.testHarness";
 
 function contextExceededResult(messageId: string) {
@@ -48,11 +44,18 @@ describe("AgentSession post-compaction context retry", () => {
     await historyCleanup?.();
   });
 
+  /** Real Config/HistoryService pair plus this workspace's session dir. */
+  async function createSessionsFixture(workspaceId: string) {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    return { historyService, config, sessionDir };
+  }
+
   test("retries once without post-compaction injection on context_exceeded", async () => {
     const workspaceId = "ws";
-    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
-    const sessionDir = path.join(sessionsDir, workspaceId);
-    await fsPromises.mkdir(sessionDir);
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
     const postCompactionPath = path.join(sessionDir, "post-compaction.json");
 
     await createPersistedPostCompactionState({
@@ -81,8 +84,6 @@ describe("AgentSession post-compaction context retry", () => {
       },
     ];
 
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
     for (const msg of history) {
       await historyService.appendToHistory(workspaceId, msg);
     }
@@ -118,49 +119,16 @@ describe("AgentSession post-compaction context retry", () => {
       });
     });
 
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      streamMessage,
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      rootDir: sessionsDir,
-      sessionsDir,
-      srcDir: "/tmp",
-      loadConfigOrDefault: mock(() => ({})),
-    } as unknown as Config;
-
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
     });
 
     const options: SendMessageOptions = {
@@ -221,16 +189,12 @@ describe("AgentSession post-compaction context retry", () => {
   // event) leave a child task running until the parent times out.
   test("recovery decision resolves only after the context retry startup outcome is known", async () => {
     const workspaceId = "ws-decision";
-    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
-    const sessionDir = path.join(sessionsDir, workspaceId);
-    await fsPromises.mkdir(sessionDir);
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
     });
 
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
     await historyService.appendToHistory(workspaceId, {
       id: "user-1",
       role: "user",
@@ -270,50 +234,16 @@ describe("AgentSession post-compaction context retry", () => {
       };
     });
 
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      streamMessage,
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-      isStreaming: mock(() => false),
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      rootDir: sessionsDir,
-      sessionsDir,
-      srcDir: "/tmp",
-      loadConfigOrDefault: mock(() => ({})),
-    } as unknown as Config;
-
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
     });
 
     const options: SendMessageOptions = {
@@ -366,16 +296,12 @@ describe("AgentSession post-compaction context retry", () => {
   // settlement convinced the (dead) retry is still carrying the turn.
   test("a retry that starts and then fails terminally records separate per-attempt outcomes", async () => {
     const workspaceId = "ws-overlap";
-    const sessionsDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
-    const sessionDir = path.join(sessionsDir, workspaceId);
-    await fsPromises.mkdir(sessionDir);
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
     });
 
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
     await historyService.appendToHistory(workspaceId, {
       id: "user-1",
       role: "user",
@@ -413,50 +339,16 @@ describe("AgentSession post-compaction context retry", () => {
       });
     });
 
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      streamMessage,
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-      isStreaming: mock(() => false),
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      rootDir: sessionsDir,
-      sessionsDir,
-      srcDir: "/tmp",
-      loadConfigOrDefault: mock(() => ({})),
-    } as unknown as Config;
-
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
     });
 
     const options: SendMessageOptions = {

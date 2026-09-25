@@ -1,74 +1,54 @@
-import { describe, expect, test, mock, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { afterEach, describe, expect, test, mock, spyOn } from "bun:test";
+import type { WorkspaceService } from "./workspaceService";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
-import type { Config } from "@/node/config";
+import type { ProjectsConfig } from "@/common/types/project";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
-import type { AIService } from "./aiService";
-import type { InitStateManager, InitStatus } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { IdleDispatcher } from "./idleDispatcher";
 import { waitForCondition } from "./testDispatchHelpers";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
+import {
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
+} from "./workspaceService.testHarness";
 
 // Regression: persisted completed init state must not defer goal continuations as initializing.
 describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
-  async function makeService(initState: InitStatus | undefined): Promise<WorkspaceService> {
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
+  const harnesses: WorkspaceServiceHarness[] = [];
+  afterEach(async () => {
+    await Promise.all(harnesses.splice(0).map((harness) => harness.cleanup()));
+  });
 
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => initState),
-    };
-    const mockExtensionMetadataService = {};
-    const mockBackgroundProcessManager = {};
-    const { historyService } = await createTestHistoryService();
-    return new WorkspaceService(
-      mockConfig as Config,
-      historyService,
-      mockAIService,
-      new ContextManagementService({
-        config: mockConfig as Config,
-        historyService,
-        aiService: mockAIService,
-      }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
-    );
+  /** Real-dependency service; each test seeds only the state it reads. */
+  async function makeHarness(): Promise<WorkspaceServiceHarness> {
+    const harness = await createWorkspaceServiceHarness();
+    harnesses.push(harness);
+    return harness;
+  }
+
+  /** Drives the real InitStateManager to the requested init phase for `workspaceId`. */
+  async function makeService(
+    initStatus: "running" | "success" | undefined,
+    workspaceId = "ws-1"
+  ): Promise<WorkspaceService> {
+    const { service, initStateManager } = await makeHarness();
+    if (initStatus !== undefined) {
+      initStateManager.startInit(workspaceId, "/tmp/proj");
+      if (initStatus === "success") {
+        await initStateManager.endInit(workspaceId, 0);
+      }
+    }
+    return service;
   }
 
   test("isInitializing is false when init has finished successfully", async () => {
-    const service = await makeService({
-      status: "success",
-      hookPath: "/tmp/proj",
-      startTime: 0,
-      lines: [],
-      exitCode: 0,
-      endTime: 1,
-    });
+    const service = await makeService("success");
     expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(false);
   });
 
@@ -78,14 +58,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
   });
 
   test("isInitializing is true only while init is actively running", async () => {
-    const service = await makeService({
-      status: "running",
-      hookPath: "/tmp/proj",
-      startTime: 0,
-      lines: [],
-      exitCode: null,
-      endTime: null,
-    });
+    const service = await makeService("running");
     expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(true);
   });
 
@@ -109,14 +82,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
 
   test("kickoff continuation fires on a freshly-init'd workspace", async () => {
     const workspaceId = "kickoff-after-init";
-    const service = await makeService({
-      status: "success",
-      hookPath: "/tmp/proj",
-      startTime: 0,
-      lines: [],
-      exitCode: 0,
-      endTime: 1,
-    });
+    const service = await makeService("success", workspaceId);
 
     const { historyService, config, cleanup } = await createTestHistoryService();
     try {
@@ -166,36 +132,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       service: WorkspaceService;
       historyService: HistoryService;
     }> {
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        isStreaming: mock(() => false),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
-      const mockInitStateManager: Partial<InitStateManager> = {
-        on: mock(() => undefined as unknown as InitStateManager),
-        getInitState: mock(() => undefined),
-      };
-      const mockConfig: MockWorkspaceConfig = {
-        srcDir: "/tmp/test",
-        getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-        sessionsDir: "/tmp/test/sessions",
-        generateStableId: mock(() => "test-id"),
-      };
-      const { historyService } = await createTestHistoryService();
-      const service = new WorkspaceService(
-        mockConfig as Config,
-        historyService,
-        mockAIService,
-        new ContextManagementService({
-          config: mockConfig as Config,
-          historyService,
-          aiService: mockAIService,
-        }),
-        mockInitStateManager as InitStateManager,
-        {} as ExtensionMetadataService,
-        {} as BackgroundProcessManager
-      );
+      const { service, historyService } = await makeHarness();
       return { service, historyService };
     }
 
@@ -399,49 +336,17 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
   // --------------------------------------------------------------------------
 
   describe("model-resolution cascade", () => {
+    /** Seeds the real Config (round-tripped through config.json) the cascade reads. */
     async function makeServiceWithConfig(
-      configOverrides: Partial<Config>
+      seed: Partial<ProjectsConfig> = {}
     ): Promise<WorkspaceService> {
-      const mockAIService = {
-        ...createStreamLifecycleMocks(),
-        isStreaming: mock(() => false),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-      } as unknown as AIService;
-      const mockInitStateManager: Partial<InitStateManager> = {
-        on: mock(() => undefined as unknown as InitStateManager),
-        getInitState: mock(() => undefined),
-      };
-      const mockConfig: MockWorkspaceConfig = {
-        srcDir: "/tmp/test",
-        getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-        sessionsDir: "/tmp/test/sessions",
-        generateStableId: mock(() => "test-id"),
-        ...configOverrides,
-      };
-      const { historyService } = await createTestHistoryService();
-      const mockExtensionMetadataService = {};
-      const mockBackgroundProcessManager = {};
-      return new WorkspaceService(
-        mockConfig as Config,
-        historyService,
-        mockAIService,
-        new ContextManagementService({
-          config: mockConfig as Config,
-          historyService,
-          aiService: mockAIService,
-        }),
-        mockInitStateManager as InitStateManager,
-        mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
-      );
+      const { service, config } = await makeHarness();
+      await config.editConfig((cfg) => ({ ...cfg, ...seed }));
+      return service;
     }
 
     test("returns null when the workspace is not found in config", async () => {
-      const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => null),
-        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-      });
+      const service = await makeServiceWithConfig();
       expect(await service.getGoalContinuationKickoffSendOptions("ws-unknown")).toBeNull();
     });
 
@@ -466,11 +371,8 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         ],
       ]);
       const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({
-          projects,
-          agentAiDefaults: { exec: { modelString: "google:gemini-2.5-pro" } },
-        })),
+        projects,
+        agentAiDefaults: { exec: { modelString: "google:gemini-2.5-pro" } },
       });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toContain("haiku");
@@ -498,10 +400,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           },
         ],
       ]);
-      const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects })),
-      });
+      const service = await makeServiceWithConfig({ projects });
 
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
 
@@ -533,10 +432,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           },
         ],
       ]);
-      const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects })),
-      });
+      const service = await makeServiceWithConfig({ projects });
 
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
 
@@ -572,10 +468,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           },
         ],
       ]);
-      const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects })),
-      });
+      const service = await makeServiceWithConfig({ projects });
 
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
 
@@ -604,10 +497,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           },
         ],
       ]);
-      const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects })),
-      });
+      const service = await makeServiceWithConfig({ projects });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toBe("openai:gpt-4o");
     });
@@ -619,11 +509,8 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
       ]);
       const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({
-          projects,
-          agentAiDefaults: { exec: { modelString: "anthropic:claude-sonnet-4-6" } },
-        })),
+        projects,
+        agentAiDefaults: { exec: { modelString: "anthropic:claude-sonnet-4-6" } },
       });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toContain("sonnet");
@@ -636,15 +523,12 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
       ]);
       const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({
-          projects,
-          // "Inherit" model in settings persists entries with only thinking
-          // fields; the model must fall through while these fields apply.
-          agentAiDefaults: {
-            exec: { thinkingLevel: "high" as const, reasoningMode: "pro" as const },
-          },
-        })),
+        projects,
+        // "Inherit" model in settings persists entries with only thinking
+        // fields; the model must fall through while these fields apply.
+        agentAiDefaults: {
+          exec: { thinkingLevel: "high" as const, reasoningMode: "pro" as const },
+        },
       });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toBeTruthy();
@@ -674,14 +558,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           ],
         ]);
         const service = await makeServiceWithConfig({
-          findWorkspace: mock(() => ({ projectPath, workspacePath: projectPath })),
-          loadConfigOrDefault: mock(() => ({
-            projects,
-            agentAiDefaults: {
-              plan: { thinkingLevel: "high" as const, reasoningMode: "pro" as const },
-              exec: { thinkingLevel: "low" as const, reasoningMode: "standard" as const },
-            },
-          })),
+          projects,
+          agentAiDefaults: {
+            plan: { thinkingLevel: "high" as const, reasoningMode: "pro" as const },
+            exec: { thinkingLevel: "low" as const, reasoningMode: "standard" as const },
+          },
         });
         // In-place metadata (projectPath === name) resolves the checkout root
         // to the fixture directory holding .mux/agents/researcher.md.
@@ -720,13 +601,10 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           [projectPath, { workspaces: [{ id: workspaceId, path: projectPath, agentId: "exec" }] }],
         ]);
         const service = await makeServiceWithConfig({
-          findWorkspace: mock(() => ({ projectPath, workspacePath: projectPath })),
-          loadConfigOrDefault: mock(() => ({
-            projects,
-            agentAiDefaults: {
-              plan: { reasoningMode: "pro" as const },
-            },
-          })),
+          projects,
+          agentAiDefaults: {
+            plan: { reasoningMode: "pro" as const },
+          },
         });
         spyOn(service, "getInfo").mockResolvedValue({
           id: workspaceId,
@@ -752,19 +630,11 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
       ]);
       const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({
-          projects,
-          agentAiDefaults: {
-            exec: { reasoningMode: "pro" as const },
-          },
-        })),
+        projects,
+        agentAiDefaults: {
+          exec: { reasoningMode: "pro" as const },
+        },
       });
-      (
-        service as unknown as {
-          extensionMetadata: { getSnapshot: (id: string) => Promise<undefined> };
-        }
-      ).extensionMetadata = { getSnapshot: () => Promise.resolve(undefined) };
 
       const result = await (
         service as unknown as {
@@ -795,28 +665,20 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
           ],
         ]);
         const service = await makeServiceWithConfig({
-          findWorkspace: mock(() => ({ projectPath, workspacePath: projectPath })),
-          loadConfigOrDefault: mock(() => ({
-            projects,
-            agentAiDefaults: {
-              plan: {
-                modelString: "openai:gpt-5.6-sol",
-                thinkingLevel: "high" as const,
-                reasoningMode: "pro" as const,
-              },
-              exec: {
-                modelString: "anthropic:claude-sonnet-4-6",
-                thinkingLevel: "low" as const,
-                reasoningMode: "standard" as const,
-              },
+          projects,
+          agentAiDefaults: {
+            plan: {
+              modelString: "openai:gpt-5.6-sol",
+              thinkingLevel: "high" as const,
+              reasoningMode: "pro" as const,
             },
-          })),
+            exec: {
+              modelString: "anthropic:claude-sonnet-4-6",
+              thinkingLevel: "low" as const,
+              reasoningMode: "standard" as const,
+            },
+          },
         });
-        (
-          service as unknown as {
-            extensionMetadata: { getSnapshot: (id: string) => Promise<undefined> };
-          }
-        ).extensionMetadata = { getSnapshot: () => Promise.resolve(undefined) };
         spyOn(service, "getInfo").mockResolvedValue({
           id: workspaceId,
           name: projectPath,
@@ -848,10 +710,7 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       const projects = new Map([
         [projectPath, { workspaces: [{ id: workspaceId, path: "/tmp/proj/ws" }] }],
       ]);
-      const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({ projects })),
-      });
+      const service = await makeServiceWithConfig({ projects });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toBeTruthy();
       expect(result?.agentId).toBe("exec");
@@ -875,11 +734,8 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         ],
       ]);
       const service = await makeServiceWithConfig({
-        findWorkspace: mock(() => ({ projectPath, workspacePath: "/tmp/proj/ws" })),
-        loadConfigOrDefault: mock(() => ({
-          projects,
-          agentAiDefaults: { exec: { modelString: "openai:gpt-4o" } },
-        })),
+        projects,
+        agentAiDefaults: { exec: { modelString: "openai:gpt-4o" } },
       });
       const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
       expect(result?.model).toBe("openai:gpt-4o");

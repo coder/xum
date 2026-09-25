@@ -8,7 +8,6 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { CompactionMonitor } from "./compactionMonitor";
-import type { Config } from "@/node/config";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type {
@@ -19,6 +18,7 @@ import type {
   AutoModelRoutingDecision,
   AutoModelRoutingEscalation,
   AutoModelRoutingRecord,
+  AutoModelRoutingTier,
 } from "@/common/types/autoModelRouting";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
@@ -45,13 +45,7 @@ import { waitForCondition } from "./testDispatchHelpers";
 const COMPOSER_MODEL = "anthropic:claude-3-5-sonnet-latest";
 const HARD_MODEL = "openai:gpt-5.5";
 
-interface TierInput {
-  id: string;
-  label: string;
-  description: string;
-  model?: string;
-  thinkingLevel?: string;
-}
+type TierInput = AutoModelRoutingTier;
 
 const TIERS: TierInput[] = [
   { id: "easy", label: "Easy", description: "Trivial", model: "anthropic:claude-3-5-haiku-latest" },
@@ -84,19 +78,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     /** Priced cost the workspace ledger reports for the evaluator's usage; absent means unpriced. */
     evaluatorCostUsd?: number;
   }) {
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({
-        autoModelRouting: {
-          tiers: options.tiers ?? TIERS,
-          ...(options.evaluationModel ? { evaluationModel: options.evaluationModel } : {}),
-        },
-      }),
-    } as unknown as Config;
+    // Persist the routing settings the way the Settings UI does.
+    await config.updateAutoModelRouting({
+      tiers: options.tiers ?? TIERS,
+      ...(options.evaluationModel ? { evaluationModel: options.evaluationModel } : {}),
+    });
     // Goal service stub: only the pricing gate has behavior; every other method the
     // send path touches is a no-op resolving to undefined (no goal exists here).
     const unpriced = new Set(options.unpricedModels ?? []);
@@ -126,6 +114,20 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       getProvidersConfig: mock(() => ({})),
+      // The workspace is not registered in this config, so the real service reports it missing.
+      getWorkspaceMetadata: mock((workspaceId: string) =>
+        Promise.resolve(Err(`Workspace ${workspaceId} not found`))
+      ),
+      createModelWithPinnedOptions: mock(() =>
+        Promise.resolve(
+          Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+        )
+      ),
+      createModelWithPinnedMetadata: mock(() =>
+        Promise.resolve(
+          Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+        )
+      ),
       isExperimentEnabled: mock(
         (id: ExperimentId) => id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && options.experimentEnabled
       ),

@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { EventEmitter } from "events";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -7,13 +6,8 @@ import type { Workspace } from "@/common/types/project";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { Config } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
-import type { AIService } from "./aiService";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { InitStateManager } from "./initStateManager";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { createTestHistoryService } from "./testHistoryService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
+import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
 
 const WORKSPACE_ID = "a1b2c3d4e5";
 const OTHER_WORKSPACE_ID = "f6e5d4c3b2";
@@ -23,7 +17,7 @@ const OTHER_WORKSPACE_ID = "f6e5d4c3b2";
  * config writer and the metadata loader, not a mocked transform.
  */
 async function createHarness() {
-  const { config, historyService, tempDir, cleanup } = await createTestHistoryService();
+  const { config, service, rootDir: tempDir, cleanup } = await createWorkspaceServiceHarness();
   const projectPath = path.join(tempDir, "project");
   const workspacePath = path.join(tempDir, "src", "project", "consent-ws");
   const otherWorkspacePath = path.join(tempDir, "src", "project", "other-ws");
@@ -37,31 +31,6 @@ async function createHarness() {
     cfg.projects.set(projectPath, { workspaces });
     return cfg;
   });
-
-  const aiService = new EventEmitter() as unknown as AIService;
-  // Metadata publication enriches rows with init state; the narrow stub keeps that path real.
-  const initStateManager = Object.assign(new EventEmitter(), {
-    getInitState: () => undefined,
-  }) as unknown as InitStateManager;
-  const service = new WorkspaceService(
-    config,
-    historyService,
-    aiService,
-    new ContextManagementService({ config, historyService, aiService }),
-    initStateManager,
-    {
-      updateRecency: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: null,
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-    } as unknown as ExtensionMetadataService,
-    {} as BackgroundProcessManager
-  );
 
   const persistedConsent = (workspaceId = WORKSPACE_ID): unknown =>
     [...config.loadConfigOrDefault().projects.values()]

@@ -1,28 +1,13 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import { EventEmitter } from "events";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import type { InitStateManager } from "@/node/services/initStateManager";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
-import { createTestHistoryService } from "./testHistoryService";
-import {
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import type { HistoryService } from "./historyService";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
-
-const config = {
-  rootDir: "/tmp",
-  sessionsDir: "/tmp",
-  srcDir: "/tmp",
-  loadConfigOrDefault: () => ({}),
-} as unknown as Config;
 
 async function waitForCondition(condition: () => boolean, timeoutMs = 1000): Promise<boolean> {
   if (condition()) {
@@ -43,39 +28,20 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     streamHandler: StreamMessageHandler = (opts: StreamMessageOptions) =>
       Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
   ) {
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
     const streamMessage = mock(streamHandler);
-    const aiService = Object.assign(new EventEmitter(), {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
-
-    return {
-      historyService,
-      streamMessage,
-      session: createTestAgentSession({
-        workspaceId,
-        config,
-        historyService,
-        aiService,
-        initStateManager: new EventEmitter() as unknown as InitStateManager,
-        backgroundProcessManager: {
-          cleanup: mock((_workspaceId: string) => Promise.resolve()),
-          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-            void _queued;
-          }),
-        } as unknown as BackgroundProcessManager,
-      }),
-    };
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    historyCleanup = harness.cleanup;
+    return { historyService: harness.historyService, streamMessage, session: harness.session };
   }
 
   async function seedImageMessage(
     workspaceId: string,
-    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"],
+    historyService: HistoryService,
     messageId = "user-message-with-image"
   ): Promise<string> {
     const originalImageUrl = "data:image/png;base64,AAAA";

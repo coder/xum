@@ -1,7 +1,6 @@
 import type { TurnCompletion } from "./streamManager";
-import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
+import type { WorkspaceService } from "./workspaceService";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
@@ -15,8 +14,7 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
-import type { InitStateManager, InitStatus } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
+import type { InitStateManager } from "./initStateManager";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -31,9 +29,13 @@ import {
   addToArchivingWorkspaces,
   createDeferred,
   mockInitStateManager,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
+  createMockAIService,
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
+import { saveWorkspaces } from "./taskService.testHarness";
 
 describe("WorkspaceService archive lifecycle hooks", () => {
   const workspaceId = "ws-archive";
@@ -49,6 +51,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   let editConfigSpy: ReturnType<typeof mock>;
   let historyService: HistoryService;
   let historyConfig: Config;
+  let backgroundProcessManager: BackgroundProcessManager;
   let cleanupHistory: () => Promise<void>;
 
   const workspaceMetadata: WorkspaceMetadata = {
@@ -113,11 +116,13 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     } as unknown as AIService;
 
     mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
+    backgroundProcessManager = createTestBackgroundProcessManager();
     workspaceService = createWorkspaceServiceForTest({
       config: mockConfig,
       historyService,
       aiService: mockAIService,
       initStateManager: mockInitStateManager as InitStateManager,
+      backgroundProcessManager,
       streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
     });
   });
@@ -853,11 +858,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // Simulates the post-unclean-restart state: the manager's in-memory map is empty but a
     // durable spawn record still points at a live nohup/setsid child (probe behavior itself
     // is covered in backgroundProcessManager.test.ts).
-    (
-      mockBackgroundProcessManager.hasOrphanedRunningBackgroundProcesses as Mock<
-        (workspaceId: string) => Promise<boolean>
-      >
-    ).mockImplementationOnce(() => Promise.resolve(true));
+    spyOn(backgroundProcessManager, "hasOrphanedRunningBackgroundProcesses").mockResolvedValueOnce(
+      true
+    );
 
     const result = await workspaceService.archive(workspaceId, undefined, {
       refuseLiveUserActivity: true,
@@ -1161,76 +1164,16 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 });
 
 describe("WorkspaceService archive init cancellation", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
+  let harness: WorkspaceServiceHarness;
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("emits metadata when it cancels init but beforeArchive hook fails", async () => {
     const workspaceId = "ws-archive-init-cancel";
     const projectPath = "/tmp/project";
     const workspacePath = "/tmp/project/ws-archive-init-cancel";
-
-    const initStates = new Map<string, InitStatus>([
-      [
-        workspaceId,
-        {
-          status: "running",
-          hookPath: projectPath,
-          startTime: 0,
-          lines: [],
-          exitCode: null,
-          endTime: null,
-        },
-      ],
-    ]);
-
-    const clearInMemoryStateMock = mock((id: string) => {
-      initStates.delete(id);
-    });
-
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock((id: string) => initStates.get(id)),
-      clearInMemoryState: clearInMemoryStateMock,
-      deleteInitStatus: mock(() => Promise.resolve()),
-    };
-
-    let configState: ProjectsConfig = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              {
-                path: workspacePath,
-                id: workspaceId,
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-
-    const editConfigSpy = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-      configState = fn(configState);
-      return Promise.resolve();
-    });
-
-    const frontendMetadata: FrontendWorkspaceMetadata = {
-      id: workspaceId,
-      name: "ws-archive-init-cancel",
-      projectName: "proj",
-      projectPath,
-      runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
-      namedWorkspacePath: workspacePath,
-    };
 
     const workspaceMetadata: WorkspaceMetadata = {
       id: workspaceId,
@@ -1240,45 +1183,27 @@ describe("WorkspaceService archive init cancellation", () => {
       runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
     };
 
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((id: string) => {
-        if (id !== workspaceId) {
-          return null;
-        }
-
-        return { projectPath, workspacePath };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       }),
-      editConfig: editConfigSpy,
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([frontendMetadata])),
-      loadConfigOrDefault: mock(() => configState),
-    };
-
-    const mockAIService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    const workspaceService = new WorkspaceService(
-      mockConfig as Config,
-      historyService,
-      mockAIService,
-      new ContextManagementService({
-        config: mockConfig as Config,
-        historyService,
-        aiService: mockAIService,
-      }),
-      mockInitStateManager as InitStateManager,
-      {} as ExtensionMetadataService,
-      { cleanup: mock(() => Promise.resolve()) } as unknown as BackgroundProcessManager
-    );
+    });
+    const { config, initStateManager } = harness;
+    const workspaceService = harness.service;
+    // A complete entry, so metadata reads have no legacy fields to migrate via editConfig.
+    await saveWorkspaces(config, projectPath, [
+      {
+        path: workspacePath,
+        id: workspaceId,
+        name: "ws-archive-init-cancel",
+        createdAt: "2020-01-01T00:00:00.000Z",
+        runtimeConfig: workspaceMetadata.runtimeConfig,
+      },
+    ]);
+    initStateManager.startInit(workspaceId, projectPath);
+    const clearInMemoryStateSpy = spyOn(initStateManager, "clearInMemoryState");
+    const editConfigSpy = spyOn(config, "editConfig");
 
     // Seed abort controller so archive() can cancel init.
     const abortController = new AbortController();
@@ -1311,11 +1236,12 @@ describe("WorkspaceService archive init cancellation", () => {
 
     // Ensure we didn't persist archivedAt on hook failure.
     expect(editConfigSpy).toHaveBeenCalledTimes(0);
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
     expect(entry?.archivedAt).toBeUndefined();
 
     expect(abortController.signal.aborted).toBe(true);
-    expect(clearInMemoryStateMock).toHaveBeenCalledWith(workspaceId);
+    expect(clearInMemoryStateSpy).toHaveBeenCalledWith(workspaceId);
+    expect(initStateManager.getInitState(workspaceId)).toBeUndefined();
 
     expect(metadataEvents.length).toBeGreaterThanOrEqual(1);
     expect(metadataEvents.at(-1)?.isInitializing).toBe(undefined);
@@ -1326,12 +1252,15 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
   const workspaceId = "ws-unarchive";
   const projectPath = "/tmp/project";
   const workspacePath = "/tmp/project/ws-unarchive";
+  const archivedEntry = {
+    path: workspacePath,
+    id: workspaceId,
+    name: "ws-unarchive",
+    archivedAt: "2020-01-01T00:00:00.000Z",
+  };
 
   let workspaceService: WorkspaceService;
-  let configState: ProjectsConfig;
-  let editConfigSpy: ReturnType<typeof mock>;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
 
   const workspaceMetadata: FrontendWorkspaceMetadata = {
     id: workspaceId,
@@ -1343,65 +1272,26 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
     namedWorkspacePath: workspacePath,
   };
 
+  function readEntry(id: string) {
+    return harness.config
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((w) => w.id === id);
+  }
+
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    configState = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              {
-                path: workspacePath,
-                id: workspaceId,
-                archivedAt: "2020-01-01T00:00:00.000Z",
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-
-    editConfigSpy = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-      configState = fn(configState);
-      return Promise.resolve();
-    });
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((id: string) => {
-        if (id !== workspaceId) {
-          return null;
-        }
-
-        return { projectPath, workspacePath };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       }),
-      editConfig: editConfigSpy,
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([workspaceMetadata])),
-    };
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
     });
+    workspaceService = harness.service;
+    await saveWorkspaces(harness.config, projectPath, [archivedEntry]);
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test.each([
@@ -1410,20 +1300,21 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
   ] as const)(
     "unarchiving a legacy archived %s queued child leaves its task status %s",
     async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
-      const project = configState.projects.get(projectPath);
-      if (!project) throw new Error("project fixture must exist");
-      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
-      Object.assign(project.workspaces[1], {
-        parentWorkspaceId: "owner",
-        taskStatus: "queued",
-        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
-      });
+      await saveWorkspaces(harness.config, projectPath, [
+        { path: "/tmp/project/owner", id: "owner", name: "owner" },
+        {
+          ...archivedEntry,
+          parentWorkspaceId: "owner",
+          taskStatus: "queued",
+          ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+        },
+      ]);
 
       expect(await workspaceService.unarchive(workspaceId)).toEqual(Ok(undefined));
 
       // Records archived before archive-time settlement must not resurface as a second active
       // controller in the same edit that makes them visible again.
-      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      const entry = readEntry(workspaceId);
       expect(entry?.unarchivedAt).toBeTruthy();
       expect(entry?.taskStatus).toBe(expectedStatus);
     }
@@ -1433,8 +1324,7 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
     const hooks = new WorkspaceLifecycleHooks();
 
     const afterHook = mock(() => {
-      const entry = configState.projects.get(projectPath)?.workspaces[0];
-      expect(entry?.unarchivedAt).toBeTruthy();
+      expect(readEntry(workspaceId)?.unarchivedAt).toBeTruthy();
       return Promise.resolve(Err("hook failed"));
     });
     hooks.registerAfterUnarchive(afterHook);
@@ -1446,17 +1336,15 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
     expect(result.success).toBe(true);
     expect(afterHook).toHaveBeenCalledTimes(1);
 
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry(workspaceId);
     expect(entry?.unarchivedAt).toBeTruthy();
     expect(entry?.unarchivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
   test("does not run afterUnarchive hooks when workspace is not archived", async () => {
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
-    if (!entry) {
-      throw new Error("Missing workspace entry");
-    }
-    entry.archivedAt = undefined;
+    await saveWorkspaces(harness.config, projectPath, [
+      { ...archivedEntry, archivedAt: undefined },
+    ]);
 
     const hooks = new WorkspaceLifecycleHooks();
     const afterHook = mock(() => Promise.resolve(Ok(undefined)));
@@ -1473,7 +1361,7 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
 
     expect(result.success).toBe(true);
 
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry(workspaceId);
     expect(entry?.unarchivedAt).toBeTruthy();
     expect(entry?.unarchivedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
@@ -1492,10 +1380,8 @@ describe("WorkspaceService archive snapshots", () => {
   const projectPath = "/tmp/project";
   const workspacePath = "/tmp/project/ws-archive-snapshot";
 
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-  let configState: ProjectsConfig;
-  let editConfigSpy: ReturnType<typeof mock>;
+  let harness: WorkspaceServiceHarness;
+  let editConfigSpy: ReturnType<typeof spyOn<Config, "editConfig">>;
   let workspaceService: WorkspaceService;
 
   const workspaceMetadata: WorkspaceMetadata = {
@@ -1505,67 +1391,35 @@ describe("WorkspaceService archive snapshots", () => {
     projectPath,
     runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
   };
+  // A complete entry, so metadata reads have no legacy fields to migrate via editConfig.
+  const workspaceEntry = {
+    path: workspacePath,
+    id: workspaceId,
+    name: "ws-archive-snapshot",
+    createdAt: "2020-01-01T00:00:00.000Z",
+    runtimeConfig: workspaceMetadata.runtimeConfig,
+  };
+
+  function readEntry() {
+    return harness.config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+  }
 
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    configState = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              {
-                path: workspacePath,
-                id: workspaceId,
-                name: "ws-archive-snapshot",
-                runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-              },
-            ],
-          },
-        ],
-      ]),
-      worktreeArchiveBehavior: "snapshot",
-    };
-
-    editConfigSpy = mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-      configState = fn(configState);
-      return Promise.resolve();
-    });
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((id: string) => {
-        if (id !== workspaceId) {
-          return null;
-        }
-
-        return { projectPath, workspacePath };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       }),
-      editConfig: editConfigSpy,
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      loadConfigOrDefault: mock(() => configState),
-    };
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
     });
+    workspaceService = harness.service;
+    await saveWorkspaces(harness.config, projectPath, [workspaceEntry], {
+      worktreeArchiveBehavior: "snapshot",
+    });
+    editConfigSpy = spyOn(harness.config, "editConfig");
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("archive() persists captured snapshot metadata together with archivedAt", async () => {
@@ -1596,7 +1450,7 @@ describe("WorkspaceService archive snapshots", () => {
     const result = await workspaceService.archive(workspaceId);
 
     expect(result).toEqual(Ok({ kind: "archived" }));
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeTruthy();
     expect(entry?.worktreeArchiveSnapshot).toEqual(snapshot);
     expect(captureSnapshotForArchive).toHaveBeenCalledWith({
@@ -1657,7 +1511,7 @@ describe("WorkspaceService archive snapshots", () => {
     if (!refused.success) {
       expect(refused.error).toContain("an MCP prompt discovery in progress");
     }
-    expect(configState.projects.get(projectPath)?.workspaces[0]?.archivedAt).toBeUndefined();
+    expect(readEntry()?.archivedAt).toBeUndefined();
 
     admission![Symbol.dispose]();
 
@@ -1669,37 +1523,21 @@ describe("WorkspaceService archive snapshots", () => {
     }
   });
 
-  test("acquireMcpPromptDiscoveryAdmission refuses archiving and archived workspaces", () => {
+  test("acquireMcpPromptDiscoveryAdmission refuses archiving and archived workspaces", async () => {
     addToArchivingWorkspaces(workspaceService, workspaceId);
     expect(workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
 
     // Discovery on an archived workspace would re-wake its runtime; refuse it durably too.
-    const archivedService = createWorkspaceServiceForTest({
-      config: {
-        srcDir: "/tmp/src",
-        sessionsDir: "/tmp/test/sessions",
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([
-            [
-              projectPath,
-              {
-                workspaces: [
-                  {
-                    path: workspacePath,
-                    id: workspaceId,
-                    name: "ws-archive-snapshot",
-                    archivedAt: "2026-01-01T00:00:00.000Z",
-                  },
-                ],
-              },
-            ],
-          ]),
-        })),
-      } as unknown as Config,
-      historyService,
-    });
-    expect(archivedService.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
-    expect(archivedService.acquireMcpPromptDiscoveryAdmission("ws-other")).toBeDefined();
+    const archived = await createWorkspaceServiceHarness();
+    try {
+      await saveWorkspaces(archived.config, projectPath, [
+        { ...workspaceEntry, archivedAt: "2026-01-01T00:00:00.000Z" },
+      ]);
+      expect(archived.service.acquireMcpPromptDiscoveryAdmission(workspaceId)).toBeUndefined();
+      expect(archived.service.acquireMcpPromptDiscoveryAdmission("ws-other")).toBeDefined();
+    } finally {
+      await archived.cleanup();
+    }
   });
 
   test("archive() does not close live sessions when archive readiness checks fail", async () => {
@@ -1777,7 +1615,7 @@ describe("WorkspaceService archive snapshots", () => {
     if (!result.success) {
       expect(result.error).toBe("snapshot failed");
     }
-    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    const entry = readEntry();
     expect(entry?.archivedAt).toBeUndefined();
     expect(entry?.worktreeArchiveSnapshot).toBeUndefined();
     expect(editConfigSpy).toHaveBeenCalledTimes(0);
@@ -2132,8 +1970,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
   const projectPath = "/tmp/project";
   const workspacePath = "/tmp/project/ws-unarchive-snapshot";
 
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let workspaceService: WorkspaceService;
 
   const workspaceMetadata: FrontendWorkspaceMetadata = {
@@ -2147,79 +1984,42 @@ describe("WorkspaceService unarchive snapshot restore", () => {
   };
 
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    let configState: ProjectsConfig = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              {
-                path: workspacePath,
-                id: workspaceId,
-                name: "ws-unarchive-snapshot",
-                archivedAt: "2020-01-01T00:00:00.000Z",
-                runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-                worktreeArchiveSnapshot: {
-                  version: 1,
-                  capturedAt: "2026-03-30T00:00:00.000Z",
-                  stateDirPath: "archive-state",
-                  projects: [
-                    {
-                      projectPath,
-                      projectName: "proj",
-                      storageKey: "proj",
-                      branchName: "ws-unarchive-snapshot",
-                      trunkBranch: "main",
-                      baseSha: "base-sha",
-                      headSha: "head-sha",
-                    },
-                  ],
-                },
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((id: string) => {
-        if (id !== workspaceId) {
-          return null;
-        }
-
-        return { projectPath, workspacePath };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
       }),
-      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        configState = fn(configState);
-        return Promise.resolve();
-      }),
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([workspaceMetadata])),
-      loadConfigOrDefault: mock(() => configState),
-    };
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(workspaceMetadata))),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
     });
+    workspaceService = harness.service;
+    await saveWorkspaces(harness.config, projectPath, [
+      {
+        path: workspacePath,
+        id: workspaceId,
+        name: "ws-unarchive-snapshot",
+        archivedAt: "2020-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+        worktreeArchiveSnapshot: {
+          version: 1,
+          capturedAt: "2026-03-30T00:00:00.000Z",
+          stateDirPath: "archive-state",
+          projects: [
+            {
+              projectPath,
+              projectName: "proj",
+              storageKey: "proj",
+              branchName: "ws-unarchive-snapshot",
+              trunkBranch: "main",
+              baseSha: "base-sha",
+              headSha: "head-sha",
+            },
+          ],
+        },
+      },
+    ]);
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("unarchive() returns Err when snapshot restore fails", async () => {
@@ -2245,8 +2045,7 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
     });
 
-    const config = workspaceService as unknown as { config: Config };
-    await config.config.editConfig((currentConfig) => {
+    await harness.config.editConfig((currentConfig) => {
       const workspaceEntry = currentConfig.projects.get(projectPath)?.workspaces[0];
       if (!workspaceEntry) {
         throw new Error("Missing workspace entry");
@@ -2254,10 +2053,26 @@ describe("WorkspaceService unarchive snapshot restore", () => {
       delete workspaceEntry.id;
       return currentConfig;
     });
+    // A legacy path-only entry resolves its id through its session metadata.json.
+    const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(sessionDir, "metadata.json"),
+      JSON.stringify({
+        id: workspaceId,
+        name: workspaceMetadata.name,
+        projectName: workspaceMetadata.projectName,
+        projectPath,
+        runtimeConfig: workspaceMetadata.runtimeConfig,
+      })
+    );
 
     const result = await workspaceService.unarchive(workspaceId);
 
     expect(result).toEqual(Err("restore failed"));
+    const entry = harness.config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+    expect(entry?.archivedAt).toBe("2020-01-01T00:00:00.000Z");
+    expect(entry?.unarchivedAt).toBeUndefined();
   });
 
   test("unarchive() invokes snapshot restore when snapshot metadata is present", async () => {
@@ -2274,7 +2089,13 @@ describe("WorkspaceService unarchive snapshot restore", () => {
     expect(result).toEqual(Ok(undefined));
     expect(restoreSnapshotAfterUnarchive).toHaveBeenCalledWith({
       workspaceId,
-      workspaceMetadata,
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      workspaceMetadata: expect.objectContaining({
+        id: workspaceId,
+        projectPath,
+        runtimeConfig: workspaceMetadata.runtimeConfig,
+        namedWorkspacePath: workspacePath,
+      }),
     });
   });
 });

@@ -3,8 +3,6 @@ import { describe, expect, it, mock, afterEach } from "bun:test";
 import { EventEmitter } from "events";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { InitStateManager } from "@/node/services/initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
@@ -15,7 +13,7 @@ import {
   type StreamErrorMessage,
   type WorkspaceChatMessage,
 } from "@/common/orpc/types";
-import { createAgentSessionHarness, createTestAgentSession } from "./agentSession.testHarness";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 interface ReplayHarnessStreamInfo {
@@ -379,7 +377,6 @@ describe("AgentSession pre-stream errors", () => {
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
-    const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
       return Promise.resolve(
         Err({
@@ -388,44 +385,24 @@ describe("AgentSession pre-stream errors", () => {
         })
       );
     });
-    const aiService = Object.assign(aiEmitter, {
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      getStreamInfo: mock((_workspaceId: string) => undefined),
-      replayStream: mock((_workspaceId: string) => Promise.resolve()),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
-    }) as unknown as AIService;
+    // Both sessions share one Config/HistoryService so the second reads the persisted opt-out.
+    const createSession = async () =>
+      (
+        await createAgentSessionHarness({
+          workspaceId,
+          config,
+          historyService,
+          aiServiceOverrides: {
+            streamMessage: streamMessage as unknown as AIService["streamMessage"],
+          },
+        })
+      ).session;
 
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const sessionWithPersistedPreference = createTestAgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+    const sessionWithPersistedPreference = await createSession();
     await sessionWithPersistedPreference.setAutoRetryEnabled(false);
     await sessionWithPersistedPreference.dispose();
 
-    const session = createTestAgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+    const session = await createSession();
 
     const events: WorkspaceChatMessage[] = [];
     session.onChatEvent((event) => {

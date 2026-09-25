@@ -3,21 +3,17 @@ import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
-import {
-  createAgentSessionHarness,
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { EventEmitter } from "events";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
-import type { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
-import { type ExtensionMetadataStreamingUpdate } from "./ExtensionMetadataService";
+import {
+  ExtensionMetadataService,
+  type ExtensionMetadataStreamingUpdate,
+} from "./ExtensionMetadataService";
+import path from "path";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceActivitySnapshot,
@@ -31,20 +27,22 @@ import * as todoStorageModule from "@/node/services/todos/todoStorage";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   withTempMuxRoot,
   writePlanFile,
   createDeferred,
-  mockInitStateManager,
+  createMockAIService,
   createWorkspaceServiceForTest,
+  createWorkspaceServiceHarness,
+  createTestBackgroundProcessManager,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
+import { saveWorkspaces } from "./taskService.testHarness";
 
 describe("WorkspaceService sendMessage status clearing", () => {
   let workspaceService: WorkspaceService;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let fakeSession: {
     isBusy: ReturnType<typeof mock>;
     hasQueuedMessages: ReturnType<typeof mock>;
@@ -57,68 +55,23 @@ describe("WorkspaceService sendMessage status clearing", () => {
   };
 
   beforeEach(async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      ),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => ({
-        workspacePath: "/tmp/test/workspace",
-        projectPath: "/tmp/test/project",
-      })),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
-      updateRecency: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: null,
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-      setStreaming: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: null,
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-      setAgentStatus: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: null,
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      extensionMetadata: mockExtensionMetadata as ExtensionMetadataService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    workspaceService = harness.service;
+    await saveWorkspaces(harness.config, "/tmp/test/project", [
+      { id: "test-workspace", path: "/tmp/test/workspace", name: "workspace" },
+    ]);
+    // sendMessage fires its recency write without awaiting it. These tests assert admission
+    // and queueing, not recency, so keep that write off disk instead of racing cleanup.
+    spyOn(harness.extensionMetadata, "updateRecency").mockImplementation((_workspaceId, recency) =>
+      Promise.resolve({
+        recency: recency ?? Date.now(),
+        streaming: false,
+        lastModel: null,
+        lastThinkingLevel: null,
+      })
+    );
 
     fakeSession = {
       ...createCompactionAdmissionMocks(),
@@ -146,7 +99,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test.each(["send", "synthetic", "resume"] as const)(
@@ -175,6 +128,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };
     workspaceService.setWorkspaceGoalService({
       assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Err(pricingError))),
+      getPendingGoalSnapshot: mock(() => null),
     } as unknown as WorkspaceGoalService);
     fakeSession.sendMessage.mockResolvedValue(Err(pricingError));
 
@@ -293,6 +247,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceGoalService({
       assertPricedModelForBudgetedGoal: pricingGate,
+      getPendingGoalSnapshot: mock(() => null),
     } as unknown as WorkspaceGoalService);
     const heartbeatPreflight = createDeferred<void>();
     pricingGate.mockImplementationOnce(() => heartbeatPreflight.promise.then(() => Ok(undefined)));
@@ -338,6 +293,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceGoalService({
       assertPricedModelForBudgetedGoal: pricingGate,
+      getPendingGoalSnapshot: mock(() => null),
     } as unknown as WorkspaceGoalService);
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
     const maintenancePreflight = createDeferred<void>();
@@ -416,6 +372,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceGoalService({
       assertPricedModelForBudgetedGoal: pricingGate,
+      getPendingGoalSnapshot: mock(() => null),
     } as unknown as WorkspaceGoalService);
     const heartbeatPreflight = createDeferred<void>();
     pricingGate.mockImplementationOnce(() => heartbeatPreflight.promise.then(() => Ok(undefined)));
@@ -1281,42 +1238,17 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
 describe("WorkspaceService idle compaction dispatch", () => {
   let workspaceService: WorkspaceService;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
 
   beforeEach(async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      ),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    workspaceService = harness.service;
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("marks idle compaction send as synthetic when stream stays active", async () => {
@@ -1568,53 +1500,27 @@ describe("WorkspaceService idle compaction dispatch", () => {
         model: string;
         thinkingLevel: ThinkingLevel;
       }>;
-      config: {
-        findWorkspace: (
-          workspaceId: string
-        ) => { projectPath: string; workspacePath: string } | null;
-        loadConfigOrDefault: () => {
-          projects: Map<string, { workspaces: Array<Record<string, unknown>> }>;
-          agentAiDefaults?: {
-            compact?: {
-              thinkingLevel?: ThinkingLevel;
-            };
-          };
-        };
-      };
-      extensionMetadata: ExtensionMetadataService;
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceIdleCompactionAccess;
 
-    svc.config.findWorkspace = mock((workspaceId: string) =>
-      workspaceId === "ws" ? { projectPath, workspacePath } : null
-    );
-    svc.config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              {
-                id: "ws",
-                path: workspacePath,
-                name: "ws",
-                aiSettingsByAgent: {
-                  exec: { model: "openai:gpt-4o-mini", thinkingLevel: "low" },
-                },
-              },
-            ],
+    await saveWorkspaces(
+      harness.config,
+      projectPath,
+      [
+        {
+          id: "ws",
+          path: workspacePath,
+          name: "ws",
+          aiSettingsByAgent: {
+            exec: { model: "openai:gpt-4o-mini", thinkingLevel: "low" },
           },
-        ],
-      ]),
-      agentAiDefaults: {
-        compact: { thinkingLevel: "high" as ThinkingLevel },
-      },
-    }));
-
-    svc.extensionMetadata = {
-      getSnapshot: mock(() => Promise.resolve({ lastThinkingLevel: "off" })),
-    } as unknown as ExtensionMetadataService;
+        },
+      ],
+      { agentAiDefaults: { compact: { thinkingLevel: "high" } } }
+    );
+    // Activity fallback: the last stream ran with thinking off.
+    await harness.extensionMetadata.setStreaming("ws", false, { thinkingLevel: "off" });
 
     const options = await svc.buildIdleCompactionSendOptions("ws");
 
@@ -1630,24 +1536,15 @@ describe("WorkspaceService idle compaction dispatch", () => {
       lastThinkingLevel: null,
     };
 
-    const setStreaming = mock(() => Promise.resolve(snapshot));
+    const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
+      snapshot
+    );
     const emitWorkspaceActivity = mock(
       (_workspaceId: string, _snapshot: typeof snapshot) => undefined
     );
 
     (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-        emitWorkspaceActivity: typeof emitWorkspaceActivity;
-      }
-    ).extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
-    (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-        emitWorkspaceActivity: typeof emitWorkspaceActivity;
-      }
+      workspaceService as unknown as { emitWorkspaceActivity: typeof emitWorkspaceActivity }
     ).emitWorkspaceActivity = emitWorkspaceActivity;
 
     const internals = workspaceService as unknown as {
@@ -1678,24 +1575,15 @@ describe("WorkspaceService idle compaction dispatch", () => {
       lastThinkingLevel: "high" as const,
     };
 
-    const setStreaming = mock(() => Promise.resolve(snapshot));
+    const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
+      snapshot
+    );
     const emitWorkspaceActivity = mock(
       (_workspaceId: string, _snapshot: typeof snapshot) => undefined
     );
 
     (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-        emitWorkspaceActivity: typeof emitWorkspaceActivity;
-      }
-    ).extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
-    (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-        emitWorkspaceActivity: typeof emitWorkspaceActivity;
-      }
+      workspaceService as unknown as { emitWorkspaceActivity: typeof emitWorkspaceActivity }
     ).emitWorkspaceActivity = emitWorkspaceActivity;
 
     const internals = workspaceService as unknown as {
@@ -1721,16 +1609,9 @@ describe("WorkspaceService idle compaction dispatch", () => {
   test("clears idle marker when streaming=false metadata update fails", async () => {
     const workspaceId = "idle-streaming-false-failure";
 
-    const setStreaming = mock(() => Promise.reject(new Error("setStreaming failed")));
-    const extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
-
-    (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-      }
-    ).extensionMetadata = extensionMetadata;
+    const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockRejectedValue(
+      new Error("setStreaming failed")
+    );
 
     const internals = workspaceService as unknown as {
       idleCompactingWorkspaces: Set<string>;
@@ -1767,22 +1648,15 @@ describe("WorkspaceService idle compaction dispatch", () => {
       lastModel: "claude-sonnet-4",
       lastThinkingLevel: null,
     };
-    const setStreaming = mock(() => Promise.resolve(snapshot));
+    const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
+      snapshot
+    );
     const emitWorkspaceActivity = mock(
       (_workspaceId: string, _snapshot: typeof snapshot) => undefined
     );
 
     (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-        emitWorkspaceActivity: typeof emitWorkspaceActivity;
-      }
-    ).extensionMetadata = { setStreaming } as unknown as ExtensionMetadataService;
-    (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-        emitWorkspaceActivity: typeof emitWorkspaceActivity;
-      }
+      workspaceService as unknown as { emitWorkspaceActivity: typeof emitWorkspaceActivity }
     ).emitWorkspaceActivity = emitWorkspaceActivity;
 
     const internals = workspaceService as unknown as {
@@ -1813,46 +1687,21 @@ describe("WorkspaceService idle compaction dispatch", () => {
 
 describe("WorkspaceService streaming generation guard", () => {
   let workspaceService: WorkspaceService;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let readTodosSpy:
     | ReturnType<typeof spyOn<typeof todoStorageModule, "readTodosForSessionDir">>
     | undefined;
 
   beforeEach(async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      ),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    workspaceService = harness.service;
   });
 
   afterEach(async () => {
     readTodosSpy?.mockRestore();
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("stop-side metadata write is skipped when a newer stream has started", async () => {
@@ -1880,13 +1729,7 @@ describe("WorkspaceService streaming generation guard", () => {
       return Promise.resolve([]);
     });
 
-    (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-      }
-    ).extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
 
     const internals = workspaceService as unknown as {
       streamingGenerations: Map<string, number>;
@@ -1944,13 +1787,7 @@ describe("WorkspaceService streaming generation guard", () => {
       return Promise.resolve([{ content: "Second task", status: "in_progress" }]);
     });
 
-    (
-      workspaceService as unknown as {
-        extensionMetadata: ExtensionMetadataService;
-      }
-    ).extensionMetadata = {
-      setTodoStatus,
-    } as unknown as ExtensionMetadataService;
+    spyOn(harness.extensionMetadata, "setTodoStatus").mockImplementation(setTodoStatus);
 
     const internals = workspaceService as unknown as {
       updateTodoStatusFromStorage: (workspaceId: string) => Promise<void>;
@@ -2005,7 +1842,6 @@ describe("WorkspaceService streaming generation guard", () => {
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
 
     const internals = workspaceService as unknown as {
-      extensionMetadata: ExtensionMetadataService;
       streamingGenerations: Map<string, number>;
       updateStreamingStatus: (
         workspaceId: string,
@@ -2016,9 +1852,7 @@ describe("WorkspaceService streaming generation guard", () => {
       handleStreamCompletion: (workspaceId: string) => Promise<void>;
     };
 
-    internals.extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
     internals.updateRecencyTimestamp = mock(() => recencyDeferred.promise);
 
     internals.streamingGenerations.set(workspaceId, 1);
@@ -2054,7 +1888,6 @@ describe("WorkspaceService streaming generation guard", () => {
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
 
     const internals = workspaceService as unknown as {
-      extensionMetadata: ExtensionMetadataService;
       streamingGenerations: Map<string, number>;
       compactionStreamGenerations: Map<string, number>;
       emitWorkspaceActivity: (
@@ -2068,9 +1901,7 @@ describe("WorkspaceService streaming generation guard", () => {
       ) => Promise<void>;
     };
 
-    internals.extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
     internals.emitWorkspaceActivity = emitWorkspaceActivity;
     internals.streamingGenerations.set(workspaceId, 3);
     internals.compactionStreamGenerations.set(workspaceId, 3);
@@ -2101,16 +1932,13 @@ describe("WorkspaceService streaming generation guard", () => {
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
 
     const internals = workspaceService as unknown as {
-      extensionMetadata: ExtensionMetadataService;
       streamingGenerations: Map<string, number>;
       idleCompactingWorkspaces: Set<string>;
       updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
       handleStreamCompletion: (workspaceId: string) => Promise<void>;
     };
 
-    internals.extensionMetadata = {
-      setStreaming,
-    } as unknown as ExtensionMetadataService;
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
     internals.updateRecencyTimestamp = mock(() => Promise.resolve());
 
     internals.streamingGenerations.set(workspaceId, 7);
@@ -2154,11 +1982,10 @@ describe("WorkspaceService streaming generation guard", () => {
 
       const internals = workspaceService as unknown as {
         aiService: AIService;
-        extensionMetadata: ExtensionMetadataService;
         streamingGenerations: Map<string, number>;
         updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
       };
-      internals.extensionMetadata = { setStreaming } as unknown as ExtensionMetadataService;
+      spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
       internals.updateRecencyTimestamp = mock(() => Promise.resolve());
       internals.streamingGenerations.set(workspaceId, 4);
 
@@ -2194,46 +2021,15 @@ describe("WorkspaceService streaming generation guard", () => {
 
 describe("WorkspaceService post-compaction metadata refresh", () => {
   let workspaceService: WorkspaceService;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
 
   beforeEach(async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      ),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-    };
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-    });
+    harness = await createWorkspaceServiceHarness();
+    workspaceService = harness.service;
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("returns expanded plan path for local runtimes", async () => {
@@ -2330,25 +2126,20 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 });
 
 describe("WorkspaceService interruptStream", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-  });
-
-  afterEach(async () => {
-    await cleanupHistory();
-  });
-
   test("soft Send Now dispatches without requiring a hard Stop receipt", async () => {
     const workspaceId = "soft-send-now-receipt";
-    const h = await createAgentSessionHarness({ workspaceId });
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      backgroundProcessManager: createTestBackgroundProcessManager(),
+    });
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
       aiService: h.aiService as AIService,
       initStateManager: h.initStateManager,
+      extensionMetadata: new ExtensionMetadataService(
+        path.join(h.config.rootDir, "extensionMetadata.json")
+      ),
       backgroundProcessManager: h.backgroundProcessManager,
     });
     spyOn(service, "getOrCreateSession").mockReturnValue(h.session);
@@ -2387,6 +2178,7 @@ describe("WorkspaceService interruptStream", () => {
       workspaceId,
       aiEmitter: emitter,
       captureEvents: true,
+      backgroundProcessManager: createTestBackgroundProcessManager(),
       aiServiceOverrides: {
         streamMessage: mock(() => {
           const messageId = `assistant-${++streamCount}`;
@@ -2421,11 +2213,20 @@ describe("WorkspaceService interruptStream", () => {
         }),
       },
     });
+    const extensionMetadata = new ExtensionMetadataService(
+      path.join(h.config.rootDir, "extensionMetadata.json")
+    );
+    // Stream start/abort activity writes are fire-and-forget and this test asserts chat-event
+    // order, not activity; keep them off disk so a late write cannot race h.cleanup().
+    spyOn(extensionMetadata, "setStreaming").mockImplementation((_id, streaming) =>
+      Promise.resolve({ recency: Date.now(), streaming, lastModel: null, lastThinkingLevel: null })
+    );
     const workspaceService = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
       aiService: h.aiService as AIService,
       initStateManager: h.initStateManager,
+      extensionMetadata,
       backgroundProcessManager: h.backgroundProcessManager,
     });
     spyOn(workspaceService, "getOrCreateSession").mockReturnValue(h.session);
@@ -2471,29 +2272,10 @@ describe("WorkspaceService interruptStream", () => {
   test("sendQueuedImmediately clears hard-interrupt suppression before queued resend", async () => {
     const workspaceId = "ws-interrupt-queue-111";
 
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-    };
-
-    const mockAIService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false, error: "not found" })),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    const workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService: mockAIService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    const harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    const workspaceService = harness.service;
 
     const resetAutoResumeCount = mock(() => undefined);
     const markParentWorkspaceInterrupted = mock(() => undefined);
@@ -2532,6 +2314,7 @@ describe("WorkspaceService interruptStream", () => {
       expect(restoreQueueToInput).not.toHaveBeenCalled();
     } finally {
       getOrCreateSessionSpy.mockRestore();
+      await harness.cleanup();
     }
   });
 });

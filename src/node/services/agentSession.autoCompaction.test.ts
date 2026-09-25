@@ -3,7 +3,11 @@ import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 
-import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
+import type {
+  ProvidersConfigMap,
+  SendMessageOptions,
+  WorkspaceChatMessage,
+} from "@/common/orpc/types";
 import {
   createMuxMessage,
   type CompactionFollowUpRequest,
@@ -11,19 +15,12 @@ import {
 } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
-import { ProvidersConfigStore, type Config } from "@/node/config";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AIService } from "@/node/services/aiService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { InitStateManager } from "@/node/services/initStateManager";
 import type { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
-import {
-  createAgentSessionHarness,
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
 
@@ -82,18 +79,22 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   async function createSessionHarness(args: {
     workspaceId: string;
     streamMessage?: AIService["streamMessage"];
-    config?: Config;
+    agentAiDefaults?: AgentAiDefaults;
     captureEvents?: boolean;
     compactionMonitor?: CompactionMonitor;
   }) {
     const harness = await createAgentSessionHarness({
       workspaceId: args.workspaceId,
-      config: args.config,
       aiServiceOverrides: args.streamMessage ? { streamMessage: args.streamMessage } : undefined,
       captureEvents: args.captureEvents,
       compactionMonitor: args.compactionMonitor,
     });
     historyCleanup = harness.cleanup;
+    const agentAiDefaults = args.agentAiDefaults;
+    if (agentAiDefaults) {
+      // The session reads compaction defaults from config on every decision.
+      await harness.config.editConfig((cfg) => ({ ...cfg, agentAiDefaults }));
+    }
     return harness;
   }
 
@@ -445,17 +446,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const compactionModel = "openai:gpt-4o-mini";
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({
-        agentAiDefaults: { compact: { modelString: compactionModel } },
-      }),
-    } as unknown as Config;
     const { session } = await createSessionHarness({
       workspaceId,
-      config,
+      agentAiDefaults: { compact: { modelString: compactionModel } },
       streamMessage: streamMessage as unknown as AIService["streamMessage"],
       compactionMonitor: overThresholdMonitor({ usagePercentage: 95, thresholdPercentage: 70 }),
     });
@@ -692,15 +685,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-explicit-model-overrides-base-model";
 
     const compactionModel = "openai:gpt-5.5";
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({
-        agentAiDefaults: { compact: { modelString: compactionModel } },
-      }),
-    } as unknown as Config;
-    const { session } = await createSessionHarness({ workspaceId, config });
+    const { session } = await createSessionHarness({
+      workspaceId,
+      agentAiDefaults: { compact: { modelString: compactionModel } },
+    });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -744,17 +732,10 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("compaction thinking level prefers compact agent default over baseOptions", async () => {
     const workspaceId = "ws-auto-compaction-compact-thinking-default";
 
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({
-        agentAiDefaults: {
-          compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" },
-        },
-      }),
-    } as unknown as Config;
-    const { session } = await createSessionHarness({ workspaceId, config });
+    const { session } = await createSessionHarness({
+      workspaceId,
+      agentAiDefaults: { compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" } },
+    });
 
     const baseOptions: SendMessageOptions = {
       model: "anthropic:claude-opus-4-6",
@@ -830,20 +811,19 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("threads providers config into pre-send and mid-stream compaction checks", async () => {
     const workspaceId = "ws-auto-compaction-providers-config";
 
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const providersConfig = {
+    const providersConfig: ProvidersConfigMap = {
       openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
         models: [
           {
             id: "openai:gpt-4o",
-            contextWindow: 222_222,
+            contextWindowTokens: 222_222,
           },
         ],
       },
     };
-    new ProvidersConfigStore(config.rootDir).saveProvidersConfig(providersConfig);
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
@@ -875,24 +855,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<unknown>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
     const checkBeforeSend = mock((_params: unknown) => ({
       shouldShowWarning: false,
       shouldForceCompact: false,
@@ -903,15 +865,18 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     }));
     const checkMidStream = mock((_params: unknown) => false);
 
-    const session = createTestAgentSession({
+    const harness = await createAgentSessionHarness({
       workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        // AIService serves ProviderService's providers-config view; the session must thread it.
+        getProvidersConfig: mock(() => providersConfig),
+      },
       compactionMonitor: stubCompactionMonitor({ checkBeforeSend, checkMidStream }),
     });
+    historyCleanup = harness.cleanup;
+    const session = harness.session;
 
     const result = await session.sendMessage("hello", {
       model: "openai:gpt-4o",
@@ -935,7 +900,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("seeds on-send compaction usage from the active compaction epoch only", async () => {
     const workspaceId = "ws-auto-compaction-seed-active-epoch";
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const oldUsage = {
@@ -985,31 +950,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamMessage = mock((_history: MuxMessage[]) =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<unknown>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({}),
-    } as unknown as Config;
-
     const checkBeforeSend = mock((params: unknown) => {
       expect((params as { usage?: unknown }).usage).toBeUndefined();
       return {
@@ -1022,13 +962,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       };
     });
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
       compactionMonitor: stubCompactionMonitor({ checkBeforeSend }),
     });
 
@@ -1046,7 +987,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("surfaces nested dispatch failures after mid-stream compaction interrupt", async () => {
     const workspaceId = "ws-auto-compaction-mid-stream-dispatch-failure";
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const aiEmitter = new EventEmitter();
@@ -1092,39 +1033,16 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return Promise.resolve(Ok(undefined));
     });
 
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream,
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<unknown>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({}),
-    } as unknown as Config;
-
     let midStreamChecks = 0;
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        stopStream,
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
       compactionMonitor: stubCompactionMonitor({
         checkMidStream: () => {
           midStreamChecks += 1;
@@ -1175,7 +1093,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("hides default follow-up sentinel in mid-stream auto-compaction prompts", async () => {
     const workspaceId = "ws-auto-compaction-mid-stream-sentinel";
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const aiEmitter = new EventEmitter();
@@ -1228,44 +1146,21 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return Promise.resolve(Ok(undefined));
     });
 
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream,
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<unknown>,
-    }) as unknown as AIService;
-
-    const initStateManager = new EventEmitter() as unknown as InitStateManager;
-
-    const backgroundProcessManager = {
-      cleanup: mock((_workspaceId: string) => Promise.resolve()),
-      setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-        void _queued;
-      }),
-    } as unknown as BackgroundProcessManager;
-
-    const config = {
-      rootDir: "/tmp",
-      sessionsDir: "/tmp",
-      srcDir: "/tmp",
-      loadConfigOrDefault: () => ({}),
-    } as unknown as Config;
-
     let midStreamChecks = 0;
     const checkMidStream = mock((_params: unknown) => {
       midStreamChecks += 1;
       return midStreamChecks === 1;
     });
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        stopStream,
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
       compactionMonitor: stubCompactionMonitor({ checkMidStream }),
     });
 

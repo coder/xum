@@ -37,7 +37,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PlatformPaths } from "@/common/utils/paths";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
-import { ProvidersConfigStore, type Config } from "@/node/config";
+import type { Config } from "@/node/config";
 import {
   TurnCoordinator,
   type TurnPhase,
@@ -2343,7 +2343,7 @@ export class AgentSession {
   }
 
   private async getWorkspaceMetadataForRetry(): Promise<WorkspaceMetadata | undefined> {
-    const metadata = await this.aiService.getWorkspaceMetadata?.(this.workspaceId);
+    const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
     return metadata?.success ? metadata.data : undefined;
   }
 
@@ -4176,10 +4176,7 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           abandonedMessages: truncateResult.data.removedMessages,
           experiments: options?.experiments,
-          isExperimentEnabled:
-            typeof this.aiService.isExperimentEnabled === "function"
-              ? (experimentId) => this.aiService.isExperimentEnabled(experimentId)
-              : undefined,
+          isExperimentEnabled: (experimentId) => this.aiService.isExperimentEnabled(experimentId),
           // Side-channel spend must reach session usage / the cost UI.
           ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
         });
@@ -5278,15 +5275,7 @@ export class AgentSession {
       // Prefer ProviderService's safe config view: it includes env/file API-key source
       // metadata plus the Codex OAuth presence bit, which context-limit resolution needs
       // to distinguish GPT-5.5 API-key requests from lower-cap OAuth-routed requests.
-      const maybeAIService = this.aiService as AgentSessionAIService & {
-        getProvidersConfig?: () => ProvidersConfigMap | null;
-      };
-      if (typeof maybeAIService.getProvidersConfig === "function") {
-        return maybeAIService.getProvidersConfig();
-      }
-
-      const providersConfig = new ProvidersConfigStore(this.config.rootDir).loadProvidersConfig();
-      return providersConfig as ProvidersConfigMap | null;
+      return this.aiService.getProvidersConfig();
     } catch {
       // Best-effort read: if config cannot be loaded, keep null and rely on
       // built-in model limits. This matches prior behavior without crashing.
@@ -6041,54 +6030,30 @@ export class AgentSession {
    * client had already created when housekeeping scheduled the recovery on it.
    */
   private isWorkspaceArchivedOnDisk(): boolean {
-    try {
-      const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
-      return (
-        entry != null &&
-        isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
-      );
-    } catch {
-      // Partial Config mocks (see getCompactionResolverInputs); a real config never throws here.
-      return false;
-    }
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), this.workspaceId);
+    return (
+      entry != null && isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+    );
   }
 
-  /**
-   * Layers for auto-compaction resolution. Defensive reads: tests construct
-   * sessions with partial Config mocks, so missing methods degrade to empty
-   * layers instead of throwing.
-   */
+  /** Layers for auto-compaction resolution. */
   private getCompactionResolverInputs(): {
     agentAiDefaults?: AgentAiDefaults;
     minThinkingLevelByModel?: Record<string, ThinkingLevel>;
     compactBucket?: AgentAiSettingsLayerValues;
   } {
-    try {
-      const maybeConfig = this.config as Config & {
-        loadConfigOrDefault?: () => ReturnType<Config["loadConfigOrDefault"]> | null;
-        findWorkspace?: Config["findWorkspace"];
-      };
-      if (typeof maybeConfig.loadConfigOrDefault !== "function") {
-        return {};
-      }
-      const cfg = maybeConfig.loadConfigOrDefault();
-      const workspaceMatch =
-        typeof maybeConfig.findWorkspace === "function"
-          ? maybeConfig.findWorkspace(this.workspaceId)
-          : null;
-      const project = workspaceMatch ? cfg?.projects.get(workspaceMatch.projectPath) : undefined;
-      const workspaceEntry = project?.workspaces.find(
-        (workspace) => workspace.id === this.workspaceId
-      );
-      const compactBucket = workspaceEntry?.aiSettingsByAgent?.compact;
-      return {
-        agentAiDefaults: cfg?.agentAiDefaults,
-        minThinkingLevelByModel: cfg?.minThinkingLevelByModel,
-        compactBucket: compactBucket ? targetWorkspaceBucketToLayer(compactBucket) : undefined,
-      };
-    } catch {
-      return {};
-    }
+    const cfg = this.config.loadConfigOrDefault();
+    const workspaceMatch = this.config.findWorkspace(this.workspaceId);
+    const project = workspaceMatch ? cfg.projects.get(workspaceMatch.projectPath) : undefined;
+    const workspaceEntry = project?.workspaces.find(
+      (workspace) => workspace.id === this.workspaceId
+    );
+    const compactBucket = workspaceEntry?.aiSettingsByAgent?.compact;
+    return {
+      agentAiDefaults: cfg.agentAiDefaults,
+      minThinkingLevelByModel: cfg.minThinkingLevelByModel,
+      compactBucket: compactBucket ? targetWorkspaceBucketToLayer(compactBucket) : undefined,
+    };
   }
 
   /**
@@ -6099,12 +6064,9 @@ export class AgentSession {
    * renderer syncs into Settings.
    */
   private isRlmCompactionEnabled(options: SendMessageOptions | undefined): boolean {
-    // Guard for test mocks that may not implement isExperimentEnabled.
-    const isExperimentEnabled =
-      typeof this.aiService.isExperimentEnabled === "function"
-        ? (experimentId: ExperimentId) => this.aiService.isExperimentEnabled(experimentId)
-        : undefined;
-    return isRlmModeEnabled(options?.experiments, isExperimentEnabled);
+    return isRlmModeEnabled(options?.experiments, (experimentId: ExperimentId) =>
+      this.aiService.isExperimentEnabled(experimentId)
+    );
   }
 
   /**
@@ -6350,9 +6312,7 @@ export class AgentSession {
     signal: AbortSignal | undefined,
     attempt: PreparationAttempt
   ): Promise<ResolvedSendMessageOptions> {
-    const experimentEnabled =
-      typeof this.aiService.isExperimentEnabled === "function" &&
-      this.aiService.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+    const experimentEnabled = this.aiService.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
     if (!experimentEnabled) return options;
 
     const fallback = (
@@ -7453,22 +7413,13 @@ export class AgentSession {
         postCompactionAttachments !== null && postCompactionAttachments.length > 0;
 
       // Apply per-model thinking floors once so desktop, mobile, and ACP requests match.
-      // Tests may provide partial config mocks, so read overrides only when available.
-      const maybeConfig = this.config as Config & {
-        loadConfigOrDefault?: () => {
-          minThinkingLevelByModel?: Record<string, ThinkingLevel>;
-        } | null;
-      };
       // Gateway-preserving key first (an explicit coder:<instance>/<model>
       // floor stays distinct from a direct model with the same ID), with a
       // legacy name-canonical fallback for floors persisted by older versions.
-      const minThinkingOverride =
-        typeof maybeConfig.loadConfigOrDefault === "function"
-          ? lookupMinThinkingLevelOverride(
-              maybeConfig.loadConfigOrDefault()?.minThinkingLevelByModel,
-              modelString
-            )
-          : undefined;
+      const minThinkingOverride = lookupMinThinkingLevelOverride(
+        this.config.loadConfigOrDefault().minThinkingLevelByModel,
+        modelString
+      );
       // Pass providersConfig so mapped aliases (mappedToModel -> e.g. GPT-5.6)
       // clamp against the target model's policy — otherwise a capability level
       // like native max would be stripped here before buildProviderOptions can
@@ -10866,9 +10817,7 @@ export class AgentSession {
           : null;
       return narrowed ?? undefined;
     }
-    const enabled = (id: ExperimentId) =>
-      typeof this.aiService.isExperimentEnabled === "function" &&
-      this.aiService.isExperimentEnabled(id);
+    const enabled = (id: ExperimentId) => this.aiService.isExperimentEnabled(id);
     const memoryEnabled = enabled(EXPERIMENT_IDS.MEMORY);
     const hotSetEnabled = enabled(EXPERIMENT_IDS.MEMORY_HOT_SET);
     const cached = cache.get(modelString);
@@ -10883,7 +10832,7 @@ export class AgentSession {
     }
 
     const generation = this.memoryContextGeneration;
-    // Guard for test mocks that may not implement buildMemorySessionContext.
+    // buildMemorySessionContext is an optional AgentSessionAIService capability.
     const context =
       typeof this.aiService.buildMemorySessionContext === "function"
         ? await this.aiService.buildMemorySessionContext(this.workspaceId, modelString, {
@@ -11100,11 +11049,6 @@ export class AgentSession {
     materializedTokens: string[];
     fileStates: Array<{ path: string; state: FileState }>;
   } | null> {
-    // Guard for test mocks that may not implement getWorkspaceMetadata
-    if (typeof this.aiService.getWorkspaceMetadata !== "function") {
-      return null;
-    }
-
     const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
     if (!metadataResult.success) {
       log.debug("Cannot materialize @file mentions: workspace metadata not found", {
@@ -11217,11 +11161,6 @@ export class AgentSession {
       return [];
     }
 
-    // Guard for test mocks that may not implement getWorkspaceMetadata.
-    if (typeof this.aiService.getWorkspaceMetadata !== "function") {
-      return [];
-    }
-
     const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
     if (!metadataResult.success) {
       const hasSlash = refs.some((ref) => ref.source === "slash");
@@ -11270,7 +11209,7 @@ export class AgentSession {
       let resolved: Awaited<ReturnType<typeof readAgentSkill>>;
       try {
         // claude-skills-compat experiment: resolve slash-invoked skills with the same
-        // roots as discovery. Guard for test mocks that may not implement the gate.
+        // roots as discovery. The gate is an optional AgentSessionAIService capability.
         const includeClaudeSkills =
           typeof this.aiService.isClaudeSkillsCompatEnabled === "function" &&
           this.aiService.isClaudeSkillsCompatEnabled();
@@ -11406,12 +11345,7 @@ export class AgentSession {
     runtime: Runtime;
     workspacePath: string;
   }): Promise<string> {
-    // The typeof guard mirrors the getWorkspaceMetadata guard in
-    // materializeAgentSkillSnapshots: test mocks may provide a partial AIService.
-    if (
-      typeof this.aiService.isExperimentEnabled !== "function" ||
-      !this.aiService.isExperimentEnabled(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT)
-    ) {
+    if (!this.aiService.isExperimentEnabled(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT)) {
       return args.body;
     }
 

@@ -6,10 +6,7 @@ import assert from "@/common/utils/assert";
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { Config } from "@/node/config";
 import type { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks, createTestAgentSession } from "./agentSession.testHarness";
-import type { AIService } from "./aiService";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import type { InitStateManager } from "./initStateManager";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 // NOTE: These tests validate crash-safe compaction follow-up recovery, including
@@ -99,58 +96,6 @@ function heartbeatBoundaryMessage(pendingFollowUp = idleFollowUp()): MuxMessage 
   });
 }
 
-function createAiService(): AIService {
-  return {
-    getWorkspaceMetadata: (id: string) =>
-      Promise.resolve({
-        success: true as const,
-        data: {
-          id,
-          name: id,
-          projectName: "project",
-          projectPath: "/tmp/project",
-          runtimeConfig: { type: "local" as const },
-        },
-      }),
-    on() {
-      return this;
-    },
-    off() {
-      return this;
-    },
-    ...createStreamLifecycleMocks(),
-    isStreaming: () => false,
-    stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-  } as unknown as AIService;
-}
-
-function createInitStateManager(): InitStateManager {
-  return {
-    on() {
-      return this;
-    },
-    off() {
-      return this;
-    },
-  } as unknown as InitStateManager;
-}
-
-function createBackgroundProcessManager(): BackgroundProcessManager {
-  return {
-    cleanup: mock(() => Promise.resolve()),
-    setMessageQueued: mock(() => undefined),
-  } as unknown as BackgroundProcessManager;
-}
-
-function createConfig(): Config {
-  return {
-    rootDir: "/tmp",
-    sessionsDir: "/tmp",
-    srcDir: "/tmp",
-    loadConfigOrDefault: mock(() => ({})),
-  } as unknown as Config;
-}
-
 describe("AgentSession continue-message agentId fallback", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
   const sessions: AgentSession[] = [];
@@ -164,20 +109,21 @@ describe("AgentSession continue-message agentId fallback", () => {
     mock.restore();
   });
 
-  const createSession = async (messages: MuxMessage[] = [], config = createConfig()) => {
-    const { historyService, cleanup } = await createTestHistoryService();
+  const createSession = async (
+    messages: MuxMessage[] = [],
+    seedConfig?: (config: Config) => Promise<void>
+  ) => {
+    const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
+    await seedConfig?.(config);
     for (const message of messages) {
       await historyService.appendToHistory("ws", message);
     }
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
-      aiService: createAiService(),
-      initStateManager: createInitStateManager(),
-      backgroundProcessManager: createBackgroundProcessManager(),
     });
     sessions.push(session);
 
@@ -383,19 +329,13 @@ describe("AgentSession continue-message agentId fallback", () => {
   });
 
   test("dispatchPendingFollowUp leaves the follow-up pending when the workspace is archived on disk", async () => {
-    const archivedConfig = {
-      ...createConfig(),
-      loadConfigOrDefault: () => ({
-        projects: new Map([
-          [
-            "/tmp",
-            {
-              workspaces: [{ id: "ws", path: "/tmp/ws", archivedAt: "2026-01-01T00:00:00.000Z" }],
-            },
-          ],
-        ]),
-      }),
-    } as unknown as Config;
+    const archiveWorkspace = (config: Config) =>
+      config.editConfig((cfg) => {
+        cfg.projects.set("/tmp", {
+          workspaces: [{ id: "ws", path: "/tmp/ws", archivedAt: "2026-01-01T00:00:00.000Z" }],
+        });
+        return cfg;
+      });
     const { historyService, internals } = await createSession(
       [
         compactionSummaryMessage("summary-archived", {
@@ -404,7 +344,7 @@ describe("AgentSession continue-message agentId fallback", () => {
           agentId: "exec",
         }),
       ],
-      archivedConfig
+      archiveWorkspace
     );
     internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
 
