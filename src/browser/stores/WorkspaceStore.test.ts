@@ -837,6 +837,27 @@ describe("WorkspaceStore", () => {
     expect(onResponseComplete).toHaveBeenCalledWith(event);
   };
 
+  /**
+   * Feed `workspaceId`'s onChat subscription from a controllable iterable, the way the
+   * backend delivers events. `send` resolves after the store handled the events (onChat
+   * delivery hops through microtasks). Call before the workspace subscribes.
+   */
+  const openChat = (workspaceId: string) => {
+    const chat = createControllableAsyncIterable<WorkspaceChatMessage>();
+    mockOnChat.mockImplementation(async function* (input, options) {
+      if (input?.workspaceId !== workspaceId) {
+        await waitForAbortSignal(options?.signal);
+        return;
+      }
+      options?.signal?.addEventListener("abort", () => chat.close(), { once: true });
+      yield* chat.iterable;
+    });
+    return async (...events: WorkspaceChatMessage[]) => {
+      for (const event of events) chat.push(event);
+      await tick(0);
+    };
+  };
+
   afterEach(() => {
     store.dispose();
   });
@@ -1483,9 +1504,7 @@ describe("WorkspaceStore", () => {
       "keeps hydration active through %s backoff with cached history %s",
       async (termination, cached) => {
         const workspaceId = "workspace-retry-hydration";
-        const client = getInternal<{ client: Parameters<WorkspaceStore["setClient"]>[0] }>(
-          store
-        ).client;
+        const client = mockClient as unknown as Parameters<WorkspaceStore["setClient"]>[0];
         const attempts = Array.from({ length: 3 }, () =>
           createControllableAsyncIterable<WorkspaceChatMessage>()
         );
@@ -1557,9 +1576,7 @@ describe("WorkspaceStore", () => {
     );
 
     it("waits for a client before hydration and clears it on deactivation during backoff", async () => {
-      const client = getInternal<{ client: Parameters<WorkspaceStore["setClient"]>[0] }>(
-        store
-      ).client;
+      const client = mockClient as unknown as Parameters<WorkspaceStore["setClient"]>[0];
       store.setClient(null);
       const workspaceId = "workspace-pending-client";
       createAndAddWorkspace(store, workspaceId);
@@ -1638,11 +1655,37 @@ describe("WorkspaceStore", () => {
       expect(replaced).toBe(true);
     });
 
-    it("carries a creation card without marking a pending stream", () => {
+    /**
+     * Leave live advisor output from a first (history-less) attempt, then end it so the
+     * retry is a full replay. The output is cleared only by resetChatStateForReplay, so
+     * its absence proves the reset ran.
+     */
+    const runFullReplayReset = async (workspaceId: string) => {
+      const endFirstAttempt = createReleaseGate();
+      const subscriptions = mockChatReconnectScript((attempt, signal) =>
+        attempt === 1
+          ? [
+              caughtUpEvent(),
+              Promise.resolve(),
+              advisorOutputEvent(workspaceId, "call-replay-probe", "partial advice", 1),
+              endFirstAttempt.wait,
+            ]
+          : [() => waitForAbortSignal(signal)]
+      );
+      expect(
+        await waitUntil(
+          () => store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe") !== null
+        )
+      ).toBe(true);
+      endFirstAttempt.release();
+      expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
+      await tick(0);
+      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe")).toBeNull();
+      mockChatScript([], { keepOpen: true });
+    };
+
+    it("carries a creation card without marking a pending stream", async () => {
       const workspaceId = "workspace-goal-creation-card";
-      const internalStore = getInternal<{
-        resetChatStateForReplay: (workspaceId: string) => void;
-      }>(store);
 
       createAndAddWorkspace(store, workspaceId);
       store.markPendingCreationInit(workspaceId, {
@@ -1652,7 +1695,7 @@ describe("WorkspaceStore", () => {
         hookPath: "/project",
         timestamp: 1,
       });
-      internalStore.resetChatStateForReplay(workspaceId);
+      await runFullReplayReset(workspaceId);
 
       const state = store.getWorkspaceState(workspaceId);
       expect(state.isStreamStarting).toBe(false);
@@ -1688,17 +1731,13 @@ describe("WorkspaceStore", () => {
       expect(state.messages.map((m) => m.type)).toEqual(["workspace-init"]);
     });
 
-    it("preserves optimistic startup across full replay resets", () => {
+    it("preserves optimistic startup across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-pending-start";
       const requestedModel = "openai:gpt-4o-mini";
-      const internalStore = getInternal<{
-        resetChatStateForReplay: (workspaceId: string) => void;
-      }>(store);
 
       createAndAddWorkspace(store, workspaceId);
       store.markPendingInitialSend(workspaceId, requestedModel);
-
-      internalStore.resetChatStateForReplay(workspaceId);
+      await runFullReplayReset(workspaceId);
 
       const state = store.getWorkspaceState(workspaceId);
       expect(state.isStreamStarting).toBe(true);
@@ -2664,18 +2703,14 @@ describe("WorkspaceStore", () => {
   describe("live usage identity pinning", () => {
     it("prices live Coder usage via the stream's pinned metadataModel", async () => {
       const workspaceId = "live-coder-usage-pinned";
+      const send = openChat(workspaceId);
       createAndAddWorkspace(store, workspaceId);
-      await tick(10);
 
-      const aggregator = store.getAggregator(workspaceId);
-      if (!aggregator) {
-        throw new Error(`Missing aggregator for ${workspaceId}`);
-      }
       // The store's providers config knows nothing about this Coder instance
       // (removed/retagged mid-stream): live re-resolution would leave the raw
       // coder ID unpriced, so pricing and identity must come from the
       // backend-stamped metadataModel on stream-start.
-      aggregator.handleStreamStart({
+      await send(caughtUpEvent(), {
         type: "stream-start",
         workspaceId,
         messageId: "msg-live-coder",
@@ -2684,19 +2719,13 @@ describe("WorkspaceStore", () => {
         metadataModel: "anthropic:claude-sonnet-4-20250514",
         startTime: 1_000,
       });
-      aggregator.handleUsageDelta({
+      await send({
         type: "usage-delta",
         workspaceId,
         messageId: "msg-live-coder",
         usage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
         cumulativeUsage: { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 },
       });
-
-      // Direct aggregator seeding bypasses the chat-event path, so invalidate
-      // the cached usage snapshot before reading.
-      getInternal<{ usageStore: { bump: (id: string) => void } }>(store).usageStore.bump(
-        workspaceId
-      );
 
       const usage = store.getWorkspaceUsage(workspaceId);
       expect(usage.liveMetadataModel).toBe("anthropic:claude-sonnet-4-20250514");
@@ -3352,25 +3381,13 @@ describe("WorkspaceStore", () => {
       const workspaceId = "buffered-stream-error-clears-stream-start";
       const streamModel = "anthropic:claude-opus-4-6";
 
-      mockOnChat.mockImplementation(async function* (
-        _input?: { workspaceId: string; mode?: unknown },
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-        if (options?.signal?.aborted) {
-          yield { type: "caught-up", historyReplayStatus: "complete" };
-        }
-        await waitForAbortSignal(options?.signal);
-      });
-
+      // No caught-up is sent: the replay stays in hydration, so stream events buffer.
+      const send = openChat(workspaceId);
       recreateStore();
       await tick(0);
       createAndAddWorkspace(store, workspaceId);
 
-      const rawStore = getInternal<{
-        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
-      }>(store);
-
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-start",
         workspaceId,
         messageId: "buffered-stream-error-message",
@@ -3383,7 +3400,7 @@ describe("WorkspaceStore", () => {
       expect(initialState.canInterrupt).toBe(true);
       expect(initialState.currentModel).toBe(streamModel);
 
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-error",
         messageId: "buffered-stream-error-message",
         error: "Mock replayed failure",
@@ -3397,27 +3414,11 @@ describe("WorkspaceStore", () => {
 
     it("routes live deltas through the keyed channel without bumping workspace state", async () => {
       const workspaceId = "fine-grained-deltas";
-      const flushMicrotasks = () => new Promise<void>((resolve) => queueMicrotask(resolve));
       const messageId = "stream-message";
-      const subscribed = Promise.withResolvers<void>();
-      mockChatScript([() => subscribed.resolve()], { keepOpen: true });
+      const send = openChat(workspaceId);
       createAndAddWorkspace(store, workspaceId);
-      await subscribed.promise;
-      const rawStore = getInternal<{
-        states: { bump: (key: string) => void };
-        streamingStatsStore: { bump: (key: string) => void };
-        streamingMessageStore: { has: (key: string) => boolean };
-        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
-        processStreamEvent: (
-          id: string,
-          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
-          event: WorkspaceChatMessage
-        ) => void;
-      }>(store);
-      const dispatch = (event: WorkspaceChatMessage) =>
-        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
 
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-start",
         workspaceId,
         messageId,
@@ -3425,8 +3426,8 @@ describe("WorkspaceStore", () => {
         model: TEST_MODEL,
         startTime: 1,
       });
-      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
-      rawStore.handleChatMessage(workspaceId, {
+      await send(caughtUpEvent());
+      await send({
         type: "tool-call-start",
         workspaceId,
         messageId,
@@ -3437,7 +3438,9 @@ describe("WorkspaceStore", () => {
         timestamp: 1,
       });
 
-      const bump = spyOn(rawStore.states, "bump");
+      // Count notifications through the public subscriptions React components use.
+      const bump = mock(() => undefined);
+      const unsubscribeWorkspace = store.subscribeKey(workspaceId, bump);
       const listener = mock(() => undefined);
       // A delta that adds a part creates a new display row, which only a
       // workspace bump can mount; within-part deltas stay row-local.
@@ -3501,7 +3504,8 @@ describe("WorkspaceStore", () => {
         },
       ];
 
-      const statsBump = spyOn(rawStore.streamingStatsStore, "bump");
+      const statsBump = mock(() => undefined);
+      const unsubscribeStats = store.subscribeStreamingStats(workspaceId, statsBump);
       const trailingRowId = () => {
         const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
         for (let i = rows.length - 1; i >= 0; i--) {
@@ -3516,67 +3520,70 @@ describe("WorkspaceStore", () => {
         bump.mockClear();
         statsBump.mockClear();
         if (createsRow) {
-          dispatch(event);
-          expect(bump).toHaveBeenCalledWith(workspaceId);
-          expect(statsBump).toHaveBeenCalledWith(workspaceId);
+          await send(event);
+          expect(bump).toHaveBeenCalled();
+          expect(statsBump).toHaveBeenCalled();
         } else {
           const unsubscribeRow = store.subscribeStreamingMessage(
             workspaceId,
             trailingRowId(),
             listener
           );
-          dispatch(event);
-          await flushMicrotasks();
+          await send(event);
           expect(bump).not.toHaveBeenCalled();
           expect(listener).toHaveBeenCalledTimes(1);
           unsubscribeRow();
         }
       }
 
-      dispatch({
+      await send({
         type: "reasoning-end",
         workspaceId,
         messageId,
       });
-      expect(bump).toHaveBeenCalledWith(workspaceId);
+      expect(bump).toHaveBeenCalled();
 
       const streamingRow = store
         .getAggregator(workspaceId)!
         .getDisplayedMessages()
         .find((message) => message.type === "assistant" && message.historyId === messageId)!;
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).not.toBeNull();
-      const liveRowKey = `${workspaceId}\u0000${trailingRowId()}`;
-      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(true);
+      // Releasing the keyed channel notifies its row subscriber; nothing else does on stream-end.
+      const releasedRow = mock(() => undefined);
+      const liveRowId = trailingRowId();
+      const unsubscribeLiveRow = store.subscribeStreamingMessage(
+        workspaceId,
+        liveRowId,
+        releasedRow
+      );
 
-      dispatch(
+      await send(
         streamEndEvent(workspaceId, messageId, {
           parts: [{ type: "text", text: "hello world" }],
         })
       );
       // Terminal events release the keyed channel and stop overriding prop rows,
       // so transcript-level transforms (e.g. merged stream errors) survive.
-      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(false);
+      expect(releasedRow).toHaveBeenCalledTimes(1);
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).toBeNull();
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { streamingMessageStore } = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(streamingMessageStore.has(`${workspaceId}\u0000${liveRowId}`)).toBe(false);
+      unsubscribeLiveRow();
+      unsubscribeStats();
+      unsubscribeWorkspace();
     });
 
-    it("mounts rows created by a second concurrent stream's deltas", () => {
+    it("mounts rows created by a second concurrent stream's deltas", async () => {
       const workspaceId = "concurrent-stream-deltas";
       const firstMessageId = "stream-message-1";
       const secondMessageId = "stream-message-2";
+      const send = openChat(workspaceId);
       createAndAddWorkspace(store, workspaceId);
-      const rawStore = getInternal<{
-        states: { bump: (key: string) => void };
-        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
-        processStreamEvent: (
-          id: string,
-          aggregator: ReturnType<WorkspaceStore["getAggregator"]>,
-          event: WorkspaceChatMessage
-        ) => void;
-      }>(store);
-      const dispatch = (event: WorkspaceChatMessage) =>
-        rawStore.processStreamEvent(workspaceId, store.getAggregator(workspaceId), event);
 
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-start",
         workspaceId,
         messageId: firstMessageId,
@@ -3584,10 +3591,10 @@ describe("WorkspaceStore", () => {
         model: TEST_MODEL,
         startTime: 1,
       });
-      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
+      await send(caughtUpEvent());
       // Second stream starts while the first stream's context is still active
       // (its terminal event has not been processed yet).
-      dispatch({
+      await send({
         type: "stream-start",
         workspaceId,
         messageId: secondMessageId,
@@ -3596,12 +3603,12 @@ describe("WorkspaceStore", () => {
         startTime: 2,
       });
 
-      const bump = spyOn(rawStore.states, "bump");
-      bump.mockClear();
+      const bump = mock(() => undefined);
+      const unsubscribe = store.subscribeKey(workspaceId, bump);
       // The row-creating delta belongs to the newer stream; deriving the part
       // count from the older active-stream entry would skip the mount bump and
       // leave the new row hidden until the next structural event.
-      dispatch({
+      await send({
         type: "stream-delta",
         workspaceId,
         messageId: secondMessageId,
@@ -3609,7 +3616,8 @@ describe("WorkspaceStore", () => {
         tokens: 1,
         timestamp: 3,
       });
-      expect(bump).toHaveBeenCalledWith(workspaceId);
+      expect(bump).toHaveBeenCalled();
+      unsubscribe();
 
       // The live row lookup must accept any active message: keying it to the
       // first active-stream entry would return null for the newer stream's row
@@ -3623,19 +3631,16 @@ describe("WorkspaceStore", () => {
 
     it("releases the keyed channel when a background activity stop clears the stream", async () => {
       const workspaceId = "keyed-channel-background-stop";
+      const releaseActivityStop = mockBackgroundActivityTransition(
+        workspaceId,
+        createActivitySnapshot(10, { streaming: true }),
+        [createActivitySnapshot(11, { streaming: false })]
+      );
+      const send = openChat(workspaceId);
+      recreateStore();
       createAndAddWorkspace(store, workspaceId);
-      const rawStore = getInternal<{
-        streamingMessageStore: { has: (key: string) => boolean };
-        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
-        applyWorkspaceActivitySnapshot: (
-          id: string,
-          snapshot: WorkspaceActivitySnapshot | null
-        ) => void;
-      }>(store);
-      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
-      const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
 
-      send({
+      await send({
         type: "stream-start",
         workspaceId,
         messageId: "msg-a",
@@ -3643,8 +3648,8 @@ describe("WorkspaceStore", () => {
         model: TEST_MODEL,
         startTime: 1,
       });
-      send(caughtUpEvent());
-      send({
+      await send(caughtUpEvent());
+      await send({
         type: "stream-delta",
         workspaceId,
         messageId: "msg-a",
@@ -3652,7 +3657,11 @@ describe("WorkspaceStore", () => {
         tokens: 1,
         timestamp: 2,
       });
-      send({
+      const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
+      const liveRow = rows.find((row) => row.type === "assistant" && row.historyId === "msg-a")!;
+      const rowListener = mock(() => undefined);
+      const unsubscribe = store.subscribeStreamingMessage(workspaceId, liveRow.id, rowListener);
+      await send({
         type: "stream-delta",
         workspaceId,
         messageId: "msg-a",
@@ -3660,37 +3669,32 @@ describe("WorkspaceStore", () => {
         tokens: 1,
         timestamp: 3,
       });
-      await flush();
-      const rows = store.getAggregator(workspaceId)!.getDisplayedMessages();
-      const liveRow = rows.find((row) => row.type === "assistant" && row.historyId === "msg-a")!;
-      const liveRowKey = `${workspaceId}\u0000${liveRow.id}`;
-      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(true);
+      // The within-part delta opened the keyed channel for this row.
+      expect(rowListener).toHaveBeenCalledTimes(1);
 
       // Background the workspace, then let activity report the stream stopped:
       // no terminal chat event ever arrives, so the activity path must release
-      // the keyed channel.
+      // the keyed channel (observable as a notification to the row subscriber).
       createAndAddWorkspace(store, "keyed-channel-foreground");
-      rawStore.applyWorkspaceActivitySnapshot(
-        workspaceId,
-        createActivitySnapshot(10, { streaming: true })
-      );
-      rawStore.applyWorkspaceActivitySnapshot(
-        workspaceId,
-        createActivitySnapshot(11, { streaming: false })
-      );
-      expect(rawStore.streamingMessageStore.has(liveRowKey)).toBe(false);
+      expect(rowListener).toHaveBeenCalledTimes(1);
+      releaseActivityStop();
+      await tick(0);
+      expect(rowListener).toHaveBeenCalledTimes(2);
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { streamingMessageStore } = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(streamingMessageStore.has(`${workspaceId}\u0000${liveRow.id}`)).toBe(false);
+      unsubscribe();
     });
 
-    it("publishes the same accumulated text shown by the live channel", () => {
+    it("publishes the same accumulated text shown by the live channel", async () => {
       const workspaceId = "live-final-content";
       const messageId = "stream-message";
+      const send = openChat(workspaceId);
       createAndAddWorkspace(store, workspaceId);
-      const rawStore = getInternal<{
-        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
-      }>(store);
-      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
 
-      send({
+      await send({
         type: "stream-start",
         workspaceId,
         messageId,
@@ -3698,12 +3702,12 @@ describe("WorkspaceStore", () => {
         model: TEST_MODEL,
         startTime: 1,
       });
-      send(caughtUpEvent());
+      await send(caughtUpEvent());
       for (const [delta, timestamp] of [
         ["hello", 2],
         [" world", 3],
       ] as const) {
-        send({ type: "stream-delta", workspaceId, messageId, delta, tokens: 1, timestamp });
+        await send({ type: "stream-delta", workspaceId, messageId, delta, tokens: 1, timestamp });
       }
 
       const aggregator = store.getAggregator(workspaceId)!;
@@ -3713,7 +3717,7 @@ describe("WorkspaceStore", () => {
       const live = store.getStreamingMessage(workspaceId, displayed.id, messageId);
       expect(live?.type === "assistant" ? live.content : null).toBe("hello world");
 
-      send(
+      await send(
         streamEndEvent(workspaceId, messageId, {
           parts: [{ type: "text", text: "hello world" }],
         })
@@ -3726,16 +3730,13 @@ describe("WorkspaceStore", () => {
       );
     });
 
-    it("keeps split tool and text rows distinct on fine-grained updates", () => {
+    it("keeps split tool and text rows distinct on fine-grained updates", async () => {
       const workspaceId = "split-streaming-rows";
       const messageId = "stream-message";
+      const send = openChat(workspaceId);
       createAndAddWorkspace(store, workspaceId);
-      const rawStore = getInternal<{
-        handleChatMessage: (id: string, event: WorkspaceChatMessage) => void;
-      }>(store);
-      const send = (event: WorkspaceChatMessage) => rawStore.handleChatMessage(workspaceId, event);
 
-      send({
+      await send({
         type: "stream-start",
         workspaceId,
         messageId,
@@ -3743,8 +3744,8 @@ describe("WorkspaceStore", () => {
         model: TEST_MODEL,
         startTime: 1,
       });
-      send(caughtUpEvent());
-      send({
+      await send(caughtUpEvent());
+      await send({
         type: "tool-call-start",
         workspaceId,
         messageId,
@@ -3754,7 +3755,7 @@ describe("WorkspaceStore", () => {
         tokens: 1,
         timestamp: 2,
       });
-      send({
+      await send({
         type: "tool-call-end",
         workspaceId,
         messageId,
@@ -3763,7 +3764,7 @@ describe("WorkspaceStore", () => {
         result: { output: "file.txt" },
         timestamp: 3,
       });
-      send({
+      await send({
         type: "stream-delta",
         workspaceId,
         messageId,
@@ -3788,29 +3789,16 @@ describe("WorkspaceStore", () => {
       const workspaceId = "stream-error-invalidates-stats";
       const streamModel = "anthropic:claude-opus-4-6";
 
-      mockOnChat.mockImplementation(async function* (
-        _input?: { workspaceId: string; mode?: unknown },
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-        if (options?.signal?.aborted) {
-          yield { type: "caught-up", historyReplayStatus: "complete" };
-        }
-        await waitForAbortSignal(options?.signal);
-      });
-
+      const send = openChat(workspaceId);
       recreateStore();
       await tick(0);
       createAndAddWorkspace(store, workspaceId);
-
-      const rawStore = getInternal<{
-        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
-      }>(store);
 
       // Open a stream and feed a delta so streaming stats become non-null.
       // stream events are buffered until a caught-up event flushes them onto
       // the aggregator, so we send caught-up before reading the live stats.
       const messageId = "stream-error-message";
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-start",
         workspaceId,
         messageId,
@@ -3818,7 +3806,7 @@ describe("WorkspaceStore", () => {
         historySequence: 1,
         startTime: 1_000,
       });
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-delta",
         workspaceId,
         messageId,
@@ -3826,7 +3814,7 @@ describe("WorkspaceStore", () => {
         tokens: 3,
         timestamp: 1_500,
       });
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "caught-up",
         historyReplayStatus: "complete",
       });
@@ -3840,7 +3828,7 @@ describe("WorkspaceStore", () => {
       const before = store.getWorkspaceStreamingStats(workspaceId);
       expect(before).not.toBeNull();
 
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-error",
         messageId,
         error: "Mock provider failure",
@@ -4582,16 +4570,7 @@ describe("WorkspaceStore", () => {
 
     it("ignores stale load-more responses after pagination state changes", async () => {
       const workspaceId = "history-pagination-stale-response";
-
-      mockOnChat.mockImplementation(async function* (
-        _input?: { workspaceId: string; mode?: unknown },
-        options?: { signal?: AbortSignal }
-      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
-        yield createHistoryMessageEvent("msg-newer", 5);
-        await Promise.resolve();
-        yield { type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: true };
-        await waitForAbortSignal(options?.signal);
-      });
+      const send = openChat(workspaceId);
 
       let resolveLoadMore: ((value: LoadMoreResponse) => void) | undefined;
       const loadMorePromise = new Promise<LoadMoreResponse>((resolve) => {
@@ -4600,26 +4579,28 @@ describe("WorkspaceStore", () => {
       mockHistoryLoadMore.mockReturnValueOnce(loadMorePromise);
 
       createAndAddWorkspace(store, workspaceId);
-      await tick(10);
+      await send(createHistoryMessageEvent("msg-newer", 5), {
+        type: "caught-up",
+        historyReplayStatus: "complete",
+        hasOlderHistory: true,
+      });
 
       const loadOlderPromise = store.loadOlderHistory(workspaceId);
       expect(store.getWorkspaceState(workspaceId).loadingOlderHistory).toBe(true);
 
-      const internalHistoryPagination = getInternal<{
-        historyPagination: Map<
-          string,
-          {
-            nextCursor: { beforeHistorySequence: number; beforeMessageId?: string | null } | null;
-            hasOlder: boolean;
-            loading: boolean;
-          }
-        >;
-      }>(store).historyPagination;
-      // Simulate a concurrent pagination reset (e.g., live compaction boundary arriving).
-      internalHistoryPagination.set(workspaceId, {
-        nextCursor: null,
-        hasOlder: false,
-        loading: false,
+      // A live compaction boundary resets pagination while the load is in flight.
+      await send({
+        type: "message",
+        id: "live-compaction-summary",
+        role: "assistant",
+        parts: [{ type: "text", text: "Compacted summary" }],
+        metadata: {
+          historySequence: 6,
+          timestamp: 6,
+          compacted: "idle",
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        },
       });
 
       resolveLoadMore?.({
@@ -4634,15 +4615,26 @@ describe("WorkspaceStore", () => {
       await loadOlderPromise;
 
       const state = store.getWorkspaceState(workspaceId);
-      expect(state.muxMessages.map((message) => message.id)).toEqual(["msg-newer"]);
-      expect(state.hasOlderHistory).toBe(false);
+      // The boundary pruned older rows; the stale page must not be merged back in, and
+      // pagination now follows the boundary (older history before it) rather than the page.
+      expect(state.muxMessages.map((message) => message.id)).toEqual(["live-compaction-summary"]);
+      expect(state.hasOlderHistory).toBe(true);
       expect(state.loadingOlderHistory).toBe(false);
+
+      // hasOlder is true either way, so the next load's cursor proves which state won.
+      await store.loadOlderHistory(workspaceId);
+      expect(mockHistoryLoadMore).toHaveBeenLastCalledWith({
+        workspaceId,
+        cursor: { beforeHistorySequence: 6, beforeMessageId: "live-compaction-summary" },
+      });
     });
   });
 
   describe("activity fallbacks", () => {
     it("recounts active goals once per bulk list, including removals and preserved live goals", () => {
       resetStore();
+      // Private on purpose: the recount-per-list budget (not the count) is the guarded
+      // behavior, and the skip-set merge has no deterministic public trigger.
       const internal = getInternal<{
         applyWorkspaceActivityList: (
           snapshots: Record<string, WorkspaceActivitySnapshot>,
@@ -5460,6 +5452,7 @@ describe("WorkspaceStore", () => {
     });
     it("clears activity stream-start recency cache on dispose", () => {
       const workspaceId = "dispose-clears-activity-recency";
+      // Private on purpose: a disposed store exposes no reads, so the leak check needs the map.
       const internalStore = getInternal<{
         activityStreamingStartRecency: Map<string, number>;
       }>(store);
@@ -6343,10 +6336,6 @@ describe("WorkspaceStore", () => {
       ]);
 
       createAndAddWorkspace(store, workspaceId);
-      const rawStore = getInternal<{
-        advisorLiveStore: { has: (key: string) => boolean };
-      }>(store);
-      const advisorKey = `${workspaceId}\u0000call-advisor-output-delete`;
 
       const hasLiveOutput = await waitUntil(
         () =>
@@ -6354,7 +6343,12 @@ describe("WorkspaceStore", () => {
           "stale partial advice"
       );
       expect(hasLiveOutput).toBe(true);
-      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(true);
+      const advisorListener = mock(() => undefined);
+      const unsubscribe = store.subscribeAdvisorLive(
+        workspaceId,
+        "call-advisor-output-delete",
+        advisorListener
+      );
 
       releaseDelete?.();
 
@@ -6362,29 +6356,35 @@ describe("WorkspaceStore", () => {
         () => store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-output-delete") === null
       );
       expect(clearedLiveOutput).toBe(true);
-      // The delete-time sweep must release the keyed channel as well: with the
-      // transient entry gone, no later sweep can rediscover this key.
-      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
+      // The delete-time sweep must release the keyed channel as well (which notifies its
+      // subscriber): with the transient entry gone, no later sweep can rediscover this key.
+      expect(advisorListener).toHaveBeenCalledTimes(1);
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { advisorLiveStore } = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-output-delete`)).toBe(false);
+      unsubscribe();
     });
 
     it("releases keyed advisor channels when a full replay resets transient state", async () => {
       const workspaceId = "advisor-output-full-replay-reset";
 
-      mockChatScript(
-        [
-          caughtUpEvent(),
-          Promise.resolve(),
-          advisorOutputEvent(workspaceId, "call-advisor-replay-reset", "partial advice", 1),
-        ],
-        { keepOpen: true }
+      const endFirstAttempt = createReleaseGate();
+      // The first attempt ends without history, so the retry is a full replay that
+      // resets transient state; the retry itself stays open and silent.
+      const subscriptions = mockChatReconnectScript((attempt, signal) =>
+        attempt === 1
+          ? [
+              caughtUpEvent(),
+              Promise.resolve(),
+              advisorOutputEvent(workspaceId, "call-advisor-replay-reset", "partial advice", 1),
+              endFirstAttempt.wait,
+            ]
+          : [() => waitForAbortSignal(signal)]
       );
 
       createAndAddWorkspace(store, workspaceId);
-      const rawStore = getInternal<{
-        advisorLiveStore: { has: (key: string) => boolean };
-        resetChatStateForReplay: (workspaceId: string) => void;
-      }>(store);
-      const advisorKey = `${workspaceId}\u0000call-advisor-replay-reset`;
 
       const hasLiveOutput = await waitUntil(
         () =>
@@ -6392,13 +6392,28 @@ describe("WorkspaceStore", () => {
           "partial advice"
       );
       expect(hasLiveOutput).toBe(true);
-      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(true);
+      const advisorListener = mock(() => undefined);
+      const unsubscribe = store.subscribeAdvisorLive(
+        workspaceId,
+        "call-advisor-replay-reset",
+        advisorListener
+      );
 
-      rawStore.resetChatStateForReplay(workspaceId);
+      endFirstAttempt.release();
+      expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
+      await tick(0);
 
       // The replaced transient maps were the only record of this tool-call ID,
-      // so the reset itself must release the keyed channel.
-      expect(rawStore.advisorLiveStore.has(advisorKey)).toBe(false);
+      // so the reset itself must release the keyed channel (notifying its subscriber).
+      expect(advisorListener).toHaveBeenCalledTimes(1);
+      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")).toBeNull();
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { advisorLiveStore } = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-replay-reset`)).toBe(false);
+      unsubscribe();
+      mockChatScript([], { keepOpen: true });
     });
 
     it("replays pre-caught-up advisor output after full replay catches up", async () => {
@@ -6893,29 +6908,34 @@ describe("WorkspaceStore", () => {
   });
 
   describe("getWorkspaceLastUserPromptInfo", () => {
-    const seedUserMessages = (workspaceId: string, rows: Array<{ id: string; text: string }>) => {
-      const rawStore = getInternal<{
-        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
-      }>(store);
-      rawStore.handleChatMessage(workspaceId, caughtUpEvent());
-      rows.forEach((row, index) => {
-        rawStore.handleChatMessage(workspaceId, {
-          type: "message",
-          id: row.id,
-          role: "user",
-          parts: [{ type: "text", text: row.text }],
-          metadata: {
-            historySequence: index + 1,
-            timestamp: (index + 1) * 1_000,
-          },
-        });
-      });
+    /** Open the workspace's chat, catch up, and stream `rows` in as live user messages. */
+    const seedUserMessages = async (
+      workspaceId: string,
+      rows: Array<{ id: string; text: string }>
+    ) => {
+      const send = openChat(workspaceId);
+      createAndAddWorkspace(store, workspaceId);
+      await send(
+        caughtUpEvent(),
+        ...rows.map(
+          (row, index): WorkspaceChatMessage => ({
+            type: "message",
+            id: row.id,
+            role: "user",
+            parts: [{ type: "text", text: row.text }],
+            metadata: {
+              historySequence: index + 1,
+              timestamp: (index + 1) * 1_000,
+            },
+          })
+        )
+      );
+      return send;
     };
 
-    it("returns the most recent typed prompt", () => {
+    it("returns the most recent typed prompt", async () => {
       const workspaceId = "last-prompt-basic";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [
+      await seedUserMessages(workspaceId, [
         { id: "u1", text: "first prompt" },
         { id: "u2", text: "second prompt" },
       ]);
@@ -6923,10 +6943,9 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("second prompt");
     });
 
-    it("keeps scanning past an attachment-only turn with empty text", () => {
+    it("keeps scanning past an attachment-only turn with empty text", async () => {
       const workspaceId = "last-prompt-attachment-only";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [
+      await seedUserMessages(workspaceId, [
         { id: "u1", text: "describe this screenshot" },
         { id: "u2", text: "   " },
       ]);
@@ -6936,9 +6955,8 @@ describe("WorkspaceStore", () => {
       );
     });
 
-    it("keeps scanning past a staged-attachment notice", () => {
+    it("keeps scanning past a staged-attachment notice", async () => {
       const workspaceId = "last-prompt-staged-notice";
-      createAndAddWorkspace(store, workspaceId);
       const notice = buildStagedAttachmentNotice([
         {
           kind: "staged",
@@ -6949,7 +6967,7 @@ describe("WorkspaceStore", () => {
           stagedPath: ".mux/user-attachments/id/data.csv",
         },
       ]);
-      seedUserMessages(workspaceId, [
+      await seedUserMessages(workspaceId, [
         { id: "u1", text: "summarize the attached data" },
         { id: "u2", text: notice.trimStart() },
       ]);
@@ -6959,26 +6977,21 @@ describe("WorkspaceStore", () => {
       );
     });
 
-    it("returns null when every user turn is empty", () => {
+    it("returns null when every user turn is empty", async () => {
       const workspaceId = "last-prompt-all-empty";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [{ id: "u1", text: "" }]);
+      await seedUserMessages(workspaceId, [{ id: "u1", text: "" }]);
 
       expect(store.getWorkspaceLastUserPromptInfo(workspaceId)).toBeNull();
     });
 
-    it("does not invalidate the footer prompt projection for assistant stream deltas", () => {
+    it("does not invalidate the footer prompt projection for assistant stream deltas", async () => {
       const workspaceId = "last-prompt-stream-deltas";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      const send = await seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
       const listener = mock(() => undefined);
       const unsubscribe = store.subscribeLastUserPrompt(workspaceId, listener);
       const snapshot = store.getWorkspaceLastUserPromptSnapshot(workspaceId);
 
-      const rawStore = getInternal<{
-        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
-      }>(store);
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-start",
         workspaceId,
         messageId: "assistant-1",
@@ -6986,7 +6999,7 @@ describe("WorkspaceStore", () => {
         historySequence: 2,
         startTime: 2_000,
       });
-      rawStore.handleChatMessage(workspaceId, {
+      await send({
         type: "stream-delta",
         workspaceId,
         messageId: "assistant-1",
@@ -7000,15 +7013,12 @@ describe("WorkspaceStore", () => {
       unsubscribe();
     });
 
-    it("holds the history epoch steady while messages stream in", () => {
+    it("holds the history epoch steady while messages stream in", async () => {
       const workspaceId = "last-prompt-epoch-stable";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      const send = await seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
       const epoch = store.getWorkspaceHistoryEpoch(workspaceId);
 
-      getInternal<{
-        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
-      }>(store).handleChatMessage(workspaceId, {
+      await send({
         type: "message",
         id: "u2",
         role: "user",
@@ -7020,15 +7030,12 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBe(epoch);
     });
 
-    it("advances the history epoch when rows this window never held are deleted", () => {
+    it("advances the history epoch when rows this window never held are deleted", async () => {
       const workspaceId = "last-prompt-epoch-clear";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      const send = await seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
       const epoch = store.getWorkspaceHistoryEpoch(workspaceId);
 
-      getInternal<{
-        handleChatMessage: (workspaceId: string, data: WorkspaceChatMessage) => void;
-      }>(store).handleChatMessage(workspaceId, {
+      await send({
         type: "delete",
         historySequences: [99],
       });
@@ -7037,15 +7044,12 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceLastUserPromptInfo(workspaceId)?.text).toBe("first prompt");
     });
 
-    it("advances the history epoch when a full replay replaces the transcript", () => {
+    it("advances the history epoch when a full replay replaces the transcript", async () => {
       const workspaceId = "last-prompt-epoch-replay";
-      createAndAddWorkspace(store, workspaceId);
-      seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
+      await seedUserMessages(workspaceId, [{ id: "u1", text: "first prompt" }]);
       const epoch = store.getWorkspaceHistoryEpoch(workspaceId);
 
-      getInternal<{ aggregators: Map<string, StreamingMessageAggregator> }>(store)
-        .aggregators.get(workspaceId)!
-        .loadHistoricalMessages([], false, { mode: "replace" });
+      store.getAggregator(workspaceId)!.loadHistoricalMessages([], false, { mode: "replace" });
 
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
       expect(store.getWorkspaceLastUserPromptInfo(workspaceId)).toBeNull();
