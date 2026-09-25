@@ -106,7 +106,7 @@ const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
 // Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
 // while several unhealthy servers' startup deadlines overlap instead of stacking.
 const MCP_STARTUP_CONCURRENCY = 4;
-const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
+export const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
 /**
  * Timed-out servers are restarted from the cached same-signature path, and
  * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without

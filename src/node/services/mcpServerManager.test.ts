@@ -27,6 +27,7 @@ import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
+  MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
   MCPServerManager,
   flattenMcpPrompt,
   isClosedClientError,
@@ -2377,7 +2378,7 @@ describe("MCPServerManager", () => {
   }
 
   /** Mirrors mcpServerManager's fail-safe wait for a timed-out startup's abort cleanup. */
-  const STARTUP_CLEANUP_WAIT_MS = 5_000;
+  const STARTUP_CLEANUP_WAIT_MS = MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS;
 
   test("startSingleServer waits for abort cleanup before surfacing timeout", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
@@ -2472,8 +2473,9 @@ describe("MCPServerManager", () => {
     });
 
     const serve = manager.getToolsForWorkspace(workspaceRequest("ws-overlap"));
-    // Every startup is in flight at once.
-    await waitFor(() => connecting === names.length);
+    // Startups overlap: at least two are in flight at once (the startup semaphore may
+    // queue the rest, so do not require every slot).
+    await waitFor(() => connecting >= 2);
     // Finish in reverse order: concurrent completion order must not perturb
     // the served tool order.
     for (const gate of [...gates].reverse()) {
