@@ -4,7 +4,7 @@ import { expect, mock } from "bun:test";
 import * as fs from "fs/promises";
 import type { Config } from "@/node/config";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import type { WorkspaceGoalService} from "./workspaceGoalService";
+import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { type GoalContinuationRuntimeBridge } from "./workspaceGoalService";
 import type { HistoryService } from "./historyService";
 import type { GoalRecordV1 } from "@/common/types/goal";
