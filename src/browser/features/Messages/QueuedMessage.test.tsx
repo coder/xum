@@ -1,4 +1,4 @@
-import "../dom";
+import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { useState, type ComponentProps } from "react";
@@ -6,7 +6,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
 import type { QueuedMessage as QueuedMessageData } from "@/common/types/message";
-import { installDom } from "../dom";
+import { installDom } from "../../../../tests/ui/dom";
 
 function createQueuedMessage(overrides?: Partial<QueuedMessageData>): QueuedMessageData {
   return {
@@ -52,9 +52,9 @@ describe("QueuedMessage banner", () => {
     const view = render(
       <QueuedMessage
         message={createQueuedMessage()}
-        onEdit={mock(() => {})}
-        onChangeDispatchMode={mock(async () => {})}
-        onSendImmediately={mock(async () => {})}
+        onEdit={mock(() => undefined)}
+        onChangeDispatchMode={mock(() => Promise.resolve())}
+        onSendImmediately={mock(() => Promise.resolve())}
       />
     );
 
@@ -95,9 +95,9 @@ describe("QueuedMessage banner", () => {
     const view = render(
       <QueuedMessage
         message={createQueuedMessage()}
-        onEdit={mock(() => {})}
-        onChangeDispatchMode={mock(async () => {})}
-        onSendImmediately={mock(async () => {})}
+        onEdit={mock(() => undefined)}
+        onChangeDispatchMode={mock(() => Promise.resolve())}
+        onSendImmediately={mock(() => Promise.resolve())}
       />
     );
 
@@ -111,7 +111,7 @@ describe("QueuedMessage banner", () => {
   });
 
   test("clicking Edit calls onEdit", () => {
-    const onEdit = mock(() => {});
+    const onEdit = mock(() => undefined);
     const view = render(<QueuedMessage message={createQueuedMessage()} onEdit={onEdit} />);
 
     fireEvent.click(view.getByRole("button", { name: "Edit" }));
@@ -120,7 +120,7 @@ describe("QueuedMessage banner", () => {
   });
 
   test("selecting a deferred mode calls onChangeDispatchMode", async () => {
-    const onChangeDispatchMode = mock(async (_mode: "tool-end" | "turn-end") => {});
+    const onChangeDispatchMode = mock((_mode: "tool-end" | "turn-end") => Promise.resolve());
     const view = render(
       <QueuedMessage message={createQueuedMessage()} onChangeDispatchMode={onChangeDispatchMode} />
     );
@@ -134,7 +134,7 @@ describe("QueuedMessage banner", () => {
   });
 
   test("reapplies the checked mode so the backend can reprioritize visible entries", async () => {
-    const onChangeDispatchMode = mock(async (_mode: "tool-end" | "turn-end") => {});
+    const onChangeDispatchMode = mock((_mode: "tool-end" | "turn-end") => Promise.resolve());
     const view = render(
       <QueuedMessage
         message={createQueuedMessage({ queueDispatchMode: "tool-end" })}
@@ -151,7 +151,7 @@ describe("QueuedMessage banner", () => {
   });
 
   test("clicking Send now calls onSendImmediately", async () => {
-    const onSendImmediately = mock(async () => {});
+    const onSendImmediately = mock(() => Promise.resolve());
     const view = render(
       <QueuedMessage message={createQueuedMessage()} onSendImmediately={onSendImmediately} />
     );
@@ -166,11 +166,11 @@ describe("QueuedMessage banner", () => {
 
   test("shows send-now failures inline and allows retry", async () => {
     let attempt = 0;
-    const onSendImmediately = mock(async () => {
+    const onSendImmediately = mock(() => {
       attempt += 1;
-      if (attempt === 1) {
-        throw new Error("Connection lost while interrupting");
-      }
+      return attempt === 1
+        ? Promise.reject(new Error("Connection lost while interrupting"))
+        : Promise.resolve();
     });
     const view = render(
       <QueuedMessageWithErrorFeedback
@@ -194,7 +194,9 @@ describe("QueuedMessage banner", () => {
   });
 
   test("keeps Send now visible but disabled when immediate dispatch is unavailable", () => {
-    const view = render(<QueuedMessage message={createQueuedMessage()} onEdit={mock(() => {})} />);
+    const view = render(
+      <QueuedMessage message={createQueuedMessage()} onEdit={mock(() => undefined)} />
+    );
 
     openDispatchMenu(view);
     expect(view.getByRole("menuitem", { name: "Send now" }).hasAttribute("disabled")).toBe(true);

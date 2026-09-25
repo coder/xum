@@ -1,26 +1,27 @@
+import "../../../../tests/ui/dom";
+
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { GlobalWindow } from "happy-dom";
 import { cleanup, render } from "@testing-library/react";
 
 import { ContextUsageBar } from "@/browser/features/RightSidebar/ContextUsageBar";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { TokenMeterData } from "@/common/utils/tokens/tokenMeterUtils";
+import { installDom } from "../../../../tests/ui/dom";
 
 describe("ContextUsageBar compaction warning", () => {
-  let originalWindow: typeof globalThis.window;
-  let originalDocument: typeof globalThis.document;
+  // Use the shared harness: a raw happy-dom swap imported UI modules before any
+  // document existed, which pins Radix's layout effect to a noop for later suites
+  // in CI's shared-process shards.
+  let cleanupDom: (() => void) | null = null;
 
   beforeEach(() => {
-    originalWindow = globalThis.window;
-    originalDocument = globalThis.document;
-    globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
-    globalThis.document = globalThis.window.document;
+    cleanupDom = installDom();
   });
 
   afterEach(() => {
     cleanup();
-    globalThis.window = originalWindow;
-    globalThis.document = originalDocument;
+    cleanupDom?.();
+    cleanupDom = null;
   });
 
   test("shows warning when compaction model is smaller than threshold", () => {
@@ -37,7 +38,7 @@ describe("ContextUsageBar compaction warning", () => {
           data={data}
           autoCompaction={{
             threshold: 80,
-            setThreshold: () => {},
+            setThreshold: () => undefined,
             contextWarning: { compactionModelMaxTokens: 500, thresholdTokens: 800 },
           }}
         />
@@ -57,7 +58,10 @@ describe("ContextUsageBar compaction warning", () => {
 
     const view = render(
       <TooltipProvider>
-        <ContextUsageBar data={data} autoCompaction={{ threshold: 80, setThreshold: () => {} }} />
+        <ContextUsageBar
+          data={data}
+          autoCompaction={{ threshold: 80, setThreshold: () => undefined }}
+        />
       </TooltipProvider>
     );
 

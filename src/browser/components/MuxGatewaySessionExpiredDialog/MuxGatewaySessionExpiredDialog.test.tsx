@@ -1,9 +1,9 @@
-import "../dom";
+import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
-import { installDom } from "../dom";
+import { installDom } from "../../../../tests/ui/dom";
 
 import { MuxGatewaySessionExpiredDialog } from "@/browser/components/MuxGatewaySessionExpiredDialog/MuxGatewaySessionExpiredDialog";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
@@ -40,16 +40,18 @@ describe("MuxGatewaySessionExpiredDialog", () => {
 
     let fetchUrl: string | null = null;
 
-    globalThis.fetch = async (input, _init) => {
-      fetchUrl = input instanceof URL ? input.toString() : String(input);
-      return new Response(
-        JSON.stringify({ authorizeUrl: "https://example.com/authorize", state: "x" }),
-        {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      fetchUrl = input instanceof Request ? input.url : input.toString();
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ authorizeUrl: "https://example.com/authorize", state: "x" }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }
+        )
       );
-    };
+    }) as typeof globalThis.fetch;
 
     const popup = {
       location: { href: "about:blank" },

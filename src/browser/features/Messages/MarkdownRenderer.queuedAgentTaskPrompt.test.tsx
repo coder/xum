@@ -1,10 +1,10 @@
-import "../dom";
+import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
-import { installDom } from "../dom";
+import { installDom } from "../../../../tests/ui/dom";
 
 describe("Queued agent task prompt markdown rendering", () => {
   let cleanupDom: (() => void) | null = null;
