@@ -553,24 +553,6 @@ export function buildReviewDiffPathFilterSpecs(params: {
   }));
 }
 
-export function buildReviewDiffPathFilter(params: {
-  isImmersive: boolean;
-  assistedOnly: boolean;
-  assistedHunks: readonly AssistedReviewHunk[];
-  selectedFilePath: string | null;
-  selectedDiffPath: string;
-  workspaceMetadata: Pick<FrontendWorkspaceMetadata, "projects"> | null | undefined;
-  repoRootProjectPath: string | null | undefined;
-  pathContext?: ProjectRelativePathContext;
-}): string {
-  return (
-    buildReviewDiffPathFilterSpecs({
-      ...params,
-      projectPath: params.repoRootProjectPath ?? "",
-    })[0]?.pathFilter ?? ""
-  );
-}
-
 export function getEffectiveReviewIncludeUncommitted(params: {
   assistedOnly: boolean;
   includeUncommitted: boolean;
@@ -605,7 +587,7 @@ export function getEffectiveReviewFrontendFilters(params: {
   return { showReadHunks: effectiveShowRead, searchTerm: params.searchTerm };
 }
 
-function getReviewPanelPathContext(params: {
+export function getReviewPanelPathContext(params: {
   workspaceMetadata:
     | Pick<FrontendWorkspaceMetadata, "projectPath" | "subProjectPath">
     | null
@@ -617,17 +599,6 @@ function getReviewPanelPathContext(params: {
     projectPath,
     executionRootPath: params.workspaceMetadata?.subProjectPath ?? projectPath,
   };
-}
-
-export function normalizeReviewPanelAssistedHunks(params: {
-  assistedHunks: readonly AssistedReviewHunk[];
-  workspaceMetadata:
-    | Pick<FrontendWorkspaceMetadata, "projectPath" | "subProjectPath">
-    | null
-    | undefined;
-  projectPath: string;
-}): AssistedReviewHunk[] {
-  return normalizeAssistedReviewHunks(params.assistedHunks, getReviewPanelPathContext(params));
 }
 
 interface ReviewAssistedStatsReporterProps {

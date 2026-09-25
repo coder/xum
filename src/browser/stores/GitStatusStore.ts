@@ -1144,15 +1144,6 @@ export function useGitStatus(workspaceId: string): GitStatus | null {
   );
 }
 
-export function useProjectGitStatuses(workspaceId: string): ProjectGitStatusResult[] | null {
-  const store = getGitStoreInstance();
-
-  return useSyncExternalStore(
-    (listener) => store.subscribeProjectStatusesKey(workspaceId, listener),
-    () => store.getProjectStatuses(workspaceId)
-  );
-}
-
 export function useMultiProjectGitSummary(workspaceId: string): MultiProjectGitSummary | null {
   const store = getGitStoreInstance();
 

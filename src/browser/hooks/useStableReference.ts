@@ -25,62 +25,12 @@ export function compareMaps<K, V>(
 }
 
 /**
- * Compare two Records for deep equality (same keys and values).
- * Uses === for value comparison by default.
- *
- * @param prev Previous Record
- * @param next Next Record
- * @param valueEquals Optional custom value equality function
- * @returns true if Records are equal, false otherwise
- */
-export function compareRecords<V>(
-  prev: Record<string, V>,
-  next: Record<string, V>,
-  valueEquals: (a: V, b: V) => boolean = (a, b) => a === b
-): boolean {
-  const prevKeys = Object.keys(prev);
-  const nextKeys = Object.keys(next);
-
-  if (prevKeys.length !== nextKeys.length) return false;
-
-  for (const key of nextKeys) {
-    if (!(key in prev)) return false;
-    if (!valueEquals(prev[key], next[key])) return false;
-  }
-
-  return true;
-}
-
-/**
- * Compare two Arrays for deep equality (same length and values).
- * Uses === for value comparison by default.
- *
- * @param prev Previous Array
- * @param next Next Array
- * @param valueEquals Optional custom value equality function
- * @returns true if Arrays are equal, false otherwise
- */
-export function compareArrays<V>(
-  prev: V[],
-  next: V[],
-  valueEquals: (a: V, b: V) => boolean = (a, b) => a === b
-): boolean {
-  if (prev.length !== next.length) return false;
-
-  for (let i = 0; i < next.length; i++) {
-    if (!valueEquals(prev[i], next[i])) return false;
-  }
-
-  return true;
-}
-
-/**
  * Hook to stabilize reference identity for computed values.
  *
  * Returns the previous reference if the new value is deeply equal to the previous value,
  * preventing unnecessary re-renders in components that depend on reference equality.
  *
- * Common use case: Stabilizing Map/Record/Array identities in useMemo when the
+ * Common use case: Stabilizing Map identities in useMemo when the
  * underlying values haven't actually changed.
  *
  * @example
