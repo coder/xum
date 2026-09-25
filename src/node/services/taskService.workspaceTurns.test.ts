@@ -678,7 +678,6 @@ describe("TaskService", () => {
 
     const internal = taskService as unknown as {
       pendingTerminalAttentionDrains: Set<Promise<void>>;
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
     };
     await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
     await Promise.all([...internal.pendingTerminalAttentionDrains]);
@@ -691,7 +690,8 @@ describe("TaskService", () => {
 
     // Notification remains pending; once the owner is idle, draining delivers it.
     hasPendingQueuedOrPreparingTurn.mockImplementation(() => false);
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     const drained = sendMessage.mock.calls.find(
       (call) => typeof call[1] === "string" && call[1].includes("wst_handle")
     );
@@ -714,7 +714,6 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { historyService, taskService } = createTaskServiceHarness(config, { workspaceService });
     const internal = taskService as unknown as {
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
       schedulePendingTerminalAttentionOwnerDrains: () => Promise<number>;
     };
 
@@ -725,7 +724,8 @@ describe("TaskService", () => {
       // detector on this host before the drain consumes it.
       .mockImplementationOnce(() => Promise.reject(new Error("EIO: history unreadable")));
     try {
-      await internal.drainTerminalAttention(parentId);
+      taskService.scheduleTerminalAttentionDrain(parentId);
+      await flushTerminalAttentionDrains(taskService);
       expect(sendMessage).not.toHaveBeenCalled();
 
       expect(await internal.schedulePendingTerminalAttentionOwnerDrains()).toBe(1);
@@ -802,15 +802,11 @@ describe("TaskService", () => {
       sourceKind: "workspace_turn",
       sourceId: "wst_backoff_deliverable",
     });
-    (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
-
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentId);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
     await flushTerminalAttentionDrains(taskService);
 
     // First attempt sends the non-workflow batch and is rejected; the re-poked drain lets the
@@ -858,11 +854,6 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -893,12 +884,13 @@ describe("TaskService", () => {
       sourceKind: "workspace_turn",
       sourceId: "wst_repoke_suppressed",
     });
-    (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
 
     // The empty suppressed batch must re-poke the drain, not park the wake on the sweep.
-    await drain(parentId);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
     await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const prompt = String(sendMessage.mock.calls[0]?.[1]);
@@ -2158,7 +2150,6 @@ describe("TaskService", () => {
     });
     const internal = taskService as unknown as {
       pendingTerminalAttentionDrains: Set<Promise<void>>;
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
     };
     await streamEnd(
       taskService,
@@ -2187,7 +2178,8 @@ describe("TaskService", () => {
       error: `${OWNER_FOLLOW_UP_SUPERSEDE_PREFIX}wst_successor from the same owner workspace`,
     });
     hasPendingQueuedOrPreparingTurn.mockImplementation(() => false);
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     const wakeCall = sendMessage.mock.calls.find(
       (call) => typeof call[1] === "string" && call[1].includes("wst_handle")

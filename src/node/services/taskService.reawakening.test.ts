@@ -2050,10 +2050,8 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const internal = taskService as unknown as {
-      drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-    };
-    await internal.drainTerminalAttention(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).toHaveBeenCalledWith(
       parentId,
@@ -2140,11 +2138,8 @@ describe("TaskService", () => {
       sourceId: handleId,
     });
 
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentWorkspaceId);
+    taskService.scheduleTerminalAttentionDrain(parentWorkspaceId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(resumeStream).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
@@ -2221,11 +2216,8 @@ describe("TaskService", () => {
       sourceId: handleId,
     });
 
-    await (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention(parentWorkspaceId);
+    taskService.scheduleTerminalAttentionDrain(parentWorkspaceId);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(String(sendMessage.mock.calls[0]?.[1])).toContain(childTaskId);
@@ -2264,11 +2256,6 @@ describe("TaskService", () => {
     (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
       mock(() => Promise.resolve("current"));
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
-    const drain = (
-      taskService as unknown as {
-        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
-      }
-    ).drainTerminalAttention.bind(taskService);
 
     await historyService.appendToHistory(
       parentId,
@@ -2292,10 +2279,12 @@ describe("TaskService", () => {
       sourceKind: "workspace_turn",
       sourceId: "wst_mixed_handle",
     });
-    (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.set(parentId, new Set([runId]));
-    await drain(parentId);
+    taskService.noteWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const firstPrompt = String(sendMessage.mock.calls[0]?.[1]);
@@ -2305,7 +2294,8 @@ describe("TaskService", () => {
       agentId: "plan",
     });
 
-    await drain(parentId);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
     expect(sendMessage).toHaveBeenCalledTimes(2);
     const secondPrompt = String(sendMessage.mock.calls[1]?.[1]);
     expect(secondPrompt).toContain(runId);
