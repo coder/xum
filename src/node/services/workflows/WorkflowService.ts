@@ -65,8 +65,8 @@ import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { parseWorkflowDescription, parseWorkflowName } from "./workflowDescription";
 import { resolveWorkflowScript, type ResolvedWorkflowScript } from "./workflowScriptResolver";
 import {
+  createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "./WorkflowEvaluationAdapter";
 import type { WorkflowEvaluationPort } from "./workflowEvaluationStep";
@@ -1111,7 +1111,7 @@ export async function resolveWorkflowContext(
         },
       }),
       taskAdapterFactory: (runId, workflowName) =>
-        new WorkflowTaskServiceAdapter({
+        createProductionWorkflowTaskAdapter({
           taskService: context.taskService,
           parentWorkspaceId: workspaceId,
           workflowRunId: runId,

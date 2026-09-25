@@ -1751,7 +1751,7 @@ describe("TaskService", () => {
         pending.get(taskId)!.resolve(Ok(undefined));
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
           kind: "terminal-no-report",
         });
       } finally {
@@ -1792,7 +1792,7 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       // A new attempt starts: the old settlement must not leak into it...
@@ -1826,7 +1826,7 @@ describe("TaskService", () => {
       const { taskService, aiService } = createTaskServiceHarness(config, { workspaceService });
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       const retiredAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
@@ -1857,7 +1857,7 @@ describe("TaskService", () => {
           expect(outcome.reason).toContain("without settlement evidence");
         }
         await taskService.terminateAllDescendantAgentTasks(rootId);
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
           kind: "terminal-no-report",
         });
         expect(findWorkspaceInConfig(config, taskId)?.taskAttemptId).toBe(published);
@@ -1901,7 +1901,7 @@ describe("TaskService", () => {
         // A Stop settles THIS process's attempt (same-process authority, as on main for any
         // owned attempt); cross-process authority stays fail-closed through the marker.
         await taskService.terminateAllDescendantAgentTasks(rootId);
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
           kind: "terminal-no-report",
         });
         const owned = (
@@ -1929,7 +1929,7 @@ describe("TaskService", () => {
       const { taskService, aiService } = createTaskServiceHarness(config);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       let reawaken: Promise<boolean> | undefined;
@@ -2017,8 +2017,8 @@ describe("TaskService", () => {
           timeoutMs: 5_000,
           ...requesting,
         });
-        expect(settled).toEqual({ kind: "terminal-no-report" });
-        expect(await realInspect(taskId, requesting)).toEqual({ kind: "terminal-no-report" });
+        expect(settled).toMatchObject({ kind: "terminal-no-report" });
+        expect(await realInspect(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
         // The lock is free while a waiter is pending (the wait below is bounded by its timeout).
         const lockProbe = await internals.workspaceEventLocks.withLock(taskId, () =>
           Promise.resolve("acquired")
@@ -2123,7 +2123,7 @@ describe("TaskService", () => {
           ...requesting,
         });
         pending.get(taskId)!.resolve(Ok(undefined));
-        expect(await waiting).toEqual({ kind: "terminal-no-report" });
+        expect(await waiting).toMatchObject({ kind: "terminal-no-report" });
         // Subscriptions do not leak past the wait.
         const listeners = (
           taskService as unknown as {
@@ -2183,7 +2183,7 @@ describe("TaskService", () => {
           // that follows makes it redundant.
           await taskService.terminateAllDescendantAgentTasks(rootId);
           expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
-          expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
             kind: "terminal-no-report",
           });
         }
@@ -2360,7 +2360,7 @@ describe("TaskService", () => {
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
       expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
       expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
     });
@@ -2624,7 +2624,7 @@ describe("TaskService", () => {
         expect(launch).not.toHaveBeenCalled();
         expect(
           await taskService.readAttemptOutcome(spawnedId, { requestingWorkspaceId: rootId })
-        ).toEqual({ kind: "terminal-no-report" });
+        ).toMatchObject({ kind: "terminal-no-report" });
         // Waiters are rejected by the owned reconcile, not left hanging.
         expect(await waiter).not.toBe("resolved");
       }
@@ -2942,22 +2942,25 @@ describe("TaskService", () => {
         // "missing task" it has to keep waiting on.
         expect(
           await taskService.readAttemptOutcome(firstId, { requestingWorkspaceId: rootId })
-        ).toEqual({ kind: "terminal-no-report" });
+        ).toMatchObject({ kind: "terminal-no-report" });
         expect(
           await taskService.waitForAttemptSettlement(firstId, {
             timeoutMs: 200,
             requestingWorkspaceId: rootId,
           })
-        ).toEqual({ kind: "terminal-no-report" });
+        ).toMatchObject({ kind: "terminal-no-report" });
         // The scheduler cannot pick a fenced record up later.
         await taskService.maybeStartQueuedTasks();
         await new Promise((resolve) => setTimeout(resolve, 5));
         expect(launch).not.toHaveBeenCalled();
-        // Control: the same persisted state seen by a fresh process stays indeterminate (no owner).
+        // Control: a fresh process owns nothing. It proves the no-report settlement only from the
+        // parent's receipt, which exists only when the failed commit's row was written (G2).
         const { taskService: legacyService } = createTaskServiceHarness(config);
         expect(
           (await legacyService.readAttemptOutcome(firstId, { requestingWorkspaceId: rootId })).kind
-        ).toBe("indeterminate");
+        ).toBe(
+          failure === "config-commit-throws-after-write" ? "terminal-no-report" : "indeterminate"
+        );
       }
     );
 
@@ -3171,7 +3174,7 @@ describe("TaskService", () => {
       for (const id of firstIds) expect(findWorkspaceInConfig(config, id)).toBeUndefined();
       expect(
         await taskService.readAttemptOutcome(firstIds[0], { requestingWorkspaceId: rootId })
-      ).toEqual({ kind: "terminal-no-report" });
+      ).toMatchObject({ kind: "terminal-no-report" });
 
       // Same run, new runner (the lease was released): exactly one replacement per failed step,
       // and the canceled ids are never admitted.

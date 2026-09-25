@@ -22,6 +22,7 @@ import {
   writeSubagentAttemptSettlementReceipt,
   type SubagentAttemptSettlementSource,
 } from "@/node/services/subagentAttemptSettlements";
+import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
@@ -356,6 +357,33 @@ describe("TaskService settlement receipt producers (G2)", () => {
       await expectReceiptEverywhere(config, taskId, attemptId, "idle-settled", true);
     });
 
+    test("terminal failure: the failure artifact is on disk before any receipt is written", async () => {
+      const taskId = "failureorder";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: PREDECESSOR } },
+      ]);
+      const { taskService, svc } = createHarness(config);
+      const attemptId = await ownEligibleAttempt(config, taskService, taskId);
+      // Another backend that sees the receipt must also see the failure (else it replaces the
+      // child as a plain no-report attempt): observe the artifact at every receipt write.
+      const writeReceipt = svc.writeSettlementReceipt.bind(svc);
+      const failureAtReceiptWrite: boolean[] = [];
+      spyOn(svc, "writeSettlementReceipt").mockImplementation(async (...args: unknown[]) => {
+        failureAtReceiptWrite.push(
+          (await readSubagentFailureArtifact(ownerDir(config, midId), taskId)) != null
+        );
+        return await writeReceipt(...args);
+      });
+      await svc.failAgentTaskTerminally(
+        taskId,
+        entryWithProject(config, taskId),
+        { errorType: "model_refusal", errorMessage: "refused" },
+        { expectedAttemptId: attemptId }
+      );
+      expect(failureAtReceiptWrite).toEqual([true]);
+      await expectReceiptEverywhere(config, taskId, attemptId, "idle-settled", true);
+    });
+
     test("stop-record release: the receipt is durable before the latch releases", async () => {
       const taskId = "stoprecord";
       const { config } = await setupTree([
@@ -385,9 +413,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       });
       expect(
         await taskService.readAttemptOutcome(taskId, { requestingWorkspaceId: midId })
-      ).toEqual({
-        kind: "terminal-no-report",
-      });
+      ).toMatchObject({ kind: "terminal-no-report" });
       await expectReceiptEverywhere(config, taskId, attemptId, "execution-settled", true);
     });
 

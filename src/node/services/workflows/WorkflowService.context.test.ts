@@ -29,6 +29,18 @@ interface TestWorkspaceService {
   getWorkflowArchiveRefusal: ReturnType<typeof mock>;
 }
 
+/** The production task adapter refuses a task service that cannot publish replacements (G2). */
+function replacementCapabilities() {
+  return {
+    createMany: mock(async () => {
+      throw new Error("createMany not expected in this test");
+    }),
+    claimRetiredAttempt: mock(async () => {
+      throw new Error("claimRetiredAttempt not expected in this test");
+    }),
+  };
+}
+
 describe("WorkflowService request orchestration", () => {
   let temp: DisposableTempDir;
   let config: Config;
@@ -101,6 +113,7 @@ describe("WorkflowService request orchestration", () => {
       },
       workspaceService,
       taskService: {
+        ...replacementCapabilities(),
         noteWorkflowRunTerminalAttention: mock(() => undefined),
         clearWorkflowRunDowngradeSettlement: mock(async () => undefined),
       },
@@ -486,6 +499,7 @@ describe("WorkflowService request orchestration", () => {
     const noteWorkflowRunTerminalAttention = mock(() => undefined);
     const { context } = createContext();
     (context as unknown as Record<string, unknown>).taskService = {
+      ...replacementCapabilities(),
       noteWorkflowRunTerminalAttention,
     };
 
@@ -522,6 +536,7 @@ describe("WorkflowService request orchestration", () => {
     const clearWorkflowRunDowngradeSettlement = mock(async () => undefined);
     const { context } = createContext();
     (context as unknown as Record<string, unknown>).taskService = {
+      ...replacementCapabilities(),
       noteWorkflowRunTerminalAttention: mock(() => undefined),
       clearWorkflowRunDowngradeSettlement,
     };

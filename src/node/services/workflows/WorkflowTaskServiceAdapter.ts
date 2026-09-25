@@ -2,7 +2,7 @@ import type { TaskAttemptOutcome, TaskAttemptSettlement } from "@/common/types/t
 import type { ParsedThinkingInput } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import type { TaskCreateResult } from "@/node/services/taskService";
+import type { TaskCreateResult, TaskRetiresClaim } from "@/node/services/taskService";
 import type {
   WorkflowAgentResult,
   WorkflowAgentSpec,
@@ -68,8 +68,20 @@ interface WorkflowTaskServiceLike {
       onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
       /** Cancels the reservation's admission stages; entered checkpoint/config writes finish. */
       abortSignal?: AbortSignal;
+      /** Single-use publication of replacements (see TaskService.claimRetiredAttempt). */
+      retires?: ReadonlyArray<TaskRetiresClaim | undefined>;
     }
   ): Promise<{ success: true; data: TaskCreateResult[] } | { success: false; error: string }>;
+  /**
+   * Workflow claim retiring a prior child's attempt before its replacement is reserved. Optional
+   * like the other authority reads: without it the adapter exposes no claim capability and the
+   * runner never replaces a child (unresolved), so no replacement is ever unclaimed.
+   */
+  claimRetiredAttempt?(
+    taskId: string,
+    attemptId: string,
+    claimant: { runId: string; stepId: string; inputHash: string }
+  ): Promise<{ success: true; data: { nonce: string } } | { success: false; error: string }>;
   waitForAgentReport(
     taskId: string,
     options: WorkflowAgentWaitOptions & {
@@ -135,6 +147,23 @@ export interface WorkflowTaskServiceAdapterOptions {
   getProjectTrusted?: () => boolean | Promise<boolean>;
 }
 
+/**
+ * The adapter production wires (the WorkflowService and turnRequestBuilder task adapter
+ * factories). Replacement capabilities stay optional on the adapter so test stubs need not grow
+ * them, and the runner treats their absence as "never replace" (the step stays unresolved). A real
+ * backend missing them would silently strand every no-report step instead, so fail at wiring.
+ */
+export function createProductionWorkflowTaskAdapter(
+  options: WorkflowTaskServiceAdapterOptions
+): WorkflowTaskServiceAdapter {
+  const adapter = new WorkflowTaskServiceAdapter(options);
+  assert(
+    adapter.claimRetiredAttempt != null && options.taskService.createMany != null,
+    "createProductionWorkflowTaskAdapter: the task service must retire attempts (claimRetiredAttempt) and publish replacements (createMany)"
+  );
+  return adapter;
+}
+
 export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
   private readonly taskService: WorkflowTaskServiceLike;
   private readonly parentWorkspaceId: string;
@@ -157,6 +186,11 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     taskId: string,
     options: { abortSignal?: AbortSignal; timeoutMs: number }
   ) => Promise<TaskAttemptSettlement<WorkflowAgentResult>>;
+  readonly claimRetiredAttempt?: (
+    taskId: string,
+    attemptId: string,
+    claimant: { stepId: string; inputHash: string }
+  ) => Promise<{ success: true; nonce: string } | { success: false; error: string }>;
 
   constructor(options: WorkflowTaskServiceAdapterOptions) {
     assert(
@@ -193,6 +227,18 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
           requestingWorkspaceId: this.parentWorkspaceId,
         });
         return this.mapAttemptOutcome(taskId, outcome);
+      };
+    }
+    if (taskService.claimRetiredAttempt != null) {
+      this.claimRetiredAttempt = async (taskId, attemptId, claimant) => {
+        assert(taskId.length > 0, "WorkflowTaskServiceAdapter.claimRetiredAttempt: taskId");
+        assert(taskService.claimRetiredAttempt != null, "claimRetiredAttempt capability vanished");
+        const claimed = await taskService.claimRetiredAttempt(taskId, attemptId, {
+          runId: this.workflowRunId,
+          stepId: claimant.stepId,
+          inputHash: claimant.inputHash,
+        });
+        return claimed.success ? { success: true, nonce: claimed.data.nonce } : claimed;
       };
     }
     if (taskService.waitForAttemptSettlement != null) {
@@ -289,10 +335,15 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
     lifecycle?: {
       onTaskCreated?: (index: number, taskId: string) => Promise<void> | void;
       abortSignal?: AbortSignal;
+      retires?: ReadonlyArray<TaskRetiresClaim | undefined>;
     }
   ): Promise<Array<{ taskId: string; status: "queued" | "starting" | "running" }>> {
     assert(specs.length > 0, "WorkflowTaskServiceAdapter.createAgentTasks: specs are required");
+    const replaces = lifecycle?.retires?.some((claim) => claim != null) === true;
     if (this.taskService.createMany == null) {
+      // A replacement is published only by createMany's single-use commit: the one-by-one create()
+      // fallback cannot consume a claim, so it must never publish one.
+      assert(!replaces, "WorkflowTaskServiceAdapter: a replacement requires createMany");
       const created: Array<{ taskId: string; status: "queued" | "starting" | "running" }> = [];
       for (const [index, spec] of specs.entries()) {
         // Single-task creation has no cancellable admission; the signal can only stop the
@@ -317,6 +368,7 @@ export class WorkflowTaskServiceAdapter implements WorkflowTaskAdapter {
           await lifecycle?.onTaskCreated?.(index, result.taskId);
         },
         ...(lifecycle?.abortSignal != null ? { abortSignal: lifecycle.abortSignal } : {}),
+        ...(replaces ? { retires: lifecycle?.retires } : {}),
       }
     );
     if (!createResult.success) {

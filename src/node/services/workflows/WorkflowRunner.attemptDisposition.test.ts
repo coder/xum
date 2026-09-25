@@ -34,6 +34,7 @@ const summarizeSpec: WorkflowAgentSpec = {
   markdownOnly: true,
 };
 const summarizeHash = hashWorkflowStepInput(summarizeSpec.id, summarizeSpec);
+const PRIOR_ATTEMPT = "att_00000000000000e5";
 
 /**
  * WorkflowRunner.run() clears its renewal interval before releasing the lease, but a renewal tick
@@ -495,12 +496,14 @@ describe("WorkflowRunner attempt disposition", () => {
     await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:00.750Z");
     const settlementWaits: Array<{ taskId: string; timeoutMs: number; hasSignal: boolean }> = [];
     const created: string[] = [];
+    const order: string[] = [];
     const runner = createRunner(store, {
       async runAgent() {
         throw new Error("must reserve through createAgentTasks");
       },
       async createAgentTasks(specs, lifecycle) {
         created.push(...specs.map((spec) => spec.id));
+        order.push(`reserve retires ${JSON.stringify(lifecycle?.retires)}`);
         await lifecycle?.onTaskCreated?.(0, "task_replacement");
         return [{ taskId: "task_replacement", status: "running" }];
       },
@@ -514,7 +517,11 @@ describe("WorkflowRunner attempt disposition", () => {
           timeoutMs: options.timeoutMs,
           hasSignal: options.abortSignal != null,
         });
-        return { kind: "terminal-no-report" };
+        return { kind: "terminal-no-report", attemptId: PRIOR_ATTEMPT };
+      },
+      async claimRetiredAttempt(taskId, attemptId, claimant) {
+        order.push(`claim ${taskId} ${attemptId} ${claimant.stepId}`);
+        return { success: true, nonce: "nonce-1" };
       },
     });
 
@@ -525,6 +532,11 @@ describe("WorkflowRunner attempt disposition", () => {
       { taskId: "task_prior", timeoutMs: WORKFLOW_ATTEMPT_SETTLEMENT_TIMEOUT_MS, hasSignal: true },
     ]);
     expect(created).toEqual(["summarize"]);
+    // The ended attempt is retired first; the replacement's reservation consumes that claim.
+    expect(order).toEqual([
+      `claim task_prior ${PRIOR_ATTEMPT} summarize`,
+      `reserve retires ${JSON.stringify([{ taskId: "task_prior", attemptId: PRIOR_ATTEMPT, nonce: "nonce-1" }])}`,
+    ]);
     const run = await store.getRun(RUN_ID);
     expect(run.steps).toMatchObject([{ taskId: "task_replacement", status: "completed" }]);
     expect(taskEvents(run.events)).toEqual([
@@ -533,6 +545,50 @@ describe("WorkflowRunner attempt disposition", () => {
       ["task_replacement", "completed"],
     ]);
   });
+
+  test.each([
+    ["the claim is refused", PRIOR_ATTEMPT, true],
+    ["the ended attempt has no identity (pre-identity)", undefined, true],
+    ["the task adapter cannot claim", PRIOR_ATTEMPT, false],
+  ] as const)(
+    "a no-report prior attempt is never replaced when %s: the run stays interrupted and nothing is reserved",
+    async (_label, attemptId, canClaim) => {
+      using tmp = new DisposableTempDir("workflow-runner-claim-refused");
+      const store = await createStore(tmp.path);
+      await seedPriorAttempt(store, "task_prior");
+      await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:00.750Z");
+      const createAgentTasks = mock(async () => {
+        throw new Error("an unclaimed prior attempt must not be replaced");
+      });
+      const runner = createRunner(store, {
+        async runAgent() {
+          throw new Error("an unclaimed prior attempt must not be replaced");
+        },
+        createAgentTasks,
+        async waitForAgentTask() {
+          throw new Error("a settled attempt is not awaited");
+        },
+        readSettledAgentResult: async () =>
+          attemptId != null
+            ? { kind: "terminal-no-report", attemptId }
+            : { kind: "terminal-no-report" },
+        ...(canClaim
+          ? {
+              claimRetiredAttempt: async () => ({
+                success: false as const,
+                error: "claim lost: the task now names attempt att_00000000000000ff",
+              }),
+            }
+          : {}),
+      });
+
+      await expect(runner.run(RUN_ID, { allowResumeFromInterrupted: true })).rejects.toThrow(
+        /previous attempt task_prior is unresolved/
+      );
+      expect(createAgentTasks).not.toHaveBeenCalled();
+      expect((await store.getRun(RUN_ID)).status).toBe("interrupted");
+    }
+  );
 
   test("resume on unresolved cleanup releases the lease, keeps the run interrupted, and starts nothing", async () => {
     using tmp = new DisposableTempDir("workflow-runner-resume-cleanup-timeout");

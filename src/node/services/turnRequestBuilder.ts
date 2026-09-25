@@ -193,8 +193,8 @@ import {
   type WorkflowRunStatusChangedEvent,
 } from "@/node/services/workflows/WorkflowService";
 import {
+  createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
-  WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -2145,7 +2145,7 @@ export class TurnRequestBuilder {
                   })
                 : undefined,
             taskAdapterFactory: (runId, workflowName) =>
-              new WorkflowTaskServiceAdapter({
+              createProductionWorkflowTaskAdapter({
                 taskService: this.dependencies.bindings.taskService!,
                 parentWorkspaceId: workspaceId,
                 workflowRunId: runId,

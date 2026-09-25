@@ -92,11 +92,13 @@ describe("Persistent sub-agent compaction", () => {
       const requesting = { requestingWorkspaceId: parentId };
       expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(parentId);
-      expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
-        kind: "terminal-no-report",
-      });
       const retiredAttemptId = findWorkspace(env, childId)?.taskAttemptId;
       expect(retiredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
+      // The outcome names the attempt that ended (what a replacement would retire).
+      expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
+        kind: "terminal-no-report",
+        attemptId: retiredAttemptId,
+      });
 
       // Keep TaskService, WorkspaceTurnManager and WorkspaceService real: the refusal comes from
       // the real createWorkspaceTurn path, which fails only AFTER the reactivation published its
@@ -133,6 +135,7 @@ describe("Persistent sub-agent compaction", () => {
         await taskService.terminateAllDescendantAgentTasks(parentId);
         expect(await taskService.readAttemptOutcome(childId, requesting)).toEqual({
           kind: "terminal-no-report",
+          attemptId: published,
         });
         expect(findWorkspace(env, childId)?.taskAttemptId).toBe(published);
       } finally {

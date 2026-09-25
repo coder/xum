@@ -148,6 +148,7 @@ function createBackendTaskService(options: {
   /** Called right before the reservation callbacks run (used to arm a pause). */
   beforeReservationCallbacks?: () => void;
   readAttemptOutcome?: TaskServiceLike["readAttemptOutcome"];
+  claimRetiredAttempt?: TaskServiceLike["claimRetiredAttempt"];
 }): { taskService: TaskServiceLike; backend: Backend } {
   let createManyCalls = 0;
   const checkpointed = createDeferred();
@@ -191,6 +192,9 @@ function createBackendTaskService(options: {
     },
     ...(options.readAttemptOutcome != null
       ? { readAttemptOutcome: options.readAttemptOutcome }
+      : {}),
+    ...(options.claimRetiredAttempt != null
+      ? { claimRetiredAttempt: options.claimRetiredAttempt }
       : {}),
   };
   return {
@@ -372,56 +376,71 @@ describe("WorkflowRunner child publication after a lease takeover (#4452 gap 2)"
     });
   });
 
-  // Expected to fail until G2's single-use publication check (or a lease-owner check inside the
-  // publishing config commit) lands: nothing fences the commit today. Latent on main because the
-  // cross-process classification above refuses to replace the unpublished child.
-  test.failing(
-    "latent gap 2: if B's recovery may replace the unpublished child, A's unfenced commit publishes a second child",
-    async () => {
-      const { storeA, storeB } = await createStores();
-      const published: string[] = [];
-      const a = createBackendTaskService({ name: "a", published, holdCommit: true });
-      const b = createBackendTaskService({
-        name: "b",
-        published,
-        holdCommit: false,
-        // NOT what today's cross-process TaskService answers (see the finding above): this models
-        // a classifier/claim that authorizes replacing a prior attempt with no positive evidence
-        // of a live child, which is what G2's replacement path must allow for this window.
-        readAttemptOutcome: async () => ({ kind: "terminal-no-report" }),
-      });
-      a.backend.releaseReports();
-      storeA.stallRenewals();
-      const runnerA = createRunner({ store: storeA, taskService: a.taskService, ownerId: OWNER_A });
-      const runnerB = createRunner({
-        store: storeB,
-        taskService: b.taskService,
-        ownerId: OWNER_B,
-        clockOffsetMs: 60_000,
-      });
+  // Formerly `test.failing` (latent #4452 gap 2): nothing fenced A's publishing commit, so a
+  // recovery that may replace A's checkpointed-but-unpublished child published a second one.
+  // G2 makes every replacement retire the prior attempt first (a config compare-and-swap on the
+  // prior child's row) and publish only by consuming that claim; A's child has no row yet, so the
+  // claim is refused and B never reserves. The classifier is still stubbed to authorize the
+  // replacement: the claim, not the classifier, is what prevents the double publish here.
+  test("gap 2: a recovery that may replace an unpublished child cannot claim it, so exactly one child is published", async () => {
+    const { storeA, storeB } = await createStores();
+    const published: string[] = [];
+    const otherProcessTaskService = createOtherProcessTaskService(
+      fixture.config,
+      fixture.historyService
+    );
+    const claims: string[] = [];
+    const a = createBackendTaskService({ name: "a", published, holdCommit: true });
+    const b = createBackendTaskService({
+      name: "b",
+      published,
+      holdCommit: false,
+      readAttemptOutcome: async () => ({
+        kind: "terminal-no-report",
+        attemptId: "att_00000000000000a0",
+      }),
+      claimRetiredAttempt: async (taskId, attemptId, claimant) => {
+        const claimed = await otherProcessTaskService.claimRetiredAttempt(
+          taskId,
+          attemptId,
+          claimant
+        );
+        claims.push(`${taskId}: ${claimed.success ? "granted" : claimed.error}`);
+        return claimed;
+      },
+    });
+    a.backend.releaseReports();
+    b.backend.releaseReports();
+    storeA.stallRenewals();
+    const runnerA = createRunner({ store: storeA, taskService: a.taskService, ownerId: OWNER_A });
+    const runnerB = createRunner({
+      store: storeB,
+      taskService: b.taskService,
+      ownerId: OWNER_B,
+      clockOffsetMs: 60_000,
+    });
 
-      const runA = settle(runnerA.run(RUN_ID));
-      await a.backend.checkpointed;
-      const runB = settle(runnerB.run(RUN_ID));
-      await b.backend.published;
+    const runA = settle(runnerA.run(RUN_ID));
+    await a.backend.checkpointed;
+    const runB = await settle(runnerB.run(RUN_ID));
 
-      // A's lease is gone, but its config commit is not fenced by the lease.
-      a.backend.releaseCommit();
-      await a.backend.published;
-      storeA.unstallRenewals();
-      await runA;
-      const journal = startedTaskIdForStep(await storeB.getRun(RUN_ID));
-      const publishedAtDecision = [...published];
-      b.backend.releaseReports();
-      await runB;
+    // A's lease is gone, but its config commit is not fenced by the lease.
+    a.backend.releaseCommit();
+    await a.backend.published;
+    storeA.unstallRenewals();
+    await runA;
 
-      // SAFE outcome: at most one published child for the step, and it is the one the journal names.
-      expect({ published: publishedAtDecision, journal }).toEqual({
-        published: ["task_b_1_0"],
-        journal: "task_b_1_0",
-      });
-    }
-  );
+    expect(claims).toEqual(["task_a_1_0: task record not found"]);
+    expect(runB.kind === "rejected" && runB.error).toBeInstanceOf(
+      WorkflowPriorAttemptUnresolvedError
+    );
+    expect(b.backend.createManyCalls).toBe(0);
+    // SAFE outcome: at most one published child for the step, and it is the one the journal names.
+    expect({ published, journal: startedTaskIdForStep(await storeB.getRun(RUN_ID)) }).toEqual({
+      published: ["task_a_1_0"],
+      journal: "task_a_1_0",
+    });
+  });
 
   test("fixed gap 1 closes the compound path: a checkpoint stalled inside its owner-checked write keeps B out", async () => {
     // Before the #4452 gap-1 fix, B reclaimed A's aged mkdir locks here, reserved and published

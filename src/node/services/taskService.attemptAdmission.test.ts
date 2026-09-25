@@ -609,7 +609,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(first?.receiptEligible).toBe(false);
       // Stop settles THIS process's attempt; the next reawaken's predecessor is settled here.
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       // ...but the predecessor is marked, and the marker is inherited: still not eligible.
@@ -1338,7 +1338,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           phase: "settled",
         });
         expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
           kind: "terminal-no-report",
         });
       }
@@ -1511,7 +1511,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // ...and an explicit Stop settles whatever is owned: the outcome recovers to terminal, the
       // id is closed, and the next reawaken is admitted (still marked, as the marker is inherited).
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
@@ -1744,7 +1744,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           phase: "settled",
           source: "stop-settled",
         });
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
           kind: "terminal-no-report",
         });
         expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
@@ -1794,7 +1794,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId: fresh,
         phase: "settled",
       });
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
     });
@@ -2013,7 +2013,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // unowned id, and that settlement proves the next reawaken's lineage.
       await taskService.terminateAllDescendantAgentTasks(rootId);
       await waitForStopRelease(taskService, spawnedId);
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       expect(await taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
@@ -2129,7 +2129,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
               phase: "settled",
             });
-            expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+            expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
               kind: "terminal-no-report",
             });
             return;
@@ -2160,7 +2160,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             source: "stop-settled",
           });
           expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
-          expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+          expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
             kind: "terminal-no-report",
           });
           // Deferred means deferred: the interrupted workspace remains for the user or parent to
@@ -2654,7 +2654,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       // Legitimate reawaken publishes a fresh id; the fence admits it and installs ownership.
@@ -2716,7 +2716,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
       expect(svc.attemptSettlementByTaskId.get(taskId)?.phase).toBe("settled");
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       // Settlement closed the attempt: a continuation is refused; only a reawaken reopens.
@@ -2770,7 +2770,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(send.state).toBe("discharged");
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
     });
@@ -2837,7 +2837,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         phase: "settled",
         source: "launch-failed",
       });
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       expect(
@@ -2899,7 +2899,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId,
         phase: "settled",
       });
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
     });
@@ -2934,7 +2934,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         phase: "settled",
         source: "user-stop-idle",
       });
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
     });
@@ -3052,7 +3052,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
       // The stop is not permanent: a later reawaken mints a fresh id and is admitted again.
@@ -3146,7 +3146,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         phase: "settled",
         source: "stop-settled",
       });
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
     });
@@ -3937,8 +3937,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
 
     test("stale settlement control: without a successor, A's stop settlement reads terminal-no-report", async () => {
       const result = await runStopSettlement({ successorAdmitted: false });
-      expect(result.waited).toEqual({ kind: "terminal-no-report" });
-      expect(result.read).toEqual({ kind: "terminal-no-report" });
+      expect(result.waited).toMatchObject({ kind: "terminal-no-report" });
+      expect(result.read).toMatchObject({ kind: "terminal-no-report" });
     });
 
     test("stale settlement: A's stop settlement landing after backend B reawakened the row must not end a waiter as terminal-no-report", async () => {
@@ -4033,7 +4033,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         settlement: result.attemptA,
         settlementPhase: "settled",
       });
-      expect(result.outcome).toEqual({ kind: "terminal-no-report" });
+      expect(result.outcome).toMatchObject({ kind: "terminal-no-report" });
     });
 
     test("shared-desktop abort: a user abort of A whose row backend B re-admitted before the handler's edit leaves B running and B's id open", async () => {
@@ -4048,7 +4048,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
 
     test("stale settlement: B's admission during the outcome read's report-artifact await is not read as A's end", async () => {
       const result = await runStopSettlement({ successorAdmitted: false });
-      expect(result.read).toEqual({ kind: "terminal-no-report" });
+      expect(result.read).toMatchObject({ kind: "terminal-no-report" });
       // The read loads the row, then awaits the report artifact: B's admission lands there.
       const realRead = subagentReportArtifacts.readSubagentReportArtifactStrict;
       const readSpy = spyOn(

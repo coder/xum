@@ -2,6 +2,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, expect, mock, test } from "bun:test";
+import assert from "@/common/utils/assert";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -72,6 +73,8 @@ function createDeferred() {
   return { promise, resolve, reject };
 }
 
+const PRIOR_ATTEMPT_ID = "att_00000000000000d1";
+
 /** Prior attempts read as live; a task's outcome is settled without a report only after its wait rejected. */
 function createLiveUntilWaitedOutcomes() {
   const waited = new Set<string>();
@@ -79,7 +82,7 @@ function createLiveUntilWaitedOutcomes() {
     taskId: string
   ): Promise<TaskAttemptOutcome<WorkflowAgentResult>> =>
     waited.has(taskId)
-      ? { kind: "terminal-no-report" }
+      ? { kind: "terminal-no-report", attemptId: PRIOR_ATTEMPT_ID }
       : { kind: "live", executionId: `exec_${taskId}` };
   return { waited, readSettledAgentResult };
 }
@@ -91,7 +94,42 @@ const liveOutcome = async (taskId: string): Promise<TaskAttemptOutcome<WorkflowA
 
 const terminalNoReportOutcome = async (): Promise<TaskAttemptOutcome<WorkflowAgentResult>> => ({
   kind: "terminal-no-report",
+  attemptId: PRIOR_ATTEMPT_ID,
 });
+
+/** A replacement retires the ended attempt first (G2); these tests only need the claim granted. */
+const acceptClaim = async () => ({ success: true as const, nonce: "nonce-test" });
+
+/**
+ * A replacement is reserved through createAgentTasks (G2: runAgent's one-by-one create() cannot
+ * consume a claim): route reservations to the test's runAgent and answer their waits with its
+ * result, while the prior attempt's waits keep the test's behavior.
+ */
+function withReservedReplacement(adapter: WorkflowTaskAdapter): WorkflowTaskAdapter {
+  const results = new Map<string, WorkflowAgentResult>();
+  return {
+    ...adapter,
+    async createAgentTasks(specs, lifecycle) {
+      const created: Array<{ taskId: string; status: "running" }> = [];
+      for (const [index, spec] of specs.entries()) {
+        const result = await adapter.runAgent(spec);
+        results.set(result.taskId, result);
+        await lifecycle?.onTaskCreated?.(index, result.taskId);
+        created.push({ taskId: result.taskId, status: "running" });
+      }
+      return created;
+    },
+    async waitForAgentTask(taskId, spec, waitOptions) {
+      const result = results.get(taskId);
+      if (result != null) return result;
+      assert(
+        adapter.waitForAgentTask != null,
+        "withReservedReplacement: the prior attempt needs a wait"
+      );
+      return await adapter.waitForAgentTask(taskId, spec, waitOptions);
+    },
+  };
+}
 
 describe("WorkflowRunner", () => {
   test("runs onRunEnded after a successful workflow", async () => {
@@ -1629,6 +1667,7 @@ describe("WorkflowRunner", () => {
         return [{ taskId: "task_restarted", status: "running" }];
       },
       readSettledAgentResult: outcomes.readSettledAgentResult,
+      claimRetiredAttempt: acceptClaim,
       async waitForAgentTask(taskId, _spec, waitOptions) {
         waitCalls.push(taskId);
         if (taskId === "task_missing") {
@@ -2859,18 +2898,22 @@ describe("WorkflowRunner", () => {
     let runAgentCalls = 0;
     const waitedFor: string[] = [];
     const outcomes = createLiveUntilWaitedOutcomes();
-    const runner = createRunner(store, {
-      async runAgent() {
-        runAgentCalls += 1;
-        return { taskId: "task_recovered", reportMarkdown: "summary", structuredOutput: {} };
-      },
-      readSettledAgentResult: outcomes.readSettledAgentResult,
-      async waitForAgentTask(taskId) {
-        waitedFor.push(taskId);
-        outcomes.waited.add(taskId);
-        throw new Error("Task not found");
-      },
-    });
+    const runner = createRunner(
+      store,
+      withReservedReplacement({
+        async runAgent() {
+          runAgentCalls += 1;
+          return { taskId: "task_recovered", reportMarkdown: "summary", structuredOutput: {} };
+        },
+        readSettledAgentResult: outcomes.readSettledAgentResult,
+        claimRetiredAttempt: acceptClaim,
+        async waitForAgentTask(taskId) {
+          waitedFor.push(taskId);
+          outcomes.waited.add(taskId);
+          throw new Error("Task not found");
+        },
+      })
+    );
 
     await expect(runner.run("wfr_123")).resolves.toEqual({ reportMarkdown: "Final: summary" });
     const run = await store.getRun("wfr_123");
@@ -2937,18 +2980,22 @@ describe("WorkflowRunner", () => {
     });
     const waitedFor: string[] = [];
     const outcomes = createLiveUntilWaitedOutcomes();
-    const runner = createRunner(store, {
-      async runAgent(spec) {
-        expect(spec.outputSchema).toBeUndefined();
-        return { taskId: "task_legacy_recovered", reportMarkdown: "summary" };
-      },
-      readSettledAgentResult: outcomes.readSettledAgentResult,
-      async waitForAgentTask(taskId) {
-        waitedFor.push(taskId);
-        outcomes.waited.add(taskId);
-        throw new Error("Task not found");
-      },
-    });
+    const runner = createRunner(
+      store,
+      withReservedReplacement({
+        async runAgent(spec) {
+          expect(spec.outputSchema).toBeUndefined();
+          return { taskId: "task_legacy_recovered", reportMarkdown: "summary" };
+        },
+        readSettledAgentResult: outcomes.readSettledAgentResult,
+        claimRetiredAttempt: acceptClaim,
+        async waitForAgentTask(taskId) {
+          waitedFor.push(taskId);
+          outcomes.waited.add(taskId);
+          throw new Error("Task not found");
+        },
+      })
+    );
 
     await expect(runner.run("wfr_legacy_stale_started_invalid_schema")).resolves.toEqual({
       reportMarkdown: "Final: summary",
@@ -2990,20 +3037,24 @@ describe("WorkflowRunner", () => {
     const waitedFor: string[] = [];
     let runAgentCalls = 0;
     const outcomes = createLiveUntilWaitedOutcomes();
-    const runner = createRunner(store, {
-      async runAgent(spec) {
-        runAgentCalls += 1;
-        expect(spec.outputSchema).toBeUndefined();
-        expect(spec.markdownOnly).toBe(true);
-        return { taskId: "task_legacy_recovered", reportMarkdown: "summary" };
-      },
-      readSettledAgentResult: outcomes.readSettledAgentResult,
-      async waitForAgentTask(taskId) {
-        waitedFor.push(taskId);
-        outcomes.waited.add(taskId);
-        throw new Error("Task not found");
-      },
-    });
+    const runner = createRunner(
+      store,
+      withReservedReplacement({
+        async runAgent(spec) {
+          runAgentCalls += 1;
+          expect(spec.outputSchema).toBeUndefined();
+          expect(spec.markdownOnly).toBe(true);
+          return { taskId: "task_legacy_recovered", reportMarkdown: "summary" };
+        },
+        readSettledAgentResult: outcomes.readSettledAgentResult,
+        claimRetiredAttempt: acceptClaim,
+        async waitForAgentTask(taskId) {
+          waitedFor.push(taskId);
+          outcomes.waited.add(taskId);
+          throw new Error("Task not found");
+        },
+      })
+    );
 
     await expect(runner.run("wfr_legacy_stale_started")).resolves.toEqual({
       reportMarkdown: "Final: summary",
@@ -3051,19 +3102,23 @@ describe("WorkflowRunner", () => {
     await store.appendStatus("wfr_123", "interrupted", "2026-05-29T00:00:00.750Z");
     let runAgentCalls = 0;
     const waitedFor: string[] = [];
-    const runner = createRunner(store, {
-      async runAgent() {
-        runAgentCalls += 1;
-        return { taskId: "task_restarted", reportMarkdown: "summary", structuredOutput: {} };
-      },
-      // The prior attempt settled without a report before the interruption: only this positive
-      // evidence (never the interrupted status alone) authorizes a replacement.
-      readSettledAgentResult: terminalNoReportOutcome,
-      async waitForAgentTask(taskId) {
-        waitedFor.push(taskId);
-        throw new Error("settled task should not be awaited");
-      },
-    });
+    const runner = createRunner(
+      store,
+      withReservedReplacement({
+        async runAgent() {
+          runAgentCalls += 1;
+          return { taskId: "task_restarted", reportMarkdown: "summary", structuredOutput: {} };
+        },
+        // The prior attempt settled without a report before the interruption: only this positive
+        // evidence (never the interrupted status alone) authorizes a replacement.
+        readSettledAgentResult: terminalNoReportOutcome,
+        claimRetiredAttempt: acceptClaim,
+        async waitForAgentTask(taskId) {
+          waitedFor.push(taskId);
+          throw new Error("settled task should not be awaited");
+        },
+      })
+    );
 
     await expect(runner.run("wfr_123", { allowResumeFromInterrupted: true })).resolves.toEqual({
       reportMarkdown: "Final: summary",
