@@ -38,7 +38,7 @@ const summarizeHash = hashWorkflowStepInput(summarizeSpec.id, summarizeSpec);
 /**
  * WorkflowRunner.run() clears its renewal interval before releasing the lease, but a renewal tick
  * that was already in flight keeps retrying the lease mutation lock (jittered backoff) and can
- * re-create `lease.json.lock` AFTER run() settled. acquireLease deliberately does not wait through
+ * re-create `lease.json.xlock` AFTER run() settled. acquireLease deliberately does not wait through
  * that lock, so a back-to-back run() would see a spurious "already active" (lease: null). Polling
  * the lock directory is a TOCTOU (absent at stat time, re-created before mkdir); awaiting the
  * in-flight renewal promises themselves is the deterministic barrier.

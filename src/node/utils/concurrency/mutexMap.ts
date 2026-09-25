@@ -46,4 +46,62 @@ export class MutexMap<K> {
       }
     }
   }
+
+  /**
+   * Like withLock, but stops waiting at `deadline` (epoch ms) and returns `{ kind: "timeout" }`.
+   * Giving up only leaves the queue: the current holder keeps the key, and the abandoned place,
+   * once reached, releases at once without running `operation`. Once entered, `operation` runs to
+   * completion; the deadline never detaches it.
+   */
+  async withLockBounded<T>(
+    key: K,
+    operation: () => Promise<T>,
+    deadline: number
+  ): Promise<{ kind: "ok"; value: T } | { kind: "timeout" }> {
+    let entered = false;
+    let abandoned = false;
+    const run = this.withLock(key, async (): Promise<T | undefined> => {
+      if (abandoned) return undefined;
+      entered = true;
+      return await operation();
+    });
+    return await new Promise((resolve, reject) => {
+      // A timer (never a synchronous check) even for a past deadline: an uncontended key is
+      // entered in a microtask, before any timer can fire, so it is never refused.
+      const timer = setTimeout(
+        () => {
+          if (entered || abandoned) return;
+          abandoned = true;
+          resolve({ kind: "timeout" });
+        },
+        Math.max(0, deadline - Date.now())
+      );
+      timer.unref?.();
+      run.then(
+        (value) => {
+          clearTimeout(timer);
+          if (!abandoned) resolve({ kind: "ok", value: value as T });
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          if (!abandoned) reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      );
+    });
+  }
+
+  /**
+   * Like withLock, but never queues: when any operation holds or awaits `key` right now, returns
+   * `{ acquired: false }` without running `operation`. The check and withLock's synchronous
+   * `locks.set` run in the same tick, so no other caller can slip in between.
+   */
+  async tryWithLock<T>(
+    key: K,
+    operation: () => Promise<T>
+  ): Promise<{ acquired: true; value: T } | { acquired: false }> {
+    if (this.locks.has(key)) {
+      return { acquired: false };
+    }
+    return { acquired: true, value: await this.withLock(key, operation) };
+  }
 }
