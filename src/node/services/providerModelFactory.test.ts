@@ -1941,6 +1941,131 @@ describe("ProviderModelFactory Codex authentication", () => {
     });
   });
 });
+describe("ProviderModelFactory.resolveGatewayModelString (mux gateway)", () => {
+  // Raw file writes (not editConfig/saveProvidersConfig) keep the legacy
+  // muxGateway* config keys exactly as older configs persist them.
+  async function writeMainConfig(config: Config, mainConfig: object): Promise<void> {
+    await writeFile(
+      path.join(config.rootDir, "config.json"),
+      JSON.stringify({ projects: [], ...mainConfig }, null, 2),
+      "utf-8"
+    );
+  }
+
+  async function writeProvidersConfig(config: Config, providersConfig: object): Promise<void> {
+    await writeFile(
+      path.join(config.rootDir, "providers.jsonc"),
+      JSON.stringify(providersConfig, null, 2),
+      "utf-8"
+    );
+  }
+
+  function toGatewayModelString(modelString: string): string {
+    const colonIndex = modelString.indexOf(":");
+    const provider = colonIndex === -1 ? modelString : modelString.slice(0, colonIndex);
+    const modelId = colonIndex === -1 ? "" : modelString.slice(colonIndex + 1);
+    return `mux-gateway:${provider}/${modelId}`;
+  }
+
+  it("routes allowlisted models when gateway is enabled + configured", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+
+      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.SONNET.id));
+    });
+  });
+
+  it("does not route when the mux-gateway provider is disabled", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        routePriority: ["mux-gateway", "direct"],
+      });
+      await writeProvidersConfig(config, {
+        anthropic: { apiKey: "sk-ant-test" },
+        "mux-gateway": {
+          couponCode: "test-coupon",
+          enabled: false,
+        },
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+
+      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
+    });
+  });
+
+  it("does not route when gateway is not configured", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+
+      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
+    });
+  });
+
+  it("does not route unsupported providers even when allowlisted", async () => {
+    await withTempConfig(async (config, factory) => {
+      const modelString = "openrouter:some-model";
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [modelString],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(modelString);
+
+      expect(resolved).toBe(modelString);
+    });
+  });
+
+  it("routes model variants when the base model is allowlisted via modelKey", async () => {
+    await withTempConfig(async (config, factory) => {
+      const variant = "xai:grok-4-1-fast-reasoning";
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: ["xai:grok-4-1-fast"],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(variant, "xai:grok-4-1-fast");
+
+      expect(resolved).toBe(toGatewayModelString(variant));
+    });
+  });
+
+  it("honors explicit mux-gateway prefixes from legacy clients", async () => {
+    await withTempConfig(async (config, factory) => {
+      await writeMainConfig(config, {
+        muxGatewayEnabled: true,
+        muxGatewayModels: [],
+      });
+      await writeProvidersConfig(config, {
+        "mux-gateway": { couponCode: "test-coupon" },
+      });
+
+      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.GPT.id, undefined, true);
+
+      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.GPT.id));
+    });
+  });
+});
+
 describe("ProviderModelFactory routing", () => {
   it("honors non-mux gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
