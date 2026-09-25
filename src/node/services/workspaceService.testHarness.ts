@@ -7,8 +7,8 @@ import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
-import type { Config, SecretsStore } from "@/node/config";
-import type { HistoryService } from "./historyService";
+import type { Config } from "@/node/config";
+import { HistoryService } from "./historyService";
 import type { AIService } from "./aiService";
 import { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -144,9 +144,7 @@ export function createMockAIService(overrides: Partial<AIService> = {}): AIServi
 }
 
 export interface WorkspaceServiceForTestOptions {
-  config:
-    | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
-    | Config;
+  config: Config;
   historyService?: HistoryService;
   aiService?: AIService;
   initStateManager?: InitStateManager;
@@ -162,17 +160,15 @@ export interface WorkspaceServiceForTestOptions {
 }
 
 /**
- * Low-level constructor for tests that already own their stores. Prefer
- * createWorkspaceServiceHarness, which also owns a real Config and HistoryService.
+ * Low-level constructor for tests that already own their Config. Omitted stores default to
+ * real instances rooted in that Config. Prefer createWorkspaceServiceHarness, which also
+ * owns the temp root and its cleanup.
  */
 export function createWorkspaceServiceForTest(
   options: WorkspaceServiceForTestOptions
 ): WorkspaceService {
-  // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
-  // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
-  const defaultHistoryService: HistoryService = {} as HistoryService;
-  const config = options.config as Config;
-  const historyService = options.historyService ?? defaultHistoryService;
+  const config = options.config;
+  const historyService = options.historyService ?? new HistoryService(config);
   const aiService = options.aiService ?? createMockAIService();
   return new WorkspaceService(
     config,
@@ -185,8 +181,9 @@ export function createWorkspaceServiceForTest(
       sessionUsageService: options.sessionUsageService,
       telemetryService: options.telemetryService,
     }),
-    options.initStateManager ?? (mockInitStateManager as InitStateManager),
-    options.extensionMetadata ?? (mockExtensionMetadataService as ExtensionMetadataService),
+    options.initStateManager ?? new InitStateManager(config),
+    options.extensionMetadata ??
+      new ExtensionMetadataService(path.join(config.rootDir, "extensionMetadata.json")),
     options.backgroundProcessManager ?? createTestBackgroundProcessManager(),
     options.sessionUsageService,
     options.policyService,

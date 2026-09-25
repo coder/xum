@@ -10,6 +10,7 @@ import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/staged
 import {
   mockInitStateManager,
   createWorkspaceServiceForTest,
+  createWorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
 describe("WorkspaceService.getHistoryLoadMore", () => {
@@ -106,8 +107,9 @@ describe("WorkspaceService.stageAttachment", () => {
 });
 
 describe("WorkspaceService.setActiveTurnThinkingLevel", () => {
-  test("returns accepted:false when the workspace has no session", () => {
-    const workspaceService = createWorkspaceServiceForTest({ config: {} });
+  test("returns accepted:false when the workspace has no session", async () => {
+    await using harness = await createWorkspaceServiceHarness();
+    const workspaceService = harness.service;
     // No session was ever created for this workspace: nothing is running, so
     // the mid-turn override is a no-op and persisted settings cover the next turn.
     const result = workspaceService.setActiveTurnThinkingLevel("unknown-workspace", "high");
