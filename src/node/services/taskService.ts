@@ -16526,27 +16526,12 @@ export class TaskService implements AgentTaskIntegration {
     if (transitionedToInterrupted) {
       this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
     }
-    if (stopRecord != null) {
-      this.markWorkspaceStopPersisted(workspaceId);
-      // Phase B for the single task: clearQueue + stopStream against the captured execution;
-      // release (and the in-memory settlement) follows the captured turn's own settlement.
-      await this.runWorkspaceStopCleanup([workspaceId], {
-        label: "failAgentTaskTerminally",
-        abandonPartial: false,
-        clearQueue: true,
-      });
-    } else {
-      this.workspaceService.clearQueue(workspaceId);
-      // Idle terminal settlement: nothing live was admitted before the closure above.
-      await this.persistOwnedAttemptSettlement(
-        workspaceId,
-        ownedAttempt,
-        "idle-settled",
-        "terminal-failure"
-      );
-    }
-    await this.emitWorkspaceMetadata(workspaceId);
-
+    // The failure artifacts land BEFORE either settlement branch writes the settlement receipt
+    // (idle: persistOwnedAttemptSettlement; stop: the record's release). Another backend reads
+    // the receipt as "ended without a report" unless it also finds the failure, and would then
+    // replace a child that must fail its step (onRefusal: "fail"). Still after the superseded
+    // checks above, so a call decided for another attempt writes nothing. A failed artifact
+    // write is only logged (known gap: a later restart could then replace the child).
     if (parentWorkspaceId) {
       const cfg = this.config.loadConfigOrDefault();
       const index = this.buildAgentTaskIndex(cfg);
@@ -16587,6 +16572,27 @@ export class TaskService implements AgentTaskIntegration {
         }
       }
     }
+
+    if (stopRecord != null) {
+      this.markWorkspaceStopPersisted(workspaceId);
+      // Phase B for the single task: clearQueue + stopStream against the captured execution;
+      // release (and the in-memory settlement) follows the captured turn's own settlement.
+      await this.runWorkspaceStopCleanup([workspaceId], {
+        label: "failAgentTaskTerminally",
+        abandonPartial: false,
+        clearQueue: true,
+      });
+    } else {
+      this.workspaceService.clearQueue(workspaceId);
+      // Idle terminal settlement: nothing live was admitted before the closure above.
+      await this.persistOwnedAttemptSettlement(
+        workspaceId,
+        ownedAttempt,
+        "idle-settled",
+        "terminal-failure"
+      );
+    }
+    await this.emitWorkspaceMetadata(workspaceId);
 
     // Captured before settlement: rejectWaiters consumes the pending waiters
     // that prove a parent turn is actively listening for this task.
