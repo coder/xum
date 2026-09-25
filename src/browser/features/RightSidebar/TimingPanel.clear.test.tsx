@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { installDom } from "../../../../tests/ui/dom";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import type { WorkspaceStatsSnapshot } from "@/common/orpc/types";
@@ -71,7 +71,7 @@ describe("TimingPanel clear", () => {
 
     try {
       const view = render(
-        <APIProvider client={client as APIClient}>
+        <APIProvider client={client}>
           <TimingPanel workspaceId={WORKSPACE_ID} />
         </APIProvider>
       );

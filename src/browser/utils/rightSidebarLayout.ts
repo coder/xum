@@ -804,4 +804,3 @@ export function dockTabToEdge(
     root: newRoot,
   };
 }
-
