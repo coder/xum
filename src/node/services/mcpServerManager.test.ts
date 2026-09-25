@@ -3527,7 +3527,9 @@ describe("MCPServerManager", () => {
       configService.listServers = mock(() => Promise.resolve({ ...configs }));
       const serveEcho = (command: string) => {
         // Modern clients get background tools/list refreshes on cached serves.
-        const listTools = mock(() => Promise.resolve({ echo: testTool() }));
+        // Each server's tool answers with its own command, so a swapped retained
+        // client is observable through the served tools.
+        const listTools = mock(() => Promise.resolve({ echo: testTool(command) }));
         const close = mock(() => Promise.resolve(undefined));
         servers.serve(command, { era: "modern", listTools, prompts: [{ name: "review" }], close });
         return { listTools, close };
@@ -3555,9 +3557,9 @@ describe("MCPServerManager", () => {
         expect(ordinary.close).not.toHaveBeenCalled();
         expect(existing.close).not.toHaveBeenCalled();
         expect(Object.keys(first.tools).sort()).toEqual(["ordinary_echo", "plugin_existing_echo"]);
-        expect(result.tools.plugin_existing_echo).toBeDefined();
-        expect(result.tools.ordinary_echo).toBeDefined();
-        expect(result.tools[`${pluginKey}_echo`]).toBeDefined();
+        expect(await result.tools.plugin_existing_echo.execute!({}, {} as never)).toBe("existing");
+        expect(await result.tools.ordinary_echo.execute!({}, {} as never)).toBe("ordinary");
+        expect(await result.tools[`${pluginKey}_echo`].execute!({}, {} as never)).toBe("selected");
         expect(result.stats.startedServerCount).toBe(3);
         expect(result.promptDescriptors.map((prompt) => prompt.serverName).sort()).toEqual(
           ["ordinary", "plugin_existing", pluginKey].sort()
