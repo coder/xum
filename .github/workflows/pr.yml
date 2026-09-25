@@ -668,30 +668,34 @@ jobs:
       actions: read
     steps:
       # A push that updates both a stacked PR's head and its base branch starts two
-      # pull_request runs for the same head SHA; the concurrency group cancels one, and
-      # its red Required blocked the PR although the sibling passed (#4547). Stand down
-      # only when this run was cancelled before Detect Changes finished (the duplicate
-      # is cancelled within a second) and another run for the same SHA was not: that run
-      # publishes the real result. Anything else, including a query error, still fails
-      # below. (Not cancelled(): in cancelled run 36124817306 this job's default
-      # success() step still ran, so the job does not see itself as cancelled.)
+      # pull_request runs for the same head SHA; the concurrency group cancels the older
+      # one, and its red Required blocked the PR although the sibling passed (#4547).
+      # When a need was cancelled and none failed, stand down only if a run of this
+      # workflow for the same PR and head SHA started at or after this one and publishes
+      # its own Required: still running, or completed with success/failure
+      # (startup_failure, action_required, stale and cancelled runs never report one).
+      # Older runs never count, so a historical pass against an older base cannot stand
+      # in. Anything else, including a query error, still fails below.
       - id: superseded
-        if: needs.changes.result == 'cancelled' && github.event_name == 'pull_request'
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(join(needs.*.result, ' '), 'cancelled') &&
+          !contains(join(needs.*.result, ' '), 'failure')
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        # A sibling counts only if it belongs to this PR (the same commit can head PRs
-        # against other bases) and publishes its own Required: still running, or
-        # completed with success/failure. startup_failure, action_required, stale and
-        # cancelled runs never report one.
         run: |
           set -euo pipefail
-          siblings=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
-            --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)
-              | select(any(.pull_requests[]; .number == $PR_NUMBER))
-              | select(.status != \"completed\" or .conclusion == \"success\" or .conclusion == \"failure\")] | length")
-          echo "Other runs for PR #$PR_NUMBER at $HEAD_SHA that report Required: $siblings"
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100")
+          started=$(jq -r --argjson id "$GITHUB_RUN_ID" '.workflow_runs[] | select(.id == $id) | .run_started_at' <<<"$runs")
+          [[ -n "$started" ]]
+          siblings=$(jq --argjson id "$GITHUB_RUN_ID" --argjson pr "$PR_NUMBER" --arg started "$started" '
+            [.workflow_runs[] | select(.id != $id and .run_started_at >= $started)
+              | select(any(.pull_requests[]; .number == $pr))
+              | select(.status != "completed" or .conclusion == "success" or .conclusion == "failure")]
+            | length' <<<"$runs")
+          echo "Newer runs for PR #$PR_NUMBER at $HEAD_SHA that report Required: $siblings"
           if ((siblings > 0)); then
             echo "value=true" >>"$GITHUB_OUTPUT"
           fi
@@ -701,7 +705,7 @@ jobs:
         run: |
           echo "Job results: $RESULTS"
           if [[ "$SUPERSEDED" == "true" ]]; then
-            echo "⏭️ Run cancelled; another run for this commit reports Required"
+            echo "⏭️ Superseded; a newer run for this commit reports Required"
             exit 0
           fi
           for result in $RESULTS; do
