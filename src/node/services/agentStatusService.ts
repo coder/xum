@@ -564,7 +564,10 @@ export class AgentStatusService {
     // A durable manual reset is a privacy floor: the user discarded everything before it,
     // so a short post-reset conversation must not be topped up with pre-reset rows (the
     // scan would otherwise continue into the archive). The reset marker row itself is
-    // structure, not conversation.
+    // structure, not conversation. Only WELL-FORMED reset markers stop this scan:
+    // iterateFullHistory skips unreadable rows, so a malformed reset row does not act as a
+    // floor here (the raw-aware provider reader, getHistoryFromLatestBoundary, also stops at
+    // compaction boundaries and reads the whole epoch, so it is not a drop-in replacement).
     const newestFirst: MuxMessage[] = [];
     const scanned = await this.historyService.iterateFullHistory(
       workspaceId,
