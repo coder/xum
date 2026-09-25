@@ -3,14 +3,9 @@ import "../../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import type { UpdateStatus } from "@/common/orpc/types";
-import type * as APIModule from "@/browser/contexts/API";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import * as realAPI from "@/browser/contexts/API";
 import { ThemeProvider } from "../../contexts/ThemeContext";
-
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
 
 // SVG ?react imports don't work in happy-dom; stub them as simple svgs.
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
@@ -54,24 +49,6 @@ let apiState: { api: APIClient | null; status: "connected" | "reconnecting" } = 
   status: "reconnecting",
 };
 
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualAPI = require("@/browser/contexts/API?real=1") as typeof APIModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
-
-// Spread the real module: replacing it outright deletes exports other test files import
-// statically (module mocks are process-wide and persist across files).
-void mock.module("@/browser/contexts/API", () => ({
-  ...actualAPI,
-  useAPI: () => ({
-    api: apiState.api,
-    status: apiState.status,
-    error: null,
-    attempt: 1,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
-
 import type { UpdateRestartOverlay as UpdateRestartOverlayComponent } from "./UpdateRestartOverlay";
 
 // Required after the mocks above so the svg stubs are in place when LoadingScreen evaluates.
@@ -85,11 +62,31 @@ const {
 
 const OVERLAY = "update-restart-overlay";
 
+// Inject `apiState` through the real context instead of mocking the API module (module
+// mocks leak across suites). The wrapper reads `apiState` on every render, so rerenders
+// switch between connected and reconnecting without remounting the overlay.
+function MutableAPIWrapper(props: { children: React.ReactNode }) {
+  const authenticate = () => undefined;
+  const retry = () => undefined;
+  return (
+    <APIContext.Provider
+      value={
+        apiState.status === "connected" && apiState.api
+          ? { status: "connected", api: apiState.api, error: null, authenticate, retry }
+          : { status: "reconnecting", api: null, error: null, attempt: 1, authenticate, retry }
+      }
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
 function renderOverlay() {
   return render(
     <ThemeProvider>
       <UpdateRestartOverlay />
-    </ThemeProvider>
+    </ThemeProvider>,
+    { wrapper: MutableAPIWrapper }
   );
 }
 
