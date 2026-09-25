@@ -3,7 +3,7 @@
  */
 import { expect, afterEach, beforeEach } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { type TurnExecutionOptions } from "./streamManager";
+import { type TurnExecutionOptions, type WorkspaceStreamInfo } from "./streamManager";
 import { type LanguageModel } from "ai";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -95,13 +95,23 @@ export function createStreamResultForTests(
   };
 }
 
-export function createStreamInfoForTests(
-  overrides: Record<string, unknown> = {}
-): Record<string, unknown> {
+/**
+ * Hand-built WorkspaceStreamInfo for the few whitebox engine tests. Every real
+ * field is checked against the engine type; only the SDK stream result and the
+ * request config are loose fakes (tests supply just the fields the engine reads).
+ */
+export type StreamInfoFixture = Omit<Partial<WorkspaceStreamInfo>, "streamResult" | "request"> & {
+  streamResult?: Record<string, unknown>;
+  request?: Record<string, unknown>;
+};
+
+export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): StreamInfoFixture {
   const now = Date.now();
   const model = overrides.model ?? TEST_STREAM_MODEL_ID;
-  return {
-    state: "streaming",
+  const defaults = {
+    // StreamState is a module-private enum and StreamToken a brand: name the
+    // runtime values through the engine type.
+    state: "streaming" as WorkspaceStreamInfo["state"],
     streamResult: createStreamResultForTests(
       (async function* emptyStream() {
         await Promise.resolve();
@@ -110,12 +120,12 @@ export function createStreamInfoForTests(
     ),
     abortController: new AbortController(),
     messageId: "test-message",
-    token: "test-token",
+    token: "test-token" as WorkspaceStreamInfo["token"],
     startTime: now,
     lastPartTimestamp: now,
     toolCompletionTimestamps: new Map<string, number>(),
-    pendingWorkflowRunAttachments: new Map<string, unknown>(),
-    pendingNestedCalls: new Map<string, unknown[]>(),
+    pendingWorkflowRunAttachments: new Map(),
+    pendingNestedCalls: new Map(),
     pendingToolExecutionStarts: new Map<string, number>(),
     model,
     metadataModel: overrides.metadataModel ?? model,
@@ -124,10 +134,10 @@ export function createStreamInfoForTests(
     toolModelUsages: [],
     parts: [],
     lastPartialWriteTime: 0,
-    partialWriteTimer: undefined,
+    partialWriteFiber: undefined,
     partialWritePromise: undefined,
     processingPromise: Promise.resolve(),
-    softInterrupt: { pending: false as const },
+    softInterrupt: { pending: false },
     runtimeTempDir: "",
     runtime: LOCAL_TEST_RUNTIME,
     cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -137,6 +147,6 @@ export function createStreamInfoForTests(
     currentStepStartIndex: 0,
     stepStartIndices: [0],
     stepTracker: {},
-    ...overrides,
-  };
+  } satisfies StreamInfoFixture;
+  return { ...defaults, ...overrides };
 }

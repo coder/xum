@@ -110,27 +110,26 @@ describe("StreamManager - exact step indices", () => {
     expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
   });
 
-  test.each([true, false])(
-    "retry reset preserves or discards step indices with parts: %s",
-    async (preserveParts) => {
-      const streamManager = new StreamManager(historyService);
-      const streamInfo = createStreamInfoForTests({
-        parts: [{ type: "text", text: "preserved", timestamp: 1 }],
-        stepStartIndices: [0, 1, 3],
-      });
-      const reset = engineInternals(streamManager).resetStreamStateForRetry;
-      await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts });
-      expect(streamInfo.stepStartIndices).toEqual(preserveParts ? [0, 1] : [0]);
-      expect(streamInfo.currentStepStartIndex).toBe(preserveParts ? 1 : 0);
-      const buildPartial = engineInternals(streamManager).buildPartialAssistantMessage;
-      const partial = buildPartial.call(streamManager, streamInfo);
-      expect(partial.metadata?.stepStartPartIndices).toEqual(preserveParts ? [0] : []);
-      await historyService.writePartial("step-reset-workspace", partial);
-      expect(
-        (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
-      ).toEqual(preserveParts ? [0] : []);
-    }
-  );
+  // The preserve-parts reset is proven publicly by errorRecovery's step-boundary
+  // previousResponseId retry, which commits stepStartPartIndices [0, 1].
+  test("retry reset discards step indices together with discarded parts", async () => {
+    const streamManager = new StreamManager(historyService);
+    const streamInfo = createStreamInfoForTests({
+      parts: [{ type: "text", text: "discarded", timestamp: 1 }],
+      stepStartIndices: [0, 1, 3],
+    });
+    const reset = engineInternals(streamManager).resetStreamStateForRetry;
+    await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts: false });
+    expect(streamInfo.stepStartIndices).toEqual([0]);
+    expect(streamInfo.currentStepStartIndex).toBe(0);
+    const buildPartial = engineInternals(streamManager).buildPartialAssistantMessage;
+    const partial = buildPartial.call(streamManager, streamInfo);
+    expect(partial.metadata?.stepStartPartIndices).toEqual([]);
+    await historyService.writePartial("step-reset-workspace", partial);
+    expect(
+      (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
+    ).toEqual([]);
+  });
 });
 
 describe("StreamManager - empty stream completions", () => {
