@@ -337,6 +337,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       );
     },
   });
+  // The menu bar is reused across workspaces. Render-time adjustment (not an effect): a
+  // confirmation for another workspace, including one opened by a preflight that resolved after
+  // navigation, must never show over (or be confirmed from) the workspace now in view.
+  if (
+    archiveFlow.confirmationWorkspaceId !== null &&
+    archiveFlow.confirmationWorkspaceId !== workspaceId
+  ) {
+    archiveFlow.cancel();
+  }
   const handleArchiveChat = (anchorEl?: HTMLElement) =>
     archiveFlow.requestArchive(workspaceId, anchorEl);
 

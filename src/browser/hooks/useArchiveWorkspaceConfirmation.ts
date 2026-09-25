@@ -145,5 +145,11 @@ export function useArchiveWorkspaceConfirmation(options: UseArchiveWorkspaceConf
     onCancel: () => setConfirmation(null),
   };
 
-  return { requestArchive, modalProps };
+  return {
+    requestArchive,
+    modalProps,
+    /** Workspace the open confirmation targets, or null when closed. */
+    confirmationWorkspaceId: confirmation?.workspaceId ?? null,
+    cancel: () => setConfirmation(null),
+  };
 }

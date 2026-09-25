@@ -862,4 +862,33 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(archiveWorkspaceMock).not.toHaveBeenCalled();
     expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
   });
+
+  it("does not show another workspace's archive confirmation after navigating away", async () => {
+    let resolvePreflight: ((result: ArchivePreflightActionResult) => void) | undefined;
+    preflightArchiveWorkspaceMock = mock(
+      (_workspaceId: string) =>
+        new Promise<ArchivePreflightActionResult>((resolve) => {
+          resolvePreflight = resolve;
+        })
+    );
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+    act(() => {
+      fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
+    });
+    await waitFor(() => expect(resolvePreflight).toBeDefined());
+
+    // The menu bar is reused when the user switches workspaces mid-preflight.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    await act(async () => {
+      resolvePreflight?.({
+        success: true,
+        data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt"] },
+      });
+      await Promise.resolve();
+    });
+
+    expect(view.queryByTestId("archive-confirmation-modal")).toBeNull();
+    expect(archiveWorkspaceMock).not.toHaveBeenCalled();
+  });
 });
