@@ -3,35 +3,123 @@ import * as fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { StreamAbortEventSchema } from "@/common/orpc/schemas/stream";
-import { Err } from "@/common/types/result";
-import { StreamManager, type TurnEngineEvent } from "./streamManager";
+import { Err, Ok } from "@/common/types/result";
+import { StreamManager, type TurnEngineEvent, type TurnExecutionOptions } from "./streamManager";
 import { SessionUsageService } from "./sessionUsageService";
 import { createTestHistoryService } from "./testHistoryService";
+import type { HistoryService } from "./historyService";
 import { countTokens } from "@/node/utils/main/tokenizer";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
-import {
-  createStreamManagerForTests,
-  engineInternals,
-  onTurnEngineEvent,
-} from "./streamManager.testHarness";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
   appendPartialAssistantForTests,
   createStreamResultForTests,
-  createStreamInfoForTests,
+  createTestLanguageModel,
+  testStartOptions,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
 
-describe("StreamManager - TTFT metadata persistence", () => {
-  const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+/** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
+type ScriptedChunk = Record<string, unknown> | (() => unknown);
 
+/** One provider attempt served by the injected streamText (the primary turn, then each fallback). */
+interface ScriptedAttempt {
+  chunks: ScriptedChunk[];
+  /** streamResult usage/totalUsage for the attempt. */
+  usage?: Record<string, number>;
+  /** Keep the stream open after the chunks until the turn's abort signal fires. */
+  holdUntilAbort?: boolean;
+}
+
+const STOP_FINISH = { type: "finish", finishReason: "stop" };
+const REFUSAL_FINISH = {
+  type: "finish",
+  finishReason: "content-filter",
+  rawFinishReason: "refusal",
+};
+
+function finishStep(
+  usage: Record<string, number>,
+  providerMetadata?: Record<string, unknown>
+): Record<string, unknown> {
+  return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
+}
+
+/** Serves scripted attempts in order: one per streamText call. */
+function scriptedStreamText(attempts: ScriptedAttempt[]) {
+  const queue = [...attempts];
+  return fakeStreamText((request) => {
+    const attempt = queue.shift();
+    if (attempt === undefined) throw new Error("unexpected extra streamText call");
+    const signal = request.abortSignal!;
+    return createStreamResultForTests(
+      (async function* () {
+        await Promise.resolve();
+        for (const chunk of attempt.chunks) {
+          if (typeof chunk === "function") await chunk();
+          else yield chunk;
+        }
+        if (attempt.holdUntilAbort && !signal.aborted) {
+          await new Promise<void>((resolve) =>
+            signal.addEventListener("abort", () => resolve(), { once: true })
+          );
+        }
+      })(),
+      attempt.usage
+    );
+  });
+}
+
+/** Starts a public turn; callers await `completion` (or stop the stream first). */
+async function startTurnForTests(
+  streamManager: StreamManager,
+  options: Partial<TurnExecutionOptions> & { workspaceId: string; messageId: string }
+) {
+  await appendPartialAssistantForTests(
+    options.workspaceId,
+    options.messageId,
+    options.historySequence ?? 1
+  );
+  const result = await streamManager.startStream(
+    testStartOptions({
+      model: createTestLanguageModel(),
+      modelString: KNOWN_MODELS.SONNET.id,
+      providedRuntimeTempDir: "",
+      ...options,
+    })
+  );
+  if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result.error)}`);
+  return result.data;
+}
+
+async function readHistoryMessage(history: HistoryService, workspaceId: string, messageId: string) {
+  const historyResult = await history.getHistoryFromLatestBoundary(workspaceId);
+  if (!historyResult.success) throw new Error(historyResult.error);
+  const message = historyResult.data.find((candidate) => candidate.id === messageId);
+  if (!message) throw new Error(`Expected message ${messageId} in history`);
+  return message;
+}
+
+async function readSidecarRecords(
+  sessionsDir: string,
+  workspaceId: string
+): Promise<Array<Record<string, unknown>>> {
+  const sidecarPath = path.join(sessionsDir, workspaceId, "headless-usage.jsonl");
+  return (await fs.readFile(sidecarPath, "utf-8"))
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+describe("StreamManager - TTFT metadata persistence", () => {
   interface ToolModelUsageEventForTests {
     toolName: string;
     toolCallId?: string;
-    timestamp?: number;
+    timestamp: number;
     model: string;
     usage: {
       inputTokens: number;
@@ -42,21 +130,6 @@ describe("StreamManager - TTFT metadata persistence", () => {
     };
     providerMetadata?: Record<string, unknown>;
     metadataModel?: string;
-  }
-
-  function recordToolModelUsageForTests(
-    streamManager: StreamManager,
-    workspaceId: string,
-    messageId: string,
-    event: ToolModelUsageEventForTests
-  ): void {
-    const recordToolModelUsage = engineInternals(streamManager).recordToolModelUsage;
-    expect(typeof recordToolModelUsage).toBe("function");
-    if (typeof recordToolModelUsage !== "function") {
-      throw new Error("Expected StreamManager.recordToolModelUsage to exist");
-    }
-
-    recordToolModelUsage.call(streamManager, workspaceId, messageId, event);
   }
 
   function readToolModelUsages(message: { metadata?: unknown }): unknown[] | undefined {
@@ -87,144 +160,79 @@ describe("StreamManager - TTFT metadata persistence", () => {
     };
   }
 
-  async function finalizeStreamAndReadMessage(params: {
+  /** Runs one completed turn through startStream and returns its final history row. */
+  async function completeTurnAndReadMessage(params: {
     workspaceId: string;
     messageId: string;
-    historySequence: number;
-    startTime: number;
-    parts: unknown[];
-    initialMetadata?: Record<string, unknown>;
-    emitStartEvent?: boolean;
-    onStreamStart?: (event: Record<string, unknown>) => void;
-    onStreamEnd?: (event: { metadata?: Record<string, unknown> }) => void;
-    usage?: {
-      inputTokens: number;
-      outputTokens: number;
-      totalTokens: number;
-      reasoningTokens?: number;
-    };
-    model?: string;
-    metadataModel?: string;
+    historySequence?: number;
+    chunks: ScriptedChunk[];
+    usage?: Record<string, number>;
     streamManager?: StreamManager;
-    beforeProcess?: (params: {
-      streamManager: StreamManager;
-      workspaceId: string;
-      messageId: string;
-    }) => Promise<void> | void;
+    events?: TurnEngineEvent[];
+    options?: Partial<TurnExecutionOptions>;
+    fallbackAttempts?: ScriptedAttempt[];
   }) {
-    const streamManager = params.streamManager ?? createStreamManagerForTests(historyService);
-    // Suppress error events from bubbling up as uncaught exceptions during tests
-
-    if (params.onStreamStart) {
-      onTurnEngineEvent(streamManager, "stream-start", params.onStreamStart);
-    }
-    if (params.onStreamEnd) {
-      onTurnEngineEvent(streamManager, "stream-end", params.onStreamEnd);
-    }
-
-    await appendPartialAssistantForTests(
-      params.workspaceId,
-      params.messageId,
-      params.historySequence
-    );
-
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const usage = params.usage ?? { inputTokens: 4, outputTokens: 6, totalTokens: 10 };
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          // Tests pre-populate parts but still need the provider's terminal proof of completion.
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "stop" };
-        })(),
-        usage
-      ),
-      messageId: params.messageId,
-      startTime: params.startTime,
-      lastPartTimestamp: params.startTime,
-      model: params.model ?? KNOWN_MODELS.SONNET.id,
-      metadataModel: params.metadataModel ?? params.model ?? KNOWN_MODELS.SONNET.id,
-      historySequence: params.historySequence,
-      initialMetadata: params.initialMetadata,
-      parts: params.parts,
-      runtime,
-    });
-    engineInternals(streamManager).workspaceStreams.set(params.workspaceId, streamInfo);
-
-    if (params.beforeProcess) {
-      await params.beforeProcess({
-        streamManager,
-        workspaceId: params.workspaceId,
-        messageId: params.messageId,
+    const streamManager =
+      params.streamManager ??
+      createStreamManagerForTests(historyService, {
+        eventSink: (event) => {
+          params.events?.push(event);
+        },
+        streamText: scriptedStreamText([
+          {
+            chunks: params.chunks,
+            usage: params.usage ?? { inputTokens: 4, outputTokens: 6, totalTokens: 10 },
+          },
+          ...(params.fallbackAttempts ?? []),
+        ]),
       });
-    }
-
-    if (params.emitStartEvent) {
-      const emitStreamStart = engineInternals(streamManager).emitStreamStart;
-      emitStreamStart.call(streamManager, params.workspaceId, streamInfo, params.historySequence);
-    }
-
-    await processStreamWithCleanup.call(
-      streamManager,
-      params.workspaceId,
-      streamInfo,
-      params.historySequence
-    );
-
-    const historyResult = await historyService.getHistoryFromLatestBoundary(params.workspaceId);
-    expect(historyResult.success).toBe(true);
-    if (!historyResult.success) {
-      throw new Error(historyResult.error);
-    }
-
-    const updatedMessage = historyResult.data.find((message) => message.id === params.messageId);
-    expect(updatedMessage).toBeDefined();
-    if (!updatedMessage) {
-      throw new Error(`Expected updated message ${params.messageId} in history`);
-    }
-
-    return updatedMessage;
+    const handle = await startTurnForTests(streamManager, {
+      workspaceId: params.workspaceId,
+      messageId: params.messageId,
+      historySequence: params.historySequence ?? 1,
+      ...params.options,
+    });
+    expect((await handle.completion).status).toBe("completed");
+    return readHistoryMessage(historyService, params.workspaceId, params.messageId);
   }
 
+  const text = (value: string) => ({ type: "text-delta", text: value });
+  const reasoning = (value: string) => ({ type: "reasoning-delta", text: value });
+
   test("persists ttftMs in final assistant metadata when first-token timing is available", async () => {
-    const startTime = Date.now() - 1000;
-    const updatedMessage = await finalizeStreamAndReadMessage({
+    const firstTokenDelayMs = 30;
+    const turnStartedAt = Date.now();
+    const updatedMessage = await completeTurnAndReadMessage({
       workspaceId: "ttft-present-workspace",
       messageId: "ttft-present-message",
-      historySequence: 1,
-      startTime,
-      parts: [
-        {
-          type: "text",
-          text: "hello",
-          timestamp: startTime + 250,
-        },
+      chunks: [
+        () => new Promise((resolve) => setTimeout(resolve, firstTokenDelayMs)),
+        text("hello"),
+        STOP_FINISH,
       ],
     });
+    const turnDurationMs = Date.now() - turnStartedAt;
 
-    expect(updatedMessage.metadata?.ttftMs).toBe(250);
+    // Measured from stream start to the first text part: at least the provider's
+    // first-token delay, never longer than the whole turn.
+    expect(updatedMessage.metadata?.ttftMs).toBeGreaterThanOrEqual(firstTokenDelayMs - 5);
+    expect(updatedMessage.metadata?.ttftMs).toBeLessThanOrEqual(turnDurationMs);
   });
 
   test("omits ttftMs in final assistant metadata when first-token timing is unavailable", async () => {
-    const startTime = Date.now() - 1000;
-    const updatedMessage = await finalizeStreamAndReadMessage({
+    const updatedMessage = await completeTurnAndReadMessage({
       workspaceId: "ttft-missing-workspace",
       messageId: "ttft-missing-message",
-      historySequence: 1,
-      startTime,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "tool-1",
-          toolName: "bash",
-          state: "output-available",
-          input: { script: "echo hi" },
-          output: { ok: true },
-          timestamp: startTime + 100,
-        },
+      chunks: [
+        { type: "tool-call", toolCallId: "tool-1", toolName: "bash", input: { script: "echo hi" } },
+        { type: "tool-result", toolCallId: "tool-1", toolName: "bash", output: { ok: true } },
+        STOP_FINISH,
       ],
     });
 
+    expect(updatedMessage.parts).toMatchObject([
+      { type: "dynamic-tool", toolCallId: "tool-1", state: "output-available" },
+    ]);
     expect(updatedMessage.metadata?.ttftMs).toBeUndefined();
     expect(Object.prototype.hasOwnProperty.call(updatedMessage.metadata ?? {}, "ttftMs")).toBe(
       false
@@ -232,20 +240,19 @@ describe("StreamManager - TTFT metadata persistence", () => {
   });
 
   test("persists metadataModel alongside the raw model for analytics pricing", async () => {
-    const updatedMessage = await finalizeStreamAndReadMessage({
+    const providersConfigSnapshot: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "my-gpt4", mappedToModel: "openai:gpt-4" }],
+      },
+    };
+    const updatedMessage = await completeTurnAndReadMessage({
       workspaceId: "metadata-model-workspace",
       messageId: "metadata-model-message",
-      historySequence: 1,
-      startTime: Date.now() - 1000,
-      model: "openai:my-gpt4",
-      metadataModel: "openai:gpt-4",
-      parts: [
-        {
-          type: "text",
-          text: "hello",
-          timestamp: Date.now(),
-        },
-      ],
+      chunks: [text("hello"), STOP_FINISH],
+      options: { modelString: "openai:my-gpt4", providersConfigSnapshot },
     });
 
     expect(updatedMessage.metadata?.model).toBe("openai:my-gpt4");
@@ -253,42 +260,26 @@ describe("StreamManager - TTFT metadata persistence", () => {
   });
 
   test("emits and persists routeProvider from initial stream metadata", async () => {
-    const startTime = Date.now() - 1000;
-    let streamStartEvent: Record<string, unknown> | undefined;
-    let streamEndEvent: { metadata?: Record<string, unknown> } | undefined;
-
-    const updatedMessage = await finalizeStreamAndReadMessage({
+    const events: TurnEngineEvent[] = [];
+    const updatedMessage = await completeTurnAndReadMessage({
       workspaceId: "route-provider-workspace",
       messageId: "route-provider-message",
-      historySequence: 1,
-      startTime,
-      initialMetadata: {
-        routeProvider: "openrouter",
-        routedThroughGateway: true,
-      },
-      emitStartEvent: true,
-      onStreamStart: (event) => {
-        streamStartEvent = event;
-      },
-      onStreamEnd: (event) => {
-        streamEndEvent = event;
-      },
-      parts: [
-        {
-          type: "text",
-          text: "hello",
-          timestamp: startTime + 100,
+      events,
+      chunks: [text("hello"), STOP_FINISH],
+      options: {
+        initialMetadata: {
+          routeProvider: "openrouter",
+          routedThroughGateway: true,
         },
-      ],
+      },
     });
 
-    expect(streamStartEvent).toMatchObject({
+    expect(events.find((event) => event.type === "stream-start")).toMatchObject({
       routeProvider: "openrouter",
       routedThroughGateway: true,
     });
-    expect(streamEndEvent?.metadata).toMatchObject({
-      routeProvider: "openrouter",
-      routedThroughGateway: true,
+    expect(events.find((event) => event.type === "stream-end")).toMatchObject({
+      metadata: { routeProvider: "openrouter", routedThroughGateway: true },
     });
     expect(updatedMessage.metadata?.routeProvider).toBe("openrouter");
     expect(updatedMessage.metadata?.routedThroughGateway).toBe(true);
@@ -321,41 +312,35 @@ describe("StreamManager - TTFT metadata persistence", () => {
       providerMetadata: { anthropic: { cacheCreationInputTokens: 3 } },
     });
 
-    const updatedMessage = await finalizeStreamAndReadMessage({
-      workspaceId: "tool-usage-persist-workspace",
-      messageId: "tool-usage-persist-message",
-      historySequence: 1,
-      startTime,
-      beforeProcess: ({ streamManager, workspaceId, messageId }) => {
-        recordToolModelUsageForTests(streamManager, workspaceId, messageId, firstToolUsage);
-        recordToolModelUsageForTests(streamManager, workspaceId, messageId, secondToolUsage);
-      },
-      parts: [
+    const workspaceId = "tool-usage-persist-workspace";
+    const messageId = "tool-usage-persist-message";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
         {
-          type: "text",
-          text: "final response",
-          timestamp: startTime + 200,
+          chunks: [
+            () => streamManager.recordToolModelUsage(workspaceId, messageId, firstToolUsage),
+            () => streamManager.recordToolModelUsage(workspaceId, messageId, secondToolUsage),
+            text("final response"),
+            STOP_FINISH,
+          ],
         },
-      ],
+      ]),
+    });
+    const updatedMessage = await completeTurnAndReadMessage({
+      workspaceId,
+      messageId,
+      streamManager,
+      chunks: [],
     });
 
     expect(readToolModelUsages(updatedMessage)).toMatchObject([firstToolUsage, secondToolUsage]);
   });
 
   test("omits toolModelUsages when the assistant turn has no tool model usage", async () => {
-    const startTime = Date.now() - 1000;
-    const updatedMessage = await finalizeStreamAndReadMessage({
+    const updatedMessage = await completeTurnAndReadMessage({
       workspaceId: "tool-usage-empty-workspace",
       messageId: "tool-usage-empty-message",
-      historySequence: 1,
-      startTime,
-      parts: [
-        {
-          type: "text",
-          text: "no tool usage here",
-          timestamp: startTime + 150,
-        },
-      ],
+      chunks: [text("no tool usage here"), STOP_FINISH],
     });
 
     expect(readToolModelUsages(updatedMessage)).toBeUndefined();
@@ -366,41 +351,51 @@ describe("StreamManager - TTFT metadata persistence", () => {
 
   test("scopes tool model usage accumulation to the active assistant turn", async () => {
     const workspaceId = "tool-usage-scope-workspace";
-    const streamManager = createStreamManagerForTests(historyService);
-    const firstStartTime = Date.now() - 2000;
-    const firstMessage = await finalizeStreamAndReadMessage({
-      workspaceId,
-      messageId: "tool-usage-first-message",
-      historySequence: 1,
-      startTime: firstStartTime,
-      streamManager,
-      beforeProcess: ({ streamManager: activeStreamManager, workspaceId, messageId }) => {
-        recordToolModelUsageForTests(
-          activeStreamManager,
-          workspaceId,
-          messageId,
-          createToolModelUsageEvent({
-            toolName: "advisor",
-            toolCallId: "tool-call-first",
-            timestamp: firstStartTime + 25,
-            model: "anthropic:claude-sonnet-4-20250514",
-            usage: {
-              inputTokens: 24,
-              outputTokens: 6,
-              totalTokens: 30,
-            },
-          })
-        );
-      },
-      parts: [
+    const firstMessageId = "tool-usage-first-message";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
         {
-          type: "text",
-          text: "first response",
-          timestamp: firstStartTime + 100,
+          chunks: [
+            () =>
+              streamManager.recordToolModelUsage(
+                workspaceId,
+                firstMessageId,
+                createToolModelUsageEvent({
+                  toolName: "advisor",
+                  toolCallId: "tool-call-first",
+                  usage: { inputTokens: 24, outputTokens: 6, totalTokens: 30 },
+                })
+              ),
+            text("first response"),
+            STOP_FINISH,
+          ],
         },
-      ],
+        {
+          chunks: [
+            // A late report for the finished first turn must not leak into the second.
+            () =>
+              streamManager.recordToolModelUsage(
+                workspaceId,
+                firstMessageId,
+                createToolModelUsageEvent({
+                  toolName: "advisor",
+                  toolCallId: "tool-call-stale",
+                  usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+                })
+              ),
+            text("second response"),
+            STOP_FINISH,
+          ],
+        },
+      ]),
     });
 
+    const firstMessage = await completeTurnAndReadMessage({
+      workspaceId,
+      messageId: firstMessageId,
+      streamManager,
+      chunks: [],
+    });
     expect(readToolModelUsages(firstMessage)).toMatchObject([
       {
         toolName: "advisor",
@@ -408,73 +403,33 @@ describe("StreamManager - TTFT metadata persistence", () => {
       },
     ]);
 
-    const secondMessage = await finalizeStreamAndReadMessage({
+    const secondMessage = await completeTurnAndReadMessage({
       workspaceId,
       messageId: "tool-usage-second-message",
       historySequence: 2,
-      startTime: firstStartTime + 500,
       streamManager,
-      beforeProcess: ({ streamManager: activeStreamManager, workspaceId }) => {
-        recordToolModelUsageForTests(
-          activeStreamManager,
-          workspaceId,
-          "tool-usage-first-message",
-          createToolModelUsageEvent({
-            toolName: "advisor",
-            toolCallId: "tool-call-stale",
-            timestamp: firstStartTime + 525,
-            model: "anthropic:claude-sonnet-4-20250514",
-            usage: {
-              inputTokens: 12,
-              outputTokens: 3,
-              totalTokens: 15,
-            },
-          })
-        );
-      },
-      parts: [
-        {
-          type: "text",
-          text: "second response",
-          timestamp: firstStartTime + 700,
-        },
-      ],
+      chunks: [],
     });
-
     expect(readToolModelUsages(secondMessage)).toBeUndefined();
   });
 
   describe("StreamManager - reasoning token backfill", () => {
     test("backfills reasoningTokens from concatenated reasoning text when provider reports undefined", async () => {
-      const startTime = Date.now() - 1000;
       const reasoningSegments = ["Thinking through ", "tradeoffs"];
       const expectedReasoningTokens = await countTokens(
         KNOWN_MODELS.SONNET.id,
         reasoningSegments.join("")
       );
 
-      const updatedMessage = await finalizeStreamAndReadMessage({
+      const updatedMessage = await completeTurnAndReadMessage({
         workspaceId: "reasoning-backfill-workspace",
         messageId: "reasoning-backfill-message",
-        historySequence: 1,
-        startTime,
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
-        parts: [
-          {
-            type: "reasoning",
-            text: reasoningSegments[0],
-            timestamp: startTime + 100,
-          },
-          {
-            type: "reasoning",
-            text: reasoningSegments[1],
-            timestamp: startTime + 150,
-          },
-          {
-            type: "text",
-            text: "Final answer",
-            timestamp: startTime + 200,
-          },
+        chunks: [
+          reasoning(reasoningSegments[0]),
+          reasoning(reasoningSegments[1]),
+          text("Final answer"),
+          STOP_FINISH,
         ],
       });
 
@@ -482,67 +437,51 @@ describe("StreamManager - TTFT metadata persistence", () => {
     });
 
     test("does not backfill refused-model reasoning under the fallback model", async () => {
-      const startTime = Date.now() - 1000;
       const fallbackReasoning = "Fallback-only reasoning";
       const expectedReasoningTokens = await countTokens(KNOWN_MODELS.GPT.id, fallbackReasoning);
 
-      const updatedMessage = await finalizeStreamAndReadMessage({
+      // The refused model streamed reasoning before refusing; the fallback continues
+      // from that partial output, so only the fallback's own reasoning is its usage.
+      const updatedMessage = await completeTurnAndReadMessage({
         workspaceId: "reasoning-fallback-boundary-workspace",
         messageId: "reasoning-fallback-boundary-message",
-        historySequence: 1,
-        startTime,
-        model: KNOWN_MODELS.GPT.id,
-        metadataModel: KNOWN_MODELS.GPT.id,
-        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
-        parts: [
+        chunks: [reasoning("Refused-model reasoning"), REFUSAL_FINISH],
+        fallbackAttempts: [
           {
-            type: "reasoning",
-            text: "Refused-model reasoning",
-            timestamp: startTime + 100,
-          },
-          {
-            type: "reasoning",
-            text: fallbackReasoning,
-            timestamp: startTime + 150,
-          },
-          {
-            type: "text",
-            text: "Final answer",
-            timestamp: startTime + 200,
+            chunks: [reasoning(fallbackReasoning), text("Final answer"), STOP_FINISH],
+            usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
           },
         ],
-        beforeProcess: ({ streamManager, workspaceId }) => {
-          const streamInfo = engineInternals(streamManager).workspaceStreams.get(workspaceId);
-          expect(streamInfo && typeof streamInfo === "object").toBe(true);
-          if (!streamInfo || typeof streamInfo !== "object") {
-            throw new Error("Expected stream info for reasoning fallback boundary test");
-          }
-          (streamInfo as { reasoningBackfillStartIndex?: number }).reasoningBackfillStartIndex = 1;
+        options: {
+          modelFallback: {
+            chain: [KNOWN_MODELS.GPT.id],
+            prepare: (nextModelString) =>
+              Promise.resolve(
+                Ok({
+                  model: createTestLanguageModel("fallback-model"),
+                  modelString: nextModelString,
+                  messages: [],
+                  system: "system",
+                  tools: undefined,
+                })
+              ),
+          },
         },
       });
 
+      expect(updatedMessage.metadata?.model).toBe(KNOWN_MODELS.GPT.id);
       expect(updatedMessage.metadata?.usage?.reasoningTokens).toBe(expectedReasoningTokens);
     });
 
     test("preserves provider-reported reasoningTokens when present", async () => {
-      const startTime = Date.now() - 1000;
-      const updatedMessage = await finalizeStreamAndReadMessage({
+      const updatedMessage = await completeTurnAndReadMessage({
         workspaceId: "reasoning-provider-workspace",
         messageId: "reasoning-provider-message",
-        historySequence: 1,
-        startTime,
         usage: { inputTokens: 100, outputTokens: 250, totalTokens: 350, reasoningTokens: 200 },
-        parts: [
-          {
-            type: "reasoning",
-            text: "Model-supplied chain of thought",
-            timestamp: startTime + 150,
-          },
-          {
-            type: "text",
-            text: "Summarized response",
-            timestamp: startTime + 300,
-          },
+        chunks: [
+          reasoning("Model-supplied chain of thought"),
+          text("Summarized response"),
+          STOP_FINISH,
         ],
       });
 
@@ -550,20 +489,11 @@ describe("StreamManager - TTFT metadata persistence", () => {
     });
 
     test("does not inject reasoningTokens when no reasoning deltas occurred", async () => {
-      const startTime = Date.now() - 1000;
-      const updatedMessage = await finalizeStreamAndReadMessage({
+      const updatedMessage = await completeTurnAndReadMessage({
         workspaceId: "reasoning-none-workspace",
         messageId: "reasoning-none-message",
-        historySequence: 1,
-        startTime,
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
-        parts: [
-          {
-            type: "text",
-            text: "Only final response",
-            timestamp: startTime + 200,
-          },
-        ],
+        chunks: [text("Only final response"), STOP_FINISH],
       });
 
       expect(updatedMessage.metadata?.usage?.reasoningTokens).toBeUndefined();
@@ -572,63 +502,128 @@ describe("StreamManager - TTFT metadata persistence", () => {
 });
 
 describe("StreamManager - aborted stream usage persistence", () => {
-  function createAbortStreamInfo(messageId: string): Record<string, unknown> {
-    const usage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
-    return createStreamInfoForTests({
-      messageId,
-      parts: [{ type: "text", text: "partial output", timestamp: Date.now() }],
-      cumulativeUsage: usage,
-      cumulativeProviderMetadata: { anthropic: { cacheCreationInputTokens: 42 } },
-      lastStepUsage: usage,
+  const ABORT_STEP_USAGE = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+
+  /**
+   * Starts a turn whose provider streams `chunks` and then stays open until aborted;
+   * resolves once every chunk was processed, so the caller can stop the stream.
+   */
+  async function startHeldTurnForTests(params: {
+    workspaceId: string;
+    messageId: string;
+    /** The function form gets the manager, for chunk callbacks that report into the live turn. */
+    chunks: ScriptedChunk[] | ((manager: () => StreamManager) => ScriptedChunk[]);
+    history?: HistoryService;
+    sessionUsageService?: SessionUsageService;
+    getProvidersConfig?: () => ProvidersConfigMap | null;
+    events?: TurnEngineEvent[];
+    options?: Partial<TurnExecutionOptions>;
+    fallbackAttempt?: ScriptedAttempt;
+  }) {
+    const history = params.history ?? historyService;
+    const processed = Promise.withResolvers<void>();
+    const heldChunks: ScriptedChunk[] = [
+      ...(typeof params.chunks === "function" ? params.chunks(() => streamManager) : params.chunks),
+      () => processed.resolve(),
+    ];
+    const streamManager = createStreamManagerForTests(history, {
+      sessionUsageService: params.sessionUsageService,
+      getProvidersConfig: params.getProvidersConfig,
+      eventSink: (event) => {
+        params.events?.push(event);
+      },
+      streamText: scriptedStreamText(
+        params.fallbackAttempt
+          ? [params.fallbackAttempt, { chunks: heldChunks, holdUntilAbort: true }]
+          : [{ chunks: heldChunks, holdUntilAbort: true }]
+      ),
     });
+    await appendPartialAssistantForTests(params.workspaceId, params.messageId, 1);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: params.workspaceId,
+        messageId: params.messageId,
+        model: createTestLanguageModel(),
+        modelString: KNOWN_MODELS.SONNET.id,
+        providedRuntimeTempDir: "",
+        ...params.options,
+      })
+    );
+    if (!result.success) throw new Error("Expected stream to start");
+    await processed.promise;
+    return { streamManager, completion: result.data.completion };
   }
 
+  const partialText = { type: "text-delta", text: "partial output" };
+
   test("stamps cumulative usage on the partial so committed history rows stay billable", async () => {
-    const streamManager = new StreamManager(historyService);
     const workspaceId = "abort-usage-workspace";
     const messageId = "abort-usage-message";
-    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId,
+      messageId,
+      chunks: [
+        partialText,
+        finishStep(ABORT_STEP_USAGE, { anthropic: { cacheCreationInputTokens: 42 } }),
+      ],
+    });
 
-    const cleanupAborted = engineInternals(streamManager).cleanupAbortedStream;
-    await cleanupAborted.call(streamManager, workspaceId, createAbortStreamInfo(messageId), "user");
+    await streamManager.stopStream(workspaceId, { abortReason: "user" });
+    expect((await completion).status).toBe("aborted");
 
     expect(await historyService.readPartial(workspaceId)).toBeNull();
     const history = await historyService.getLastMessages(workspaceId, 10);
     if (!history.success) throw new Error(history.error);
     const partial = history.data.find((message) => message.id === messageId);
-    expect(partial?.metadata?.usage).toEqual({
-      inputTokens: 120,
-      outputTokens: 30,
-      totalTokens: 150,
-    });
+    expect(partial?.metadata?.usage).toMatchObject(ABORT_STEP_USAGE);
     expect(partial?.metadata?.providerMetadata).toEqual({
       anthropic: { cacheCreationInputTokens: 42 },
     });
-    expect(partial?.metadata?.contextUsage).toEqual({
-      inputTokens: 120,
-      outputTokens: 30,
-      totalTokens: 150,
-    });
+    expect(partial?.metadata?.contextUsage).toMatchObject(ABORT_STEP_USAGE);
   });
 
   test("emits the effective fallback model and its pinned pricing identity with aborted usage", async () => {
-    const streamManager = new StreamManager(historyService);
-    const effectiveModel = "coder:acme/opus";
+    // The refused model swaps to a Coder fallback whose prepared request pinned its
+    // providers snapshot; the live config no longer knows the instance.
+    const effectiveModel = "coder:acme/claude-opus-4-1";
     const pinnedMetadataModel = "anthropic:claude-opus-4-1";
-    const abort = Promise.withResolvers<unknown>();
-    onTurnEngineEvent(streamManager, "stream-abort", (event) => abort.resolve(event));
-    const cleanupAborted = engineInternals(streamManager).cleanupAbortedStream;
-    await cleanupAborted.call(
-      streamManager,
-      "fallback-abort",
-      {
-        ...createAbortStreamInfo("fallback-message"),
-        model: effectiveModel,
-        metadataModel: pinnedMetadataModel,
+    const fallbackSnapshot: ProvidersConfigMap = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "acme", type: "anthropic" }],
       },
-      "system"
-    );
-    const event = StreamAbortEventSchema.parse(await abort.promise);
+    };
+    const events: TurnEngineEvent[] = [];
+    const { streamManager, completion } = await startHeldTurnForTests({
+      workspaceId: "fallback-abort",
+      messageId: "fallback-message",
+      events,
+      getProvidersConfig: () => ({}),
+      fallbackAttempt: { chunks: [REFUSAL_FINISH] },
+      chunks: [partialText, finishStep(ABORT_STEP_USAGE)],
+      options: {
+        modelFallback: {
+          chain: [effectiveModel],
+          prepare: (nextModelString) =>
+            Promise.resolve(
+              Ok({
+                model: createTestLanguageModel("fallback-model"),
+                modelString: nextModelString,
+                messages: [],
+                system: "system",
+                tools: undefined,
+                providersConfig: fallbackSnapshot,
+              })
+            ),
+        },
+      },
+    });
+
+    await streamManager.stopStream("fallback-abort", { abortReason: "system" });
+    expect((await completion).status).toBe("aborted");
+    const event = StreamAbortEventSchema.parse(events.find((e) => e.type === "stream-abort"));
     expect(event.metadata?.model).toBe(effectiveModel);
     expect(event.metadata?.metadataModel).toBe(pinnedMetadataModel);
     expect(event.metadata?.usage?.inputTokens).toBe(120);
@@ -639,16 +634,12 @@ describe("StreamManager - aborted stream usage persistence", () => {
     async (failure) => {
       const workspaceId = `partial-finalize-${failure}`;
       const messageId = "partial-owner";
-      const info = createAbortStreamInfo(messageId);
-      await historyService.writePartial(workspaceId, {
-        id: messageId,
-        role: "assistant",
-        parts: [{ type: "text", text: "recover me" }],
-        metadata: { historySequence: 1 },
-      });
       const events: TurnEngineEvent[] = [];
-      const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
-        events.push(event);
+      const { streamManager, completion } = await startHeldTurnForTests({
+        workspaceId,
+        messageId,
+        events,
+        chunks: [{ type: "text-delta", text: "recover me" }, finishStep(ABORT_STEP_USAGE)],
       });
       const abandon = failure.startsWith("delete");
       if (abandon) {
@@ -661,8 +652,8 @@ describe("StreamManager - aborted stream usage persistence", () => {
         if (failure.endsWith("throw")) commit.mockRejectedValueOnce(new Error("disk unavailable"));
         else commit.mockResolvedValueOnce(Err("disk unavailable"));
       }
-      const cleanupAborted = engineInternals(streamManager).cleanupAbortedStream;
-      await cleanupAborted.call(streamManager, workspaceId, info, "user", abandon);
+      await streamManager.stopStream(workspaceId, { abortReason: "user", abandonPartial: abandon });
+      expect(await completion).toMatchObject({ status: "aborted", abortReason: "user" });
       expect(events.filter((event) => event.type === "stream-abort")).toHaveLength(1);
       expect(events.at(-1)).toMatchObject({ abortReason: "user", messageId });
       expect(await historyService.readPartial(workspaceId)).not.toBeNull();
@@ -698,46 +689,36 @@ describe("StreamManager - aborted stream usage persistence", () => {
     const { historyService: hs, config, cleanup } = await createTestHistoryService();
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
-      const streamManager = new StreamManager(hs, sessionUsageService);
       const workspaceId = "abort-tool-only-workspace";
-
-      const usage = { inputTokens: 500, outputTokens: 0, totalTokens: 500 };
-      const streamInfo = createStreamInfoForTests({
-        messageId: "abort-tool-only-message",
-        parts: [
+      const messageId = "abort-tool-only-message";
+      const { streamManager } = await startHeldTurnForTests({
+        workspaceId,
+        messageId,
+        history: hs,
+        sessionUsageService,
+        chunks: (activeManager) => [
           {
-            type: "dynamic-tool",
+            type: "tool-call",
             toolCallId: "call-1",
             toolName: "bash",
             input: { script: "sleep 60" },
-            state: "input-available",
-            timestamp: Date.now(),
           },
-        ],
-        cumulativeUsage: usage,
-        lastStepUsage: usage,
-        // Tool-internal model call reported before the abort: stamped as
-        // metadata.toolModelUsages on the partial, which is dropped too.
-        toolModelUsages: [
-          {
-            toolName: "agent_report",
-            model: KNOWN_MODELS.SONNET.id,
-            usage: { inputTokens: 70, outputTokens: 7, totalTokens: 77 },
-          },
+          finishStep({ inputTokens: 500, outputTokens: 0, totalTokens: 500 }),
+          // Tool-internal model call reported before the abort: stamped as
+          // metadata.toolModelUsages on the partial, which is dropped too.
+          () =>
+            activeManager().recordToolModelUsage(workspaceId, messageId, {
+              toolName: "agent_report",
+              timestamp: Date.now(),
+              model: KNOWN_MODELS.SONNET.id,
+              usage: { inputTokens: 70, outputTokens: 7, totalTokens: 77 },
+            }),
         ],
       });
 
-      const cleanupAborted = engineInternals(streamManager).cleanupAbortedStream;
-      await cleanupAborted.call(streamManager, workspaceId, streamInfo, "user");
+      await streamManager.stopStream(workspaceId, { abortReason: "user" });
 
-      const sidecarPath = path.join(
-        path.join(config.sessionsDir, workspaceId),
-        "headless-usage.jsonl"
-      );
-      const records = (await fs.readFile(sidecarPath, "utf-8"))
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const records = await readSidecarRecords(config.sessionsDir, workspaceId);
       // Parent stream usage AND the tool-internal model call each get a row.
       expect(records).toHaveLength(2);
       expect(records[0].source).toBe("aborted_stream");
@@ -756,28 +737,24 @@ describe("StreamManager - aborted stream usage persistence", () => {
     const { historyService: hs, config, cleanup } = await createTestHistoryService();
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
-      const streamManager = new StreamManager(hs, sessionUsageService);
       const workspaceId = "abort-commit-worthy-workspace";
-      await appendPartialAssistantForTests(workspaceId, "abort-commit-worthy-message", 1);
-
-      const cleanupAborted = engineInternals(streamManager).cleanupAbortedStream;
-      await cleanupAborted.call(
-        streamManager,
+      const messageId = "abort-commit-worthy-message";
+      const { streamManager } = await startHeldTurnForTests({
         workspaceId,
-        createAbortStreamInfo("abort-commit-worthy-message"),
-        "user"
-      );
+        messageId,
+        history: hs,
+        sessionUsageService,
+        chunks: [partialText, finishStep(ABORT_STEP_USAGE)],
+      });
 
-      const sidecarPath = path.join(
-        path.join(config.sessionsDir, workspaceId),
-        "headless-usage.jsonl"
-      );
+      await streamManager.stopStream(workspaceId, { abortReason: "user" });
+
+      const sidecarPath = path.join(config.sessionsDir, workspaceId, "headless-usage.jsonl");
       expect(existsSync(sidecarPath)).toBe(false);
       const history = await hs.getLastMessages(workspaceId, 10);
       if (!history.success) throw new Error(history.error);
       expect(
-        history.data.find((message) => message.id === "abort-commit-worthy-message")?.metadata
-          ?.usage
+        history.data.find((message) => message.id === messageId)?.metadata?.usage
       ).toBeDefined();
       expect(await hs.readPartial(workspaceId)).toBeNull();
     } finally {
@@ -785,39 +762,60 @@ describe("StreamManager - aborted stream usage persistence", () => {
     }
   });
 
+  /** Runs a turn whose provider fails mid-stream after billing one step. */
+  async function runFailingTurnForTests(params: {
+    history: HistoryService;
+    sessionUsageService: SessionUsageService;
+    workspaceId: string;
+    messageId: string;
+    chunks: ScriptedChunk[];
+    error: string;
+  }) {
+    const streamManager = createStreamManagerForTests(params.history, {
+      sessionUsageService: params.sessionUsageService,
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            ...params.chunks,
+            () => {
+              throw new Error(params.error);
+            },
+          ],
+        },
+      ]),
+    });
+    await appendPartialAssistantForTests(params.workspaceId, params.messageId, 1);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: params.workspaceId,
+        messageId: params.messageId,
+        model: createTestLanguageModel(),
+        modelString: KNOWN_MODELS.SONNET.id,
+        providedRuntimeTempDir: "",
+      })
+    );
+    if (!result.success) throw new Error("Expected stream to start");
+    expect((await result.data.completion).status).toBe("failed");
+  }
+
   test("routes non-durable errored usage to the headless sidecar (commit would drop it)", async () => {
-    // Provider/empty-output error before any commit-worthy output: the error
-    // placeholder is deleted at commit time, so the billed usage must ride
-    // the sidecar or the turn never reaches the events table.
+    // Provider error before any commit-worthy output: the error placeholder is
+    // deleted at commit time, so the billed usage must ride the sidecar or the
+    // turn never reaches the events table.
     const { historyService: hs, config, cleanup } = await createTestHistoryService();
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
-      const streamManager = new StreamManager(hs, sessionUsageService);
       const workspaceId = "error-nondurable-workspace";
-
-      const usage = { inputTokens: 900, outputTokens: 0, totalTokens: 900 };
-      const streamInfo = createStreamInfoForTests({
+      await runFailingTurnForTests({
+        history: hs,
+        sessionUsageService,
+        workspaceId,
         messageId: "error-nondurable-message",
-        parts: [],
-        cumulativeUsage: usage,
-        lastStepUsage: usage,
-      });
-
-      const persistError = engineInternals(streamManager).persistStreamError;
-      await persistError.call(streamManager, workspaceId, streamInfo, {
-        messageId: "error-nondurable-message",
+        chunks: [finishStep({ inputTokens: 900, outputTokens: 0, totalTokens: 900 })],
         error: "provider exploded",
-        errorType: "empty_output",
       });
 
-      const sidecarPath = path.join(
-        path.join(config.sessionsDir, workspaceId),
-        "headless-usage.jsonl"
-      );
-      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
-        string,
-        unknown
-      >;
+      const [record] = await readSidecarRecords(config.sessionsDir, workspaceId);
       expect(record.source).toBe("errored_stream");
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(900);
     } finally {
@@ -833,32 +831,20 @@ describe("StreamManager - aborted stream usage persistence", () => {
     const { historyService: hs, config, cleanup } = await createTestHistoryService();
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
-      const streamManager = new StreamManager(hs, sessionUsageService);
       const workspaceId = "error-commit-worthy-workspace";
-
-      const usage = { inputTokens: 900, outputTokens: 40, totalTokens: 940 };
-      const streamInfo = createStreamInfoForTests({
+      await runFailingTurnForTests({
+        history: hs,
+        sessionUsageService,
+        workspaceId,
         messageId: "error-commit-worthy-message",
-        parts: [{ type: "text", text: "partial answer before failure", timestamp: Date.now() }],
-        cumulativeUsage: usage,
-        lastStepUsage: usage,
-      });
-
-      const persistError = engineInternals(streamManager).persistStreamError;
-      await persistError.call(streamManager, workspaceId, streamInfo, {
-        messageId: "error-commit-worthy-message",
+        chunks: [
+          { type: "text-delta", text: "partial answer before failure" },
+          finishStep({ inputTokens: 900, outputTokens: 40, totalTokens: 940 }),
+        ],
         error: "stream truncated",
-        errorType: "stream_truncated",
       });
 
-      const sidecarPath = path.join(
-        path.join(config.sessionsDir, workspaceId),
-        "headless-usage.jsonl"
-      );
-      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
-        string,
-        unknown
-      >;
+      const [record] = await readSidecarRecords(config.sessionsDir, workspaceId);
       expect(record.source).toBe("errored_stream");
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(900);
       // The partial keeps its content for retry/resume but carries no usage.
@@ -877,31 +863,21 @@ describe("StreamManager - aborted stream usage persistence", () => {
     const { historyService: hs, config, cleanup } = await createTestHistoryService();
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
-      const streamManager = new StreamManager(hs, sessionUsageService);
       const workspaceId = "abort-abandon-workspace";
-      const messageId = "abort-abandon-message";
-
-      const cleanupAborted = engineInternals(streamManager).cleanupAbortedStream;
-      await cleanupAborted.call(
-        streamManager,
+      const { streamManager } = await startHeldTurnForTests({
         workspaceId,
-        createAbortStreamInfo(messageId),
-        "user",
-        true
-      );
+        messageId: "abort-abandon-message",
+        history: hs,
+        sessionUsageService,
+        chunks: [partialText, finishStep(ABORT_STEP_USAGE)],
+      });
+
+      await streamManager.stopStream(workspaceId, { abortReason: "user", abandonPartial: true });
 
       // Partial untouched (the abandon contract) …
-      const partial = await hs.readPartial(workspaceId);
-      expect(partial).toBeNull();
+      expect(await hs.readPartial(workspaceId)).toBeNull();
       // … but the billed usage still reaches analytics via the sidecar.
-      const sidecarPath = path.join(
-        path.join(config.sessionsDir, workspaceId),
-        "headless-usage.jsonl"
-      );
-      const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
-        string,
-        unknown
-      >;
+      const [record] = await readSidecarRecords(config.sessionsDir, workspaceId);
       expect(record.source).toBe("aborted_stream");
       expect((record.usage as Record<string, unknown>).inputTokens).toBe(120);
     } finally {
