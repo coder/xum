@@ -28,6 +28,7 @@ import {
 } from "@/constants/terminationTimeouts";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
 import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
+import * as subagentReportArtifacts from "@/node/services/subagentReportArtifacts";
 import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
@@ -102,7 +103,10 @@ interface Internals {
     ownedAttempt: undefined,
     source: string
   ) => void;
-  releaseSharedDesktopTaskOnUserStop: (taskId: string) => Promise<void>;
+  releaseSharedDesktopTaskOnUserStop: (taskId: string, abortOrigin: unknown) => Promise<void>;
+  /** The abort event's origin capture (the production stream-abort listener's). */
+  resolveStreamAttemptAtEvent: (taskId: string) => unknown;
+  workspaceEventLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
   startReservedAgentTask: (plan: unknown) => Promise<void>;
   materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
   cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
@@ -2927,12 +2931,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const token = admitted(
         taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })
       );
-      await svc.releaseSharedDesktopTaskOnUserStop(taskId);
+      await svc.releaseSharedDesktopTaskOnUserStop(taskId, svc.resolveStreamAttemptAtEvent(taskId));
       // The pending send keeps the task live: no transition, no closure.
       expect(entryOf(config, taskId)?.taskStatus).toBe("running");
       expect(svc.attemptSettlementByTaskId.get(taskId)).toBeUndefined();
       token.onDisposed("refused");
-      await svc.releaseSharedDesktopTaskOnUserStop(taskId);
+      await svc.releaseSharedDesktopTaskOnUserStop(taskId, svc.resolveStreamAttemptAtEvent(taskId));
       expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
       expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId: entryOf(config, taskId)?.taskAttemptId,
@@ -3864,4 +3868,304 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(entryOf(config, validTaskId)?.taskAttemptUnproven).toBeUndefined();
     }
   );
+
+  // -----------------------------------------------------------------------------------------------
+  // Stale predecessor effects with two backends sharing one Xum root (#4414). Predecessor A (this
+  // backend) starts an effect, another backend admits successor B, A's delayed effect lands. Only
+  // as strong as cross-process config exclusion (#4415).
+  // -----------------------------------------------------------------------------------------------
+  describe("stale predecessor effects after another backend admits a successor (#4414)", () => {
+    const SUCCESSOR_ATTEMPT_ID = "att_00000000000000d1";
+    async function admitSuccessorElsewhere(otherBackend: Config, workspaceId: string) {
+      await otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === workspaceId);
+          if (ws) {
+            ws.taskAttemptId = SUCCESSOR_ATTEMPT_ID;
+            ws.taskAttemptUnproven = true;
+            ws.taskStatus = "running";
+            delete ws.taskLaunchError;
+          }
+        }
+        return cfg;
+      });
+    }
+
+    /**
+     * A stops its owned attempt (stop record retained by a captured turn); optionally backend B
+     * reawakens the row as B; then A's captured turn settles and the stop record releases, which
+     * records A's settlement (settleOwnedTaskAttempt "stop-settled"). A waiter subscribed in A
+     * before the release reads the outcome.
+     */
+    async function runStopSettlement(options: { successorAdmitted: boolean }) {
+      const taskId = options.successorAdmitted ? "stale-settle-moved" : "stale-settle-control";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000d0" },
+        },
+      ]);
+      const otherBackend = await createTestConfig(rootDir);
+      let activeTurn: symbol | undefined;
+      const host = hostWithTurnEvents({ getActiveTurnGeneration: mock(() => activeTurn) });
+      const { taskService } = createHarness(config, { workspaceService: host.workspaceService });
+      const svc = internals(taskService);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const attemptA = entryOf(config, taskId)!.taskAttemptId!;
+      const turn = Symbol("turn-A");
+      admitted(
+        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      ).onAdmitted(turn);
+      activeTurn = turn;
+      await taskService.stopDescendantAgentTask(rootId, taskId);
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
+      expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
+      if (options.successorAdmitted) {
+        // Backend B resumes the stopped row as its own attempt (its stop latch is process-local).
+        await admitSuccessorElsewhere(otherBackend, taskId);
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: SUCCESSOR_ATTEMPT_ID,
+        });
+      }
+      // A workflow in this process waits on the task (outcome is cleanup-pending until release).
+      const waiting = taskService.waitForAttemptSettlement(taskId, {
+        timeoutMs: 400,
+        requestingWorkspaceId: rootId,
+      });
+      await settle();
+      // A's delayed effect: its captured turn settles, the stop record releases and settles A.
+      activeTurn = undefined;
+      host.settleTurn(taskId, turn);
+      await settle();
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
+      return {
+        taskId,
+        attemptA,
+        config,
+        svc,
+        taskService,
+        otherBackend,
+        waited: await waiting,
+        read: await taskService.readAttemptOutcome(taskId, requesting),
+      };
+    }
+
+    test("stale settlement control: without a successor, A's stop settlement reads terminal-no-report", async () => {
+      const result = await runStopSettlement({ successorAdmitted: false });
+      expect(result.waited).toEqual({ kind: "terminal-no-report" });
+      expect(result.read).toEqual({ kind: "terminal-no-report" });
+    });
+
+    test("stale settlement: A's stop settlement landing after backend B reawakened the row must not end a waiter as terminal-no-report", async () => {
+      const result = await runStopSettlement({ successorAdmitted: true });
+      // B's row is untouched by A's release (control that only the in-memory classifier is at stake).
+      expect(entryOf(result.config, result.taskId)).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: SUCCESSOR_ATTEMPT_ID,
+      });
+      // The recorded settlement names A, not the row's current attempt.
+      expect(result.svc.attemptSettlementByTaskId.get(result.taskId)).toMatchObject({
+        attemptId: result.attemptA,
+        phase: "settled",
+        source: "stop-settled",
+      });
+      // The live successor is not reported as ended without a report.
+      expect(result.waited.kind).not.toBe("terminal-no-report");
+      expect(result.read.kind).not.toBe("terminal-no-report");
+    });
+
+    async function runSharedDesktopUserAbort(options: { successorAdmitted: boolean }) {
+      const taskId = options.successorAdmitted ? "stale-abort-moved" : "stale-abort-control";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: {
+            taskStatus: "interrupted",
+            taskAttemptId: "att_00000000000000d2",
+            taskDesktopOwnerWorkspaceId: rootId,
+          },
+        },
+      ]);
+      const otherBackend = await createTestConfig(rootDir);
+      const { taskService } = createHarness(config);
+      const svc = internals(taskService);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      const attemptA = entryOf(config, taskId)!.taskAttemptId!;
+      const closures: Array<{ attemptId: string | undefined; source: string }> = [];
+      const realClose = svc.closeAttemptAdmission.bind(svc);
+      const closeSpy = spyOn(svc, "closeAttemptAdmission").mockImplementation(
+        (id, attemptId, owned, source) => {
+          closures.push({ attemptId, source });
+          realClose(id, attemptId, owned, source);
+        }
+      );
+      // A's stream emitted a user abort; while the handler awaits the execution-mirror finalizer
+      // (the await before the row edit), backend B re-admits the row as its own attempt.
+      let rotatedAtFinalize = 0;
+      const finalizeSpy = spyOn(
+        WorkspaceTurnManager.prototype,
+        "finalizeWorkspaceTurnFromStreamAbort"
+      ).mockImplementation(async () => {
+        if (options.successorAdmitted) {
+          rotatedAtFinalize += 1;
+          await admitSuccessorElsewhere(otherBackend, taskId);
+        }
+        return false as never;
+      });
+      try {
+        await (
+          taskService as unknown as { handleStreamAbort: (event: unknown) => Promise<void> }
+        ).handleStreamAbort({
+          type: "stream-abort",
+          workspaceId: taskId,
+          messageId: "assistant-A",
+          metadata: {},
+          abortReason: "user",
+        });
+      } finally {
+        finalizeSpy.mockRestore();
+        closeSpy.mockRestore();
+      }
+      expect(rotatedAtFinalize).toBe(options.successorAdmitted ? 1 : 0);
+      const row = entryOf(config, taskId);
+      return {
+        attemptA,
+        observed: {
+          taskStatus: row?.taskStatus,
+          taskAttemptId: row?.taskAttemptId,
+          closures,
+          settlement: svc.attemptSettlementByTaskId.get(taskId)?.attemptId,
+          settlementPhase: svc.attemptSettlementByTaskId.get(taskId)?.phase,
+        },
+        outcome: await taskService.readAttemptOutcome(taskId, requesting),
+      };
+    }
+
+    test("shared-desktop abort control: without a successor, A's shared-desktop user abort interrupts and settles A", async () => {
+      const result = await runSharedDesktopUserAbort({ successorAdmitted: false });
+      expect(result.observed).toEqual({
+        taskStatus: "interrupted",
+        taskAttemptId: result.attemptA,
+        closures: [{ attemptId: result.attemptA, source: "user-stop-idle" }],
+        settlement: result.attemptA,
+        settlementPhase: "settled",
+      });
+      expect(result.outcome).toEqual({ kind: "terminal-no-report" });
+    });
+
+    test("shared-desktop abort: a user abort of A whose row backend B re-admitted before the handler's edit leaves B running and B's id open", async () => {
+      const result = await runSharedDesktopUserAbort({ successorAdmitted: true });
+      // The abort belongs to A; B's row and B's admission are B's.
+      expect(result.observed).toMatchObject({
+        taskStatus: "running",
+        taskAttemptId: SUCCESSOR_ATTEMPT_ID,
+        closures: [],
+      });
+    });
+
+    test("stale settlement: B's admission during the outcome read's report-artifact await is not read as A's end", async () => {
+      const result = await runStopSettlement({ successorAdmitted: false });
+      expect(result.read).toEqual({ kind: "terminal-no-report" });
+      // The read loads the row, then awaits the report artifact: B's admission lands there.
+      const realRead = subagentReportArtifacts.readSubagentReportArtifactStrict;
+      const readSpy = spyOn(
+        subagentReportArtifacts,
+        "readSubagentReportArtifactStrict"
+      ).mockImplementation(async (...args) => {
+        await admitSuccessorElsewhere(result.otherBackend, result.taskId);
+        return await realRead(...args);
+      });
+      try {
+        const read = await result.taskService.readAttemptOutcome(result.taskId, requesting);
+        expect(readSpy).toHaveBeenCalled();
+        expect(entryOf(result.config, result.taskId)?.taskAttemptId).toBe(SUCCESSOR_ATTEMPT_ID);
+        expect(read.kind).not.toBe("terminal-no-report");
+      } finally {
+        readSpy.mockRestore();
+      }
+    });
+
+    test.each([false, true])(
+      "shared-desktop abort through the stream-abort listener: B admitted while the handler waits for the event lock (successor: %p)",
+      async (successorAdmitted) => {
+        const taskId = successorAdmitted ? "stale-abort-lock-moved" : "stale-abort-lock-ctrl";
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: {
+              taskStatus: "interrupted",
+              taskAttemptId: "att_00000000000000d3",
+              taskDesktopOwnerWorkspaceId: rootId,
+            },
+          },
+        ]);
+        const otherBackend = await createTestConfig(rootDir);
+        const listeners = new Map<string, (payload: unknown) => void>();
+        const on = mock((event: string, handler: (payload: unknown) => void) => {
+          listeners.set(event, handler);
+        });
+        const { aiService } = createAIServiceMocks(config, { on });
+        const { taskService } = createHarness(config, { aiService });
+        const svc = internals(taskService);
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        const attemptA = entryOf(config, taskId)!.taskAttemptId!;
+        const finalizeSpy = spyOn(
+          WorkspaceTurnManager.prototype,
+          "finalizeWorkspaceTurnFromStreamAbort"
+        ).mockImplementation(() => Promise.resolve(false as never));
+        try {
+          // Barrier before the handler's lock acquisition: the event fires while the task's event
+          // lock is held, so the handler runs only after B's admission (when successorAdmitted).
+          let releaseLock!: () => void;
+          let lockEntered!: () => void;
+          const entered = new Promise<void>((resolve) => {
+            lockEntered = resolve;
+          });
+          const held = svc.workspaceEventLocks.withLock(
+            taskId,
+            () =>
+              new Promise<void>((resolve) => {
+                releaseLock = resolve;
+                lockEntered();
+              })
+          );
+          await entered;
+          const onStreamAbort = listeners.get("stream-abort");
+          assert(onStreamAbort, "TaskService must subscribe to stream-abort");
+          onStreamAbort({
+            type: "stream-abort",
+            workspaceId: taskId,
+            messageId: "assistant-A",
+            metadata: {},
+            abortReason: "user",
+          });
+          if (successorAdmitted) await admitSuccessorElsewhere(otherBackend, taskId);
+          releaseLock();
+          await held;
+          // FIFO lock: this runs after the listener's handler finished.
+          await svc.workspaceEventLocks.withLock(taskId, () => Promise.resolve());
+        } finally {
+          finalizeSpy.mockRestore();
+        }
+        if (!successorAdmitted) {
+          expect(entryOf(config, taskId)).toMatchObject({
+            taskStatus: "interrupted",
+            taskAttemptId: attemptA,
+          });
+          expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+            attemptId: attemptA,
+            phase: "settled",
+          });
+          return;
+        }
+        // The abort belongs to A: B's row, admission and settlement are B's.
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: SUCCESSOR_ATTEMPT_ID,
+        });
+        expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(SUCCESSOR_ATTEMPT_ID);
+      }
+    );
+  });
 });
