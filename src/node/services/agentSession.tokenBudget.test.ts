@@ -27,6 +27,9 @@ import {
 import type { AgentSessionAIService } from "./agentSession";
 import { CompactionCancellation } from "./compactionCancellation";
 import { HistoryService } from "./historyService";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { createTestHistoryService } from "./testHistoryService";
+import { WorkspaceGoalService } from "./workspaceGoalService";
 import {
   createAgentSessionHarness,
   seedAutoCompactionThreshold,
@@ -214,12 +217,14 @@ async function seedLegacyFlushTurn(
 
 describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
+  const storageCleanups: Array<() => Promise<void>> = [];
   afterEach(async () => {
     for (const h of harnesses.reverse()) {
       await h.session.dispose();
       await h.cleanup();
     }
     harnesses.length = 0;
+    for (const cleanup of storageCleanups.splice(0)) await cleanup();
     mock.restore();
   });
 
@@ -229,7 +234,30 @@ describe("AgentSession token-budget lifecycle", () => {
     failure?: (
       attempt: number
     ) => SendMessageError | undefined | Promise<SendMessageError | undefined>;
+    /** Inject a real goal service (no goal set) whose stream accounting the test observes. */
+    goals?: boolean;
   }) {
+    let storage: Pick<AgentSessionHarness, "historyService" | "config"> | undefined =
+      args?.previous;
+    if (!storage && args?.goals) {
+      const owned = await createTestHistoryService();
+      storageCleanups.push(owned.cleanup);
+      storage = owned;
+    }
+    const workspaceGoalService =
+      args?.goals && storage
+        ? new WorkspaceGoalService(
+            storage.config,
+            storage.historyService,
+            new ExtensionMetadataService(
+              path.join(storage.config.rootDir, "extension-metadata.json")
+            )
+          )
+        : undefined;
+    const goalAccounting = workspaceGoalService && {
+      recordStreamAccounting: spyOn(workspaceGoalService, "recordStreamAccounting"),
+      previewStreamAccounting: spyOn(workspaceGoalService, "previewStreamAccounting"),
+    };
     const requests: Request[] = [];
     const secondRequest = Promise.withResolvers<Request>();
     const requestWaiters = new Map<number, ReturnType<typeof Promise.withResolvers<Request>>>();
@@ -271,9 +299,10 @@ describe("AgentSession token-budget lifecycle", () => {
     const h = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
-      historyService: args?.previous?.historyService,
-      config: args?.previous?.config,
+      historyService: storage?.historyService,
+      config: storage?.config,
       mcpServerManager: args?.mcpServerManager,
+      workspaceGoalService,
       aiServiceOverrides: {
         streamMessage,
         buildMemorySessionContext: mock(() => Promise.resolve(null)),
@@ -323,6 +352,7 @@ describe("AgentSession token-budget lifecycle", () => {
     };
     return {
       ...h,
+      goalAccounting,
       requests,
       completions,
       streamMessage,
@@ -616,8 +646,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (scope) => {
       const h = await setup();
       await seedHistory(h, 120_000);
-      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const unregister = eventSpine.useBefore(
         "request.assemble",
         (ctx) => {
@@ -699,9 +728,8 @@ describe("AgentSession token-budget lifecycle", () => {
         );
       };
       if (phase === "cleanup") {
-        const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-        const cleanup = session.applyContextResetSideEffects.bind(session);
-        spyOn(session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
+        const cleanup = h.session.applyContextResetSideEffects.bind(h.session);
+        spyOn(h.session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
           replaceRegistration();
           await cleanup();
         });
@@ -747,6 +775,8 @@ describe("AgentSession token-budget lifecycle", () => {
       { workspaceId }
     );
     let removeLive: (() => void) | undefined;
+    // Kept private: the real backoff retry fires ~2 s later on the global clock (these fakes
+    // carry no effectRunner), so the test cancels it and runs the same retry step directly.
     const session = h.session as unknown as {
       retryManager: { cancel(): void };
       retryActiveStream(): Promise<void>;
@@ -773,8 +803,7 @@ describe("AgentSession token-budget lifecycle", () => {
     async (blocked) => {
       const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
       await seedHistory(h, 20_000);
-      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
-      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
       const unregister = blocked
         ? eventSpine.useBefore("request.assemble", () => undefined, { workspaceId })
         : eventSpine.useRequestContext(
@@ -2538,24 +2567,9 @@ describe("AgentSession token-budget lifecycle", () => {
   });
 
   test("a handoff continuation stays ordinary goal work", async () => {
-    const h = await setup();
-    // Minimal goal service: only the stream accounting seams are observed.
-    const recordStreamAccounting = mock((_input: { streamOriginKind?: string }) =>
-      Promise.resolve(null)
-    );
-    const previewStreamAccounting = mock(() => Promise.resolve(null));
-    const noop = () => Promise.resolve();
-    Reflect.set(h.session, "workspaceGoalService", {
-      recordStreamAccounting,
-      previewStreamAccounting,
-      recordStreamStarted: noop,
-      recordUserStoppedStream: noop,
-      applyPendingAfterStreamEnd: noop,
-      requestContinuationAfterStreamEnd: noop,
-      syncGoalModeWithChatTail: noop,
-      getGoal: () => Promise.resolve(null),
-      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
-    });
+    const h = await setup({ goals: true });
+    assert(h.goalAccounting, "Expected an injected goal service");
+    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
     expect(
       (
         await h.session.sendMessage("Goal work", options, {
@@ -2905,23 +2919,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const first = await setup();
     await seedLegacyFlushTurn(first);
     await first.session.dispose();
-    const h = await setup({ previous: first });
-    const recordStreamAccounting = mock((_input: { streamOriginKind?: string }) =>
-      Promise.resolve(null)
-    );
-    const previewStreamAccounting = mock(() => Promise.resolve(null));
-    const noop = () => Promise.resolve();
-    Reflect.set(h.session, "workspaceGoalService", {
-      recordStreamAccounting,
-      previewStreamAccounting,
-      recordStreamStarted: noop,
-      recordUserStoppedStream: noop,
-      applyPendingAfterStreamEnd: noop,
-      requestContinuationAfterStreamEnd: noop,
-      syncGoalModeWithChatTail: noop,
-      getGoal: () => Promise.resolve(null),
-      assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
-    });
+    const h = await setup({ previous: first, goals: true });
+    assert(h.goalAccounting, "Expected an injected goal service");
+    const { recordStreamAccounting, previewStreamAccounting } = h.goalAccounting;
     expect((await h.session.resumeStream(resumeOptions)).success).toBe(true);
     expect(h.requests[0].muxMetadata).toMatchObject({ contextBudgetFlush: true });
     // Neither the live preview nor the final accounting sees the housekeeping stream's usage.
