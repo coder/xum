@@ -14,10 +14,10 @@ import {
 } from "@/constants/agentMessaging";
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
 import type { AIService } from "@/node/services/aiService";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import type { InitStateManager } from "@/node/services/initStateManager";
+import { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
 import { readSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import { TaskService } from "@/node/services/taskService";
@@ -208,20 +208,10 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         }),
       },
     });
-    const backgroundProcessManager = Object.assign(new EventEmitter(), {
-      cleanup: mock(() => Promise.resolve()),
-      hasRunningBackgroundProcesses: mock(() => false),
-      hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-      setMessageQueued: mock(() => undefined),
-    }) as unknown as BackgroundProcessManager;
-    const initStateManager = {
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-      getInitState: mock(() => undefined),
-      waitForInit: mock(() => Promise.resolve()),
-      clearInMemoryState: mock(() => undefined),
-      runningInitWorkspaceIds: mock(() => []),
-    } as unknown as InitStateManager;
+    const backgroundProcessManager = new BackgroundProcessManager(
+      path.join(config.rootDir, "hold-background-processes")
+    );
+    const initStateManager = new InitStateManager(config);
     const aiService = sessionHarness.aiService as unknown as AIService;
     const workspaceService = new WorkspaceService(
       config,
