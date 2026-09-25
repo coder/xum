@@ -562,7 +562,7 @@ const taskToolBaseShape = {
     .describe(
       'Parent-chosen title. For a persistent sub-agent, use a short, friendly reusable role name such as "Reviewer" or "Simplicity Auditor", not the current assignment. For kind="workspace", use a normal work-specific chat title.'
     ),
-  run_in_background: z.boolean().default(false),
+  run_in_background: z.boolean().nullish().default(false),
   n: TaskToolBestOfCountSchema.nullish().describe(
     "Optional best-of count. Use n when several agents should try the same prompt independently; omit it for a single task. Only use grouped runs for sub-agents without interfering side effects, such as read-only agents like explore."
   ),
@@ -2438,6 +2438,7 @@ export const TOOL_DEFINITIONS = {
             ),
           run_in_background: z
             .boolean()
+            .nullish()
             .default(false)
             .describe(
               "Run this command in the background without blocking. " +
