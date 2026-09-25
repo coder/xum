@@ -3,7 +3,7 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
-import * as ActualAPIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
 import * as ActualModelsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
@@ -51,7 +51,6 @@ interface MockAPIClient {
 
 // Capture every dependency before mocking: later settings tests mount the real provider stack.
 restoreModulesAfterSuite([
-  ["@/browser/contexts/API", { ...ActualAPIModule }],
   ["@/browser/contexts/ExperimentsContext", { ...ActualExperimentsModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...ActualModelsModule }],
   ["@/browser/components/ModelSelector/ModelSelector", { ...ActualModelSelectorModule }],
@@ -70,16 +69,6 @@ let experimentValues: Record<string, boolean>;
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
   createSelectPrimitiveDouble()
 );
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
   useExperiment: (experimentId: string) => [
@@ -212,9 +201,11 @@ describe("ExperimentsSection advisor config", () => {
     mockApi = api;
 
     const view = render(
-      <ThemeProvider forcedTheme="dark">
-        <ExperimentsSection />
-      </ThemeProvider>
+      <APIProvider client={mockApi as unknown as APIClient}>
+        <ThemeProvider forcedTheme="dark">
+          <ExperimentsSection />
+        </ThemeProvider>
+      </APIProvider>
     );
 
     return { view, getConfigMock, saveConfigMock };
@@ -328,9 +319,11 @@ describe("ExperimentsSection advisor config", () => {
       });
       view.unmount();
       const restored = render(
-        <ThemeProvider forcedTheme="dark">
-          <ExperimentsSection />
-        </ThemeProvider>
+        <APIProvider client={mockApi as unknown as APIClient}>
+          <ThemeProvider forcedTheme="dark">
+            <ExperimentsSection />
+          </ThemeProvider>
+        </APIProvider>
       );
       fireEvent.click(await restored.findByRole("button", { name: "Reasoning" }));
       expect(restored.getByRole("button", { name: /Pro mode/ }).getAttribute("aria-pressed")).toBe(

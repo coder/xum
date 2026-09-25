@@ -4,7 +4,7 @@ import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
-import * as APIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
@@ -37,7 +37,6 @@ let selectedWorkspaceMock: { projectPath: string; workspaceId: string } | null =
 
 // Snapshot real exports before Bun replaces their live bindings for this suite.
 restoreModulesAfterSuite([
-  ["@/browser/contexts/API", { ...APIModule }],
   ["@/browser/contexts/WorkspaceContext", { ...WorkspaceModule }],
   ["@/browser/hooks/useExperiments", { ...ExperimentsModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...ModelsModule }],
@@ -45,12 +44,6 @@ restoreModulesAfterSuite([
   ["@/browser/components/ModelSelector/ModelSelector", { ...ModelSelectorModule }],
   ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...SelectPrimitiveModule }],
 ]);
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: apiMock }),
-  // Config hooks read the shared store directly; this harness needs no API subscription.
-  useOptionalAPI: () => null,
-}));
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useWorkspaceContext: () => ({ selectedWorkspace: selectedWorkspaceMock }),
@@ -159,10 +152,14 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
     updatePersistedState(getModelKey("ws-1"), options.workspaceModel);
   }
 
+  // Inject the per-test client through the real provider; mocking the API module leaks into
+  // later files.
   const view = render(
-    <PolicyProvider>
-      <TasksSection />
-    </PolicyProvider>
+    <APIProvider client={apiMock as unknown as APIClient}>
+      <PolicyProvider>
+        <TasksSection />
+      </PolicyProvider>
+    </APIProvider>
   );
   return { ...view, getConfig, saveConfig };
 }

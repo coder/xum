@@ -1,9 +1,10 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { ReactNode } from "react";
 
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import * as ActualAPIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ActualModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -22,7 +23,6 @@ import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
 // Capture before installing module mocks; mock.restore() does not undo them.
-const actualAPIModule = { ...ActualAPIModule };
 const actualModelsFromSettingsModule = { ...ActualModelsFromSettingsModule };
 const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
 let mockProvidersConfig: ProvidersConfigMap | null = null;
@@ -51,10 +51,6 @@ interface MockApi {
 
 let mockApi: MockApi;
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: mockApi, status: "connected" as const }),
-  useOptionalAPI: () => ({ api: mockApi, status: "connected" as const }),
-}));
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
   createSelectPrimitiveDouble()
 );
@@ -136,6 +132,15 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
   };
 }
 
+// Inject the per-test client through the real provider; mocking the API module leaks across files.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+}
+
+function renderConfig() {
+  return render(<AutoModelRoutingExperimentConfig />, { wrapper: ApiWrapper });
+}
+
 function lastUpdate(): AutoModelRoutingConfig {
   const call = mockApi.config.updateAutoModelRouting.mock.calls.at(-1)?.[0] as {
     autoModelRouting: AutoModelRoutingConfig;
@@ -147,7 +152,6 @@ describe("AutoModelRoutingExperimentConfig", () => {
   let cleanupDom: (() => void) | null = null;
 
   afterAll(async () => {
-    await mock.module("@/browser/contexts/API", () => actualAPIModule);
     await mock.module(
       "@/browser/hooks/useModelsFromSettings",
       () => actualModelsFromSettingsModule
@@ -190,7 +194,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   }
 
   test("adds and removes tiers through the update route, respecting the minimum", async () => {
-    const { container, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     fireEvent.click(getByRole("button", { name: "Add tier" }));
@@ -212,7 +216,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("moving a tier reorders the persisted list", async () => {
-    const { container, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     fireEvent.click(getByRole("button", { name: "Move tier 2 up" }));
@@ -225,7 +229,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("commits a label edit on blur", async () => {
-    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     const label = getByLabelText("Tier 1 label") as HTMLInputElement;
@@ -239,7 +243,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("Enter commits a label; a duplicate label is flagged, never written, and reverts on blur", async () => {
-    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     const label = getByLabelText("Tier 1 label") as HTMLInputElement;
@@ -278,7 +282,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
         },
       })
     );
-    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
     await waitFor(() => expect(configChange.signal).not.toBeNull());
 
@@ -323,14 +327,14 @@ describe("AutoModelRoutingExperimentConfig", () => {
       );
       return subscribe();
     });
-    const { getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { getByLabelText } = renderConfig();
     const field = getByLabelText("Evaluation model") as HTMLInputElement;
     await waitFor(() => expect(field.value).toBe("openai:gpt-5.5"));
   });
 
   test("a rejected write shows the error and reverts the field to the persisted config", async () => {
     mockApi.config.updateAutoModelRouting = mock(() => Promise.reject(new Error("disk full")));
-    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
     const fetchesBefore = mockApi.config.getConfig.mock.calls.length;
 
@@ -350,7 +354,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("a valid evaluation model is saved with the tiers on Enter", async () => {
-    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     const field = getByLabelText("Evaluation model") as HTMLInputElement;
@@ -373,7 +377,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("an unsupported evaluation model is flagged, never saved, and reverts on blur", async () => {
-    const { container, getByLabelText } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     const field = getByLabelText("Evaluation model") as HTMLInputElement;
@@ -409,12 +413,12 @@ describe("AutoModelRoutingExperimentConfig", () => {
           reason: "No TypeSafe API key configured",
         })
     );
-    const { container } = render(<AutoModelRoutingExperimentConfig />);
+    const { container } = renderConfig();
     await waitFor(() => expect(statusText(container)).toBe("No TypeSafe API key configured"));
   });
 
   test("classifying a sample prompt shows the chosen tier, model, and evaluator", async () => {
-    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     await userEvent.type(getByLabelText("Sample prompt"), "Refactor the queue");
@@ -429,7 +433,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("classifying bills the preview to the last selected workspace and says so", async () => {
-    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
     expect(
       container.querySelector("[data-auto-model-routing-preview-workspace]")?.textContent
@@ -451,7 +455,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
     ],
   ])("Classify stays disabled when %s", async (_case, arrange) => {
     arrange();
-    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     await userEvent.type(getByLabelText("Sample prompt"), "Refactor the queue");
@@ -464,7 +468,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
 
   test("re-checks the evaluator's availability when the providers config changes", async () => {
     const getStatus = mockApi.config.getAutoModelRoutingEvaluationStatus;
-    const { container, rerender } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, rerender } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
     await waitFor(() => expect(getStatus.mock.calls.length).toBeGreaterThan(0));
     const checksAfterLoad = getStatus.mock.calls.length;
@@ -480,7 +484,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
   });
 
   test("classifying sends the tiers on screen, not the last persisted config", async () => {
-    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     // The edit is saved optimistically on blur; a save still in flight must not make the
@@ -516,7 +520,7 @@ describe("AutoModelRoutingExperimentConfig", () => {
         },
       })
     );
-    const { container, getByLabelText, getByRole } = render(<AutoModelRoutingExperimentConfig />);
+    const { container, getByLabelText, getByRole } = renderConfig();
     await waitFor(() => expect(tierRows(container)).toHaveLength(4));
 
     await userEvent.type(getByLabelText("Sample prompt"), "Rename a variable");
