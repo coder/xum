@@ -1,6 +1,7 @@
 import * as path from "path";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
 import { HistoryService } from "@/node/services/historyService";
 import {
   buildAgentTaskIndex,
@@ -122,7 +123,7 @@ function createWorkspaceTurnManagerHost(
           (run) =>
             referencedRunIds.includes(run.id) &&
             run.workspaceId === workspaceId &&
-            ["pending", "running", "backgrounded"].includes(run.status)
+            isActiveWorkflowRunStatus(run.status)
         )
         .map((run) => run.id);
     },
@@ -136,7 +137,7 @@ function createWorkspaceTurnManagerHost(
           (run) =>
             run.workspaceId === workspaceId &&
             run.parentWorkflow == null &&
-            ["pending", "running", "backgrounded"].includes(run.status)
+            isActiveWorkflowRunStatus(run.status)
         )
         .map((run) => run.id);
     },

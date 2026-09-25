@@ -14,7 +14,6 @@ import * as path from "path";
 
 import { configFilePath, type Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
-import { SecretsStore } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
   getSubagentAttemptSettlementReceiptPath,
@@ -23,11 +22,12 @@ import {
   type SubagentAttemptSettlementSource,
 } from "@/node/services/subagentAttemptSettlements";
 import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
-import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
+import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
   createAIServiceMocks,
-  createMockInitStateManager,
+  createTaskServiceStack,
   createTestConfig,
   createTestProject,
   createWorkspaceServiceMocks,
@@ -37,8 +37,6 @@ import {
   stubStableIds,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
-import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
-import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
 import { TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
 import { EventEmitter } from "events";
@@ -137,34 +135,10 @@ describe("TaskService settlement receipt producers (G2)", () => {
       workspaceService?: ReturnType<typeof createWorkspaceServiceMocks>["workspaceService"];
     }
   ) {
-    const aiService = overrides?.aiService ?? createAIServiceMocks(config).aiService;
-    const workspaceService =
-      overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
-    const initStateManager = createMockInitStateManager();
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const taskService = new TaskService(
-      config,
-      fixture.historyService,
-      aiService,
-      workspaceService,
-      initStateManager,
-      undefined,
-      undefined,
-      new SecretsStore(config.rootDir),
-      terminalAttentionStore
-    );
-    taskService.setWorkspaceTurnManager(
-      new WorkspaceTurnManager(
-        config,
-        fixture.historyService,
-        aiService,
-        workspaceService,
-        initStateManager,
-        taskService,
-        terminalAttentionStore,
-        aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7]
-      )
-    );
+    const { taskService } = createTaskServiceStack(config, {
+      historyService: fixture.historyService,
+      ...overrides,
+    });
     return { taskService, svc: internals(taskService) };
   }
 
