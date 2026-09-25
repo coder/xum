@@ -7145,8 +7145,13 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve({}),
         // Acquired right after the dispatch-time serve passed its gate. A
         // forget leaves the recorded options in place and only sets the marker.
+        // Injects exactly one forget (then disarms), so a regression that
+        // retries after it cannot stay blocked on fresh invalidations.
         acquireOverridesLock: () => {
-          if (forgetOnDispatchLock) manager.forgetWorkspaceOverrides(workspaceId);
+          if (forgetOnDispatchLock) {
+            forgetOnDispatchLock = false;
+            manager.forgetWorkspaceOverrides(workspaceId);
+          }
           return Promise.resolve(() => Promise.resolve());
         },
       },
