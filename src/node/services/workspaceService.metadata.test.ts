@@ -1,79 +1,46 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import { EventEmitter } from "events";
 import path from "path";
-import type { ProjectsConfig } from "@/common/types/project";
+import type { Workspace } from "@/common/types/project";
 import type { Config } from "@/node/config";
-import type { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import * as todoStorageModule from "@/node/services/todos/todoStorage";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
-  mockInitStateManager,
-  createTestBackgroundProcessManager,
-  createWorkspaceServiceForTest,
+  createMockAIService,
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
+import { saveWorkspaces } from "./taskService.testHarness";
+import { waitForCondition } from "./testDispatchHelpers";
 
 describe("WorkspaceService metadata listeners", () => {
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
+  let aiEvents: EventEmitter;
 
   beforeEach(async () => {
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+    // The service subscribes to AI stream events in its constructor; route them through a
+    // real emitter so the test can drive its listeners.
+    aiEvents = new EventEmitter();
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        on: aiEvents.on.bind(aiEvents) as AIService["on"],
+        off: aiEvents.off.bind(aiEvents) as AIService["off"],
+      }),
+    });
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("error events clear streaming metadata", async () => {
     const workspaceId = "ws-error";
-    const setStreaming = mock(() =>
-      Promise.resolve({
-        recency: Date.now(),
-        streaming: false,
-        lastModel: null,
-        lastThinkingLevel: null,
-        agentStatus: null,
-      })
-    );
+    const setStreaming = spyOn(harness.extensionMetadata, "setStreaming");
 
-    class FakeAIService extends EventEmitter {
-      isStreaming = mock(() => false);
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      );
-    }
-
-    const aiService = new FakeAIService() as unknown as AIService;
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
-      isWorkspaceDeleted: mock(() => false),
-      setStreaming,
-    };
-
-    new WorkspaceService(
-      mockConfig as Config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadata as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
-
-    aiService.emit("error", {
+    aiEvents.emit("error", {
       type: "error",
       workspaceId,
       messageId: "msg-1",
@@ -81,7 +48,8 @@ describe("WorkspaceService metadata listeners", () => {
       errorType: "rate_limit",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await waitForCondition(() => setStreaming.mock.calls.length > 0);
+    await setStreaming.mock.results[0]?.value;
 
     expect(setStreaming).toHaveBeenCalledTimes(1);
     // todoStatus is intentionally NOT passed when there are no todos —
@@ -90,55 +58,19 @@ describe("WorkspaceService metadata listeners", () => {
       hasTodos: false,
       generation: 0,
     });
+    expect((await harness.extensionMetadata.getSnapshot(workspaceId))?.streaming).toBe(false);
   });
 
   test("todo_write events publish todo-derived sidebar status", async () => {
     const workspaceId = "ws-todo-status";
-    const setTodoStatus = mock(() =>
-      Promise.resolve({
-        recency: Date.now(),
-        streaming: true,
-        lastModel: null,
-        lastThinkingLevel: null,
-        agentStatus: null,
-      })
-    );
+    const setTodoStatus = spyOn(harness.extensionMetadata, "setTodoStatus");
     const readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([
       { content: "Run typecheck", status: "in_progress" },
       { content: "Add tests", status: "pending" },
     ]);
 
-    class FakeAIService extends EventEmitter {
-      isStreaming = mock(() => false);
-      getWorkspaceMetadata = mock(() =>
-        Promise.resolve({ success: false as const, error: "not found" })
-      );
-    }
-
-    const aiService = new FakeAIService() as unknown as AIService;
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      findWorkspace: mock(() => null),
-      loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-    };
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
-      isWorkspaceDeleted: mock(() => false),
-      setTodoStatus,
-    };
-
-    new WorkspaceService(
-      mockConfig as Config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadata as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
-
     try {
-      aiService.emit("tool-call-end", {
+      aiEvents.emit("tool-call-end", {
         type: "tool-call-end",
         workspaceId,
         messageId: "msg-1",
@@ -148,11 +80,10 @@ describe("WorkspaceService metadata listeners", () => {
         timestamp: Date.now(),
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await waitForCondition(() => setTodoStatus.mock.calls.length > 0);
+      await setTodoStatus.mock.results[0]?.value;
 
-      expect(readTodosSpy).toHaveBeenCalledWith(
-        path.join(mockConfig.sessionsDir ?? "", workspaceId)
-      );
+      expect(readTodosSpy).toHaveBeenCalledWith(path.join(harness.config.sessionsDir, workspaceId));
       expect(setTodoStatus).toHaveBeenCalledWith(
         workspaceId,
         { emoji: "🔄", message: "Run typecheck" },
@@ -164,6 +95,36 @@ describe("WorkspaceService metadata listeners", () => {
   });
 });
 
+/** A complete config entry, so metadata reads have no legacy fields to migrate. */
+function workspaceEntry(
+  projectPath: string,
+  id: string,
+  extra: Partial<Workspace> = {}
+): Workspace {
+  return {
+    path: `${projectPath}/${id}`,
+    id,
+    name: id,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+    ...extra,
+  };
+}
+
+async function setEntryPinnedAt(
+  config: Config,
+  projectPath: string,
+  id: string,
+  pinnedAt: string
+): Promise<void> {
+  await config.editConfig((cfg) => {
+    const entry = cfg.projects.get(projectPath)?.workspaces.find((w) => w.id === id);
+    if (!entry) throw new Error(`fixture missing ${id}`);
+    entry.pinnedAt = pinnedAt;
+    return cfg;
+  });
+}
+
 describe("WorkspaceService setPinned", () => {
   const projectPath = "/tmp/project";
   const rootId = "ws-root";
@@ -172,85 +133,29 @@ describe("WorkspaceService setPinned", () => {
   const archivedId = "ws-archived";
 
   let workspaceService: WorkspaceService;
-  let configState: ProjectsConfig;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let emittedMetadata: Array<{ workspaceId: string; metadata: FrontendWorkspaceMetadata | null }>;
 
   const getEntry = (id: string) =>
-    configState.projects.get(projectPath)?.workspaces.find((w) => w.id === id);
+    harness.config
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((w) => w.id === id);
+
+  const seedPinnedAt = (id: string, pinnedAt: string) =>
+    setEntryPinnedAt(harness.config, projectPath, id, pinnedAt);
 
   beforeEach(async () => {
-    configState = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              { path: `${projectPath}/${rootId}`, id: rootId },
-              { path: `${projectPath}/${otherRootId}`, id: otherRootId },
-              {
-                path: `${projectPath}/${childId}`,
-                id: childId,
-                parentWorkspaceId: rootId,
-              },
-              {
-                path: `${projectPath}/${archivedId}`,
-                id: archivedId,
-                archivedAt: "2026-01-01T00:00:00.000Z",
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      findWorkspace: mock((id: string) => {
-        const entry = getEntry(id);
-        if (!entry) return null;
-        return {
-          projectPath,
-          workspacePath: entry.path,
-          parentWorkspaceId: entry.parentWorkspaceId,
-        };
-      }),
-      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        configState = fn(configState);
-        return Promise.resolve();
-      }),
-      // Project config entries back into metadata so emitted events carry pin state.
-      getAllWorkspaceMetadata: mock(() =>
-        Promise.resolve(
-          (configState.projects.get(projectPath)?.workspaces ?? [])
-            .filter((w): w is typeof w & { id: string } => w.id != null)
-            .map(
-              (w): FrontendWorkspaceMetadata => ({
-                id: w.id,
-                name: w.id,
-                projectName: "proj",
-                projectPath,
-                namedWorkspacePath: w.path,
-                runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
-                parentWorkspaceId: w.parentWorkspaceId,
-                archivedAt: w.archivedAt,
-                unarchivedAt: w.unarchivedAt,
-                pinnedAt: w.pinnedAt,
-              })
-            )
-        )
-      ),
-      loadConfigOrDefault: mock(() => configState),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-    });
+    harness = await createWorkspaceServiceHarness();
+    workspaceService = harness.service;
+    const entry = (id: string, extra: Partial<Workspace> = {}) =>
+      workspaceEntry(projectPath, id, extra);
+    await saveWorkspaces(harness.config, projectPath, [
+      entry(rootId),
+      entry(otherRootId),
+      entry(childId, { parentWorkspaceId: rootId }),
+      entry(archivedId, { archivedAt: "2026-01-01T00:00:00.000Z" }),
+    ]);
 
     emittedMetadata = [];
     workspaceService.on("metadata", (payload) => {
@@ -259,7 +164,7 @@ describe("WorkspaceService setPinned", () => {
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("pin persists pinnedAt and emits metadata; unpin clears it and emits", async () => {
@@ -282,9 +187,7 @@ describe("WorkspaceService setPinned", () => {
   test("corrupted boundary pinnedAt on another chat cannot block pinning", async () => {
     // A parseable boundary timestamp has no representable +1ms successor; the
     // global monotonic scan must ignore it rather than fail every future pin.
-    const other = getEntry(otherRootId);
-    if (!other) throw new Error("fixture missing otherRootId");
-    other.pinnedAt = "+275760-09-13T00:00:00.000Z";
+    await seedPinnedAt(otherRootId, "+275760-09-13T00:00:00.000Z");
 
     const result = await workspaceService.setPinned(rootId, true);
     expect(result.success).toBe(true);
@@ -299,9 +202,7 @@ describe("WorkspaceService setPinned", () => {
     // An existing pin at the sane cap has no strictly-greater sane successor;
     // the write path renumbers pins instead of minting a duplicate key.
     const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
-    const other = getEntry(otherRootId);
-    if (!other) throw new Error("fixture missing otherRootId");
-    other.pinnedAt = saneMax;
+    await seedPinnedAt(otherRootId, saneMax);
 
     const result = await workspaceService.setPinned(rootId, true);
     expect(result.success).toBe(true);
@@ -358,7 +259,7 @@ describe("WorkspaceService setPinned", () => {
 
   test("appends after an existing future pinnedAt (clock skew)", async () => {
     const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    getEntry(otherRootId)!.pinnedAt = future;
+    await seedPinnedAt(otherRootId, future);
 
     expect((await workspaceService.setPinned(rootId, true)).success).toBe(true);
     expect(Date.parse(getEntry(rootId)?.pinnedAt ?? "")).toBeGreaterThan(Date.parse(future));
@@ -409,106 +310,32 @@ describe("WorkspaceService reorderPinned", () => {
   const archivedId = "ws-archived";
 
   let workspaceService: WorkspaceService;
-  let configState: ProjectsConfig;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
   let emittedMetadata: Array<{ workspaceId: string; metadata: FrontendWorkspaceMetadata | null }>;
 
-  const getEntry = (id: string) =>
-    configState.projects.get(projectPath)?.workspaces.find((w) => w.id === id);
+  const projectWorkspaces = () =>
+    harness.config.loadConfigOrDefault().projects.get(projectPath)?.workspaces ?? [];
+  const getEntry = (id: string) => projectWorkspaces().find((w) => w.id === id);
 
   /** Pinned ids in effective order (pinnedAt asc), as the sidebar sorts them. */
   const pinnedOrder = () =>
-    (configState.projects.get(projectPath)?.workspaces ?? [])
+    projectWorkspaces()
       .filter((w) => w.id && w.pinnedAt && !w.parentWorkspaceId && !w.archivedAt)
       .sort((a, b) => Date.parse(a.pinnedAt ?? "") - Date.parse(b.pinnedAt ?? ""))
       .map((w) => w.id);
 
   beforeEach(async () => {
-    configState = {
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              // Pinned block in order A, B, C (pinnedAt ascending).
-              {
-                path: `${projectPath}/${idA}`,
-                id: idA,
-                pinnedAt: "2026-01-01T00:00:00.000Z",
-              },
-              {
-                path: `${projectPath}/${idB}`,
-                id: idB,
-                pinnedAt: "2026-01-01T00:00:10.000Z",
-              },
-              {
-                path: `${projectPath}/${idC}`,
-                id: idC,
-                pinnedAt: "2026-01-01T00:00:20.000Z",
-              },
-              { path: `${projectPath}/${unpinnedId}`, id: unpinnedId },
-              {
-                path: `${projectPath}/${childId}`,
-                id: childId,
-                parentWorkspaceId: idA,
-              },
-              {
-                path: `${projectPath}/${archivedId}`,
-                id: archivedId,
-                archivedAt: "2026-01-01T00:00:00.000Z",
-              },
-            ],
-          },
-        ],
-      ]),
-    };
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/src",
-      sessionsDir: "/tmp/test/sessions",
-      findWorkspace: mock((id: string) => {
-        const entry = getEntry(id);
-        if (!entry) return null;
-        return {
-          projectPath,
-          workspacePath: entry.path,
-          parentWorkspaceId: entry.parentWorkspaceId,
-        };
-      }),
-      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        configState = fn(configState);
-        return Promise.resolve();
-      }),
-      getAllWorkspaceMetadata: mock(() =>
-        Promise.resolve(
-          (configState.projects.get(projectPath)?.workspaces ?? [])
-            .filter((w): w is typeof w & { id: string } => w.id != null)
-            .map(
-              (w): FrontendWorkspaceMetadata => ({
-                id: w.id,
-                name: w.id,
-                projectName: "proj",
-                projectPath,
-                namedWorkspacePath: w.path,
-                runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
-                parentWorkspaceId: w.parentWorkspaceId,
-                archivedAt: w.archivedAt,
-                unarchivedAt: w.unarchivedAt,
-                pinnedAt: w.pinnedAt,
-              })
-            )
-        )
-      ),
-      loadConfigOrDefault: mock(() => configState),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-    });
+    harness = await createWorkspaceServiceHarness();
+    workspaceService = harness.service;
+    await saveWorkspaces(harness.config, projectPath, [
+      // Pinned block in order A, B, C (pinnedAt ascending).
+      workspaceEntry(projectPath, idA, { pinnedAt: "2026-01-01T00:00:00.000Z" }),
+      workspaceEntry(projectPath, idB, { pinnedAt: "2026-01-01T00:00:10.000Z" }),
+      workspaceEntry(projectPath, idC, { pinnedAt: "2026-01-01T00:00:20.000Z" }),
+      workspaceEntry(projectPath, unpinnedId),
+      workspaceEntry(projectPath, childId, { parentWorkspaceId: idA }),
+      workspaceEntry(projectPath, archivedId, { archivedAt: "2026-01-01T00:00:00.000Z" }),
+    ]);
 
     emittedMetadata = [];
     workspaceService.on("metadata", (payload) => {
@@ -517,7 +344,7 @@ describe("WorkspaceService reorderPinned", () => {
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("persists the new order and emits metadata only for displaced rows", async () => {
@@ -597,9 +424,9 @@ describe("WorkspaceService reorderPinned", () => {
 
   test("identical pinnedAt values (client races) still reorder deterministically", async () => {
     const same = "2026-01-01T00:00:00.000Z";
-    getEntry(idA)!.pinnedAt = same;
-    getEntry(idB)!.pinnedAt = same;
-    getEntry(idC)!.pinnedAt = same;
+    for (const id of [idA, idB, idC]) {
+      await setEntryPinnedAt(harness.config, projectPath, id, same);
+    }
 
     const result = await workspaceService.reorderPinned([idB, idC, idA]);
     expect(result.success).toBe(true);
@@ -621,12 +448,11 @@ describe("WorkspaceService reorderPinned across projects", () => {
   const idB2 = "ws-b2";
 
   let workspaceService: WorkspaceService;
-  let configState: ProjectsConfig;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
 
+  const projects = () => harness.config.loadConfigOrDefault().projects;
   const findEntry = (id: string) => {
-    for (const [projectPath, project] of configState.projects) {
+    for (const [projectPath, project] of projects()) {
       const entry = project.workspaces.find((w) => w.id === id);
       if (entry) return { projectPath, entry };
     }
@@ -635,67 +461,42 @@ describe("WorkspaceService reorderPinned across projects", () => {
 
   /** Pinned ids across all projects in effective order (pinnedAt asc), as the flat sidebar sorts them. */
   const globalPinnedOrder = () =>
-    [...configState.projects.values()]
+    [...projects().values()]
       .flatMap((project) => project.workspaces)
       .filter((w) => w.id && w.pinnedAt && !w.parentWorkspaceId && !w.archivedAt)
       .sort((a, b) => Date.parse(a.pinnedAt ?? "") - Date.parse(b.pinnedAt ?? ""))
       .map((w) => w.id);
 
   beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    workspaceService = harness.service;
     // Interleaved global pin order: a1, b1, a2, b2.
-    configState = {
-      projects: new Map([
-        [
-          projectA,
-          {
-            workspaces: [
-              { path: `${projectA}/${idA1}`, id: idA1, pinnedAt: "2026-01-01T00:00:00.000Z" },
-              { path: `${projectA}/${idA2}`, id: idA2, pinnedAt: "2026-01-01T00:00:20.000Z" },
-              { path: `${projectA}/${idA3}`, id: idA3 },
-            ],
-          },
+    await saveWorkspaces(
+      harness.config,
+      projectA,
+      [
+        workspaceEntry(projectA, idA1, { pinnedAt: "2026-01-01T00:00:00.000Z" }),
+        workspaceEntry(projectA, idA2, { pinnedAt: "2026-01-01T00:00:20.000Z" }),
+        workspaceEntry(projectA, idA3),
+      ],
+      {
+        extraProjects: [
+          [
+            projectB,
+            {
+              workspaces: [
+                workspaceEntry(projectB, idB1, { pinnedAt: "2026-01-01T00:00:10.000Z" }),
+                workspaceEntry(projectB, idB2, { pinnedAt: "2026-01-01T00:00:30.000Z" }),
+              ],
+            },
+          ],
         ],
-        [
-          projectB,
-          {
-            workspaces: [
-              { path: `${projectB}/${idB1}`, id: idB1, pinnedAt: "2026-01-01T00:00:10.000Z" },
-              { path: `${projectB}/${idB2}`, id: idB2, pinnedAt: "2026-01-01T00:00:30.000Z" },
-            ],
-          },
-        ],
-      ]),
-    };
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: Partial<Config> = {
-      srcDir: "/tmp/src",
-      findWorkspace: mock((id: string) => {
-        const found = findEntry(id);
-        if (!found) return null;
-        return {
-          projectPath: found.projectPath,
-          workspacePath: found.entry.path,
-          parentWorkspaceId: found.entry.parentWorkspaceId,
-        };
-      }),
-      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
-        configState = fn(configState);
-        return Promise.resolve();
-      }),
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-      loadConfigOrDefault: mock(() => configState),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-    });
+      }
+    );
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("persists a flat-mode reorder spanning project buckets", async () => {
@@ -719,7 +520,7 @@ describe("WorkspaceService reorderPinned across projects", () => {
     // Give the other bucket the newest pin so a bucket-local max would sort the
     // new pin above it in the flat sidebar's unified block.
     const future = new Date(Date.now() + 60_000).toISOString();
-    findEntry(idB2)!.entry.pinnedAt = future;
+    await setEntryPinnedAt(harness.config, projectB, idB2, future);
 
     expect((await workspaceService.setPinned(idA3, true)).success).toBe(true);
     expect(globalPinnedOrder().at(-1)).toBe(idA3);

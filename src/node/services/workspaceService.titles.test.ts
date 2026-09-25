@@ -1,41 +1,33 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import * as fsPromises from "fs/promises";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
-import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { createMuxMessage } from "@/common/types/message";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   createDeferred,
-  mockInitStateManager,
-  createTestBackgroundProcessManager,
   createMockAIService,
-  createWorkspaceServiceForTest,
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
+import { saveWorkspaces } from "./taskService.testHarness";
 
 describe("WorkspaceService pending auto-title", () => {
   let workspaceService: WorkspaceService;
+  let harness: WorkspaceServiceHarness;
   let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
   let config: Config;
-  let tempDir: string;
   let workspaceId: string;
   let projectPath: string;
   let workspacePath: string;
@@ -50,15 +42,23 @@ describe("WorkspaceService pending auto-title", () => {
   };
 
   beforeEach(async () => {
-    ({
-      config,
-      tempDir,
-      historyService,
-      cleanup: cleanupHistory,
-    } = await createTestHistoryService());
-
     workspaceId = "pending-auto-title-workspace";
-    projectPath = path.join(tempDir, "project");
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
+    });
+    ({ config, historyService, service: workspaceService } = harness);
+    // sendMessage fires its recency write without awaiting it; these tests assert titles,
+    // not recency, so keep that write off disk instead of racing harness cleanup.
+    spyOn(harness.extensionMetadata, "updateRecency").mockImplementation((_workspaceId, recency) =>
+      Promise.resolve({
+        recency: recency ?? Date.now(),
+        streaming: false,
+        lastModel: null,
+        lastThinkingLevel: null,
+      })
+    );
+
+    projectPath = path.join(harness.rootDir, "project");
     workspacePath = path.join(projectPath, "fork-branch");
     await fsPromises.mkdir(projectPath, { recursive: true });
     await config.addWorkspace(projectPath, {
@@ -84,46 +84,7 @@ describe("WorkspaceService pending auto-title", () => {
       runtimeConfig: { type: "local" },
       namedWorkspacePath: workspacePath,
     };
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    const mockExtensionMetadata: Partial<ExtensionMetadataService> = {
-      updateRecency: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: null,
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-      setStreaming: mock(() =>
-        Promise.resolve({
-          recency: Date.now(),
-          streaming: false,
-          lastModel: null,
-          lastThinkingLevel: null,
-          agentStatus: null,
-        })
-      ),
-    };
-
-    workspaceService = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadata as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
+    spyOn(harness.aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(metadata));
 
     fakeSession = {
       ...createCompactionAdmissionMocks(),
@@ -150,7 +111,7 @@ describe("WorkspaceService pending auto-title", () => {
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("sendMessage triggers fork auto-title after the first accepted continue message", async () => {
@@ -364,12 +325,18 @@ describe("WorkspaceService naming model candidates", () => {
     name_workspace: { modelString: "google:gemini-3.8-flash", thinkingLevel: "medium" as const },
   };
 
-  function createNamingService(options: {
+  const harnesses: WorkspaceServiceHarness[] = [];
+
+  afterEach(async () => {
+    await Promise.all(harnesses.splice(0).map((harness) => harness.cleanup()));
+  });
+
+  async function createNamingService(options: {
     agentAiDefaults?: AgentAiDefaults;
     defaultModel?: string;
     minThinkingLevelByModel?: Record<string, ThinkingLevel>;
     metadata?: Partial<FrontendWorkspaceMetadata>;
-  }): WorkspaceService {
+  }): Promise<WorkspaceService> {
     const metadata = options.metadata
       ? Ok({
           id: "ws-naming",
@@ -381,25 +348,23 @@ describe("WorkspaceService naming model candidates", () => {
           ...options.metadata,
         })
       : { success: false as const, error: "workspace metadata unavailable" };
-    return createWorkspaceServiceForTest({
-      config: {
-        srcDir: "/tmp/test",
-        sessionsDir: "/tmp/test/sessions",
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map(),
-          agentAiDefaults: options.agentAiDefaults,
-          defaultModel: options.defaultModel,
-          minThinkingLevelByModel: options.minThinkingLevelByModel,
-        })),
-      },
+    const harness = await createWorkspaceServiceHarness({
       aiService: createMockAIService({
         getWorkspaceMetadata: mock(() => Promise.resolve(metadata)),
       }),
     });
+    harnesses.push(harness);
+    await harness.config.editConfig((cfg) => ({
+      ...cfg,
+      agentAiDefaults: options.agentAiDefaults,
+      defaultModel: options.defaultModel,
+      minThinkingLevelByModel: options.minThinkingLevelByModel,
+    }));
+    return harness.service;
   }
 
   test("configured naming model + thinking leads, hardcoded small models follow", async () => {
-    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+    const service = await createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
 
     const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
 
@@ -410,7 +375,7 @@ describe("WorkspaceService naming model candidates", () => {
   test.each(["medium", "off"] as const)(
     "honors thinking-only naming settings with an inherited model (thinking=%s)",
     async (thinkingLevel) => {
-      const service = createNamingService({
+      const service = await createNamingService({
         agentAiDefaults: { name_workspace: { thinkingLevel } },
       });
 
@@ -421,7 +386,7 @@ describe("WorkspaceService naming model candidates", () => {
   );
 
   test("thinking-only naming settings inherit the workspace's active model, not the app default", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
       defaultModel: "openai:gpt-5.6-terra",
       metadata: {
@@ -444,7 +409,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("thinking-only naming settings inherit the caller's model for a workspace that does not exist yet", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
       defaultModel: "openai:gpt-5.6-terra",
     });
@@ -460,7 +425,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("thinking-only naming settings fall back to the configured default model", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       agentAiDefaults: { name_workspace: { thinkingLevel: "medium" } },
       defaultModel: "openai:gpt-5.6-terra",
     });
@@ -471,7 +436,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("an active model without naming settings does not displace the hardcoded small models", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       defaultModel: "openai:gpt-5.6-terra",
       metadata: {
         agentId: "exec",
@@ -488,7 +453,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("carries each candidate's per-model thinking floor override", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       agentAiDefaults: NAMING_DEFAULTS,
       minThinkingLevelByModel: {
         "google:gemini-3.8-flash": "high",
@@ -506,7 +471,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("keeps legacy model fallback for workspaces without per-agent settings", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       metadata: { aiSettings: { model: "openai:gpt-5.6-sol", thinkingLevel: "off" } },
     });
 
@@ -519,7 +484,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("unset naming config keeps the hardcoded small models first, thinking off", async () => {
-    const service = createNamingService({});
+    const service = await createNamingService({});
 
     const candidates = await service.getWorkspaceNamingCandidates("ws-naming");
 
@@ -528,7 +493,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("the active per-agent model leads workspace fallbacks without stale legacy models or duplicates", async () => {
-    const service = createNamingService({
+    const service = await createNamingService({
       agentAiDefaults: NAMING_DEFAULTS,
       metadata: {
         agentId: "ask",
@@ -552,7 +517,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("pre-creation naming (no workspace) puts caller fallbacks after the configured and built-in models", async () => {
-    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+    const service = await createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
 
     const candidates = await service.getWorkspaceNamingCandidates(undefined, [
       "openai:gpt-5.6-sol",
@@ -567,7 +532,7 @@ describe("WorkspaceService naming model candidates", () => {
   });
 
   test("small-model string candidates share the same precedence", async () => {
-    const service = createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
+    const service = await createNamingService({ agentAiDefaults: NAMING_DEFAULTS });
 
     expect(await service.getWorkspaceTitleModelCandidates("ws-naming")).toEqual([
       "google:gemini-3.8-flash",
@@ -579,53 +544,31 @@ describe("WorkspaceService naming model candidates", () => {
 describe("WorkspaceService regenerateTitle", () => {
   let workspaceService: WorkspaceService;
   let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
 
   beforeEach(async () => {
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() =>
-        Promise.resolve({ success: false as const, error: "workspace metadata unavailable" })
-      ),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => ({ projectPath: "/tmp/proj", workspacePath: "/tmp/proj/ws" })),
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map(),
-        agentAiDefaults: {
-          name_workspace: {
-            modelString: "google:gemini-3.8-flash",
-            thinkingLevel: "medium" as const,
-          },
-        },
-      })),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-    };
-
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService: mockAIService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    ({ historyService, service: workspaceService } = harness);
+    await saveWorkspaces(
+      harness.config,
+      "/tmp/proj",
+      [
+        "ws-regenerate-title",
+        "ws-regenerate-title-compacted",
+        "ws-regenerate-title-first-plus-last-three",
+      ].map((id) => ({ id, name: id, path: `/tmp/proj/${id}` })),
+      {
+        agentAiDefaults: {
+          name_workspace: { modelString: "google:gemini-3.8-flash", thinkingLevel: "medium" },
+        },
+      }
+    );
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("returns updateTitle error when persisting generated title fails", async () => {

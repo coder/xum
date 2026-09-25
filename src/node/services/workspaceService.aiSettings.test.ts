@@ -1,17 +1,9 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { SendMessageError } from "@/common/types/errors";
-import type { Config } from "@/node/config";
-import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
-import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import {
@@ -19,12 +11,14 @@ import {
   modelHasPricingData,
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
-import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   createMockAIService,
   createWorkspaceServiceForTest,
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
+import { saveWorkspaces } from "./taskService.testHarness";
 
 describe("WorkspaceService sendMessage AI settings persistence", () => {
   // Backend-initiated turns (peer messages, task wakes, heartbeats) carry the recipient's
@@ -362,65 +356,23 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
 });
 
 describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
+  const projectPath = "/tmp/proj";
+  const workspacePath = "/tmp/proj/ws";
   let workspaceService: WorkspaceService;
-  let historyService: HistoryService;
-  let cleanupHistory: () => Promise<void>;
+  let harness: WorkspaceServiceHarness;
 
   beforeEach(async () => {
-    const aiService: AIService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as AIService;
-
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
-
-    const workspacePath = "/tmp/proj/ws";
-    const projectPath = "/tmp/proj";
-    const mockConfig: MockWorkspaceConfig = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock((workspaceId: string) =>
-        workspaceId === "ws" ? { projectPath, workspacePath } : null
-      ),
-      loadConfigOrDefault: mock(() => ({
-        projects: new Map([
-          [
-            projectPath,
-            {
-              workspaces: [
-                {
-                  id: "ws",
-                  path: workspacePath,
-                  name: "ws",
-                },
-              ],
-            },
-          ],
-        ]),
-      })),
-    };
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => undefined),
-    };
-    workspaceService = createWorkspaceServiceForTest({
-      config: mockConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
     });
+    workspaceService = harness.service;
+    await saveWorkspaces(harness.config, projectPath, [
+      { id: "ws", path: workspacePath, name: "ws" },
+    ]);
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test("refuses unpriced model persistence for budgeted active goals", async () => {
@@ -506,41 +458,14 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     interface WorkspaceServiceTestAccess {
       maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
       persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
-      config: {
-        findWorkspace: (
-          workspaceId: string
-        ) => { projectPath: string; workspacePath: string } | null;
-        loadConfigOrDefault: () => {
-          projects: Map<string, { workspaces: Array<Record<string, unknown>> }>;
-        };
-      };
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
     svc.persistWorkspaceAISettingsForAgent = persistSpy;
 
-    const projectPath = "/tmp/proj";
-    const workspacePath = "/tmp/proj/ws";
-    svc.config.findWorkspace = mock((workspaceId: string) =>
-      workspaceId === "ws" ? { projectPath, workspacePath } : null
-    );
-    svc.config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          projectPath,
-          {
-            workspaces: [
-              {
-                id: "ws",
-                path: workspacePath,
-                name: "ws",
-                parentWorkspaceId: "parent-ws",
-              },
-            ],
-          },
-        ],
-      ]),
-    }));
+    await saveWorkspaces(harness.config, projectPath, [
+      { id: "ws", path: workspacePath, name: "ws", parentWorkspaceId: "parent-ws" },
+    ]);
 
     await svc.maybePersistAISettingsFromOptions("ws", {
       agentId: "exec",
@@ -582,36 +507,7 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
   const UNPRICED = "openai:not-priced-model";
   const PRICED = "openai:gpt-4o-mini";
   let workspaceService: WorkspaceService;
-  let cleanupHistory: () => Promise<void>;
-
-  async function makeService(): Promise<WorkspaceService> {
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock(() => false),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const { historyService, cleanup } = await createTestHistoryService();
-    cleanupHistory = cleanup;
-    const config = {
-      srcDir: "/tmp/test",
-      sessionsDir: "/tmp/test/sessions",
-      generateStableId: mock(() => "test-id"),
-      findWorkspace: mock(() => null),
-    } as unknown as Config;
-    return new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      {
-        on: mock(() => undefined),
-        getInitState: mock(() => undefined),
-      } as unknown as InitStateManager,
-      {} as ExtensionMetadataService,
-      { cleanup: mock(() => Promise.resolve()) } as unknown as BackgroundProcessManager
-    );
-  }
+  let harness: WorkspaceServiceHarness;
 
   function setGoal(goal: GoalRecordV1 | null): void {
     // Mock the canonical WorkspaceGoalService.assertPricedModelForBudgetedGoal
@@ -646,11 +542,14 @@ describe("WorkspaceService assertPricedModelForBudgetedGoal", () => {
   }
 
   beforeEach(async () => {
-    workspaceService = await makeService();
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({ isStreaming: mock(() => false) }),
+    });
+    workspaceService = harness.service;
   });
 
   afterEach(async () => {
-    await cleanupHistory();
+    await harness.cleanup();
   });
 
   test.each([

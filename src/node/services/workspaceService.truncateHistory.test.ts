@@ -2,14 +2,9 @@ import { CompactionPendingState } from "./compactionPendingState";
 import * as historyScanner from "./historyScanner";
 import type { TurnCoordinator } from "./turnCoordinator";
 import { describe, expect, test, mock, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
-import {
-  createAgentSessionHarness,
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { EventEmitter } from "events";
@@ -17,7 +12,6 @@ import * as fsPromises from "fs/promises";
 import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import { HistoryService } from "./historyService";
-import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
@@ -26,8 +20,6 @@ import {
   startAbandonedBranchSummaryInBackground,
   type BranchSummaryAiService,
 } from "./branchSummary";
-import type { InitStateManager } from "./initStateManager";
-import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import { createMuxMessage } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -38,8 +30,9 @@ import {
   createCompactionAdmissionMocks,
   writePlanFile,
   createDeferred,
-  createTestBackgroundProcessManager,
   setWorkspaceGoalOk,
+  createMockAIService,
+  createWorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
 // Partial-truncation fixtures: truncateHistory(0.5) sizes its cut by token counts of the whole
@@ -50,30 +43,20 @@ const LONGER_FIRST_ROW_TEXT =
 
 describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   async function createServices(aiServiceOverride?: AIService) {
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    const extensionMetadata = new ExtensionMetadataService(
-      path.join(config.rootDir, "extensionMetadata.json")
-    );
-    const aiService =
-      aiServiceOverride ??
-      ({
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        isStreaming: mock(() => false),
-      } as unknown as AIService);
-    const initStateManager = {
-      on: mock(() => undefined),
-      getInitState: mock(() => null),
-    } as unknown as InitStateManager;
-    const workspaceService = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      initStateManager,
-      extensionMetadata,
-      createTestBackgroundProcessManager()
-    );
+    const harness = await createWorkspaceServiceHarness({
+      aiService:
+        aiServiceOverride ??
+        createMockAIService({
+          isStreaming: mock(() => false),
+          // No provider is configured, so a send that gets past admission fails at stream
+          // startup the way the real service does.
+          streamMessage: mock(() =>
+            Promise.resolve(Err({ type: "api_key_not_found" as const, provider: "anthropic" }))
+          ),
+        }),
+    });
+    const { aiService, config, historyService, extensionMetadata, cleanup } = harness;
+    const workspaceService = harness.service;
     const goalService = new WorkspaceGoalService(config, historyService, extensionMetadata);
     workspaceService.setWorkspaceGoalService(goalService);
     return { aiService, config, historyService, workspaceService, goalService, cleanup };
@@ -1575,11 +1558,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // in its refine drain/lock awaits. The busy recheck under the guard +
     // lock must fail the mutation instead of truncating under a live stream.
     let streaming = false;
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      isStreaming: mock(() => streaming),
-    } as unknown as AIService;
+    const aiService = createMockAIService({ isStreaming: mock(() => streaming) });
     const { config, historyService, workspaceService, cleanup } = await createServices(aiService);
     const workspaceId = "clear-recheck-busy";
     try {
@@ -1631,11 +1610,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // turn is active and, while held, refuse new turn admission so the
     // published row cannot land inside a PREPARING snapshot window.
     let streaming = true;
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      isStreaming: mock(() => streaming),
-    } as unknown as AIService;
+    const aiService = createMockAIService({ isStreaming: mock(() => streaming) });
     const { config, workspaceService, cleanup } = await createServices(aiService);
     const workspaceId = "refine-turn-exclusion";
     try {
@@ -2112,11 +2087,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   });
 
   test("context reset rejects active streams", async () => {
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      isStreaming: mock(() => true),
-    } as unknown as AIService;
+    const aiService = createMockAIService({ isStreaming: mock(() => true) });
     const { config, workspaceService, cleanup } = await createServices(aiService);
     const workspaceId = "context-reset-active-stream";
     try {
@@ -2377,10 +2348,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   // ---------------------------------------------------------------------------
   test("user-aborted streams do NOT replay queued goal mutations", async () => {
     const aiEmitter = new EventEmitter();
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
+    const aiService = createMockAIService({
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => false),
-    }) as unknown as AIService;
+    });
     const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
     const workspaceId = "user-abort-discards-mutation";
     try {
@@ -2423,7 +2395,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       // WorkspaceService stream-abort listener fires synchronously on the
       // emit below, before this clear — so the new gate inside that listener
       // is what prevents the replay.
-      aiService.emit("stream-abort", {
+      aiEmitter.emit("stream-abort", {
         type: "stream-abort",
         workspaceId,
         messageId: "msg",
@@ -2453,10 +2425,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   // the pending mutation (abort / stream-end).
   test("mid-stream activity emits surface the optimistic goal, then revert on user abort", async () => {
     const aiEmitter = new EventEmitter();
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
+    const aiService = createMockAIService({
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => false),
-    }) as unknown as AIService;
+    });
     const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
     const workspaceId = "midstream-goal-overlay";
     try {
@@ -2543,10 +2516,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // accounting. WorkspaceService must not drain here, or the aborted
     // in-flight stream can be charged to the replacement goal.
     const aiEmitter = new EventEmitter();
-    const aiService = Object.assign(aiEmitter, {
-      ...createStreamLifecycleMocks(),
+    const aiService = createMockAIService({
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => false),
-    }) as unknown as AIService;
+    });
     const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
     const workspaceId = "system-abort-replays-mutation";
     try {
@@ -2580,7 +2554,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         goalServiceAccess.isWorkspaceStreaming = isStreamingOriginal;
       }
 
-      aiService.emit("stream-abort", {
+      aiEmitter.emit("stream-abort", {
         type: "stream-abort",
         workspaceId,
         messageId: "msg",
