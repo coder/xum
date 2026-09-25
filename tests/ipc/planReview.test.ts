@@ -906,6 +906,64 @@ describeIntegration("workspace.planReview", () => {
     expect(all.threads.map((t) => t.threadId)).toContain(newThread.threadId);
   }, 120_000);
 
+  test("feedback that was sent reports success even when the post-send state refresh fails", async () => {
+    const snapshot = (await getState()).snapshots.at(-1);
+    expect(snapshot).toBeDefined();
+    if (!snapshot) return;
+    const feedbacksBefore = (await getState()).feedbacks.length;
+    const options = { model: MODEL, agentId: "plan" as const };
+
+    // Fail only the first full-history read after sendMessage returned (the state refresh).
+    const workspaceService = env.services.workspaceService;
+    const historyService = env.services.toORPCContext().historyService;
+    const originalSend = workspaceService.sendMessage.bind(workspaceService);
+    const originalIterate = historyService.iterateFullHistory.bind(historyService);
+    let sendReturned = false;
+    let refreshFailed = false;
+    const sendSpy = jest
+      .spyOn(workspaceService, "sendMessage")
+      .mockImplementation(async (...args: Parameters<typeof originalSend>) => {
+        const result = await originalSend(...args);
+        sendReturned = true;
+        return result;
+      });
+    const iterateSpy = jest
+      .spyOn(historyService, "iterateFullHistory")
+      .mockImplementation(async (id, direction, visitor) => {
+        if (sendReturned && !refreshFailed && id === workspaceId) {
+          refreshFailed = true;
+          return { success: false as const, error: "injected refresh failure" };
+        }
+        return originalIterate(id, direction, visitor);
+      });
+    collector.clear();
+    let sent: Awaited<ReturnType<ReturnType<typeof planReview>["submitFeedback"]>>;
+    try {
+      sent = await planReview().submitFeedback({
+        workspaceId,
+        snapshotId: snapshot.snapshotId,
+        comments: [{ anchor: { startLine: 1, endLine: 1 }, quote: "# Plan", body: "Once only" }],
+        replies: [],
+        options,
+      });
+    } finally {
+      sendSpy.mockRestore();
+      iterateSpy.mockRestore();
+    }
+    expect(refreshFailed).toBe(true);
+    // Committed mutation: success with no state, so a client does not resend and duplicate it.
+    expect(sent.success).toBe(true);
+    if (!sent.success) return;
+    expect(sent.data.state).toBeNull();
+    expect(await collector.waitForEvent("stream-end", STREAM_TIMEOUT_MS)).toBeDefined();
+    await workspaceService.getOrCreateSession(workspaceId).waitForIdle();
+    const after = await getState();
+    expect(after.feedbacks.length).toBe(feedbacksBefore + 1);
+    expect(after.feedbacks.some((feedback) => feedback.feedbackId === sent.data.feedbackId)).toBe(
+      true
+    );
+  }, 120_000);
+
   test("feedback is bounded per field and as a persisted row", async () => {
     const snapshot = (await getState()).snapshots.find((s) => s.contentHash === sha256(PLAN_B));
     expect(snapshot).toBeDefined();

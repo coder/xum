@@ -11777,7 +11777,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   async planReviewSubmitFeedback(
     workspaceId: string,
     input: SubmitPlanReviewFeedbackInput & { options: SendMessageOptions }
-  ): Promise<Result<{ feedbackId: string; state: PlanReviewState }, PlanReviewError>> {
+  ): Promise<Result<{ feedbackId: string; state: PlanReviewState | null }, PlanReviewError>> {
     // The feedback binds snapshot/thread ids read from history BEFORE sendMessage's entry
     // check, so a context clear/reset/replace committed in that gap (idle workspace, another
     // window) would append a row whose references were just discarded — the projection would
@@ -11837,8 +11837,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             : sent.error,
       });
     }
+    // The feedback row is durable (and may already drive a turn) once sendMessage succeeds. A
+    // failed refresh must not turn that into an error: a client keeping its drafts on failure
+    // would resend and duplicate the threads and the turn. Report success without state.
     const state = await getPlanReviewState(this.historyService, workspaceId);
-    if (!state.success) return state;
+    if (!state.success) {
+      log.warn("plan review: feedback sent but refreshing review state failed", {
+        workspaceId,
+        feedbackId: prepared.data.feedbackId,
+        error: state.error,
+      });
+      return Ok({ feedbackId: prepared.data.feedbackId, state: null });
+    }
     return Ok({ feedbackId: prepared.data.feedbackId, state: state.data });
   }
 

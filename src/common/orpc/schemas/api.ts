@@ -1874,7 +1874,12 @@ export const workspace = {
         }),
       }),
       output: ResultSchema(
-        z.object({ feedbackId: z.string(), state: PlanReviewStateSchema }),
+        z.object({
+          feedbackId: z.string(),
+          // null when the feedback was sent but refreshing review state afterwards failed: the
+          // mutation is committed, so callers must not retry it; refresh via getState instead.
+          state: PlanReviewStateSchema.nullable(),
+        }),
         PlanReviewErrorSchema
       ),
     },
