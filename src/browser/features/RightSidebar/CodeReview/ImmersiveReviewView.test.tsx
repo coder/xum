@@ -1,6 +1,7 @@
 import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import * as RealAPIModule from "@/browser/contexts/API";
+import * as RealClipboardModule from "@/browser/utils/clipboard";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
@@ -27,8 +28,12 @@ interface MockApiClient {
 let mockApi: MockApiClient;
 let clipboardWrites: string[] = [];
 
-// Later full-app suites must not inherit this partial API client.
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
+// Later suites must not inherit this partial API client or the clipboard stub (which
+// swallowed clipboard.test.ts's copies when it ran later in the same process).
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...RealAPIModule }],
+  ["@/browser/utils/clipboard", { ...RealClipboardModule }],
+]);
 void mock.module("@/browser/contexts/API", () => ({
   useAPI: () => ({
     api: mockApi,
