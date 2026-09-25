@@ -6,7 +6,7 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { StreamManager, TurnExecutionOptions, WorkspaceStreamInfo } from "./streamManager";
 import { fakeStreamText } from "./streamManager.testHarness";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
-import { type LanguageModel } from "ai";
+import type { LanguageModel, ModelMessage, streamText } from "ai";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -271,4 +271,37 @@ export function createExecRecordingRuntimeForTests(): {
     return Promise.resolve(createExecStreamForTests());
   };
   return { runtime, execCalls };
+}
+
+type StreamTextOptionsForTests = Parameters<typeof streamText>[0];
+
+/** A prepareStep result as the AI SDK types it. */
+export type PreparedStepForTests = Awaited<
+  ReturnType<NonNullable<StreamTextOptionsForTests["prepareStep"]>>
+>;
+
+/**
+ * Plays one SDK step preparation against the prepareStep StreamManager handed
+ * to the injected streamText. StreamManager reads only `messages` and
+ * `stepNumber`; the remaining fields satisfy the SDK's callback type.
+ */
+export async function prepareStepForTests(
+  options: StreamTextOptionsForTests,
+  messages: ModelMessage[],
+  stepNumber = 1
+): Promise<PreparedStepForTests> {
+  const prepare = options.prepareStep;
+  if (!prepare) throw new Error("Expected StreamManager to pass prepareStep");
+  return await prepare({
+    messages,
+    stepNumber,
+    model: options.model,
+    steps: [],
+    initialMessages: messages,
+    responseMessages: [],
+    instructions: undefined,
+    initialInstructions: undefined,
+    toolsContext: {},
+    runtimeContext: {},
+  });
 }

@@ -20,6 +20,7 @@ import {
 } from "@/common/orpc/schemas/continuousCompaction";
 import type { StreamManager, TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
+import { prepareStepForTests, type PreparedStepForTests } from "./streamManager.suite.testHarness";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createTestHistoryService } from "./testHistoryService";
 import {
@@ -106,30 +107,6 @@ function journalFixture(): ContinuousCompactionJournal {
 }
 
 type StreamTextOptions = Parameters<typeof ai.streamText>[0];
-/** The prepareStep result fields these tests read. */
-type StepResult = { messages?: ai.ModelMessage[]; providerOptions?: unknown } | undefined;
-
-/** Plays one SDK step preparation against the prepareStep StreamManager handed to streamText. */
-async function prepareStep(
-  options: StreamTextOptions,
-  messages: ai.ModelMessage[] = originalMessages,
-  stepNumber = 1
-): Promise<StepResult> {
-  const prepare = options.prepareStep;
-  assert(prepare, "Expected prepareStep callback");
-  return await prepare({
-    messages,
-    stepNumber,
-    model,
-    steps: [],
-    initialMessages: originalMessages,
-    responseMessages: [],
-    instructions: undefined,
-    initialInstructions: undefined,
-    toolsContext: {},
-    runtimeContext: {},
-  });
-}
 
 /** Provider stream that stays open until the turn is aborted. */
 async function* hangUntilAborted(signal: AbortSignal | undefined) {
@@ -244,8 +221,8 @@ describe("continuous prefix prepareStep and journal", () => {
       completion,
       latestMessages: () => latestMessages,
       swapState: () => manager.getPrefixSwapState(workspaceId),
-      run: (messages?: ai.ModelMessage[], stepNumber?: number) =>
-        prepareStep(first, messages, stepNumber),
+      run: (messages: ai.ModelMessage[] = originalMessages, stepNumber?: number) =>
+        prepareStepForTests(first, messages, stepNumber),
     };
   }
 
@@ -926,9 +903,9 @@ describe("continuous prefix prepareStep and journal", () => {
       const retried: {
         state?: string;
         persisted?: boolean;
-        retryStep?: StepResult;
+        retryStep?: PreparedStepForTests;
       } = {};
-      const first: { step?: StepResult } = {};
+      const first: { step?: PreparedStepForTests } = {};
       let activated = false;
       const turn = await startLiveTurn({
         // A previousResponseId rejection after a completed step retries at that step boundary.
@@ -937,9 +914,9 @@ describe("continuous prefix prepareStep and journal", () => {
           async function* (options, manager) {
             if (consumed) {
               activated = manager.setPrefixSwap(workspaceId, swap);
-              first.step = await prepareStep(options);
+              first.step = await prepareStepForTests(options, originalMessages);
             } else {
-              first.step = await prepareStep(options);
+              first.step = await prepareStepForTests(options, originalMessages);
               // Compaction finished while this step was streaming: the swap is still pending.
               activated = manager.setPrefixSwap(workspaceId, swap);
             }
@@ -966,7 +943,10 @@ describe("continuous prefix prepareStep and journal", () => {
             retried.state = manager.getPrefixSwapState(workspaceId);
             retried.persisted = (await store.read()) !== null;
             assert(options.messages, "Expected the retry to resend messages");
-            retried.retryStep = await prepareStep(options, options.messages);
+            retried.retryStep = await prepareStepForTests(
+              options,
+              options.messages ?? originalMessages
+            );
             yield* answer();
           },
         ],
@@ -1177,7 +1157,7 @@ describe("continuous prefix prepareStep and journal", () => {
             async function* (options, manager) {
               liveManager = manager;
               activated = manager.setPrefixSwap(workspaceId, swap);
-              if (consumed) await prepareStep(options);
+              if (consumed) await prepareStepForTests(options, originalMessages);
               yield { type: "start-step" };
               yield { type: "text-delta", text: "retained step" };
               yield {
@@ -1193,9 +1173,11 @@ describe("continuous prefix prepareStep and journal", () => {
                 // Until the session stops the stream, the fallback cannot send the
                 // invalidated prefix: preparing its first step waits for the stop and fails.
                 assert(options.messages, "Expected fallback messages");
-                const step = prepareStep(options, options.messages, 0).catch(
-                  (error: unknown) => error
-                );
+                const step = prepareStepForTests(
+                  options,
+                  options.messages ?? originalMessages,
+                  0
+                ).catch((error: unknown) => error);
                 // The session stops the stream for a durable fold; that stop waits
                 // for this attempt to exit, so it is awaited after the turn settles.
                 sessionStop = manager.stopStream(workspaceId, { abortReason: "system" });

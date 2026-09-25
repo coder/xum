@@ -7,20 +7,14 @@ import {
   createLiveStreamHarness,
   eventsOfType,
   type LiveStream,
+  toolCallChunk,
+  toolResultChunk,
 } from "./streamManager.liveStream.testHarness";
 
 installStreamManagerTestHistory();
 
 function isReplay(event: TurnEngineEvent): boolean {
   return (event as { replay?: boolean }).replay === true;
-}
-
-function toolCall(toolCallId: string) {
-  return { type: "tool-call", toolCallId, toolName: "bash", input: { script: "true" } };
-}
-
-function toolResult(toolCallId: string) {
-  return { type: "tool-result", toolCallId, toolName: "bash", output: { ok: true } };
 }
 
 describe("StreamManager - replayStream", () => {
@@ -64,10 +58,10 @@ describe("StreamManager - replayStream", () => {
     // Both parts land before either completes, so tool-new's part timestamp is
     // older than the cursor and only its completion time is newer.
     await live.push(
-      toolCall("tool-old"),
-      toolCall("tool-new"),
-      toolResult("tool-old"),
-      toolResult("tool-new")
+      toolCallChunk("tool-old"),
+      toolCallChunk("tool-new"),
+      toolResultChunk("tool-old"),
+      toolResultChunk("tool-new")
     );
     const cursor = eventsOfType(harness.events, "tool-call-end").find(
       (event) => event.toolCallId === "tool-old"
@@ -93,7 +87,7 @@ describe("StreamManager - replayStream", () => {
       tools: { bash },
     });
     // Both calls are queued before the cursor; only one begins execute() after it.
-    await live.push(toolCall("tool-still-queued"), toolCall("tool-started-after-cursor"));
+    await live.push(toolCallChunk("tool-still-queued"), toolCallChunk("tool-started-after-cursor"));
     const cursor = eventsOfType(harness.events, "tool-call-start").at(-1)?.timestamp;
     if (cursor == null) throw new Error("Expected tool-call-start");
     const executionOptions: ToolExecutionOptions<unknown> = {
