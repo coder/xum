@@ -19,7 +19,7 @@ import { setupProviders, setupWorkspaceWithoutProvider, shouldRunIntegrationTest
 import { createStreamCollector, resolveOrpcClient } from "./helpers";
 import { HistoryService } from "../../src/node/services/historyService";
 import { createMuxMessage } from "../../src/common/types/message";
-import { hasNative1MContext, supports1MContext } from "../../src/common/utils/ai/models";
+import { getAnthropic1MContextMode, supports1MContext } from "../../src/common/utils/ai/models";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -207,7 +207,7 @@ async function runCompaction(retryResponse: RetryResponse) {
 describeIntegration("compaction 1M context retry (loopback fixture)", () => {
   test("pins a beta-1M model so the retry branch is reachable", () => {
     expect(supports1MContext(BETA_1M_MODEL)).toBe(true);
-    expect(hasNative1MContext(BETA_1M_MODEL)).toBe(false);
+    expect(getAnthropic1MContextMode(BETA_1M_MODEL)).toBe("beta");
   });
 
   test("retries an overflowing compaction exactly once with the 1M beta header", async () => {

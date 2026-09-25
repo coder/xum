@@ -163,11 +163,16 @@ export { shouldRunIntegrationTests, validateApiKeys, getApiKey };
  * Call this in beforeAll hooks to prevent Jest sandbox race conditions.
  */
 export async function preloadTestModules(): Promise<void> {
-  const [{ loadTokenizerModules }, { preloadAISDKProviders }] = await Promise.all([
+  const [{ loadTokenizerModules }, { PROVIDER_REGISTRY }] = await Promise.all([
     import("../../src/node/utils/main/tokenizer"),
-    import("../../src/node/services/providerModelFactory"),
+    import("../../src/common/constants/providers"),
   ]);
-  await Promise.all([loadTokenizerModules(), preloadAISDKProviders()]);
+  // Production lazy-loads AI SDK providers on first use; load them all up front so
+  // concurrent createModel() calls hit the module cache instead of racing.
+  await Promise.all([
+    loadTokenizerModules(),
+    ...Object.values(PROVIDER_REGISTRY).map((importProvider) => importProvider()),
+  ]);
 }
 
 /**

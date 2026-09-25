@@ -257,43 +257,6 @@ export function isAnthropic1MEffectivelyEnabled(
 }
 
 /**
- * Preserve Anthropic 1M beta intent across routed follow-ups only when the source request
- * had effective beta 1M enabled and the target model is also beta-eligible.
- */
-export function preserveAnthropic1MContextForFollowUp(
-  sourceModelString: string,
-  targetModelString: string,
-  muxProviderOptions?: MuxProviderOptions,
-  providersConfig?: ProvidersConfigMap | null
-): MuxProviderOptions | undefined {
-  if (!muxProviderOptions) {
-    return undefined;
-  }
-
-  if (!isAnthropic1MEffectivelyEnabled(sourceModelString, muxProviderOptions, providersConfig)) {
-    return muxProviderOptions;
-  }
-
-  const anthropicOptions = muxProviderOptions.anthropic;
-  if (!anthropicOptions) {
-    return muxProviderOptions;
-  }
-
-  const { capabilityModel } = resolveAnthropic1MCapabilityModel(targetModelString, providersConfig);
-  if (!supports1MContext(capabilityModel, providersConfig)) {
-    return muxProviderOptions;
-  }
-
-  return {
-    ...muxProviderOptions,
-    anthropic: {
-      ...anthropicOptions,
-      use1MContext: true,
-    },
-  };
-}
-
-/**
  * Route-aware eligibility for Anthropic's thinking block-binding control.
  *
  * The SDK pairs `thinking.blockBinding` with the

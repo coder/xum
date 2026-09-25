@@ -26,6 +26,7 @@
     "**/*.test.ts",
     "**/*.test.tsx",
     "**/*.testHarness.ts",
+    "src/node/services/testHistoryService.ts",
     "src/browser/**/*",
     "src/cli/debug/**/*",
     "src/node/builtinWorkflowActions/**/*",
