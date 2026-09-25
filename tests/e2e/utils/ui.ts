@@ -23,6 +23,8 @@ export interface StreamTimeline {
 export interface WorkspaceUI {
   readonly projects: {
     openFirstWorkspace(): Promise<void>;
+    /** Select a workspace row in the sidebar by ID (expands the first project if needed). */
+    openWorkspaceById(workspaceId: string): Promise<void>;
   };
   readonly chat: {
     waitForTranscript(): Promise<void>;
@@ -100,30 +102,35 @@ function transcriptLocator(page: Page): Locator {
 }
 
 export function createWorkspaceUI(page: Page, context: DemoProjectConfig): WorkspaceUI {
+  /** Workspace rows of the first project, expanding it when collapsed. */
+  async function firstProjectWorkspaceRows(): Promise<Locator> {
+    const navigation = page.getByRole("navigation", { name: "Projects" });
+    await expect(navigation).toBeVisible();
+
+    const projectItems = navigation.locator('[role="button"][aria-controls]');
+    const projectItem = projectItems.first();
+    await expect(projectItem).toBeVisible();
+
+    const workspaceListId = await projectItem.getAttribute("aria-controls");
+    if (!workspaceListId) {
+      throw new Error("Project item is missing aria-controls attribute");
+    }
+
+    const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
+    const workspaceItem = workspaceItems.first();
+    const isVisible = await workspaceItem.isVisible().catch(() => false);
+    if (!isVisible) {
+      // Click the expand/collapse button within the project item
+      const expandButton = projectItem.getByRole("button", { name: /expand project/i });
+      await expandButton.click();
+      await workspaceItem.waitFor({ state: "visible" });
+    }
+    return workspaceItems;
+  }
+
   const projects = {
     async openFirstWorkspace(): Promise<void> {
-      const navigation = page.getByRole("navigation", { name: "Projects" });
-      await expect(navigation).toBeVisible();
-
-      const projectItems = navigation.locator('[role="button"][aria-controls]');
-      const projectItem = projectItems.first();
-      await expect(projectItem).toBeVisible();
-
-      const workspaceListId = await projectItem.getAttribute("aria-controls");
-      if (!workspaceListId) {
-        throw new Error("Project item is missing aria-controls attribute");
-      }
-
-      const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
-      const workspaceItem = workspaceItems.first();
-      const isVisible = await workspaceItem.isVisible().catch(() => false);
-      if (!isVisible) {
-        // Click the expand/collapse button within the project item
-        const expandButton = projectItem.getByRole("button", { name: /expand project/i });
-        await expandButton.click();
-        await workspaceItem.waitFor({ state: "visible" });
-      }
-
+      const workspaceItem = (await firstProjectWorkspaceRows()).first();
       await workspaceItem.click();
 
       // Startup can land on a project page or a restored workspace. After clicking a
@@ -134,6 +141,15 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         timeout: 20_000,
       });
 
+      await chat.waitForTranscript();
+    },
+
+    async openWorkspaceById(workspaceId: string): Promise<void> {
+      const workspaceItem = (await firstProjectWorkspaceRows()).and(
+        page.locator(`[data-workspace-id="${workspaceId}"]`)
+      );
+      await workspaceItem.click();
+      await expect(workspaceItem).toHaveAttribute("aria-current", "true");
       await chat.waitForTranscript();
     },
   };

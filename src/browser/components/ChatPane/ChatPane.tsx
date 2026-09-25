@@ -125,6 +125,7 @@ import {
 } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
+import { markChatSwitchMilestoneOnNextFrame } from "@/browser/utils/perf/chatSwitchTiming";
 import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
 import {
   CUSTOM_EVENTS,
@@ -618,6 +619,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   });
   const revealedMessages =
     revealFromIndex === 0 ? deferredMessages : deferredMessages.slice(revealFromIndex);
+  const hasCommittedTranscriptRow =
+    !showTranscriptHydrationPlaceholder && revealedMessages.length > 0;
+  // Chat-switch User Timing (#4504): first transcript row painted after a switch. The commit
+  // before the store activates the workspace can hold cached rows that a synchronous re-render
+  // replaces with the skeleton before paint; the next-frame check drops those.
+  useEffect(() => {
+    if (!hasCommittedTranscriptRow) return;
+    return markChatSwitchMilestoneOnNextFrame(workspaceId, "first-row");
+  }, [workspaceId, hasCommittedTranscriptRow]);
   // Older pages prepend above rows the reveal has not reached yet; offer them once it has.
   const shouldRenderLoadOlderMessagesButton =
     hasOlderHistory && isFullyRevealed && !isPixelSnapshotEnvironment();
@@ -1557,7 +1567,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
-                <TranscriptHydrationSkeleton />
+                <TranscriptHydrationSkeleton workspaceId={workspaceId} />
               ) : showEmptyTranscriptPlaceholder ? (
                 <div className="text-placeholder flex h-full flex-1 flex-col items-center justify-center text-center [&_h3]:m-0 [&_h3]:mb-2.5 [&_h3]:text-base [&_h3]:font-medium [&_p]:m-0 [&_p]:text-[13px]">
                   <h3>No Messages Yet</h3>

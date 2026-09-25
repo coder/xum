@@ -2850,6 +2850,43 @@ describe("HistoryService", () => {
       }
     });
 
+    it("reports the lock acquisition and only the active epoch's bytes to a read observer", async () => {
+      // onChat replay timing (#4504) logs these; counting the whole file (or the archive)
+      // would overstate the replay cost of compacted workspaces.
+      const workspaceId = "ws-read-observer";
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      const lines = [
+        createMuxMessage("pre-user", "user", "x".repeat(500), { historySequence: 0 }),
+        createMuxMessage("boundary", "assistant", "Summary", {
+          historySequence: 1,
+          compactionBoundary: true,
+          compacted: "user",
+          compactionEpoch: 1,
+        }),
+        createMuxMessage("post-user", "user", "after", { historySequence: 2 }),
+      ].map((message) => JSON.stringify({ ...message, workspaceId }));
+      await fs.writeFile(path.join(workspaceDir, "chat.jsonl"), lines.join("\n") + "\n");
+
+      let lockAcquiredCount = 0;
+      let bytesRead = 0;
+      const result = await service.getHistoryFromLatestBoundary(workspaceId, 0, {
+        onLockAcquired: () => {
+          lockAcquiredCount += 1;
+        },
+        onBytesRead: (bytes) => {
+          bytesRead += bytes;
+        },
+      });
+
+      expect(result.success && result.data.map((message) => message.id)).toEqual([
+        "boundary",
+        "post-user",
+      ]);
+      expect(lockAcquiredCount).toBe(1);
+      expect(bytesRead).toBe(Buffer.byteLength(lines.slice(1).join("\n") + "\n"));
+    });
+
     it("should skip malformed lines in boundary region", async () => {
       const workspaceId = "ws-malformed";
       const workspaceDir = path.join(config.sessionsDir, workspaceId);

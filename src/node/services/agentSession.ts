@@ -76,6 +76,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
+import { createOnChatReplayTimer, logOnChatReplayTiming } from "@/node/services/onChatReplayTiming";
 import type {
   HeldInput,
   WorkspaceChatMessage,
@@ -2937,6 +2938,11 @@ export class AgentSession {
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
     // whether the history it closes is trustworthy (see CaughtUpMessageSchema).
     let historyReplayFailed = false;
+    // Phase timing for the one replay log line (#4504). The subscription delivers nothing until
+    // this method returns, so totalMs is the server's share of the switch-back skeleton window.
+    const replayTimer = createOnChatReplayTimer();
+    let historyBytesRead = 0;
+    let streamReplayed = false;
 
     // Self-healing: persisted rows can fail the current wire schema (older
     // writers, schema drift, corruption). oRPC validates every event yielded to
@@ -3016,9 +3022,12 @@ export class AgentSession {
         const liveStreamInfo = initialStreamInfo;
         if (liveStreamInfo) {
           const streamLastTimestamp = this.getStreamLastTimestamp(liveStreamInfo);
-          await this.streamManager.replayStream(this.workspaceId, {
-            afterTimestamp: streamLastTimestamp,
-          });
+          await replayTimer.time("streamReplay", () =>
+            this.streamManager.replayStream(this.workspaceId, {
+              afterTimestamp: streamLastTimestamp,
+            })
+          );
+          streamReplayed = true;
 
           // Stream can end while replayStream runs; only expose cursor when still active.
           const liveStreamInfoAfterReplay = this.streamManager.getStreamInfo(this.workspaceId);
@@ -3035,7 +3044,9 @@ export class AgentSession {
 
         // Re-emit current init state in live mode too. If init finished while the
         // client was disconnected, replaying init-end clears stale "running" UI.
-        await this.initStateManager.replayInit(this.workspaceId);
+        await replayTimer.time("initReplay", () =>
+          this.initStateManager.replayInit(this.workspaceId)
+        );
 
         return;
       }
@@ -3043,14 +3054,23 @@ export class AgentSession {
       // Read partial BEFORE iterating history so we can skip the corresponding
       // placeholder message (which has empty parts). The partial has the real content.
       const streamInfo = initialStreamInfo;
-      const partial = await this.historyService.readPartial(this.workspaceId);
+      const partial = await replayTimer.time("partialRead", () =>
+        this.historyService.readPartial(this.workspaceId)
+      );
       const partialHistorySequence = partial?.metadata?.historySequence;
 
       // Load chat history from the latest compaction boundary onward (skip=0).
       // Older compaction epochs are fetched on demand through workspace.history.loadMore.
-      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
-        this.workspaceId,
-        0
+      const historyResult = await replayTimer.timeLocked(
+        "historyLockWait",
+        "historyRead",
+        (onLockAcquired) =>
+          this.historyService.getHistoryFromLatestBoundary(this.workspaceId, 0, {
+            onLockAcquired,
+            onBytesRead: (bytes) => {
+              historyBytesRead += bytes;
+            },
+          })
       );
 
       let sinceHistorySequence: number | undefined;
@@ -3108,9 +3128,8 @@ export class AgentSession {
           // Defensively verify rows below the cursor are unchanged. Without this,
           // deleting or rewriting an older row while disconnected could leave stale
           // client state when since-mode append replay skips those older sequences.
-          const priorHistoryFingerprint = computePriorHistoryFingerprint(
-            history,
-            historyCursor.historySequence
+          const priorHistoryFingerprint = replayTimer.timeSync("fingerprint", () =>
+            computePriorHistoryFingerprint(history, historyCursor.historySequence)
           );
           anchorFingerprint = {
             historySequence: historyCursor.historySequence,
@@ -3162,13 +3181,14 @@ export class AgentSession {
             // Empty full replay means there is no older page to request.
             hasOlderHistory = false;
           } else {
-            hasOlderHistory = await this.historyService.hasHistoryBeforeSequence(
-              this.workspaceId,
-              oldestHistorySequence
+            const oldestSequence = oldestHistorySequence;
+            hasOlderHistory = await replayTimer.time("olderHistoryCheck", () =>
+              this.historyService.hasHistoryBeforeSequence(this.workspaceId, oldestSequence)
             );
           }
         }
 
+        const stopEmitRows = replayTimer.start("emitRows");
         for (const message of history) {
           // Skip the placeholder message if we have a partial with the same historySequence.
           // The placeholder has empty parts; the partial has the actual content.
@@ -3199,6 +3219,7 @@ export class AgentSession {
             sentRowCount += 1;
           }
         }
+        stopEmitRows();
 
         for (let index = history.length - 1; index >= 0; index -= 1) {
           const message = history[index];
@@ -3210,7 +3231,9 @@ export class AgentSession {
           const priorHistoryFingerprint =
             anchorFingerprint?.historySequence === historySequence
               ? anchorFingerprint.value
-              : computePriorHistoryFingerprint(history, historySequence);
+              : replayTimer.timeSync("fingerprint", () =>
+                  computePriorHistoryFingerprint(history, historySequence)
+                );
 
           serverCursor = {
             ...serverCursor,
@@ -3227,7 +3250,10 @@ export class AgentSession {
 
       const attemptedStreamReplay = streamInfo !== undefined;
       if (streamInfo) {
-        await this.streamManager.replayStream(this.workspaceId, { afterTimestamp });
+        await replayTimer.time("streamReplay", () =>
+          this.streamManager.replayStream(this.workspaceId, { afterTimestamp })
+        );
+        streamReplayed = true;
       }
 
       // Re-read stream state after replay. The stream can end while we are
@@ -3251,7 +3277,9 @@ export class AgentSession {
 
       // Re-emit current init state for all replay modes. Incremental reconnects can
       // otherwise miss init-end while disconnected and remain stuck in running state.
-      await this.initStateManager.replayInit(this.workspaceId);
+      await replayTimer.time("initReplay", () =>
+        this.initStateManager.replayInit(this.workspaceId)
+      );
     } catch (error) {
       log.error("Failed to replay history for workspace", {
         workspaceId: this.workspaceId,
@@ -3318,16 +3346,21 @@ export class AgentSession {
         });
       }
 
-      // Surface since→full downgrades (and replay shape in general) in logs. Row counts
-      // only — no JSON.stringify byte accounting on this hot path.
+      // Surface since→full downgrades (and replay shape in general) in logs. Row counts and
+      // raw bytes read only — no JSON.stringify byte accounting on this hot path. Logged
+      // before caught-up so totalMs is the server's time-to-caught-up for this replay.
       const wasDowngraded = mode?.type === "since" && replayMode === "full";
-      log.debug("onChat replay", {
+      logOnChatReplayTiming({
         workspaceId: this.workspaceId,
         requestedMode: mode?.type ?? "full",
         replayMode,
         ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
         epochRowCount,
         sentRowCount,
+        historyBytesRead,
+        streamReplayed,
+        historyReplayStatus: historyReplayFailed ? "failed" : "complete",
+        ...replayTimer.finish(),
       });
 
       // Send caught-up after ALL historical data (including init events)
