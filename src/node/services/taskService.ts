@@ -15381,10 +15381,9 @@ export class TaskService implements AgentTaskIntegration {
 
   private async handleStreamAbort(
     event: StreamAbortEvent,
-    /** Captured by the production listener at event time; the entry-time read is for tests. */
-    eventAbortOrigin?: StreamAttemptOrigin
+    /** Captured by the stream-abort listener in the event's own tick, before the lock wait. */
+    abortOrigin: StreamAttemptOrigin
   ): Promise<void> {
-    const abortOrigin = eventAbortOrigin ?? this.resolveStreamAttemptAtEvent(event.workspaceId);
     if (event.abortReason === "user") {
       // Explicit Stop withdraws the execution, not just its continuation. A later queue
       // notification or delayed source event must not turn that Stop into automatic recovery.
@@ -15484,10 +15483,9 @@ export class TaskService implements AgentTaskIntegration {
 
   private async handleTaskStreamError(
     event: ErrorEvent,
-    /** Captured by the production listener at event time; the entry-time read is for tests. */
-    eventAttemptId?: string
+    /** Captured by the error listener in the event's own tick, before the lock wait. */
+    errorAttemptId: string | undefined
   ): Promise<void> {
-    const errorAttemptId = eventAttemptId ?? this.streamAttemptIdAtEvent(event.workspaceId);
     if (await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamError(event)) {
       return;
     }
