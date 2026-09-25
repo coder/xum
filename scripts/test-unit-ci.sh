@@ -76,6 +76,10 @@ isolated_unit_tests=(
   # (AutoModelRoutingExperimentConfig.test.tsx also breaks it; two-file repro on bun 1.3.5),
   # so isolate it rather than chase each shard reshuffle (#4524).
   src/browser/features/Settings/Sections/ModelsSection.discovery.test.tsx
+  # Guards the DOM harness itself by deliberately poisoning process globals
+  # (document/window set to undefined, a replaced baseline window), which would
+  # perturb later suites in a shared process.
+  ./tests/ui/domIsolation.test.ts
 )
 
 # One process per file rather than one shared isolated process. Sharing it still
@@ -118,6 +122,27 @@ find_excludes=()
 for isolated_unit_test in "${isolated_unit_tests[@]}"; do
   find_excludes+=(! -path "$isolated_unit_test")
 done
+
+# Bun-run test trees outside src/ (Jest ignores them, see jest.config.js). Storybook
+# policy tests read story sources and use bun:test.
+#
+# Paths outside bunfig's `root = "src"` need a ./ prefix (here and in
+# isolated_unit_tests): without it `bun test` treats them as name filters over src/
+# and runs nothing. They run in one extra process on shard 1, never inside the shared
+# src shards: a single ./ path switches `bun test` from filter mode (files run in
+# bun's own traversal order) to path mode (argument order), which reorders the whole
+# shard and exposed order-dependent module mocks that the usual order hides.
+tooling_roots=(./tests/ui/storybook)
+tooling_files=()
+while IFS= read -r tooling_file; do
+  tooling_files+=("$tooling_file")
+done < <(
+  find "${tooling_roots[@]}" -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
+    "${find_excludes[@]}" | LC_ALL=C sort
+)
+if [[ "${1:-}" != "--list" ]] && ((SHARD_INDEX == 1 && ${#tooling_files[@]} > 0)); then
+  bun_test_retrying_crashes "tooling tests" "${tooling_files[@]}"
+fi
 
 # Deterministic, size-balanced split: largest files first, each assigned to the
 # currently lightest shard (file size is a cheap proxy for runtime). Every shard
