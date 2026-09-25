@@ -3,20 +3,18 @@ import * as fsPromises from "fs/promises";
 
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
-import { SecretsStore } from "@/node/config";
 import { Ok, type Result } from "@/common/types/result";
-import type { StreamEndEvent } from "@/common/types/stream";
-import { TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
-  createAIServiceMocks,
-  createMockInitStateManager,
+  createTaskServiceStack,
   createTestConfig,
   createTestProject,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspaces,
+  streamEnd,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
 import type {
@@ -24,8 +22,6 @@ import type {
   QueueCutSuccessorState,
   SendMessageInternalOptions,
 } from "@/node/services/taskWorkspaceSeam";
-import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
-import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 
 /**
@@ -46,7 +42,6 @@ const B = "att_00000000000000b1";
 
 interface Internals {
   admittedSendsByTaskId: Map<string, Set<{ attemptId: string; state: string }>>;
-  handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
   workspaceEventLocks: MutexMap<string>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
@@ -154,32 +149,10 @@ describe("stale attempt effects after another backend admits a successor (#4414)
       }
     );
     const mocks = createWorkspaceServiceMocks({ ...hostOverrides, sendMessage });
-    const { aiService } = createAIServiceMocks(config);
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const initStateManager = createMockInitStateManager();
-    const taskService = new TaskService(
-      config,
-      fixture.historyService,
-      aiService,
-      mocks.workspaceService,
-      initStateManager,
-      undefined,
-      undefined,
-      new SecretsStore(config.rootDir),
-      terminalAttentionStore
-    );
-    taskService.setWorkspaceTurnManager(
-      new WorkspaceTurnManager(
-        config,
-        fixture.historyService,
-        aiService,
-        mocks.workspaceService,
-        initStateManager,
-        taskService,
-        terminalAttentionStore,
-        aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7]
-      )
-    );
+    const { taskService, aiService } = createTaskServiceStack(config, {
+      historyService: fixture.historyService,
+      workspaceService: mocks.workspaceService,
+    });
     ledger.taskService = taskService;
     return { taskService, sendMessage, bound, aiService };
   }
@@ -205,7 +178,7 @@ describe("stale attempt effects after another backend admits a successor (#4414)
         }
         return result;
       });
-      await internals(taskService).handleStreamEnd({
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: taskId,
         messageId: "assistant-incomplete",
@@ -234,7 +207,7 @@ describe("stale attempt effects after another backend admits a successor (#4414)
   // ---------------------------------------------------------------------------------------------
   /** A's plan turn ends with a successful propose_plan: the plan→exec auto-handoff runs. */
   async function endPlanStream(taskService: TaskService, taskId: string) {
-    await internals(taskService).handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: taskId,
       messageId: "assistant-plan-output",
@@ -456,7 +429,7 @@ describe("stale attempt effects after another backend admits a successor (#4414)
         internals(taskService).workspaceEventLocks.withLock(taskId, () => Promise.resolve());
       receiptFake.register("entry-1");
       // A's stream is cut for queued input whose continuation is still pending: A defers.
-      await internals(taskService).handleStreamEnd({
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: taskId,
         messageId: "assistant-cut",

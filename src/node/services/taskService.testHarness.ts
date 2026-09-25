@@ -1,10 +1,13 @@
 import * as path from "path";
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 
 import {
   Config,
+  SecretsStore,
   type ProjectConfig,
   type ProjectsConfig,
   type Workspace as WorkspaceConfigEntry,
@@ -18,8 +21,14 @@ import type { AIService } from "@/node/services/aiService";
 import type { TurnAdmissionToken, WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { makeWorkspaceHostFake } from "@/node/services/taskWorkspaceSeam.testUtils";
 import type { InitStateManager } from "@/node/services/initStateManager";
-import type { TaskService } from "@/node/services/taskService";
+import { TaskService } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import { HistoryService } from "@/node/services/historyService";
+import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
+import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import type {
   TaskHandleStore,
   WorkspaceTurnTaskHandleRecord,
@@ -227,6 +236,11 @@ export function stubStableIds(config: Config, ids: string[], fallbackId = "fffff
   configWithStableId.generateStableId = () => ids[nextIdIndex++] ?? fallbackId;
 }
 
+/** Emitters behind createAIServiceMocks' on/off, keyed by the mock AIService they serve. */
+const aiServiceEvents = new WeakMap<AIService, EventEmitter>();
+/** The AIService event source each createTaskServiceStack TaskService subscribed to. */
+const taskServiceStreamEvents = new WeakMap<TaskService, EventEmitter>();
+
 export function createAIServiceMocks(
   config: Config,
   overrides?: Partial<{
@@ -249,6 +263,7 @@ export function createAIServiceMocks(
   getProvidersConfig: ReturnType<typeof mock>;
   on: ReturnType<typeof mock>;
   off: ReturnType<typeof mock>;
+  events: EventEmitter;
 } {
   const isStreaming = overrides?.isStreaming ?? mock(() => false);
   const getWorkspaceMetadata =
@@ -273,22 +288,36 @@ export function createAIServiceMocks(
   const getProvidersConfig = overrides?.getProvidersConfig ?? mock(() => null);
   const replayStream = mock(() => Promise.resolve());
 
-  const on = overrides?.on ?? mock(() => undefined);
-  const off = overrides?.off ?? mock(() => undefined);
+  // A real emitter behind on/off so TaskService's stream listeners run exactly as in production
+  // (see streamEnd below); tests that script their own subscription override on/off.
+  const events = new EventEmitter();
+  const on =
+    overrides?.on ??
+    mock((event: string, listener: (...args: unknown[]) => void) => {
+      events.on(event, listener);
+    });
+  const off =
+    overrides?.off ??
+    mock((event: string, listener: (...args: unknown[]) => void) => {
+      events.off(event, listener);
+    });
 
+  const aiService = {
+    isStreaming,
+    getWorkspaceMetadata,
+    stopStream,
+    createModel,
+    getStreamInfo,
+    getProvidersConfig,
+    replayStream,
+    acquireStreamStartLock: mock(() => Promise.resolve(undefined)),
+    on,
+    off,
+  } as unknown as AIService;
+  aiServiceEvents.set(aiService, events);
   return {
-    aiService: {
-      isStreaming,
-      getWorkspaceMetadata,
-      stopStream,
-      createModel,
-      getStreamInfo,
-      getProvidersConfig,
-      replayStream,
-      acquireStreamStartLock: mock(() => Promise.resolve(undefined)),
-      on,
-      off,
-    } as unknown as AIService,
+    aiService,
+    events,
     isStreaming,
     getWorkspaceMetadata,
     stopStream,
@@ -529,4 +558,116 @@ export function workspaceTurnSnapshot(
   handleId = "wst_handle"
 ) {
   return workspaceTurnManagerFor(service).getWorkspaceTurnSnapshot(ownerWorkspaceId, handleId);
+}
+
+/**
+ * The production TaskService + WorkspaceTurnManager wiring (see di/layers/core.ts), shared by every
+ * TaskService suite. The default AIService is createAIServiceMocks' emitter-backed mock, so
+ * streamEnd() drives the real stream-end listener. Suites with their own AIService pass its event
+ * source as `aiEvents` when they want streamEnd().
+ */
+export function createTaskServiceStack(
+  config: Config,
+  overrides: {
+    historyService?: HistoryService;
+    aiService?: AIService;
+    aiEvents?: EventEmitter;
+    workspaceService?: WorkspaceHost;
+    initStateManager?: InitStateManager;
+    sessionUsageService?: SessionUsageService;
+    workspaceGoalService?: WorkspaceGoalService;
+    desktopInputCoordinator?: DesktopInputCoordinator;
+    terminalAttentionStore?: TerminalAttentionStore;
+  } = {}
+) {
+  const historyService = overrides.historyService ?? new HistoryService(config);
+  const aiService = overrides.aiService ?? createAIServiceMocks(config).aiService;
+  const workspaceService =
+    overrides.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
+  const initStateManager = overrides.initStateManager ?? createMockInitStateManager();
+  const terminalAttentionStore =
+    overrides.terminalAttentionStore ?? new TerminalAttentionStore(config);
+  const taskService = new TaskService(
+    config,
+    historyService,
+    aiService,
+    workspaceService,
+    initStateManager,
+    overrides.sessionUsageService,
+    overrides.workspaceGoalService,
+    new SecretsStore(config.rootDir),
+    terminalAttentionStore,
+    overrides.desktopInputCoordinator
+  );
+  const workspaceTurnManager = new WorkspaceTurnManager(
+    config,
+    historyService,
+    aiService,
+    workspaceService,
+    initStateManager,
+    taskService,
+    terminalAttentionStore,
+    aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7],
+    overrides.desktopInputCoordinator
+  );
+  taskService.setWorkspaceTurnManager(workspaceTurnManager);
+  const events = overrides.aiEvents ?? aiServiceEvents.get(aiService);
+  if (events != null) {
+    taskServiceStreamEvents.set(taskService, events);
+    recordHandlerFailures(taskService, "handleStreamEnd");
+  }
+  return {
+    historyService,
+    taskService,
+    workspaceTurnManager,
+    aiService,
+    workspaceService,
+    initStateManager,
+    terminalAttentionStore,
+  };
+}
+
+/** Handler rejections keyed by the event object the listener handed to the handler. */
+const handlerFailures = new WeakMap<object, unknown>();
+
+/**
+ * Observe (never alter) a private stream handler: its listener only logs a rejection, so record it
+ * against the exact event, which keeps overlapping deliveries apart without a global logger spy.
+ */
+function recordHandlerFailures(taskService: TaskService, handler: "handleStreamEnd"): void {
+  const target = taskService as unknown as Record<
+    typeof handler,
+    (event: object, ...rest: unknown[]) => Promise<void>
+  >;
+  const original = target[handler].bind(taskService);
+  target[handler] = async (event, ...rest) => {
+    try {
+      await original(event, ...rest);
+    } catch (error) {
+      handlerFailures.set(event, error);
+      throw error;
+    }
+  };
+}
+
+/**
+ * Deliver a stream-end the way StreamManager does: emit it on the AIService TaskService subscribed
+ * to, so the listener captures the queue-cut snapshot and the attempt origin in the event's own
+ * tick, registers the stream-end decision and serializes on the workspace event lock. Resolves once
+ * that lock drained, and rethrows this event's handler failure, which the listener only logs.
+ */
+export async function streamEnd(taskService: TaskService, event: StreamEndEvent): Promise<void> {
+  const events = taskServiceStreamEvents.get(taskService);
+  assert(
+    events,
+    "streamEnd needs a TaskService built by createTaskServiceStack with an event source"
+  );
+  assert(events.listenerCount("stream-end") > 0, "TaskService is not subscribed to stream-end");
+  // Draining needs the lock itself: the listener's chained handler is not otherwise observable.
+  // The handler (and its failure record) finishes inside the lock, before this wait resolves.
+  const locks = (taskService as unknown as { workspaceEventLocks: MutexMap<string> })
+    .workspaceEventLocks;
+  events.emit("stream-end", event);
+  await locks.withLock(event.workspaceId, () => Promise.resolve());
+  if (handlerFailures.has(event)) throw handlerFailures.get(event);
 }

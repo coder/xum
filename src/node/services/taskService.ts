@@ -14715,28 +14715,18 @@ export class TaskService implements AgentTaskIntegration {
 
   private async handleStreamEnd(
     event: StreamEndEvent,
-    // The production stream-end listener captures this synchronously at event
-    // time, before waiting on the workspace event lock; the entry-time capture
-    // below is a fallback for direct callers (tests) only.
-    eventTimeQueueCutSnapshot?: QueueCutAttributionSnapshot,
-    eventTimeTaskOrigin?: {
+    // Both are captured by the stream-end listener in the event's own tick, before it waits on
+    // the workspace event lock: cut attribution and the task origin must reflect the state at the
+    // ended stream's own event, not whatever input engaged while the lock wait or the awaits
+    // below ran (see QueueCutAttributionSnapshot).
+    queueCutSnapshot: QueueCutAttributionSnapshot,
+    taskOrigin: {
       executionId: string | null;
       stopEpoch: number;
       ownedAttempt: OwnedTaskAttempt | undefined;
       unownedAttemptId?: string;
     }
   ): Promise<void> {
-    // Cut attribution must reflect the state at the ended stream's own event,
-    // not whatever input engaged while the lock wait or the awaits below ran
-    // (see QueueCutAttributionSnapshot).
-    const queueCutSnapshot =
-      eventTimeQueueCutSnapshot ??
-      this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(event.workspaceId);
-    const taskOrigin = eventTimeTaskOrigin ?? {
-      executionId: this.getAgentTaskExecutionId(event.workspaceId),
-      stopEpoch: this.getWorkspaceStopEpoch(event.workspaceId),
-      ...this.resolveStreamAttemptAtEvent(event.workspaceId),
-    };
     const cutSourceIsObsolete = () =>
       taskOrigin.executionId !== this.getAgentTaskExecutionId(event.workspaceId) ||
       taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(event.workspaceId);
