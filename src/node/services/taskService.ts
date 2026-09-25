@@ -7279,6 +7279,9 @@ export class TaskService implements AgentTaskIntegration {
     // evidence while work still running under it keeps its own settlement.
     const attemptId = newTaskAttemptId();
     let launchAttempt: OwnedTaskAttempt | undefined;
+    // Flipped when the launch fence admits the send (as TaskLaunchPlan.sendAdmitted): a failure
+    // that observes it false has positive evidence that this launch never dispatched its prompt.
+    let launchSendAdmitted = false;
     /**
      * Launch failure. Before the entry is persisted (launchAttempt unset) nothing is published:
      * only the materialized checkout exists and the rollback removes it. Once the entry is
@@ -7406,7 +7409,18 @@ export class TaskService implements AgentTaskIntegration {
           });
         }
       } else if (!liveExecution) {
-        this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
+        // Receipt evidence as in markTaskLaunchFailed: the send was never admitted (on top of the
+        // shared attemptCannotStillReport boundary); otherwise the settlement stays in memory.
+        if (launchSendAdmitted) {
+          this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
+        } else {
+          await this.persistOwnedAttemptSettlement(
+            taskId,
+            launchAttempt,
+            "launch-failed",
+            "launch-failed"
+          );
+        }
       }
       if (transitionedToInterrupted) {
         this.recordTaskInterrupted(taskId, parentWorkspaceId);
@@ -7671,6 +7685,7 @@ export class TaskService implements AgentTaskIntegration {
       acceptanceOrigin: "automatic",
       expectedAttemptId: attemptId,
     });
+    launchSendAdmitted = admission.kind === "admitted";
     const sendResult =
       admission.kind !== "admitted"
         ? Err(
