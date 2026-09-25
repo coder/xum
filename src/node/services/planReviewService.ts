@@ -534,9 +534,22 @@ export function createPlanReviewFeedbackPrecondition(
   if (carried.length === 0) return undefined;
   return (history) => {
     const prior = history.filter(isPlanReviewRow);
+    const priorRecordIds = new Set(
+      prior.flatMap((row) => {
+        const muxMetadata = row.metadata?.muxMetadata;
+        return muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE ? [muxMetadata.recordId] : [];
+      })
+    );
     return carried.every((candidate) => {
       const record = getAuthenticPlanReviewRecord(candidate);
       assert(record?.kind === "feedback", "carried plan-review feedback must stay authentic");
+      // A row with this record id already in history means another dispatch (e.g. a sibling
+      // backend recovering the same compaction follow-up) appended it first. Replay would ignore
+      // this candidate as a duplicate while the earlier copy satisfies every check below, so a
+      // second provider-visible row and model turn would slip through. Only plan-review rows are
+      // in `prior`: the compaction request and summary that carry the deferred follow-up are not,
+      // so the follow-up's own append after compaction still passes.
+      if (priorRecordIds.has(record.recordId)) return false;
       const state = derivePlanReviewState([...prior, candidate], {
         hashContent: hashPlanSnapshotContent,
       });

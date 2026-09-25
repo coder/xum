@@ -525,6 +525,42 @@ describe("plan-review feedback whose snapshot or threads leave history before it
       "thr_1",
     ]);
   });
+
+  test("(10) a sibling backend re-dispatching an already delivered follow-up is refused", async () => {
+    const h = await fixture();
+    await seedSnapshot(h);
+    await sendDivertedFeedback(h);
+    setMonitor(h, false);
+    await runSessionTerminalPolicy(h.session, h.aiEmitter, {
+      type: "stream-end",
+      workspaceId,
+      messageId: "compaction-summary",
+      parts: [{ type: "text", text: "Summary of the plan discussion." }],
+      metadata: { model: options.model, agentId: "compact", finishReason: "stop" },
+    });
+    // The compaction request and summary that carried the follow-up did not block its own append.
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(1);
+    expect(h.stream).toHaveBeenCalledTimes(2);
+
+    // A sibling backend (XUM_ALLOW_MULTIPLE_INSTANCES) that passed its staleness check before
+    // this append sends the same retained handoff: same record, so it must not append again.
+    const sibling = await createAgentSessionHarness({
+      workspaceId,
+      config: h.config,
+      historyService: new HistoryService(h.config),
+    });
+    fixtures.push(sibling);
+    const siblingStream = spyOn(sibling.aiService, "streamMessage");
+    const sent = await sibling.session.sendMessage(feedbackText, {
+      ...options,
+      muxMetadata: feedbackMeta,
+    });
+    expect(!sent.success && sent.error.type === "unknown" && sent.error.raw).toBe(
+      PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+    );
+    expect(siblingStream).not.toHaveBeenCalled();
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(1);
+  });
 });
 
 describe("plan-review feedback refused before it streams", () => {
