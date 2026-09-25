@@ -1463,9 +1463,9 @@ export class McpOauthService {
       const result = await auth(provider, {
         serverUrl: flow.serverUrlForDiscovery,
         authorizationCode: input.code,
-        // RFC 9207 mix-up defense: the SDK rejects the exchange unless `iss`
-        // matches an issuer that advertises support. Forward it unmodified;
-        // null -> undefined because the SDK treats only undefined as absent.
+        // RFC 9207 mix-up defense: the SDK compares `iss` to the discovered
+        // issuer and requires it when the issuer advertises support. Forward it
+        // unmodified; null -> undefined because the SDK treats only undefined as absent.
         iss: input.iss ?? undefined,
         scope: flow.scope,
         resourceMetadataUrl: flow.resourceMetadataUrl,
