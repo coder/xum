@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/require-await */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "events";
+import { Effect } from "effect";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,13 +15,13 @@ import { MemoryMetaService } from "@/node/services/memoryMeta";
 import type { ORPCContext } from "@/node/orpc/context";
 import { subscribeMemoryChanges } from "@/node/orpc/routerSubscriptions";
 import {
-  consolidateMemory,
-  deleteMemory,
-  getMemoryConsolidationStatus,
-  listMemory,
-  readMemory,
-  saveMemory,
-  setMemoryPinned,
+  consolidateMemoryEffect,
+  deleteMemoryEffect,
+  getMemoryConsolidationStatusEffect,
+  listMemoryEffect,
+  readMemoryEffect,
+  saveMemoryEffect,
+  setMemoryPinnedEffect,
   assertMemoryEnabled,
 } from "./memoryOperations";
 
@@ -86,16 +87,21 @@ describe("memory operations", () => {
     const context = createContext(options);
     return {
       memory: {
-        list: (input: Parameters<typeof listMemory>[1]) => listMemory(context, input),
-        read: (input: Parameters<typeof readMemory>[1]) => readMemory(context, input),
-        save: (input: Parameters<typeof saveMemory>[1]) => saveMemory(context, input),
-        delete: (input: Parameters<typeof deleteMemory>[1]) => deleteMemory(context, input),
-        setPinned: (input: Parameters<typeof setMemoryPinned>[1]) =>
-          setMemoryPinned(context, input),
-        consolidationStatus: (input: Parameters<typeof getMemoryConsolidationStatus>[1]) =>
-          getMemoryConsolidationStatus(context, input),
-        consolidate: (input: Parameters<typeof consolidateMemory>[1]) =>
-          consolidateMemory(context, input),
+        // Run the same Effects the router's handlerGen procedures yield.
+        list: (input: Parameters<typeof listMemoryEffect>[1]) =>
+          Effect.runPromise(listMemoryEffect(context, input)),
+        read: (input: Parameters<typeof readMemoryEffect>[1]) =>
+          Effect.runPromise(readMemoryEffect(context, input)),
+        save: (input: Parameters<typeof saveMemoryEffect>[1]) =>
+          Effect.runPromise(saveMemoryEffect(context, input)),
+        delete: (input: Parameters<typeof deleteMemoryEffect>[1]) =>
+          Effect.runPromise(deleteMemoryEffect(context, input)),
+        setPinned: (input: Parameters<typeof setMemoryPinnedEffect>[1]) =>
+          Effect.runPromise(setMemoryPinnedEffect(context, input)),
+        consolidationStatus: (input: Parameters<typeof getMemoryConsolidationStatusEffect>[1]) =>
+          Effect.runPromise(getMemoryConsolidationStatusEffect(context, input)),
+        consolidate: (input: Parameters<typeof consolidateMemoryEffect>[1]) =>
+          Effect.runPromise(consolidateMemoryEffect(context, input)),
         onChange: (input: { workspaceId?: string | null }, options?: { signal?: AbortSignal }) =>
           subscribeMemoryChanges(context, input.workspaceId ?? null, options?.signal, () =>
             assertMemoryEnabled(context)
@@ -200,19 +206,23 @@ describe("memory operations", () => {
 
   test("setPinned broadcasts a change event so other tabs on the same store refetch", async () => {
     const context = createContext({ enabled: true });
-    await saveMemory(context, {
-      workspaceId: "ws-mem",
-      path: "/memories/workspace/pinned.md",
-      content: "x",
-      expectedSha256: null,
-    });
+    await Effect.runPromise(
+      saveMemoryEffect(context, {
+        workspaceId: "ws-mem",
+        path: "/memories/workspace/pinned.md",
+        content: "x",
+        expectedSha256: null,
+      })
+    );
     const events: MemoryChangeEvent[] = [];
     memoryService.on("change", (event: MemoryChangeEvent) => events.push(event));
-    const result = await setMemoryPinned(context, {
-      workspaceId: "ws-mem",
-      path: "/memories/workspace/pinned.md",
-      pinned: true,
-    });
+    const result = await Effect.runPromise(
+      setMemoryPinnedEffect(context, {
+        workspaceId: "ws-mem",
+        path: "/memories/workspace/pinned.md",
+        pinned: true,
+      })
+    );
     expect(result).toEqual({ success: true, data: undefined });
     expect(events).toEqual([
       {

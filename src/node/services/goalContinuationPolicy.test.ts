@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import {
   applyBudgetDrivenStatus,
-  evaluateGoalContinuation,
+  evaluateGoalContinuationBeforeGoal,
+  evaluateGoalContinuationGoal,
   hasReachedAnyGoalLimit,
   hasReachedGoalBudgetLimit,
   hasReachedGoalTurnLimit,
@@ -86,7 +87,13 @@ function policyState(overrides: PolicyOverrides = {}): GoalContinuationPolicySta
   };
 }
 
-describe("evaluateGoalContinuation", () => {
+// Production (WorkspaceGoalService) runs the probe stage before loading the goal and
+// only reaches the goal stage when the probe returns no decision; compose them the same way.
+function evaluateGoalContinuation(state: GoalContinuationPolicyState): GoalContinuationDecision {
+  return evaluateGoalContinuationBeforeGoal(state) ?? evaluateGoalContinuationGoal(state);
+}
+
+describe("goal continuation policy stages", () => {
   const cases: Array<{
     name: string;
     state: PolicyOverrides;

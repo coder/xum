@@ -4,7 +4,7 @@
  *
  * These types are inferred from the Zod schemas in
  * `@/common/orpc/schemas/instructions` so the IPC payload and the internal
- * data structure used by `buildSystemMessage` cannot drift — adding a field
+ * data structure used by `buildSystemMessageFromSources` cannot drift — adding a field
  * to the schema flows through every consumer (prompt builder, IPC handler,
  * right-sidebar Instructions tab) at compile time.
  */
