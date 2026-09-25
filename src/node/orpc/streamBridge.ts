@@ -72,8 +72,7 @@ export interface SubscriptionStreamOptions<T> {
   /**
    * Buffering strategy. `"all"` (default) is an unbounded FIFO. `"latest"`
    * coalesces: an unconsumed value is replaced by the newest one, so a slow
-   * consumer never accumulates a backlog and never replays stale snapshots
-   * (mirrors `createLatestValueQueue`).
+   * consumer never accumulates a backlog and never replays stale snapshots.
    */
   buffer?: "all" | "latest";
   /**
