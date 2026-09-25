@@ -674,8 +674,10 @@ jobs:
       # workflow for the same PR and head SHA started at or after this one and publishes
       # its own Required: still running, or completed with success/failure
       # (startup_failure, action_required, stale and cancelled runs never report one).
-      # Older runs never count, so a historical pass against an older base cannot stand
-      # in. Anything else, including a query error, still fails below.
+      # Older runs and reruns (attempt > 1: they keep their original, possibly stale,
+      # merge ref while getting a fresh start time) never count, so only a fresh event
+      # for the current base can stand in. Anything else, including a query error,
+      # still fails below.
       - id: superseded
         if: >-
           github.event_name == 'pull_request' &&
@@ -691,7 +693,7 @@ jobs:
           started=$(jq -r --argjson id "$GITHUB_RUN_ID" '.workflow_runs[] | select(.id == $id) | .run_started_at' <<<"$runs")
           [[ -n "$started" ]]
           siblings=$(jq --argjson id "$GITHUB_RUN_ID" --argjson pr "$PR_NUMBER" --arg started "$started" '
-            [.workflow_runs[] | select(.id != $id and .run_started_at >= $started)
+            [.workflow_runs[] | select(.id != $id and .run_attempt == 1 and .run_started_at >= $started)
               | select(any(.pull_requests[]; .number == $pr))
               | select(.status != "completed" or .conclusion == "success" or .conclusion == "failure")]
             | length' <<<"$runs")
