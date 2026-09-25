@@ -674,9 +674,10 @@ jobs:
       # workflow for the same PR and head SHA started at or after this one and publishes
       # its own Required: still running, or completed with success/failure
       # (startup_failure, action_required, stale and cancelled runs never report one).
-      # Older runs and reruns (attempt > 1: they keep their original, possibly stale,
-      # merge ref while getting a fresh start time) never count, so only a fresh event
-      # for the current base can stand in. Anything else, including a query error,
+      # The sibling must record the same base SHA as this event (concurrency order is
+      # not guaranteed, so start time alone cannot prove it validated the current
+      # base). Older runs and reruns (attempt > 1: they keep their original merge ref
+      # while getting a fresh start time) never count. Anything else, including a query error,
       # still fails below.
       - id: superseded
         if: >-
@@ -687,14 +688,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100")
           started=$(jq -r --argjson id "$GITHUB_RUN_ID" '.workflow_runs[] | select(.id == $id) | .run_started_at' <<<"$runs")
           [[ -n "$started" ]]
-          siblings=$(jq --argjson id "$GITHUB_RUN_ID" --argjson pr "$PR_NUMBER" --arg started "$started" '
+          siblings=$(jq --argjson id "$GITHUB_RUN_ID" --argjson pr "$PR_NUMBER" --arg base "$BASE_SHA" --arg started "$started" '
             [.workflow_runs[] | select(.id != $id and .run_attempt == 1 and .run_started_at >= $started)
-              | select(any(.pull_requests[]; .number == $pr))
+              | select(any(.pull_requests[]; .number == $pr and .base.sha == $base))
               | select(.status != "completed" or .conclusion == "success" or .conclusion == "failure")]
             | length' <<<"$runs")
           echo "Newer runs for PR #$PR_NUMBER at $HEAD_SHA that report Required: $siblings"
