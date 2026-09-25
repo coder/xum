@@ -236,15 +236,6 @@ export function computeWorkBundleInfos(
   return infos;
 }
 
-export function computeTaskAwaitPollGroupInfos(
-  messages: DisplayedMessage[]
-): Array<OperationalBundleInfo | undefined> {
-  return computeOperationalBundleInfos(messages, {
-    isTurnActive: false,
-    taskAwaitPollsOnly: true,
-  });
-}
-
 export function computeOperationalBundleInfos(
   messages: DisplayedMessage[],
   options: ComputeBundleInfosOptions

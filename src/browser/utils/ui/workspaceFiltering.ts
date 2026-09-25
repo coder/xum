@@ -190,12 +190,6 @@ export function isSidebarSubAgentRunning(
   );
 }
 
-export function isActionableTaskExecutionStatus(
-  status: FrontendWorkspaceMetadata["taskExecutionStatus"]
-): boolean {
-  return status === "queued" || status === "starting" || status === "running";
-}
-
 export function isActiveOrStartingTaskStatus(
   status: FrontendWorkspaceMetadata["taskStatus"]
 ): boolean {

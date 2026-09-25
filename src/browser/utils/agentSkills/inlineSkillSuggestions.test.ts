@@ -3,7 +3,6 @@ import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import {
   getInlineSkillInsertionTrailingText,
   getInlineSkillSuggestions,
-  shouldRefreshInlineSkillSuggestions,
 } from "./inlineSkillSuggestions";
 
 function descriptor(name: string, description = `${name} description`): AgentSkillDescriptor {
@@ -148,37 +147,6 @@ describe("getInlineSkillSuggestions", () => {
         descriptors: [descriptor("deep-review"), descriptor("tdd"), descriptor("clear")],
       }).map((suggestion) => suggestion.display)
     ).toEqual(["$deep-review", "$tdd", "$clear"]);
-  });
-});
-
-describe("shouldRefreshInlineSkillSuggestions", () => {
-  test("refreshes when descriptor discovery updates an unchanged partial", () => {
-    const previousDescriptors: AgentSkillDescriptor[] = [];
-    const descriptors = [descriptor("deep-review")];
-
-    expect(
-      shouldRefreshInlineSkillSuggestions({
-        inputChanged: false,
-        previousPartial: "dee",
-        partial: "dee",
-        previousDescriptors,
-        descriptors,
-      })
-    ).toBe(true);
-  });
-
-  test("skips only when input, partial, and descriptor list identity are unchanged", () => {
-    const descriptors = [descriptor("deep-review")];
-
-    expect(
-      shouldRefreshInlineSkillSuggestions({
-        inputChanged: false,
-        previousPartial: "dee",
-        partial: "dee",
-        previousDescriptors: descriptors,
-        descriptors,
-      })
-    ).toBe(false);
   });
 });
 
