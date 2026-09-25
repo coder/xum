@@ -1,34 +1,46 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { LanguageModel } from "ai";
-import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { describe, expect, test } from "bun:test";
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
-import type { ToolCallEndEvent } from "@/common/types/stream";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
-import type { HistoryService } from "./historyService";
-import { StreamManager } from "./streamManager";
-import { engineInternals, onTurnEngineEvent } from "./streamManager.testHarness";
-import { createTestHistoryService } from "./testHistoryService";
+import type { TurnExecutionOptions } from "./streamManager";
+import { installStreamManagerTestHistory, historyService } from "./streamManager.suite.testHarness";
+import {
+  createLiveStreamHarness,
+  eventsOfType,
+  type LiveStream,
+} from "./streamManager.liveStream.testHarness";
 import { ToolCallDisplayRegistry, type ExecutionScope } from "./toolCallDisplayRegistry";
 
 /**
  * Ownership regressions for the host-authored MCP identity snapshot: the
  * stream that assembled a tool set is the only consumer of its snapshots, on
- * both the top-level (completeToolCall) and nested (emitNestedToolEvent)
- * paths, and persisted snapshots replay to reconnecting renderers.
+ * both the top-level (tool-result) and nested (emitNestedToolEvent) paths,
+ * and persisted snapshots replay to reconnecting renderers.
  */
 
-let historyService: HistoryService;
-let historyCleanup: () => Promise<void>;
+installStreamManagerTestHistory();
 
-beforeEach(async () => {
-  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
-});
+type LiveStreamHarness = ReturnType<typeof createLiveStreamHarness>;
 
-afterEach(async () => {
-  await historyCleanup();
-});
-
-const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+/** Starts `scope`'s stream; the scope object is the ownership identity and its token must match. */
+async function startScope(
+  harness: LiveStreamHarness,
+  scope: ExecutionScope,
+  historySequence = 1
+): Promise<LiveStream> {
+  const live = await harness.start({
+    workspaceId: scope.workspaceId,
+    messageId: scope.messageId,
+    historySequence,
+    executionScope: scope,
+    providedStreamToken: scope.token as TurnExecutionOptions["providedStreamToken"],
+  });
+  return {
+    push: live.push,
+    finish: async () => {
+      await live.push({ type: "text-delta", text: "done" });
+      await live.finish();
+    },
+  };
+}
 
 function snapshot(name: string): MCPToolCallDisplay {
   return {
@@ -38,99 +50,12 @@ function snapshot(name: string): MCPToolCallDisplay {
   };
 }
 
-const unusedModel: LanguageModel = {
-  specificationVersion: "v3",
-  provider: "test",
-  modelId: "unused",
-  supportedUrls: {},
-  doGenerate: () => Promise.reject(new Error("unused")),
-  doStream: () => Promise.reject(new Error("unused")),
-};
-
-/** Minimal registered stream: only what completeToolCall, emitNestedToolEvent and replay touch. */
-function registerStream(
-  streamManager: StreamManager,
-  scope: ExecutionScope,
-  parts: PartRecord[] = []
-): PartRecord {
-  const now = Date.now();
-  const usage = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
-  const streamInfo: PartRecord = {
-    state: "streaming",
-    streamResult: {
-      fullStream: (async function* emptyStream() {
-        await Promise.resolve();
-        yield* [];
-      })(),
-      totalUsage: Promise.resolve(usage),
-      usage: Promise.resolve(usage),
-      providerMetadata: Promise.resolve(undefined),
-      steps: Promise.resolve([]),
-    },
-    abortController: new AbortController(),
-    messageId: scope.messageId,
-    token: scope.token,
-    executionScope: scope,
-    startTime: now,
-    lastPartTimestamp: now,
-    lastPartialWriteTime: now,
-    toolCompletionTimestamps: new Map<string, number>(),
-    pendingWorkflowRunAttachments: new Map<string, unknown>(),
-    pendingNestedCalls: new Map<string, unknown[]>(),
-    pendingToolExecutionStarts: new Map<string, number>(),
-    model: KNOWN_MODELS.SONNET.id,
-    metadataModel: KNOWN_MODELS.SONNET.id,
-    historySequence: 1,
-    request: { model: unusedModel, messages: [], providerOptions: undefined },
-    toolModelUsages: [],
-    parts,
-    partialWriteTimer: undefined,
-    partialWritePromise: undefined,
-    processingPromise: Promise.resolve(),
-    softInterrupt: { pending: false as const },
-    runtimeTempDir: "",
-    runtime: LOCAL_TEST_RUNTIME,
-    cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
-    cumulativeProviderMetadata: undefined,
-    didRetryPreviousResponseIdAtStep: false,
-    receivedTerminalEvent: false,
-    currentStepStartIndex: 0,
-    stepStartIndices: [0],
-    stepTracker: {},
-  };
-  const streams: unknown = engineInternals(streamManager).workspaceStreams;
-  if (!(streams instanceof Map)) throw new Error("Expected StreamManager.workspaceStreams");
-  streams.set(scope.workspaceId, streamInfo);
-  return streamInfo;
+function toolCall(toolCallId: string, toolName = "identity_identity_probe") {
+  return { type: "tool-call", toolCallId, toolName, input: {} };
 }
 
-type CompleteToolCall = (
-  workspaceId: string,
-  streamInfo: Record<string, unknown>,
-  toolCalls: Map<string, unknown>,
-  toolCallId: string,
-  toolName: string,
-  output: unknown
-) => Promise<void>;
-
-function completeToolCallFor(streamManager: StreamManager): CompleteToolCall {
-  const method: unknown = engineInternals(streamManager).completeToolCall;
-  if (typeof method !== "function") throw new Error("Expected StreamManager.completeToolCall");
-  return (method as CompleteToolCall).bind(streamManager);
-}
-
-type PartRecord = Record<string, unknown>;
-
-function toolPart(toolCallId: string, extra: PartRecord = {}): PartRecord {
-  return {
-    type: "dynamic-tool",
-    toolCallId,
-    toolName: "identity_identity_probe",
-    input: {},
-    state: "input-available",
-    timestamp: Date.now(),
-    ...extra,
-  };
+function toolResult(toolCallId: string, toolName = "identity_identity_probe") {
+  return { type: "tool-result", toolCallId, toolName, output: { content: [] } };
 }
 
 describe("StreamManager - MCP identity snapshot ownership", () => {
@@ -140,77 +65,50 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
 
   test("a top-level completion consumes only its own execution's snapshot, exactly once", async () => {
     const registry = new ToolCallDisplayRegistry();
-    const streamManager = new StreamManager(
-      historyService,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      registry
-    );
-    const ends: ToolCallEndEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-end", (event) => ends.push(event));
-    const completeToolCall = completeToolCallFor(streamManager);
+    const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
+    const ends = () => eventsOfType(harness.events, "tool-call-end");
 
-    // The replaced execution still owns a registered stream object while the
-    // replacement's wrapper published a snapshot under the same call id.
-    registry.open(replaced);
+    // The replaced execution still streams while the replacement's wrapper
+    // published a snapshot under the same call id.
+    const staleStream = await startScope(harness, replaced);
     registry.open(replacement);
     registry.set(replacement, "call-1", snapshot("replacement"));
-    const staleStream = registerStream(streamManager, replaced, [toolPart("call-1")]);
-    await completeToolCall(
-      workspaceId,
-      staleStream,
-      new Map(),
-      "call-1",
-      "identity_identity_probe",
-      {
-        content: [],
-      }
-    );
-    expect((staleStream.parts as Array<Record<string, unknown>>)[0]?.mcpServer).toBeUndefined();
-    expect(ends[0]?.mcpServer).toBeUndefined();
+    await staleStream.push(toolCall("call-1"), toolResult("call-1"));
+    const staleParts = harness.streamManager.getStreamInfo(workspaceId)?.parts ?? [];
+    expect(staleParts).toHaveLength(1);
+    expect((staleParts[0] as { mcpServer?: unknown }).mcpServer).toBeUndefined();
+    expect(ends()).toHaveLength(1);
+    expect(ends()[0]?.mcpServer).toBeUndefined();
     expect(registry.take(replacement, "call-1")).toStrictEqual(snapshot("replacement"));
+    await staleStream.finish();
 
-    // The owning execution consumes it: persisted before the live event, then gone.
+    // The owning execution consumes it: persisted with the part, carried by the
+    // live event, then gone.
     registry.set(replacement, "call-1", snapshot("replacement"));
-    const ownStream = registerStream(streamManager, replacement, [toolPart("call-1")]);
-    await completeToolCall(workspaceId, ownStream, new Map(), "call-1", "identity_identity_probe", {
-      content: [],
-    });
+    const ownStream = await startScope(harness, replacement, 2);
+    await ownStream.push(toolCall("call-1"), toolResult("call-1"));
     const persisted = await historyService.readPartial(workspaceId);
     const persistedPart = persisted?.parts[0] as Record<string, unknown> | undefined;
     expect(persistedPart?.mcpServer).toStrictEqual(snapshot("replacement"));
-    expect(ends[1]?.mcpServer).toStrictEqual(snapshot("replacement"));
-    expect(ends[1]?.messageId).toBe(replacement.messageId);
+    expect(ends()[1]?.mcpServer).toStrictEqual(snapshot("replacement"));
+    expect(ends()[1]?.messageId).toBe(replacement.messageId);
     expect(registry.take(replacement, "call-1")).toBeUndefined();
+    await ownStream.finish();
   });
 
-  test("a nested completion from a closed or mismatched originating scope cannot consume the replacement's snapshot", () => {
+  test("a nested completion from a closed or mismatched originating scope cannot consume the replacement's snapshot", async () => {
     const registry = new ToolCallDisplayRegistry();
-    const streamManager = new StreamManager(
-      historyService,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      registry
-    );
-    const ends: ToolCallEndEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-end", (event) => ends.push(event));
+    const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
+    const ends = () => eventsOfType(harness.events, "tool-call-end");
 
     // Run B replaced run A and owns the workspace stream. A's teardown has not
     // closed its registry scope yet, and A's wrapper published its own snapshot
     // under the same nested call id.
+    const stream = await startScope(harness, replacement);
     registry.open(replaced);
-    registry.open(replacement);
     registry.set(replaced, "nested-1", snapshot("replaced"));
     registry.set(replacement, "nested-1", snapshot("replacement"));
-    const stream = registerStream(streamManager, replacement, [
-      toolPart("code-exec", { toolName: "code_execution", input: { code: "…" } }),
-    ]);
+    await stream.push(toolCall("code-exec", "code_execution"));
     const startTime = Date.now();
     const nestedStart = {
       type: "tool-call-start" as const,
@@ -226,72 +124,73 @@ describe("StreamManager - MCP identity snapshot ownership", () => {
       endTime: startTime + 1,
       result: { content: [] },
     };
-    streamManager.emitNestedToolEvent(replacement, nestedStart);
+    harness.streamManager.emitNestedToolEvent(replacement, nestedStart);
     const nestedCalls = () =>
-      ((stream.parts as Array<Record<string, unknown>>)[0]?.nestedCalls ?? []) as Array<
-        Record<string, unknown>
-      >;
+      ((harness.streamManager.getStreamInfo(workspaceId)?.parts[0] as { nestedCalls?: unknown })
+        ?.nestedCalls ?? []) as Array<Record<string, unknown>>;
+    expect(nestedCalls()).toHaveLength(1);
 
     // A's late nested consumer must neither brand B's record with A's snapshot
     // nor consume B's; after A closes, a structurally equal lookalike of B's
     // scope fails the identity check too.
-    streamManager.emitNestedToolEvent(replaced, nestedEnd);
+    harness.streamManager.emitNestedToolEvent(replaced, nestedEnd);
     expect(registry.take(replaced, "nested-1")).toStrictEqual(snapshot("replaced"));
     registry.close(replaced);
-    streamManager.emitNestedToolEvent(replaced, nestedEnd);
-    streamManager.emitNestedToolEvent({ ...replacement }, nestedEnd);
+    harness.streamManager.emitNestedToolEvent(replaced, nestedEnd);
+    harness.streamManager.emitNestedToolEvent({ ...replacement }, nestedEnd);
     expect(nestedCalls().every((call) => call.mcpServer === undefined)).toBe(true);
-    expect(ends.every((event) => event.mcpServer === undefined)).toBe(true);
+    expect(ends()).toHaveLength(3);
+    expect(ends().every((event) => event.mcpServer === undefined)).toBe(true);
     expect(registry.take(replacement, "nested-1")).toStrictEqual(snapshot("replacement"));
 
     // Only the owning scope object consumes it, and only once.
     registry.set(replacement, "nested-1", snapshot("replacement"));
-    streamManager.emitNestedToolEvent(replacement, nestedEnd);
+    harness.streamManager.emitNestedToolEvent(replacement, nestedEnd);
     const owned = nestedCalls().find((call) => call.mcpServer !== undefined);
     expect(owned?.toolCallId).toBe("nested-1");
     expect(owned?.mcpServer).toStrictEqual(snapshot("replacement"));
-    const ownedEvent = ends.find((event) => event.mcpServer !== undefined);
+    const ownedEvent = ends().find((event) => event.mcpServer !== undefined);
     expect(ownedEvent?.toolCallId).toBe("nested-1");
     expect(ownedEvent?.parentToolCallId).toBe("code-exec");
     expect(registry.take(replacement, "nested-1")).toBeUndefined();
+    await stream.finish();
   });
 
   test("replay carries persisted snapshots for top-level parts and nested records", async () => {
-    const streamManager = new StreamManager(historyService);
-    const timestamp = Date.now();
-    registerStream(streamManager, replacement, [
-      toolPart("call-1", {
-        state: "output-available",
-        output: { content: [] },
-        mcpServer: snapshot("top"),
-      }),
-      toolPart("code-exec", {
-        toolName: "code_execution",
-        input: { code: "…" },
-        state: "output-available",
-        output: { ok: true },
-        nestedCalls: [
-          {
-            toolCallId: "nested-1",
-            toolName: "identity_identity_probe",
-            input: {},
-            state: "output-available",
-            output: { content: [] },
-            timestamp: timestamp + 1,
-            mcpServer: snapshot("nested"),
-          },
-        ],
-      }),
-    ]);
-    const ends: ToolCallEndEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-end", (event) => ends.push(event));
+    const registry = new ToolCallDisplayRegistry();
+    const harness = createLiveStreamHarness({ toolCallDisplayRegistry: registry });
+    const stream = await startScope(harness, replacement);
+    registry.set(replacement, "call-1", snapshot("top"));
+    await stream.push(toolCall("call-1"), toolResult("call-1"));
+    await stream.push(toolCall("code-exec", "code_execution"));
+    const startTime = Date.now();
+    const nested = {
+      callId: "nested-1",
+      toolName: "identity_identity_probe",
+      args: {},
+      parentToolCallId: "code-exec",
+      startTime,
+    };
+    harness.streamManager.emitNestedToolEvent(replacement, { ...nested, type: "tool-call-start" });
+    registry.set(replacement, "nested-1", snapshot("nested"));
+    harness.streamManager.emitNestedToolEvent(replacement, {
+      ...nested,
+      type: "tool-call-end",
+      endTime: startTime + 1,
+      result: { content: [] },
+    });
+    await stream.push(toolResult("code-exec", "code_execution"));
+    const replayStart = harness.events.length;
 
-    await streamManager.replayStream(workspaceId);
+    await harness.streamManager.replayStream(workspaceId);
 
+    const ends = eventsOfType(harness.events.slice(replayStart), "tool-call-end");
+    expect(ends.every((event) => event.replay === true)).toBe(true);
     expect(ends.find((e) => e.toolCallId === "call-1")?.mcpServer).toStrictEqual(snapshot("top"));
-    const nested = ends.find((e) => e.toolCallId === "nested-1");
-    expect(nested?.parentToolCallId).toBe("code-exec");
-    expect(nested?.mcpServer).toStrictEqual(snapshot("nested"));
+    const nestedEnd = ends.find((e) => e.toolCallId === "nested-1");
+    expect(nestedEnd?.parentToolCallId).toBe("code-exec");
+    expect(nestedEnd?.mcpServer).toStrictEqual(snapshot("nested"));
     expect(ends.find((e) => e.toolCallId === "code-exec")?.mcpServer).toBeUndefined();
+    await stream.finish();
   });
 });
