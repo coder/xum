@@ -3901,7 +3901,20 @@ export class TaskService implements AgentTaskIntegration {
     const owned = this.ownedAttemptByTaskId.get(taskId);
     if (owned == null) {
       if (entry == null) {
-        return indeterminate("no task record and no attempt owned by this process");
+        // Only a strict read proves the row is gone: the lenient read above also returns an
+        // empty config for a malformed or unreadable file.
+        let absent = false;
+        try {
+          absent =
+            findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId) ==
+            null;
+        } catch {
+          absent = false;
+        }
+        const reason = "no task record and no attempt owned by this process";
+        return absent
+          ? { kind: "indeterminate", reason, code: "no-record" }
+          : indeterminate(reason);
       }
       // Report first: this branch runs only once the report artifact read positively found none.
       if (reportPositivelyAbsent) {

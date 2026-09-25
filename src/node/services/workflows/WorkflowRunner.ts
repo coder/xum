@@ -96,7 +96,7 @@ export class WorkflowPriorAttemptUnresolvedError extends Error {
   constructor(
     readonly stepId: string,
     readonly taskId: string,
-    readonly outcome: "indeterminate" | "cleanup-pending" | "timeout" | "claim-refused",
+    readonly outcome: "indeterminate" | "cleanup-pending" | "timeout" | "claim-refused" | "live",
     detail: string
   ) {
     // Avoid the word "interrupted": the sandbox normalizes any such error text.
@@ -1436,6 +1436,11 @@ export class WorkflowRunner {
         return { handleId };
       }
       priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
+    } else if (existingStep?.status === "failed" && existingStep.taskId != null) {
+      priorReplace = await this.consultFailedCheckpoint(
+        { stepId: spec.id, taskId: existingStep.taskId },
+        { leaseGuard: options.leaseGuard, runAbortSignal: options.waitOptions?.abortSignal }
+      );
     }
 
     const resultSpec = normalizeWorkflowAgentSpecForExecution(spec, {
@@ -1654,6 +1659,13 @@ export class WorkflowRunner {
       return existingStep.result;
     }
 
+    const priorChild =
+      existingStep?.status === "failed" && existingStep.taskId != null
+        ? await this.consultFailedCheckpoint(
+            { stepId: spec.id, taskId: existingStep.taskId },
+            { leaseGuard: options.leaseGuard, runAbortSignal: options.waitOptions?.abortSignal }
+          )
+        : undefined;
     options.leaseGuard.throwIfLost();
     return await this.runAndRecordAgentStepWithRetries(runId, sequence, {
       spec,
@@ -1661,6 +1673,7 @@ export class WorkflowRunner {
       startedAt: existingStep?.startedAt ?? this.clock.nowIso(),
       // Classified by its authoritative outcome in runOrResumeAgentStep, never discarded blindly.
       taskId: existingStep?.status === "started" ? existingStep.taskId : undefined,
+      ...(priorChild != null ? { priorChild } : {}),
       allowMissingOutputSchema: options.allowLegacyMissingOutputSchema,
       leaseGuard: options.leaseGuard,
       waitOptions: options.waitOptions,
@@ -1702,6 +1715,8 @@ export class WorkflowRunner {
       startedAt: string;
       taskId?: string;
       reservedInThisRun?: boolean;
+      /** A failed checkpoint's ended child the first attempt retires (consultFailedCheckpoint). */
+      priorChild?: WorkflowPriorChild;
       attempt: number;
       retryMessage?: string;
       allowMissingOutputSchema: boolean;
@@ -1720,6 +1735,13 @@ export class WorkflowRunner {
         results[index] = existingStep.result;
         continue;
       }
+      const priorChild =
+        existingStep?.status === "failed" && existingStep.taskId != null
+          ? await this.consultFailedCheckpoint(
+              { stepId: step.spec.id, taskId: existingStep.taskId },
+              { leaseGuard: options.leaseGuard, runAbortSignal: options.waitOptions?.abortSignal }
+            )
+          : undefined;
       pending.push({
         index,
         spec: step.spec,
@@ -1728,6 +1750,7 @@ export class WorkflowRunner {
         // A started checkpoint is classified by its authoritative outcome when the step runs,
         // for explicit resumes as much as for crash replay; it is never discarded blindly.
         taskId: existingStep?.status === "started" ? existingStep.taskId : undefined,
+        ...(priorChild != null ? { priorChild } : {}),
         allowMissingOutputSchema: options.allowLegacyMissingOutputSchema,
         attempt: 1,
       });
@@ -1874,6 +1897,10 @@ export class WorkflowRunner {
               startedAt: step.startedAt,
               taskId: step.taskId,
               reservedInThisRun: step.reservedInThisRun,
+              // Consumed by the first reservation only (bulk above, or here under a window).
+              ...(step.priorChild != null && step.reservedInThisRun !== true
+                ? { priorChild: step.priorChild }
+                : {}),
               allowMissingOutputSchema: step.allowMissingOutputSchema,
               leaseGuard: options.leaseGuard,
               waitOptions: batchWaitOptions,
@@ -1911,6 +1938,7 @@ export class WorkflowRunner {
                 inputHash: step.inputHash,
                 startedAt: step.startedAt,
                 title: step.spec.title,
+                ...(step.priorChild != null ? { priorChild: step.priorChild } : {}),
               })),
               abortSignal: batchAbortController.signal,
               runAbortSignal: upstreamAbortSignal,
@@ -1969,6 +1997,7 @@ export class WorkflowRunner {
               ...settled.step,
               startedAt: this.clock.nowIso(),
               taskId: undefined,
+              priorChild: undefined,
               attempt: settled.step.attempt + 1,
               retryMessage: getErrorMessage(error),
             });
@@ -1991,6 +2020,8 @@ export class WorkflowRunner {
       inputHash: string;
       startedAt: string;
       taskId?: string;
+      /** A failed checkpoint's ended child the first attempt retires (consultFailedCheckpoint). */
+      priorChild?: WorkflowPriorChild;
       waitOptions?: WorkflowAgentWaitOptions;
       allowMissingOutputSchema: boolean;
       leaseGuard: WorkflowRunnerLeaseGuard;
@@ -1999,6 +2030,7 @@ export class WorkflowRunner {
     let attempt = 1;
     let startedAt = step.startedAt;
     let taskId = step.taskId;
+    let priorChild = step.priorChild;
     let spec = step.spec;
     while (attempt <= WORKFLOW_AGENT_MAX_ATTEMPTS) {
       const runResult = await this.runOrResumeAgentStep(runId, sequence, {
@@ -2006,6 +2038,7 @@ export class WorkflowRunner {
         inputHash: step.inputHash,
         startedAt,
         taskId,
+        ...(priorChild != null ? { priorChild } : {}),
         allowMissingOutputSchema: step.allowMissingOutputSchema,
         leaseGuard: step.leaseGuard,
         waitOptions: step.waitOptions,
@@ -2030,6 +2063,7 @@ export class WorkflowRunner {
         spec = buildRetryAgentSpec(step.spec, attempt, getErrorMessage(error));
         startedAt = this.clock.nowIso();
         taskId = undefined;
+        priorChild = undefined;
         attempt += 1;
       }
     }
@@ -3078,9 +3112,9 @@ export class WorkflowRunner {
    * never replaced unclaimed. This includes this process's own settled attempts, so a
    * pre-identity owned attempt (no attempt id to claim) is no longer replaced automatically.
    *
-   * Interim gap until failed-checkpoint consultation lands (G2 PR B2): a crash between
-   * recordStartedAttemptFailed and this claim leaves a failed checkpoint, whose re-run reserves a
-   * fresh child without consulting the old one (the pre-G2 behavior).
+   * A crash (or stall) between recordStartedAttemptFailed and this claim leaves a failed
+   * checkpoint naming the ended child; its re-run consults that child (consultFailedCheckpoint)
+   * and claims it again, which re-stamps the nonce, so the stalled runner can no longer publish.
    */
   private async claimPriorChildren(
     steps: ReadonlyArray<{
@@ -3123,6 +3157,57 @@ export class WorkflowRunner {
       retires.push({ taskId: prior.taskId, attemptId: prior.attemptId, nonce: claim.nonce });
     }
     return retires;
+  }
+
+  /**
+   * Failed-checkpoint consultation (G2 PR B2): a step the journal records as FAILED may still name
+   * a child, and re-running it blindly could start a second child next to a live one, or replace
+   * an ended one without retiring it (a runner stalled between recording the failure and its
+   * claim could then still publish). So the named child is classified first:
+   * - live, cleanup pending or timed out → unresolved (resume again once it settles);
+   * - ended without a report → the fresh reservation retires it (claim, single-use publication);
+   * - reported → fresh run: the step failed after that report (e.g. its output was rejected), so
+   *   adopting it again would fail the same way;
+   * - no task record (strict read) → fresh run: no process can admit the child;
+   * - any other indeterminate outcome (including an adapter that cannot classify) → unresolved.
+   * The disposition depends only on the child's evidence, never on the journal's "failed" label:
+   * that label is written before the claim (a runner can stall between the two), so it does not
+   * prove the child is retired, only that a runner decided to retire it.
+   * Returns the prior child to retire, or undefined for a plain fresh run.
+   */
+  private async consultFailedCheckpoint(
+    step: { stepId: string; taskId: string },
+    options: { leaseGuard: WorkflowRunnerLeaseGuard; runAbortSignal?: AbortSignal }
+  ): Promise<WorkflowPriorChild | undefined> {
+    options.leaseGuard.throwIfLost();
+    const outcome = await this.resolveAttemptOutcome(step.taskId, {
+      ...(options.runAbortSignal != null ? { abortSignal: options.runAbortSignal } : {}),
+      wait: "pending",
+    });
+    options.leaseGuard.throwIfLost();
+    switch (outcome.kind) {
+      case "terminal-no-report":
+        return { taskId: step.taskId, attemptId: outcome.attemptId };
+      case "reported":
+        return undefined;
+      case "indeterminate":
+        if (outcome.code === "no-record") return undefined;
+        throw new WorkflowPriorAttemptUnresolvedError(
+          step.stepId,
+          step.taskId,
+          "indeterminate",
+          `nothing proves the failed step's previous child ended (${outcome.reason}); stop or delete it to re-run the step`
+        );
+      case "live":
+      case "cleanup-pending":
+      case "timeout":
+        throw new WorkflowPriorAttemptUnresolvedError(
+          step.stepId,
+          step.taskId,
+          outcome.kind,
+          "the failed step's previous child has not settled; resume again once it does"
+        );
+    }
   }
 
   /**

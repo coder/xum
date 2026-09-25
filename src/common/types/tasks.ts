@@ -12,7 +12,11 @@ export type TaskAttemptOutcome<Report> =
   | { kind: "reported"; report: Report }
   | { kind: "live"; executionId: string }
   | { kind: "cleanup-pending" }
-  | { kind: "indeterminate"; reason: string }
+  /**
+   * `code: "no-record"`: a strict config read (well-formed, or no config file) has no row for
+   * the task, so no process can admit it. Never set for an unreadable or malformed config.
+   */
+  | { kind: "indeterminate"; reason: string; code?: "no-record" }
   /**
    * `attemptId`: the attempt that ended (the owned attempt, or the row's current attempt named
    * by the parent's settlement receipt). A replacement may retire exactly this attempt
