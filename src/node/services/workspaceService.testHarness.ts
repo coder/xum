@@ -9,10 +9,11 @@ import path from "path";
 import type { Config, SecretsStore } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { InitStateManager } from "./initStateManager";
+import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import { BackgroundProcessManager } from "./backgroundProcessManager";
+import { createTestHistoryService } from "./testHistoryService";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -134,7 +135,7 @@ export function createMockAIService(overrides: Partial<AIService> = {}): AIServi
   } as unknown as AIService;
 }
 
-export function createWorkspaceServiceForTest(options: {
+export interface WorkspaceServiceForTestOptions {
   config:
     | (Partial<Config> & { getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"] })
     | Config;
@@ -150,7 +151,15 @@ export function createWorkspaceServiceForTest(options: {
   sessionTimingService?: WorkspaceServiceArgs[11];
   streamManager?: WorkspaceServiceArgs[12];
   secretsStore?: WorkspaceServiceArgs[13];
-}): WorkspaceService {
+}
+
+/**
+ * Low-level constructor for tests that already own their stores. Prefer
+ * createWorkspaceServiceHarness, which also owns a real Config and HistoryService.
+ */
+export function createWorkspaceServiceForTest(
+  options: WorkspaceServiceForTestOptions
+): WorkspaceService {
   // Test helpers often don't exercise HistoryService; use a narrow stub for those cases.
   // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
   const defaultHistoryService: HistoryService = {} as HistoryService;
@@ -179,6 +188,67 @@ export function createWorkspaceServiceForTest(options: {
     options.streamManager,
     options.secretsStore
   );
+}
+
+export type WorkspaceServiceHarnessOptions = Omit<
+  WorkspaceServiceForTestOptions,
+  "config" | "historyService"
+>;
+
+export interface WorkspaceServiceHarness extends AsyncDisposable {
+  service: WorkspaceService;
+  config: Config;
+  historyService: HistoryService;
+  aiService: AIService;
+  initStateManager: InitStateManager;
+  extensionMetadata: ExtensionMetadataService;
+  backgroundProcessManager: BackgroundProcessManager;
+  /** Temp root that owns config.json, sessions/, and the managers' files. */
+  rootDir: string;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Default WorkspaceService fixture. Every dependency is a real instance rooted in one
+ * temp directory (Config, HistoryService, InitStateManager, ExtensionMetadataService,
+ * BackgroundProcessManager) except the AI service, which is a stream-lifecycle fake
+ * because a real one needs providers. Seed state through the real stores
+ * (`config.editConfig`/`config.addWorkspace`, `historyService.appendToHistory`) and
+ * assert against them instead of hand-written partial doubles.
+ */
+export async function createWorkspaceServiceHarness(
+  options: WorkspaceServiceHarnessOptions = {}
+): Promise<WorkspaceServiceHarness> {
+  const { config, historyService, tempDir, cleanup } = await createTestHistoryService();
+  const aiService = options.aiService ?? createMockAIService();
+  const initStateManager = options.initStateManager ?? new InitStateManager(config);
+  const extensionMetadata =
+    options.extensionMetadata ??
+    new ExtensionMetadataService(path.join(tempDir, "extensionMetadata.json"));
+  const backgroundProcessManager =
+    options.backgroundProcessManager ??
+    new BackgroundProcessManager(path.join(tempDir, "background-processes"));
+  const service = createWorkspaceServiceForTest({
+    ...options,
+    config,
+    historyService,
+    aiService,
+    initStateManager,
+    extensionMetadata,
+    backgroundProcessManager,
+  });
+  return {
+    service,
+    config,
+    historyService,
+    aiService,
+    initStateManager,
+    extensionMetadata,
+    backgroundProcessManager,
+    rootDir: tempDir,
+    cleanup,
+    [Symbol.asyncDispose]: cleanup,
+  };
 }
 
 export async function setWorkspaceGoalOk(

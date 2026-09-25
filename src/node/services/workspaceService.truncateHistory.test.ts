@@ -43,6 +43,12 @@ import {
   setWorkspaceGoalOk,
 } from "./workspaceService.testHarness";
 
+// Partial-truncation fixtures: truncateHistory(0.5) sizes its cut by token counts of the whole
+// serialized rows, so two near-equal rows can round either way and remove both. A clearly
+// larger first row makes 50% remove exactly that row.
+const LONGER_FIRST_ROW_TEXT =
+  "before the cut: this first row is deliberately several times longer than the row kept after it";
+
 describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   async function createServices(aiServiceOverride?: AIService) {
     const { config, historyService, cleanup } = await createTestHistoryService();
@@ -1405,11 +1411,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/full-clear-sandbox-project",
         runtimeConfig: { type: "local" },
       });
-      // Two similar-size messages: 50% removes only the first, keeping the truncation genuinely
-      // partial (a one-message 50% empties history and routes as a full clear).
+      // A larger first row: 50% removes only it, keeping the truncation genuinely partial
+      // (a one-message 50% empties history and routes as a full clear).
       await historyService.appendToHistory(
         workspaceId,
-        createMuxMessage("pre-clear-user", "user", "before clear", {})
+        createMuxMessage("pre-clear-user", "user", LONGER_FIRST_ROW_TEXT, {})
       );
       await historyService.appendToHistory(
         workspaceId,
@@ -1465,11 +1471,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/clear-drains-refine-project",
         runtimeConfig: { type: "local" },
       });
-      // Two similar-size messages keep the 50% truncation genuinely partial (see the sandbox
+      // A larger first row keeps the 50% truncation genuinely partial (see the sandbox
       // discard test above).
       await historyService.appendToHistory(
         workspaceId,
-        createMuxMessage("pre-clear-user", "user", "before clear", {})
+        createMuxMessage("pre-clear-user", "user", LONGER_FIRST_ROW_TEXT, {})
       );
       await historyService.appendToHistory(
         workspaceId,

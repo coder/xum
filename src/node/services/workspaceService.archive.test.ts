@@ -48,6 +48,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   let configState: ProjectsConfig;
   let editConfigSpy: ReturnType<typeof mock>;
   let historyService: HistoryService;
+  let historyConfig: Config;
   let cleanupHistory: () => Promise<void>;
 
   const workspaceMetadata: WorkspaceMetadata = {
@@ -80,7 +81,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       return Promise.resolve();
     });
 
-    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+    ({
+      historyService,
+      config: historyConfig,
+      cleanup: cleanupHistory,
+    } = await createTestHistoryService());
 
     const mockConfig: MockWorkspaceConfig = {
       srcDir: "/tmp/src",
@@ -738,6 +743,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     const harness = await createAgentSessionHarness({
       workspaceId,
+      config: historyConfig,
       historyService,
       aiEmitter,
       aiServiceOverrides: {

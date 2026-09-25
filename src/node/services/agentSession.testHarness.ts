@@ -5,6 +5,7 @@ import { EventEmitter } from "events";
 
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
+import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
@@ -72,15 +73,6 @@ export function runSessionTerminalPolicy(
   return payload.type === "stream-end"
     ? policy.handleTurnSuccess(payload)
     : policy.handleTurnAbort(payload, systemMessageTokens);
-}
-
-function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
-  return {
-    rootDir: sessionDir,
-    sessionsDir: sessionDir,
-    srcDir: sessionDir,
-    loadConfigOrDefault: mock(() => ({})),
-  } as unknown as Config;
 }
 
 function createMockBackgroundProcessManager(
@@ -256,9 +248,15 @@ export async function seedAutoCompactionThreshold(
 export async function createAgentSessionHarness(
   options: AgentSessionHarnessOptions
 ): Promise<AgentSessionHarness> {
+  // A caller-owned HistoryService must come with the Config that owns its sessions dir;
+  // pairing it with a stand-in config would split session state across two roots.
+  assert(
+    options.historyService == null || options.config != null,
+    "createAgentSessionHarness: pass config together with historyService"
+  );
   const testHistory = options.historyService ? undefined : await createTestHistoryService();
   const historyService = options.historyService ?? testHistory!.historyService;
-  const config = options.config ?? testHistory?.config ?? createAgentSessionTestConfig();
+  const config = options.config ?? testHistory!.config;
   const cleanup = testHistory?.cleanup ?? (() => Promise.resolve());
   const { aiEmitter, aiService } = options.aiService
     ? { aiEmitter: options.aiEmitter ?? new EventEmitter(), aiService: options.aiService }

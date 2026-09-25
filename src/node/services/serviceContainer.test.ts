@@ -1324,6 +1324,7 @@ describe("ServiceContainer", () => {
         }
         const h = await createAgentSessionHarness({
           workspaceId,
+          config: services.config,
           historyService,
           aiEmitter: emitter,
           streamManager: services.streamManager,
