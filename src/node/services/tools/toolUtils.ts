@@ -26,9 +26,9 @@ export function requireWorkspaceTurnManager(
   config: ToolConfiguration,
   toolName: string
 ): WorkspaceTurnManager {
-  const manager = config.workspaceTurnManager ?? config.taskService;
+  const manager = config.workspaceTurnManager;
   assert(manager, toolName + " requires workspaceTurnManager");
-  return manager as WorkspaceTurnManager;
+  return manager;
 }
 
 export function parseToolResult<TSchema>(

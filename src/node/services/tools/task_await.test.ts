@@ -7,7 +7,7 @@ import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import { COMPLETED_REPORT_REFETCH_NOTE } from "@/common/utils/tools/toolDefinitions";
 import type { WorkflowRunRecord, WorkflowRunStatus } from "@/common/types/workflow";
 import { createTaskAwaitTool } from "./task_await";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { getSubagentGitPatchArtifactsFilePath } from "@/node/services/subagentGitPatchArtifacts";
 import {
@@ -97,16 +97,15 @@ function createFakeTaskServices(
     },
     ...taskServiceOverrides,
   };
-  const workspaceTurnManager: Partial<FakeWorkspaceTurnManagerApi> = {
-    listWorkspaceTurnTasks,
-    getWorkspaceTurnSnapshot,
-    markWorkspaceTurnTerminalAttentionConsumed,
-    waitForWorkspaceTurn,
-  };
   // Partial fakes: the tool only reaches the methods picked above.
   return {
     taskService: taskService as TaskService,
-    workspaceTurnManager: workspaceTurnManager as WorkspaceTurnManager,
+    workspaceTurnManager: createFakeWorkspaceTurnManager({
+      listWorkspaceTurnTasks,
+      getWorkspaceTurnSnapshot,
+      markWorkspaceTurnTerminalAttentionConsumed,
+      waitForWorkspaceTurn,
+    }),
   };
 }
 

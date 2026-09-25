@@ -5,7 +5,12 @@ import { tool } from "ai";
 import { z } from "zod";
 
 import { createTaskTool, markBuiltInTaskTool, isBuiltInTaskTool } from "./task";
-import { createTestToolConfig, mockToolCallOptions, TestTempDir } from "./testHelpers";
+import {
+  createFakeWorkspaceTurnManager,
+  createTestToolConfig,
+  mockToolCallOptions,
+  TestTempDir,
+} from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
 
@@ -42,6 +47,9 @@ function expectGroupedQueuedOrRunningTaskToolResult(
   );
   expect(typeof obj.note).toBe("string");
 }
+
+// The task tool requires a TaskService up front, but workspace-turn launches never call it.
+const unusedTaskService = {} as unknown as TaskService;
 
 describe("task tool", () => {
   it("uses runtime-aware description for local runtimes", () => {
@@ -156,25 +164,37 @@ describe("task tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     const createWorkspaceTurn = mock(() =>
-      Ok({
-        taskId: "wst_child-turn",
-        kind: "workspace_turn" as const,
-        status: "running" as const,
-        workspaceId: "child-workspace",
-      })
+      Promise.resolve(
+        Ok({
+          taskId: "wst_child-turn",
+          kind: "workspace_turn" as const,
+          status: "running" as const,
+          workspaceId: "child-workspace",
+        })
+      )
     );
     const create = mock(() => Err("sub-agent path should not be used"));
-    const waitForWorkspaceTurn = mock(() => Promise.resolve({ reportMarkdown: "ignored" }));
+    const waitForWorkspaceTurn = mock(() =>
+      Promise.resolve({
+        taskId: "wst_child-turn",
+        workspaceId: "child-workspace",
+        updatedAt: "2026-06-19T00:00:00.000Z",
+        reportMarkdown: "ignored",
+      })
+    );
     const taskService = {
       create,
+    } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
       createWorkspaceTurn,
       waitForWorkspaceTurn,
-    } as unknown as TaskService;
+    });
 
     const tool = createTaskTool({
       ...baseConfig,
       xumEnv: { MUX_MODEL_STRING: "openai:gpt-4o-mini", MUX_THINKING_LEVEL: "high" },
       taskService,
+      workspaceTurnManager,
     });
 
     const result: unknown = await Promise.resolve(
@@ -213,15 +233,21 @@ describe("task tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     const createWorkspaceTurn = mock(() =>
-      Ok({
-        taskId: "wst_child-turn",
-        kind: "workspace_turn" as const,
-        status: "running" as const,
-        workspaceId: "child-workspace",
-      })
+      Promise.resolve(
+        Ok({
+          taskId: "wst_child-turn",
+          kind: "workspace_turn" as const,
+          status: "running" as const,
+          workspaceId: "child-workspace",
+        })
+      )
     );
-    const taskService = { createWorkspaceTurn } as unknown as TaskService;
-    const tool = createTaskTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ createWorkspaceTurn });
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: unusedTaskService,
+      workspaceTurnManager,
+    });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -257,15 +283,21 @@ describe("task tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     const createWorkspaceTurn = mock(() =>
-      Ok({
-        taskId: "wst_child-turn",
-        kind: "workspace_turn" as const,
-        status: "queued" as const,
-        workspaceId: "child-workspace",
-      })
+      Promise.resolve(
+        Ok({
+          taskId: "wst_child-turn",
+          kind: "workspace_turn" as const,
+          status: "queued" as const,
+          workspaceId: "child-workspace",
+        })
+      )
     );
-    const taskService = { createWorkspaceTurn } as unknown as TaskService;
-    const tool = createTaskTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ createWorkspaceTurn });
+    const tool = createTaskTool({
+      ...baseConfig,
+      taskService: unusedTaskService,
+      workspaceTurnManager,
+    });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -307,16 +339,22 @@ describe("task tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
     const executeFollowUp = async (maySupersedeTaskId?: string): Promise<{ note?: string }> => {
       const createWorkspaceTurn = mock(() =>
-        Ok({
-          taskId: "wst_follow_up",
-          kind: "workspace_turn" as const,
-          status: "queued" as const,
-          workspaceId: "child-workspace",
-          ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
-        })
+        Promise.resolve(
+          Ok({
+            taskId: "wst_follow_up",
+            kind: "workspace_turn" as const,
+            status: "queued" as const,
+            workspaceId: "child-workspace",
+            ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
+          })
+        )
       );
-      const taskService = { createWorkspaceTurn } as unknown as TaskService;
-      const tool = createTaskTool({ ...baseConfig, taskService });
+      const workspaceTurnManager = createFakeWorkspaceTurnManager({ createWorkspaceTurn });
+      const tool = createTaskTool({
+        ...baseConfig,
+        taskService: unusedTaskService,
+        workspaceTurnManager,
+      });
       return (await Promise.resolve(
         tool.execute!(
           {
@@ -348,13 +386,15 @@ describe("task tool", () => {
       maySupersedeTaskId?: string
     ): Promise<{ status?: string; note?: string }> => {
       const createWorkspaceTurn = mock(() =>
-        Ok({
-          taskId: "wst_follow_up",
-          kind: "workspace_turn" as const,
-          status: "queued" as const,
-          workspaceId: "child-workspace",
-          ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
-        })
+        Promise.resolve(
+          Ok({
+            taskId: "wst_follow_up",
+            kind: "workspace_turn" as const,
+            status: "queued" as const,
+            workspaceId: "child-workspace",
+            ...(maySupersedeTaskId != null ? { maySupersedeTaskId } : {}),
+          })
+        )
       );
       const waitForWorkspaceTurn = mock(() =>
         Promise.resolve({
@@ -364,8 +404,15 @@ describe("task tool", () => {
           reportMarkdown: "done",
         })
       );
-      const taskService = { createWorkspaceTurn, waitForWorkspaceTurn } as unknown as TaskService;
-      const tool = createTaskTool({ ...baseConfig, taskService });
+      const workspaceTurnManager = createFakeWorkspaceTurnManager({
+        createWorkspaceTurn,
+        waitForWorkspaceTurn,
+      });
+      const tool = createTaskTool({
+        ...baseConfig,
+        taskService: unusedTaskService,
+        workspaceTurnManager,
+      });
       return (await Promise.resolve(
         tool.execute!(
           {
@@ -403,9 +450,7 @@ describe("task tool", () => {
     const tool = createTaskTool({
       ...baseConfig,
       taskService: { create } as unknown as TaskService,
-      workspaceTurnManager: {
-        createWorkspaceTurn,
-      } as unknown as NonNullable<typeof baseConfig.workspaceTurnManager>,
+      workspaceTurnManager: createFakeWorkspaceTurnManager({ createWorkspaceTurn }),
     });
     await Promise.resolve(
       expect(
@@ -685,16 +730,19 @@ describe("task tool", () => {
         Ok({ taskId: "child-task", kind: "agent" as const, status: "queued" as const })
       );
       const createWorkspaceTurn = mock((_: { modelString?: unknown; thinkingLevel?: unknown }) =>
-        Ok({
-          taskId: "wst_child-turn",
-          kind: "workspace_turn" as const,
-          status: "queued" as const,
-          workspaceId: "child-workspace",
-        })
+        Promise.resolve(
+          Ok({
+            taskId: "wst_child-turn",
+            kind: "workspace_turn" as const,
+            status: "queued" as const,
+            workspaceId: "child-workspace",
+          })
+        )
       );
       const tool = createTaskTool({
         ...baseConfig,
-        taskService: { create, createWorkspaceTurn } as unknown as TaskService,
+        taskService: { create } as unknown as TaskService,
+        workspaceTurnManager: createFakeWorkspaceTurnManager({ createWorkspaceTurn }),
       });
 
       await Promise.resolve(
@@ -1379,19 +1427,22 @@ describe("task tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
 
     const createWorkspaceTurn = mock(() =>
-      Ok({
-        taskId: "wst_child-turn",
-        kind: "workspace_turn" as const,
-        status: "running" as const,
-        workspaceId: "child-workspace",
-      })
+      Promise.resolve(
+        Ok({
+          taskId: "wst_child-turn",
+          kind: "workspace_turn" as const,
+          status: "running" as const,
+          workspaceId: "child-workspace",
+        })
+      )
     );
-    const taskService = { createWorkspaceTurn } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ createWorkspaceTurn });
 
     const tool = createTaskTool({
       ...baseConfig,
       planFileOnly: true,
-      taskService,
+      taskService: unusedTaskService,
+      workspaceTurnManager,
     });
 
     let caught: unknown = null;
