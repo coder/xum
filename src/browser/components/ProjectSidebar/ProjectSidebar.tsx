@@ -2303,7 +2303,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             depth: headerDepth,
             rowKind: "subagent",
             connectorPosition: "single",
-            connectorStartsAtParent: false,
             sharedTrunkActiveThroughRow: false,
             sharedTrunkActiveBelowRow: false,
             ancestorTrunks: [],
@@ -2339,7 +2338,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             depth: headerDepth,
             rowKind: "subagent",
             connectorPosition: "single",
-            connectorStartsAtParent: false,
             sharedTrunkActiveThroughRow: false,
             sharedTrunkActiveBelowRow: false,
             ancestorTrunks: [],
@@ -2409,12 +2407,29 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           }}
         />
       );
+      // Expanded members hang below the header on the task-group member rail;
+      // the header owns the top of that trunk so the run starts at the header
+      // row (mirrors childTrunkActive on workspace parent rows).
+      const firstDisplayMember = group.displayMembers[0];
+      const firstMemberMeta =
+        isExpanded && firstDisplayMember != null
+          ? memberMetaByWorkspaceId.get(firstDisplayMember.id)
+          : undefined;
+      const memberChildTrunk =
+        firstMemberMeta != null
+          ? {
+              left: getSubAgentParentRailX(
+                getTaskGroupMemberDepth(headerDepth),
+                "task-group-member"
+              ),
+              active: firstMemberMeta.sharedTrunkActiveThroughRow,
+            }
+          : undefined;
       const renderedRows: React.ReactNode[] = [
         headerMeta != null ? (
           <SubAgentListItem
             key={`task-group:${group.storageKey}`}
             connectorPosition={headerMeta.connectorPosition}
-            connectorStartsAtParent={headerMeta.connectorStartsAtParent}
             sharedTrunkActiveThroughRow={headerMeta.sharedTrunkActiveThroughRow}
             sharedTrunkActiveBelowRow={headerMeta.sharedTrunkActiveBelowRow}
             ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
@@ -2424,7 +2439,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             connectorRailX={getSubAgentParentRailX(headerDepth, "default")}
             childStatusCenterX={getSubAgentChildStatusCenterX(headerDepth)}
             isSelected={isGroupSelected}
-            isElbowActive={group.runActiveWithoutMembers === true || group.runningCount > 0}
+            childTrunk={memberChildTrunk}
           >
             {headerRow}
           </SubAgentListItem>
@@ -2690,7 +2705,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           className={cn(
             // The sidebar doubles as a drag surface, so keep copy selection disabled
             // unless a child input explicitly opts back into text selection.
-            "font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
+            "subagent-connector-clock font-primary bg-surface-primary border-border-light relative flex flex-1 select-none flex-col overflow-hidden border-r",
             // In desktop mode when collapsed, hide border (LeftSidebar handles the partial border)
             isDesktopMode() && collapsed && "border-r-0"
           )}

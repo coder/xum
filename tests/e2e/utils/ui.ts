@@ -114,7 +114,9 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("Project item is missing aria-controls attribute");
       }
 
-      const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
+      // Connector wrappers preserve row state as children appear/disappear, so
+      // find the workspace by identity rather than assuming a direct list child.
+      const workspaceItems = page.locator(`#${workspaceListId} [role="button"][data-workspace-id]`);
       const workspaceItem = workspaceItems.first();
       const isVisible = await workspaceItem.isVisible().catch(() => false);
       if (!isVisible) {

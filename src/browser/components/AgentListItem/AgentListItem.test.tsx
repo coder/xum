@@ -55,7 +55,6 @@ const SUBAGENT_ROW_META: AgentRowRenderMeta = {
   depth: 1,
   rowKind: "subagent",
   connectorPosition: "single",
-  connectorStartsAtParent: true,
   sharedTrunkActiveThroughRow: false,
   sharedTrunkActiveBelowRow: false,
   ancestorTrunks: [],
@@ -67,6 +66,7 @@ type MockWorkspaceUnreadState = ReturnType<typeof WorkspaceUnreadModule.useWorks
 type MockWorkspaceSidebarState = ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>;
 
 let mockWorkspaceHeartbeatsEnabled = false;
+let mockEditingWorkspaceId: string | null = null;
 let latestUseDragSpec: (() => { item?: () => Record<string, unknown> }) | null = null;
 let mockWorkspaceUnreadState: MockWorkspaceUnreadState;
 let mockWorkspaceSidebarState: MockWorkspaceSidebarState;
@@ -234,7 +234,7 @@ function installAgentListItemTestDoubles() {
   void mock.module("@/browser/contexts/WorkspaceTitleEditContext", () => ({
     ...actualWorkspaceTitleEditContext,
     useTitleEdit: () => ({
-      editingWorkspaceId: null,
+      editingWorkspaceId: mockEditingWorkspaceId,
       requestEdit: () => true,
       confirmEdit: () => Promise.resolve({ success: true }),
       cancelEdit: () => undefined,
@@ -354,6 +354,7 @@ describe("AgentListItem", () => {
   beforeEach(() => {
     cleanupDom = installDom();
     mockWorkspaceHeartbeatsEnabled = false;
+    mockEditingWorkspaceId = null;
     mockWorkspaceUnreadState = createWorkspaceUnreadState();
     mockWorkspaceSidebarState = createWorkspaceSidebarState();
     installAgentListItemTestDoubles();
@@ -988,28 +989,30 @@ describe("AgentListItem", () => {
       rowRenderMeta: SUBAGENT_ROW_META,
     });
 
-    const topSegment = view.getByTestId("subagent-connector-top-segment");
+    const trunk = view.getByTestId("subagent-connector-trunk");
     const elbow = view.getByTestId("subagent-connector-elbow");
 
-    expect(topSegment.getAttribute("style")).toContain(`left: ${left}`);
+    expect(trunk.getAttribute("style")).toContain(`left: ${left}`);
     expect(elbow.getAttribute("style")).toContain(`left: ${left}`);
     expect(elbow.getAttribute("style")).toContain(`width: ${width}`);
   });
 
-  test("keeps the sub-agent elbow active during live interrupted-state fallback", () => {
+  test("keeps solid branch joins alongside an active sub-agent rail", () => {
     const { view } = renderWorkspaceItem({
       metadata: createMetadata({
         parentWorkspaceId: "parent",
         taskStatus: "interrupted",
       }),
       depth: 1,
-      rowRenderMeta: SUBAGENT_ROW_META,
+      rowRenderMeta: { ...SUBAGENT_ROW_META, sharedTrunkActiveThroughRow: true },
       isWorkspaceLiveActive: true,
     });
 
     const elbow = view.getByTestId("subagent-connector-elbow");
-    expect(elbow.tagName.toLowerCase()).toBe("svg");
-    expect(elbow.querySelector(".subagent-connector-elbow-active")).toBeTruthy();
+    expect(elbow.classList.contains("border-b")).toBe(true);
+    expect(
+      view.getByTestId("subagent-connector-trunk").classList.contains("subagent-connector-active")
+    ).toBe(true);
   });
 
   test("does not render a heartbeat icon fallback when completed children indicator is shown", () => {
@@ -1021,7 +1024,6 @@ describe("AgentListItem", () => {
         depth: 0,
         rowKind: "primary",
         connectorPosition: "single",
-        connectorStartsAtParent: false,
         sharedTrunkActiveThroughRow: false,
         sharedTrunkActiveBelowRow: false,
         ancestorTrunks: [],
@@ -1064,6 +1066,35 @@ describe("AgentListItem", () => {
 
     expect(within(row).queryByTestId("heartbeat-icon")).toBeNull();
     expect(row.querySelector(".bg-surface-invert-secondary.border-surface-tertiary")).toBeTruthy();
+  });
+
+  test("keeps the parent editor mounted and focused as visible children appear and disappear", () => {
+    const metadata = createMetadata();
+    mockEditingWorkspaceId = metadata.id;
+    let rowRenderMeta: AgentRowRenderMeta | undefined;
+    const renderItem = () => (
+      <AgentListItem
+        metadata={metadata}
+        projectPath={metadata.projectPath}
+        projectName={metadata.projectName}
+        rowRenderMeta={rowRenderMeta}
+        isSelected={false}
+        onSelectWorkspace={() => undefined}
+        onForkWorkspace={() => Promise.resolve()}
+        onArchiveWorkspace={() => Promise.resolve()}
+        onCancelCreation={() => Promise.resolve()}
+      />
+    );
+    const view = render(renderItem());
+    const input = view.getByRole("textbox") as HTMLInputElement;
+    expect(document.activeElement).toBe(input);
+    for (const childTrunkActive of [true, false, undefined]) {
+      rowRenderMeta = { ...SUBAGENT_ROW_META, rowKind: "primary", depth: 0, childTrunkActive };
+      view.rerender(renderItem());
+      const currentInput = view.getByRole("textbox") as HTMLInputElement;
+      expect(currentInput).toBe(input);
+      expect(document.activeElement).toBe(input);
+    }
   });
 
   test("keeps the secondary status row mounted through a quick create-to-stream handoff", () => {

@@ -2596,14 +2596,24 @@ html[data-renderer-inactive] *::after {
   }
 }
 
-/* Animated dashed connector for active sub-agents */
+/* One inherited clock keeps late-mounted/reactivated connectors in phase even
+   across renderer pauses. Per-segment clocks drift while performance.now()
+   advances in the background; a single CSS timeline needs no JS phase storage.
+   Scope it to the sidebar (not the app root), and stop it when no rail is active. */
+@property --subagent-connector-phase {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
 @keyframes connector-dash-scroll {
-  from {
-    transform: translateY(-6px);
-  }
   to {
-    transform: translateY(0);
+    --subagent-connector-phase: 6;
   }
+}
+
+.subagent-connector-clock:has(.subagent-connector-active) {
+  animation: connector-dash-scroll 0.4s linear infinite;
 }
 
 /* Radix ScrollArea wraps viewport children in a `display: table; min-width: 100%`
@@ -2625,56 +2635,33 @@ html[data-renderer-inactive] *::after {
 .subagent-connector-active::before {
   content: "";
   position: absolute;
-  left: 0;
-  top: 0;
-  width: 100%;
-  /* Extra height of one dash cycle (6px) so translateY animation has no gaps */
-  height: calc(100% + 6px);
-  background: repeating-linear-gradient(
+  inset: 0;
+  /* The dash pattern is anchored to the viewport (background-attachment:
+     fixed) rather than to each segment's own box: a connector run is stitched
+     together from per-row segments whose heights vary, so box-anchored
+     gradients would restart the dash phase at every row seam. One shared
+     anchor keeps the pattern continuous across rows; the scroll animation
+     moves background-position (viewport-relative) instead of the box. */
+  background-image: repeating-linear-gradient(
     to bottom,
     var(--connector-color) 0px,
     var(--connector-color) 3px,
     transparent 3px,
     transparent 6px
   );
-  animation: connector-dash-scroll 0.4s linear infinite;
-}
-
-
-@keyframes connector-elbow-dash-scroll {
-  from {
-    stroke-dashoffset: 6;
-  }
-  to {
-    stroke-dashoffset: 0;
-  }
-}
-
-.subagent-connector-elbow-active {
-  fill: none;
-  stroke: var(--connector-color);
-  stroke-width: 1;
-  stroke-linejoin: round;
-  stroke-dasharray: 3 3;
-  animation: connector-elbow-dash-scroll 0.4s linear infinite;
+  background-attachment: fixed;
+  background-position-y: calc(var(--subagent-connector-phase) * 1px);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .subagent-connector-active::before,
-  .subagent-connector-elbow-active {
+  .subagent-connector-clock:has(.subagent-connector-active) {
     animation: none;
   }
 }
 
-/* Storybook snapshot determinism: the active sub-agent connector animates an
-   infinite stroke-dashoffset (SVG elbow) and translateY (trunk dashes).
-   Visual snapshots cannot pin those to a stable frame, so "SubAgent States/Gallery"
-   otherwise snapshots the dashes at a random phase. The story tags its row
-   container with this class to freeze both animations; the class is never used
-   in the shipped app, so this rule is inert outside Storybook. */
-.storybook-static-subagent-connectors .subagent-connector-active::before,
-.storybook-static-subagent-connectors .subagent-connector-elbow-active {
-  animation: none !important;
+/* Pin the inherited phase at the story container for deterministic snapshots. */
+.storybook-static-subagent-connectors {
+  --subagent-connector-phase: 0;
 }
 
 /* Section color picker - react-colorful sizing */
