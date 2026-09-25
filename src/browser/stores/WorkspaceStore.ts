@@ -106,6 +106,10 @@ import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
 import { isProviderConfigFixableError } from "@/common/utils/messages/retryEligibility";
+import {
+  markChatSwitchMilestone,
+  markChatSwitchStart,
+} from "@/browser/utils/perf/chatSwitchTiming";
 
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
@@ -1579,6 +1583,10 @@ export class WorkspaceStore {
 
     const previousActiveId = this.activeWorkspaceId;
     this.activeWorkspaceId = workspaceId;
+    if (workspaceId) {
+      // Chat-switch User Timing origin (#4504): every switch milestone is measured from here.
+      markChatSwitchStart(workspaceId);
+    }
     this.ensureActiveOnChatSubscription();
 
     // Re-hydrate persisted session usage so cost totals reflect any
@@ -5014,6 +5022,8 @@ export class WorkspaceStore {
       this.resetStaleSkeletonDeadline(workspaceId);
       this.lastUserPromptStore.bump(workspaceId);
       this.states.bump(workspaceId);
+      // No-op unless this is the workspace the latest switch targeted.
+      markChatSwitchMilestone(workspaceId, "caught-up", { replay });
       this.checkAndBumpRecencyIfChanged(); // Messages loaded, update recency
 
       // Replay resets clear the aggregator before history is rebuilt. Drop the temporary
