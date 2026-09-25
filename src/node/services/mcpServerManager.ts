@@ -88,6 +88,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
+import { MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -102,7 +103,6 @@ const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
  */
 const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
-export const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downloads
 // Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
 // while several unhealthy servers' startup deadlines overlap instead of stacking.
 const MCP_STARTUP_CONCURRENCY = 4;

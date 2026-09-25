@@ -5,7 +5,7 @@ import type { Tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import * as mcpSdk from "@/node/services/mcpClient";
-import { MCP_STARTUP_TIMEOUT_MS } from "@/node/services/mcpServerManager";
+import { MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
 
 /**
  * Fake MCP servers for MCPServerManager tests.
@@ -137,6 +137,8 @@ export class FakeMcpServers {
 
   /** Restore createMCPClient and forget every server; call from afterEach. */
   reset(): void {
+    // Exit every live process so no transport read loop or exit promise outlives its test.
+    for (const process of this.processes) process.crash();
     this.clientSpy?.mockRestore();
     this.clientSpy = null;
     this.behaviors.clear();
@@ -159,6 +161,13 @@ export class FakeMcpServers {
     let exit!: (code: number) => void;
     const exitCode = new Promise<number>((resolve) => (exit = resolve));
     let exited = false;
+    // The process is gone once anything ends it: crash(), a later abort, or the manager
+    // closing the transport (stdout cancelled / stdin closed) when it retires a generation.
+    const retire = (code: number) => {
+      if (exited) return;
+      exited = true;
+      exit(code);
+    };
     const process: FakeProcess = {
       command,
       get exited() {
@@ -166,13 +175,12 @@ export class FakeMcpServers {
       },
       crash: () => {
         if (exited) return;
-        exited = true;
         try {
           stdout.close();
         } catch {
           // The transport already cancelled stdout.
         }
-        exit(1);
+        retire(1);
       },
     };
     // Like a real exec, a later abort kills the process: an abandoned (e.g.
@@ -185,6 +193,7 @@ export class FakeMcpServers {
         start: (controller) => {
           stdout = controller;
         },
+        cancel: () => retire(0),
       }),
       stderr: new ReadableStream<Uint8Array>(),
       stdin: new WritableStream<Uint8Array>({
@@ -197,6 +206,8 @@ export class FakeMcpServers {
             }
           }
         },
+        close: () => retire(0),
+        abort: () => retire(0),
       }),
       exitCode,
       duration: exitCode.then(() => 0),
