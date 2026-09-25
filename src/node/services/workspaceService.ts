@@ -2257,11 +2257,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   // On-demand plan-review snapshot captures in flight, per workspace. A context mutation
   // aborts them when it acquires its admission guard, and a capture that starts while a
   // mutation holds the guard is refused up front. ensurePlanSnapshot's generation frontier
-  // already refuses bytes read before a clear commits, and a full clear moves the plan aside
-  // before its commit (stagePlanFilesForClear), which closes its commit-to-plan-deletion window
-  // for every backend. This registry still covers that window, in this process only, for a
-  // destructive replaceHistory with deletePlanFile, which deletes the plan after its commit (no
-  // in-app caller sets that flag).
+  // already refuses bytes read before a clear commits, and both a full clear and a destructive
+  // replaceHistory with deletePlanFile move the plan aside before their commit
+  // (stagePlanFilesForClear), which closes the commit-to-plan-deletion window for every backend.
+  // This registry only stops this process's captures early.
   private readonly onDemandPlanSnapshotCaptures = new Map<string, Set<AbortController>>();
 
   // r41: sends currently between the entry check and their settled outcome
@@ -14177,7 +14176,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   /**
    * Move a full clear's plan files (current and legacy path) aside to a unique name in the same
-   * directory, before its history commit (see the call site in truncateHistory). `restore`
+   * directory, before its history commit (see the call sites in truncateHistory and, for a
+   * destructive replacement that deletes the plan, replaceHistory). `restore`
    * puts them back when the clear does not commit, unless a plan was written in the meantime
    * (that newer plan wins); `discard` removes them after the commit.
    *
@@ -14765,6 +14765,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     using _admissionGuard = admissionGuard;
 
     const replaceMode = options?.mode ?? "destructive";
+    // Plan files a destructive replacement with deletePlanFile moved aside before its commit,
+    // settled by the deletion receipt on every exit (see the finally below).
+    let planStaging: Awaited<ReturnType<typeof this.stagePlanFilesForClear>> = null;
+    const replacement = { committed: false };
 
     try {
       let messageToAppend = summaryMessage;
@@ -14885,15 +14889,31 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           }
         }
         this.sessions.get(workspaceId)?.clearUsageState();
+        // Same window as a full clear (#4420): the plan is deleted only after this commit, which
+        // advances the generation, so another backend's capture in between would read the
+        // pre-replacement plan and append it. Move it aside BEFORE the commit instead. Compaction
+        // replaces leave the generation alone, so the snapshot fence never applies to them.
+        if (!isCompaction && options?.deletePlanFile === true) {
+          planStaging = await this.stagePlanFilesForClear(workspaceId);
+        }
         let cancellationError: string | undefined;
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
-          () =>
-            isCompaction
-              ? this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false })
-              : this.clearHistoryThroughCompactionCancellation(workspaceId, 1, (error) => {
-                  cancellationError = error;
-                }),
+          async () => {
+            if (isCompaction) {
+              return this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false });
+            }
+            const cleared = await this.clearHistoryThroughCompactionCancellation(
+              workspaceId,
+              1,
+              (error) => {
+                cancellationError = error;
+              }
+            );
+            // Set only from the deletion receipt: Ok exactly when the history deletion committed.
+            replacement.committed = cleared.success;
+            return cleared;
+          },
           { discardUnacceptedOnSuccess: true }
         );
         if (!clearResult.success) {
@@ -15007,6 +15027,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to replace history: ${message}`);
+    } finally {
+      // Only a replacement without a deletion receipt puts the plan back; bookkeeping that fails
+      // after the commit must not resurrect it for a later capture to read.
+      await (replacement.committed ? planStaging?.discard() : planStaging?.restore());
     }
   }
 
