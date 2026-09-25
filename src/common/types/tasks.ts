@@ -14,7 +14,9 @@ export type TaskAttemptOutcome<Report> =
   | { kind: "cleanup-pending" }
   /**
    * `code: "no-record"`: a strict config read (well-formed, or no config file) has no row for
-   * the task, so no process can admit it. Never set for an unreadable or malformed config.
+   * the task: it was removed, or never published. Never set for an unreadable or malformed
+   * config. Not proof of absence by itself: a reservation stalled before its publishing commit
+   * can still publish the row later (see WorkflowRunner.consultFailedCheckpoint).
    */
   | { kind: "indeterminate"; reason: string; code?: "no-record" }
   /**

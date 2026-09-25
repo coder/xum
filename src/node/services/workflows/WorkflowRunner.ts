@@ -3168,7 +3168,10 @@ export class WorkflowRunner {
    * - ended without a report → the fresh reservation retires it (claim, single-use publication);
    * - reported → fresh run: the step failed after that report (e.g. its output was rejected), so
    *   adopting it again would fail the same way;
-   * - no task record (strict read) → fresh run: no process can admit the child;
+   * - no task record (strict read) → fresh run. On a STARTED checkpoint no-record may be a
+   *   reservation still before its publishing commit, so it stays unresolved there; a failed
+   *   label is only written after an outcome read of a published child or by the reserving
+   *   runner once its own commit failed, so here the row was removed or never published;
    * - any other indeterminate outcome (including an adapter that cannot classify) → unresolved.
    * The disposition depends only on the child's evidence, never on the journal's "failed" label:
    * that label is written before the claim (a runner can stall between the two), so it does not

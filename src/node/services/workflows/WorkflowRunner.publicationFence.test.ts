@@ -359,9 +359,11 @@ describe("WorkflowRunner child publication after a lease takeover (#4452 gap 2)"
       await otherProcessTaskService.readAttemptOutcome("task_a_1_0", {
         requestingWorkspaceId: PARENT_ID,
       });
+    // No row yet (A's commit is pending): on a started checkpoint that stays unresolved.
     expect(bClassification).toEqual({
       kind: "indeterminate",
       reason: "no task record and no attempt owned by this process",
+      code: "no-record",
     });
     expect(runB.kind).toBe("rejected");
     expect(runB.kind === "rejected" && runB.error).toBeInstanceOf(
