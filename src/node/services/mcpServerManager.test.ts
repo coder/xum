@@ -2389,7 +2389,11 @@ describe("MCPServerManager", () => {
     // must close the connected client before the timeout surfaces.
     const listing = Promise.withResolvers<void>();
     const cleanup = Promise.withResolvers<undefined>();
-    const close = mock(() => cleanup.promise);
+    const closing = Promise.withResolvers<void>();
+    const close = mock(() => {
+      closing.resolve();
+      return cleanup.promise;
+    });
     servers.serve("never", {
       listTools: () => {
         listing.resolve();
@@ -2405,7 +2409,10 @@ describe("MCPServerManager", () => {
 
     await listing.promise;
     timers.fire(MCP_STARTUP_TIMEOUT_MS);
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // The abort cleanup has started; drain queued continuations so a timeout
+    // that did not wait for it would already have settled the serve.
+    await closing.promise;
+    await new Promise((resolve) => setImmediate(resolve));
     expect(close).toHaveBeenCalledTimes(1);
     expect(settled).toBe(false);
 
@@ -2425,7 +2432,11 @@ describe("MCPServerManager", () => {
       Promise.resolve({ "cleanup-hang-server": stdioConfig("never") })
     );
     const listing = Promise.withResolvers<void>();
-    const close = mock(() => new Promise<never>(() => undefined));
+    const closing = Promise.withResolvers<void>();
+    const close = mock(() => {
+      closing.resolve();
+      return new Promise<never>(() => undefined);
+    });
     servers.serve("never", {
       listTools: () => {
         listing.resolve();
@@ -2441,7 +2452,10 @@ describe("MCPServerManager", () => {
 
     await listing.promise;
     timers.fire(MCP_STARTUP_TIMEOUT_MS);
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // The abort cleanup has started (and never settles); drain queued
+    // continuations so only the fail-safe deadline can settle the serve.
+    await closing.promise;
+    await new Promise((resolve) => setImmediate(resolve));
     expect(close).toHaveBeenCalledTimes(1);
     expect(settled).toBe(false);
 
