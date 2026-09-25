@@ -1,5 +1,5 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
@@ -20,7 +20,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
     const harness = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     historyCleanup = harness.cleanup;

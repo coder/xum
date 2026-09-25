@@ -654,7 +654,11 @@ describe("WorkspaceService transient startup probes", () => {
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as unknown as AIService,
+      // The service listens on the session's AI emitter, as the real shared AIService does.
+      aiService: createMockAIService({
+        on: h.aiEmitter.on.bind(h.aiEmitter) as AIService["on"],
+        off: h.aiEmitter.off.bind(h.aiEmitter) as AIService["off"],
+      }),
     });
     const access = service as unknown as {
       createSession: (id: string) => AgentSession;
