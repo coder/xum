@@ -38,6 +38,9 @@ import {
 } from "@/node/services/taskService.testHarness";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import type { TurnAdmissionToken } from "@/node/services/taskWorkspaceSeam";
+import { TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE } from "@/constants/agentMessaging";
+import { EventEmitter } from "events";
 
 /**
  * G2 — settlement receipt producers. Every point that ends an OWNED, receipt-eligible attempt
@@ -71,6 +74,10 @@ interface Internals {
     taskId: string,
     entry: WorkspaceConfigEntry
   ) => Promise<{ proven: boolean; reason: string }>;
+  emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
+  writeSettlementReceipt: (...args: unknown[]) => Promise<boolean>;
+  workspaceEventLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+  streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -698,6 +705,219 @@ describe("TaskService settlement receipt producers (G2)", () => {
       expect(await restarted.taskService.markInterruptedTaskRunning(marked)).toBe(true);
       expect(restarted.svc.ownedAttemptByTaskId.get(marked)?.receiptEligible).toBe(false);
       expect(entryOf(restartedConfig, marked)?.taskAttemptUnproven).toBe(true);
+    });
+  });
+
+  describe("no-report boundary (attemptCannotStillReport)", () => {
+    function admit(taskService: TaskService, taskId: string) {
+      return taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
+    }
+
+    test("a send admitted between the reservation commit and its cancel keeps the attempt memory-only", async () => {
+      const spawnedId = "cancelracesend";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService, svc } = createHarness(config);
+      spyOn(svc, "startReservedAgentTask").mockImplementation(() => Promise.resolve());
+      const controller = new AbortController();
+      let token: TurnAdmissionToken | undefined;
+      const emit = svc.emitWorkspaceMetadata.bind(taskService);
+      spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
+        await emit(id);
+        // Committed and published, not yet canceled: a send is admitted (and stays pending).
+        if (id === spawnedId && token == null) {
+          const admission = admit(taskService, spawnedId);
+          expect(admission.kind).toBe("admitted");
+          if (admission.kind === "admitted") token = admission.token;
+          controller.abort();
+        }
+      });
+      const created = await taskService.createMany([spawn], { abortSignal: controller.signal });
+      expect(created.success).toBe(false);
+      expect(token).toBeDefined();
+      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
+      // The obligation may still run toward a report: settled in memory only, no durable claim.
+      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        attemptId,
+        phase: "settled",
+        source: "reservation-canceled",
+      });
+      await expectNoReceipt(config, spawnedId, attemptId);
+      token?.onDisposed("refused");
+    });
+
+    test("a send attempted once the cancel began is refused, and the receipt follows", async () => {
+      const spawnedId = "cancelthensend";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [spawnedId]);
+      const { taskService, svc } = createHarness(config);
+      spyOn(svc, "startReservedAgentTask").mockImplementation(() => Promise.resolve());
+      const controller = new AbortController();
+      const emit = svc.emitWorkspaceMetadata.bind(taskService);
+      spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
+        await emit(id);
+        if (id === spawnedId) controller.abort();
+      });
+      let raced: ReturnType<typeof admit> | undefined;
+      const edit = taskService.editWorkspaceEntry.bind(taskService);
+      spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
+        // The cancel's per-plan status edit: the attempt is already closed.
+        if (id === spawnedId && controller.signal.aborted && raced == null) {
+          raced = admit(taskService, spawnedId);
+        }
+        return edit(id, updater, options);
+      });
+      const created = await taskService.createMany([spawn], { abortSignal: controller.signal });
+      expect(created.success).toBe(false);
+      expect(raced).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
+      const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
+      await expectReceiptEverywhere(config, spawnedId, attemptId, "reservation-canceled", false);
+    });
+
+    test("in a batch cancel, a send racing an earlier plan's receipt write is refused for the later plan", async () => {
+      const first = "batchfirst";
+      const second = "batchsecond";
+      const { config } = await setupTree([]);
+      stubStableIds(config, [first, second]);
+      const { taskService, svc } = createHarness(config);
+      spyOn(svc, "startReservedAgentTask").mockImplementation(() => Promise.resolve());
+      const controller = new AbortController();
+      const emit = svc.emitWorkspaceMetadata.bind(taskService);
+      spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
+        await emit(id);
+        if (id === second) controller.abort();
+      });
+      let raced: ReturnType<typeof admit> | undefined;
+      const write = svc.writeSettlementReceipt.bind(taskService);
+      spyOn(svc, "writeSettlementReceipt").mockImplementation(async (...args: unknown[]) => {
+        // The first plan's receipt write: the second plan's attempt was closed with the batch.
+        if (args[0] === first) raced = admit(taskService, second);
+        return write(...args);
+      });
+      const created = await taskService.createMany([spawn, spawn], {
+        abortSignal: controller.signal,
+      });
+      expect(created.success).toBe(false);
+      expect(raced).toEqual({
+        kind: "refused",
+        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
+      });
+      // Nothing could gain work under either attempt, so both receipts are sound.
+      for (const id of [first, second]) {
+        const attemptId = entryOf(config, id)!.taskAttemptId!;
+        await expectReceiptEverywhere(config, id, attemptId, "reservation-canceled", false);
+      }
+    });
+
+    /** A harness whose AI service delivers real stream-end events to TaskService's listener. */
+    function createStreamHarness(config: Config) {
+      const emitter = new EventEmitter();
+      const { aiService } = createAIServiceMocks(config, {
+        on: mock((event: string, listener: (payload: unknown) => void) => {
+          emitter.on(event, listener);
+        }),
+      });
+      return { ...createHarness(config, { aiService }), emitter };
+    }
+
+    function streamEnd(taskId: string, messageId: string, reportMarkdown?: string) {
+      return {
+        type: "stream-end",
+        workspaceId: taskId,
+        messageId,
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts:
+          reportMarkdown == null
+            ? [{ type: "text", text: "still working" }]
+            : [
+                {
+                  type: "dynamic-tool",
+                  toolCallId: `${messageId}-report`,
+                  toolName: "agent_report",
+                  input: { reportMarkdown },
+                  state: "output-available",
+                  output: { success: true, report: { reportMarkdown } },
+                },
+                { type: "text", text: reportMarkdown },
+              ],
+      };
+    }
+
+    test("a Stop racing a natural stream end holds its receipt until the decision resolves nonreport", async () => {
+      const taskId = "stopracenonreport";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: PREDECESSOR } },
+      ]);
+      const { taskService, svc, emitter } = createStreamHarness(config);
+      const attemptId = await ownEligibleAttempt(config, taskService, taskId);
+      // Hold the task's event lock: the stream-end decision registers in the event's own tick and
+      // stays pending while the handler waits for the lock.
+      const gate = Promise.withResolvers<void>();
+      const held = svc.workspaceEventLocks.withLock(taskId, () => gate.promise);
+      emitter.emit("stream-end", streamEnd(taskId, "assistant-1"));
+      expect(svc.streamEndDecisionsByTaskId.get(taskId)?.map((d) => d.outcome)).toEqual([
+        "pending",
+      ]);
+      expect((await taskService.stopDescendantAgentTask(rootId, taskId)).success).toBe(true);
+      // Every other release condition holds once the cleanup paid back; the pending decision
+      // alone keeps the latch, and no receipt write has even begun.
+      const record = () =>
+        svc.workspaceStopRecords.get(taskId) as
+          | { cleanupInFlight: number; receipt?: string }
+          | undefined;
+      await waitForCondition(() => record()?.cleanupInFlight === 0);
+      expect(record()?.receipt).toBeUndefined();
+      expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(true);
+      await expectNoReceipt(config, taskId, attemptId);
+      gate.resolve();
+      await held;
+      await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
+      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        attemptId,
+        phase: "settled",
+        source: "stop-settled",
+      });
+      await expectReceiptEverywhere(config, taskId, attemptId, "execution-settled", true);
+    });
+
+    test("a Stop racing a stream end that publishes the report releases without a receipt", async () => {
+      const taskId = "stoprace-published";
+      const { config } = await setupTree([
+        { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: PREDECESSOR } },
+      ]);
+      const { taskService, svc, emitter } = createStreamHarness(config);
+      const attemptId = await ownEligibleAttempt(config, taskService, taskId);
+      // Hold the handler right after it persisted `reported`, decision still pending.
+      const gate = Promise.withResolvers<void>();
+      let blocked = false;
+      const emit = svc.emitWorkspaceMetadata.bind(taskService);
+      spyOn(svc, "emitWorkspaceMetadata").mockImplementation(async (id: string) => {
+        if (id === taskId && entryOf(config, taskId)?.taskStatus === "reported" && !blocked) {
+          blocked = true;
+          await gate.promise;
+        }
+        return emit(id);
+      });
+      emitter.emit("stream-end", streamEnd(taskId, "assistant-1", "done"));
+      await waitForCondition(() => blocked);
+      expect(svc.streamEndDecisionsByTaskId.get(taskId)?.map((d) => d.outcome)).toEqual([
+        "pending",
+      ]);
+      expect((await taskService.stopDescendantAgentTask(rootId, taskId)).success).toBe(true);
+      await new Promise((resolve) => setImmediate(resolve));
+      await expectNoReceipt(config, taskId, attemptId);
+      gate.resolve();
+      await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
+      await waitForCondition(() => !svc.streamEndDecisionsByTaskId.has(taskId));
+      expect(entryOf(config, taskId)).toMatchObject({
+        taskStatus: "reported",
+        taskAttemptId: attemptId,
+      });
+      await expectNoReceipt(config, taskId, attemptId);
     });
   });
 });
