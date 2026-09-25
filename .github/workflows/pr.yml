@@ -663,11 +663,42 @@ jobs:
       - build-vscode
       - codex-comments
     runs-on: ubuntu-latest
+    # Lists sibling runs of this workflow (superseded step below).
+    permissions:
+      actions: read
     steps:
-      - run: |
-          results="${{ join(needs.*.result, ' ') }}"
-          echo "Job results: $results"
-          for result in $results; do
+      # A push that updates both a stacked PR's head and its base branch starts two
+      # pull_request runs for the same head SHA; the concurrency group cancels one, and
+      # its red Required blocked the PR although the sibling passed (#4547). Stand down
+      # only when this run was cancelled before Detect Changes finished (the duplicate
+      # is cancelled within a second) and another run for the same SHA was not: that run
+      # publishes the real result. Anything else, including a query error, still fails
+      # below. (Not cancelled(): in cancelled run 36124817306 this job's default
+      # success() step still ran, so the job does not see itself as cancelled.)
+      - id: superseded
+        if: needs.changes.result == 'cancelled' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          siblings=$(gh run list -R "$GITHUB_REPOSITORY" --commit "$HEAD_SHA" \
+            --workflow "$GITHUB_WORKFLOW" --event pull_request --json databaseId,conclusion \
+            --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and .conclusion != \"cancelled\")] | length")
+          echo "Other non-cancelled runs for $HEAD_SHA: $siblings"
+          if ((siblings > 0)); then
+            echo "value=true" >>"$GITHUB_OUTPUT"
+          fi
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          SUPERSEDED: ${{ steps.superseded.outputs.value }}
+        run: |
+          echo "Job results: $RESULTS"
+          if [[ "$SUPERSEDED" == "true" ]]; then
+            echo "⏭️ Run cancelled; another run for this commit reports Required"
+            exit 0
+          fi
+          for result in $RESULTS; do
             if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
               echo "❌ CI failed"
               exit 1
