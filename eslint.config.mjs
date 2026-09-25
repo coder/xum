@@ -8,6 +8,7 @@ import reactHooks from "eslint-plugin-react-hooks";
 import tailwindcss from "eslint-plugin-tailwindcss";
 import tseslint from "typescript-eslint";
 import ts from "typescript";
+import path from "node:path";
 
 /**
  * Shared helpers for the rules ported from anti-slop
@@ -534,6 +535,122 @@ const localPlugin = {
                 node,
                 messageId: "desktopToBrowser",
               });
+            }
+          },
+        };
+      },
+    },
+    "require-module-mock-restore": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Require every file-scope bun `mock.module` registration in a test to be restored after the suite",
+        },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative test path -> specifiers whose file-scope mock may stay unrestored.
+              allow: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          unrestored:
+            'File-scope mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`, or inject the dependency instead of mocking the module.',
+          dynamicSpecifier:
+            "File-scope mock.module needs a string-literal specifier so its restore can be verified.",
+        },
+      },
+      create(context) {
+        // bun registers mock.module process-wide and never unregisters it, so a file-scope
+        // mock silently replaces the module for every test file that runs later in the same
+        // shard. That made unrelated suites fail only for certain CI shard orders (#4524,
+        // #3359). A mock inside a test/hook callback is not file scope; one inside `afterAll`
+        // counts as a restore; `describe` callbacks run at file load, so they stay file scope.
+        const allowed = new Set(
+          context.options[0]?.allow?.[
+            path.relative(context.cwd, context.filename).split(path.sep).join("/")
+          ] ?? []
+        );
+        const fileScopeMocks = [];
+        const restored = new Set();
+
+        const isMockModuleCall = (node) =>
+          node.callee.type === "MemberExpression" &&
+          !node.callee.computed &&
+          node.callee.object.type === "Identifier" &&
+          node.callee.object.name === "mock" &&
+          node.callee.property.type === "Identifier" &&
+          node.callee.property.name === "module";
+        const getStringLiteral = (node) =>
+          node?.type === "Literal" && typeof node.value === "string" ? node.value : null;
+        const getCalleeRootName = (callee) => {
+          let current = callee;
+          while (current.type === "MemberExpression" || current.type === "CallExpression") {
+            current = current.type === "MemberExpression" ? current.object : current.callee;
+          }
+          return current.type === "Identifier" ? current.name : null;
+        };
+        // Name of the call (e.g. "afterAll", "describe") a function is passed to, if any.
+        const getCallbackOwner = (fn) =>
+          fn.parent?.type === "CallExpression" && fn.parent.arguments.includes(fn)
+            ? getCalleeRootName(fn.parent.callee)
+            : null;
+
+        return {
+          CallExpression(node) {
+            if (
+              node.callee.type === "Identifier" &&
+              node.callee.name === "restoreModulesAfterSuite" &&
+              node.arguments[0]?.type === "ArrayExpression"
+            ) {
+              for (const entry of node.arguments[0].elements) {
+                const specifier =
+                  entry?.type === "ArrayExpression" ? getStringLiteral(entry.elements[0]) : null;
+                if (specifier != null) {
+                  restored.add(specifier);
+                }
+              }
+              return;
+            }
+            if (!isMockModuleCall(node)) {
+              return;
+            }
+            const enclosingFunctions = context.sourceCode
+              .getAncestors(node)
+              .filter(
+                (ancestor) =>
+                  ancestor.type === "ArrowFunctionExpression" ||
+                  ancestor.type === "FunctionExpression" ||
+                  ancestor.type === "FunctionDeclaration"
+              );
+            const specifier = getStringLiteral(node.arguments[0]);
+            if (enclosingFunctions.some((fn) => getCallbackOwner(fn) === "afterAll")) {
+              if (specifier != null) {
+                restored.add(specifier);
+              }
+              return;
+            }
+            if (enclosingFunctions.some((fn) => getCallbackOwner(fn) !== "describe")) {
+              return;
+            }
+            if (specifier == null) {
+              context.report({ node, messageId: "dynamicSpecifier" });
+              return;
+            }
+            fileScopeMocks.push({ node, specifier });
+          },
+          "Program:exit"() {
+            for (const { node, specifier } of fileScopeMocks) {
+              if (!restored.has(specifier) && !allowed.has(specifier)) {
+                context.report({ node, messageId: "unrestored", data: { specifier } });
+              }
             }
           },
         };
@@ -1869,6 +1986,18 @@ export default defineConfig([
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
       "local/no-unknown-cast-to-api-client": "error",
+      "local/require-module-mock-restore": [
+        "error",
+        {
+          allow: {
+            // bun 1.3.5 cannot load the real noVNC RFB module (`require() async module
+            // .../util/browser.js is unsupported`), so there are no real exports to restore and
+            // no later suite can observe the stub.
+            "src/browser/features/desktop/DesktopPanel.test.tsx": ["@novnc/novnc/lib/rfb"],
+            "src/browser/features/desktop/useDesktopConnection.test.tsx": ["@novnc/novnc/lib/rfb"],
+          },
+        },
+      ],
     },
     languageOptions: {
       globals: {
