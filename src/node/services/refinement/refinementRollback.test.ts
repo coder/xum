@@ -464,8 +464,11 @@ describe("refinementRollback", () => {
     // recorded birth identity proves the reuse. A PID-only liveness check
     // treated this lock as live forever, refusing every rollback until
     // manual cleanup. Simulate with our own (alive) pid + a foreign birth.
+    // Only Linux starttimes are comparable birth evidence (#4415), so the
+    // foreign birth uses that format and the case is Linux-only.
+    if (process.platform !== "linux") return;
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-    const bogusBirth = Buffer.from("crashed-xum-birth").toString("hex");
+    const bogusBirth = Buffer.from("linux-ticks:1").toString("hex");
     await fsPromises.writeFile(lockPath, `${process.pid}:cafe:${bogusBirth}`, {
       encoding: "utf-8",
       flag: "wx",

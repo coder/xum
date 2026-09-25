@@ -7,6 +7,7 @@ import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { markLockOwnerDead } from "@/node/utils/concurrency/fileLockTestHelpers";
 import { HistoryAppendProvenance } from "./historyAppendProvenance";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -137,11 +138,9 @@ describe("HistoryService private publication seam", () => {
         let successor: Awaited<ReturnType<typeof acquireProcessFileLock>> | undefined;
         let commits = 0;
         const staging = afterPublicationPreparation(kind, async () => {
-          // Model an expired birth-less lease while publication is prepared, then let
+          // Lose the lock (dead recorded owner) while publication is prepared, then let
           // the real lock protocol reclaim it and a successor publish new bytes.
-          const token = await fs.readFile(lockPath, "utf8");
-          await fs.writeFile(lockPath, token.split(":").slice(0, 2).join(":"));
-          await fs.utimes(lockPath, new Date(0), new Date(0));
+          await markLockOwnerDead(lockPath);
           successor = await acquireProcessFileLock({
             lockPath,
             timeoutMs: 1000,

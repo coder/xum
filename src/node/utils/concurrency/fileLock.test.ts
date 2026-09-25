@@ -1,9 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { getSelfIdentity, probeProcessBirth } from "./processLiveness";
 import { acquireProcessFileLock, getProcessBirth, type ReclaimSeamPhase } from "./fileLock";
+
+const FILE_LOCK_MODULE = path.join(import.meta.dir, "fileLock.ts");
+
+/** A token in the format acquire writes, with identity fields overridden. */
+function v2Token(pid: number, nonce: string, fields: Record<string, unknown>): string {
+  const identity = { ...getSelfIdentity(), ...fields };
+  return `${pid}:${nonce}::${Buffer.from(JSON.stringify(identity)).toString("hex")}`;
+}
+
+async function expectTimeout(lockPath: string): Promise<void> {
+  try {
+    await (
+      await acquireProcessFileLock({ lockPath, timeoutMs: 150, label: "test" })
+    )[Symbol.asyncDispose]();
+  } catch (error) {
+    expect(String(error)).toContain("Timed out");
+    return;
+  }
+  throw new Error(`expected ${lockPath} to stay held`);
+}
 
 /** A verified-live token for this process (the format acquire writes). */
 function liveToken(nonce: string): string {
@@ -49,35 +70,165 @@ describe("acquireProcessFileLock", () => {
     expect(await lockExists(lockPath)).toBe(true);
   });
 
-  test("reclaims a live-pid lock whose recorded process birth does not match (PID reuse)", async () => {
+  test.skipIf(process.platform !== "linux")(
+    "reclaims a live-pid legacy lock whose recorded process birth does not match (PID reuse)",
+    async () => {
+      using tmp = new DisposableTempDir("file-lock-test");
+      const lockPath = path.join(tmp.path, "x.lock");
+      // Our own pid is definitely alive, but the recorded birth identity is a
+      // different (crashed) process's: the OS handed its PID to us. Without
+      // birth verification this lock is judged live forever. Only Linux
+      // starttimes are comparable evidence (#4415), so the bogus birth uses
+      // that format (formerly an arbitrary string).
+      const bogusBirth = Buffer.from("linux-ticks:1").toString("hex");
+      await fs.writeFile(lockPath, `${process.pid}:cafe:${bogusBirth}`, {
+        encoding: "utf-8",
+        flag: "wx",
+      });
+
+      await using _lock = await acquireProcessFileLock({
+        lockPath,
+        timeoutMs: 2_000,
+        label: "test",
+      });
+      expect(await lockExists(lockPath)).toBe(true);
+    }
+  );
+
+  test("never lease-breaks an undetermined-birth live-pid lock, however old (#4415)", async () => {
     using tmp = new DisposableTempDir("file-lock-test");
     const lockPath = path.join(tmp.path, "x.lock");
-    // Our own pid is definitely alive, but the recorded birth identity is a
-    // different (crashed) process's: the OS handed its PID to us. Without
-    // birth verification this lock is judged live forever.
-    const bogusBirth = Buffer.from("crashed-process-birth").toString("hex");
-    await fs.writeFile(lockPath, `${process.pid}:cafe:${bogusBirth}`, {
-      encoding: "utf-8",
-      flag: "wx",
-    });
-
-    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
-    expect(await lockExists(lockPath)).toBe(true);
-  });
-
-  test("reclaims an undetermined-birth live-pid lock once its lease expires", async () => {
-    using tmp = new DisposableTempDir("file-lock-test");
-    const lockPath = path.join(tmp.path, "x.lock");
-    // Old-format token (no birth recorded): staleness cannot be proven via
-    // birth, so the bounded mtime lease governs. An hours-old lock cannot be
-    // a legitimate hold (all holds are ms-to-seconds).
+    // Formerly reclaimed once the lease expired: a live pid whose birth
+    // cannot be proven is indeterminate, and age is not evidence of death
+    // (a stopped or starved holder resumes and keeps writing).
     await fs.writeFile(lockPath, `${process.pid}:cafe`, { encoding: "utf-8", flag: "wx" });
     const ancient = new Date(Date.now() - 60 * 60 * 1000);
     await fs.utimes(lockPath, ancient, ancient);
-
-    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
-    expect(await lockExists(lockPath)).toBe(true);
+    await expectTimeout(lockPath);
   });
+
+  test("a malformed token still ages out after the lease (no owner to judge)", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await fs.writeFile(lockPath, "garbage", { encoding: "utf-8", flag: "wx" });
+    await expectTimeout(lockPath);
+    const ancient = new Date(Date.now() - 60 * 60 * 1000);
+    await fs.utimes(lockPath, ancient, ancient);
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  });
+
+  test("writes an additive identity segment older readers ignore", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 500, label: "test" });
+    const parts = (await fs.readFile(lockPath, "utf-8")).split(":");
+    expect(Number(parts[0])).toBe(process.pid);
+    const identity = JSON.parse(Buffer.from(parts[3], "hex").toString("utf-8")) as {
+      platform: string;
+    };
+    expect(identity.platform).toBe(process.platform);
+  });
+
+  test("a lock leaked by this process (token no longer registered) is reclaimable", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await fs.writeFile(lockPath, v2Token(process.pid, "leaked", {}), {
+      encoding: "utf-8",
+      flag: "wx",
+    });
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  });
+
+  test("a live holder of this process (registered token) is refused", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await using _held = await acquireProcessFileLock({ lockPath, timeoutMs: 500, label: "test" });
+    await expectTimeout(lockPath);
+  });
+
+  test.skipIf(process.platform !== "linux")(
+    "Linux identity: foreign domains are retired; unknown evidence and live same-domain pids are refused",
+    async () => {
+      using tmp = new DisposableTempDir("file-lock-test");
+      const lockPath = path.join(tmp.path, "x.lock");
+      const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
+        stdio: "ignore",
+      });
+      const otherPid = other.pid!;
+      try {
+        // Positively different PID domain (single-PID-domain contract):
+        // reclaimed even though a process with that pid number runs here.
+        for (const fields of [
+          { pidNs: "pid:[1]" },
+          { bootId: "earlier-boot", machineId: null },
+          { machineId: "0".repeat(32) },
+          { platform: "darwin" },
+        ]) {
+          await fs.writeFile(lockPath, v2Token(otherPid, "foreign", fields), "utf-8");
+          await (
+            await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" })
+          )[Symbol.asyncDispose]();
+        }
+        // Unknown domain evidence: refused even with a dead pid.
+        await fs.writeFile(lockPath, v2Token(deadPid(), "unknown", { pidNs: null }), "utf-8");
+        await expectTimeout(lockPath);
+        // Same domain, live pid with its real birth: refused; a different
+        // birth (pid reuse): reclaimed. Hostname alone is diagnostic.
+        const birth = probeProcessBirth(otherPid);
+        await fs.writeFile(lockPath, v2Token(otherPid, "live", { birth }), "utf-8");
+        await expectTimeout(lockPath);
+        await fs.writeFile(
+          lockPath,
+          v2Token(otherPid, "reused", { birth: "linux-ticks:1", hostname: "renamed" }),
+          "utf-8"
+        );
+        await (
+          await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" })
+        )[Symbol.asyncDispose]();
+      } finally {
+        other.kill("SIGKILL");
+      }
+    }
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "a SIGSTOPped holder with an ancient lockfile is refused; a SIGKILLed one is reclaimed",
+    async () => {
+      using tmp = new DisposableTempDir("file-lock-test");
+      const lockPath = path.join(tmp.path, "x.lock");
+      const script =
+        `const { acquireProcessFileLock } = await import(${JSON.stringify(FILE_LOCK_MODULE)});` +
+        `await acquireProcessFileLock({ lockPath: ${JSON.stringify(lockPath)}, timeoutMs: 2000, label: "child", renewIntervalMs: 50 });` +
+        `console.log("acquired"); setTimeout(() => {}, 120000);`;
+      const holder = spawn(process.execPath, ["-e", script], {
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          holder.stdout.on("data", (chunk: Buffer) => {
+            if (chunk.toString().includes("acquired")) resolve();
+          });
+          holder.on("exit", () => reject(new Error("holder exited before acquiring")));
+        });
+        holder.kill("SIGSTOP");
+        // Older builds would lease-break this; this build must not.
+        const ancient = new Date(Date.now() - 60 * 60 * 1000);
+        await fs.utimes(lockPath, ancient, ancient);
+        await expectTimeout(lockPath);
+        holder.kill("SIGCONT");
+        holder.kill("SIGKILL");
+        await new Promise((resolve) => holder.once("exit", resolve));
+        await using _lock = await acquireProcessFileLock({
+          lockPath,
+          timeoutMs: 2_000,
+          label: "test",
+        });
+      } finally {
+        holder.kill("SIGKILL");
+      }
+    },
+    20_000
+  );
 
   test("retains a fresh undetermined-birth live-pid lock (lease not expired)", async () => {
     using tmp = new DisposableTempDir("file-lock-test");
