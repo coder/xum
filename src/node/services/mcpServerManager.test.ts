@@ -71,9 +71,11 @@ const WORKSPACE_PATH = "/tmp/workspace";
 
 /** Poll a synchronous predicate until it holds (bounded), yielding real time between checks. */
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  // performance.now(), not Date.now(): tests freeze the system clock with setSystemTime
+  // (e.g. after expireStartupDeadline), which would otherwise make this wait unbounded.
+  const deadline = performance.now() + timeoutMs;
   while (!predicate()) {
-    if (Date.now() > deadline) {
+    if (performance.now() > deadline) {
       throw new Error("waitFor: condition not met in time");
     }
     await new Promise((resolve) => setTimeout(resolve, 1));
