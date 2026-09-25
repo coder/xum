@@ -4374,6 +4374,7 @@ export class TaskService implements AgentTaskIntegration {
 
     let resumedAwaitingReportCount = 0;
     let skippedAwaitingReportDueToActiveDescendants = 0;
+    let skippedAwaitingReportAlreadyBusy = 0;
     let failedAwaitingReportCount = 0;
 
     for (const task of awaitingReportTasks) {
@@ -4386,6 +4387,13 @@ export class TaskService implements AgentTaskIntegration {
         this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
       if (hasBlockingActiveDescendants) {
         skippedAwaitingReportDueToActiveDescendants += 1;
+        continue;
+      }
+      // A busy session already owns a turn (e.g. an earlier pass's background completion prompt
+      // still preparing, not yet streaming): rotating would hand its result to a superseded
+      // attempt. Its stream end re-enters completion recovery.
+      if (this.workspaceService.isBusyForMessage(task.id)) {
+        skippedAwaitingReportAlreadyBusy += 1;
         continue;
       }
 
@@ -4590,6 +4598,7 @@ export class TaskService implements AgentTaskIntegration {
       awaitingReportTaskCount: awaitingReportTasks.length,
       resumedAwaitingReportCount,
       skippedAwaitingReportDueToActiveDescendants,
+      skippedAwaitingReportAlreadyBusy,
       failedAwaitingReportCount,
       runningTaskCount: runningTasks.length,
       resumedRunningCount,

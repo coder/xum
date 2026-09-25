@@ -4863,6 +4863,49 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, preparingTaskId)?.taskAttemptId).toBe(attemptBefore);
   });
 
+  test("recovery does not re-drive an awaiting_report task whose accepted turn is still preparing", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-awaiting-preparing";
+    const preparingTaskId = "child-awaiting-preparing";
+    const idleTaskId = "child-awaiting-idle";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        ...[preparingTaskId, idleTaskId].map((taskId) =>
+          projectWorkspace(projectPath, taskId, taskId, {
+            parentWorkspaceId,
+            agentId: "exec",
+            agentType: "exec",
+            taskStatus: "awaiting_report",
+            taskModelString: "openai:gpt-5.2",
+          })
+        ),
+      ],
+      testTaskSettings()
+    );
+
+    // An earlier pass's background completion prompt is accepted but not yet streaming.
+    const isBusyForMessage = mock((workspaceId: string) => workspaceId === preparingTaskId);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ isBusyForMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const before = findWorkspaceInConfig(config, preparingTaskId);
+
+    await taskService.recoverInterruptedTasks();
+
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toContain(idleTaskId);
+    expect(messagedWorkspaceIds).not.toContain(preparingTaskId);
+    const after = findWorkspaceInConfig(config, preparingTaskId);
+    expect(after?.taskAttemptId).toBe(before?.taskAttemptId);
+    expect(after?.taskRecoveryAttempts).toBe(before?.taskRecoveryAttempts);
+  });
+
   test("startup phases stay partitioned: recovery resumes tasks, housekeeping prunes reported ones", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
