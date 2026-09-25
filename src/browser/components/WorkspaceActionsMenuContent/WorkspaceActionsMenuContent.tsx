@@ -27,15 +27,19 @@ function WorkspaceActionButton(props: WorkspaceActionButtonProps) {
   return (
     <button
       type="button"
-      className="text-content-secondary bg-surface-primary hover:bg-hover w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
+      className="text-content-secondary bg-surface-primary hover:bg-hover block w-full rounded-sm px-2 py-1.5 text-left text-xs whitespace-nowrap"
       onClick={props.onClick}
       data-testid={props.testId}
     >
       <span className="flex items-center gap-2">
         <span className="h-3 w-3 shrink-0 [&_svg]:h-3 [&_svg]:w-3">{props.icon}</span>
-        {props.label}
+        {/* Label truncates and the shortcut never shrinks, so a narrow menu cannot
+            push the shortcut outside the row. */}
+        <span className="min-w-0 truncate">{props.label}</span>
         {props.shortcut && (
-          <span className={`text-muted ml-auto text-[10px] ${props.shortcutClassName ?? ""}`}>
+          <span
+            className={`text-muted ml-auto shrink-0 pl-2 text-[10px] ${props.shortcutClassName ?? ""}`}
+          >
             ({props.shortcut})
           </span>
         )}

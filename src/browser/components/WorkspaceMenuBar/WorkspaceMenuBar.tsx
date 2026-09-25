@@ -863,7 +863,9 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             side="bottom"
             align="end"
             sideOffset={6}
-            className="w-[240px] !min-w-0 p-1"
+            // Size to the widest row ("Messages from other workspaces" + shortcut
+            // overflowed a fixed 240px), but never wider than the viewport.
+            className="w-max max-w-[calc(100vw-1rem)] !min-w-[240px] p-1"
             onClick={(event: React.MouseEvent<HTMLDivElement>) => {
               event.stopPropagation();
             }}
