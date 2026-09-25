@@ -10,6 +10,7 @@ import React, {
 import { Lightbulb } from "lucide-react";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
+import { TranscriptBackfillContext } from "@/browser/features/Messages/TranscriptBackfillContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
@@ -630,6 +631,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!hasCommittedTranscriptRow) return;
     return markChatSwitchMilestoneOnNextFrame(workspaceId, "first-row");
   }, [workspaceId, hasCommittedTranscriptRow]);
+  // Streaming rows render synchronously while older chunks still mount (see
+  // TranscriptBackfillContext). Gated on an active stream so a switch to an idle chat never
+  // flips the value, which would re-render every mounted markdown row once the reveal ends.
+  const isTranscriptBackfillingDuringStream = canInterrupt && !isFullyRevealed;
   // Older pages prepend above rows the reveal has not reached yet; offer them once it has.
   const shouldRenderLoadOlderMessagesButton =
     hasOlderHistory && isFullyRevealed && !isPixelSnapshotEnvironment();
@@ -1592,169 +1597,172 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               ) : (
                 <BashCollapsedSummaryModeProvider>
                   <MessageListProvider value={messageListContextValue}>
-                    {shouldRenderLoadOlderMessagesButton && (
-                      <div className="flex justify-center py-3">
-                        <TooltipIfPresent
-                          tooltip={`Load older messages (${loadOlderMessagesShortcutLabel})`}
-                          side="top"
-                        >
-                          <button
-                            type="button"
-                            onClick={handleLoadOlderHistory}
-                            disabled={loadingOlderHistory}
-                            className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors disabled:opacity-50"
+                    <TranscriptBackfillContext.Provider value={isTranscriptBackfillingDuringStream}>
+                      {shouldRenderLoadOlderMessagesButton && (
+                        <div className="flex justify-center py-3">
+                          <TooltipIfPresent
+                            tooltip={`Load older messages (${loadOlderMessagesShortcutLabel})`}
+                            side="top"
                           >
-                            {loadingOlderHistory ? "Loading..." : "Load older messages"}
-                          </button>
-                        </TooltipIfPresent>
-                      </div>
-                    )}
-                    {revealedMessages.map((msg, revealOffset) => {
-                      const index = revealFromIndex + revealOffset;
-                      const workBundle = workBundleInfos?.[index];
-                      const operationalBundle = workBundle
-                        ? undefined
-                        : operationalBundleInfos?.[index];
-                      const workBundleOverride = workBundle
-                        ? workBundleExpansionOverrides.get(workBundle.key)
-                        : undefined;
-                      const defaultRevealTailPlanWorkBundle =
-                        tailProposePlanWorkBundleKey !== null &&
-                        workBundle?.key === tailProposePlanWorkBundleKey;
-                      const isWorkBundleExpanded = workBundle
-                        ? (workBundleOverride ??
-                          (defaultRevealTailPlanWorkBundle || workBundle.defaultExpanded))
-                        : false;
+                            <button
+                              type="button"
+                              onClick={handleLoadOlderHistory}
+                              disabled={loadingOlderHistory}
+                              className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors disabled:opacity-50"
+                            >
+                              {loadingOlderHistory ? "Loading..." : "Load older messages"}
+                            </button>
+                          </TooltipIfPresent>
+                        </div>
+                      )}
+                      {revealedMessages.map((msg, revealOffset) => {
+                        const index = revealFromIndex + revealOffset;
+                        const workBundle = workBundleInfos?.[index];
+                        const operationalBundle = workBundle
+                          ? undefined
+                          : operationalBundleInfos?.[index];
+                        const workBundleOverride = workBundle
+                          ? workBundleExpansionOverrides.get(workBundle.key)
+                          : undefined;
+                        const defaultRevealTailPlanWorkBundle =
+                          tailProposePlanWorkBundleKey !== null &&
+                          workBundle?.key === tailProposePlanWorkBundleKey;
+                        const isWorkBundleExpanded = workBundle
+                          ? (workBundleOverride ??
+                            (defaultRevealTailPlanWorkBundle || workBundle.defaultExpanded))
+                          : false;
 
-                      const keepCollapsedWorkBundleMemberVisible =
-                        msg.type === "user" ||
-                        (msg.type === "assistant" && workBundle?.position === "final");
-                      if (
-                        (workBundle?.position === "member" || workBundle?.position === "final") &&
-                        (isWorkBundleExpanded || !keepCollapsedWorkBundleMemberVisible)
-                      ) {
-                        return null;
-                      }
+                        const keepCollapsedWorkBundleMemberVisible =
+                          msg.type === "user" ||
+                          (msg.type === "assistant" && workBundle?.position === "final");
+                        if (
+                          (workBundle?.position === "member" || workBundle?.position === "final") &&
+                          (isWorkBundleExpanded || !keepCollapsedWorkBundleMemberVisible)
+                        ) {
+                          return null;
+                        }
 
-                      const renderWorkBundle = workBundle?.position === "head";
-                      const renderMessageBeforeWorkBundle = renderWorkBundle && msg.type === "user";
-                      const renderMessageAfterWorkBundle = !renderWorkBundle;
-                      const operationalBundleOverride = operationalBundle
-                        ? operationalBundleExpansionOverrides.get(operationalBundle.key)
-                        : undefined;
-                      const defaultRevealTailPlanOperationalBundle =
-                        tailProposePlanOperationalBundleKey !== null &&
-                        operationalBundle?.key === tailProposePlanOperationalBundleKey;
-                      const isOperationalBundleExpanded = operationalBundle
-                        ? operationalBundle.summary.tone !== undefined ||
-                          (operationalBundleOverride ??
-                            (defaultRevealTailPlanOperationalBundle ||
-                              operationalBundle.defaultExpanded))
-                        : false;
+                        const renderWorkBundle = workBundle?.position === "head";
+                        const renderMessageBeforeWorkBundle =
+                          renderWorkBundle && msg.type === "user";
+                        const renderMessageAfterWorkBundle = !renderWorkBundle;
+                        const operationalBundleOverride = operationalBundle
+                          ? operationalBundleExpansionOverrides.get(operationalBundle.key)
+                          : undefined;
+                        const defaultRevealTailPlanOperationalBundle =
+                          tailProposePlanOperationalBundleKey !== null &&
+                          operationalBundle?.key === tailProposePlanOperationalBundleKey;
+                        const isOperationalBundleExpanded = operationalBundle
+                          ? operationalBundle.summary.tone !== undefined ||
+                            (operationalBundleOverride ??
+                              (defaultRevealTailPlanOperationalBundle ||
+                                operationalBundle.defaultExpanded))
+                          : false;
 
-                      if (
-                        operationalBundle?.position === "member" &&
-                        !isOperationalBundleExpanded
-                      ) {
-                        return null;
-                      }
+                        if (
+                          operationalBundle?.position === "member" &&
+                          !isOperationalBundleExpanded
+                        ) {
+                          return null;
+                        }
 
-                      const renderOperationalBundle = operationalBundle?.position === "head";
-                      const renderMessageAfterOperationalBundle =
-                        renderMessageAfterWorkBundle &&
-                        (!renderOperationalBundle || isOperationalBundleExpanded);
+                        const renderOperationalBundle = operationalBundle?.position === "head";
+                        const renderMessageAfterOperationalBundle =
+                          renderMessageAfterWorkBundle &&
+                          (!renderOperationalBundle || isOperationalBundleExpanded);
 
-                      return (
-                        <React.Fragment key={`${workspaceId}:${msg.id}`}>
-                          {renderMessageBeforeWorkBundle &&
-                            renderMessageAtIndex(msg, index, {
-                              key: `${workspaceId}:${msg.id}:message`,
-                            })}
-                          {renderWorkBundle && workBundle && (
-                            <WorkBundleMessage
-                              item={workBundle}
-                              expanded={isWorkBundleExpanded}
-                              onToggle={() =>
-                                setWorkBundleExpanded(workBundle.key, !isWorkBundleExpanded)
-                              }
-                            />
-                          )}
-                          {renderWorkBundle &&
-                            workBundle &&
-                            isWorkBundleExpanded &&
-                            workBundle.entries.map((entry) => {
-                              const nestedOperationalBundle =
-                                operationalBundleInfos?.[entry.originalIndex];
-                              const nestedOverride = nestedOperationalBundle
-                                ? operationalBundleExpansionOverrides.get(
-                                    nestedOperationalBundle.key
+                        return (
+                          <React.Fragment key={`${workspaceId}:${msg.id}`}>
+                            {renderMessageBeforeWorkBundle &&
+                              renderMessageAtIndex(msg, index, {
+                                key: `${workspaceId}:${msg.id}:message`,
+                              })}
+                            {renderWorkBundle && workBundle && (
+                              <WorkBundleMessage
+                                item={workBundle}
+                                expanded={isWorkBundleExpanded}
+                                onToggle={() =>
+                                  setWorkBundleExpanded(workBundle.key, !isWorkBundleExpanded)
+                                }
+                              />
+                            )}
+                            {renderWorkBundle &&
+                              workBundle &&
+                              isWorkBundleExpanded &&
+                              workBundle.entries.map((entry) => {
+                                const nestedOperationalBundle =
+                                  operationalBundleInfos?.[entry.originalIndex];
+                                const nestedOverride = nestedOperationalBundle
+                                  ? operationalBundleExpansionOverrides.get(
+                                      nestedOperationalBundle.key
+                                    )
+                                  : undefined;
+                                const defaultRevealTailPlanNestedBundle =
+                                  tailProposePlanOperationalBundleKey !== null &&
+                                  nestedOperationalBundle?.key ===
+                                    tailProposePlanOperationalBundleKey;
+                                const isNestedExpanded = nestedOperationalBundle
+                                  ? nestedOperationalBundle.summary.tone !== undefined ||
+                                    (nestedOverride ??
+                                      (defaultRevealTailPlanNestedBundle ||
+                                        nestedOperationalBundle.defaultExpanded))
+                                  : false;
+
+                                if (
+                                  nestedOperationalBundle?.position === "member" &&
+                                  !isNestedExpanded
+                                ) {
+                                  return null;
+                                }
+
+                                const renderNestedBundle =
+                                  nestedOperationalBundle?.position === "head";
+                                const renderNestedMessage = !renderNestedBundle || isNestedExpanded;
+
+                                return (
+                                  <React.Fragment
+                                    key={`${workspaceId}:${workBundle.key}:${entry.message.id}`}
+                                  >
+                                    {renderNestedBundle && nestedOperationalBundle && (
+                                      <OperationalBundleMessage
+                                        item={nestedOperationalBundle}
+                                        expanded={isNestedExpanded}
+                                        onToggle={() =>
+                                          setOperationalBundleExpanded(
+                                            nestedOperationalBundle.key,
+                                            !isNestedExpanded
+                                          )
+                                        }
+                                      />
+                                    )}
+                                    {renderNestedMessage &&
+                                      renderMessageAtIndex(entry.message, entry.originalIndex, {
+                                        key: `${workspaceId}:${workBundle.key}:${entry.message.id}:message`,
+                                      })}
+                                  </React.Fragment>
+                                );
+                              })}
+                            {renderOperationalBundle && operationalBundle && (
+                              <OperationalBundleMessage
+                                item={operationalBundle}
+                                expanded={isOperationalBundleExpanded}
+                                onToggle={() =>
+                                  setOperationalBundleExpanded(
+                                    operationalBundle.key,
+                                    !isOperationalBundleExpanded
                                   )
-                                : undefined;
-                              const defaultRevealTailPlanNestedBundle =
-                                tailProposePlanOperationalBundleKey !== null &&
-                                nestedOperationalBundle?.key ===
-                                  tailProposePlanOperationalBundleKey;
-                              const isNestedExpanded = nestedOperationalBundle
-                                ? nestedOperationalBundle.summary.tone !== undefined ||
-                                  (nestedOverride ??
-                                    (defaultRevealTailPlanNestedBundle ||
-                                      nestedOperationalBundle.defaultExpanded))
-                                : false;
-
-                              if (
-                                nestedOperationalBundle?.position === "member" &&
-                                !isNestedExpanded
-                              ) {
-                                return null;
-                              }
-
-                              const renderNestedBundle =
-                                nestedOperationalBundle?.position === "head";
-                              const renderNestedMessage = !renderNestedBundle || isNestedExpanded;
-
-                              return (
-                                <React.Fragment
-                                  key={`${workspaceId}:${workBundle.key}:${entry.message.id}`}
-                                >
-                                  {renderNestedBundle && nestedOperationalBundle && (
-                                    <OperationalBundleMessage
-                                      item={nestedOperationalBundle}
-                                      expanded={isNestedExpanded}
-                                      onToggle={() =>
-                                        setOperationalBundleExpanded(
-                                          nestedOperationalBundle.key,
-                                          !isNestedExpanded
-                                        )
-                                      }
-                                    />
-                                  )}
-                                  {renderNestedMessage &&
-                                    renderMessageAtIndex(entry.message, entry.originalIndex, {
-                                      key: `${workspaceId}:${workBundle.key}:${entry.message.id}:message`,
-                                    })}
-                                </React.Fragment>
-                              );
-                            })}
-                          {renderOperationalBundle && operationalBundle && (
-                            <OperationalBundleMessage
-                              item={operationalBundle}
-                              expanded={isOperationalBundleExpanded}
-                              onToggle={() =>
-                                setOperationalBundleExpanded(
-                                  operationalBundle.key,
-                                  !isOperationalBundleExpanded
-                                )
-                              }
-                            />
-                          )}
-                          {renderMessageAfterOperationalBundle &&
-                            renderMessageAtIndex(msg, index, {
-                              key: `${workspaceId}:${msg.id}:message`,
-                              className: operationalBundle ? "ml-4" : undefined,
-                            })}
-                        </React.Fragment>
-                      );
-                    })}
+                                }
+                              />
+                            )}
+                            {renderMessageAfterOperationalBundle &&
+                              renderMessageAtIndex(msg, index, {
+                                key: `${workspaceId}:${msg.id}:message`,
+                                className: operationalBundle ? "ml-4" : undefined,
+                              })}
+                          </React.Fragment>
+                        );
+                      })}
+                    </TranscriptBackfillContext.Provider>
                   </MessageListProvider>
                 </BashCollapsedSummaryModeProvider>
               )}

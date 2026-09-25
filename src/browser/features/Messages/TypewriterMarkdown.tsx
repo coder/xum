@@ -1,9 +1,10 @@
-import React from "react";
+import React, { useContext } from "react";
 import { useSmoothStreamingText } from "@/browser/hooks/useSmoothStreamingText";
 import { useWorkspaceStreamingStats } from "@/browser/stores/WorkspaceStore";
 import { cn } from "@/common/lib/utils";
 import { MarkdownCore } from "./MarkdownCore";
 import { StreamingContext } from "./StreamingContext";
+import { TranscriptBackfillContext } from "./TranscriptBackfillContext";
 
 interface TypewriterMarkdownProps {
   /** Full text to render. During streaming this grows monotonically. */
@@ -71,12 +72,20 @@ export const TypewriterMarkdown: React.FC<TypewriterMarkdownProps> = ({
   // React Compiler memoizes this object; no manual useMemo needed.
   const streamingContextValue = { isStreaming };
 
+  // While the transcript backfill runs, Streamdown's transition-published streaming blocks can
+  // stay unpainted until it ends (see TranscriptBackfillContext). Render the streaming text
+  // synchronously (MarkdownCore's static mode) meanwhile; incomplete-markdown repair is skipped
+  // for those few seconds. The static render's effect keeps Streamdown's block state current,
+  // so switching back to streaming mode afterwards never blanks the row.
+  const isTranscriptBackfilling = useContext(TranscriptBackfillContext);
+  const parseIncompleteMarkdown = isStreaming && !isTranscriptBackfilling;
+
   return (
     <StreamingContext.Provider value={streamingContextValue}>
       <div className={cn("markdown-content", className)}>
         <MarkdownCore
           content={visibleText}
-          parseIncompleteMarkdown={isStreaming}
+          parseIncompleteMarkdown={parseIncompleteMarkdown}
           preserveLineBreaks={preserveLineBreaks}
         />
       </div>
