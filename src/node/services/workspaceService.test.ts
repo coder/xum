@@ -1,54 +1,54 @@
 import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
-import { describe, expect, test, mock, beforeEach, spyOn } from "bun:test";
+import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import { STARTUP_RECOVERY_CONCURRENCY } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { existsSync } from "fs";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import type { Config, SecretsStore } from "@/node/config";
-import { createTestHistoryService } from "./testHistoryService";
+import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { createMuxMessage } from "@/common/types/message";
+import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import {
   createCompactionAdmissionMocks,
   createDeferred,
-  mockInitStateManager,
   createMockAIService,
   createWorkspaceServiceForTest,
-  createFrontendWorkspaceMetadata,
+  createWorkspaceServiceHarness,
+  type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
+const PROJECT_PATH = "/tmp/project";
+
+/** Config entries for plain workspaces `ids` under PROJECT_PATH (seed with saveWorkspaces). */
+function workspaceEntries(
+  ids: readonly string[],
+  options: Omit<Partial<WorkspaceConfigEntry>, "id" | "path"> = {}
+): WorkspaceConfigEntry[] {
+  return ids.map((id) => projectWorkspace(PROJECT_PATH, id, id, options));
+}
+
 describe("WorkspaceService initialize", () => {
+  let harness: WorkspaceServiceHarness;
   let workspaceService: WorkspaceService;
   let config: Config;
 
-  beforeEach(() => {
-    config = {
-      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
-    } as unknown as Config;
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    ({ service: workspaceService, config } = harness);
+  });
 
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-
-    workspaceService = createWorkspaceServiceForTest({
-      config,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-      secretsStore: { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore,
-    });
+  afterEach(async () => {
+    await harness.cleanup();
   });
 
   test("contains pending-compaction recovery failures as per-task results", async () => {
@@ -68,65 +68,25 @@ describe("WorkspaceService initialize", () => {
   });
 
   test("schedules startup recovery for non-task, non-archived chats", async () => {
-    const liveWorkspace = createFrontendWorkspaceMetadata({
-      id: "live-ws",
-      name: "Live Workspace",
-    });
-    const taskWorkspace = createFrontendWorkspaceMetadata({
-      id: "task-ws",
-      name: "Task Workspace",
-      parentWorkspaceId: "live-ws",
-    });
-    const archivedWorkspace = createFrontendWorkspaceMetadata({
-      id: "archived-ws",
-      name: "Archived Workspace",
-      archivedAt: "2026-03-20T00:00:00.000Z",
-    });
+    await saveWorkspaces(config, PROJECT_PATH, [
+      ...workspaceEntries(["live-ws", "archived-since-ws", "removed-since-ws"]),
+      ...workspaceEntries(["task-ws"], { parentWorkspaceId: "live-ws", taskStatus: "running" }),
+      ...workspaceEntries(["archived-ws"], { archivedAt: "2026-03-20T00:00:00.000Z" }),
+    ]);
     // Active when metadata was read, but archived (or removed) by a client before the
     // scheduling loop ran: the live config decides, not the stale metadata.
-    const archivedSinceWorkspace = createFrontendWorkspaceMetadata({
-      id: "archived-since-ws",
-      name: "Archived Since Read",
+    const readMetadata = config.getAllWorkspaceMetadata.bind(config);
+    spyOn(config, "getAllWorkspaceMetadata").mockImplementationOnce(async (options) => {
+      const staleSnapshot = await readMetadata(options);
+      await config.editConfig((current) => {
+        const project = current.projects.get(PROJECT_PATH)!;
+        project.workspaces = project.workspaces.filter((ws) => ws.id !== "removed-since-ws");
+        project.workspaces.find((ws) => ws.id === "archived-since-ws")!.archivedAt =
+          "2026-03-21T00:00:00.000Z";
+        return current;
+      });
+      return staleSnapshot;
     });
-    const removedSinceWorkspace = createFrontendWorkspaceMetadata({
-      id: "removed-since-ws",
-      name: "Removed Since Read",
-    });
-
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([
-        liveWorkspace,
-        taskWorkspace,
-        archivedWorkspace,
-        archivedSinceWorkspace,
-        removedSinceWorkspace,
-      ])
-    ) as unknown as Config["getAllWorkspaceMetadata"];
-    config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/project",
-          {
-            workspaces: [
-              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
-              { id: "task-ws", name: "task-ws", path: "/tmp/task-ws", taskStatus: "running" },
-              {
-                id: "archived-ws",
-                name: "archived-ws",
-                path: "/tmp/archived-ws",
-                archivedAt: "2026-03-20T00:00:00.000Z",
-              },
-              {
-                id: "archived-since-ws",
-                name: "archived-since-ws",
-                path: "/tmp/archived-since-ws",
-                archivedAt: "2026-03-21T00:00:00.000Z",
-              },
-            ],
-          },
-        ],
-      ]),
-    })) as unknown as Config["loadConfigOrDefault"];
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -145,9 +105,8 @@ describe("WorkspaceService initialize", () => {
   });
 
   test("swallows startup metadata lookup failures", async () => {
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.reject(new Error("config unavailable"))
-    ) as unknown as Config["getAllWorkspaceMetadata"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(["live-ws"]));
+    spyOn(config, "getAllWorkspaceMetadata").mockRejectedValueOnce(new Error("config unavailable"));
 
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
@@ -160,34 +119,16 @@ describe("WorkspaceService initialize", () => {
   });
 
   test("preserves scratch workdirs when config cannot be loaded", async () => {
-    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
-    const scratchPath = path.join(realConfig.rootDir, "scratch", "existing-scratch");
+    const scratchPath = path.join(config.rootDir, "scratch", "existing-scratch");
     await fsPromises.mkdir(scratchPath, { recursive: true });
-    await fsPromises.writeFile(path.join(realConfig.rootDir, "config.json"), "{invalid-json");
+    await fsPromises.writeFile(path.join(config.rootDir, "config.json"), "{invalid-json");
 
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const service = createWorkspaceServiceForTest({
-      config: realConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-    });
-
-    try {
-      await service.initialize();
-      expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
-    } finally {
-      await cleanup();
-    }
+    await workspaceService.initialize();
+    expect(await fsPromises.stat(scratchPath).then(() => true)).toBe(true);
   });
 
   test("removes stale orphaned scratch workdirs but keeps referenced and recent ones", async () => {
-    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
-    const scratchDirFor = (id: string) => path.join(realConfig.rootDir, "scratch", id);
+    const scratchDirFor = (id: string) => path.join(config.rootDir, "scratch", id);
     const referencedDir = scratchDirFor("referenced-scratch");
     const staleOrphanDir = scratchDirFor("stale-orphan-scratch");
     // A scratch chat created while the sweep runs has a fresh workdir and, briefly, no
@@ -200,7 +141,7 @@ describe("WorkspaceService initialize", () => {
     for (const dir of [referencedDir, staleOrphanDir]) {
       await fsPromises.utimes(dir, staleTime, staleTime);
     }
-    await realConfig.editConfig((cfg) => {
+    await config.editConfig((cfg) => {
       cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
         workspaces: [
           {
@@ -217,18 +158,7 @@ describe("WorkspaceService initialize", () => {
       return cfg;
     });
 
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const service = createWorkspaceServiceForTest({
-      config: realConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-    });
-    const startupAccess = service as unknown as {
+    const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
     };
     spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
@@ -239,19 +169,14 @@ describe("WorkspaceService initialize", () => {
         () => false
       );
 
-    try {
-      await service.initialize();
-      expect(await exists(referencedDir)).toBe(true);
-      expect(await exists(freshOrphanDir)).toBe(true);
-      expect(await exists(staleOrphanDir)).toBe(false);
-    } finally {
-      await cleanup();
-    }
+    await workspaceService.initialize();
+    expect(await exists(referencedDir)).toBe(true);
+    expect(await exists(freshOrphanDir)).toBe(true);
+    expect(await exists(staleOrphanDir)).toBe(false);
   });
 
   test("removes stale orphaned session directories but keeps referenced and recent ones", async () => {
-    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
-    await realConfig.editConfig((cfg) => {
+    await config.editConfig((cfg) => {
       cfg.projects.set("/tmp/proj", {
         workspaces: [
           { path: "/tmp/proj/known-ws", id: "known-ws", name: "known-ws" },
@@ -262,7 +187,7 @@ describe("WorkspaceService initialize", () => {
       return cfg;
     });
 
-    const sessionDirFor = (id: string) => path.join(realConfig.sessionsDir, id);
+    const sessionDirFor = (id: string) => path.join(config.sessionsDir, id);
     const knownDir = sessionDirFor("known-ws");
     const legacyDir = sessionDirFor("proj-legacy-branch");
     // Unreferenced in config (the load-time migration removed the legacy Chat
@@ -280,18 +205,7 @@ describe("WorkspaceService initialize", () => {
       await fsPromises.utimes(dir, staleTime, staleTime);
     }
 
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const service = createWorkspaceServiceForTest({
-      config: realConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-    });
-    const startupAccess = service as unknown as {
+    const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
     };
     spyOn(startupAccess, "startStartupRecovery").mockImplementation(() => undefined);
@@ -302,112 +216,49 @@ describe("WorkspaceService initialize", () => {
         () => false
       );
 
-    try {
-      await service.initialize();
-      expect(await exists(knownDir)).toBe(true);
-      expect(await exists(legacyDir)).toBe(true);
-      expect(await exists(muxChatDir)).toBe(true);
-      expect(await exists(freshOrphanDir)).toBe(true);
-      expect(await exists(staleOrphanDir)).toBe(false);
-    } finally {
-      await cleanup();
-    }
+    await workspaceService.initialize();
+    expect(await exists(knownDir)).toBe(true);
+    expect(await exists(legacyDir)).toBe(true);
+    expect(await exists(muxChatDir)).toBe(true);
+    expect(await exists(freshOrphanDir)).toBe(true);
+    expect(await exists(staleOrphanDir)).toBe(false);
   });
 
   test("preserves orphaned session directories when config cannot be loaded", async () => {
-    const { config: realConfig, historyService, cleanup } = await createTestHistoryService();
-    const orphanDir = path.join(realConfig.sessionsDir, "stale-orphan-ws");
+    const orphanDir = path.join(config.sessionsDir, "stale-orphan-ws");
     await fsPromises.mkdir(orphanDir, { recursive: true });
     const staleTime = new Date(Date.now() - 48 * 60 * 60 * 1000);
     await fsPromises.utimes(orphanDir, staleTime, staleTime);
-    await fsPromises.writeFile(path.join(realConfig.rootDir, "config.json"), "{invalid-json");
+    await fsPromises.writeFile(path.join(config.rootDir, "config.json"), "{invalid-json");
 
-    const aiService = {
-      ...createStreamLifecycleMocks(),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
-    const service = createWorkspaceServiceForTest({
-      config: realConfig,
-      historyService,
-      aiService,
-      initStateManager: mockInitStateManager as InitStateManager,
-    });
-
-    try {
-      await service.initialize();
-      expect(await fsPromises.stat(orphanDir).then(() => true)).toBe(true);
-    } finally {
-      await cleanup();
-    }
+    await workspaceService.initialize();
+    expect(await fsPromises.stat(orphanDir).then(() => true)).toBe(true);
   });
 
   test("removes DevTools logs for archived workspaces at startup", async () => {
-    const liveWorkspace = createFrontendWorkspaceMetadata({
-      id: "live-ws",
-      name: "Live Workspace",
-    });
-    const archivedWorkspace = createFrontendWorkspaceMetadata({
-      id: "archived-ws",
-      name: "Archived Workspace",
-      archivedAt: "2026-03-20T00:00:00.000Z",
-    });
-    // Archived when metadata was read, but a client unarchived it (and produced new logs)
-    // before the sweep reached it: the live config decides.
-    const unarchivedSinceWorkspace = createFrontendWorkspaceMetadata({
-      id: "unarchived-since-ws",
-      name: "Unarchived Since Read",
-      archivedAt: "2026-03-20T00:00:00.000Z",
-    });
-    const archivedWithoutDataWorkspace = createFrontendWorkspaceMetadata({
-      id: "archived-no-data-ws",
-      name: "Archived Without DevTools Data",
-      archivedAt: "2026-03-20T00:00:00.000Z",
-    });
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([
-        liveWorkspace,
-        archivedWorkspace,
-        unarchivedSinceWorkspace,
-        archivedWithoutDataWorkspace,
-      ])
-    ) as unknown as Config["getAllWorkspaceMetadata"];
-    config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/project",
-          {
-            workspaces: [
-              { id: "live-ws", name: "live-ws", path: "/tmp/live-ws" },
-              {
-                id: "archived-ws",
-                name: "archived-ws",
-                path: "/tmp/archived-ws",
-                archivedAt: "2026-03-20T00:00:00.000Z",
-              },
-              {
-                id: "unarchived-since-ws",
-                name: "unarchived-since-ws",
-                path: "/tmp/unarchived-since-ws",
-                archivedAt: "2026-03-20T00:00:00.000Z",
-                unarchivedAt: "2026-03-21T00:00:00.000Z",
-              },
-              {
-                id: "archived-no-data-ws",
-                name: "archived-no-data-ws",
-                path: "/tmp/archived-no-data-ws",
-                archivedAt: "2026-03-20T00:00:00.000Z",
-              },
-            ],
-          },
-        ],
-      ]),
-    })) as unknown as Config["loadConfigOrDefault"];
+    await saveWorkspaces(config, PROJECT_PATH, [
+      ...workspaceEntries(["live-ws"]),
+      ...workspaceEntries(["archived-ws", "unarchived-since-ws", "archived-no-data-ws"], {
+        archivedAt: "2026-03-20T00:00:00.000Z",
+      }),
+    ]);
 
     const removeWorkspaceData = mock(() => Promise.resolve());
     workspaceService.setDevToolsService({
-      hasWorkspaceData: (workspaceId: string) =>
-        Promise.resolve(workspaceId !== "archived-no-data-ws"),
+      hasWorkspaceData: async (workspaceId: string) => {
+        // Archived when metadata was read, but a client unarchived it (and produced new logs)
+        // before the sweep reached it: the live config decides.
+        if (workspaceId === "unarchived-since-ws") {
+          await config.editConfig((current) => {
+            current.projects
+              .get(PROJECT_PATH)!
+              .workspaces.find((ws) => ws.id === workspaceId)!.unarchivedAt =
+              "2026-03-21T00:00:00.000Z";
+            return current;
+          });
+        }
+        return workspaceId !== "archived-no-data-ws";
+      },
       removeWorkspaceData,
     });
 
@@ -428,15 +279,12 @@ describe("WorkspaceService initialize", () => {
   });
 
   test("bounds archived DevTools cleanup and stops admitting work on shutdown", async () => {
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve(
-        Array.from({ length: 40 }, (_, i) =>
-          createFrontendWorkspaceMetadata({
-            id: "archived-" + i,
-            name: "Archived",
-            archivedAt: "2026-01-01T00:00:00.000Z",
-          })
-        )
+    await saveWorkspaces(
+      config,
+      PROJECT_PATH,
+      workspaceEntries(
+        Array.from({ length: 40 }, (_, i) => "archived-" + i),
+        { archivedAt: "2026-01-01T00:00:00.000Z" }
       )
     );
     const started = createDeferred<void>();
@@ -470,17 +318,7 @@ describe("WorkspaceService initialize", () => {
   });
 
   test("initialize schedules no recovery once shutdown has aborted it", async () => {
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "Live Workspace" })])
-    ) as unknown as Config["getAllWorkspaceMetadata"];
-    config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        [
-          "/tmp/project",
-          { workspaces: [{ id: "live-ws", name: "live-ws", path: "/tmp/live-ws" }] },
-        ],
-      ]),
-    })) as unknown as Config["loadConfigOrDefault"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(["live-ws"]));
     const startupAccess = workspaceService as unknown as {
       startStartupRecovery: (workspaceId: string) => void;
     };
@@ -532,14 +370,7 @@ describe("WorkspaceService initialize", () => {
 
   test("bounds concurrent transient startup-recovery sessions while recovering every chat", async () => {
     const ids = Array.from({ length: 30 }, (_, index) => `ws-${index}`);
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
-    ) as unknown as Config["getAllWorkspaceMetadata"];
-    config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
-      ]),
-    })) as unknown as Config["loadConfigOrDefault"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(ids));
 
     const startupAccess = workspaceService as unknown as {
       createSession: (workspaceId: string) => AgentSession;
@@ -591,14 +422,7 @@ describe("WorkspaceService initialize", () => {
     // The first admitted session is promoted (recovery left activity alive); the rest are
     // transient and must be disposed before their slot is reusable.
     const promoted = ids[0];
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve(ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id })))
-    ) as unknown as Config["getAllWorkspaceMetadata"];
-    config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
-      ]),
-    })) as unknown as Config["loadConfigOrDefault"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(ids));
 
     const startupAccess = workspaceService as unknown as {
       createSession: (workspaceId: string) => AgentSession;
@@ -668,17 +492,7 @@ describe("WorkspaceService initialize", () => {
     const ids = Array.from({ length: STARTUP_RECOVERY_CONCURRENCY + 4 }, (_, i) => `ws-${i}`);
     const archivedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 1];
     const removedWhileQueued = ids[STARTUP_RECOVERY_CONCURRENCY + 2];
-    // Mutable registry: the mock re-reads it on every call, standing in for the memo refresh
-    // that a real archive/remove edit triggers via the config snapshot change.
-    const registry = ids.map((id) => createFrontendWorkspaceMetadata({ id, name: id }));
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve(registry.map((entry) => ({ ...entry })))
-    ) as unknown as Config["getAllWorkspaceMetadata"];
-    config.loadConfigOrDefault = mock(() => ({
-      projects: new Map([
-        ["/tmp/project", { workspaces: ids.map((id) => ({ id, name: id, path: `/tmp/${id}` })) }],
-      ]),
-    })) as unknown as Config["loadConfigOrDefault"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(ids));
 
     const startupAccess = workspaceService as unknown as {
       createSession: (workspaceId: string) => AgentSession;
@@ -710,14 +524,15 @@ describe("WorkspaceService initialize", () => {
 
     // While the tail is still waiting on a permit, the user archives one workspace, removes
     // another, and retitles a third.
-    const archivedEntry = registry.find((entry) => entry.id === archivedWhileQueued)!;
-    archivedEntry.archivedAt = "2026-03-20T00:00:00.000Z";
-    registry.splice(
-      registry.findIndex((entry) => entry.id === removedWhileQueued),
-      1
-    );
     const retitled = ids[STARTUP_RECOVERY_CONCURRENCY + 3];
-    registry.find((entry) => entry.id === retitled)!.title = "Renamed while queued";
+    await config.editConfig((current) => {
+      const project = current.projects.get(PROJECT_PATH)!;
+      project.workspaces = project.workspaces.filter((ws) => ws.id !== removedWhileQueued);
+      project.workspaces.find((ws) => ws.id === archivedWhileQueued)!.archivedAt =
+        "2026-03-20T00:00:00.000Z";
+      project.workspaces.find((ws) => ws.id === retitled)!.title = "Renamed while queued";
+      return current;
+    });
 
     // Array iteration is live: gates pushed by newly admitted sessions are released too.
     for (const gate of gates) {
@@ -748,16 +563,16 @@ describe("WorkspaceService initialize", () => {
       startStartupRecovery: (workspaceId: string) => void;
       createSession: (workspaceId: string) => AgentSession;
       sessions: Map<string, AgentSession>;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
     };
     const createSessionSpy = spyOn(startupAccess, "createSession").mockImplementation(
       () => fakeSession
     );
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "live-ws" })])
-    ) as unknown as Config["getAllWorkspaceMetadata"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(["live-ws"]));
 
     startupAccess.startStartupRecovery("live-ws");
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Recovery re-reads the real registry from disk before it runs; wait for the tracked task.
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
 
     expect(createSessionSpy).toHaveBeenCalledWith("live-ws");
     expect(dispose).toHaveBeenCalledTimes(1);
@@ -782,14 +597,14 @@ describe("WorkspaceService initialize", () => {
       startStartupRecovery: (workspaceId: string) => void;
       createSession: (workspaceId: string) => AgentSession;
       sessions: Map<string, AgentSession>;
+      pendingWorkspaceCleanup: Set<Promise<void>>;
     };
     spyOn(startupAccess, "createSession").mockImplementation(() => fakeSession);
-    config.getAllWorkspaceMetadata = mock(() =>
-      Promise.resolve([createFrontendWorkspaceMetadata({ id: "live-ws", name: "live-ws" })])
-    ) as unknown as Config["getAllWorkspaceMetadata"];
+    await saveWorkspaces(config, PROJECT_PATH, workspaceEntries(["live-ws"]));
 
     startupAccess.startStartupRecovery("live-ws");
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Recovery re-reads the real registry from disk before it runs; wait for the tracked task.
+    await Promise.all(startupAccess.pendingWorkspaceCleanup);
 
     expect(dispose).not.toHaveBeenCalled();
     expect(startupAccess.sessions.get("live-ws")).toBe(fakeSession);
@@ -984,21 +799,43 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean>;
   }
 
-  function makeService(
-    existingWorkspaces: Array<{ id: string; path: string; runtimeConfig?: unknown }>
-  ): WorkspaceService {
-    return createWorkspaceServiceForTest({
-      config: {
-        srcDir: "/tmp/src",
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([["/tmp/proj", { workspaces: existingWorkspaces }]]),
-        })),
-      } as unknown as Config,
-    });
+  let harness: WorkspaceServiceHarness;
+  const extraRoots: string[] = [];
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+    for (const root of extraRoots.splice(0)) {
+      await fsPromises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  async function makeService(
+    existingWorkspaces: Array<Pick<WorkspaceConfigEntry, "id" | "path" | "runtimeConfig">>
+  ): Promise<WorkspaceService> {
+    await saveWorkspaces(
+      harness.config,
+      "/tmp/proj",
+      existingWorkspaces.map((ws) => ({ ...ws, name: ws.id }))
+    );
+    return harness.service;
+  }
+
+  /** A second real Config standing in for the persistent ~/.xum config of a CLI run. */
+  async function makePersistentConfig(configJson?: string): Promise<Config> {
+    const root = await fsPromises.mkdtemp(path.join(tmpdir(), "xum-persistent-config-"));
+    extraRoots.push(root);
+    if (configJson !== undefined) {
+      await fsPromises.writeFile(path.join(root, "config.json"), configJson);
+    }
+    return new Config(root);
   }
 
   test("sanitizes canonical plugin keys when no sibling shares the path", async () => {
-    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const service = await makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
       acquireWorkspaceLock: () => Promise.resolve(() => Promise.resolve()),
@@ -1022,7 +859,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     // strip enables that live consent context still owns from the shared
     // .xum/mcp.local.jsonc — the persistent sibling must force a skip, while
     // a persistent record for a DIFFERENT checkout must not.
-    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const service = await makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
       acquireWorkspaceLock: () => Promise.resolve(() => Promise.resolve()),
@@ -1032,21 +869,20 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
     });
-    const persistentWith = (workspacePath: string): Pick<Config, "loadConfigOrDefault"> =>
-      ({
-        loadConfigOrDefault: () => ({
-          projects: new Map([
-            ["/tmp/proj", { workspaces: [{ id: "ws-desktop", path: workspacePath }] }],
-          ]),
-        }),
-      }) as unknown as Pick<Config, "loadConfigOrDefault">;
+    const persistentWith = async (workspacePath: string): Promise<Config> => {
+      const persistent = await makePersistentConfig();
+      await saveWorkspaces(persistent, "/tmp/proj", [
+        { id: "ws-desktop", name: "ws-desktop", path: workspacePath },
+      ]);
+      return persistent;
+    };
 
     const skip = await (
       service as unknown as SanitizeAccess
     ).sanitizeStalePluginOverridesForNewWorkspace(
       "ws-new",
       "/tmp/proj",
-      persistentWith("/tmp/proj")
+      await persistentWith("/tmp/proj")
     );
     expect(skip).toBeUndefined();
     expect(pruned).toEqual([]);
@@ -1056,7 +892,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     ).sanitizeStalePluginOverridesForNewWorkspace(
       "ws-new",
       "/tmp/proj",
-      persistentWith("/tmp/other")
+      await persistentWith("/tmp/other")
     );
     expect(prune).toBeUndefined();
     expect(pruned).toEqual(["ws-new:plugin:"]);
@@ -1068,7 +904,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     // prune enables a live desktop workspace still owns. The persistent
     // source must be read in throwing mode and sanitization must fail closed
     // (abort the registration, leave the override file untouched).
-    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const service = await makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     const pruned: string[] = [];
     service.setWorkspaceMcpOverridesService({
       acquireWorkspaceLock: () => Promise.resolve(() => Promise.resolve()),
@@ -1078,15 +914,8 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
       },
       copyOverridesToForkedCheckout: () => Promise.resolve(),
     });
-    const broken = {
-      loadConfigOrDefault: (options?: { throwOnError?: boolean }) => {
-        if (options?.throwOnError) {
-          throw new Error("config.json is malformed");
-        }
-        // A lenient read would hide the corruption behind an empty map.
-        return { projects: new Map() };
-      },
-    } as unknown as Pick<Config, "loadConfigOrDefault">;
+    // A lenient read would hide the corruption behind an empty map.
+    const broken = await makePersistentConfig("{malformed-json");
     const error = await (
       service as unknown as SanitizeAccess
     ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj", broken);
@@ -1097,7 +926,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
   test("skips sanitization while a live sibling resolves to the same path", async () => {
     // Conversation forks of a local workspace share the checkout: the
     // sibling's consent context is alive, so its enables must survive.
-    const service = makeService([
+    const service = await makeService([
       { id: "ws-sibling", path: "/tmp/proj" },
       { id: "ws-new", path: "/tmp/proj/" },
     ]);
@@ -1118,7 +947,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
   });
 
   test("a failed sanitize surfaces an error so creation aborts", async () => {
-    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const service = await makeService([{ id: "ws-new", path: "/tmp/proj" }]);
     service.setWorkspaceMcpOverridesService({
       acquireWorkspaceLock: () => Promise.resolve(() => Promise.resolve()),
       prunePluginOverrideKeys: () =>
@@ -1136,8 +965,12 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     // SSH/container paths occupy a different filesystem namespace: an equal
     // STRING proves nothing about the local overrides file, and skipping
     // would leave a stale enable to activate on the next local request.
-    const service = makeService([
-      { id: "ws-ssh", path: "/tmp/proj", runtimeConfig: { type: "ssh", host: "box" } },
+    const service = await makeService([
+      {
+        id: "ws-ssh",
+        path: "/tmp/proj",
+        runtimeConfig: { type: "ssh", host: "box", srcBaseDir: "/home/box/src" },
+      },
       { id: "ws-new", path: "/tmp/proj" },
     ]);
     const pruned: string[] = [];
@@ -1163,7 +996,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     const linkPath = `${realDir}-link`;
     await fsPromises.symlink(realDir, linkPath);
     try {
-      const service = makeService([
+      const service = await makeService([
         { id: "ws-symlink-sibling", path: linkPath },
         { id: "ws-new", path: realDir },
       ]);
@@ -1191,7 +1024,7 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     // Two creations for the same checkout can both persist config entries
     // before either sanitizes; a not-yet-sanitized entry is no proof of live
     // consent, so the scan must ignore it or BOTH creations skip pruning.
-    const service = makeService([
+    const service = await makeService([
       { id: "ws-concurrent", path: "/tmp/proj" },
       { id: "ws-new", path: "/tmp/proj" },
     ]);
@@ -1216,17 +1049,11 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     // Config.saveConfig logs and swallows write errors, so removeWorkspace
     // can resolve while the entry survives on disk; the rollback must verify
     // absence rather than trust the resolved promise.
-    const stuckWorkspaces = [{ id: "ws-stuck", path: "/tmp/proj" }];
-    const service = createWorkspaceServiceForTest({
-      config: {
-        removeWorkspace: mock(() => Promise.resolve()),
-        loadConfigOrDefault: mock(() => ({
-          projects: new Map([["/tmp/proj", { workspaces: stuckWorkspaces }]]),
-        })),
-      } as unknown as Config,
-    });
+    const service = await makeService([{ id: "ws-stuck", path: "/tmp/proj" }]);
+    const removeSpy = spyOn(harness.config, "removeWorkspace").mockResolvedValue(undefined);
     const access = service as unknown as SanitizeAccess;
     expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-stuck")).toBe(false);
+    removeSpy.mockRestore();
     // A rollback that actually lands verifies clean.
     expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-gone")).toBe(true);
   });
