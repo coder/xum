@@ -632,6 +632,40 @@ describe("TaskService settlement receipt producers (G2)", () => {
     }
   );
 
+  test("inconsistent ancestry at the receipt decision fails closed like an unreadable config (no throw)", async () => {
+    const taskId = "inconsistentancestry";
+    const { config } = await setupTree([
+      {
+        id: taskId,
+        overrides: {
+          taskStatus: "interrupted",
+          taskAttemptId: PREDECESSOR,
+          taskDesktopOwnerWorkspaceId: rootId,
+        },
+      },
+    ]);
+    const { taskService, svc } = createHarness(config);
+    const attemptId = await ownEligibleAttempt(config, taskService, taskId);
+    // Duplicate workspace ids with different parents: the row lookup finds one parent while the
+    // task index (last duplicate wins) walks another. Simulated by a divergent parentById.
+    const realIndex = taskService.buildAgentTaskIndex.bind(taskService);
+    const indexSpy = spyOn(taskService, "buildAgentTaskIndex").mockImplementation((cfg) => {
+      const index = realIndex(cfg);
+      index.parentById.set(taskId, "some-other-parent");
+      return index;
+    });
+    try {
+      await svc.releaseSharedDesktopTaskOnUserStop(taskId, svc.resolveStreamAttemptAtEvent(taskId));
+    } finally {
+      indexSpy.mockRestore();
+    }
+    expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      attemptId,
+      phase: "closing",
+    });
+    await expectNoReceipt(config, taskId, attemptId);
+  });
+
   test("idle Stop rejects its own waiters, never a successor's registered during the receipt write", async () => {
     const taskId = "waiterrace";
     const successor = "att_00000000000000b3";
