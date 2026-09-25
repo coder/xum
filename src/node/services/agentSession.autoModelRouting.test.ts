@@ -1,13 +1,12 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "events";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { SendMessageError } from "@/common/types/errors";
-import type { AgentSession } from "./agentSession";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { CompactionMonitor } from "./compactionMonitor";
+import { CompactionMonitor } from "./compactionMonitor";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type {
@@ -190,6 +189,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
   }
 
   afterEach(async () => {
+    mock.restore();
     await historyCleanup?.();
   });
 
@@ -217,23 +217,22 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       : undefined;
   }
 
-  /** Make the next send hit the on-send compaction threshold. */
-  function forceOnSendCompaction(session: Awaited<ReturnType<typeof createHarness>>["session"]) {
-    const internals = session as unknown as {
-      contextController: { compactionMonitor: CompactionMonitor };
-    };
-    internals.contextController.compactionMonitor = {
-      checkBeforeSend: mock(() => ({
-        shouldShowWarning: true,
-        shouldForceCompact: true,
-        usagePercentage: 99,
-        thresholdPercentage: 85,
-      })),
-      checkMidStream: mock(() => false),
-      resetForNewStream: mock(() => undefined),
-      setThreshold: mock(() => undefined),
-      getThreshold: mock(() => 0.85),
-    } as unknown as CompactionMonitor;
+  /** Context usage far past any catalogued window, so the real threshold check forces compaction. */
+  const OVERFLOWING_USAGE = { inputTokens: 10_000_000, outputTokens: 1, totalTokens: 10_000_001 };
+
+  /**
+   * Make the next send hit the on-send compaction threshold: the session seeds its context
+   * usage from the last assistant row in history before the pressure check.
+   */
+  async function seedContextPressure(
+    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"]
+  ) {
+    const prior = createMuxMessage("prior-assistant", "assistant", "earlier answer", {
+      timestamp: Date.now() - 5_000,
+      model: COMPOSER_MODEL,
+      contextUsage: OVERFLOWING_USAGE,
+    });
+    expect((await historyService.appendToHistory("ws-auto-routing", prior)).success).toBe(true);
   }
 
   const UNSUPPORTED_IMAGE = {
@@ -762,7 +761,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("carries the routing record on the on-send compaction follow-up instead of reclassifying", async () => {
     const { session, historyService, classify } = await createHarness({ experimentEnabled: true });
-    forceOnSendCompaction(session);
+    await seedContextPressure(historyService);
 
     const result = await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
@@ -788,7 +787,16 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       experimentEnabled: true,
       tiers: TIERS_WITH_GROK,
     });
-    forceOnSendCompaction(session);
+    // The compaction turn falls back to the composer model, whose window the model catalog
+    // does not know, so no real usage can cross its threshold: force the decision instead.
+    spyOn(CompactionMonitor.prototype, "checkBeforeSend").mockReturnValue({
+      shouldShowWarning: true,
+      shouldForceCompact: true,
+      usagePercentage: 99,
+      thresholdPercentage: 85,
+      contextTokens: 198_000,
+      maxTokens: 200_000,
+    });
     const earlier = createMuxMessage("earlier-image", "user", "Look at this", undefined, [
       UNSUPPORTED_IMAGE,
     ]);
@@ -926,30 +934,19 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(undefined));
       });
 
-      const internals = session as unknown as {
-        contextController: { compactionMonitor: CompactionMonitor };
-        sendMessage: AgentSession["sendMessage"];
-      };
+      // Forced: the fallback composer model has no catalogued window. The spy records the
+      // model each check priced.
       let midStreamChecks = 0;
-      const checkMidStream = mock((_params: { model: string }) => {
+      const checkMidStream = spyOn(
+        CompactionMonitor.prototype,
+        "checkMidStream"
+      ).mockImplementation(() => {
         midStreamChecks += 1;
         return midStreamChecks === 1;
       });
-      internals.contextController.compactionMonitor = {
-        checkBeforeSend: mock(() => ({
-          shouldShowWarning: false,
-          shouldForceCompact: false,
-          usagePercentage: 0,
-          thresholdPercentage: 85,
-        })),
-        checkMidStream,
-        resetForNewStream: mock(() => undefined),
-        setThreshold: mock(() => undefined),
-        getThreshold: mock(() => 0.85),
-      } as unknown as CompactionMonitor;
       const originalSendMessage = session.sendMessage.bind(session);
       let compactionRequest: SendMessageOptions | undefined;
-      internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
+      const sendMessage = spyOn(session, "sendMessage").mockImplementation((...args) => {
         // Send options carry muxMetadata as a black box; the session stamps a typed payload.
         const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
         if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
@@ -957,14 +954,14 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         // what the resumed turn would dispatch.
         compactionRequest ??= args[1];
         return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
-      }) as AgentSession["sendMessage"];
+      });
 
       let streamErrored = false;
       session.onChatEvent(({ message }) => {
         if (message.type === "stream-error") streamErrored = true;
       });
 
-      const result = await internals.sendMessage("Refactor the scheduler", {
+      const result = await sendMessage("Refactor the scheduler", {
         model: COMPOSER_MODEL,
         agentId: "exec",
         autoModelRouting: true,
@@ -1109,7 +1106,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         experimentEnabled: true,
         classify: () => Promise.resolve(Ok(decision("hard"))),
       });
-      const usage = { inputTokens: 4_000, outputTokens: 1, totalTokens: 4_001 };
+      const usage = OVERFLOWING_USAGE;
       let streamCalls = 0;
       streamMessage.mockImplementation((opts: StreamMessageOptions) => {
         streamCalls += 1;
@@ -1147,40 +1144,20 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(undefined));
       });
 
-      const internals = session as unknown as {
-        contextController: { compactionMonitor: CompactionMonitor };
-        sendMessage: AgentSession["sendMessage"];
-      };
-      let midStreamChecks = 0;
-      internals.contextController.compactionMonitor = {
-        checkBeforeSend: mock(() => ({
-          shouldShowWarning: false,
-          shouldForceCompact: false,
-          usagePercentage: 0,
-          thresholdPercentage: 85,
-        })),
-        checkMidStream: mock(() => {
-          midStreamChecks += 1;
-          return midStreamChecks === 1;
-        }),
-        resetForNewStream: mock(() => undefined),
-        setThreshold: mock(() => undefined),
-        getThreshold: mock(() => 0.85),
-      } as unknown as CompactionMonitor;
       const originalSendMessage = session.sendMessage.bind(session);
       let compactionRequest: SendMessageOptions | undefined;
-      internals.sendMessage = ((...args: Parameters<AgentSession["sendMessage"]>) => {
+      const sendMessage = spyOn(session, "sendMessage").mockImplementation((...args) => {
         const muxMetadata = args[1]?.muxMetadata as MuxMessageMetadata | undefined;
         if (muxMetadata?.type !== "compaction-request") return originalSendMessage(...args);
         compactionRequest ??= args[1];
         return Promise.resolve(Err({ type: "unknown", raw: "captured" }));
-      }) as AgentSession["sendMessage"];
+      });
       let streamErrored = false;
       session.onChatEvent(({ message }) => {
         if (message.type === "stream-error") streamErrored = true;
       });
 
-      const result = await internals.sendMessage("design it", {
+      const result = await sendMessage("design it", {
         model: COMPOSER_MODEL,
         agentId: "exec",
         thinkingLevel: "low",
@@ -1311,6 +1288,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
     // The resume request is the routed turn (report rows are not retry targets), so the
     // routing lookup must skip the report row the same way.
+    // A manual resumeStream refuses a report-row tail before streaming, so call the lookup directly.
     const internals = session as unknown as {
       applyAutoRoutedResume(options: {
         model: string;
@@ -1357,6 +1335,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     }
     expect(streamMessage).toHaveBeenCalledTimes(1);
 
+    // A manual resumeStream refuses a report-row tail before streaming, so call the lookup directly.
     const internals = session as unknown as {
       applyAutoRoutedResume(options: {
         model: string;
@@ -1514,12 +1493,15 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a compaction the user stops settles the evaluator spend it carried for its follow-up", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
-      experimentEnabled: true,
-      unpricedModels: [],
-      evaluatorCostUsd: 0.0042,
-      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
-    });
+    const { session, historyService, aiService, streamMessage, recordStreamAccounting } =
+      await createHarness({
+        experimentEnabled: true,
+        unpricedModels: [],
+        evaluatorCostUsd: 0.0042,
+        classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+      });
+    // The delivered stream is an on-send compaction; the send behind its boundary is deferred.
+    await seedContextPressure(historyService);
     streamMessage.mockImplementation((opts: StreamMessageOptions) => {
       aiService.emit("stream-start", {
         type: "stream-start",
@@ -1540,10 +1522,9 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
     expect(recordStreamAccounting).not.toHaveBeenCalled();
 
-    // The delivered stream is an on-send compaction; the user stops it before the deferred
-    // send behind its boundary is dispatched, and the queue holding that send is cleared.
-    const internals = session as unknown as { activeCompactionRequest?: { id: string } };
-    internals.activeCompactionRequest = { id: "compaction-1" };
+    expect(await persistedCompactionFollowUp(historyService)).toBeDefined();
+    // The user stops the compaction before the deferred send behind its boundary is
+    // dispatched, and the queue holding that send is cleared.
     await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
       type: "stream-abort",
       workspaceId: "ws-auto-routing",

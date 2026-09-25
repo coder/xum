@@ -92,7 +92,10 @@ function createAiService(
   }) as unknown as AIService & EventEmitter;
 }
 
-async function createSessionHarness(workspaceId: string): Promise<SessionHarness> {
+async function createSessionHarness(
+  workspaceId: string,
+  options?: { hasExternalSendPreflight?: () => boolean }
+): Promise<SessionHarness> {
   const { historyService, config, cleanup } = await createTestHistoryService();
   await config.addWorkspace(PROJECT_PATH, {
     id: workspaceId,
@@ -129,6 +132,7 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,
+    hasExternalSendPreflight: options?.hasExternalSendPreflight,
   });
 
   return { historyService, session, goalService, extensionMetadata, aiService, analytics, cleanup };
@@ -358,9 +362,7 @@ describe("AgentSession goal safety hooks", () => {
     const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
       Promise.resolve(Ok(undefined))
     );
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     sendSpy.mockRestore();
 
     // Vetoed: nothing dispatched, and the stale follow-up was cleared so it
@@ -415,9 +417,7 @@ describe("AgentSession goal safety hooks", () => {
       }
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     buildSpy.mockRestore();
 
     expect(dispatched).toBe(false);
@@ -444,8 +444,11 @@ describe("AgentSession goal safety hooks", () => {
     // counted in preflight without queueing or holding the turn phase. The
     // entry idle check must consult the injected probe.
     const workspaceId = "compaction-followup-service-preflight";
-    const { session, goalService, historyService, cleanup } =
-      await createSessionHarness(workspaceId);
+    let preflightActive = false;
+    const { session, goalService, historyService, cleanup } = await createSessionHarness(
+      workspaceId,
+      { hasExternalSendPreflight: () => preflightActive }
+    );
     cleanups.push(cleanup);
     const created = await setGoalOk(goalService, { workspaceId, objective: "Preflight race" });
     const summary = createMuxMessage(
@@ -466,15 +469,12 @@ describe("AgentSession goal safety hooks", () => {
       }
     );
     expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
-    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
-      () => true;
+    preflightActive = true;
     const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
       Promise.resolve(Ok(undefined))
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
 
     expect(dispatched).toBe(false);
     expect(sendSpy).not.toHaveBeenCalled();
@@ -493,8 +493,11 @@ describe("AgentSession goal safety hooks", () => {
     // the entry sample, during the awaited goal read — the live probe carried
     // through the send-admission gates must observe it.
     const workspaceId = "compaction-followup-preflight-mid-read";
-    const { session, goalService, historyService, cleanup } =
-      await createSessionHarness(workspaceId);
+    let preflightActive = false;
+    const { session, goalService, historyService, cleanup } = await createSessionHarness(
+      workspaceId,
+      { hasExternalSendPreflight: () => preflightActive }
+    );
     cleanups.push(cleanup);
     const created = await setGoalOk(goalService, { workspaceId, objective: "Late preflight" });
     const summary = createMuxMessage(
@@ -516,9 +519,6 @@ describe("AgentSession goal safety hooks", () => {
     );
     expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
 
-    let preflightActive = false;
-    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
-      () => preflightActive;
     const realBuild = goalService.buildGoalRedispatchAdmission.bind(goalService);
     const buildSpy = spyOn(goalService, "buildGoalRedispatchAdmission").mockImplementationOnce(
       async (...args: Parameters<typeof realBuild>) => {
@@ -528,9 +528,7 @@ describe("AgentSession goal safety hooks", () => {
       }
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     buildSpy.mockRestore();
 
     expect(dispatched).toBe(false);
@@ -594,9 +592,7 @@ describe("AgentSession goal safety hooks", () => {
       Promise.resolve(Ok(undefined))
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
 
     expect(dispatched).toBe(true);
     expect(sendSpy).toHaveBeenCalledTimes(1);
@@ -636,9 +632,7 @@ describe("AgentSession goal safety hooks", () => {
       Promise.resolve(Ok(undefined))
     );
 
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
 
     expect(dispatched).toBe(false);
     expect(sendSpy).not.toHaveBeenCalled();
@@ -748,9 +742,7 @@ describe("AgentSession goal safety hooks", () => {
     const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
       Promise.resolve(Ok(undefined))
     );
-    const dispatched = await (
-      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
-    ).dispatchPendingFollowUp();
+    const dispatched = await session.dispatchPendingCompactionFollowUpIfNeeded();
     sendSpy.mockRestore();
 
     expect(dispatched).toBe(false);

@@ -52,7 +52,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
     drainQueuedMessagesIfIdle: ReturnType<typeof mock>;
+    onChatEvent: ReturnType<typeof mock>;
+    onMetadataEvent: ReturnType<typeof mock>;
   };
+  let persistSettings: ReturnType<typeof mock>;
 
   beforeEach(async () => {
     harness = await createWorkspaceServiceHarness({
@@ -83,19 +86,23 @@ describe("WorkspaceService sendMessage status clearing", () => {
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
       drainQueuedMessagesIfIdle: mock(() => undefined),
+      // registerSession subscribes to both streams.
+      onChatEvent: mock(() => () => undefined),
+      onMetadataEvent: mock(() => () => undefined),
     };
 
-    (
-      workspaceService as unknown as {
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
+      fakeSession as unknown as AgentSession
+    );
 
-    (
+    // Private preflight await: the queue-ordering tests below hold it to park a send
+    // mid-preflight, which no public entry point can do deterministically.
+    persistSettings = spyOn(
       workspaceService as unknown as {
         maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
-      }
-    ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
+      },
+      "maybePersistAISettingsFromOptions"
+    ).mockResolvedValue(undefined);
   });
 
   afterEach(async () => {
@@ -105,12 +112,8 @@ describe("WorkspaceService sendMessage status clearing", () => {
   test.each(["send", "synthetic", "resume"] as const)(
     "only a user message updates remembered settings (%s)",
     async (kind) => {
-      const persist = mock(() => Promise.resolve());
-      (
-        workspaceService as unknown as {
-          maybePersistAISettingsFromOptions: typeof persist;
-        }
-      ).maybePersistAISettingsFromOptions = persist;
+      // Real persistence: the remembered settings are what the config file holds afterwards.
+      persistSettings.mockRestore();
       const options = { model: "openai:gpt-5.2", agentId: "plan", thinkingLevel: "high" as const };
       const result =
         kind === "resume"
@@ -119,11 +122,19 @@ describe("WorkspaceService sendMessage status clearing", () => {
               synthetic: kind === "synthetic",
             });
       expect(result.success).toBe(true);
-      expect(persist).toHaveBeenCalledTimes(kind === "send" ? 1 : 0);
+      const remembered = harness.config
+        .loadConfigOrDefault()
+        .projects.get("/tmp/test/project")
+        ?.workspaces.find((workspace) => workspace.id === "test-workspace")?.aiSettingsByAgent;
+      expect(remembered?.plan).toEqual(
+        kind === "send" ? { model: options.model, thinkingLevel: options.thinkingLevel } : undefined
+      );
     }
   );
 
-  test("delegates manual pricing rejections to AgentSession so user input is preserved", async () => {
+  test("leaves budgeted-goal pricing rejections to AgentSession instead of rejecting early", async () => {
+    // The session is a fake, so this only proves the forward. Input preservation is owned by
+    // agentSession.budgetGate.test.ts "manual rejected send preserves the user message + emits a stream-error event".
     fakeSession.isBusy.mockReturnValue(false);
     const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };
     workspaceService.setWorkspaceGoalService({
@@ -178,10 +189,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // end fires. Draining while the earlier send is still in preflight would let the queued
     // entry jump ahead of it.
     fakeSession.isBusy.mockReturnValue(false);
-    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      "test-workspace",
-      fakeSession as unknown as AgentSession
-    );
+    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     const firstSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
 
@@ -208,13 +216,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // queued behind the failed one. Draining as soon as the head of the line settles makes
     // the younger send observe the dispatched (busy) session instead.
     fakeSession.isBusy.mockReturnValue(false);
-    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      "test-workspace",
-      fakeSession as unknown as AgentSession
-    );
-    const persistSettings = (
-      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
-    ).maybePersistAISettingsFromOptions;
+    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     const firstSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
@@ -286,10 +288,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // queues behind it, so it must not decide who drains. Otherwise the entry queued behind
     // the failed manual send waits until the maintenance preflight settles.
     fakeSession.isBusy.mockReturnValue(false);
-    (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      "test-workspace",
-      fakeSession as unknown as AgentSession
-    );
+    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceGoalService({
       assertPricedModelForBudgetedGoal: pricingGate,
@@ -333,9 +332,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // pricing/settings awaits before "second"; enqueueing on completion order would make the
     // user's third prompt dispatch before the second.
     fakeSession.isBusy.mockReturnValue(false);
-    const persistSettings = (
-      workspaceService as unknown as { maybePersistAISettingsFromOptions: ReturnType<typeof mock> }
-    ).maybePersistAISettingsFromOptions;
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
     const firstSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
@@ -418,10 +414,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const realSession = (
       workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
     ).createSession("test-workspace");
-    // The shared fixture aiService omits stopStream; disposal needs it.
-    (
-      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
-    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
     expect(probe).toBeDefined();
@@ -494,10 +486,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const realSession = (
       workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
     ).createSession("test-workspace");
-    // The shared fixture aiService omits stopStream; disposal needs it.
-    (
-      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
-    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
     expect(probe).toBeDefined();
@@ -536,10 +524,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const realSession = (
       workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
     ).createSession("test-workspace");
-    // The shared fixture aiService omits stopStream; disposal needs it.
-    (
-      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
-    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
     expect(probe).toBeDefined();
@@ -1164,12 +1148,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
   );
 
   test("registerSession clears persisted agent status for accepted user chat events", () => {
-    const updateAgentStatus = spyOn(
-      workspaceService as unknown as {
-        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
-      },
-      "updateAgentStatus"
-    ).mockResolvedValue(undefined);
+    const updateAgentStatus = spyOn(workspaceService, "updateAgentStatus").mockResolvedValue(
+      undefined
+    );
 
     const workspaceId = "listener-workspace";
     const sessionEmitter = new EventEmitter();
@@ -1200,12 +1181,9 @@ describe("WorkspaceService sendMessage status clearing", () => {
   });
 
   test("registerSession does not clear persisted agent status for synthetic user chat events", () => {
-    const updateAgentStatus = spyOn(
-      workspaceService as unknown as {
-        updateAgentStatus: (workspaceId: string, status: null) => Promise<void>;
-      },
-      "updateAgentStatus"
-    ).mockResolvedValue(undefined);
+    const updateAgentStatus = spyOn(workspaceService, "updateAgentStatus").mockResolvedValue(
+      undefined
+    );
 
     const workspaceId = "synthetic-listener-workspace";
     const sessionEmitter = new EventEmitter();
@@ -1239,13 +1217,41 @@ describe("WorkspaceService sendMessage status clearing", () => {
 describe("WorkspaceService idle compaction dispatch", () => {
   let workspaceService: WorkspaceService;
   let harness: WorkspaceServiceHarness;
+  let aiEvents: EventEmitter;
 
   beforeEach(async () => {
-    harness = await createWorkspaceServiceHarness({
-      aiService: createMockAIService({ isStreaming: mock(() => false) }),
+    aiEvents = new EventEmitter();
+    const aiService = createMockAIService({
+      isStreaming: mock(() => false),
+      on: ((event: string, listener: (...args: unknown[]) => void) => {
+        aiEvents.on(event, listener);
+        return aiService;
+      }) as AIService["on"],
     });
+    harness = await createWorkspaceServiceHarness({ aiService });
     workspaceService = harness.service;
   });
+
+  /** Emit a provider stream error and collect the idle-compaction outcomes it reports. */
+  async function reportedOutcomesOnStreamError(workspaceId: string) {
+    const outcomes: Array<{ workspaceId: string; outcome: IdleCompactionOutcome }> = [];
+    workspaceService.setIdleCompactionOutcomeListener((id, outcome) =>
+      outcomes.push({ workspaceId: id, outcome })
+    );
+    // The error also stops streaming status; wait for that write so it cannot outlive cleanup.
+    const stopped = createDeferred<void>();
+    spyOn(harness.extensionMetadata, "setStreaming").mockImplementation((_id, streaming) => {
+      stopped.resolve();
+      return Promise.resolve({ recency: 0, streaming, lastModel: null, lastThinkingLevel: null });
+    });
+    aiEvents.emit("error", {
+      workspaceId,
+      error: "provider rejected",
+      errorType: "model_not_found",
+    });
+    await stopped.promise;
+    return outcomes;
+  }
 
   afterEach(async () => {
     await harness.cleanup();
@@ -1254,9 +1260,6 @@ describe("WorkspaceService idle compaction dispatch", () => {
   test("marks idle compaction send as synthetic when stream stays active", async () => {
     const workspaceId = "idle-ws";
     const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
-    const buildIdleCompactionSendOptions = mock(() =>
-      Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
-    );
 
     let busyChecks = 0;
     const session = {
@@ -1266,27 +1269,8 @@ describe("WorkspaceService idle compaction dispatch", () => {
       }),
     } as unknown as AgentSession;
 
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).sendMessage = sendMessage;
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = (_workspaceId: string) => session;
+    spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
 
     await workspaceService.executeIdleCompaction(workspaceId);
 
@@ -1302,51 +1286,27 @@ describe("WorkspaceService idle compaction dispatch", () => {
       })
     );
 
-    const idleCompactingWorkspaces = (
-      workspaceService as unknown as { idleCompactingWorkspaces: Set<string> }
-    ).idleCompactingWorkspaces;
-    expect(idleCompactingWorkspaces.has(workspaceId)).toBe(true);
+    // The marker's observable consumer: a stream error reports an outcome only for idle compaction.
+    expect(await reportedOutcomesOnStreamError(workspaceId)).toEqual([
+      { workspaceId, outcome: { success: false, modelNotFound: true } },
+    ]);
   });
 
   test("does not mark idle compaction when send succeeds without active stream", async () => {
     const workspaceId = "idle-no-stream-ws";
     const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
-    const buildIdleCompactionSendOptions = mock(() =>
-      Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
-    );
 
     const session = {
       isBusy: mock(() => false),
     } as unknown as AgentSession;
 
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).sendMessage = sendMessage;
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = (_workspaceId: string) => session;
+    spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
 
     await workspaceService.executeIdleCompaction(workspaceId);
 
-    const idleCompactingWorkspaces = (
-      workspaceService as unknown as { idleCompactingWorkspaces: Set<string> }
-    ).idleCompactingWorkspaces;
-    expect(idleCompactingWorkspaces.has(workspaceId)).toBe(false);
+    // The marker's observable consumer: a stream error reports an outcome only for idle compaction.
+    expect(await reportedOutcomesOnStreamError(workspaceId)).toEqual([]);
   });
 
   test("propagates busy-skip errors", async () => {
@@ -1359,22 +1319,8 @@ describe("WorkspaceService idle compaction dispatch", () => {
         })
       )
     );
-    const buildIdleCompactionSendOptions = mock(() =>
-      Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
-    );
 
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-      }
-    ).sendMessage = sendMessage;
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-      }
-    ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
+    spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
 
     // The busy-skip is an expected race, so it must not be reported as a failure
     // (otherwise two normal user-interaction races would suppress idle compaction).
@@ -1408,28 +1354,10 @@ describe("WorkspaceService idle compaction dispatch", () => {
         })
       )
     );
-    const buildIdleCompactionSendOptions = mock(() =>
-      Promise.resolve({ model: "openai:does-not-exist", agentId: "compact" })
-    );
     const session = { isBusy: mock(() => false) } as unknown as AgentSession;
 
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).sendMessage = sendMessage;
-    (
-      workspaceService as unknown as {
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-      }
-    ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
-    (
-      workspaceService as unknown as {
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = () => session;
+    spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
 
     const outcomes: Array<{ workspaceId: string; outcome: IdleCompactionOutcome }> = [];
     workspaceService.setIdleCompactionOutcomeListener((id, outcome) =>
@@ -1450,28 +1378,10 @@ describe("WorkspaceService idle compaction dispatch", () => {
   test("reports a non-model_not_found outcome for generic pre-stream failures", async () => {
     const workspaceId = "idle-generic-failure-ws";
     const sendMessage = mock(() => Promise.resolve(Err({ type: "unknown" as const, raw: "boom" })));
-    const buildIdleCompactionSendOptions = mock(() =>
-      Promise.resolve({ model: "openai:gpt-4o", agentId: "compact" })
-    );
     const session = { isBusy: mock(() => false) } as unknown as AgentSession;
 
-    (
-      workspaceService as unknown as {
-        sendMessage: typeof sendMessage;
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).sendMessage = sendMessage;
-    (
-      workspaceService as unknown as {
-        buildIdleCompactionSendOptions: typeof buildIdleCompactionSendOptions;
-      }
-    ).buildIdleCompactionSendOptions = buildIdleCompactionSendOptions;
-    (
-      workspaceService as unknown as {
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = () => session;
+    spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
 
     const outcomes: Array<{ workspaceId: string; outcome: IdleCompactionOutcome }> = [];
     workspaceService.setIdleCompactionOutcomeListener((id, outcome) =>
@@ -1493,16 +1403,10 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const projectPath = "/tmp/project";
     const workspacePath = "/tmp/project/ws";
 
-    type ThinkingLevel = Parameters<typeof enforceThinkingPolicy>[1];
-
-    interface WorkspaceServiceIdleCompactionAccess {
-      buildIdleCompactionSendOptions: (workspaceId: string) => Promise<{
-        model: string;
-        thinkingLevel: ThinkingLevel;
-      }>;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceIdleCompactionAccess;
+    const sendMessage = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+      isBusy: () => false,
+    } as unknown as AgentSession);
 
     await saveWorkspaces(
       harness.config,
@@ -1522,8 +1426,10 @@ describe("WorkspaceService idle compaction dispatch", () => {
     // Activity fallback: the last stream ran with thinking off.
     await harness.extensionMetadata.setStreaming("ws", false, { thinkingLevel: "off" });
 
-    const options = await svc.buildIdleCompactionSendOptions("ws");
+    await workspaceService.executeIdleCompaction("ws");
 
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const options = sendMessage.mock.calls[0][2];
     expect(options.thinkingLevel).toBe(enforceThinkingPolicy(options.model, "high"));
   });
 
@@ -1539,13 +1445,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
       snapshot
     );
-    const emitWorkspaceActivity = mock(
-      (_workspaceId: string, _snapshot: typeof snapshot) => undefined
-    );
-
-    (
-      workspaceService as unknown as { emitWorkspaceActivity: typeof emitWorkspaceActivity }
-    ).emitWorkspaceActivity = emitWorkspaceActivity;
+    const emitWorkspaceActivity = spyOn(workspaceService, "emitWorkspaceActivity");
 
     const internals = workspaceService as unknown as {
       idleCompactingWorkspaces: Set<string>;
@@ -1578,30 +1478,22 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
       snapshot
     );
-    const emitWorkspaceActivity = mock(
-      (_workspaceId: string, _snapshot: typeof snapshot) => undefined
-    );
+    const emitWorkspaceActivity = spyOn(workspaceService, "emitWorkspaceActivity");
 
-    (
-      workspaceService as unknown as { emitWorkspaceActivity: typeof emitWorkspaceActivity }
-    ).emitWorkspaceActivity = emitWorkspaceActivity;
-
-    const internals = workspaceService as unknown as {
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-    };
-
-    await internals.updateStreamingStatus(workspaceId, true, {
+    aiEvents.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: "assistant-1",
       model: "claude-sonnet-4",
       thinkingLevel: "high",
+      startTime: Date.now(),
     });
+    await waitForCondition(() => emitWorkspaceActivity.mock.calls.length === 1);
 
     expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, {
       model: "claude-sonnet-4",
       thinkingLevel: "high",
+      generation: 1,
     });
     expect(emitWorkspaceActivity).toHaveBeenCalledWith(workspaceId, snapshot);
   });
@@ -1651,34 +1543,24 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
       snapshot
     );
-    const emitWorkspaceActivity = mock(
-      (_workspaceId: string, _snapshot: typeof snapshot) => undefined
-    );
 
-    (
-      workspaceService as unknown as { emitWorkspaceActivity: typeof emitWorkspaceActivity }
-    ).emitWorkspaceActivity = emitWorkspaceActivity;
-
-    const internals = workspaceService as unknown as {
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-    };
-
-    await internals.updateStreamingStatus(workspaceId, false);
+    aiEvents.emit("stream-abort", { type: "stream-abort", workspaceId, messageId: "assistant-1" });
+    await waitForCondition(() => setStreaming.mock.calls.length > 0);
 
     // The setStreaming call must omit `todoStatus` entirely. If it included
     // `todoStatus: null`, ExtensionMetadataService.setStreaming would delete
     // the slot (see the `update.todoStatus !== undefined` branch there).
     expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, { hasTodos: false });
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, {
+      generation: 0,
+      hasTodos: false,
+    });
     // Defensive double-check that the assertion is strict — toHaveBeenCalledWith
     // with an object literal in some matchers tolerates extra fields. Use
     // `not` against an explicit `todoStatus: null` payload to lock the
     // contract.
     expect(setStreaming).not.toHaveBeenCalledWith(workspaceId, false, {
+      generation: 0,
       hasTodos: false,
       todoStatus: null,
     });
@@ -1703,6 +1585,27 @@ describe("WorkspaceService streaming generation guard", () => {
     readTodosSpy?.mockRestore();
     await harness.cleanup();
   });
+
+  /** Drive the real listener WorkspaceService registered on the (mock) AI service. */
+  function emitAiEvent(event: string, data: Record<string, unknown>): void {
+    const onCalls = (harness.aiService.on as unknown as ReturnType<typeof mock>).mock.calls;
+    const listener = onCalls.find((call) => call[0] === event)?.[1] as
+      | ((data: unknown) => void)
+      | undefined;
+    if (!listener) throw new Error(`Expected a ${event} listener`);
+    listener({ type: event, ...data });
+  }
+
+  function spyRecency() {
+    return spyOn(harness.extensionMetadata, "updateRecency").mockImplementation((_id, recency) =>
+      Promise.resolve({
+        recency: recency ?? 0,
+        streaming: false,
+        lastModel: null,
+        lastThinkingLevel: null,
+      })
+    );
+  }
 
   test("stop-side metadata write is skipped when a newer stream has started", async () => {
     const workspaceId = "ws-generation-guard";
@@ -1881,19 +1784,13 @@ describe("WorkspaceService streaming generation guard", () => {
           agentStatus: null,
         })
     );
-    const emitWorkspaceActivity = mock(
-      (_workspaceId: string, _snapshot: WorkspaceActivitySnapshot | null) => undefined
-    );
+    const emitWorkspaceActivity = spyOn(workspaceService, "emitWorkspaceActivity");
 
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
 
     const internals = workspaceService as unknown as {
       streamingGenerations: Map<string, number>;
       compactionStreamGenerations: Map<string, number>;
-      emitWorkspaceActivity: (
-        workspaceId: string,
-        snapshot: WorkspaceActivitySnapshot | null
-      ) => void;
       updateStreamingStatus: (
         workspaceId: string,
         streaming: boolean,
@@ -1902,7 +1799,6 @@ describe("WorkspaceService streaming generation guard", () => {
     };
 
     spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-    internals.emitWorkspaceActivity = emitWorkspaceActivity;
     internals.streamingGenerations.set(workspaceId, 3);
     internals.compactionStreamGenerations.set(workspaceId, 3);
 
@@ -1917,41 +1813,44 @@ describe("WorkspaceService streaming generation guard", () => {
 
   test("handleStreamCompletion skips recency updates for idle compaction", async () => {
     const workspaceId = "ws-idle-stream-completion";
+    const stopped = createDeferred<void>();
     const setStreaming = mock(
-      (_workspaceId: string, streaming: boolean, update: ExtensionMetadataStreamingUpdate = {}) =>
-        Promise.resolve({
+      (_workspaceId: string, streaming: boolean, update: ExtensionMetadataStreamingUpdate = {}) => {
+        if (!streaming) stopped.resolve();
+        return Promise.resolve({
           recency: Date.now(),
           streaming,
           lastModel: update.model ?? null,
           lastThinkingLevel: update.thinkingLevel ?? null,
           hasTodos: update.hasTodos,
           agentStatus: null,
-        })
+        });
+      }
     );
 
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
-
-    const internals = workspaceService as unknown as {
-      streamingGenerations: Map<string, number>;
-      idleCompactingWorkspaces: Set<string>;
-      updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
-      handleStreamCompletion: (workspaceId: string) => Promise<void>;
-    };
-
     spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-    internals.updateRecencyTimestamp = mock(() => Promise.resolve());
+    const updateRecency = spyRecency();
 
-    internals.streamingGenerations.set(workspaceId, 7);
-    internals.idleCompactingWorkspaces.add(workspaceId);
+    // Mark the workspace through the real idle-compaction dispatch: idle before the send,
+    // streaming after it.
+    spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+    let busyChecks = 0;
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+      isBusy: () => ++busyChecks >= 2,
+    } as unknown as AgentSession);
+    await workspaceService.executeIdleCompaction(workspaceId);
 
-    await internals.handleStreamCompletion(workspaceId);
+    emitAiEvent("stream-start", { workspaceId, messageId: "compact-1", model: "openai:gpt-4o" });
+    emitAiEvent("stream-end", { workspaceId, messageId: "compact-1", parts: [], metadata: {} });
+    await stopped.promise;
 
-    expect(internals.updateRecencyTimestamp).not.toHaveBeenCalled();
-    expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(
+    expect(updateRecency).not.toHaveBeenCalled();
+    expect(setStreaming).toHaveBeenCalledTimes(2);
+    expect(setStreaming).toHaveBeenLastCalledWith(
       workspaceId,
       false,
-      expect.objectContaining({ generation: 7, hasTodos: false })
+      expect.objectContaining({ generation: 1, hasTodos: false })
     );
   });
 
@@ -1980,23 +1879,15 @@ describe("WorkspaceService streaming generation guard", () => {
 
       readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
 
-      const internals = workspaceService as unknown as {
-        aiService: AIService;
-        streamingGenerations: Map<string, number>;
-        updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
-      };
       spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-      internals.updateRecencyTimestamp = mock(() => Promise.resolve());
-      internals.streamingGenerations.set(workspaceId, 4);
+      const updateRecency = spyRecency();
 
-      // Drive the real stream-end listener registered on the AI service.
-      const onCalls = (internals.aiService.on as unknown as ReturnType<typeof mock>).mock.calls;
-      const streamEndListener = onCalls.find((call) => call[0] === "stream-end")?.[1] as
-        | ((data: unknown) => void)
-        | undefined;
-      if (!streamEndListener) throw new Error("Expected a stream-end listener");
-      streamEndListener({
-        type: "stream-end",
+      emitAiEvent("stream-start", {
+        workspaceId,
+        messageId: "flush-answer",
+        model: "anthropic:claude-opus-5",
+      });
+      emitAiEvent("stream-end", {
         workspaceId,
         messageId: "flush-answer",
         parts: [],
@@ -2009,11 +1900,11 @@ describe("WorkspaceService streaming generation guard", () => {
 
       // A hidden flush is maintenance: streaming still stops, but recency (which drives
       // unread state and background completion notifications) must not advance.
-      expect(internals.updateRecencyTimestamp).toHaveBeenCalledTimes(flush ? 0 : 1);
+      expect(updateRecency).toHaveBeenCalledTimes(flush ? 0 : 1);
       expect(setStreaming).toHaveBeenCalledWith(
         workspaceId,
         false,
-        expect.objectContaining({ generation: 4 })
+        expect.objectContaining({ generation: 1 })
       );
     }
   );
@@ -2039,10 +1930,6 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       const projectName = "cmux";
       const planFile = await writePlanFile(muxRoot, projectName, workspaceName);
 
-      interface WorkspaceServiceTestAccess {
-        getInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
-      }
-
       const fakeMetadata: FrontendWorkspaceMetadata = {
         id: workspaceId,
         name: workspaceName,
@@ -2052,8 +1939,7 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
         runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
       };
 
-      const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-      svc.getInfo = mock(() => Promise.resolve(fakeMetadata));
+      spyOn(workspaceService, "getInfo").mockResolvedValue(fakeMetadata);
 
       const result = await workspaceService.getPostCompactionState(workspaceId);
 
@@ -2067,19 +1953,11 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
 
     const emitMetadata = mock(() => undefined);
 
-    interface WorkspaceServiceTestAccess {
-      sessions: Map<string, { emitMetadata: (metadata: unknown) => void }>;
-      getInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
-      getPostCompactionState: (workspaceId: string) => Promise<{
-        planPath: string | null;
-        trackedFilePaths: string[];
-        excludedItems: string[];
-      }>;
-      schedulePostCompactionMetadataRefresh: (workspaceId: string) => void;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.sessions.set(workspaceId, { emitMetadata });
+    workspaceService.registerSession(workspaceId, {
+      emitMetadata,
+      onChatEvent: () => () => undefined,
+      onMetadataEvent: () => () => undefined,
+    } as unknown as AgentSession);
 
     const fakeMetadata: FrontendWorkspaceMetadata = {
       id: workspaceId,
@@ -2090,9 +1968,7 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
     };
 
-    const getInfoMock: WorkspaceServiceTestAccess["getInfo"] = mock(() =>
-      Promise.resolve(fakeMetadata)
-    );
+    const getInfoMock = spyOn(workspaceService, "getInfo").mockResolvedValue(fakeMetadata);
 
     const postCompactionState = {
       planPath: "~/.mux/plans/cmux/plan.md",
@@ -2100,13 +1976,16 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       excludedItems: [],
     };
 
-    const getPostCompactionStateMock: WorkspaceServiceTestAccess["getPostCompactionState"] = mock(
-      () => Promise.resolve(postCompactionState)
-    );
+    const getPostCompactionStateMock = spyOn(
+      workspaceService,
+      "getPostCompactionState"
+    ).mockResolvedValue(postCompactionState);
 
-    svc.getInfo = getInfoMock;
-    svc.getPostCompactionState = getPostCompactionStateMock;
-
+    // Only the session's onCompactionComplete callback schedules this refresh; calling it
+    // directly is the cheap way to issue a burst without a real compaction.
+    const svc = workspaceService as unknown as {
+      schedulePostCompactionMetadataRefresh: (workspaceId: string) => void;
+    };
     svc.schedulePostCompactionMetadataRefresh(workspaceId);
     svc.schedulePostCompactionMetadataRefresh(workspaceId);
     svc.schedulePostCompactionMetadataRefresh(workspaceId);
