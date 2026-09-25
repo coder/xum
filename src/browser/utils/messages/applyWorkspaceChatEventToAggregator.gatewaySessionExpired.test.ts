@@ -1,8 +1,8 @@
-import "../dom";
+import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { installDom } from "../dom";
+import { installDom } from "../../../../tests/ui/dom";
 
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
@@ -10,28 +10,30 @@ import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatew
 import type { StreamErrorMessage } from "@/common/orpc/types";
 
 const stubAggregator = {
-  handleStreamStart: () => {},
-  handleStreamDelta: () => {},
-  handleStreamEnd: () => {},
-  handleStreamAbort: () => {},
-  handleStreamError: () => {},
+  handleStreamStart: () => undefined,
+  handleStreamDelta: () => undefined,
+  handleStreamEnd: () => undefined,
+  handleStreamAbort: () => undefined,
+  handleStreamError: () => undefined,
+  handleStreamLifecycle: () => undefined,
 
-  handleToolCallStart: () => {},
-  handleToolCallDelta: () => {},
-  handleToolCallEnd: () => {},
+  handleToolCallStart: () => undefined,
+  handleToolCallExecutionStart: () => undefined,
+  handleToolCallDelta: () => undefined,
+  handleToolCallEnd: () => undefined,
 
-  handleReasoningDelta: () => {},
-  handleReasoningEnd: () => {},
+  handleReasoningDelta: () => undefined,
+  handleReasoningEnd: () => undefined,
 
-  handleUsageDelta: () => {},
+  handleUsageDelta: () => undefined,
 
-  handleDeleteMessage: () => {},
+  handleDeleteMessage: () => undefined,
 
-  handleMessage: () => {},
+  handleMessage: () => undefined,
 
-  handleRuntimeStatus: () => {},
+  handleRuntimeStatus: () => undefined,
 
-  clearTokenState: () => {},
+  clearTokenState: () => undefined,
 };
 
 describe("applyWorkspaceChatEventToAggregator (Xum Gateway session expiry)", () => {

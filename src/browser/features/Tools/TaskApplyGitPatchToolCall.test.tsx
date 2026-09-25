@@ -1,7 +1,7 @@
-import "../dom";
+import "../../../../tests/ui/dom";
 
-import React from "react";
-import { render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { cleanup, render } from "@testing-library/react";
 
 import {
   TaskApplyGitPatchProjectResultCard,
@@ -9,6 +9,7 @@ import {
   type ParsedProjectResult,
 } from "@/browser/features/Tools/TaskApplyGitPatchToolCall";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import { installDom } from "../../../../tests/ui/dom";
 
 const projectResults: ParsedProjectResult[] = [
   {
@@ -39,6 +40,20 @@ const projectResults: ParsedProjectResult[] = [
 ];
 
 describe("task_apply_git_patch commit list", () => {
+  // Render into a per-test window and unmount afterwards so nodes never linger in
+  // the baseline document shared by later suites in the same bun process.
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
   test("renders commit groups per project with skipped and failed sections", () => {
     const view = render(
       <TooltipProvider>
@@ -70,7 +85,7 @@ describe("task_apply_git_patch commit list", () => {
     const view = render(
       <TooltipProvider>
         <TaskApplyGitPatchToolCall
-          args={{ task_id: "task-legacy" }}
+          args={{ task_id: "task-legacy", three_way: null }}
           status="completed"
           result={{
             success: false,

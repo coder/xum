@@ -1,14 +1,20 @@
-import "../dom";
+import "../../../../tests/ui/dom";
 
 import React from "react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
-import { installDom } from "../dom";
+import { installDom } from "../../../../tests/ui/dom";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import * as RealGitStatusStoreModule from "@/browser/stores/GitStatusStore";
 import type { GitStatus } from "@/common/types/workspace";
 import type {
   MultiProjectGitSummary,
   ProjectGitStatusResult,
 } from "@/browser/stores/GitStatusStore";
+
+// Captured before the stub below so the real store is restored for later suites
+// in the same bun process (CI shares one process per shard).
+restoreModulesAfterSuite([["@/browser/stores/GitStatusStore", { ...RealGitStatusStoreModule }]]);
 
 let currentSummary: MultiProjectGitSummary | null = null;
 let currentRefreshing = false;
@@ -126,7 +132,9 @@ describe("MultiProjectGitStatusIndicator", () => {
       }),
     ]);
 
-    const view = renderWithTooltipProvider(<MultiProjectGitStatusIndicator workspaceId="workspace-1" />);
+    const view = renderWithTooltipProvider(
+      <MultiProjectGitStatusIndicator workspaceId="workspace-1" />
+    );
     const button = view.getByRole("button", { name: "Open multi-project git status details" });
 
     expect(button.textContent).toContain("1 unknown");
@@ -152,7 +160,9 @@ describe("MultiProjectGitStatusIndicator", () => {
       }),
     ]);
 
-    const view = renderWithTooltipProvider(<MultiProjectGitStatusIndicator workspaceId="workspace-1" />);
+    const view = renderWithTooltipProvider(
+      <MultiProjectGitStatusIndicator workspaceId="workspace-1" />
+    );
     const button = view.getByRole("button", { name: "Open multi-project git status details" });
     const body = within(view.container.ownerDocument.body);
 
@@ -176,7 +186,9 @@ describe("MultiProjectGitStatusIndicator", () => {
   test("shows a loading state when the summary has not arrived yet", async () => {
     currentSummary = null;
 
-    const view = renderWithTooltipProvider(<MultiProjectGitStatusIndicator workspaceId="workspace-1" />);
+    const view = renderWithTooltipProvider(
+      <MultiProjectGitStatusIndicator workspaceId="workspace-1" />
+    );
     const button = view.getByRole("button", { name: "Open multi-project git status details" });
     expect(button.textContent).toContain("repos…");
 
