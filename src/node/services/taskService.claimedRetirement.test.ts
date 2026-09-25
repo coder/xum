@@ -1,10 +1,12 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import assert from "node:assert/strict";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { retiredAttemptMessage } from "@/constants/agentMessaging";
+import { Ok, type Result } from "@/common/types/result";
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { TaskService } from "@/node/services/taskService";
@@ -12,6 +14,7 @@ import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
   createTaskServiceStack,
   createTestProject,
+  createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspaces,
@@ -31,6 +34,8 @@ const RUN = { runId: "wfr_retire", stepId: "summarize", inputHash: "hash-1" };
 
 interface Internals {
   startReservedAgentTask: (plan: unknown) => Promise<void>;
+  materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
+  cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
 }
 
 describe("TaskService claimed retirement (G2 PR B)", () => {
@@ -237,6 +242,95 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       expect(second.success).toBe(false);
       expect(findWorkspaceInConfig(config, "replacementtwo")).toBeUndefined();
       expect((await taskService.claimRetiredAttempt("retired", ATTEMPT, RUN)).success).toBe(false);
+    });
+  });
+
+  /**
+   * Gate 4 at the TaskService/host seam: every send, resume and plugin-override sanitize the
+   * replacement's launch issues is recorded in order. MCP activation for a task happens inside the
+   * host's send/resume (AgentSession), so "no send or resume" here is the TaskService half of "no
+   * MCP call"; prompt discovery issued by other callers is outside this seam.
+   */
+  describe("gate 4: replacement launch", () => {
+    test.each([
+      ["fails", "sanitize failed"],
+      ["passes", undefined],
+    ] as const)("when sanitization %s", async (_label, sanitizeResult) => {
+      const config = await setupChild("retiredlaunch");
+      const calls: string[] = [];
+      const { workspaceService } = createWorkspaceServiceMocks({
+        sendMessage: mock((id: string): Promise<Result<void>> => {
+          calls.push(`send:${id}`);
+          return Promise.resolve(Ok(undefined));
+        }),
+        resumeStream: mock((id: string): Promise<Result<{ started: boolean }>> => {
+          calls.push(`resume:${id}`);
+          return Promise.resolve(Ok({ started: true }));
+        }),
+      });
+      spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+        (id: string) => {
+          calls.push(`sanitize:${id}`);
+          return Promise.resolve(sanitizeResult);
+        }
+      );
+      const { taskService } = createTaskServiceStack(config, {
+        historyService: fixture.historyService,
+        workspaceService,
+      });
+      const svc = taskService as unknown as Internals;
+      spyOn(svc, "cleanupMaterializedTaskWorkspace").mockImplementation(() => Promise.resolve());
+      spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
+        Promise.resolve({
+          workspacePath: config.srcDir,
+          trunkBranch: "main",
+          forkedRuntimeConfig: { type: "local" },
+          runtimeForTaskWorkspace: {
+            deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
+            getWorkspacePath: () => config.srcDir,
+          },
+          inheritedProjects: undefined,
+        })
+      );
+
+      const claim = await taskService.claimRetiredAttempt("retiredlaunch", ATTEMPT, RUN);
+      assert(claim.success, "claim must succeed");
+      stubStableIds(config, ["replacementlaunch"]);
+      const created = await taskService.createMany(
+        [
+          {
+            parentWorkspaceId: midId,
+            kind: "agent",
+            agentId: "explore",
+            prompt: "go",
+            title: "Replacement",
+            workflowTask: { runId: RUN.runId, stepId: RUN.stepId },
+          },
+        ],
+        { retires: [{ taskId: "retiredlaunch", attemptId: ATTEMPT, nonce: claim.data.nonce }] }
+      );
+      expect(created.success).toBe(true);
+      const settled = () =>
+        sanitizeResult === undefined
+          ? calls.includes("send:replacementlaunch")
+          : // A reserved launch that cannot sanitize reclaims its checkout and unpublishes the row.
+            findWorkspaceInConfig(config, "replacementlaunch") === undefined;
+      for (let i = 0; i < 400 && !settled(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(settled()).toBe(true);
+
+      expect(calls).toEqual(
+        sanitizeResult === undefined
+          ? ["sanitize:replacementlaunch", "send:replacementlaunch"]
+          : ["sanitize:replacementlaunch"]
+      );
+      // The retired child is never sent into, resumed or reactivated.
+      expect(findWorkspaceInConfig(config, "retiredlaunch")).toMatchObject({
+        taskStatus: "interrupted",
+        taskAttemptId: ATTEMPT,
+        taskAttemptRetiredBy: { replacementTaskId: "replacementlaunch" },
+      });
     });
   });
 });

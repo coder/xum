@@ -353,6 +353,43 @@ describe("WorkflowTaskServiceAdapter", () => {
     ]);
   });
 
+  test("publishes a replacement only through createMany's retires claim, never create()", async () => {
+    const claim = { taskId: "retired_1", attemptId: "att_00000000000000c1", nonce: "n1" };
+    const create = mock(async (_args: unknown) =>
+      Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+    );
+    const createMany = mock(async (args: unknown[], _options?: unknown) =>
+      Ok(args.map(() => ({ taskId: "task_r", kind: "agent" as const, status: "queued" as const })))
+    );
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
+    const adapterFor = (
+      taskService: ConstructorParameters<typeof WorkflowTaskServiceAdapter>[0]["taskService"]
+    ) =>
+      new WorkflowTaskServiceAdapter({
+        taskService,
+        parentWorkspaceId: "parent_1",
+        workflowRunId: "wfr_123",
+        defaultAgentId: "explore",
+      });
+
+    await adapterFor({ create, createMany, waitForAgentReport }).createAgentTasks(
+      [{ id: "step", prompt: "Redo" }],
+      { retires: [claim] }
+    );
+    expect(createMany.mock.calls[0]?.[1]).toMatchObject({ retires: [claim] });
+
+    // Without createMany there is no single-use commit: the fallback refuses before creating.
+    const fallback = adapterFor({ create, waitForAgentReport });
+    let caught: unknown;
+    try {
+      await fallback.createAgentTasks([{ id: "step", prompt: "Redo" }], { retires: [claim] });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   test("forwards run-end lifecycle hooks to the task service", async () => {
     const markWorkflowRunEnded = mock(async (_runId: string) => undefined);
     const adapter = new WorkflowTaskServiceAdapter({
