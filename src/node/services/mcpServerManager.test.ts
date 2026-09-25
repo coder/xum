@@ -1331,9 +1331,10 @@ describe("MCPServerManager", () => {
         imports: { demo: [String(reads++)] },
       })
     );
-    expect(access.runWithStablePluginEpoch(() => Promise.resolve(undefined))).rejects.toThrow(
-      /kept racing/
-    );
+    const error: unknown = await manager
+      .getToolsForWorkspace(workspaceRequest("churn"))
+      .catch((error: unknown) => error);
+    expect(String(error)).toMatch(/kept racing/);
     expect(reads).toBeLessThanOrEqual(18);
   });
 
