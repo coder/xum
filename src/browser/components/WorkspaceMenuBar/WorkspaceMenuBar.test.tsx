@@ -863,50 +863,32 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
   });
 
-  it("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    let archiveAttempt = 0;
-    archiveWorkspaceMock = mock(
-      (
-        id: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        archiveAttempt += 1;
-        if (archiveAttempt === 1) {
-          return resolveArchiveResult({
-            kind: "confirm-lossy-untracked-files",
-            paths: ["late-file.txt"],
-          });
-        }
-
-        expect(id).toBe(workspaceId);
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return resolveArchiveResult({ kind: "archived" });
-      }
+  it("does not show another workspace's archive confirmation after navigating away", async () => {
+    let resolvePreflight: ((result: ArchivePreflightActionResult) => void) | undefined;
+    preflightArchiveWorkspaceMock = mock(
+      (_workspaceId: string) =>
+        new Promise<ArchivePreflightActionResult>((resolve) => {
+          resolvePreflight = resolve;
+        })
     );
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
-
     act(() => {
       fireEvent.click(view.getByRole("button", { name: "Archive chat" }));
     });
+    await waitFor(() => expect(resolvePreflight).toBeDefined());
 
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
+    // The menu bar is reused when the user switches workspaces mid-preflight.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+    await act(async () => {
+      resolvePreflight?.({
+        success: true,
+        data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt"] },
+      });
+      await Promise.resolve();
     });
-    expect(archiveShowErrorMock).not.toHaveBeenCalled();
-    expect(archiveWorkspaceMock).toHaveBeenCalledTimes(1);
-    expect(archiveWorkspaceMock).toHaveBeenNthCalledWith(1, workspaceId, undefined);
 
-    act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive and delete files" }));
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceMock).toHaveBeenCalledTimes(2);
-    });
-    expect(archiveWorkspaceMock).toHaveBeenNthCalledWith(2, workspaceId, {
-      acknowledgedUntrackedPaths: ["late-file.txt"],
-    });
-    expect(archiveShowErrorMock).not.toHaveBeenCalled();
+    expect(view.queryByTestId("archive-confirmation-modal")).toBeNull();
+    expect(archiveWorkspaceMock).not.toHaveBeenCalled();
   });
 });
