@@ -7,24 +7,7 @@ import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
-
-async function waitForCondition(
-  condition: () => boolean,
-  options?: { timeoutMs?: number; intervalMs?: number }
-): Promise<void> {
-  const timeoutMs = options?.timeoutMs ?? 1_000;
-  const intervalMs = options?.intervalMs ?? 10;
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    if (condition()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for condition`);
-}
+import { waitForCondition } from "./testDispatchHelpers";
 
 describe("IdleCompactionService", () => {
   // Mock services
@@ -381,23 +364,57 @@ describe("IdleCompactionService", () => {
     });
 
     test("deduplicates queued idle compaction for same workspace", async () => {
+      const sentinelWorkspaceId = "sentinel-workspace";
+      const idleTimestamp = now - 25 * oneHourMs;
+      loadConfigMock.mockImplementation(() => ({
+        projects: new Map([
+          [
+            testProjectPath,
+            {
+              workspaces: [
+                { id: testWorkspaceId, path: "/test/path", name: "test" },
+                { id: sentinelWorkspaceId, path: "/sentinel/path", name: "sentinel" },
+              ],
+              idleCompactionHours: 24,
+            },
+          ],
+        ]),
+      }));
+
       let releaseCompaction: (() => void) | undefined;
       const gate = new Promise<void>((resolve) => {
         releaseCompaction = resolve;
       });
-
-      executeIdleCompactionMock.mockImplementation(async () => {
-        await gate;
+      const executed: string[] = [];
+      executeIdleCompactionMock.mockImplementation(async (workspaceId: string) => {
+        executed.push(workspaceId);
+        if (workspaceId === testWorkspaceId) {
+          await gate;
+        }
       });
 
+      // The sentinel has no history yet, so only the first workspace is eligible.
       await service.checkAllWorkspaces();
+      await waitForCondition(() => executed.length === 1);
+      // Duplicate sweep while the first compaction is still running.
       await service.checkAllWorkspaces();
 
-      await waitForCondition(() => executeIdleCompactionMock.mock.calls.length === 1);
+      // Queue the sentinel behind any duplicate. The queue is FIFO, so once the
+      // sentinel has run, a duplicate entry would already have executed.
+      await historyService.appendToHistory(
+        sentinelWorkspaceId,
+        createMuxMessage("s1", "user", "Hello", { timestamp: idleTimestamp })
+      );
+      await historyService.appendToHistory(
+        sentinelWorkspaceId,
+        createMuxMessage("s2", "assistant", "Hi!", { timestamp: idleTimestamp })
+      );
+      await service.checkAllWorkspaces();
+
       releaseCompaction?.();
+      await waitForCondition(() => executed.includes(sentinelWorkspaceId));
 
-      // Ensure the queue drains without running a duplicate.
-      await waitForCondition(() => executeIdleCompactionMock.mock.calls.length === 1);
+      expect(executed).toEqual([testWorkspaceId, sentinelWorkspaceId]);
     });
   });
 

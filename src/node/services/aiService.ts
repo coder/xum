@@ -17,7 +17,6 @@ import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
   type TurnRequestBuilderBindings,
-  resolveMuxProjectRootForHostFs,
   resolveXumToolScope,
   type StreamMessageOptions,
   type PreparedStreamMessage,
@@ -95,8 +94,6 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
 import { ProviderModelFactory } from "./providerModelFactory";
-
-export { resolveMuxProjectRootForHostFs };
 
 interface ToolExecutionContext {
   toolCallId?: string;
