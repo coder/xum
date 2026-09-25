@@ -311,28 +311,6 @@ export const WorkflowStepRecordSchema = z.object({
   evaluation: EvaluationAdmissionSchema.optional(),
 });
 
-const WorkflowRunStatusTransitions: Record<
-  z.infer<typeof WorkflowRunStatusSchema>,
-  ReadonlyArray<z.infer<typeof WorkflowRunStatusSchema>>
-> = {
-  pending: ["running", "backgrounded", "interrupted", "failed"],
-  running: ["backgrounded", "interrupted", "completed", "failed"],
-  backgrounded: ["running", "interrupted", "completed", "failed"],
-  interrupted: ["running", "failed"],
-  completed: [],
-  failed: [],
-};
-
-export const WorkflowRunStatusTransitionSchema = z
-  .object({
-    from: WorkflowRunStatusSchema,
-    to: WorkflowRunStatusSchema,
-  })
-  .refine((transition) => WorkflowRunStatusTransitions[transition.from].includes(transition.to), {
-    message: "Invalid workflow run status transition",
-    path: ["to"],
-  });
-
 export const WorkflowRunParentSchema = z
   .object({
     runId: WorkflowRunIdSchema,

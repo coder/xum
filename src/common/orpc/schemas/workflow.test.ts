@@ -10,7 +10,6 @@ import {
   WorkflowNameSchema,
   WorkflowRunIdSchema,
   WorkflowRunRecordSchema,
-  WorkflowRunStatusTransitionSchema,
   WorkflowStepRecordSchema,
 } from "./workflow";
 
@@ -198,15 +197,6 @@ describe("workflow domain schemas", () => {
     ]);
 
     expect(result.success).toBe(false);
-  });
-
-  test("rejects impossible status transitions", () => {
-    expect(
-      WorkflowRunStatusTransitionSchema.safeParse({ from: "completed", to: "running" }).success
-    ).toBe(false);
-    expect(
-      WorkflowRunStatusTransitionSchema.safeParse({ from: "running", to: "interrupted" }).success
-    ).toBe(true);
   });
 
   test("round-trips evaluation step records and events; agent records without an admission still parse", () => {
