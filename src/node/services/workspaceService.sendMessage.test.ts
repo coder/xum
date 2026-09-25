@@ -3,6 +3,7 @@ import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
+import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { EventEmitter } from "events";
@@ -46,6 +47,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
   let fakeSession: {
     isBusy: ReturnType<typeof mock>;
     hasQueuedMessages: ReturnType<typeof mock>;
+    promotedToolEndWouldLeadQueue: ReturnType<typeof mock>;
     hasQueuedOrDispatchingEntry: ReturnType<typeof mock>;
     dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
@@ -80,6 +82,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       ...createCompactionAdmissionMocks(),
       isBusy: mock(() => true),
       hasQueuedMessages: mock(() => false),
+      promotedToolEndWouldLeadQueue: mock(() => true),
       hasQueuedOrDispatchingEntry: mock(() => false),
       dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
@@ -402,6 +405,69 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     manualSend.resolve(Ok(undefined));
     expect((await manualResult).success).toBe(true);
+  });
+
+  // Busy-owner sub-agent report wakes (TaskService.cutBusyOwnerTurnForSubagentAttention).
+  const promotedWake = (overrides: Partial<SendMessageInternalOptions> = {}) =>
+    workspaceService.sendMessage(
+      "test-workspace",
+      "Background sub-agent task(s) have completed.",
+      { model: "openai:gpt-4o-mini", agentId: "exec", queueDispatchMode: "tool-end" },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        skipAutoResumeReset: true,
+        promoteAheadOfHiddenTurnEnd: true,
+        yieldToPreflightSends: true,
+        ...overrides,
+      }
+    );
+
+  test("a promoted wake queues past hidden turn-end work but yields when it would not lead", async () => {
+    fakeSession.isBusy.mockReturnValue(true);
+    // Hidden turn-end entries are queued, but the promoted wake would still lead: unlike
+    // yieldToQueuedMessages, it must queue so it can cut the stream.
+    fakeSession.hasQueuedMessages.mockReturnValue(true);
+    expect((await promotedWake()).success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+
+    // A user-authored entry queued during the send's awaits would sit ahead of the wake, which
+    // would then run after that (possibly stricter) turn with the grants it captured.
+    fakeSession.promotedToolEndWouldLeadQueue.mockReturnValue(false);
+    expect((await promotedWake()).success).toBe(true);
+    expect(fakeSession.queueMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("a promoted wake yields quietly to a manual send already in preflight", async () => {
+    // The manual send is invisible to the queue while in preflight, yet may carry stricter
+    // caller restrictions and would queue ahead of the wake.
+    fakeSession.isBusy.mockReturnValue(true);
+    const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
+    workspaceService.setWorkspaceGoalService({
+      assertPricedModelForBudgetedGoal: pricingGate,
+      getPendingGoalSnapshot: mock(() => null),
+    } as unknown as WorkspaceGoalService);
+    const manualPreflight = createDeferred<void>();
+    pricingGate.mockImplementationOnce(() => manualPreflight.promise.then(() => Ok(undefined)));
+    fakeSession.queueMessage.mockImplementation((message: string) => {
+      // Once the manual entry is queued the wake could no longer lead either.
+      if (message === "manual") fakeSession.promotedToolEndWouldLeadQueue.mockReturnValue(false);
+      return "tool-end" as const;
+    });
+
+    const manualResult = workspaceService.sendMessage("test-workspace", "manual", {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    });
+    await waitForCondition(() => pricingGate.mock.calls.length === 1);
+    const wakeResult = promotedWake();
+    manualPreflight.resolve();
+
+    expect((await manualResult).success).toBe(true);
+    expect((await wakeResult).success).toBe(true);
+    expect((fakeSession.queueMessage.mock.calls as unknown[][]).map((call) => call[0])).toEqual([
+      "manual",
+    ]);
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {

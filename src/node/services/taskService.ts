@@ -341,6 +341,22 @@ function buildCompletedWorkspaceTurnPrompt(handleIds: string[]): string {
   );
 }
 
+/**
+ * Tool-end wake for sub-agent reports/failures that landed in a busy owner's history (see
+ * cutBusyOwnerTurnForSubagentAttention). The reports themselves are already durable rows above
+ * this prompt, so it only points at them and explains the backgrounded waits.
+ */
+function buildBusyOwnerSubagentAttentionPrompt(allFailed: boolean): string {
+  const opening = allFailed
+    ? BACKGROUND_WORK_WAKE_OPENINGS.subagentsFailed
+    : BACKGROUND_WORK_WAKE_OPENINGS.subagentsCompleted;
+  return (
+    `${opening} Their ${allFailed ? "failures are" : "reports are"} in the conversation above; ` +
+    "review them now. Any task_await you were running was sent to the background and its tasks " +
+    "keep running; call task_await again when you need their results."
+  );
+}
+
 function getTaskCompletionInstruction(params: {
   completionKind: "final_response" | "propose_plan";
   requiresStructuredOutput?: boolean;
@@ -1791,6 +1807,11 @@ export class TaskService implements AgentTaskIntegration {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  // Sub-agent terminal notifications this process just enqueued while their owner was streaming,
+  // mapped to that owner turn's generation (owner -> notification ID -> turn). The next drain takes
+  // the whole map, so each report can cut at most one busy turn, and only the turn that was live
+  // at its delivery (see cutBusyOwnerTurnForSubagentAttention).
+  private readonly freshSubagentAttentionTurnByOwner = new Map<string, Map<string, symbol>>();
   // Terminal settlements of the same run must not overlap: settlement is multi-step (stable
   // refresh, generation marker, post-write mismatch delete), so an older generation reaching
   // its mismatch delete after a newer settlement's stable refresh would remove the newer
@@ -10574,6 +10595,17 @@ export class TaskService implements AgentTaskIntegration {
     if (created == null) {
       return;
     }
+    const liveTurn = this.aiService.isStreaming(created.ownerWorkspaceId)
+      ? this.workspaceService.getActiveTurnGeneration(created.ownerWorkspaceId)
+      : undefined;
+    if (created.sourceKind === "agent_task" && liveTurn != null) {
+      let fresh = this.freshSubagentAttentionTurnByOwner.get(created.ownerWorkspaceId);
+      if (fresh == null) {
+        fresh = new Map();
+        this.freshSubagentAttentionTurnByOwner.set(created.ownerWorkspaceId, fresh);
+      }
+      fresh.set(created.id, liveTurn);
+    }
     this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
@@ -11191,11 +11223,107 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
+   * A sub-agent report or failure that lands while its owner is mid-turn is already a durable row
+   * in the owner's history, but the terminal drain defers until idle and the running turn's model
+   * only sees its in-memory messages. A parent blocked in a long task_await on OTHER tasks (or any
+   * long tool) therefore could not act on it for many minutes. Per user request, such reports also
+   * trigger a new agent turn promptly: queue one coalesced tool-end wake, which (like an
+   * agent_report progress update) backgrounds foreground waits and ends the current turn at the
+   * next tool boundary. The wake travels the normal queue so queue-cut attribution, delegated-turn
+   * continuation and sub-agent parents behave exactly as for any other queued input; the drain
+   * then acknowledges the reports once that turn answers after them.
+   *
+   * Edge-triggered and immediate: only notifications this process just enqueued while the owner
+   * was streaming (fresh edges) can cut, on the first drain after their delivery. So a failed or withdrawn wake never re-cuts later
+   * turns, and a report left pending across a restart or an older delegated continuation never
+   * cuts a later turn; the idle drain still delivers (or supersedes) those as before. No history is
+   * read here: busy drains must not inspect history (see "Reconcile only after observing idle").
+   */
+  private async cutBusyOwnerTurnForSubagentAttention(
+    ownerWorkspaceId: string,
+    ownerEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>,
+    pending: readonly TerminalAttentionNotification[],
+    freshTurns: ReadonlyMap<string, symbol>
+  ): Promise<void> {
+    // Only the streaming turn that was live when the report was delivered can be cut: a successor
+    // turn (for example a manual send, or the next turn after this one ended) already loaded the
+    // report from history. A queued, preparing or retrying turn reads history when it starts (a
+    // report landing mid-PREPARING keeps the previous wait-for-idle delivery), and a
+    // user-interrupted parent stays put until the user acts.
+    // The wake must also become the queue head, overtaking only hidden turn-end entries (peer
+    // messages, heartbeats). Security: a queued user-authored message may carry stricter caller
+    // restrictions that are not in history yet, and promotion never overtakes it, so a wake queued
+    // behind it would run after it with older grants. A queued tool-end entry already cuts this
+    // turn, and the turn it starts sees the report. Both cases defer to the idle drain.
+    const liveTurnStillCuttable = (): boolean =>
+      this.aiService.isStreaming(ownerWorkspaceId) &&
+      !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
+      this.workspaceService.promotedToolEndWouldLeadQueue(ownerWorkspaceId);
+    const liveTurn = this.workspaceService.getActiveTurnGeneration(ownerWorkspaceId);
+    const fresh = pending.filter(
+      (notification) =>
+        notification.sourceKind === "agent_task" &&
+        liveTurn != null &&
+        freshTurns.get(notification.id) === liveTurn
+    );
+    if (fresh.length === 0 || !liveTurnStillCuttable()) {
+      return;
+    }
+    // Non-fatal on failure: the notification stays pending and the idle drain resumes the owner
+    // as before. Contain throws too, so the caller still schedules its after-idle drain.
+    let wakeError: string | undefined;
+    try {
+      // Security: this wake starts a fresh turn whose timing the child's report chooses, so it
+      // must keep the conversation's caller restrictions exactly like the idle drain's wake.
+      // Throws on unreadable history, which fails closed (no cut) via the catch below.
+      const restrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
+      // That history read awaited: the turn may have ended or input may have been queued since.
+      if (
+        !liveTurnStillCuttable() ||
+        this.workspaceService.getActiveTurnGeneration(ownerWorkspaceId) !== liveTurn
+      ) {
+        return;
+      }
+      const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
+        parentWorkspaceId: ownerWorkspaceId,
+        parentEntry: ownerEntry,
+        content: buildBusyOwnerSubagentAttentionPrompt(
+          fresh.every((notification) => notification.terminalOutcome !== "completed")
+        ),
+        sendRestrictions: restrictions,
+        // Coalesces reports that arrive before the wake dispatches into one queued turn.
+        queueDedupeKey: "busy-owner-subagent-attention",
+        queueDispatchMode: "tool-end",
+        // Same reason as agent_report: only the queue head's dispatch mode can cut the stream.
+        promoteAheadOfHiddenTurnEnd: true,
+        settleContinuationOnSendRefusal: false,
+        // Security: yield to a manual send still in preflight (invisible to the queue check
+        // above), and re-check queue leadership at the enqueue point after the send's awaits.
+        yieldToPreflightSends: true,
+      });
+      if (!wakeResult.success) wakeError = wakeResult.error;
+    } catch (error: unknown) {
+      wakeError = getErrorMessage(error);
+    }
+    if (wakeError != null) {
+      log.warn("Busy-owner sub-agent report wake failed; deferring to the idle drain", {
+        ownerWorkspaceId,
+        error: wakeError,
+      });
+    }
+  }
+
+  /**
    * Drain pending terminal notifications for one owner workspace: defer (leave pending) when the
    * owner is busy/queued/preparing, otherwise send one coalesced synthetic wake-up and mark the
    * drained notifications delivered. Stale (deleted-workspace) notifications are marked superseded.
    */
   private async drainTerminalAttention(ownerWorkspaceId: string): Promise<void> {
+    // Every drain consumes the fresh edges, whichever branch it takes: an idle drain delivers them
+    // itself, and a busy drain may cut the live turn for them exactly once.
+    const freshSubagentAttentionTurns =
+      this.freshSubagentAttentionTurnByOwner.get(ownerWorkspaceId) ?? new Map<string, symbol>();
+    this.freshSubagentAttentionTurnByOwner.delete(ownerWorkspaceId);
     const allPending = await this.terminalAttentionStore.listPending(ownerWorkspaceId);
     // Legacy pre-reconciler outbox records for workflow runs (no generation suffix) are dead
     // state now that workflow wakes are re-derived from run records + settled markers: delete
@@ -11247,6 +11375,12 @@ export class TaskService implements AgentTaskIntegration {
       ownerHasBusyQueuedOrRetry ||
       this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)
     ) {
+      await this.cutBusyOwnerTurnForSubagentAttention(
+        ownerWorkspaceId,
+        entry,
+        pending,
+        freshSubagentAttentionTurns
+      );
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
         this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
       }
@@ -11964,6 +12098,21 @@ export class TaskService implements AgentTaskIntegration {
      * than dispatched, and never settles the parent's own workspace turn as failed.
      */
     admissionStale?: () => boolean;
+    /**
+     * Opportunistic wakes (see cutBusyOwnerTurnForSubagentAttention) pass false: a send refused
+     * before anything was queued never cut the parent's live stream, so the delegated turn is
+     * intact and must not be settled as failed. Cancellation or a pre-stream failure after the
+     * entry was queued still settles, because a queued tool-end entry may already have ended it.
+     */
+    settleContinuationOnSendRefusal?: boolean;
+    /** See SendMessageInternalOptions.yieldToPreflightSends. */
+    yieldToPreflightSends?: boolean;
+    /** Caller restrictions restored onto the wake's turn (see resolveTerminalWakeCallerSendRestrictions). */
+    sendRestrictions?: {
+      toolPolicy?: ToolPolicy;
+      disableWorkspaceAgents?: boolean;
+      strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
+    };
     queueDispatchMode?: TaskMessageQueueDispatchMode;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
@@ -12028,6 +12177,15 @@ export class TaskService implements AgentTaskIntegration {
         ...(params.queueDispatchMode != null
           ? { queueDispatchMode: params.queueDispatchMode }
           : {}),
+        ...(params.sendRestrictions?.toolPolicy != null
+          ? { toolPolicy: params.sendRestrictions.toolPolicy }
+          : {}),
+        ...(params.sendRestrictions?.disableWorkspaceAgents === true
+          ? { disableWorkspaceAgents: true }
+          : {}),
+        ...(params.sendRestrictions?.strictAgentResolution != null
+          ? { strictAgentResolution: params.sendRestrictions.strictAgentResolution }
+          : {}),
         ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
       },
       {
@@ -12048,6 +12206,7 @@ export class TaskService implements AgentTaskIntegration {
         ...(params.promoteAheadOfHiddenTurnEnd === true
           ? { promoteAheadOfHiddenTurnEnd: true }
           : {}),
+        ...(params.yieldToPreflightSends === true ? { yieldToPreflightSends: true } : {}),
         ...(params.admissionStale != null ? { admissionStale: params.admissionStale } : {}),
         ...(workspaceTurnMuxMetadata != null
           ? {
@@ -12063,7 +12222,9 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (!sendResult.success) {
       const formattedError = formatSendMessageError(sendResult.error);
-      await settleContinuationFailure("error", formattedError.message);
+      if (params.settleContinuationOnSendRefusal !== false) {
+        await settleContinuationFailure("error", formattedError.message);
+      }
       return Err(formattedError.message);
     }
     return Ok(undefined);

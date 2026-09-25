@@ -440,6 +440,14 @@ export class MessageQueue {
   }
 
   /**
+   * Whether a tool-end add flagged promoteAheadOfHiddenTurnEnd would become the FIFO head (and so
+   * cut the active stream): the queue is empty or holds only hidden turn-end entries.
+   */
+  promotedToolEndWouldLead(): boolean {
+    return this.trailingHiddenTurnEndRunStart() === 0;
+  }
+
+  /**
    * Index where the trailing run of hidden (non-user-authored) turn-end entries begins — the
    * entries a promoteAheadOfHiddenTurnEnd add overtakes. Equals entries.length when the tail is
    * user-authored or tool-end (nothing to overtake).

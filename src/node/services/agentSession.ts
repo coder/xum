@@ -9780,6 +9780,11 @@ export class AgentSession {
     return this.messageQueue.hasManualUserInput() || this.heldInputs.length > 0;
   }
 
+  /** See MessageQueue.promotedToolEndWouldLead. */
+  promotedToolEndWouldLeadQueue(): boolean {
+    return this.messageQueue.promotedToolEndWouldLead();
+  }
+
   hasQueuedMessages(dispatchMode?: "tool-end" | "turn-end"): boolean {
     const nextMode = this.messageQueue.getNextDispatchableMode();
     return nextMode != null && (dispatchMode == null || nextMode === dispatchMode);

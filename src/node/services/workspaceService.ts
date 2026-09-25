@@ -12317,7 +12317,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Maintenance sends that yield to user input: requireIdle skips and queue-mode
       // heartbeats. Both must yield to a manual send in preflight rather than race it.
       const yieldsToPreflightSends =
-        internal?.requireIdle === true || internal?.yieldToQueuedMessages === true;
+        internal?.requireIdle === true ||
+        internal?.yieldToQueuedMessages === true ||
+        internal?.yieldToPreflightSends === true;
       // A queue-mode heartbeat superseded by input that arrived during its preparation is a
       // quiet success: its next slot fires anyway.
       const yieldToPreflightSend = (): Result<void, SendMessageError> => {
@@ -12566,7 +12568,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
       }
       // Starting a queue-mode heartbeat here would race that input to PREPARING.
-      if (!shouldQueue && internal?.yieldToQueuedMessages === true && hasOtherSendInPreflight) {
+      if (
+        !shouldQueue &&
+        (internal?.yieldToQueuedMessages === true || internal?.yieldToPreflightSends === true) &&
+        hasOtherSendInPreflight
+      ) {
         return yieldToPreflightSend();
       }
 
@@ -12609,7 +12615,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         const admitted = admitTaskTurn();
         if (!admitted.success) return admitted;
         if (internal?.admissionStale?.() === true) {
-          if (internal.yieldToQueuedMessages === true) {
+          if (internal.yieldToQueuedMessages === true || internal.yieldToPreflightSends === true) {
             return yieldToPreflightSend();
           }
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
@@ -12673,6 +12679,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         // cannot go stale again.
         if (internal?.yieldToQueuedMessages === true && session.hasQueuedMessages()) {
           log.info("sendMessage: yielded to messages queued during send preparation", {
+            workspaceId,
+          });
+          return Ok(undefined);
+        }
+        // Same synchronous enqueue point for promoted wakes: a user-authored (or tool-end) entry
+        // queued during the awaits above would sit ahead of this one (see yieldToPreflightSends).
+        if (internal?.yieldToPreflightSends === true && !session.promotedToolEndWouldLeadQueue()) {
+          log.info("sendMessage: promoted wake yielded to input queued during send preparation", {
             workspaceId,
           });
           return Ok(undefined);
@@ -13875,6 +13889,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   /** See WorkspaceHost.hasPendingUserInput. */
   hasPendingUserInput(workspaceId: string): boolean {
     return this.sessions.get(workspaceId.trim())?.hasPendingUserInput() ?? false;
+  }
+
+  /** See WorkspaceHost.promotedToolEndWouldLeadQueue. */
+  promotedToolEndWouldLeadQueue(workspaceId: string): boolean {
+    return this.sessions.get(workspaceId.trim())?.promotedToolEndWouldLeadQueue() ?? true;
   }
 
   hasQueuedMessages(workspaceId: string, dispatchMode?: "tool-end" | "turn-end"): boolean {
