@@ -47,7 +47,6 @@ void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
 }));
 
 let providersConfigMock: ProvidersConfigMap | null = null;
-let apiMock: APIClient | null = null;
 const providersRefreshMock = mock(() => Promise.resolve());
 const updateOptimisticallyMock = mock((provider: string, updates: Partial<ProviderConfigInfo>) => {
   if (!providersConfigMock?.[provider]) {
@@ -81,10 +80,6 @@ void mock.module("@/browser/hooks/useRouting", () => ({
     setRoutePriority: () => undefined,
     setRouteOverride: () => undefined,
   }),
-}));
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: apiMock }),
 }));
 
 void mock.module("@/browser/contexts/PolicyContext", () => ({
@@ -205,7 +200,6 @@ function renderProvidersSection() {
   const providersConfig = createProvidersConfig();
   providersConfigMock = providersConfig;
   const client = setupSettingsStory({ providersConfig: {} });
-  apiMock = client;
   const providerMocks = patchProviderMethods(client, providersConfig);
   const view = render(
     <SettingsSectionStory setup={() => client}>
@@ -238,7 +232,6 @@ describe("ProvidersSection", () => {
       (_provider: string, _workspaceIds: Iterable<string>) => undefined
     );
     providersConfigMock = null;
-    apiMock = null;
     providersRefreshMock.mockClear();
     updateOptimisticallyMock.mockClear();
   });
@@ -253,7 +246,6 @@ describe("ProvidersSection", () => {
       () => ActualSelectPrimitiveModule
     );
     providersConfigMock = null;
-    apiMock = null;
     restoreDom?.();
     restoreDom = null;
   });
@@ -664,7 +656,6 @@ describe("ProvidersSection", () => {
     };
     providersConfigMock = providersConfig;
     const client = setupSettingsStory({ providersConfig: {} });
-    apiMock = client;
 
     const startDesktopFlow = mock((_input: { deploymentUrl: string; flowId?: string }) =>
       Promise.resolve({

@@ -4,8 +4,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
 import { installDom } from "../../../../../tests/ui/dom";
-import * as APIModule from "@/browser/contexts/API";
-import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 
 interface MockAPIClient {
   config: {
@@ -13,21 +12,6 @@ interface MockAPIClient {
     updateGoalDefaults: (input: { goalDefaults: GoalDefaults }) => Promise<void>;
   };
 }
-
-let mockApi: MockAPIClient;
-
-// Do not leave the config-only API stub in later settings component tests.
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...APIModule }]]);
-
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
 
 import { GoalsSection } from "./GoalsSection";
 
@@ -38,17 +22,21 @@ function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
     return Promise.resolve();
   });
 
-  mockApi = {
+  const mockApi: MockAPIClient = {
     config: {
       getConfig: mock(() => Promise.resolve({ ...current })),
       updateGoalDefaults,
     },
   };
 
+  // Inject the config-only client through the real provider; mocking the API module leaks
+  // into later files.
   const view = render(
-    <ThemeProvider forcedTheme="dark">
-      <GoalsSection />
-    </ThemeProvider>
+    <APIProvider client={mockApi as unknown as APIClient}>
+      <ThemeProvider forcedTheme="dark">
+        <GoalsSection />
+      </ThemeProvider>
+    </APIProvider>
   );
 
   return { view, updateGoalDefaults };

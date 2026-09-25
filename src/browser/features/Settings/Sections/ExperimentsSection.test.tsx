@@ -1,17 +1,16 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import * as ActualAPIModule from "@/browser/contexts/API";
+import type { ReactNode } from "react";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
 
 // Snapshot values, not Bun's live module namespaces, before installing overrides.
-const actualAPI = { ...ActualAPIModule };
 const actualExperiments = { ...ActualExperimentsModule };
 const actualTelemetry = { ...ActualTelemetryModule };
 
 afterAll(() => {
-  void mock.module("@/browser/contexts/API", () => actualAPI);
   void mock.module("@/browser/contexts/ExperimentsContext", () => actualExperiments);
   void mock.module("@/browser/hooks/useTelemetry", () => actualTelemetry);
 });
@@ -59,16 +58,11 @@ let mockApi: MockApiClient;
 let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
 
-void mock.module("@/browser/contexts/API", () => ({
-  ...actualAPI,
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the current client through the real provider; mocking the API module leaks across
+// files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+}
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
   ...actualExperiments,
@@ -103,7 +97,7 @@ let originalSetInterval: typeof globalThis.setInterval;
 let originalClearInterval: typeof globalThis.clearInterval;
 
 function renderWarning() {
-  return render(<PortableDesktopExperimentWarning />);
+  return render(<PortableDesktopExperimentWarning />, { wrapper: ApiWrapper });
 }
 
 describe("PortableDesktopExperimentWarning", () => {
@@ -191,7 +185,7 @@ describe("PortableDesktopExperimentWarning", () => {
         [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: enabled,
         [EXPERIMENT_IDS.TOKEN_BUDGET]: enabled,
       };
-      const view = render(<ExperimentsSection />);
+      const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
       expect(view.queryByLabelText("Toggle Continuous Compaction")).toBeNull();
       expect(view.queryByLabelText("Toggle Token-budget context windows")).toBeNull();
       for (const name of [
@@ -218,7 +212,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: false,
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
     expect(view.queryByLabelText("Default heartbeat threshold in minutes")).toBeNull();
@@ -242,7 +236,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.MEMORY]: false,
       [EXPERIMENT_IDS.MEMORY_INTUITION]: true,
     };
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
     expect(view.queryByLabelText("Toggle Memory Intuition")).toBeNull();
 
     fireEvent.click(view.getByLabelText("Toggle Agent Memory"));
@@ -263,7 +257,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     // Hidden from the flat list and no nested panel while the parent is off.
     expect(view.queryByLabelText("Toggle RLM Mode")).toBeNull();
@@ -283,7 +277,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     await waitFor(() => {
       expect(view.getByLabelText("Default heartbeat threshold in minutes")).toBeTruthy();
@@ -329,7 +323,7 @@ describe("PortableDesktopExperimentWarning", () => {
       },
     };
 
-    const view = render(<ExperimentsSection />);
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
 
     await waitFor(() => {
       expect(staleGetConfig).toHaveBeenCalledTimes(1);
