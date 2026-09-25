@@ -4230,6 +4230,14 @@ export class TaskService implements AgentTaskIntegration {
    * Such a recovery can still be running at shutdown, so `options.signal` (aborted by dispose)
    * stops it before the queue drain and before each re-drive: work reserved or dispatched after
    * shutdown began would fail against latched services and be persisted as interrupted.
+   *
+   * Only the decisions belong here, never network-bound work: a large server restarted with many
+   * active tasks outlived the startup step bound while awaiting each re-drive's stream startup
+   * (runtime `ensureReady`, MCP servers, model creation) one task at a time, and an outlived
+   * recovery overlaps early clients. So re-drive prompts return once accepted (stream startup
+   * continues in the background, like the guidance replay and compaction follow-up sends), and
+   * the queue drain is scheduled like any runtime drain instead of awaiting the forks, init hooks
+   * and first turns it launches.
    */
   async recoverInterruptedTasks(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
@@ -4330,10 +4338,10 @@ export class TaskService implements AgentTaskIntegration {
 
     // Normalize stopped capacity before launching siblings; newly launched work is not part of
     // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
+    // Scheduled, not awaited: launches are ordinary runtime work that already races clients
+    // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
     if (cancelled("queue-drain")) return;
-    const maybeStartQueuedTasksStartedAt = Date.now();
-    await this.maybeStartQueuedTasks();
-    const maybeStartQueuedTasksMs = Date.now() - maybeStartQueuedTasksStartedAt;
+    this.scheduleMaybeStartQueuedTasks();
 
     // Recovery awaits and queue draining can change task status: re-read before replaying intent.
     config = this.config.loadConfigOrDefault();
@@ -4553,6 +4561,8 @@ export class TaskService implements AgentTaskIntegration {
                 acceptanceOrigin: "automatic",
                 synthetic: true,
                 agentInitiated: true,
+                // Accepted is enough; stream startup must not gate the listener (see method doc).
+                startStreamInBackground: true,
                 turnAdmission: nudgeToken,
                 admissionStale: () => nudgeToken.admissionStale(),
               }
@@ -4574,7 +4584,6 @@ export class TaskService implements AgentTaskIntegration {
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
       totalMs: Date.now() - startupStartedAt,
-      maybeStartQueuedTasksMs,
       awaitingReportTaskCount: awaitingReportTasks.length,
       resumedAwaitingReportCount,
       skippedAwaitingReportDueToActiveDescendants,
@@ -14533,6 +14542,9 @@ export class TaskService implements AgentTaskIntegration {
           agentInitiated: true,
           queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
           removableQueueDedupeKey: true,
+          // Startup recovery gates the server listener: return once the prompt is accepted and
+          // let stream startup (runtime readiness, MCP, model) continue in the background.
+          startStreamInBackground: options?.reason === "startup",
           ...(sendToken != null
             ? {
                 turnAdmission: sendToken,

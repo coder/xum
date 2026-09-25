@@ -4538,6 +4538,7 @@ describe("TaskService", () => {
       try {
         expect(taskService.countActiveAgentTasks(config.loadConfigOrDefault())).toBe(1);
         await taskService.recoverInterruptedTasks();
+        await taskService.maybeStartQueuedTasks();
         const stopped = ["stop", "opt-out", "handle"].includes(blocker);
         expect(findWorkspaceInConfig(config, pausedId)?.taskStatus).toBe(
           stopped ? "interrupted" : "running"
@@ -4619,6 +4620,7 @@ describe("TaskService", () => {
       false
     );
     await taskService.recoverInterruptedTasks();
+    await taskService.maybeStartQueuedTasks();
     expect(findWorkspaceInConfig(config, "first")?.taskStatus).toBe("interrupted");
     expect(findWorkspaceInConfig(config, "second")?.taskStatus).toBe("interrupted");
     expect(findWorkspaceInConfig(config, "descendant")?.taskStatus).toBe("interrupted");
@@ -4666,6 +4668,7 @@ describe("TaskService", () => {
         );
       }
       await taskService.recoverInterruptedTasks();
+      await taskService.maybeStartQueuedTasks();
       expect(findWorkspaceInConfig(config, "unreadable")?.taskStatus).toBe("running");
       expect(findWorkspaceInConfig(config, "healthy")?.taskStatus).toBe("interrupted");
       expect(findWorkspaceInConfig(config, "queued")?.taskStatus).toBe("running");
@@ -5794,6 +5797,7 @@ describe("TaskService", () => {
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       await taskService.recoverInterruptedTasks();
+      await taskService.maybeStartQueuedTasks();
       expect(sendMessage).not.toHaveBeenCalled();
       expect(findWorkspaceInConfig(config, "child")?.taskStatus).toBe("interrupted");
       expect(findWorkspaceInConfig(config, "child")?.taskDesktopOwnerWorkspaceId).toBe("deleted");
@@ -6387,6 +6391,7 @@ describe("TaskService", () => {
     );
     try {
       await taskService.initialize();
+      await taskService.maybeStartQueuedTasks();
 
       expect(sendMessage).toHaveBeenCalledWith(
         queued.data.taskId,
@@ -6492,6 +6497,7 @@ describe("TaskService", () => {
     );
     try {
       await taskService.initialize();
+      await taskService.maybeStartQueuedTasks();
 
       for (const taskId of [queuedTaskId, acceptedStartingTaskId]) {
         expect(resumeStream).toHaveBeenCalledWith(
@@ -6685,6 +6691,7 @@ describe("TaskService", () => {
       });
 
       await taskService.initialize();
+      await taskService.maybeStartQueuedTasks();
 
       const postCfg = config.loadConfigOrDefault();
       const workspaces = Array.from(postCfg.projects.values()).flatMap((p) => p.workspaces);
@@ -6822,6 +6829,7 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
       await taskService.initialize();
+      await taskService.maybeStartQueuedTasks();
 
       expect(forkSpy).toHaveBeenCalledTimes(1);
       expect(sendMessage).toHaveBeenCalledWith(
@@ -7425,7 +7433,9 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
 
     expect(sendMessage).not.toHaveBeenCalled();
 
@@ -7515,7 +7525,9 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
 
     expect(sendMessage).not.toHaveBeenCalled();
 
@@ -7617,6 +7629,7 @@ describe("TaskService", () => {
     });
 
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
 
     expect(sendMessage).toHaveBeenCalledWith(
       queued.data.taskId,
@@ -7635,6 +7648,76 @@ describe("TaskService", () => {
       .find((w) => w.id === queued.data.taskId);
     expect(queuedEntryAfterStart).toBeTruthy();
     expect(await fsPromises.stat(queuedEntryAfterStart!.path)).toBeTruthy();
+  }, 20_000);
+
+  test("startup recovery does not wait for queued task launches to finish", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"], "dddddddddd");
+
+    const projectPath = await createTestProject(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const runtime = createRuntime(runtimeConfig, { projectPath });
+    const parentName = "parent";
+    await runtime.createWorkspace({
+      projectPath,
+      branchName: parentName,
+      trunkBranch: "main",
+      directoryName: parentName,
+      initLogger: createNullInitLogger(),
+    });
+    const parentId = "1111111111";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        {
+          path: runtime.getWorkspacePath(projectPath, parentName),
+          id: parentId,
+          name: parentName,
+          createdAt: new Date().toISOString(),
+          runtimeConfig,
+        },
+      ],
+      testTaskSettings(1, 3)
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const running = await createAgentTask(taskService, parentId, "task 1");
+    expect(running.success).toBe(true);
+    if (!running.success) return;
+    const queued = await createAgentTask(taskService, parentId, "task 2");
+    expect(queued.success).toBe(true);
+    if (!queued.success) return;
+    expect(queued.data.status).toBe("queued");
+
+    await config.editConfig((cfg) => {
+      for (const [_project, project] of cfg.projects) {
+        const ws = project.workspaces.find((w) => w.id === running.data.taskId);
+        if (ws) ws.taskStatus = "reported";
+      }
+      return cfg;
+    });
+
+    // The dequeued launch's first turn hangs, like a stream start blocked on a slow runtime.
+    const launchSend = Promise.withResolvers<Result<void>>();
+    const launchSendStarted = Promise.withResolvers<void>();
+    sendMessage.mockImplementationOnce(() => {
+      launchSendStarted.resolve();
+      return launchSend.promise;
+    });
+
+    const recovery = taskService.recoverInterruptedTasks();
+    await launchSendStarted.promise;
+    try {
+      expect((await raceWithAbortAndTimeout(recovery, { timeoutMs: 5_000 })).kind).toBe("ok");
+    } finally {
+      launchSend.resolve(Ok(undefined));
+      await recovery;
+    }
+    await taskService.maybeStartQueuedTasks();
+    expect(findWorkspaceInConfig(config, queued.data.taskId)?.taskStatus).toBe("running");
   }, 20_000);
 
   test("does not start queued tasks while a reported task is still streaming", async () => {
@@ -18197,6 +18280,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     await taskService.initialize();
+    await taskService.maybeStartQueuedTasks();
 
     expect(findWorkspaceInConfig(config, runningTaskId)?.taskStatus).toBe("interrupted");
     expect(findWorkspaceInConfig(config, queuedWorkflowTaskId)?.taskStatus).toBe("interrupted");
