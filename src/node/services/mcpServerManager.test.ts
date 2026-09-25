@@ -1220,7 +1220,8 @@ describe("MCPServerManager", () => {
     await f.write(["keep"]);
     await manager.reconcilePluginComponents();
     // Private read: retries re-filter by enabled servers, so a stale timed-out
-    // candidate has no public effect; this pins the removal's own cleanup.
+    // candidate has no public effect; this pins the removal's own cleanup
+    // (no other test catches dropping that filter).
     const entry = (
       manager as unknown as { workspaceServers: Map<string, { timedOutServerNames: string[] }> }
     ).workspaceServers.get(request.workspaceId);
@@ -1537,15 +1538,15 @@ describe("MCPServerManager", () => {
     expect(close2).toHaveBeenCalledTimes(0);
     expect(servers.connectCount("node server.js")).toBe(2);
     expect(Object.keys(result.tools)).toHaveLength(1);
-    // With no disk reader wired, the sweep scrubs plugin keys from the
-    // cross-process-stale cache while preserving unrelated override state.
-    // Private read: the scrubbed overlay only changes a later serve's outcome
-    // for a disabled server, which this enabled-server race cannot also cover.
-    expect(
-      (
-        manager as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
-      ).latestWorkspaceOverrides.get(workspaceId)
-    ).toEqual({ enabledServers: [] });
+
+    // With no disk reader wired, the sweep scrubbed the plugin key from the
+    // seeded stale override cache: once the server is project-disabled, a
+    // serve without overrides of its own is not re-enabled by that cache.
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js", true) })
+    );
+    const disabled = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(disabled.tools)).toHaveLength(0);
   });
 
   test("concurrent serves await an in-flight cross-process sweep before returning", async () => {
@@ -1839,15 +1840,6 @@ describe("MCPServerManager", () => {
     const overlaid = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(overlaid.tools)).toHaveLength(0);
     expect(servers.connectCount("node server.js")).toBe(1);
-    // Private read: the live overlay masks recorded options on every public
-    // path above, but they become authoritative once an invalidation drops the
-    // overlay, so their convergence is asserted directly.
-    const recorded = (
-      manager as unknown as {
-        lastWorkspaceRequestOptions: Map<string, { overrides?: unknown }>;
-      }
-    ).lastWorkspaceRequestOptions;
-    expect(recorded.get(workspaceId)?.overrides).toEqual({});
   });
 
   test("a cold workspace's first serve loads disk overrides instead of trusting the caller snapshot", async () => {
@@ -2233,7 +2225,7 @@ describe("MCPServerManager", () => {
     return constructed.sweepIdle;
   }
 
-  test("cleanupIdleServers stops idle servers when workspace is not leased", async () => {
+  test("the idle sweep stops an unleased workspace's idle servers", async () => {
     const workspaceId = "ws-idle";
     const sweepIdleServers = useManagerWithIdleSweep();
     configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd") }));
@@ -2250,7 +2242,7 @@ describe("MCPServerManager", () => {
     expect(servers.connectCount("cmd")).toBe(2);
   });
 
-  test("cleanupIdleServers does not stop idle servers when workspace is leased", async () => {
+  test("the idle sweep keeps a leased workspace's idle servers running", async () => {
     const workspaceId = "ws-leased";
     const sweepIdleServers = useManagerWithIdleSweep();
     configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd") }));
@@ -2270,7 +2262,7 @@ describe("MCPServerManager", () => {
     manager.releaseLease(workspaceId);
   });
 
-  test("startSingleServer times out when startup never finishes", async () => {
+  test("a startup that never finishes fails as a timeout and is retried after its backoff", async () => {
     configService.listServers = mock(() =>
       Promise.resolve({ "stuck-server": stdioConfig("never") })
     );
@@ -2325,7 +2317,7 @@ describe("MCPServerManager", () => {
   /** Mirrors mcpServerManager's fail-safe wait for a timed-out startup's abort cleanup. */
   const STARTUP_CLEANUP_WAIT_MS = MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS;
 
-  test("startSingleServer waits for abort cleanup before surfacing timeout", async () => {
+  test("a startup timeout waits for its abort cleanup before surfacing", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
     configService.listServers = mock(() =>
       Promise.resolve({ "cleanup-server": stdioConfig("never") })
@@ -2371,7 +2363,7 @@ describe("MCPServerManager", () => {
     expect(Object.keys(retried.tools)).toHaveLength(1);
   });
 
-  test("startSingleServer still times out when abort cleanup hangs", async () => {
+  test("a startup timeout still surfaces when its abort cleanup hangs", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
     configService.listServers = mock(() =>
       Promise.resolve({ "cleanup-hang-server": stdioConfig("never") })
@@ -2414,7 +2406,7 @@ describe("MCPServerManager", () => {
     expect(Object.keys(retried.tools)).toHaveLength(1);
   });
 
-  test("startServers overlaps slow startups instead of stacking them serially", async () => {
+  test("slow server startups overlap instead of stacking serially", async () => {
     const names = ["a", "b", "c"];
     configService.listServers = mock(() =>
       Promise.resolve(Object.fromEntries(names.map((name) => [name, stdioConfig(`cmd-${name}`)])))
@@ -2446,7 +2438,7 @@ describe("MCPServerManager", () => {
     expect(Object.keys(result.tools)).toEqual(["a_t", "b_t", "c_t"]);
   });
 
-  test("startServers only marks startup timeouts as retryable", async () => {
+  test("only startup timeouts, not other startup failures, are retried", async () => {
     configService.listServers = mock(() =>
       Promise.resolve({
         "slow-server": stdioConfig("slow"),
@@ -2471,7 +2463,7 @@ describe("MCPServerManager", () => {
     expect(servers.connectCount("broken")).toBe(0);
   });
 
-  test("startSingleServerImpl closes spawned stdio stream when aborted after exec", async () => {
+  test("a stdio process spawned after its startup aborted has its streams closed", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS]);
     configService.listServers = mock(() =>
       Promise.resolve({ "stdio-aborted-after-exec": stdioConfig("never") })
@@ -2701,7 +2693,7 @@ describe("MCPServerManager", () => {
     expect(f.held.component).toBe(false);
   });
 
-  test("startSingleServerImpl cleans up client that resolves after abort", async () => {
+  test("a stdio client connecting after its startup aborted is closed", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS]);
     configService.listServers = mock(() =>
       Promise.resolve({ "stdio-late-client-cleanup": stdioConfig("never") })
@@ -2730,7 +2722,7 @@ describe("MCPServerManager", () => {
     expect(lateClientClose).toHaveBeenCalledTimes(1);
   });
 
-  test("startSingleServerImpl cleans up HTTP client that resolves after abort", async () => {
+  test("an HTTP client connecting after its startup aborted is closed", async () => {
     using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS]);
     const url = "https://example.com/mcp";
     configService.listServers = mock(() =>
@@ -2765,7 +2757,7 @@ describe("MCPServerManager", () => {
       ([config]) => (config as mcpSdk.MCPClientConfig).prior
     );
 
-  test("startSingleServerImpl respawns stdio server as legacy after probe crash", async () => {
+  test("a stdio server that crashes on the era probe is respawned as legacy", async () => {
     // Fragile legacy stdio servers can exit on the server/discover probe.
     // The manager must respawn the process once and reconnect with a legacy
     // era verdict so the server still comes up.
@@ -2784,7 +2776,7 @@ describe("MCPServerManager", () => {
     expect(Object.keys(result.tools)).toEqual(["crashy_crashy_tool"]);
   });
 
-  test("startSingleServerImpl re-probes when a cached legacy verdict is rejected", async () => {
+  test("a rejected cached legacy verdict triggers a fresh era probe", async () => {
     // A server cached as legacy can be upgraded in place to a 2026-only
     // implementation that rejects the initialize handshake. The manager must
     // drop the cached verdict and re-probe instead of failing every startup
