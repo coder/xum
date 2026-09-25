@@ -90,7 +90,7 @@ include fmt.mk
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
 .PHONY: benchmark-terminal
 .PHONY: ensure-deps mux
-.PHONY: check-startup-imports check-react-compiler
+.PHONY: check-startup-imports check-react-compiler check-test-routing test-bench-scripts
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
 TSGO := bun run tsgo
@@ -375,9 +375,16 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links lint-shellcheck lint-hadolint ## Run fast local static checks
+static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing lint-shellcheck lint-hadolint ## Run fast local static checks
 
-static-check-full: static-check check-bench-agent check-docs-links ## Run the full CI static check suite
+static-check-full: static-check check-bench-agent test-bench-scripts check-docs-links ## Run the full CI static check suite
+
+# pytest is not a repo dependency; uv (installed in CI's static-check job) supplies it.
+test-bench-scripts: ## Test the Terminal-Bench result checker with offline fixtures
+	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
+
+check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
+	@./scripts/check-test-routing.sh
 
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
@@ -466,7 +473,7 @@ test-integration: node_modules/.installed build-main ## Run all tests (unit + in
 
 test-unit: node_modules/.installed build-main ## Run unit tests
 	@bun test src
-	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts
+	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/
 
 # CI runs this once per shard; SHARD_INDEX/SHARD_TOTAL (env) pick the slice. See the script header.
 test-unit-ci: node_modules/.installed build-main ## Run the CI unit suite with coverage (sharded via SHARD_INDEX/SHARD_TOTAL)

@@ -7,9 +7,18 @@
 # (~15 min on the 16-core runner while the rest of the pipeline finished in ~11),
 # so each shard runs a size-balanced slice of the files in its own process.
 #
-# Usage: SHARD_INDEX=<1..N> SHARD_TOTAL=<N> ./scripts/test-unit-ci.sh
+# Usage: SHARD_INDEX=<1..N> SHARD_TOTAL=<N> ./scripts/test-unit-ci.sh [--list | --list-all]
 #        (defaults to 1/1, i.e. the whole suite in one shard)
+#        --list      prints this shard's shared-process files
+#        --list-all  prints every file this lane runs (isolated, tooling and shared)
+#                    across all shards; consumed by scripts/check-test-routing.sh
 set -euo pipefail
+
+mode="${1:-}"
+if [[ "$mode" == "--list-all" ]]; then
+  SHARD_INDEX=1
+  SHARD_TOTAL=1
+fi
 
 SHARD_INDEX="${SHARD_INDEX:-1}"
 SHARD_TOTAL="${SHARD_TOTAL:-1}"
@@ -108,7 +117,7 @@ bun_test_retrying_crashes() {
 }
 
 for i in "${!isolated_unit_tests[@]}"; do
-  [[ "${1:-}" != "--list" ]] || break
+  [[ -z "$mode" ]] || break
   ((i % SHARD_TOTAL == SHARD_INDEX - 1)) || continue
   bun_test_retrying_crashes "${isolated_unit_tests[$i]}" "${isolated_unit_tests[$i]}"
 done
@@ -123,8 +132,12 @@ for isolated_unit_test in "${isolated_unit_tests[@]}"; do
   find_excludes+=(! -path "$isolated_unit_test")
 done
 
-# Bun-run test trees outside src/ (Jest ignores them, see jest.config.js). Storybook
-# policy tests read story sources and use bun:test.
+# Bun-run test trees outside src/ (Jest ignores them, see jest.config.js): Storybook
+# policy tests, the VS Code extension's pure helpers (incl. the webview oRPC allowlist
+# guard) and tooling tests under scripts/. check-startup-imports.test.ts is excluded
+# because `make check-startup-imports` (static-check) runs it right before its
+# analyzer; orpcConnection.integration.test.ts needs a live xum server (see
+# scripts/check-test-routing.sh for every file run outside this lane).
 #
 # Paths outside bunfig's `root = "src"` need a ./ prefix (here and in
 # isolated_unit_tests): without it `bun test` treats them as name filters over src/
@@ -132,15 +145,17 @@ done
 # src shards: a single ./ path switches `bun test` from filter mode (files run in
 # bun's own traversal order) to path mode (argument order), which reorders the whole
 # shard and exposed order-dependent module mocks that the usual order hides.
-tooling_roots=(./tests/ui/storybook)
+tooling_roots=(./tests/ui/storybook ./vscode/src ./scripts)
 tooling_files=()
 while IFS= read -r tooling_file; do
   tooling_files+=("$tooling_file")
 done < <(
   find "${tooling_roots[@]}" -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
+    ! -path ./scripts/check-startup-imports.test.ts \
+    ! -path ./vscode/src/api/orpcConnection.integration.test.ts \
     "${find_excludes[@]}" | LC_ALL=C sort
 )
-if [[ "${1:-}" != "--list" ]] && ((SHARD_INDEX == 1 && ${#tooling_files[@]} > 0)); then
+if [[ -z "$mode" ]] && ((SHARD_INDEX == 1 && ${#tooling_files[@]} > 0)); then
   bun_test_retrying_crashes "tooling tests" "${tooling_files[@]}"
 fi
 
@@ -169,10 +184,14 @@ done < <(
 )
 
 # --list prints this shard's shared-process files, e.g. to reproduce a shard locally.
-if [[ "${1:-}" == "--list" ]]; then
+if [[ "$mode" == "--list" ]]; then
   if ((${#unit_files[@]} > 0)); then
     printf '%s\n' "${unit_files[@]}"
   fi
+  exit 0
+fi
+if [[ "$mode" == "--list-all" ]]; then
+  printf '%s\n' "${isolated_unit_tests[@]}" "${tooling_files[@]}" "${unit_files[@]}"
   exit 0
 fi
 
