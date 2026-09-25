@@ -43,10 +43,6 @@ isolated_unit_tests=(
   src/node/services/sandbox/sandboxHostService.test.ts
   src/node/services/agentPlugins/hookService.test.ts
   src/node/orpc/router.test.ts
-  src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx
-  src/browser/features/Messages/InlineSkillMarkdown.test.tsx
-  src/browser/hooks/useChatTranscriptFullWidth.test.tsx
-  src/browser/utils/commands/sources.test.ts
   # In the shared monolithic process on CI runners this file can enter an
   # infinite 'Maximum update depth exceeded' render loop (timing/coverage
   # sensitive; also seen on main and sibling branches) that spews ~1GB of
