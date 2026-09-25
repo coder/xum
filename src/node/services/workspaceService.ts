@@ -14643,6 +14643,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       deletePlanFile?: boolean;
     }
   ): Promise<Result<void>> {
+    // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
+    // from the dedicated endpoints; with a matching envelope this row would otherwise persist an
+    // authentic record that skipped their validation, directly or as a compaction summary's
+    // pending follow-up that recovery dispatches. Refused before anything is cleared.
+    if (carriesPlanReviewMetadata(summaryMessage.metadata?.muxMetadata)) {
+      return Err(PLAN_REVIEW_METADATA_RESERVED_MESSAGE);
+    }
     // Support both new enum ("user"|"idle") and legacy boolean (true)
     const isCompaction = !!summaryMessage.metadata?.compacted;
     // Non-compaction replaces hold the admission guard (r40): the destructive

@@ -7,6 +7,7 @@ import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  isCompactionSummaryMetadata,
   pickPreservedSendOptions,
   pickStartupRetrySendOptions,
 } from "@/common/types/message";
@@ -111,17 +112,22 @@ export interface PreparedPlanReviewFeedback {
   muxMetadata: MuxMessageMetadata;
 }
 
-/** Refusal for plan-review metadata on a generic send (see carriesPlanReviewMetadata). */
+/**
+ * Refusal for plan-review metadata on a generic send or a client-supplied history row (see
+ * carriesPlanReviewMetadata).
+ */
 export const PLAN_REVIEW_METADATA_RESERVED_MESSAGE =
-  "Plan review records can only be created through the plan review actions, not sent as a message.";
+  "Plan review records can only be created through the plan review actions, not sent as a message or written into chat history.";
 
 /**
- * Whether send options' muxMetadata would persist a plan-review row: directly, or as the nested
- * follow-up of a compaction request that dispatches after compaction. Only the dedicated
- * endpoints (planReviewSubmitFeedback and the record appends in this module) may write such
- * rows; a generic send carrying the discriminator plus a matching envelope would otherwise
- * persist an authentic record that skipped their validation. Accepts any value: generic send
- * options carry muxMetadata as an unvalidated black box.
+ * Whether client-supplied muxMetadata (send options, or a row written through
+ * workspace.replaceChatHistory) would persist a plan-review row: directly, as the nested
+ * follow-up of a compaction request that dispatches after compaction, or as a compaction
+ * summary's pending follow-up that recovery dispatches. Only the dedicated endpoints
+ * (planReviewSubmitFeedback and the record appends in this module) may write such rows; a
+ * generic write carrying the discriminator plus a matching envelope would otherwise persist an
+ * authentic record that skipped their validation. Accepts any value: clients supply muxMetadata
+ * as an unvalidated black box.
  */
 export function carriesPlanReviewMetadata(muxMetadata: unknown): boolean {
   // Compaction recovery redispatches each nested follow-up straight through AgentSession, past
@@ -132,7 +138,9 @@ export function carriesPlanReviewMetadata(muxMetadata: unknown): boolean {
     if (typeof current !== "object" || current === null) return false;
     const metadata = current as MuxMessageMetadata;
     if (metadata.type === PLAN_REVIEW_METADATA_TYPE) return true;
-    current = getCompactionFollowUpContent(metadata)?.muxMetadata;
+    current = isCompactionSummaryMetadata(metadata)
+      ? metadata.pendingFollowUp?.muxMetadata
+      : getCompactionFollowUpContent(metadata)?.muxMetadata;
   }
   return true;
 }
