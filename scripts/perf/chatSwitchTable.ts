@@ -4,6 +4,8 @@
  * Usage: bun scripts/perf/chatSwitchTable.ts <perf-summary.json | directory>...
  * Directories are searched recursively. Medians are taken over every switch of every run,
  * so pass all runs of one build (e.g. five `--repeat-each` runs) to get a before/after column.
+ * Run those repeats with `--workers 1`: Playwright otherwise starts one Electron app per worker
+ * in parallel, and the contention changes the numbers.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
