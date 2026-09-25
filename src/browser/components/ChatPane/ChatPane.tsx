@@ -597,7 +597,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   };
   // Keep rendering cached transcript rows during incremental (since) catch-up so workspace
   // switches feel stable, even when they are known to be missing backend content: the server
-  // verified every row up to the cursor, so the missing content only appends. Stale rows
+  // verified every row up to the cursor, and rows after it are swapped for the server's
+  // copies at caught-up, so the missing content mostly appends. Stale rows
   // under a full replay hide behind the skeleton instead. The stream/monitor barrier
   // lives in the composer dock, so it never vetoes the skeleton. The skeleton
   // additionally holds until decoration data sources are known so the transcript and all

@@ -435,7 +435,7 @@ function createHydrationStory(workspaceId: string): AppStory {
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         // A new turn started while this workspace was unsubscribed from onChat: the cached
-        // rows are missing that content, but the since replay only appends after the
+        // rows are missing that content, but the since replay mostly appends after the
         // server-verified cursor, so they stay painted with the dock shimmer (#4505).
         emitActivity(workspace.id, {
           recency: STABLE_TIMESTAMP + 1,

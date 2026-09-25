@@ -116,8 +116,9 @@ export interface ChatViewRevealState {
  *   and the latched known-flags make decorations renderable in that same
  *   first commit.
  * - Stale cached rows repaired by a since replay stay painted with the dock
- *   shimmer: the server verifies every row up to the cursor, so missing content
- *   only appends after it or grows the in-flight message.
+ *   shimmer: the server verifies every row up to the cursor. Rows after it (sent
+ *   live since the last caught-up) grow, or are swapped in one commit at caught-up
+ *   if they were edited or deleted elsewhere meanwhile.
  * - Stale cached rows under a full replay, or an empty transcript, hold the
  *   skeleton until caught-up, even with an active stream/monitor barrier: an
  *   active turn does not mean history has loaded, and a full replay rebuilds the

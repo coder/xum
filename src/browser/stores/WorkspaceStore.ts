@@ -225,8 +225,11 @@ export interface WorkspaceState {
   isTranscriptStale: boolean;
   /**
    * Hydration is (or is about to be) a since replay: the server verifies every row up to
-   * the history cursor, so missing content can only append after the cursor or grow the
-   * in-flight message. Stale cached rows may therefore stay painted while it catches up.
+   * the history cursor, and caught-up replaces the rows after it (the ones that arrived
+   * live since the last caught-up, e.g. the prompt and the in-flight reply) with the
+   * server's copies. Those change only by growing, or when edited or deleted elsewhere while
+   * unsubscribed, which caught-up swaps in one commit. Stale cached rows may therefore stay
+   * painted while it catches up; hiding them would also hide the rows after the cursor.
    * A server downgrade to full swaps rows atomically at caught-up; a full replay or a
    * reset clears the cursor, so this goes false and the skeleton returns.
    */

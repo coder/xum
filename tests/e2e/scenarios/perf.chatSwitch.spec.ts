@@ -59,7 +59,7 @@ const CAUGHT_UP_BUDGET_MS = 15_000;
  * Leaving a chat mid-stream marks its cached transcript stale. A since-mode return keeps those
  * cached rows painted (with the composer-dock shimmer) instead of hiding them behind
  * the hydration skeleton until `caught-up`: the server verifies every row up to the cursor, so
- * the missing content only appends.
+ * the missing content mostly appends after it.
  */
 const EXPECT_SKELETON_ON_MID_STREAM_SWITCH_BACK = false;
 
