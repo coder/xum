@@ -20,9 +20,14 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
  * deleted. Concurrent writers of DIFFERENT attempts never touch the same file; the process-local
  * workspaceFileLocks used by the read-modify-write failure artifacts are therefore not needed.
  *
- * This module is receipt-independent plumbing: the producers that write receipts (settlement
- * paths in TaskService) and the classifier that consumes them are enabled by a later change.
- * Only reads (lineage proof at reawaken/reactivation) are wired at this point.
+ * Scope: a receipt is evidence that ONE backend settled the attempt, never proof that no report
+ * exists. With two backends on one root, another backend can run a turn under the same attempt id
+ * without rotating it and still publish a report after this receipt (#4545). Consumers must read
+ * the report artifact first: a receipt followed by a report is "reported".
+ *
+ * Producers are TaskService's settlement paths (persistOwnedAttemptSettlement and the stop-record
+ * release). The only reader so far is the lineage proof at reawaken/reactivation; the classifier
+ * that would consume receipts for workflow replacement is enabled by a later change.
  */
 export const SUBAGENT_ATTEMPT_SETTLEMENT_RECEIPT_VERSION = 1 as const;
 const SUBAGENT_ATTEMPT_SETTLEMENTS_DIR_NAME = "subagent-attempt-settlements";
@@ -188,7 +193,18 @@ export async function writeSubagentAttemptSettlementReceipt(params: {
         receipt.taskId,
         receipt.attemptId
       );
-      if (existing.kind === "found") continue;
+      if (existing.kind === "found") {
+        // Immutable: an existing receipt for this attempt stands, but only when it vouches for
+        // the same parent. One naming another parent (copied or corrupted state) is not this
+        // settlement's evidence, and lineage would reject it after a restart, so the write
+        // fails (the caller leaves the attempt closing) instead of reporting success.
+        if (existing.receipt.parentWorkspaceId !== receipt.parentWorkspaceId) {
+          errors.push(
+            `${receiptPath}: existing receipt names parent ${existing.receipt.parentWorkspaceId}, not ${receipt.parentWorkspaceId}`
+          );
+        }
+        continue;
+      }
       if (existing.kind === "unreadable") {
         errors.push(`${receiptPath}: existing receipt unreadable (${existing.error})`);
         continue;
