@@ -6312,9 +6312,7 @@ export class AgentSession {
     signal: AbortSignal | undefined,
     attempt: PreparationAttempt
   ): Promise<ResolvedSendMessageOptions> {
-    const experimentEnabled = this.aiService.isExperimentEnabled(
-      EXPERIMENT_IDS.AUTO_MODEL_ROUTING
-    );
+    const experimentEnabled = this.aiService.isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
     if (!experimentEnabled) return options;
 
     const fallback = (
