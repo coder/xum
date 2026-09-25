@@ -9891,7 +9891,10 @@ describe("TaskService", () => {
       });
       sendMessage.mockClear();
       const internal = taskService as unknown as {
-        promptTaskForRequiredCompletionTool(workspaceId: string): Promise<boolean>;
+        promptTaskForRequiredCompletionTool(
+          workspaceId: string,
+          options: { expectedAttemptId: null }
+        ): Promise<boolean>;
         finalizeAgentTaskReport(
           childWorkspaceId: string,
           childEntry: ReturnType<typeof findWorkspaceEntry>,
@@ -9901,7 +9904,9 @@ describe("TaskService", () => {
         ownedAttemptByTaskId: Map<string, unknown>;
       };
 
-      expect(await internal.promptTaskForRequiredCompletionTool(childId)).toBe(true);
+      expect(
+        await internal.promptTaskForRequiredCompletionTool(childId, { expectedAttemptId: null })
+      ).toBe(true);
       const recovery = sendMessage.mock.calls.filter((call) => call[0] === childId);
       expect(recovery).toHaveLength(1);
       expect(recovery[0][2]).toMatchObject({ model: MODEL_B, thinkingLevel: "xhigh" });
