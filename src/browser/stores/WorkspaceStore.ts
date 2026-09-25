@@ -220,9 +220,17 @@ export interface WorkspaceState {
   transcriptReplayFailed: boolean;
   isHydratingTranscript: boolean;
   // Cached rows are known to be missing backend content that arrived while this
-  // workspace was not subscribed to onChat. Hydration must hide them behind the
-  // skeleton instead of painting them and jumping when caught-up lands.
+  // workspace was not subscribed to onChat. Hydration hides them behind the skeleton
+  // only when the catch-up is not incremental (see isIncrementalCatchUp).
   isTranscriptStale: boolean;
+  /**
+   * Hydration is (or is about to be) a since replay: the server verifies every row up to
+   * the history cursor, so missing content can only append after the cursor or grow the
+   * in-flight message. Stale cached rows may therefore stay painted while it catches up.
+   * A server downgrade to full swaps rows atomically at caught-up; a full replay or a
+   * reset clears the cursor, so this goes false and the skeleton returns.
+   */
+  isIncrementalCatchUp: boolean;
   hasOlderHistory: boolean;
   loadingOlderHistory: boolean;
   muxMessages: MuxMessage[];
@@ -488,6 +496,17 @@ function areHistoryPaginationCursorsEqual(
     a.beforeHistorySequence === b.beforeHistorySequence &&
     (a.beforeMessageId ?? null) === (b.beforeMessageId ?? null)
   );
+}
+
+/**
+ * The onChat replay mode the next subscription attempt requests. Shared by the subscription
+ * and the WorkspaceState selector so they can never disagree about whether catch-up is a
+ * since replay.
+ */
+function getOnChatReplayMode(aggregator: StreamingMessageAggregator): OnChatMode | undefined {
+  const cursor = aggregator.getOnChatCursor();
+  if (!cursor?.history) return undefined;
+  return { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
 }
 
 function createInitialHistoryPaginationState(): WorkspaceHistoryPaginationState {
@@ -2477,6 +2496,10 @@ export class WorkspaceStore {
         displayedMessages.length > 0 &&
         !transient.staleSkeletonExpired &&
         (transient.cachedTranscriptStale || displayedOnlyReplayedInitCards);
+      const isIncrementalCatchUp =
+        isHydratingTranscript &&
+        !transient.fullReplayInFlight &&
+        getOnChatReplayMode(aggregator)?.type === "since";
       const aggregatorTodos = aggregator.getCurrentTodos();
       // Sidebar status precedence, split into four tiers so each signal
       // wins exactly when it should. Active and inactive workspaces draw
@@ -2531,6 +2554,7 @@ export class WorkspaceStore {
         transcriptReplayFailed: transient.replayFailed,
         isHydratingTranscript,
         isTranscriptStale,
+        isIncrementalCatchUp,
         hasOlderHistory: historyPagination.hasOlder,
         loadingOlderHistory: historyPagination.loading,
         muxMessages: messages,
@@ -4261,12 +4285,11 @@ export class WorkspaceStore {
         if (refreshRequest) attemptContext.refreshRequest = refreshRequest;
         this.currentOnChatAttempts.set(workspaceId, attemptContext);
         if (aggregator) {
-          const cursor = aggregator.getOnChatCursor();
-          if (cursor?.history) {
-            mode = { type: "since", cursor: { history: cursor.history, stream: cursor.stream } };
+          mode = getOnChatReplayMode(aggregator);
+          if (mode?.type === "since") {
             attemptContext.since = {
-              requestedAnchorSequence: cursor.history.historySequence,
-              localActiveStreamMessageId: cursor.stream?.messageId,
+              requestedAnchorSequence: mode.cursor.history.historySequence,
+              localActiveStreamMessageId: mode.cursor.stream?.messageId,
             };
           }
         }

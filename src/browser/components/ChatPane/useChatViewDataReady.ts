@@ -95,6 +95,8 @@ export interface ChatViewRevealInputs {
   hasRenderableMessages: boolean;
   /** Cached rows are known to be missing backend content (WorkspaceState.isTranscriptStale). */
   isTranscriptStale: boolean;
+  /** Catch-up is a since replay (WorkspaceState.isIncrementalCatchUp). */
+  isIncrementalCatchUp: boolean;
 }
 
 export interface ChatViewRevealState {
@@ -113,16 +115,19 @@ export interface ChatViewRevealState {
  * - Revisit with trustworthy cached rows: they paint immediately (no skeleton)
  *   and the latched known-flags make decorations renderable in that same
  *   first commit.
- * - Stale cached rows or an empty transcript hold the skeleton until caught-up,
- *   even with an active stream/monitor barrier: an active turn does not mean
- *   history has loaded, and painting rows that are known to be incomplete would
- *   jump when the missing content lands. Live status stays in the composer dock
- *   so Stop remains reachable without following the skeleton or history height.
+ * - Stale cached rows repaired by a since replay stay painted with the dock
+ *   shimmer: the server verifies every row up to the cursor, so missing content
+ *   only appends after it or grows the in-flight message.
+ * - Stale cached rows under a full replay, or an empty transcript, hold the
+ *   skeleton until caught-up, even with an active stream/monitor barrier: an
+ *   active turn does not mean history has loaded, and a full replay rebuilds the
+ *   transcript from scratch. Live status stays in the composer dock so Stop
+ *   remains reachable without following the skeleton or history height.
  */
 export function computeChatViewReveal(inputs: ChatViewRevealInputs): ChatViewRevealState {
   const showHydrationPlaceholder =
     (inputs.isHydratingTranscript || !inputs.chatViewDataReady) &&
-    (!inputs.hasRenderableMessages || inputs.isTranscriptStale);
+    (!inputs.hasRenderableMessages || (inputs.isTranscriptStale && !inputs.isIncrementalCatchUp));
 
   return {
     showHydrationPlaceholder,

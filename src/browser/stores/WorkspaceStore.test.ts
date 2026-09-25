@@ -1738,7 +1738,7 @@ describe("WorkspaceStore", () => {
     });
 
     type ChatAttempt = ControllableAsyncIterable<WorkspaceChatMessage>;
-    let chatAttempts: Array<{ workspaceId: string; events: ChatAttempt }>;
+    let chatAttempts: Array<{ workspaceId: string; mode: unknown; events: ChatAttempt }>;
     let activityEvents: ControllableAsyncIterable<WorkspaceActivityEvent>;
 
     const attemptsFor = (id: string) =>
@@ -1778,7 +1778,7 @@ describe("WorkspaceStore", () => {
       chatAttempts = [];
       mockOnChat.mockImplementation(async function* (input, options) {
         const events = createControllableAsyncIterable<WorkspaceChatMessage>();
-        chatAttempts.push({ workspaceId: input?.workspaceId ?? "", events });
+        chatAttempts.push({ workspaceId: input?.workspaceId ?? "", mode: input?.mode, events });
         options?.signal?.addEventListener("abort", () => events.close(), { once: true });
         yield* events.iterable;
       });
@@ -1825,6 +1825,7 @@ describe("WorkspaceStore", () => {
       expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
       expect(state().isHydratingTranscript).toBe(false);
       expect(state().isTranscriptStale).toBe(false);
+      expect(state().isIncrementalCatchUp).toBe(false);
       expect(state().messages).toHaveLength(1);
     }
 
@@ -1833,7 +1834,7 @@ describe("WorkspaceStore", () => {
       ["streamingGeneration advances", { ...idleSnapshot, streamingGeneration: 2 }],
       ["recency advances", { ...idleSnapshot, recency: baseRecency + 1 }],
     ])(
-      "hides cached rows behind hydration after background activity (%s) until since caught-up",
+      "marks cached rows stale after background activity (%s) and keeps them painted until since caught-up",
       async (_change, snapshot) => {
         await hydrateCachedRow();
 
@@ -1842,7 +1843,11 @@ describe("WorkspaceStore", () => {
         await tick(0);
 
         const attempt = await revisit(2);
+        expect(attemptsFor(workspaceId)[1].mode).toMatchObject({ type: "since" });
         expect(state().isTranscriptStale).toBe(true);
+        // The since replay only appends after the server-verified cursor, so the stale rows
+        // stay painted (dock shimmer) instead of hiding behind the skeleton.
+        expect(state().isIncrementalCatchUp).toBe(true);
         await finishSinceReplay(attempt);
       }
     );
@@ -1921,6 +1926,189 @@ describe("WorkspaceStore", () => {
       // The aggregator already holds that stream's end; nothing is missing from the cache.
       await revisit(2);
       expect(state().isTranscriptStale).toBe(false);
+    });
+
+    /** Displayed rows as history ids, in display order. */
+    const displayedHistoryIds = () =>
+      state().messages.map((message) => ("historyId" in message ? message.historyId : message.id));
+
+    /** Leave with background activity so the revisit hydrates over stale cached rows. */
+    async function leaveWithBackgroundActivity(): Promise<void> {
+      store.setActiveWorkspaceId(otherWorkspaceId);
+      pushActivity(workspaceId, { ...idleSnapshot, recency: baseRecency + 1 });
+      await tick(0);
+    }
+
+    it("hides stale cached rows when the revisit has no history cursor (full replay)", async () => {
+      createAndAddWorkspace(store, workspaceId);
+      createAndAddWorkspace(store, otherWorkspaceId, {}, false);
+      const first = await chatAttempt(workspaceId, 1);
+      first.push(createHistoryMessageEvent("history-1", 1));
+      // A caught-up without a cursor leaves nothing to reconnect from.
+      first.push(caughtUpEvent({ replay: "full" }));
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      await leaveWithBackgroundActivity();
+
+      const hold = holdNextOnChatOpen();
+      store.setActiveWorkspaceId(workspaceId);
+      await hold.reached;
+      await tick(0);
+      expect(state().messages).toHaveLength(1);
+      expect(state().isTranscriptStale).toBe(true);
+      expect(state().isIncrementalCatchUp).toBe(false);
+
+      hold.release();
+      const attempt = await chatAttempt(workspaceId, 2);
+      expect(attemptsFor(workspaceId)[1].mode).toBeUndefined();
+      // The full replay rebuilds the transcript from scratch.
+      expect(await waitUntil(() => state().messages.length === 0)).toBe(true);
+      expect(state().isIncrementalCatchUp).toBe(false);
+      attempt.push(createHistoryMessageEvent("history-1", 1));
+      attempt.push(createHistoryMessageEvent("history-2", 2));
+      attempt.push(fullCaughtUpEvent(2));
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(displayedHistoryIds()).toEqual(["history-1", "history-2"]);
+    });
+
+    it("swaps painted stale rows for the replayed rows when the server downgrades since to full", async () => {
+      await hydrateCachedRow();
+      await leaveWithBackgroundActivity();
+      const attempt = await revisit(2);
+      expect(state().isIncrementalCatchUp).toBe(true);
+
+      // Prior history changed while away (fingerprint mismatch): the server answers the since
+      // request with the whole history. The cached row stays painted until caught-up.
+      attempt.push(createUserMessageEvent("edited-1", "edited", 1, 1));
+      attempt.push(createHistoryMessageEvent("history-2", 2));
+      await tick(0);
+      expect(displayedHistoryIds()).toEqual(["history-1"]);
+      attempt.push(
+        caughtUpEvent({
+          replay: "full",
+          downgradeReason: "fingerprint-mismatch",
+          cursor: { history: { messageId: "history-2", historySequence: 2 } },
+        })
+      );
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+
+      expect(displayedHistoryIds()).toEqual(["edited-1", "history-2"]);
+      expect(state().isTranscriptStale).toBe(false);
+      expect(state().isIncrementalCatchUp).toBe(false);
+    });
+
+    it("falls back to a full replay behind the skeleton after a since caught-up without an anchor", async () => {
+      await hydrateCachedRow();
+      await leaveWithBackgroundActivity();
+      const attempt = await revisit(2);
+      expect(state().isIncrementalCatchUp).toBe(true);
+      await finishSinceReplay(attempt);
+
+      // A second since caught-up on the same attempt has no anchor left to reconcile against,
+      // so the store drops its cursor and resubscribes with a full replay.
+      const hold = holdNextOnChatOpen();
+      attempt.push(sinceCaughtUpEvent());
+      await hold.reached;
+      await tick(0);
+      expect(state().isHydratingTranscript).toBe(true);
+      expect(state().isIncrementalCatchUp).toBe(false);
+
+      hold.release();
+      const retry = await chatAttempt(workspaceId, 3);
+      expect(attemptsFor(workspaceId)[2].mode).toBeUndefined();
+      expect(await waitUntil(() => state().messages.length === 0)).toBe(true);
+      expect(state().isIncrementalCatchUp).toBe(false);
+      retry.push(createHistoryMessageEvent("history-1", 1));
+      retry.push(fullCaughtUpEvent());
+      expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+      expect(displayedHistoryIds()).toEqual(["history-1"]);
+    });
+
+    describe("cached in-flight partial", () => {
+      const streamId = "live-stream";
+
+      /** Build a partial assistant row over the cached history, then leave mid-stream. */
+      async function leaveMidStream(): Promise<ChatAttempt> {
+        await hydrateCachedRow();
+        const live = attemptsFor(workspaceId)[0].events;
+        live.push(
+          streamStartEvent(workspaceId, streamId, { historySequence: 2, startTime: 2_000 })
+        );
+        live.push({
+          type: "stream-delta",
+          workspaceId,
+          messageId: streamId,
+          delta: "hello ",
+          tokens: 1,
+          timestamp: 2_100,
+        });
+        expect(
+          await waitUntil(() => store.getAggregator(workspaceId)!.getMessagePartCount(streamId) > 0)
+        ).toBe(true);
+
+        store.setActiveWorkspaceId(otherWorkspaceId);
+        await tick(0);
+        const attempt = await revisit(2);
+        expect(attemptsFor(workspaceId)[1].mode).toMatchObject({
+          type: "since",
+          cursor: { stream: { messageId: streamId } },
+        });
+        expect(state().isTranscriptStale).toBe(true);
+        expect(state().isIncrementalCatchUp).toBe(true);
+        expect(displayedHistoryIds()).toEqual(["history-1", streamId]);
+        return attempt;
+      }
+
+      const streamRows = () =>
+        state().messages.filter(
+          (message) => message.type === "assistant" && message.historyId === streamId
+        );
+
+      it("replaces the partial with the finalized row when the stream finished while away", async () => {
+        const attempt = await leaveMidStream();
+        attempt.push(createHistoryMessageEvent("history-1", 1));
+        attempt.push({
+          type: "message",
+          id: streamId,
+          role: "assistant",
+          parts: [{ type: "text", text: "hello world" }],
+          metadata: { historySequence: 2, timestamp: 2_500, model: TEST_MODEL },
+        });
+        attempt.push(sinceCaughtUpEvent(2, streamId));
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+
+        expect(displayedHistoryIds()).toEqual(["history-1", streamId]);
+        expect(streamRows()).toMatchObject([{ content: "hello world", isStreaming: false }]);
+        expect(state().canInterrupt).toBe(false);
+      });
+
+      it("appends the missed deltas to the partial when the same stream is still running", async () => {
+        const attempt = await leaveMidStream();
+        attempt.push(createHistoryMessageEvent("history-1", 1));
+        attempt.push(
+          streamStartEvent(workspaceId, streamId, {
+            historySequence: 2,
+            startTime: 2_000,
+            replay: true,
+          })
+        );
+        attempt.push({
+          type: "stream-delta",
+          workspaceId,
+          messageId: streamId,
+          delta: "world",
+          tokens: 1,
+          timestamp: 2_200,
+          replay: true,
+        });
+        attempt.push(
+          sinceCaughtUpEvent(1, "history-1", { messageId: streamId, lastTimestamp: 2_200 })
+        );
+        expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
+
+        expect(displayedHistoryIds()).toEqual(["history-1", streamId]);
+        expect(streamRows()).toMatchObject([{ content: "hello world", isStreaming: true }]);
+        expect(state().canInterrupt).toBe(true);
+      });
     });
 
     /** Swap in a store with a short stale-skeleton deadline and a fresh activity feed. */

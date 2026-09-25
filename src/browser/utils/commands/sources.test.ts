@@ -832,6 +832,7 @@ function makeWorkspaceState(goal: WorkspaceState["goal"]): WorkspaceState {
     transcriptReplayFailed: false,
     isHydratingTranscript: false,
     isTranscriptStale: false,
+    isIncrementalCatchUp: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],

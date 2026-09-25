@@ -428,14 +428,15 @@ function createHydrationStory(workspaceId: string): AppStory {
     });
 
     await step(
-      "Switching back to a workspace that streamed in the background shows the skeleton, not cached rows",
+      "Switching back to a workspace that streamed in the background keeps cached rows painted during the since replay",
       async () => {
         await switchWorkspace(canvasElement, otherWorkspace.id);
         await expect(
           await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
         ).toBeVisible();
         // A new turn started while this workspace was unsubscribed from onChat: the cached
-        // rows are missing that content, so they must not paint and then jump on caught-up.
+        // rows are missing that content, but the since replay only appends after the
+        // server-verified cursor, so they stay painted with the dock shimmer (#4505).
         emitActivity(workspace.id, {
           recency: STABLE_TIMESTAMP + 1,
           streaming: true,
@@ -447,9 +448,9 @@ function createHydrationStory(workspaceId: string): AppStory {
         await waitFor(() => expect(subscriptions).toBe(4));
         await expect(await canvas.findByRole("button", { name: "Stop streaming" })).toBeVisible();
         await checkTranscriptLayout(canvasElement);
-        await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
-        await expect(canvas.queryByText("Previously loaded response.")).toBeNull();
-        await expect(canvas.queryByTestId("transcript-loading-status")).toBeNull();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+        await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.getByTestId("transcript-loading-status")).toBeVisible();
         emitChat(history);
         emitChat({
           type: "caught-up",

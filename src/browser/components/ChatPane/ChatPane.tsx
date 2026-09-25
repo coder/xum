@@ -595,9 +595,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const operationalBundle = operationalBundleInfos?.[index];
     return operationalBundle === undefined || operationalBundle.position === "head";
   };
-  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
-  // workspace switches feel stable; rows known to be missing backend content hide behind
-  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
+  // Keep rendering cached transcript rows during incremental (since) catch-up so workspace
+  // switches feel stable, even when they are known to be missing backend content: the server
+  // verified every row up to the cursor, so the missing content only appends. Stale rows
+  // under a full replay hide behind the skeleton instead. The stream/monitor barrier
   // lives in the composer dock, so it never vetoes the skeleton. The skeleton
   // additionally holds until decoration data sources are known so the transcript and all
   // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
@@ -607,6 +608,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       chatViewDataReady,
       hasRenderableMessages: deferredMessages.length > 0,
       isTranscriptStale: workspaceState.isTranscriptStale,
+      isIncrementalCatchUp: workspaceState.isIncrementalCatchUp,
     });
   // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
   // it: it would otherwise mount the whole transcript in the one commit that replaces the

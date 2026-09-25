@@ -45,8 +45,8 @@ import { ONCHAT_REPLAY_TIMING_LOG_MESSAGE } from "../../../src/node/services/onC
  * (MockAiStreamPlayer.replayStream is a no-op and StreamManager.getStreamInfo is undefined for
  * them). The server therefore replays the chat without its live stream (`streamReplayed:
  * false`) and the renderer then shows it as interrupted, so only the FIRST return after leaving
- * a chat mid-stream is representative. That return still exercises the since-mode replay and
- * the stale-transcript skeleton (#4505); the streamReplay phase needs a real provider.
+ * a chat mid-stream is representative. That return still exercises the since-mode replay over
+ * a stale cached transcript (#4505); the streamReplay phase needs a real provider.
  */
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
@@ -56,11 +56,32 @@ const dwellMs = Number(getXumE2EEnv("E2E_CHAT_SWITCH_DWELL_MS") ?? "1000");
 const CAUGHT_UP_BUDGET_MS = 15_000;
 
 /**
- * Documented behavior before #4505: leaving a chat mid-stream marks its cached transcript
- * stale, so switching back shows the hydration skeleton until `caught-up`. #4505 (show cached
- * rows on incremental returns) should flip this to false.
+ * Leaving a chat mid-stream marks its cached transcript stale. Since #4505 a since-mode return
+ * keeps those cached rows painted (with the composer-dock shimmer) instead of hiding them behind
+ * the hydration skeleton until `caught-up`: the server verifies every row up to the cursor, so
+ * the missing content only appends.
  */
-const EXPECT_SKELETON_ON_MID_STREAM_SWITCH_BACK = true;
+const EXPECT_SKELETON_ON_MID_STREAM_SWITCH_BACK = false;
+
+/**
+ * Collapse the rendered `[data-message-id]` sequence into runs of consecutive equal ids and
+ * return the ids that appear in more than one run. One message can render several consecutive
+ * rows with the same id, so global uniqueness is not the invariant; a duplicated or reordered
+ * row after caught-up reconciliation would split a message's rows into separate runs.
+ */
+function findSplitMessageIds(renderedIds: string[]): string[] {
+  const runs: string[] = [];
+  for (const id of renderedIds) {
+    if (runs[runs.length - 1] !== id) runs.push(id);
+  }
+  const seen = new Set<string>();
+  const split = new Set<string>();
+  for (const id of runs) {
+    if (seen.has(id)) split.add(id);
+    seen.add(id);
+  }
+  return [...split];
+}
 
 interface SeededChat {
   config: DemoProjectConfig;
@@ -247,6 +268,17 @@ test.describe("chat switch performance profiling", () => {
         timeout: 20_000,
       });
       await expect.poll(measuredNames).toContain("first-row");
+      const renderedIds = await page
+        .getByTestId("message-window")
+        .locator("[data-message-id]")
+        .evaluateAll((elements) =>
+          elements.map((element) => element.getAttribute("data-message-id") ?? "")
+        );
+      expect(renderedIds.length, `${leg} renders transcript rows`).toBeGreaterThan(0);
+      expect(
+        findSplitMessageIds(renderedIds),
+        `${leg} has no duplicated or reordered rows`
+      ).toEqual([]);
 
       const dom = await readSwitchMilestones(page);
       const { measured: _measured, ...renderer } = await readRendererTimings(
