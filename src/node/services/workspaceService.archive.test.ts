@@ -1,5 +1,5 @@
 import type { TurnCompletion } from "./streamManager";
-import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
+import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
@@ -31,7 +31,7 @@ import {
   addToArchivingWorkspaces,
   createDeferred,
   mockInitStateManager,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
 
@@ -49,6 +49,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   let editConfigSpy: ReturnType<typeof mock>;
   let historyService: HistoryService;
   let historyConfig: Config;
+  let backgroundProcessManager: BackgroundProcessManager;
   let cleanupHistory: () => Promise<void>;
 
   const workspaceMetadata: WorkspaceMetadata = {
@@ -113,11 +114,13 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     } as unknown as AIService;
 
     mockStreamManager = { ...createStreamLifecycleMocks(), getStreamInfo: mock(() => undefined) };
+    backgroundProcessManager = createTestBackgroundProcessManager();
     workspaceService = createWorkspaceServiceForTest({
       config: mockConfig,
       historyService,
       aiService: mockAIService,
       initStateManager: mockInitStateManager as InitStateManager,
+      backgroundProcessManager,
       streamManager: mockStreamManager as unknown as WorkspaceServiceArgs[12],
     });
   });
@@ -853,11 +856,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // Simulates the post-unclean-restart state: the manager's in-memory map is empty but a
     // durable spawn record still points at a live nohup/setsid child (probe behavior itself
     // is covered in backgroundProcessManager.test.ts).
-    (
-      mockBackgroundProcessManager.hasOrphanedRunningBackgroundProcesses as Mock<
-        (workspaceId: string) => Promise<boolean>
-      >
-    ).mockImplementationOnce(() => Promise.resolve(true));
+    spyOn(backgroundProcessManager, "hasOrphanedRunningBackgroundProcesses").mockResolvedValueOnce(
+      true
+    );
 
     const result = await workspaceService.archive(workspaceId, undefined, {
       refuseLiveUserActivity: true,

@@ -2484,47 +2484,34 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
-    // Narrow WorkspaceService test doubles construct partial manager stubs (see the
-    // typeof guard on subscriptions below); a missing method reads as "no live monitor
-    // state" so shared paths like history clear still reconcile instead of crashing.
     const monitorManager = this.backgroundProcessManager;
     this.bashMonitorWakeReconciler = new BashMonitorWakeReconciler({
       sessionsDir: config.sessionsDir,
       processManager: {
         pullMonitorWakeSignals: (ownerWorkspaceId) =>
-          typeof monitorManager.pullMonitorWakeSignals === "function"
-            ? monitorManager.pullMonitorWakeSignals(ownerWorkspaceId)
-            : [],
+          monitorManager.pullMonitorWakeSignals(ownerWorkspaceId),
         getMonitorWakeDeliveryState: (processId, originNotAfterMs) =>
-          typeof monitorManager.getMonitorWakeDeliveryState === "function"
-            ? monitorManager.getMonitorWakeDeliveryState(processId, originNotAfterMs)
-            : Promise.resolve(undefined),
+          monitorManager.getMonitorWakeDeliveryState(processId, originNotAfterMs),
         acknowledgeMonitorWake: (processId, originNotAfterMs, matchedThroughOffset, settledAt) =>
-          typeof monitorManager.acknowledgeMonitorWake === "function"
-            ? monitorManager.acknowledgeMonitorWake(
-                processId,
-                originNotAfterMs,
-                matchedThroughOffset,
-                settledAt
-              )
-            : undefined,
+          monitorManager.acknowledgeMonitorWake(
+            processId,
+            originNotAfterMs,
+            matchedThroughOffset,
+            settledAt
+          ),
         dropRetiredMonitor: (processId, createdAt) =>
-          typeof monitorManager.dropRetiredMonitor === "function"
-            ? monitorManager.dropRetiredMonitor(processId, createdAt)
-            : undefined,
+          monitorManager.dropRetiredMonitor(processId, createdAt),
       },
       registry: this.bashMonitorRegistryStore,
       deliveredWakes: (ownerWorkspaceId, sinceMs) =>
         this.listDeliveredBashMonitorWakes(ownerWorkspaceId, sinceMs),
       onWake: (dispatch) => this.dispatchBashMonitorWake(dispatch),
     });
-    if (typeof this.backgroundProcessManager.on === "function") {
-      this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
-      this.backgroundProcessManager.on("monitor:match", this.bashMonitorMatchListener);
-      this.backgroundProcessManager.on("monitor:armed", this.bashMonitorArmedListener);
-      this.backgroundProcessManager.on("monitor:stopped", this.bashMonitorStoppedListener);
-      this.backgroundProcessManager.on("change", this.bashProcessChangeListener);
-    }
+    this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
+    this.backgroundProcessManager.on("monitor:match", this.bashMonitorMatchListener);
+    this.backgroundProcessManager.on("monitor:armed", this.bashMonitorArmedListener);
+    this.backgroundProcessManager.on("monitor:stopped", this.bashMonitorStoppedListener);
+    this.backgroundProcessManager.on("change", this.bashProcessChangeListener);
     this.bashMonitorRecoveryPromise = this.recoverBashMonitorStateAfterRestart();
     this.policyService = policyService;
     this.telemetryService = telemetryService;
@@ -2558,14 +2545,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // process-local activity caches bootstrapped for the REMOVED incarnation
     // so the revived workspace re-probes disk instead of showing ghost
     // workflow-run counts from session state that removal deleted.
-    // Guarded like the backgroundProcessManager subscriptions above: tests
-    // may construct WorkspaceService with a partial ExtensionMetadataService
-    // stub.
-    if (typeof this.extensionMetadata.setTombstoneClearedListener === "function") {
-      this.extensionMetadata.setTombstoneClearedListener((workspaceId) => {
-        this.evictWorkspaceActivityCaches(workspaceId);
-      });
-    }
+    this.extensionMetadata.setTombstoneClearedListener((workspaceId) => {
+      this.evictWorkspaceActivityCaches(workspaceId);
+    });
     // r63 startup self-heal: reclaim removal tombstones left behind by a
     // removal whose config deregistration AND tombstone rollback both failed
     // — otherwise that workspace stays registered but refused every mutation
@@ -4079,11 +4061,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private getActiveBashMonitorCount(workspaceId: string): number {
-    // Tests may construct WorkspaceService with a partial BackgroundProcessManager stub
-    // (same reason the constructor guards the event subscriptions).
-    if (typeof this.backgroundProcessManager.getActiveMonitorCount !== "function") {
-      return 0;
-    }
     return this.backgroundProcessManager.getActiveMonitorCount(workspaceId);
   }
 
@@ -4115,11 +4092,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   private notifyBashMonitorWakeStateChanged(workspaceId: string): void {
-    // Tests may construct WorkspaceService with a partial BackgroundProcessManager stub
-    // (same reason the constructor guards the event subscriptions).
-    if (typeof this.backgroundProcessManager.notifyMonitorWakeStateChanged !== "function") {
-      return;
-    }
     this.backgroundProcessManager.notifyMonitorWakeStateChanged(workspaceId);
   }
 
@@ -8476,13 +8448,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       : undefined;
     const metadata = metadataResult?.success ? metadataResult.data : undefined;
 
-    // Defensive config read: tests construct the service with partial Config mocks.
-    let cfg: Pick<ProjectsConfig, "agentAiDefaults" | "defaultModel" | "minThinkingLevelByModel">;
-    try {
-      cfg = this.config.loadConfigOrDefault();
-    } catch {
-      cfg = {};
-    }
+    const cfg = this.config.loadConfigOrDefault();
     const nameBucket = metadata?.aiSettingsByAgent?.name_workspace;
     // The workspace's active model (selected agent first; legacy settings can be
     // stale once per-agent settings exist), or the caller's models for a workspace
@@ -16605,11 +16571,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private async getDelegatedTurnContinuationSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {
-    // Tests construct WorkspaceService with partial HistoryService mocks (same
-    // defensive pattern as the iterateFullHistory caller above).
-    if (typeof this.historyService.getHistoryFromLatestBoundary !== "function") {
-      return null;
-    }
     const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) {
       return null;
@@ -16650,19 +16611,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // A wake row without valid options: keep walking toward the anchor row.
     }
     return null;
-  }
-
-  /**
-   * Defensive providers-config read: tests construct WorkspaceService with
-   * partial AIService mocks, so a missing method degrades to null instead of
-   * throwing inside internal turns (goal kickoff, heartbeats, compaction).
-   */
-  private getProvidersConfigSafe(): ReturnType<AIService["getProvidersConfig"]> | null {
-    try {
-      return this.aiService.getProvidersConfig() ?? null;
-    } catch {
-      return null;
-    }
   }
 
   /**
@@ -16720,7 +16668,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       agentId,
       profile: "interactive",
       cfg: config,
-      providersConfig: this.getProvidersConfigSafe(),
+      providersConfig: this.aiService.getProvidersConfig(),
       targetWorkspaceSettings: selectedAgentSettings
         ? targetWorkspaceBucketToLayer(selectedAgentSettings)
         : undefined,
@@ -16933,7 +16881,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       agentId: "compact",
       profile: "interactive",
       cfg: config,
-      providersConfig: this.getProvidersConfigSafe(),
+      providersConfig: this.aiService.getProvidersConfig(),
       targetWorkspaceSettings: compactAgentSettings
         ? targetWorkspaceBucketToLayer(compactAgentSettings)
         : undefined,
@@ -17308,7 +17256,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       agentId,
       profile: "interactive",
       cfg: config,
-      providersConfig: this.getProvidersConfigSafe(),
+      providersConfig: this.aiService.getProvidersConfig(),
       targetWorkspaceSettings: agentSettings
         ? targetWorkspaceBucketToLayer(agentSettings)
         : undefined,

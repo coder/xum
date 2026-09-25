@@ -21,7 +21,6 @@ import { awaitPendingBranchSummary } from "./branchSummary";
 import type { InitStateManager, InitStatus } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { createMuxMessage } from "@/common/types/message";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator";
@@ -30,7 +29,7 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   mockExtensionMetadataService,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
   setWorkspaceGoalOk,
 } from "./workspaceService.testHarness";
@@ -205,7 +204,7 @@ describe("WorkspaceService fork", () => {
       new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       extensionMetadata,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
     workspaceService.setWorkspaceGoalService(goalService);
 
@@ -395,7 +394,7 @@ describe("WorkspaceService fork", () => {
       }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager,
+      createTestBackgroundProcessManager(),
       sessionUsageService
     );
 
@@ -515,7 +514,7 @@ describe("WorkspaceService fork", () => {
       new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     const targetRuntime = {
@@ -629,7 +628,7 @@ describe("WorkspaceService fork", () => {
       new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     const targetRuntime = {
@@ -741,7 +740,7 @@ describe("WorkspaceService fork", () => {
       new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     const targetRuntime = {
@@ -852,7 +851,7 @@ describe("WorkspaceService fork", () => {
       new ContextManagementService({ config, historyService, aiService: mockAIService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadataService as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     const targetRuntime = {

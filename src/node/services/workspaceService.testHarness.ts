@@ -1,5 +1,6 @@
 // Shared fixtures for the workspaceService.*.test.ts suites (split from workspaceService.test.ts).
 import { expect, mock } from "bun:test";
+import { Err } from "@/common/types/result";
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
 import { createStreamLifecycleMocks } from "./agentSession.testHarness";
@@ -114,11 +115,12 @@ export const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
   ),
 };
 
-export const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
-  cleanup: mock(() => Promise.resolve()),
-  hasRunningBackgroundProcesses: mock(() => false),
-  hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-};
+/** Real manager with no processes; its output dir is only created if a test spawns one. */
+export function createTestBackgroundProcessManager(): BackgroundProcessManager {
+  return new BackgroundProcessManager(
+    path.join(tmpdir(), `xum-test-bg-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  );
+}
 
 export type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
 
@@ -126,11 +128,21 @@ export type MockWorkspaceConfig = Partial<Config> & {
   getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
 };
 
+/**
+ * AI-service fake with every member WorkspaceService and AgentSession call unconditionally:
+ * no provider config, no experiments, and no workspace metadata (the real service's answer
+ * for an unknown workspace). Tests override the members they drive.
+ */
 export function createMockAIService(overrides: Partial<AIService> = {}): AIService {
   return {
     on: mock(() => undefined),
     off: mock(() => undefined),
     ...createStreamLifecycleMocks(),
+    getProvidersConfig: mock(() => null),
+    isExperimentEnabled: mock(() => false),
+    getWorkspaceMetadata: mock((workspaceId: string) =>
+      Promise.resolve(Err(`Workspace metadata not found for ${workspaceId}`))
+    ),
     ...overrides,
   } as unknown as AIService;
 }
@@ -179,7 +191,7 @@ export function createWorkspaceServiceForTest(
     }),
     options.initStateManager ?? (mockInitStateManager as InitStateManager),
     options.extensionMetadata ?? (mockExtensionMetadataService as ExtensionMetadataService),
-    options.backgroundProcessManager ?? (mockBackgroundProcessManager as BackgroundProcessManager),
+    options.backgroundProcessManager ?? createTestBackgroundProcessManager(),
     options.sessionUsageService,
     options.policyService,
     options.telemetryService,

@@ -18,14 +18,13 @@ import type { AIService } from "./aiService";
 import type { InitStateManager, InitStatus } from "./initStateManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { WorkspaceServiceArgs, MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   createCompactionAdmissionMocks,
   mockInitStateManager,
   mockExtensionMetadataService,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
 
@@ -770,7 +769,7 @@ describe("WorkspaceService init cancellation", () => {
         }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager,
+        createTestBackgroundProcessManager(),
         undefined,
         undefined,
         undefined,
@@ -945,7 +944,7 @@ describe("WorkspaceService init cancellation", () => {
         }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager,
+        createTestBackgroundProcessManager(),
         undefined,
         undefined,
         undefined,
@@ -1066,7 +1065,7 @@ describe("WorkspaceService init cancellation", () => {
         }),
         mockInitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        createTestBackgroundProcessManager()
       );
 
       // Inject an in-progress init AbortController.
@@ -1147,7 +1146,7 @@ describe("WorkspaceService init cancellation", () => {
         }),
         mockInitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        createTestBackgroundProcessManager()
       );
 
       // Inject an in-progress init AbortController.
@@ -1224,7 +1223,7 @@ describe("WorkspaceService init cancellation", () => {
         }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        createTestBackgroundProcessManager()
       );
 
       // A session whose startup recovery may be one await away from dispatching.
@@ -1309,7 +1308,7 @@ describe("WorkspaceService init cancellation", () => {
         }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager
+        createTestBackgroundProcessManager()
       );
 
       const result = await workspaceService.remove(workspaceId, true);

@@ -29,7 +29,6 @@ import {
 import type { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { createMuxMessage } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
@@ -39,7 +38,7 @@ import {
   createCompactionAdmissionMocks,
   writePlanFile,
   createDeferred,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   setWorkspaceGoalOk,
 } from "./workspaceService.testHarness";
 
@@ -73,7 +72,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       new ContextManagementService({ config, historyService, aiService }),
       initStateManager,
       extensionMetadata,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
     const goalService = new WorkspaceGoalService(config, historyService, extensionMetadata);
     workspaceService.setWorkspaceGoalService(goalService);

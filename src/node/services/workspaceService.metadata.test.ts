@@ -12,12 +12,11 @@ import type { InitStateManager } from "./initStateManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import * as todoStorageModule from "@/node/services/todos/todoStorage";
 import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   mockInitStateManager,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
 
@@ -71,7 +70,7 @@ describe("WorkspaceService metadata listeners", () => {
       new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadata as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     aiService.emit("error", {
@@ -135,7 +134,7 @@ describe("WorkspaceService metadata listeners", () => {
       new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadata as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     try {

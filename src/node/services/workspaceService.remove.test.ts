@@ -24,7 +24,6 @@ import { resolveWorkspaceMemoryOwnerId } from "./memoryWorkspaceOwner";
 import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
@@ -32,7 +31,7 @@ import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
 import {
   mockInitStateManager,
   mockExtensionMetadataService,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createMockAIService,
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
@@ -245,7 +244,7 @@ describe("WorkspaceService remove timing rollup", () => {
         new ContextManagementService({ config: mockConfig as Config, historyService, aiService }),
         mockInitStateManager as InitStateManager,
         mockExtensionMetadataService as ExtensionMetadataService,
-        mockBackgroundProcessManager as BackgroundProcessManager,
+        createTestBackgroundProcessManager(),
         undefined, // sessionUsageService
         undefined, // policyService
         undefined, // telemetryService

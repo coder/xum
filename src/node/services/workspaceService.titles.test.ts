@@ -18,7 +18,6 @@ import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { createMuxMessage } from "@/common/types/message";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
 import type { MockWorkspaceConfig } from "./workspaceService.testHarness";
@@ -26,7 +25,7 @@ import {
   createCompactionAdmissionMocks,
   createDeferred,
   mockInitStateManager,
-  mockBackgroundProcessManager,
+  createTestBackgroundProcessManager,
   createMockAIService,
   createWorkspaceServiceForTest,
 } from "./workspaceService.testHarness";
@@ -123,7 +122,7 @@ describe("WorkspaceService pending auto-title", () => {
       new ContextManagementService({ config, historyService, aiService }),
       mockInitStateManager as InitStateManager,
       mockExtensionMetadata as ExtensionMetadataService,
-      mockBackgroundProcessManager as BackgroundProcessManager
+      createTestBackgroundProcessManager()
     );
 
     fakeSession = {
