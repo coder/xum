@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { Workspace } from "@/common/types/project";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { Config } from "@/node/config";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -290,6 +291,167 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
       (await config.getAllWorkspaceMetadata()).find((m) => m.id === WORKSPACE_ID)
         ?.unrelatedWorkspaceConsent
     ).toBe(source?.unrelatedWorkspaceConsent);
+  });
+});
+
+describe("WorkspaceService deferred-checkout default consent", () => {
+  let harness: Awaited<ReturnType<typeof createHarness>>;
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    mock.restore();
+    await harness.cleanup();
+  });
+
+  interface ServiceInternals {
+    pendingDefaultUnrelatedConsent: Set<string>;
+    grantPendingDefaultUnrelatedWorkspaceConsent: (workspaceId: string) => Promise<void>;
+    sanitizeMaterializedTaskWorkspace: (...args: unknown[]) => Promise<string | undefined>;
+    abortUnsanitizedCreation: (...args: unknown[]) => Promise<boolean>;
+    materializeDeferredCheckout: (args: unknown) => Promise<void>;
+    saveConfig: (config: unknown) => Promise<void>;
+    grantCreationUnrelatedWorkspaceConsent: (
+      projectPath: string,
+      workspaceId: string,
+      workspacePath: string
+    ) => Promise<string | undefined>;
+  }
+  const internals = () => harness.service as unknown as ServiceInternals;
+  /** What create() records for a deferred checkout before announcing it. */
+  const markPending = (workspaceId = WORKSPACE_ID) =>
+    internals().pendingDefaultUnrelatedConsent.add(workspaceId);
+  const grantPending = (workspaceId = WORKSPACE_ID) =>
+    internals().grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
+
+  /** Drives the real deferred-checkout settlement with a fake runtime. */
+  async function runDeferredCheckout(options: { materializeError?: Error } = {}) {
+    const initLogger = { logStderr: mock(() => undefined), logComplete: mock(() => undefined) };
+    await internals().materializeDeferredCheckout({
+      workspaceId: WORKSPACE_ID,
+      runtime: {
+        materializeWorkspace: mock(() =>
+          options.materializeError
+            ? Promise.reject(options.materializeError)
+            : Promise.resolve(undefined)
+        ),
+      },
+      runtimeConfig: { type: "worktree" },
+      workspaceName: "consent-ws",
+      initParams: {
+        projectPath: harness.projectPath,
+        workspacePath: harness.workspacePath,
+        initLogger,
+        trusted: true,
+      },
+      pending: {},
+      initAbortController: new AbortController(),
+    });
+  }
+
+  test("grants only after the checkout is sanitized, before the init hook runs", async () => {
+    markPending();
+    const consentAtSanitize: unknown[] = [];
+    const consentAtInit: unknown[] = [];
+    spyOn(internals(), "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
+      consentAtSanitize.push(harness.persistedConsent());
+      return Promise.resolve(undefined);
+    });
+    spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() => {
+      consentAtInit.push(harness.persistedConsent());
+      return Promise.resolve(undefined);
+    });
+    const published: Array<{ workspaceId: string }> = [];
+    harness.service.on("metadata", (event: { workspaceId: string }) => published.push(event));
+
+    await runDeferredCheckout();
+
+    // Not discoverable while stale plugin enables could still be unpruned...
+    expect(consentAtSanitize).toEqual([undefined]);
+    // ...granted (and published, since the workspace is already announced) before init.
+    const generation = harness.persistedConsent();
+    expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
+    expect(consentAtInit).toEqual([generation]);
+    expect(published.map((event) => event.workspaceId)).toEqual([WORKSPACE_ID]);
+    expect(harness.persistedConsent(OTHER_WORKSPACE_ID)).toBeUndefined();
+  });
+
+  test.each([
+    { label: "failed sanitization", sanitizeError: "stale enable", materializeError: undefined },
+    { label: "failed checkout", sanitizeError: undefined, materializeError: new Error("clone") },
+  ])("$label never grants", async ({ sanitizeError, materializeError }) => {
+    markPending();
+    spyOn(internals(), "sanitizeMaterializedTaskWorkspace").mockResolvedValue(sanitizeError);
+    spyOn(internals(), "abortUnsanitizedCreation").mockResolvedValue(true);
+    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+
+    await runDeferredCheckout({ materializeError });
+
+    expect(harness.persistedConsent()).toBeUndefined();
+  });
+
+  test("an explicit toggle while the default is pending wins", async () => {
+    markPending();
+    // The user turns it on and back off after the workspace appeared, before the grant runs.
+    expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(
+      true
+    );
+    expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false)).success).toBe(
+      true
+    );
+    const published: unknown[] = [];
+    harness.service.on("metadata", (event: unknown) => published.push(event));
+
+    await grantPending();
+
+    expect(harness.persistedConsent()).toBeUndefined();
+    expect(published).toEqual([]);
+  });
+
+  test("never grants a workspace that is not pending, and the mark is one-shot", async () => {
+    // Existing workspaces must never be backfilled through this path.
+    await grantPending(OTHER_WORKSPACE_ID);
+    expect(harness.persistedConsent(OTHER_WORKSPACE_ID)).toBeUndefined();
+
+    markPending();
+    await grantPending();
+    expect(harness.persistedConsent()).toBeDefined();
+    expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false)).success).toBe(
+      true
+    );
+    await grantPending();
+    expect(harness.persistedConsent()).toBeUndefined();
+  });
+
+  test("does not report consent whose save was swallowed", async () => {
+    // Config.saveConfig logs and swallows write failures; model one reaching the real edit path.
+    spyOn(harness.config as unknown as ServiceInternals, "saveConfig").mockResolvedValue(undefined);
+
+    // create() and fork() announce exactly what this returns, so it must be the persisted
+    // value (none), not the one the transform wrote in memory.
+    const reported = await internals().grantCreationUnrelatedWorkspaceConsent(
+      harness.projectPath,
+      WORKSPACE_ID,
+      harness.workspacePath
+    );
+
+    expect(reported).toBeUndefined();
+    expect(harness.persistedConsent()).toBeUndefined();
+  });
+
+  test("a failing metadata publication does not throw out of the grant", async () => {
+    markPending();
+    harness.service.on("metadata", () => {
+      throw new Error("metadata consumer exploded");
+    });
+
+    // Resolves (the deferred checkout must still go on to run its init hook)...
+    await grantPending();
+    // ...and the grant itself stays durable.
+    const generation = harness.persistedConsent();
+    expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
   });
 });
 

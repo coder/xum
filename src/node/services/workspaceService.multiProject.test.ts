@@ -5,6 +5,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import { Config, type SecretsStore } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { createStreamLifecycleMocks } from "@/node/services/agentSession.testHarness";
@@ -892,6 +893,10 @@ describe("WorkspaceService multi-project lifecycle", () => {
           { projectPath: projectAPath, projectName: "project-a" },
           { projectPath: projectBPath, projectName: "project-b" },
         ]);
+        // New root workspaces are opted in to unrelated messaging at creation.
+        const multiConsent = storedMultiWorkspaces[0]?.unrelatedWorkspaceConsent;
+        expect(multiConsent).toBeDefined();
+        expect(getValidUnrelatedWorkspaceConsent(multiConsent)).toBe(multiConsent);
       } finally {
         createContainerSpy.mockRestore();
         createRuntimeSpy.mockRestore();

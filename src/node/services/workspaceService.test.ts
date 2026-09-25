@@ -40,6 +40,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
 import type { SendMessageError } from "@/common/types/errors";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { Config, SecretsStore } from "@/node/config";
@@ -21193,6 +21194,56 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
+  test("new scratch workspaces opt in with distinct generations and a later opt-out persists", async () => {
+    const {
+      config,
+      historyService: scratchHistoryService,
+      cleanup,
+    } = await createTestHistoryService();
+    const aiService = {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      on: mock(() => undefined),
+      off: mock(() => undefined),
+    } as unknown as AIService;
+
+    try {
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService: scratchHistoryService,
+        aiService,
+      });
+      const first = await workspaceService.createScratch("First scratch");
+      const second = await workspaceService.createScratch("Second scratch");
+      if (!first.success || !second.success) {
+        throw new Error("Expected both scratch workspaces to be created");
+      }
+      const firstId = first.data.metadata.id;
+      const secondId = second.data.metadata.id;
+      const consentOf = async (workspaceId: string) =>
+        (await config.getAllWorkspaceMetadata()).find((m) => m.id === workspaceId)
+          ?.unrelatedWorkspaceConsent;
+
+      const firstConsent = await consentOf(firstId);
+      const secondConsent = await consentOf(secondId);
+      // The returned metadata already carries the grant, so the UI switch starts on.
+      expect(first.data.metadata.unrelatedWorkspaceConsent).toBe(firstConsent);
+      expect(getValidUnrelatedWorkspaceConsent(firstConsent)).toBe(firstConsent);
+      expect(getValidUnrelatedWorkspaceConsent(secondConsent)).toBe(secondConsent);
+      // Each workspace owns its own revocation generation.
+      expect(firstConsent).not.toBe(secondConsent);
+
+      // Opting out deletes the field; nothing re-mints it on reload (no startup backfill).
+      expect((await workspaceService.setUnrelatedWorkspaceConsent(firstId, false)).success).toBe(
+        true
+      );
+      expect(await consentOf(firstId)).toBeUndefined();
+      expect(await consentOf(secondId)).toBe(secondConsent);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("scratch removal refuses to delete a workdir the workspace does not own", async () => {
     // A stale or hand-edited config entry can point at another chat's dir
     // under the scratch root; removal must not recursively delete it.
@@ -21734,6 +21785,182 @@ describe("WorkspaceService init cancellation", () => {
       }),
     };
 
+    // Two pre-existing workspaces — auto-naming should skip past them. loadConfigOrDefault
+    // returns the same state editConfig mutates, so post-write re-reads see real writes.
+    const configState: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            workspaces: [
+              { id: "x", name: "workspace-1", path: "/tmp/proj-auto/workspace-1" },
+              { id: "y", name: "workspace-2", path: "/tmp/proj-auto/workspace-2" },
+            ],
+            trusted: true,
+          },
+        ],
+      ]),
+    };
+
+    const mockMetadata: FrontendWorkspaceMetadata = {
+      id: workspaceId,
+      name: "workspace-3",
+      projectName: "proj-auto",
+      projectPath,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      namedWorkspacePath: workspacePath,
+      runtimeConfig: { type: "local" },
+      pendingAutoTitle: true,
+    };
+
+    const mockConfig: MockWorkspaceConfig = {
+      rootDir: "/tmp/mux-root",
+      srcDir: "/tmp/src",
+      generateStableId: mock(() => workspaceId),
+      editConfig: mock((editFn: (config: ProjectsConfig) => ProjectsConfig) => {
+        editFn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([mockMetadata])),
+      sessionsDir: "/tmp/test/sessions",
+      findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => configState),
+    };
+
+    const mockAIService = {
+      ...createStreamLifecycleMocks(),
+      isStreaming: mock(() => false),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      on: mock(() => {}),
+      // eslint-disable-next-line @typescript-eslint/no-empty-function
+      off: mock(() => {}),
+    } as unknown as AIService;
+    const createWorkspaceMock = mock(() =>
+      Promise.resolve({ success: true as const, workspacePath })
+    );
+
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      createWorkspace: createWorkspaceMock,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+
+    try {
+      const workspaceService = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        new ContextManagementService({
+          config: mockConfig as Config,
+          historyService,
+          aiService: mockAIService,
+        }),
+        mockInitStateManager as InitStateManager,
+        mockExtensionMetadataService as ExtensionMetadataService,
+        mockBackgroundProcessManager as BackgroundProcessManager,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { getEffectiveSecrets: mock(() => []) } as unknown as SecretsStore
+      );
+
+      const removingWorkspaces = (
+        workspaceService as unknown as { removingWorkspaces: Set<string> }
+      ).removingWorkspaces;
+      // Skip the background init path so the test stays focused on auto-naming/persistence.
+      removingWorkspaces.add(workspaceId);
+
+      // Record the persisted consent while registration-time sanitization runs.
+      const consentDuringSanitize: unknown[] = [];
+      spyOn(
+        workspaceService as unknown as {
+          sanitizeStalePluginOverridesForNewWorkspace: (
+            workspaceId: string,
+            workspacePath: string
+          ) => Promise<string | undefined>;
+        },
+        "sanitizeStalePluginOverridesForNewWorkspace"
+      ).mockImplementation((id: string) => {
+        consentDuringSanitize.push(
+          configState.projects.get(projectPath)?.workspaces.find((entry) => entry.id === id)
+            ?.unrelatedWorkspaceConsent
+        );
+        return Promise.resolve(undefined);
+      });
+
+      const result = await workspaceService.create(
+        projectPath,
+        // No branchName — backend should auto-generate workspace-3.
+        undefined,
+        undefined,
+        undefined,
+        { type: "local" },
+        undefined,
+        // pendingAutoTitle: true mirrors the /fork-with-message flow.
+        true
+      );
+
+      expect(result.success).toBe(true);
+      if (!result.success) {
+        return;
+      }
+
+      // Backend picked the next "workspace-N" slot and threaded it through to
+      // both the runtime call and the persisted config entry.
+      expect(createWorkspaceMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branchName: "workspace-3",
+          directoryName: "workspace-3",
+        })
+      );
+
+      const persisted = configState.projects.get(projectPath)?.workspaces ?? [];
+      const newEntry = persisted.find((entry) => entry.id === workspaceId);
+      expect(newEntry?.name).toBe("workspace-3");
+      expect(newEntry?.pendingAutoTitle).toBe(true);
+      // New root workspaces are opted in to unrelated messaging at creation, but only after
+      // registration-time sanitization; the announced metadata carries the same generation.
+      expect(consentDuringSanitize).toEqual([undefined]);
+      expect(getValidUnrelatedWorkspaceConsent(newEntry?.unrelatedWorkspaceConsent)).toBe(
+        newEntry?.unrelatedWorkspaceConsent
+      );
+      expect(newEntry?.unrelatedWorkspaceConsent).toBeDefined();
+      expect(result.data.metadata.unrelatedWorkspaceConsent).toBe(
+        newEntry?.unrelatedWorkspaceConsent
+      );
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  test("create() with skipDefaultUnrelatedWorkspaceConsent leaves the workspace opted out", async () => {
+    // /new mirrors /fork's seamless flow: callers no longer have to invent a
+    // workspace name. The backend should derive the next "workspace-N" slot
+    // and persist `pendingAutoTitle` so the first message can title the workspace.
+    const workspaceId = "ws-auto-named";
+    const projectPath = "/tmp/proj-auto";
+    const workspacePath = "/tmp/proj-auto/workspace-3";
+
+    const initStates = new Map<string, InitStatus>();
+    const mockInitStateManager: Partial<InitStateManager> = {
+      on: mock(() => undefined as unknown as InitStateManager),
+      startInit: mock((id: string) => {
+        initStates.set(id, {
+          status: "running",
+          hookPath: projectPath,
+          startTime: 0,
+          lines: [],
+          exitCode: null,
+          endTime: null,
+        });
+      }),
+      getInitState: mock((id: string) => initStates.get(id)),
+      clearInMemoryState: mock((id: string) => {
+        initStates.delete(id);
+      }),
+    };
+
     const configState: ProjectsConfig = { projects: new Map() };
 
     const mockMetadata: FrontendWorkspaceMetadata = {
@@ -21819,6 +22046,24 @@ describe("WorkspaceService init cancellation", () => {
       // Skip the background init path so the test stays focused on auto-naming/persistence.
       removingWorkspaces.add(workspaceId);
 
+      // Record the persisted consent while registration-time sanitization runs.
+      const consentDuringSanitize: unknown[] = [];
+      spyOn(
+        workspaceService as unknown as {
+          sanitizeStalePluginOverridesForNewWorkspace: (
+            workspaceId: string,
+            workspacePath: string
+          ) => Promise<string | undefined>;
+        },
+        "sanitizeStalePluginOverridesForNewWorkspace"
+      ).mockImplementation((id: string) => {
+        consentDuringSanitize.push(
+          configState.projects.get(projectPath)?.workspaces.find((entry) => entry.id === id)
+            ?.unrelatedWorkspaceConsent
+        );
+        return Promise.resolve(undefined);
+      });
+
       const result = await workspaceService.create(
         projectPath,
         // No branchName — backend should auto-generate workspace-3.
@@ -21828,7 +22073,9 @@ describe("WorkspaceService init cancellation", () => {
         { type: "local" },
         undefined,
         // pendingAutoTitle: true mirrors the /fork-with-message flow.
-        true
+        true,
+        undefined,
+        { skipDefaultUnrelatedWorkspaceConsent: true }
       );
 
       expect(result.success).toBe(true);
@@ -21849,6 +22096,14 @@ describe("WorkspaceService init cancellation", () => {
       const newEntry = persisted.find((entry) => entry.id === workspaceId);
       expect(newEntry?.name).toBe("workspace-3");
       expect(newEntry?.pendingAutoTitle).toBe(true);
+      // Delegated targets are not opted in (yet): nothing persisted, announced or pending.
+      expect(newEntry?.unrelatedWorkspaceConsent).toBeUndefined();
+      expect(result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
+      expect(
+        (
+          workspaceService as unknown as { pendingDefaultUnrelatedConsent: Set<string> }
+        ).pendingDefaultUnrelatedConsent.has(workspaceId)
+      ).toBe(false);
     } finally {
       createRuntimeSpy.mockRestore();
     }
@@ -22670,7 +22925,7 @@ describe("WorkspaceService fork", () => {
       getOrCreateSessionSpy.mockRestore();
     }
   });
-  test("fork inherits a paused goal with fresh accounting but not unrelated-message consent", async () => {
+  test("fork inherits a paused goal with fresh accounting and gets its own unrelated-message consent", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -22768,6 +23023,38 @@ describe("WorkspaceService fork", () => {
       })
     );
 
+    // Record what other task trees could see while goal inheritance (post-registration fork
+    // setup) runs; the real inheritance still executes.
+    const consentDuringGoalInheritance: unknown[] = [];
+    const originalInheritFromFork = goalService.inheritFromFork.bind(goalService);
+    const inheritSpy = spyOn(goalService, "inheritFromFork").mockImplementation(
+      async (sourceId: string, targetId: string) => {
+        consentDuringGoalInheritance.push(
+          (await config.getAllWorkspaceMetadata()).find((entry) => entry.id === targetId)
+            ?.unrelatedWorkspaceConsent
+        );
+        return originalInheritFromFork(sourceId, targetId);
+      }
+    );
+
+    // Record what other task trees could see while registration-time sanitization runs.
+    const consentDuringSanitize: unknown[] = [];
+    const sanitizeSpy = spyOn(
+      workspaceService as unknown as {
+        sanitizeStalePluginOverridesForNewWorkspace: (
+          workspaceId: string,
+          workspacePath: string
+        ) => Promise<string | undefined>;
+      },
+      "sanitizeStalePluginOverridesForNewWorkspace"
+    ).mockImplementation(async (workspaceId: string) => {
+      consentDuringSanitize.push(
+        (await config.getAllWorkspaceMetadata()).find((entry) => entry.id === workspaceId)
+          ?.unrelatedWorkspaceConsent
+      );
+      return undefined;
+    });
+
     try {
       const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
 
@@ -22775,14 +23062,26 @@ describe("WorkspaceService fork", () => {
       if (!result.success) {
         throw new Error(`Expected success result, got error: ${result.error}`);
       }
+      // Consent is granted only after sanitization: while it runs the fork is registered but
+      // must not be discoverable or wakeable by unrelated agents.
+      expect(consentDuringSanitize).toEqual([undefined]);
+      // ...nor while the rest of the fork's setup (goal inheritance) is still running.
+      expect(consentDuringGoalInheritance).toEqual([undefined]);
 
       const metadataAfterFork = await config.getAllWorkspaceMetadata();
       expect(
         metadataAfterFork.find((entry) => entry.id === sourceWorkspaceId)?.unrelatedWorkspaceConsent
       ).toBe("source-consent");
-      expect(
-        metadataAfterFork.find((entry) => entry.id === newWorkspaceId)?.unrelatedWorkspaceConsent
-      ).toBeUndefined();
+      // New root workspaces are opted in by default, but with a fresh generation: sharing the
+      // source's value would let a revocation on one workspace be bypassed through the other.
+      const forkConsent = metadataAfterFork.find(
+        (entry) => entry.id === newWorkspaceId
+      )?.unrelatedWorkspaceConsent;
+      expect(forkConsent).toBeDefined();
+      expect(getValidUnrelatedWorkspaceConsent(forkConsent)).toBe(forkConsent);
+      expect(forkConsent).not.toBe("source-consent");
+      // The announced metadata matches what was persisted, so the UI switch starts on.
+      expect(result.data.metadata.unrelatedWorkspaceConsent).toBe(forkConsent);
 
       const forkGoal = await goalService.getGoal(newWorkspaceId);
       expect(forkGoal).toMatchObject({
@@ -22802,6 +23101,8 @@ describe("WorkspaceService fork", () => {
         turnsUsed: 1,
       });
     } finally {
+      inheritSpy.mockRestore();
+      sanitizeSpy.mockRestore();
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();

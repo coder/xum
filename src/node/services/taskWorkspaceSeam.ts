@@ -664,7 +664,7 @@ export interface WorkspaceProvisioningHost {
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
     tags?: Record<string, string>,
-    options?: { awaitMaterialization?: boolean }
+    options?: { awaitMaterialization?: boolean; skipDefaultUnrelatedWorkspaceConsent?: boolean }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,
