@@ -95,7 +95,7 @@ import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { SendMessageError } from "@/common/types/errors";
-import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
+import type { ErrorEvent, StreamEndEvent } from "@/common/types/stream";
 import {
   createMuxMessage,
   parseWorkspaceTurnTaskCorrelation,
@@ -140,7 +140,9 @@ import {
   saveLocalParentWorkspace,
   saveTestConfig,
   saveWorkspaces,
+  streamAbort,
   streamEnd,
+  streamError,
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
@@ -26843,10 +26845,6 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
@@ -26856,7 +26854,7 @@ describe("TaskService", () => {
     });
 
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      await internal.handleTaskStreamError({
+      await streamError(taskService, {
         type: "error",
         workspaceId: childId,
         messageId: `assistant-error-${attempt}`,
@@ -26922,10 +26920,6 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
@@ -26934,7 +26928,7 @@ describe("TaskService", () => {
       parts: [],
     });
 
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-auth",
@@ -27011,10 +27005,6 @@ describe("TaskService", () => {
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-      const internal = taskService as unknown as {
-        handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-      };
-
       const refusalMessage = terminal.message;
 
       // Waiter registered before the failure must reject promptly with the refusal
@@ -27026,7 +27016,7 @@ describe("TaskService", () => {
           (error: unknown) => error
         );
 
-      await internal.handleTaskStreamError({
+      await streamError(taskService, {
         type: "error",
         workspaceId: childId,
         messageId: "assistant-error-refusal",
@@ -27085,14 +27075,10 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     const refusalMessage =
       "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.";
 
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-refusal",
@@ -27146,13 +27132,9 @@ describe("TaskService", () => {
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     // A user interrupt (aborted) is a steerable pause: the user can still send a
     // follow-up message, so the task must not be terminally interrupted.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-abort",
@@ -27163,7 +27145,7 @@ describe("TaskService", () => {
     // context_exceeded is non-retryable but has in-session recovery (compaction
     // retry) listening on the same error event; while that recovery is preparing
     // a retry, settling here would interrupt a child that was about to continue.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-context",
@@ -27172,7 +27154,7 @@ describe("TaskService", () => {
     });
 
     // Retryable transport errors stay owned by the agent session's retry loop.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-network",
@@ -27224,12 +27206,8 @@ describe("TaskService", () => {
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     const contextMessage = "Prompt is too long: 250000 tokens > 200000 maximum";
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-context",
@@ -27279,15 +27257,11 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     const refusalMessage =
       "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.";
 
     // No foreground waiter exists (background child) when the refusal lands.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-refusal",
@@ -27362,10 +27336,6 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     const refusalMessage =
       "The model refused to continue (finishReason: content-filter): anthropic:claude-fable-5.";
 
@@ -27381,7 +27351,7 @@ describe("TaskService", () => {
     // parent is NOT woken yet (the last settlement owns the wake-up), but the
     // failure details are already delivered durably into the parent context so
     // a later sibling REPORT cannot present the fanout as fully successful.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childAId,
       messageId: "assistant-error-refusal-a",
@@ -27398,7 +27368,7 @@ describe("TaskService", () => {
 
     // Last background child refuses with no foreground waiter: its failure is appended too,
     // and the idle parent resumes once from the durable failure rows.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childBId,
       messageId: "assistant-error-refusal-b",
@@ -27448,11 +27418,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-refusal",
@@ -27503,12 +27469,8 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-
     // A retryable error that would normally trigger yet another recovery prompt.
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-empty",
@@ -27598,10 +27560,7 @@ describe("TaskService", () => {
     const { taskService: restartedTaskService } = createTaskServiceHarness(config, {
       workspaceService: restartedMocks.workspaceService,
     });
-    const restartedInternal = restartedTaskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-    await restartedInternal.handleTaskStreamError({
+    await streamError(restartedTaskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-empty",
@@ -27703,10 +27662,7 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    const internal = taskService as unknown as {
-      handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-    };
-    await internal.handleTaskStreamError({
+    await streamError(taskService, {
       type: "error",
       workspaceId: childId,
       messageId: "assistant-error-empty",
@@ -31851,11 +31807,8 @@ describe("TaskService", () => {
 
   test("workspace-turn system stream aborts keep the handle running for resume", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamAbort: (event: StreamAbortEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamAbort({
+    await streamAbort(taskService, {
       type: "stream-abort",
       workspaceId: "childworkspace",
       messageId: "msg_system_abort",
@@ -31879,11 +31832,8 @@ describe("TaskService", () => {
 
   test("workspace-turn stream aborts mark the handle interrupted", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamAbort: (event: StreamAbortEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamAbort({
+    await streamAbort(taskService, {
       type: "stream-abort",
       workspaceId: "childworkspace",
       messageId: "msg_1",
@@ -32039,11 +31989,7 @@ describe("TaskService", () => {
 
     const errorRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const failed = await startWorkspaceTurnForTest({ disposable: true, remove: errorRemove });
-    await (
-      failed.taskService as unknown as {
-        handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
-      }
-    ).handleTaskStreamError({
+    await streamError(failed.taskService, {
       type: "error",
       workspaceId: "childworkspace",
       messageId: "msg_error",
@@ -35147,11 +35093,7 @@ describe("TaskService", () => {
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
       t.receiptFake.record("entry-1", "canceled");
-      await (
-        t.taskService as unknown as {
-          handleStreamAbort: (event: StreamAbortEvent) => Promise<void>;
-        }
-      ).handleStreamAbort({
+      await streamAbort(t.taskService, {
         type: "stream-abort",
         workspaceId: t.childId,
         messageId: "successor",

@@ -33,7 +33,7 @@ import type {
   TaskHandleStore,
   WorkspaceTurnTaskHandleRecord,
 } from "@/node/services/taskHandleStore";
-import type { StreamEndEvent } from "@/common/types/stream";
+import type { ErrorEvent, StreamAbortEvent, StreamEndEvent } from "@/common/types/stream";
 import type { MuxMessageMetadata } from "@/common/types/message";
 
 export function initGitRepo(projectPath: string): void {
@@ -615,6 +615,8 @@ export function createTaskServiceStack(
   if (events != null) {
     taskServiceStreamEvents.set(taskService, events);
     recordHandlerFailures(taskService, "handleStreamEnd");
+    recordHandlerFailures(taskService, "handleStreamAbort");
+    recordHandlerFailures(taskService, "handleTaskStreamError");
   }
   return {
     historyService,
@@ -634,7 +636,10 @@ const handlerFailures = new WeakMap<object, unknown>();
  * Observe (never alter) a private stream handler: its listener only logs a rejection, so record it
  * against the exact event, which keeps overlapping deliveries apart without a global logger spy.
  */
-function recordHandlerFailures(taskService: TaskService, handler: "handleStreamEnd"): void {
+function recordHandlerFailures(
+  taskService: TaskService,
+  handler: "handleStreamEnd" | "handleStreamAbort" | "handleTaskStreamError"
+): void {
   const target = taskService as unknown as Record<
     typeof handler,
     (event: object, ...rest: unknown[]) => Promise<void>
@@ -651,23 +656,37 @@ function recordHandlerFailures(taskService: TaskService, handler: "handleStreamE
 }
 
 /**
- * Deliver a stream-end the way StreamManager does: emit it on the AIService TaskService subscribed
- * to, so the listener captures the queue-cut snapshot and the attempt origin in the event's own
- * tick, registers the stream-end decision and serializes on the workspace event lock. Resolves once
- * that lock drained, and rethrows this event's handler failure, which the listener only logs.
+ * Deliver a stream event the way StreamManager does: emit it on the AIService TaskService
+ * subscribed to, so the production listener captures its event-time state (queue-cut snapshot,
+ * attempt origin) in the event's own tick, registers the stream-end decision and serializes on the
+ * workspace event lock. Resolves once that lock drained, and rethrows this event's handler failure,
+ * which the listener only logs.
  */
-export async function streamEnd(taskService: TaskService, event: StreamEndEvent): Promise<void> {
+async function deliverStreamEvent(
+  taskService: TaskService,
+  name: "stream-end" | "stream-abort" | "error",
+  event: StreamEndEvent | StreamAbortEvent | ErrorEvent
+): Promise<void> {
   const events = taskServiceStreamEvents.get(taskService);
-  assert(
-    events,
-    "streamEnd needs a TaskService built by createTaskServiceStack with an event source"
-  );
-  assert(events.listenerCount("stream-end") > 0, "TaskService is not subscribed to stream-end");
+  assert(events, "stream events need a TaskService built by createTaskServiceStack");
+  assert(events.listenerCount(name) > 0, `TaskService is not subscribed to ${name}`);
   // Draining needs the lock itself: the listener's chained handler is not otherwise observable.
   // The handler (and its failure record) finishes inside the lock, before this wait resolves.
   const locks = (taskService as unknown as { workspaceEventLocks: MutexMap<string> })
     .workspaceEventLocks;
-  events.emit("stream-end", event);
+  events.emit(name, event);
   await locks.withLock(event.workspaceId, () => Promise.resolve());
   if (handlerFailures.has(event)) throw handlerFailures.get(event);
+}
+
+export function streamEnd(taskService: TaskService, event: StreamEndEvent): Promise<void> {
+  return deliverStreamEvent(taskService, "stream-end", event);
+}
+
+export function streamAbort(taskService: TaskService, event: StreamAbortEvent): Promise<void> {
+  return deliverStreamEvent(taskService, "stream-abort", event);
+}
+
+export function streamError(taskService: TaskService, event: ErrorEvent): Promise<void> {
+  return deliverStreamEvent(taskService, "error", event);
 }

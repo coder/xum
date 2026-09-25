@@ -40,7 +40,9 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspaces,
+  streamAbort,
   streamEnd,
+  streamError,
   stubStableIds,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
@@ -3625,20 +3627,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       });
       return false;
     });
-    await (
-      taskService as unknown as {
-        handleTaskStreamError: (event: unknown, attemptId?: string) => Promise<void>;
-      }
-    ).handleTaskStreamError(
-      {
-        type: "error",
-        workspaceId: taskId,
-        messageId: "assistant-refused",
-        error: "The model refused.",
-        errorType: "model_refusal",
-      },
-      attemptA
-    );
+    await streamError(taskService, {
+      type: "error",
+      workspaceId: taskId,
+      messageId: "assistant-refused",
+      error: "The model refused.",
+      errorType: "model_refusal",
+    });
     expect(entryOf(config, taskId)).toMatchObject({
       taskStatus: "running",
       taskAttemptId: foreign,
@@ -3989,9 +3984,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         return false as never;
       });
       try {
-        await (
-          taskService as unknown as { handleStreamAbort: (event: unknown) => Promise<void> }
-        ).handleStreamAbort({
+        await streamAbort(taskService, {
           type: "stream-abort",
           workspaceId: taskId,
           messageId: "assistant-A",
