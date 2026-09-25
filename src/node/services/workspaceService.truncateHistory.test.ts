@@ -59,7 +59,15 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     const workspaceService = harness.service;
     const goalService = new WorkspaceGoalService(config, historyService, extensionMetadata);
     workspaceService.setWorkspaceGoalService(goalService);
-    return { aiService, config, historyService, workspaceService, goalService, cleanup };
+    return {
+      aiService,
+      config,
+      historyService,
+      extensionMetadata,
+      workspaceService,
+      goalService,
+      cleanup,
+    };
   }
 
   test.each(["send", "resume", "resume-replaced"] as const)(
@@ -397,13 +405,11 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         chatEvents.on("chat-event", listener);
         return () => chatEvents.off("chat-event", listener);
       }),
+      onMetadataEvent: mock(() => () => undefined),
     } as unknown as AgentSession;
-    const internalWorkspaceService = workspaceService as unknown as {
-      sessions: Map<string, AgentSession>;
-    };
 
     try {
-      internalWorkspaceService.sessions.set(workspaceId, session);
+      workspaceService.registerSession(workspaceId, session);
       let resolved = false;
       const waitPromise = workspaceService.waitForIdleAndNoQueuedMessages(workspaceId).then(() => {
         resolved = true;
@@ -427,7 +433,6 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       expect(resolved).toBe(true);
       expect(waitForIdle).toHaveBeenCalledTimes(1);
     } finally {
-      internalWorkspaceService.sessions.delete(workspaceId);
       await cleanup();
     }
   });
@@ -794,10 +799,9 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         })
       );
 
-      (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-        workspaceId,
-        harness.session
-      );
+      workspaceService.registerSession(workspaceId, harness.session);
+      // Stale in-memory usage the replacement must drop: history seeding cannot supply it,
+      // because after the replacement the active window has no usage-bearing row.
       (harness.session as unknown as { lastUsageState?: AutoCompactionUsageState }).lastUsageState =
         {
           lastContextUsage: createDisplayUsage(
@@ -2353,7 +2357,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => false),
     });
-    const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
+    const { config, extensionMetadata, workspaceService, goalService, cleanup } =
+      await createServices(aiService);
     const workspaceId = "user-abort-discards-mutation";
     try {
       await config.addWorkspace("/tmp/user-abort-test-project", {
@@ -2372,13 +2377,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       });
 
       // Queue a mid-stream mutation (the real flow goes through
-      // setGoal-while-streaming; we override the private streaming check
-      // directly to avoid plumbing an entire AgentSession into this test).
-      const goalServiceAccess = goalService as unknown as {
-        isWorkspaceStreaming: (workspaceId: string) => Promise<boolean>;
-      };
-      const isStreamingOriginal = goalServiceAccess.isWorkspaceStreaming;
-      goalServiceAccess.isWorkspaceStreaming = () => Promise.resolve(true);
+      // setGoal-while-streaming; we mark the workspace streaming in the activity
+      // store the goal service reads, to avoid plumbing an entire AgentSession
+      // into this test).
+      await extensionMetadata.setStreaming(workspaceId, true);
       try {
         const queued = await goalService.setGoal({
           workspaceId,
@@ -2387,7 +2389,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         });
         expect(queued.success).toBe(true);
       } finally {
-        goalServiceAccess.isWorkspaceStreaming = isStreamingOriginal;
+        await extensionMetadata.setStreaming(workspaceId, false);
       }
 
       // Mirror the real AgentSession listener: when abortReason === "user",
@@ -2430,7 +2432,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => false),
     });
-    const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
+    const { config, extensionMetadata, workspaceService, goalService, cleanup } =
+      await createServices(aiService);
     const workspaceId = "midstream-goal-overlay";
     try {
       await config.addWorkspace("/tmp/midstream-goal-overlay-project", {
@@ -2448,11 +2451,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
 
       // Queue a goal set mid-stream (publishes an optimistic, pendingPersistence
       // snapshot without persisting goal.json).
-      const goalServiceAccess = goalService as unknown as {
-        isWorkspaceStreaming: (workspaceId: string) => Promise<boolean>;
-      };
-      const isStreamingOriginal = goalServiceAccess.isWorkspaceStreaming;
-      goalServiceAccess.isWorkspaceStreaming = () => Promise.resolve(true);
+      await extensionMetadata.setStreaming(workspaceId, true);
       try {
         const queued = await goalService.setGoal({
           workspaceId,
@@ -2461,7 +2460,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         });
         expect(queued.success).toBe(true);
       } finally {
-        goalServiceAccess.isWorkspaceStreaming = isStreamingOriginal;
+        await extensionMetadata.setStreaming(workspaceId, false);
       }
 
       // The durable goal.json still holds the pre-stream goal.
@@ -2521,7 +2520,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => false),
     });
-    const { config, workspaceService, goalService, cleanup } = await createServices(aiService);
+    const { config, extensionMetadata, workspaceService, goalService, cleanup } =
+      await createServices(aiService);
     const workspaceId = "system-abort-replays-mutation";
     try {
       await config.addWorkspace("/tmp/system-abort-test-project", {
@@ -2538,11 +2538,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         objective: "Original objective",
       });
 
-      const goalServiceAccess = goalService as unknown as {
-        isWorkspaceStreaming: (workspaceId: string) => Promise<boolean>;
-      };
-      const isStreamingOriginal = goalServiceAccess.isWorkspaceStreaming;
-      goalServiceAccess.isWorkspaceStreaming = () => Promise.resolve(true);
+      await extensionMetadata.setStreaming(workspaceId, true);
       try {
         const queued = await goalService.setGoal({
           workspaceId,
@@ -2551,7 +2547,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         });
         expect(queued.success).toBe(true);
       } finally {
-        goalServiceAccess.isWorkspaceStreaming = isStreamingOriginal;
+        await extensionMetadata.setStreaming(workspaceId, false);
       }
 
       aiEmitter.emit("stream-abort", {

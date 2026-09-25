@@ -97,12 +97,13 @@ describe("WorkspaceService pending auto-title", () => {
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
     };
 
-    (
-      workspaceService as unknown as {
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
+      fakeSession as unknown as AgentSession
+    );
 
+    // Keep AI-settings persistence instant: it runs between the concurrent-send test's capture
+    // barrier and the auto-title claim, and real disk I/O lets one send finish before the other
+    // reaches the claim, so the two sends no longer overlap.
     (
       workspaceService as unknown as {
         maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
@@ -110,28 +111,53 @@ describe("WorkspaceService pending auto-title", () => {
     ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
   });
 
+  /** Resolves once the service publishes `title` for this workspace (auto-title completion). */
+  function waitForTitleEmission(title: string): Promise<void> {
+    const emitted = createDeferred<void>();
+    const listener = (event: {
+      workspaceId: string;
+      metadata: FrontendWorkspaceMetadata | null;
+    }) => {
+      if (event.workspaceId !== workspaceId || event.metadata?.title !== title) return;
+      workspaceService.off("metadata", listener);
+      emitted.resolve();
+    };
+    workspaceService.on("metadata", listener);
+    return emitted.promise;
+  }
+
   afterEach(async () => {
     await harness.cleanup();
   });
 
   test("sendMessage triggers fork auto-title after the first accepted continue message", async () => {
-    const autoTitleSpy = spyOn(
-      workspaceService as unknown as {
-        maybeRunPendingAutoTitleFromMessage: (
-          workspaceId: string,
-          message: string
-        ) => Promise<void>;
-      },
-      "maybeRunPendingAutoTitleFromMessage"
-    ).mockResolvedValue(undefined);
+    const generateIdentitySpy = spyOn(
+      workspaceTitleGenerator,
+      "generateWorkspaceIdentity"
+    ).mockResolvedValue(
+      Ok({
+        name: "auth-hardening-a1b2",
+        title: "Harden auth flow",
+        modelUsed: "openai:gpt-4o-mini",
+      })
+    );
+    const titled = waitForTitleEmission("Harden auth flow");
 
-    const result = await workspaceService.sendMessage(workspaceId, "Continue with auth hardening", {
-      model: "openai:gpt-4o-mini",
-      agentId: "exec",
-    });
+    try {
+      const result = await workspaceService.sendMessage(
+        workspaceId,
+        "Continue with auth hardening",
+        { model: "openai:gpt-4o-mini", agentId: "exec" }
+      );
 
-    expect(result.success).toBe(true);
-    expect(autoTitleSpy).toHaveBeenCalledWith(workspaceId, "Continue with auth hardening");
+      expect(result.success).toBe(true);
+      // The auto-title runs detached from the send; its published title is the completion signal.
+      await titled;
+      expect(generateIdentitySpy).toHaveBeenCalledTimes(1);
+      expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("Continue with auth hardening");
+    } finally {
+      generateIdentitySpy.mockRestore();
+    }
   });
 
   test("concurrent sends only claim one pending auto-title generation", async () => {

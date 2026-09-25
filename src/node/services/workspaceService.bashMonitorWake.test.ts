@@ -21,6 +21,7 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { streamText, tool } from "ai";
 import { z } from "zod";
 import { StreamManager } from "./streamManager";
+import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
@@ -34,7 +35,6 @@ import type {
   BashMonitorProcessSnapshot,
   BashMonitorWakeReconciler,
   BashMonitorWakeReconcilerProcessManager,
-  BashMonitorWakeReconcilerRegistry,
   BashMonitorWakeDispatch,
 } from "./bashMonitorWakeReconciler";
 import {
@@ -44,6 +44,14 @@ import {
 } from "./workspaceService.testHarness";
 
 describe("WorkspaceService bash monitor wake reconciler wiring", () => {
+  // The durable auto-retry preference a restarted session reads for this workspace.
+  function autoRetryPreferencePath(h: {
+    config: { sessionsDir: string };
+    workspaceId: string;
+  }): string {
+    return path.join(h.config.sessionsDir, h.workspaceId, "auto-retry-preference.json");
+  }
+
   async function createWakeWiringService() {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const events = new EventEmitter();
@@ -57,16 +65,25 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       dropRetiredMonitor: mock(() => undefined),
       setMessageQueued: mock(() => undefined),
     }) as unknown as BackgroundProcessManager;
+    const aiService = createMockAIService({ isStreaming: mock(() => false) });
     const service = createWorkspaceServiceForTest({
       config,
       historyService,
-      aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      aiService,
       extensionMetadata: new ExtensionMetadataService(
         path.join(config.rootDir, "wake-wiring-extension-metadata.json")
       ),
       backgroundProcessManager,
     });
-    return { config, historyService, backgroundProcessManager, service, events, cleanup };
+    return {
+      config,
+      historyService,
+      aiService,
+      backgroundProcessManager,
+      service,
+      events,
+      cleanup,
+    };
   }
 
   async function createActiveWakeHarness(options?: {
@@ -124,7 +141,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     });
     const internal = service as unknown as {
       aiService: typeof harness.aiService;
-      sessions: Map<string, AgentSession>;
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: BashMonitorWakeReconciler;
       pendingBashMonitorWakeIdleWaitsByOwner: Map<string, Promise<void>>;
@@ -133,7 +149,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     await internal.bashMonitorRecoveryPromise;
     internal.aiService = harness.aiService;
-    internal.sessions.set(workspaceId, harness.session);
+    service.registerSession(workspaceId, harness.session);
     internal.getDelegatedTurnContinuationSendOptions = () =>
       Promise.resolve({ model, agentId: "exec" });
     const signals: BashMonitorProcessSnapshot[] = [];
@@ -327,17 +343,18 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
       // An unarchive whose restoration fails rolls back to archived; the wake must not have run
       // against the half-restored checkout in between.
-      const snapshots = h.internal as unknown as {
-        worktreeArchiveSnapshotService?: { restoreSnapshotAfterUnarchive(): Promise<unknown> };
-      };
-      snapshots.worktreeArchiveSnapshotService = {
-        restoreSnapshotAfterUnarchive: () => Promise.resolve(Err("restore failed")),
-      };
+      const restoreSnapshotAfterUnarchive = mock(
+        (): Promise<Result<void>> => Promise.resolve(Err("restore failed"))
+      );
+      h.service.setWorktreeArchiveSnapshotService({
+        restoreSnapshotAfterUnarchive,
+      } as unknown as Parameters<WorkspaceService["setWorktreeArchiveSnapshotService"]>[0]);
       expect((await h.service.unarchive(h.workspaceId)).success).toBe(false);
+      expect(restoreSnapshotAfterUnarchive).toHaveBeenCalledTimes(1);
       await h.reconciler.reconcile(h.workspaceId);
       expect(send).not.toHaveBeenCalled();
 
-      snapshots.worktreeArchiveSnapshotService = undefined;
+      restoreSnapshotAfterUnarchive.mockImplementation(() => Promise.resolve(Ok(undefined)));
       // Restoration succeeds but a follow-up step throws: unarchivedAt is already persisted and a
       // retried unarchive would not run the hooks again, so the held attention must still wake.
       spyOn(
@@ -978,17 +995,16 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
   test("a hard Stop whose retirement failed reports it and the retirement lands before any later wake", async () => {
     const h = await createActiveWakeHarness();
+    let registryListAll: { mockRestore(): void } | undefined;
     try {
       await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
       await h.addAttention(10);
-      const reconcilerInternal = h.reconciler as unknown as {
-        args: { registry: BashMonitorWakeReconcilerRegistry };
-      };
+      // The service owns a single registry store, so the prototype spy reaches exactly it.
       // Lazy rejection: the stop's I/O crosses a macrotask boundary before the retirement reads
       // the registry, and an eager mockRejectedValueOnce promise trips bun's unhandled-rejection
       // detector in that gap.
-      spyOn(reconcilerInternal.args.registry, "listAll").mockImplementationOnce(() =>
-        Promise.reject(new Error("transient registry read"))
+      registryListAll = spyOn(BashMonitorRegistryStore.prototype, "listAll").mockImplementationOnce(
+        () => Promise.reject(new Error("transient registry read"))
       );
       spyOn(h.aiService, "stopStream").mockImplementation(async () => {
         h.abort("user");
@@ -1011,6 +1027,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await woke;
       expect(h.requests).toHaveLength(2);
     } finally {
+      registryListAll?.mockRestore();
       await h.finish();
     }
   });
@@ -1309,9 +1326,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect((await stop!).success).toBe(true);
       expect(wakeWithdrawnAtOptOut).toBe(true);
       expect(h.requests).toHaveLength(0);
-      const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
       const persisted = JSON.parse(
-        await fsPromises.readFile(sessionInternal.getAutoRetryPreferencePath(), "utf-8")
+        await fsPromises.readFile(autoRetryPreferencePath(h), "utf-8")
       ) as { enabled?: boolean };
       expect(persisted.enabled).toBe(false);
     } finally {
@@ -1325,7 +1341,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     try {
       const sessionInternal = h.session as unknown as {
         persistAutoRetryState(): Promise<void>;
-        getAutoRetryPreferencePath(): string;
       };
       const persist = sessionInternal.persistAutoRetryState.bind(h.session);
       const persisting = createDeferred<void>();
@@ -1355,7 +1370,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect((await stop!).success).toBe(true);
       await attention;
       const persisted = JSON.parse(
-        await fsPromises.readFile(sessionInternal.getAutoRetryPreferencePath(), "utf-8")
+        await fsPromises.readFile(autoRetryPreferencePath(h), "utf-8")
       ) as { startupAutoRetryAbandon?: { reason: string; userMessageId?: string } };
       expect(persisted.startupAutoRetryAbandon?.reason).toBe("aborted");
       expect(persisted.startupAutoRetryAbandon?.userMessageId).toBeDefined();
@@ -1369,8 +1384,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   test("hard Stop during a wake's acceptance window fails until the withdrawn wake's abandon marker is written", async () => {
     const h = await createActiveWakeHarness();
     try {
-      const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
-      const preferencePath = sessionInternal.getAutoRetryPreferencePath();
+      const preferencePath = autoRetryPreferencePath(h);
       // A directory at the preference path makes the marker write fail (EISDIR).
       await fsPromises.mkdir(preferencePath, { recursive: true });
       let stop: Promise<Result<void>> | undefined;
@@ -1460,9 +1474,8 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         await h.addAttention(10);
         expect(stop).toBeDefined();
         expect((await stop!).success).toBe(true);
-        const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
         const persisted = JSON.parse(
-          await fsPromises.readFile(sessionInternal.getAutoRetryPreferencePath(), "utf-8")
+          await fsPromises.readFile(autoRetryPreferencePath(h), "utf-8")
         ) as { startupAutoRetryAbandon?: { reason: string; userMessageId?: string } };
         const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
         const wakeRow = history.success
@@ -1725,25 +1738,14 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   });
 
   test("runtime failure recreates missing registry evidence from arm metadata", async () => {
-    const { service, events, cleanup } = await createWakeWiringService();
+    const { config, service, events, cleanup } = await createWakeWiringService();
     const scheduleReconcile = mock(() => undefined);
     const internal = service as unknown as {
       bashMonitorRecoveryPromise: Promise<void>;
       bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-      bashMonitorRegistryStore: {
-        listAll(workspaceId: string): Promise<
-          Array<{
-            processId: string;
-            lost?: {
-              reason: "runtime-failure";
-              failureMessage?: string;
-              failedOperations?: string[];
-              failedMatch?: { lines: string[] };
-            };
-          }>
-        >;
-      };
     };
+    // Read the evidence back through a fresh store: it must be durable, not only in memory.
+    const registry = new BashMonitorRegistryStore(config);
     try {
       await internal.bashMonitorRecoveryPromise;
       internal.bashMonitorWakeReconciler = { scheduleReconcile };
@@ -1771,10 +1773,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         },
       });
 
-      let rows = await internal.bashMonitorRegistryStore.listAll("owner");
+      let rows = await registry.listAll("owner");
       for (let attempt = 0; attempt < 20 && rows.length === 0; attempt++) {
         await new Promise((resolve) => setTimeout(resolve, 10));
-        rows = await internal.bashMonitorRegistryStore.listAll("owner");
+        rows = await registry.listAll("owner");
       }
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
@@ -2118,7 +2120,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   });
 
   test("active session-backed streams defer monitor attention until idle", async () => {
-    const { config, service, cleanup } = await createWakeWiringService();
+    const { config, aiService, service, cleanup } = await createWakeWiringService();
     const workspaceId = "streaming-wake-owner";
     await config.addWorkspace("/tmp/streaming-wake-project", {
       id: workspaceId,
@@ -2127,14 +2129,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       projectPath: "/tmp/streaming-wake-project",
       runtimeConfig: { type: "local" },
     });
-    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
     const afterIdle = mock(() => undefined);
     const internal = service as unknown as {
-      aiService: { isStreaming(workspaceId: string): boolean };
       hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
       scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
       getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
-      sendMessage: typeof sendMessage;
       dispatchBashMonitorWake(dispatch: {
         ownerWorkspaceId: string;
         prompt: string;
@@ -2146,11 +2145,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     };
     try {
       spyOn(service.getOrCreateSession(workspaceId), "isBusy").mockReturnValue(true);
-      internal.aiService = { isStreaming: () => true };
+      spyOn(aiService, "isStreaming").mockReturnValue(true);
       internal.hasPendingQueuedOrPreparingTurn = () => false;
       internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
       internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
-      internal.sendMessage = sendMessage;
+      const sendMessage = spyOn(service, "sendMessage").mockResolvedValue(Ok(undefined));
 
       const outcome = await internal.dispatchBashMonitorWake({
         ownerWorkspaceId: workspaceId,
@@ -2179,12 +2178,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       projectPath: "/tmp/compacting-wake-project",
       runtimeConfig: { type: "local" },
     });
-    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
     const afterIdle = mock(() => undefined);
     const internal = service as unknown as {
       scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
       getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
-      sendMessage: typeof sendMessage;
       dispatchBashMonitorWake(dispatch: {
         ownerWorkspaceId: string;
         prompt: string;
@@ -2204,7 +2201,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       coordinator.setCompactionStage(token, "stopping");
       internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
       internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
-      internal.sendMessage = sendMessage;
+      const sendMessage = spyOn(service, "sendMessage").mockResolvedValue(Ok(undefined));
 
       const outcome = await internal.dispatchBashMonitorWake({
         ownerWorkspaceId: workspaceId,

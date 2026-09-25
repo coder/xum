@@ -622,13 +622,12 @@ describe("WorkspaceService initialize", () => {
     const startupAccess = workspaceService as unknown as {
       transientStartupRecoverySessions: Map<string, AgentSession>;
       sessions: Map<string, AgentSession>;
-      getOrCreateSession: (workspaceId: string) => AgentSession;
       createSession: (workspaceId: string) => AgentSession;
     };
     startupAccess.transientStartupRecoverySessions.set("live-ws", fakeSession);
     const createSessionSpy = spyOn(startupAccess, "createSession");
 
-    const claimedSession = startupAccess.getOrCreateSession("live-ws");
+    const claimedSession = workspaceService.getOrCreateSession("live-ws");
 
     expect(claimedSession).toBe(fakeSession);
     expect(startupAccess.transientStartupRecoverySessions.has("live-ws")).toBe(false);
