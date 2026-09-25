@@ -193,7 +193,18 @@ export async function writeSubagentAttemptSettlementReceipt(params: {
         receipt.taskId,
         receipt.attemptId
       );
-      if (existing.kind === "found") continue;
+      if (existing.kind === "found") {
+        // Immutable: an existing receipt for this attempt stands, but only when it vouches for
+        // the same parent. One naming another parent (copied or corrupted state) is not this
+        // settlement's evidence, and lineage would reject it after a restart, so the write
+        // fails (the caller leaves the attempt closing) instead of reporting success.
+        if (existing.receipt.parentWorkspaceId !== receipt.parentWorkspaceId) {
+          errors.push(
+            `${receiptPath}: existing receipt names parent ${existing.receipt.parentWorkspaceId}, not ${receipt.parentWorkspaceId}`
+          );
+        }
+        continue;
+      }
       if (existing.kind === "unreadable") {
         errors.push(`${receiptPath}: existing receipt unreadable (${existing.error})`);
         continue;

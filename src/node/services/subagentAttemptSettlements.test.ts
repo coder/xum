@@ -99,6 +99,30 @@ describe("subagentAttemptSettlements", () => {
     if (read.kind === "found") expect(read.receipt.source).toBe("execution-settled");
   });
 
+  test("an existing receipt naming another parent fails the write and is kept unchanged", async () => {
+    const attemptId = newTaskAttemptId();
+    const receipt = {
+      taskId,
+      attemptId,
+      parentWorkspaceId: "parent",
+      source: "execution-settled" as const,
+      settledAt: "2026-09-18T00:00:00.000Z",
+    };
+    // Copied or corrupted state: a valid receipt for this attempt that vouches for another parent.
+    await writeSubagentAttemptSettlementReceipt({
+      ownerWorkspaceSessionDirs: [parentDir],
+      receipt: { ...receipt, parentWorkspaceId: "other-parent" },
+    });
+    const write = await writeSubagentAttemptSettlementReceipt({
+      ownerWorkspaceSessionDirs: [parentDir],
+      receipt,
+    });
+    expect(write.success).toBe(false);
+    const read = await readSubagentAttemptSettlementReceiptStrict(parentDir, taskId, attemptId);
+    expect(read.kind).toBe("found");
+    if (read.kind === "found") expect(read.receipt.parentWorkspaceId).toBe("other-parent");
+  });
+
   test("a receipt for another attempt never matches, and corrupt or mismatched files read unreadable", async () => {
     const attemptId = newTaskAttemptId();
     const other = newTaskAttemptId();
