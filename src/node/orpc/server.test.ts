@@ -1152,6 +1152,54 @@ describe("createOrpcServer", () => {
     }
   });
 
+  test("MCP OAuth callback forwards the RFC 9207 iss parameter (query + form_post)", async () => {
+    // The MCP SDK rejects the code exchange for issuers that advertise RFC 9207
+    // unless the route passes `iss` through (Linear login regression).
+    const callbackInputs: unknown[] = [];
+    const stubContext: Partial<ORPCContext> = {
+      mcpOauthService: {
+        handleServerCallbackAndExchange: (input: unknown) => {
+          callbackInputs.push(input);
+          return Promise.resolve({ success: true, data: undefined });
+        },
+      } as unknown as ORPCContext["mcpOauthService"],
+    };
+
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+      });
+
+      const issuer = "https://mcp.linear.app";
+      const queryRes = await fetch(
+        `${server.baseUrl}/auth/mcp-oauth/callback?state=query-state&code=query-code&iss=${encodeURIComponent(issuer)}`
+      );
+      expect(queryRes.status).toBe(200);
+
+      const formRes = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          state: "form-state",
+          code: "form-code",
+          iss: issuer,
+        }).toString(),
+      });
+      expect(formRes.status).toBe(200);
+
+      expect(callbackInputs).toEqual([
+        expect.objectContaining({ state: "query-state", code: "query-code", iss: issuer }),
+        expect.objectContaining({ state: "form-state", code: "form-code", iss: issuer }),
+      ]);
+    } finally {
+      await server?.close();
+    }
+  });
+
   test("allows cross-origin POST requests on OAuth callback routes", async () => {
     const handleSuccessfulCallback = () => Promise.resolve({ success: true, data: undefined });
     const stubContext: Partial<ORPCContext> = {
