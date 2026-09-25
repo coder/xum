@@ -763,6 +763,31 @@ describe("ServiceContainer", () => {
     expect(idleCompactionStart).not.toHaveBeenCalled();
   });
 
+  it("dispose joins a queue drain that startup recovery left launching tasks", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Recovery returned, but the drain it scheduled is still launching a task.
+    const drain = Promise.withResolvers<void>();
+    const drainSettled = spyOn(services.taskService, "queueDrainSettled").mockReturnValue(
+      drain.promise
+    );
+    const closeAll = spyOn(services.desktopSessionManager, "closeAll").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+
+    await services.initializeCore();
+    const disposed = services.dispose();
+    while (drainSettled.mock.calls.length === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    // Teardown past the join waits for the launch to settle (within the join bound).
+    expect(closeAll).not.toHaveBeenCalled();
+    drain.resolve();
+    await disposed;
+    expect(closeAll).toHaveBeenCalledTimes(1);
+  });
+
   it("runStartupHousekeeping starts the periodic services even when task housekeeping rejects", async () => {
     services = new ServiceContainer(stores);
     spyOn(services.taskService, "recoverInterruptedTasks").mockImplementation(() =>

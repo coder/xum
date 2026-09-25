@@ -4248,6 +4248,14 @@ export class TaskService implements AgentTaskIntegration {
    * Such a recovery can still be running at shutdown, so `options.signal` (aborted by dispose)
    * stops it before the queue drain and before each re-drive: work reserved or dispatched after
    * shutdown began would fail against latched services and be persisted as interrupted.
+   *
+   * Only the decisions belong here, never network-bound work: a large server restarted with many
+   * active tasks outlived the startup step bound while awaiting each re-drive's stream startup
+   * (runtime `ensureReady`, MCP servers, model creation) one task at a time, and an outlived
+   * recovery overlaps early clients. So re-drive prompts return once accepted (stream startup
+   * continues in the background, like the guidance replay and compaction follow-up sends), and
+   * the queue drain is scheduled like any runtime drain instead of awaiting the forks, init hooks
+   * and first turns it launches.
    */
   async recoverInterruptedTasks(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
@@ -4348,10 +4356,10 @@ export class TaskService implements AgentTaskIntegration {
 
     // Normalize stopped capacity before launching siblings; newly launched work is not part of
     // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
+    // Scheduled, not awaited: launches are ordinary runtime work that already races clients
+    // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
     if (cancelled("queue-drain")) return;
-    const maybeStartQueuedTasksStartedAt = Date.now();
-    await this.maybeStartQueuedTasks();
-    const maybeStartQueuedTasksMs = Date.now() - maybeStartQueuedTasksStartedAt;
+    this.scheduleMaybeStartQueuedTasks();
 
     // Recovery awaits and queue draining can change task status: re-read before replaying intent.
     config = this.config.loadConfigOrDefault();
@@ -4384,6 +4392,7 @@ export class TaskService implements AgentTaskIntegration {
 
     let resumedAwaitingReportCount = 0;
     let skippedAwaitingReportDueToActiveDescendants = 0;
+    let skippedAwaitingReportAlreadyBusy = 0;
     let failedAwaitingReportCount = 0;
 
     for (const task of awaitingReportTasks) {
@@ -4396,6 +4405,13 @@ export class TaskService implements AgentTaskIntegration {
         this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
       if (hasBlockingActiveDescendants) {
         skippedAwaitingReportDueToActiveDescendants += 1;
+        continue;
+      }
+      // A busy session already owns a turn (e.g. an earlier pass's background completion prompt
+      // still preparing, not yet streaming): rotating would hand its result to a superseded
+      // attempt. Its stream end re-enters completion recovery.
+      if (this.workspaceService.isBusyForMessage(task.id)) {
+        skippedAwaitingReportAlreadyBusy += 1;
         continue;
       }
 
@@ -4454,7 +4470,10 @@ export class TaskService implements AgentTaskIntegration {
       const pendingGuidance = task.taskPendingGuidance ?? [];
       const queueOnly = states.get(task.id) === "question";
       if (queueOnly && pendingGuidance.length === 0) continue;
-      const alreadyStreaming = this.aiService.isStreaming(task.id);
+      // A busy session counts as active: re-drive sends return once accepted, so an earlier
+      // recovery pass's nudge can still be preparing (not yet streaming) when this pass runs.
+      const alreadyStreaming =
+        this.aiService.isStreaming(task.id) || this.workspaceService.isBusyForMessage(task.id);
       // Guidance must queue even for active tasks; generic restart nudges must not.
       if (alreadyStreaming && pendingGuidance.length === 0) {
         skippedRunningAlreadyStreaming += 1;
@@ -4571,6 +4590,8 @@ export class TaskService implements AgentTaskIntegration {
                 acceptanceOrigin: "automatic",
                 synthetic: true,
                 agentInitiated: true,
+                // Accepted is enough; stream startup must not gate the listener (see method doc).
+                startStreamInBackground: true,
                 turnAdmission: nudgeToken,
                 admissionStale: () => nudgeToken.admissionStale(),
               }
@@ -4592,10 +4613,10 @@ export class TaskService implements AgentTaskIntegration {
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
       totalMs: Date.now() - startupStartedAt,
-      maybeStartQueuedTasksMs,
       awaitingReportTaskCount: awaitingReportTasks.length,
       resumedAwaitingReportCount,
       skippedAwaitingReportDueToActiveDescendants,
+      skippedAwaitingReportAlreadyBusy,
       failedAwaitingReportCount,
       runningTaskCount: runningTasks.length,
       resumedRunningCount,
@@ -6019,6 +6040,20 @@ export class TaskService implements AgentTaskIntegration {
       log.error("Failed to launch reserved task", { taskId: plan.taskId, error });
       void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
     });
+  }
+
+  /**
+   * Settles (never rejects) once the in-flight queue drain settles, including the launches it
+   * awaits. Shutdown joins it: startup recovery schedules its drain instead of awaiting it, so
+   * the recovery promise alone no longer covers those launches.
+   */
+  queueDrainSettled(): Promise<void> {
+    return (
+      this.maybeStartQueuedTasksInFlight?.then(
+        () => undefined,
+        () => undefined
+      ) ?? Promise.resolve()
+    );
   }
 
   scheduleMaybeStartQueuedTasks(): void {
@@ -14690,6 +14725,9 @@ export class TaskService implements AgentTaskIntegration {
           agentInitiated: true,
           queueDedupeKey: taskRecoveryPromptDedupeKey(workspaceId, "completion"),
           removableQueueDedupeKey: true,
+          // Startup recovery gates the server listener: return once the prompt is accepted and
+          // let stream startup (runtime readiness, MCP, model) continue in the background.
+          startStreamInBackground: options?.reason === "startup",
           ...(sendToken != null
             ? {
                 turnAdmission: sendToken,
