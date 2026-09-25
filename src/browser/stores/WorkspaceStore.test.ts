@@ -2063,16 +2063,18 @@ describe("WorkspaceStore", () => {
           (message) => message.type === "assistant" && message.historyId === streamId
         );
 
+      const finalizedRow = (): WorkspaceChatMessage => ({
+        type: "message",
+        id: streamId,
+        role: "assistant",
+        parts: [{ type: "text", text: "hello world" }],
+        metadata: { historySequence: 2, timestamp: 2_500, model: TEST_MODEL },
+      });
+
       it("replaces the partial with the finalized row when the stream finished while away", async () => {
         const attempt = await leaveMidStream();
         attempt.push(createHistoryMessageEvent("history-1", 1));
-        attempt.push({
-          type: "message",
-          id: streamId,
-          role: "assistant",
-          parts: [{ type: "text", text: "hello world" }],
-          metadata: { historySequence: 2, timestamp: 2_500, model: TEST_MODEL },
-        });
+        attempt.push(finalizedRow());
         attempt.push(sinceCaughtUpEvent(2, streamId));
         expect(await waitUntil(() => state().isTranscriptCaughtUp)).toBe(true);
 
@@ -2114,13 +2116,6 @@ describe("WorkspaceStore", () => {
       // it leaves the STREAMING state and emits stream-end. A replay that lands in that window
       // sends the finalized row AND replays the stream (stream-start plus the parts after the
       // stream cursor), then the live stream-end. #4505 UAT: the reply's tail showed twice.
-      const finalizedRow = (): WorkspaceChatMessage => ({
-        type: "message",
-        id: streamId,
-        role: "assistant",
-        parts: [{ type: "text", text: "hello world" }],
-        metadata: { historySequence: 2, timestamp: 2_500, model: TEST_MODEL },
-      });
       const replayedStream = (deltas: Array<[text: string, timestamp: number]>) => [
         streamStartEvent(workspaceId, streamId, {
           historySequence: 2,
