@@ -5,6 +5,7 @@ import type { Tool } from "ai";
 import assert from "@/common/utils/assert";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import * as mcpSdk from "@/node/services/mcpClient";
+import { MCP_STARTUP_TIMEOUT_MS } from "@/node/services/mcpServerManager";
 
 /**
  * Fake MCP servers for MCPServerManager tests.
@@ -19,8 +20,8 @@ import * as mcpSdk from "@/node/services/mcpClient";
  * command line, or the remote URL.
  */
 
-/** Mirrors mcpServerManager's per-server startup deadline (a real timer). */
-export const MCP_STARTUP_TIMEOUT_MS = 60_000;
+// The manager's per-server startup deadline (a real timer), shared so the harness cannot drift.
+export { MCP_STARTUP_TIMEOUT_MS };
 
 // bun-types (^1.2.23) lags the pinned runtime (bun@1.3.5), which implements this.
 const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
@@ -54,6 +55,7 @@ type BehaviorSource =
 
 interface FakeProcess {
   command: string;
+  readonly exited: boolean;
   crash: () => void;
 }
 
@@ -96,8 +98,11 @@ export class FakeMcpServers {
    * and the manager marks the instance closed.
    */
   async crash(command: string): Promise<void> {
-    const matching = this.processes.filter((process) => process.command === command);
-    assert(matching.length > 0, `FakeMcpServers.crash: no process launched for ${command}`);
+    // Only live processes: crashing an already-exited one must not satisfy a restart test.
+    const matching = this.processes.filter(
+      (process) => process.command === command && !process.exited
+    );
+    assert(matching.length > 0, `FakeMcpServers.crash: no live process for ${command}`);
     for (const process of matching) process.crash();
     // The transport observes the exit asynchronously.
     await new Promise((resolve) => setImmediate(resolve));
@@ -156,6 +161,9 @@ export class FakeMcpServers {
     let exited = false;
     const process: FakeProcess = {
       command,
+      get exited() {
+        return exited;
+      },
       crash: () => {
         if (exited) return;
         exited = true;
