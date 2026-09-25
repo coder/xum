@@ -24,7 +24,6 @@ import {
   ProviderModelFactory,
   buildAIProviderRequestHeaders,
   classifyCopilotInitiator,
-  countAnthropicCacheBreakpoints,
   XUM_AI_PROVIDER_USER_AGENT,
   normalizeCodexResponsesBody,
   markCodexOauthRoutedResponse,
@@ -2435,81 +2434,6 @@ describe("classifyCopilotInitiator", () => {
 
   it("returns 'user' when body has no messages field", () => {
     expect(classifyCopilotInitiator(JSON.stringify({ model: "gpt-4o" }))).toBe("user");
-  });
-});
-
-describe("countAnthropicCacheBreakpoints", () => {
-  it("counts the intended three manual Anthropic cache breakpoints for direct requests", () => {
-    const requestBody = {
-      model: "claude-sonnet-4-5",
-      system: [
-        {
-          type: "text",
-          text: "You are a helpful assistant",
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "hello" },
-            {
-              type: "text",
-              text: "world",
-              cache_control: { type: "ephemeral", ttl: "1h" },
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          name: "read_file",
-          input_schema: { type: "object" },
-        },
-        {
-          name: "bash",
-          input_schema: { type: "object" },
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-    };
-
-    expect(countAnthropicCacheBreakpoints(requestBody)).toBe(3);
-  });
-
-  it("treats a top-level Anthropic cache_control block as an extra breakpoint", () => {
-    const requestBody = {
-      cache_control: { type: "ephemeral", ttl: "1h" },
-      system: [
-        {
-          type: "text",
-          text: "You are a helpful assistant",
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: "world",
-              cache_control: { type: "ephemeral", ttl: "1h" },
-            },
-          ],
-        },
-      ],
-      tools: [
-        {
-          name: "bash",
-          input_schema: { type: "object" },
-          cache_control: { type: "ephemeral", ttl: "1h" },
-        },
-      ],
-    };
-
-    expect(countAnthropicCacheBreakpoints(requestBody)).toBe(4);
   });
 });
 

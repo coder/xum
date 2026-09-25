@@ -512,59 +512,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function hasAnthropicProviderCacheControl(value: unknown): boolean {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  const anthropicOptions = value.anthropic;
-  return isRecord(anthropicOptions) && isRecord(anthropicOptions.cacheControl);
-}
-
-/**
- * Count Anthropic prompt-cache breakpoints in a shaped request payload.
- *
- * This intentionally counts both raw `cache_control` blocks and untransformed
- * `providerOptions.anthropic.cacheControl` markers so tests can guard the
- * budget across direct and gateway request-shaping paths.
- */
-export function countAnthropicCacheBreakpoints(requestBody: unknown): number {
-  const pending: unknown[] = [requestBody];
-  let count = 0;
-
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (current == null) {
-      continue;
-    }
-
-    if (Array.isArray(current)) {
-      for (const value of current) {
-        pending.push(value);
-      }
-      continue;
-    }
-
-    if (!isRecord(current)) {
-      continue;
-    }
-
-    if (isRecord(current.cache_control)) {
-      count += 1;
-    }
-
-    if (hasAnthropicProviderCacheControl(current.providerOptions)) {
-      count += 1;
-    }
-
-    for (const value of Object.values(current)) {
-      pending.push(value);
-    }
-  }
-
-  return count;
-}
-
 /**
  * Remove every cache marker the request pipeline may have serialized:
  * `cache_control` on system/message/tool entries and nested content parts,
@@ -875,19 +822,6 @@ export function buildAppAttributionHeaders(
   }
 
   return headers;
-}
-
-/**
- * Preload AI SDK provider modules to avoid race conditions in concurrent test environments.
- * This function loads @ai-sdk/anthropic, @ai-sdk/openai, and ollama-ai-provider-v2 eagerly
- * so that subsequent dynamic imports in createModel() hit the module cache instead of racing.
- *
- * In production, providers are lazy-loaded on first use to optimize startup time.
- * In tests, we preload them once during setup to ensure reliable concurrent execution.
- */
-export async function preloadAISDKProviders(): Promise<void> {
-  // Preload providers to ensure they're in the module cache before concurrent tests run
-  await Promise.all(Object.values(PROVIDER_REGISTRY).map((importFn) => importFn()));
 }
 
 /**
@@ -1330,8 +1264,6 @@ interface CreateModelOptions {
  *   AI SDK-owned async callbacks executed on every network request after
  *   model creation, not service pipelines — converting them would embed a
  *   `runPromise` boundary per request with no error-typing win.
- * - `preloadAISDKProviders`: a single `Promise.all` of module imports used by
- *   test setup only.
  */
 export class ProviderModelFactory {
   private readonly config: Config;

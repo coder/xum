@@ -274,10 +274,3 @@ export function supports1MContext(
 ): boolean {
   return getAnthropic1MContextMode(modelString, providersConfig) === "beta";
 }
-
-export function hasNative1MContext(
-  modelString: string,
-  providersConfig?: Record<string, unknown> | null
-): boolean {
-  return getAnthropic1MContextMode(modelString, providersConfig) === "native";
-}

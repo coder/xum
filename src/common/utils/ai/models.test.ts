@@ -5,7 +5,6 @@ import {
   normalizeToCanonical,
   getModelName,
   getAnthropic1MContextMode,
-  hasNative1MContext,
   supports1MContext,
   isValidModelFormat,
 } from "./models";
@@ -140,7 +139,6 @@ describe("Anthropic 1M context classification", () => {
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-sonnet-4-5")).toBe("beta");
     expect(supports1MContext("anthropic:claude-sonnet-4-20250514")).toBe(true);
     expect(supports1MContext("anthropic:claude-sonnet-4-5")).toBe(true);
-    expect(hasNative1MContext("anthropic:claude-sonnet-4-5")).toBe(false);
   });
 
   it("treats Opus 4.6 to 4.8, Opus 5, Opus 5.5, and Sonnet 4.6 as native 1M models", () => {
@@ -150,7 +148,6 @@ describe("Anthropic 1M context classification", () => {
     // needs (and has) its own pattern.
     expect(getAnthropic1MContextMode("anthropic:claude-opus-5-5")).toBe("native");
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-opus-5-5")).toBe("native");
-    expect(hasNative1MContext("anthropic:claude-opus-5-5")).toBe(true);
     expect(supports1MContext("anthropic:claude-opus-5-5")).toBe(false);
     expect(getAnthropic1MContextMode("anthropic:claude-opus-4-8")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-opus-4-8-20260528")).toBe("native");
@@ -161,8 +158,6 @@ describe("Anthropic 1M context classification", () => {
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-sonnet-4-6")).toBe("native");
     expect(supports1MContext("anthropic:claude-opus-4-6")).toBe(false);
     expect(supports1MContext("anthropic:claude-sonnet-4-6")).toBe(false);
-    expect(hasNative1MContext("anthropic:claude-opus-4-6")).toBe(true);
-    expect(hasNative1MContext("anthropic:claude-sonnet-4-6")).toBe(true);
   });
 
   it("treats Sonnet 5 as a native 1M model", () => {
@@ -170,7 +165,6 @@ describe("Anthropic 1M context classification", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-sonnet-5-20260630")).toBe("native");
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-sonnet-5")).toBe("native");
     expect(supports1MContext("anthropic:claude-sonnet-5")).toBe(false);
-    expect(hasNative1MContext("anthropic:claude-sonnet-5")).toBe(true);
   });
 
   it("treats Mythos-class Fable 5 / Fable 5.1 / Mythos 5 / Mythos 5.1 as native 1M models", () => {
@@ -180,9 +174,6 @@ describe("Anthropic 1M context classification", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-mythos-5-1")).toBe("native");
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-fable-5-1")).toBe("native");
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-mythos-5-1")).toBe("native");
-    expect(hasNative1MContext("anthropic:claude-fable-5")).toBe(true);
-    expect(hasNative1MContext("anthropic:claude-fable-5-1")).toBe(true);
-    expect(hasNative1MContext("anthropic:claude-mythos-5-1")).toBe(true);
     expect(supports1MContext("anthropic:claude-fable-5-1")).toBe(false);
     expect(supports1MContext("anthropic:claude-mythos-5-1")).toBe(false);
   });
@@ -194,7 +185,6 @@ describe("Anthropic 1M context classification", () => {
     expect(getAnthropic1MContextMode("openai:gpt-5.2")).toBe("none");
     expect(supports1MContext("openai:gpt-5.5")).toBe(false);
     expect(supports1MContext("anthropic:claude-haiku-4-5")).toBe(false);
-    expect(hasNative1MContext("openai:gpt-5.5")).toBe(false);
   });
 });
 
