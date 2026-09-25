@@ -4080,14 +4080,8 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", { getPrompt });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
     revokeOnNextTrustedList = true;
@@ -4117,14 +4111,8 @@ describe("MCPServerManager", () => {
     });
     const revokedRefresh = mock(() => Promise.resolve([]));
     const stableRefresh = mock(() => Promise.resolve([]));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { refreshPrompts: revokedRefresh }],
-          ["stable", { refreshPrompts: stableRefresh }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { listPrompts: revokedRefresh });
+    servers.serve("cmd-stable", { listPrompts: stableRefresh });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
     expect(revokedRefresh).toHaveBeenCalledTimes(1);
@@ -4148,17 +4136,16 @@ describe("MCPServerManager", () => {
     );
     const revokedRefresh = mock(() => Promise.resolve([]));
     const stableRefresh = mock(() => Promise.resolve([]));
-    access.startServers = mock(() => {
-      // Revocation lands while startServers is still in flight, before the
-      // cold path caches the entry and refreshes prompts.
-      manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
-      return Promise.resolve(
-        startResult([
-          ["server", { refreshPrompts: revokedRefresh }],
-          ["stable", { refreshPrompts: stableRefresh }],
-        ])
-      );
+    servers.serve("cmd-1", {
+      listPrompts: revokedRefresh,
+      // Revocation lands while startup is still in flight, before the cold
+      // path caches the entry and refreshes prompts.
+      connect: () => {
+        manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
+        return Promise.resolve();
+      },
     });
+    servers.serve("cmd-stable", { listPrompts: stableRefresh });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
@@ -4175,13 +4162,8 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    access.startServers = mock((servers) =>
-      Promise.resolve(
-        startResult(
-          Object.keys(servers as Record<string, unknown>).map((name) => [name, { getPrompt }])
-        )
-      )
-    );
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", { getPrompt });
 
     // workspace.mcp.set lands while the manager is cold (no recorded options,
     // no cache entry), then a caller that read pre-mutation persisted
@@ -4190,6 +4172,7 @@ describe("MCPServerManager", () => {
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     expect(result.stats.enabledServerCount).toBe(1);
+    expect(servers.connectCount("cmd-1")).toBe(0);
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "server", "review", {})).rejects.toThrow(
       "is disabled"
@@ -4206,29 +4189,22 @@ describe("MCPServerManager", () => {
           : { stable: stdioConfig("cmd-stable") }
       )
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { prompts: [{ name: "review" }] }],
-          ["stable", { prompts: [{ name: "status" }] }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { prompts: [{ name: "review" }] });
+    servers.serve("cmd-stable", { prompts: [{ name: "status" }] });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
-    // Revoke in the gap after the discovery refresh resolves but before the
-    // enablement copy runs.
-    const originalEnsure = access.ensureWorkspaceServers.bind(manager);
-    let revokeAfterRefresh = true;
-    access.ensureWorkspaceServers = async (...args: unknown[]) => {
-      const result = await originalEnsure(...args);
-      if (revokeAfterRefresh) {
-        revokeAfterRefresh = false;
+    // Revoke in the gap after the discovery refresh resolves: the secret
+    // re-resolution is the refresh bracket's last await (resolution 1 runs
+    // before the refresh, resolution 2 right after it).
+    let resolutions = 0;
+    manager.setSecretsResolver(() => {
+      resolutions += 1;
+      if (resolutions === 2) {
         manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
       }
-      return result;
-    };
+      return Promise.resolve({});
+    });
 
     const descriptors = await manager.getPromptsForWorkspace(
       workspaceRequest(workspaceId, { trusted: true })
@@ -4245,14 +4221,8 @@ describe("MCPServerManager", () => {
           : { stable: stdioConfig("cmd-stable") }
       )
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { prompts: [{ name: "review" }] }],
-          ["stable", { prompts: [{ name: "status" }] }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { prompts: [{ name: "review" }] });
+    servers.serve("cmd-stable", { prompts: [{ name: "status" }] });
 
     // Revocation lands while the workspace is cold (no recorded options), so
     // only the retained per-project trust can correct the stale snapshot the
@@ -4263,6 +4233,7 @@ describe("MCPServerManager", () => {
       workspaceRequest(workspaceId, { trusted: true })
     );
     expect(descriptors.map((descriptor) => descriptor.serverName)).toEqual(["stable"]);
+    expect(servers.connectCount("cmd-1")).toBe(0);
   });
 
   test("closes late-started servers instead of caching them for a removed workspace", async () => {
@@ -4469,14 +4440,8 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", { getPrompt });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
