@@ -786,37 +786,49 @@ describe("TOOL_DEFINITIONS", () => {
     ).toBe(false);
   });
 
-  it("keeps workflow_run launch fields nullable in generated tool schemas", () => {
-    const workflowSchema = z.toJSONSchema(WorkflowRunToolArgsSchema);
-    const properties = workflowSchema.properties;
-    const schemaHasAnyOfEntry = (schema: unknown, expected: Record<string, unknown>) => {
-      if (schema == null || typeof schema !== "object") {
-        return false;
-      }
-      const anyOf = (schema as { anyOf?: unknown }).anyOf;
-      return (
-        Array.isArray(anyOf) &&
-        anyOf.some(
-          (entry) =>
-            entry != null &&
-            typeof entry === "object" &&
-            Object.entries(expected).every(
-              ([key, value]) => (entry as Record<string, unknown>)[key] === value
-            )
-        )
+  // AGENTS.md: optional tool inputs use `.nullish()`, because OpenAI strict mode forces every field
+  // into `required` and expects optional ones to accept null. Convert each schema the way the AI
+  // SDK does and require every non-required property, at any depth, to accept null.
+  it("every optional tool input property accepts null", () => {
+    type JsonSchema = Record<string, unknown>;
+    const acceptsNull = (schema: unknown): boolean => {
+      if (schema == null || typeof schema !== "object") return schema !== false;
+      const node = schema as JsonSchema;
+      if (Object.keys(node).length === 0) return true;
+      if (node.type === "null" || (Array.isArray(node.type) && node.type.includes("null")))
+        return true;
+      return [node.anyOf, node.oneOf].some(
+        (branches) => Array.isArray(branches) && branches.some(acceptsNull)
       );
     };
+    const violations: string[] = [];
+    const visit = (schema: unknown, at: string): void => {
+      // Draft-7 tuples list their member schemas as an `items` array.
+      if (Array.isArray(schema)) {
+        schema.forEach((member, index) => visit(member, `${at}[${index}]`));
+        return;
+      }
+      if (schema == null || typeof schema !== "object") return;
+      const node = schema as JsonSchema;
+      const required = new Set((node.required as string[] | undefined) ?? []);
+      for (const [key, property] of Object.entries((node.properties as JsonSchema) ?? {})) {
+        if (!required.has(key) && !acceptsNull(property)) violations.push(`${at}.${key}`);
+        visit(property, `${at}.${key}`);
+      }
+      for (const branches of [node.anyOf, node.oneOf, node.allOf]) {
+        if (Array.isArray(branches)) for (const branch of branches) visit(branch, at);
+      }
+      visit(node.items, `${at}[]`);
+      visit(node.additionalItems, `${at}[]`);
+      visit(node.additionalProperties, `${at}{}`);
+    };
 
-    expect(schemaHasAnyOfEntry(properties?.script_path, { type: "string", minLength: 1 })).toBe(
-      true
-    );
-    expect(schemaHasAnyOfEntry(properties?.script_path, { type: "null" })).toBe(true);
-    expect(schemaHasAnyOfEntry(properties?.script_source, { type: "string", minLength: 1 })).toBe(
-      true
-    );
-    expect(schemaHasAnyOfEntry(properties?.script_source, { type: "null" })).toBe(true);
-    expect(workflowSchema.required).not.toContain("script_path");
-    expect(workflowSchema.required).not.toContain("script_source");
+    const tools = Object.entries(TOOL_DEFINITIONS);
+    expect(tools.length).toBeGreaterThan(0);
+    for (const [name, definition] of tools) {
+      visit(z.toJSONSchema(definition.schema, { target: "draft-7", io: "input" }), name);
+    }
+    expect(violations).toEqual([]);
   });
 
   it("only includes workflow tools when dynamic workflows are enabled", () => {
