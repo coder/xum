@@ -22,7 +22,6 @@ import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { createBashBackgroundListTool } from "@/node/services/tools/bash_background_list";
 import { createBashBackgroundTerminateTool } from "@/node/services/tools/bash_background_terminate";
 import { createFileEditReplaceStringTool } from "@/node/services/tools/file_edit_replace_string";
-// DISABLED: import { createFileEditReplaceLinesTool } from "@/node/services/tools/file_edit_replace_lines";
 import { createFileEditInsertTool } from "@/node/services/tools/file_edit_insert";
 import { createAskUserQuestionTool } from "@/node/services/tools/ask_user_question";
 import { createIntuitionTool } from "@/node/services/tools/intuition";
@@ -838,10 +837,10 @@ export async function getToolsForModel(
     agent_skill_read_file: wrap(createAgentSkillReadFileTool(config)),
     file_edit_replace_string: wrap(createFileEditReplaceStringTool(config)),
     file_edit_insert: wrap(createFileEditInsertTool(config)),
-    // DISABLED: file_edit_replace_lines - causes models (particularly GPT-5-Codex)
-    // to leave repository in broken state due to issues with concurrent file modifications
-    // and line number miscalculations. Use file_edit_replace_string instead.
-    // file_edit_replace_lines: wrap(createFileEditReplaceLinesTool(config)),
+    // file_edit_replace_lines was removed: it caused models (particularly GPT-5-Codex)
+    // to leave repositories broken through concurrent edits and line-number
+    // miscalculations. Its TOOL_DEFINITIONS entry and renderers stay so older
+    // transcripts containing it still render.
 
     // Sub-agent task orchestration (child workspaces)
     task: wrap(createTaskTool(config)),

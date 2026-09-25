@@ -440,12 +440,11 @@ export async function analyzeCode(code: string, xumTypes?: string): Promise<Anal
 }
 
 /**
- * Clean up the cached validation context.
- * Call this when shutting down to free resources.
- *
- * TODO: Wire into app/workspace shutdown to free QuickJS context (Phase 6)
+ * Test reset hook: dispose the cached QuickJS validation context. Production keeps the
+ * context for the process lifetime; tests dispose it so shared test processes do not
+ * accumulate QuickJS contexts.
  */
-export function disposeAnalysisContext(): void {
+export function disposeAnalysisContextForTests(): void {
   if (cachedContext) {
     cachedContext.dispose();
     cachedContext = null;

@@ -4,7 +4,8 @@ import * as path from "path";
 import type { ToolExecutionOptions } from "ai";
 import type { ProposePlanToolResult } from "@/common/types/tools";
 import { createProposePlanTool } from "./propose_plan";
-import { getTodosForSessionDir, setTodosForSessionDir } from "./todo";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import { setTodosForSessionDir } from "./todo";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
 
 const toolCallOptions: ToolExecutionOptions<unknown> = {
@@ -39,7 +40,7 @@ describe("propose_plan tool", () => {
       planPath,
       message: "Plan proposed. Waiting for user approval.",
     });
-    expect(await getTodosForSessionDir(config.workspaceSessionDir!)).toEqual([
+    expect(await readTodosForSessionDir(config.workspaceSessionDir!)).toEqual([
       { content: "Inspected relevant files", status: "completed" },
       { content: "Writing the plan", status: "completed" },
       { content: "Wait for approval", status: "pending" },

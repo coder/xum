@@ -66,9 +66,10 @@ const cache: TypeCache = {
 };
 
 /**
- * Clear all type caches. Call for test isolation or when tool schemas might have changed.
+ * Test reset hook for the module-level type cache (production keys it by tool-set hash, so
+ * it never needs clearing at runtime).
  */
-export function clearTypeCache(): void {
+export function clearTypeCacheForTests(): void {
   cache.fullTypes.clear();
   cache.resultTypes.clear();
 }
