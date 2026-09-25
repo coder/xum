@@ -893,6 +893,15 @@ const ACTIVE_AGENT_TASK_STATUSES = new Set<AgentTaskStatus>([
 
 const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 
+/**
+ * isolation: "none" cannot be honored for multi-project parents: AIService runs multi-project rows
+ * through a MultiProjectRuntime that derives the container and every per-project checkout from the
+ * task's OWN name, so a task pointed at the parent's checkouts would run in paths that were never
+ * created (#4411). Refuse explicitly instead of silently forking, so the caller sees what happened.
+ */
+const MULTI_PROJECT_SHARED_ISOLATION_ERROR =
+  'isolation: "none" is not supported for multi-project workspaces; omit isolation or pass isolation: "fork" to run the sub-agent in forked checkouts.';
+
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
     error != null &&
@@ -5087,9 +5096,17 @@ export class TaskService implements AgentTaskIntegration {
         runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
 
     // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
-    // share the parent checkout; everything else falls back to the normal fork path.
+    // share the parent checkout; multi-project parents on those runtimes are refused (see
+    // MULTI_PROJECT_SHARED_ISOLATION_ERROR); everything else falls back to the normal fork path.
     const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
     const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+    if (
+      args.isolation === "none" &&
+      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+      parentIsMultiProject
+    ) {
+      return Err(`Task.createMany: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+    }
     const useSharedWorkspace =
       parentIsScratch ||
       (args.isolation === "none" &&
@@ -6600,9 +6617,17 @@ export class TaskService implements AgentTaskIntegration {
 
     // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead of
     // forking a new one. Only honored on runtimes where the fork creates a separate checkout we can
-    // safely bypass (worktree/SSH) and for single-project parents; otherwise fall back to forking.
+    // safely bypass (worktree/SSH) and for single-project parents; multi-project parents on those
+    // runtimes are refused (see MULTI_PROJECT_SHARED_ISOLATION_ERROR); otherwise fall back to forking.
     const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
     const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+    if (
+      args.isolation === "none" &&
+      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+      parentIsMultiProject
+    ) {
+      return Err(`Task.create: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+    }
     const useSharedWorkspace =
       parentIsScratch ||
       (args.isolation === "none" &&

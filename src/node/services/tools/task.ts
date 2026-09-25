@@ -73,12 +73,26 @@ function resolveRuntimeMode(config: ToolConfiguration): RuntimeMode | undefined 
 }
 
 /**
+ * Whether to offer `isolation: "none"`: only where TaskService honors it — runtimes that can share
+ * the parent checkout, in single-project workspaces. Multi-project workspaces run through a runtime
+ * that derives every checkout from the task's own name, so TaskService refuses it there (#4411).
+ */
+function supportsSharedIsolation(config: ToolConfiguration): boolean {
+  return (
+    runtimeModeSupportsSharedTaskWorkspace(resolveRuntimeMode(config)) &&
+    (config.projects?.length ?? 0) <= 1
+  );
+}
+
+/**
  * Build dynamic task tool description with runtime-specific workspace visibility
  * guidance and the currently available sub-agents.
  */
 function buildTaskDescription(config: ToolConfiguration): string {
   const runtimeMode = resolveRuntimeMode(config);
-  const baseDescription = buildTaskToolDescription(runtimeMode);
+  const baseDescription = buildTaskToolDescription(runtimeMode, {
+    sharedIsolation: supportsSharedIsolation(config),
+  });
   const subagents = config.availableSubagents?.filter((a) => a.subagentRunnable) ?? [];
 
   if (subagents.length === 0) {
@@ -371,12 +385,11 @@ function normalizePendingTaskStatuses(params: {
 }
 
 export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
-  // Only advertise the `isolation` parameter on runtimes where sharing the parent checkout is
-  // supported. On local runtimes the field is omitted from the schema entirely, so it never
+  // Only advertise the `isolation` parameter where sharing the parent checkout is supported (see
+  // supportsSharedIsolation). Elsewhere the field is omitted from the schema entirely, so it never
   // enters LLM context.
-  const runtimeMode = resolveRuntimeMode(config);
   const inputSchema = buildTaskToolAgentArgsSchema({
-    includeIsolation: runtimeModeSupportsSharedTaskWorkspace(runtimeMode),
+    includeIsolation: supportsSharedIsolation(config),
   });
   const taskTool = tool({
     description: buildTaskDescription(config),

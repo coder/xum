@@ -96,6 +96,23 @@ describe("task tool", () => {
     expect(parseWithIsolation(tool).success).toBe(true);
   });
 
+  // Multi-project workspaces run through a runtime that derives every checkout from the task's own
+  // name, so TaskService refuses isolation: "none" there (#4411); the tool must not offer it.
+  it("omits the isolation parameter on worktree runtimes for multi-project workspaces", () => {
+    using tempDir = new TestTempDir("test-task-tool-multi-project-isolation-schema");
+    const tool = createTaskTool({
+      ...createTestToolConfig(tempDir.path),
+      xumEnv: { MUX_RUNTIME: "worktree" },
+      projects: [
+        { projectPath: "/repo/a", projectName: "a" },
+        { projectPath: "/repo/b", projectName: "b" },
+      ],
+    });
+
+    expect(parseWithIsolation(tool).success).toBe(false);
+    expect(tool.description).not.toContain('isolation: "none"');
+  });
+
   it("rejects unsupported workspace fork mode in the schema", () => {
     using tempDir = new TestTempDir("test-task-tool-workspace-fork-schema");
     const tool = createTaskTool({

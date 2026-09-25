@@ -82,6 +82,7 @@ import * as forkOrchestrator from "@/node/services/utils/forkOrchestrator";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
@@ -7362,6 +7363,194 @@ describe("TaskService", () => {
       );
     } finally {
       runBackgroundInitSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
+  // Issue #4411: a multi-project workspace executes through a MultiProjectRuntime that derives the
+  // container (`_workspaces/<name>`) and every per-project checkout (`<srcBaseDir>/<project>/<name>`)
+  // from the workspace's OWN name, ignoring any persisted shared path. A multi-project task must
+  // therefore fork real checkouts under its own name, and isolation: "none" (which would reuse the
+  // parent's checkouts) is refused explicitly rather than silently turned into a fork.
+  async function setUpMultiProjectParent(): Promise<{
+    config: Config;
+    runtimeConfig: { type: "worktree"; srcBaseDir: string };
+    projects: Array<{ projectPath: string; projectName: string }>;
+    parentId: string;
+    containerPath: string;
+  }> {
+    const config = await createTestConfig(rootDir);
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+    const projects: Array<{ projectPath: string; projectName: string }> = [];
+    for (const name of ["mp-primary", "mp-secondary"]) {
+      const projectPath = await createTestProject(rootDir, name);
+      projects.push({ projectPath, projectName: path.basename(projectPath) });
+    }
+    const parentName = "parent";
+    const projectWorkspaces: Array<{ projectName: string; workspacePath: string }> = [];
+    for (const project of projects) {
+      const created = await createRuntime(runtimeConfig, {
+        projectPath: project.projectPath,
+      }).createWorkspace({
+        projectPath: project.projectPath,
+        branchName: parentName,
+        trunkBranch: "main",
+        directoryName: parentName,
+        initLogger: createNullInitLogger(),
+      });
+      assert(created.success && created.workspacePath, "Expected parent checkout to be created");
+      projectWorkspaces.push({
+        projectName: project.projectName,
+        workspacePath: created.workspacePath,
+      });
+    }
+    // Same layout as WorkspaceService's multi-project create: a container of symlinks, persisted
+    // under the _multi bucket with the container as the workspace path.
+    const containerPath = await new ContainerManager(config.srcDir).createContainer(
+      parentName,
+      projectWorkspaces
+    );
+    const parentId = "1111111111";
+    await config.editConfig(() => {
+      const projectsConfig: ProjectsConfig["projects"] = new Map();
+      projectsConfig.set(MULTI_PROJECT_CONFIG_KEY, {
+        projectKind: "system",
+        workspaces: [
+          {
+            path: containerPath,
+            id: parentId,
+            name: parentName,
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+            projects,
+          },
+        ],
+      });
+      for (const project of projects) {
+        projectsConfig.set(project.projectPath, { trusted: true, workspaces: [] });
+      }
+      return { projects: projectsConfig, taskSettings: testTaskSettings() };
+    });
+    return { config, runtimeConfig, projects, parentId, containerPath };
+  }
+
+  function createMultiProjectExperimentHost() {
+    return createWorkspaceServiceMocks({
+      isExperimentEnabled: mock(
+        (experimentId: string) => experimentId === EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+      ),
+    });
+  }
+
+  // Mirrors AIService.createWorkspaceRuntimeContext for multi-project rows: every path comes from
+  // the task's own name, so each one must exist on disk for the task to run anywhere real.
+  function expectMultiProjectExecutionPathsExist(
+    config: Config,
+    runtimeConfig: { type: "worktree"; srcBaseDir: string },
+    projects: Array<{ projectPath: string; projectName: string }>,
+    childEntry: WorkspaceConfigEntry
+  ): void {
+    const childName = childEntry.name;
+    assert(childName, "Expected child task to have a workspace name");
+    expect(childEntry.projects).toEqual(projects);
+    expect(existsSync(new ContainerManager(config.srcDir).getContainerPath(childName))).toBe(true);
+    for (const project of projects) {
+      const projectRuntime = createRuntime(runtimeConfig, {
+        projectPath: project.projectPath,
+        workspaceName: childName,
+      });
+      expect(existsSync(projectRuntime.getWorkspacePath(project.projectPath, childName))).toBe(
+        true
+      );
+    }
+  }
+
+  test("a multi-project task forks checkouts under its own name that execution can use", async () => {
+    const { config, runtimeConfig, projects, parentId, containerPath } =
+      await setUpMultiProjectParent();
+    const childTaskId = "2222222222";
+    stubStableIds(config, [childTaskId]);
+
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
+    );
+    try {
+      const { workspaceService } = createMultiProjectExperimentHost();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const result = await createAgentTask(taskService, parentId, "multi-project analysis");
+
+      expect(result.success).toBe(true);
+      assert(result.success, "Expected multi-project task to be created");
+      expect(forkSpy).toHaveBeenCalledTimes(1);
+
+      const childEntry = findWorkspaceInConfig(config, childTaskId);
+      assert(childEntry, "Expected child task workspace to be persisted");
+      expect(childEntry.taskIsolation).toBeUndefined();
+      expect(childEntry.path).not.toBe(containerPath);
+      expectMultiProjectExecutionPathsExist(config, runtimeConfig, projects, childEntry);
+    } finally {
+      runBackgroundInitSpy.mockRestore();
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
+  test("create refuses isolation: none under a multi-project parent before reserving or forking", async () => {
+    const { config, parentId } = await setUpMultiProjectParent();
+    const childTaskId = "2222222222";
+    stubStableIds(config, [childTaskId]);
+
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    try {
+      const { workspaceService, sendMessage } = createMultiProjectExperimentHost();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const result = await createAgentTask(taskService, parentId, "multi-project analysis", {
+        isolation: "none",
+      });
+
+      expect(result.success).toBe(false);
+      assert(!result.success, "Expected isolation: none to be refused");
+      expect(result.error).toContain('isolation: "none"');
+      expect(result.error).toContain('isolation: "fork"');
+      expect(forkSpy).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
+    } finally {
+      forkSpy.mockRestore();
+    }
+  }, 20_000);
+
+  test("createMany refuses isolation: none under a multi-project parent before reserving or forking", async () => {
+    const { config, parentId } = await setUpMultiProjectParent();
+    const childTaskId = "3333333333";
+    stubStableIds(config, [childTaskId]);
+
+    const forkSpy = spyOn(forkOrchestrator, "orchestrateFork");
+    try {
+      const { workspaceService, sendMessage } = createMultiProjectExperimentHost();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      const result = await taskService.createMany([
+        {
+          parentWorkspaceId: parentId,
+          kind: "agent" as const,
+          agentId: "explore",
+          prompt: "batched multi-project analysis",
+          title: "Batched multi-project task",
+          isolation: "none" as const,
+        },
+      ]);
+
+      expect(result.success).toBe(false);
+      assert(!result.success, "Expected isolation: none to be refused");
+      expect(result.error).toContain('isolation: "none"');
+      expect(result.error).toContain('isolation: "fork"');
+      expect(forkSpy).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(findWorkspaceInConfig(config, childTaskId)).toBeUndefined();
+    } finally {
       forkSpy.mockRestore();
     }
   }, 20_000);
