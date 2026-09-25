@@ -1888,4 +1888,64 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  // #4454: a workflow plan task whose propose_plan succeeded but whose plan file is missing gets
+  // a completion prompt instead of a report. The stream-end decision is still pending then (a
+  // successful propose_plan is normally the report), so the prompt must decide it first.
+  test("a workflow plan task with no plan content still gets its completion prompt (#4454)", async () => {
+    const childId = "emptyplan4454";
+    const stack = await createStack(childId, {
+      agentType: "plan",
+      agentId: "plan",
+      workflowTask: { runId: "wfr_empty_plan", stepId: "plan" },
+    });
+    const { config, taskService, svc, workspaceService, completions, streamStarts } = stack;
+    try {
+      // The owning workflow run is active in production; the harness has no run store.
+      spyOn(
+        taskService as unknown as { getInactiveWorkflowTaskOwnerForRecovery: () => unknown },
+        "getInactiveWorkflowTaskOwnerForRecovery"
+      ).mockImplementation(() => Promise.resolve(null));
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
+      expect(
+        await workspaceService.sendMessage(childId, "plan it", { model, agentId: "plan" })
+      ).toEqual(Ok(undefined));
+      expect(completions).toHaveLength(1);
+      const event = {
+        type: "stream-end",
+        workspaceId: childId,
+        messageId: "assistant-1",
+        metadata: { model, finishReason: "stop" },
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "propose-plan-1",
+            toolName: "propose_plan",
+            input: { plan: "the plan" },
+            state: "output-available",
+            output: { success: true, planPath: "/tmp/does-not-exist-4454.md" },
+          },
+        ],
+      };
+      // endStream() clears the harness's streaming flag, but builds a report-less text event;
+      // this one is hand-built, so report the ended stream as no longer streaming here.
+      const ai = stack.sessionHarness.aiService as unknown as { isStreaming: () => boolean };
+      const realIsStreaming = ai.isStreaming.bind(ai);
+      spyOn(ai, "isStreaming").mockImplementation(() =>
+        completions.length === 1 ? false : realIsStreaming()
+      );
+      stack.aiEmitter.emit("stream-end", event);
+      stack.completeStream(0, event as ReturnType<typeof streamEndEvent>);
+      await until(() => completions.length === 2, "the completion prompt turn started");
+      expect(streamStarts[1]).toMatchObject({
+        row: attemptA,
+        owner: attemptA,
+        status: "awaiting_report",
+      });
+      expect(outstanding(svc, childId)).toHaveLength(0);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 });

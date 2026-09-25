@@ -16002,6 +16002,19 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (planSummary == null) {
+      // No plan content: this propose_plan is no terminal report after all, so the attempt
+      // continues. Decide (and wake the held queue) before the completion prompt, as for any
+      // other non-report end: the prompt's admission reads a still-pending decision for its
+      // attempt as stale and would be refused, leaving the task awaiting a report forever.
+      this.resolveStreamEndDecision(
+        args.workspaceId,
+        this.findPendingStreamEndDecision(
+          args.workspaceId,
+          args.reportedAttempt,
+          args.reportedAttempt == null ? (args.streamAttemptId ?? undefined) : undefined
+        ),
+        "nonreport"
+      );
       await this.editActiveWorkspaceEntry(
         args.workspaceId,
         (workspace) => {
