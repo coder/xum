@@ -33,10 +33,10 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 import { createTestHistoryService } from "./testHistoryService";
 import {
+  createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
-  createTestAgentSession,
   runSessionTerminalPolicy,
 } from "./agentSession.testHarness";
 import { waitForCondition } from "./testDispatchHelpers";
@@ -158,7 +158,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       }
     );
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws-auto-routing",
       config,
       historyService,

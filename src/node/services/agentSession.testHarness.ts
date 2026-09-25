@@ -162,26 +162,6 @@ function createMockAiService(args: {
   return { aiEmitter, aiService };
 }
 
-/** Direct session fixtures bypass the app graph, but still use the real context controller. */
-export function createTestAgentSession(
-  options: Omit<ConstructorParameters<typeof AgentSession>[0], "contextManagement"> & {
-    contextManagement?: ContextManagementService;
-  }
-): AgentSession {
-  return new AgentSession({
-    ...options,
-    contextManagement:
-      options.contextManagement ??
-      new ContextManagementService({
-        config: options.config,
-        historyService: options.historyService,
-        aiService: options.aiService,
-        sessionUsageService: options.sessionUsageService,
-        telemetryService: options.telemetryService,
-      }),
-  });
-}
-
 export interface AgentSessionHarnessOptions extends Pick<
   ConstructorParameters<typeof AgentSession>[0],
   | "effectRunner"
@@ -193,6 +173,10 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "onBeforeTurnCompletion"
   | "compactionMonitor"
   | "planSnapshotCaptureTimeoutMs"
+  | "onPostCompactionStateChange"
+  | "sessionUsageService"
+  | "autoModelRouter"
+  | "hasExternalSendPreflight"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -284,6 +268,7 @@ export async function createAgentSessionHarness(
       config,
       historyService,
       aiService,
+      sessionUsageService: options.sessionUsageService,
     });
   const session: AgentSession = new AgentSession({
     contextManagement,
@@ -307,6 +292,10 @@ export async function createAgentSessionHarness(
     onBeforeTurnCompletion: options.onBeforeTurnCompletion,
     compactionMonitor: options.compactionMonitor,
     planSnapshotCaptureTimeoutMs: options.planSnapshotCaptureTimeoutMs,
+    onPostCompactionStateChange: options.onPostCompactionStateChange,
+    sessionUsageService: options.sessionUsageService,
+    autoModelRouter: options.autoModelRouter,
+    hasExternalSendPreflight: options.hasExternalSendPreflight,
   });
 
   const events: WorkspaceChatMessage[] = [];

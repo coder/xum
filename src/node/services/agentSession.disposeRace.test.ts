@@ -3,7 +3,6 @@ import { describe, expect, test, mock, spyOn } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
-import type { Config } from "@/node/config";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
@@ -17,11 +16,7 @@ import {
   startAbandonedBranchSummaryInBackground,
   type BranchSummaryAiService,
 } from "./branchSummary";
-import {
-  createAgentSessionHarness,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
 import type { StreamMessageOptions } from "./aiService";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -58,7 +53,7 @@ describe("AgentSession disposal race conditions", () => {
     } as unknown as AIService;
 
     const history = await createTestHistoryService();
-    const historyService = history.historyService;
+    const { historyService, config } = history;
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -74,12 +69,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      sessionsDir: "/tmp",
-    } as unknown as Config;
-
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -180,7 +170,7 @@ describe("AgentSession disposal race conditions", () => {
       }
     );
     try {
-      const session = createTestAgentSession({
+      const { session } = await createAgentSessionHarness({
         workspaceId,
         config,
         historyService,
@@ -301,7 +291,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -383,7 +373,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -472,7 +462,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
@@ -615,7 +605,7 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
