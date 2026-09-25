@@ -148,9 +148,7 @@ export class ContinuousStrategy {
     const providersConfig = this.host.state.providersConfig;
     const selection = resolveContextStrategy({
       experiments: options?.experiments,
-      isEnabled: (id) =>
-        typeof this.deps.aiService.isExperimentEnabled === "function" &&
-        this.deps.aiService.isExperimentEnabled(id),
+      isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
     return {

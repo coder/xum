@@ -22,7 +22,6 @@ import { SummarizeStrategy } from "./strategies/summarize";
 import { resolveContextStrategy } from "./selection";
 import type { StreamContextSnapshot, ContextResetReason } from "./types";
 import { CompactionHandler } from "../compactionHandler";
-import type { Config } from "@/node/config";
 import { CompactionMonitor } from "../compactionMonitor";
 import { resolveAutoCompactionThreshold } from "@/common/utils/compaction/autoCompactionThreshold";
 import type { ContextManagementDependencies } from "./contextManagementService";
@@ -107,14 +106,10 @@ export class SessionContextController {
    * controller never caches it, so a slider change is honored by the next decision.
    */
   autoCompactionThreshold(model: string): number {
-    const maybeConfig = this.deps.config as Config & {
-      loadConfigOrDefault?: () => ReturnType<Config["loadConfigOrDefault"]> | null;
-    };
-    const preferences =
-      typeof maybeConfig.loadConfigOrDefault === "function"
-        ? maybeConfig.loadConfigOrDefault()?.userPreferences
-        : undefined;
-    return resolveAutoCompactionThreshold(preferences, model);
+    return resolveAutoCompactionThreshold(
+      this.deps.config.loadConfigOrDefault().userPreferences,
+      model
+    );
   }
 
   normalizeSend(
@@ -244,9 +239,7 @@ export class SessionContextController {
   isTokenBudgetActive(options?: SendMessageOptions): boolean {
     const selection = resolveContextStrategy({
       experiments: options?.experiments,
-      isEnabled: (id) =>
-        typeof this.deps.aiService.isExperimentEnabled === "function" &&
-        this.deps.aiService.isExperimentEnabled(id),
+      isEnabled: (id) => this.deps.aiService.isExperimentEnabled(id),
       isCompactionRequest: isCompactionRequestMetadata(options?.muxMetadata),
     });
     if (
@@ -508,11 +501,8 @@ export class SessionContextController {
       // RLM keep-recent floor: stamp on-send auto-compaction requests with
       // the durable tail-start sequence. No-op when RLM is off.
       if (autoCompactionRequest.metadata.type === "compaction-request") {
-        const enabled = isRlmModeEnabled(
-          optionsForStream.experiments,
-          typeof this.deps.aiService.isExperimentEnabled === "function"
-            ? (id) => this.deps.aiService.isExperimentEnabled(id)
-            : undefined
+        const enabled = isRlmModeEnabled(optionsForStream.experiments, (id) =>
+          this.deps.aiService.isExperimentEnabled(id)
         );
         const stamp = await computeKeepRecentTailStamp(
           this.deps.historyService,

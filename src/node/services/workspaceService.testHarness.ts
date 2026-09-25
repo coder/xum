@@ -30,16 +30,17 @@ export function createCompactionAdmissionMocks() {
   };
 }
 
-// Helper to access private renamingWorkspaces set
+// Rename/archive gate tests hold these private in-progress sets open directly: a real rename or
+// archive would release the gate before the guarded call could observe it. Element access keeps
+// the member names and Set types checked by TypeScript (no `any`).
 export function addToRenamingWorkspaces(service: WorkspaceService, workspaceId: string): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
-  (service as any).renamingWorkspaces.add(workspaceId);
+  // eslint-disable-next-line @typescript-eslint/dot-notation -- private member, typed access
+  service["renamingWorkspaces"].add(workspaceId);
 }
 
-// Helper to access private archivingWorkspaces set
 export function addToArchivingWorkspaces(service: WorkspaceService, workspaceId: string): void {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
-  (service as any).archivingWorkspaces.add(workspaceId);
+  // eslint-disable-next-line @typescript-eslint/dot-notation -- private member, typed access
+  service["archivingWorkspaces"].add(workspaceId);
 }
 
 export async function withTempMuxRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
