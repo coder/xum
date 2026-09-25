@@ -88,7 +88,13 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
-import { MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS, MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
+import {
+  MCP_LAUNCH_INITIATION_FENCE_MS,
+  MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
+  MCP_STARTUP_CONCURRENCY,
+  MCP_STARTUP_TIMEOUT_MS,
+  MCP_STDIO_LAUNCH_FENCE_MS,
+} from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -103,9 +109,6 @@ const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
  */
 const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
-// Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
-// while several unhealthy servers' startup deadlines overlap instead of stacking.
-const MCP_STARTUP_CONCURRENCY = 4;
 /**
  * Timed-out servers are restarted from the cached same-signature path, and
  * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
@@ -443,17 +446,6 @@ const PENDING_REPAIR_WAIT_MS = 10_000;
  * gate as a whole — not each helper — is bounded.
  */
 const CALL_GATE_TIMEOUT_MS = 30_000;
-/** How long a remote MCP connect keeps the override writer's lock after its initiation (see launchUnderOverrideFence). */
-const LAUNCH_INITIATION_FENCE_MS = 2_000;
-/**
- * How long a stdio launch may take to hand back its exec stream under the
- * override writer's lock before it is ABORTED (see launchUnderOverrideFence).
- * Matches the SSH2 transport's connection-acquisition cap: a cold connection
- * that takes longer fails as a startup timeout and is retried by the next
- * request (with a fresh fence) instead of being released to send its command
- * after a sibling's revocation committed.
- */
-const STDIO_LAUNCH_FENCE_MS = 15_000;
 /** Iterations a served tool call spends waiting for override state to settle before failing closed. */
 const CALL_GATE_MAX_ATTEMPTS = 5;
 
@@ -6027,7 +6019,7 @@ export class MCPServerManager {
         // held for the whole startup deadline, and the launch must not be
         // released to send its command after a revocation: abort it instead
         // (see launchUnderOverrideFence).
-        { workspaceId, abortAfterMs: { ms: STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        { workspaceId, abortAfterMs: { ms: MCP_STDIO_LAUNCH_FENCE_MS, serverName: name } }
       );
 
       const cleanupSpawnedExecStream = async () => {
@@ -6327,7 +6319,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
       );
 
     const trySse = () =>
@@ -6344,7 +6336,7 @@ export class MCPServerManager {
             ...(prior !== undefined ? { prior } : {}),
           }),
         signal,
-        { workspaceId, releaseAfterMs: LAUNCH_INITIATION_FENCE_MS }
+        { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
       );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;

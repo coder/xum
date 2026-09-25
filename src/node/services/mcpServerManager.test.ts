@@ -47,7 +47,12 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { jsonSchema, type Tool } from "ai";
-import { MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS } from "@/constants/mcp";
+import {
+  MCP_LAUNCH_INITIATION_FENCE_MS,
+  MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
+  MCP_STARTUP_CONCURRENCY,
+  MCP_STDIO_LAUNCH_FENCE_MS,
+} from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 
 interface MCPServerManagerTestAccess {
@@ -2631,11 +2636,6 @@ describe("MCPServerManager", () => {
     expect(lockHeld).toBe(false);
   });
 
-  /** Mirrors mcpServerManager's LAUNCH_INITIATION_FENCE_MS (remote connect lock hold). */
-  const LAUNCH_INITIATION_FENCE_MS = 2_000;
-  /** Mirrors mcpServerManager's STDIO_LAUNCH_FENCE_MS (stdio exec lock hold before abort). */
-  const STDIO_LAUNCH_FENCE_MS = 15_000;
-
   /**
    * Instrument a component fixture's invalidation with the override writer's
    * lock and report whether each lock is held, then serve it from a manager
@@ -2677,7 +2677,7 @@ describe("MCPServerManager", () => {
     // endpoint-controlled handshake for the whole startup deadline.
     using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
     const f = await launchFenceFixture(tmp.path);
-    using timers = holdTimers([LAUNCH_INITIATION_FENCE_MS]);
+    using timers = holdTimers([MCP_LAUNCH_INITIATION_FENCE_MS]);
     const serverKey = "plugin:instance:remove";
     const url = "https://remove.example/mcp";
     configService.listServers = mock(() =>
@@ -2699,7 +2699,7 @@ describe("MCPServerManager", () => {
     await waitFor(() => heldAtLaunch !== undefined);
     expect(heldAtLaunch).toBe(true);
     // The handshake is still pending at the initiation deadline: release.
-    timers.fire(LAUNCH_INITIATION_FENCE_MS);
+    timers.fire(MCP_LAUNCH_INITIATION_FENCE_MS);
     await waitFor(() => !f.held.overrides && !f.held.component);
     // A real component writer can commit while the admitted handshake is pending.
     await f.write(["keep"]);
@@ -2716,7 +2716,7 @@ describe("MCPServerManager", () => {
     // repository-configured command after a sibling's revocation committed.
     using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
     const f = await launchFenceFixture(tmp.path);
-    using timers = holdTimers([STDIO_LAUNCH_FENCE_MS]);
+    using timers = holdTimers([MCP_STDIO_LAUNCH_FENCE_MS]);
     const serverKey = "plugin:instance:remove";
     configService.listServers = mock(() => Promise.resolve({ [serverKey]: f.configs[serverKey] }));
     servers.serve("remove", { tools: { echo: testTool() } });
@@ -2741,7 +2741,7 @@ describe("MCPServerManager", () => {
 
     const serve = manager.getToolsForWorkspace(request);
     await waitFor(() => launchSignal !== undefined);
-    timers.fire(STDIO_LAUNCH_FENCE_MS);
+    timers.fire(MCP_STDIO_LAUNCH_FENCE_MS);
     const result = await serve;
     expect(result.stats.failedServerNames).toEqual([serverKey]);
     expect(heldWhilePending).toBe(true);
@@ -3180,9 +3180,12 @@ describe("MCPServerManager", () => {
 
   test("timed-out retry backoff is measured from the attempt's own completion, not the batch's", async () => {
     const workspaceId = "ws-timeout-retry-attempt-time";
-    // Four hanging servers fill every startup slot, so "slow" starts only
-    // after their first-wave timeouts and settles the batch 45 s later.
-    const hanging = ["flaky-1", "flaky-2", "flaky-3", "flaky-4"];
+    // Hanging servers fill every startup slot, so "slow" starts only after
+    // their first-wave timeouts and settles the batch 45 s later.
+    const hanging = Array.from(
+      { length: MCP_STARTUP_CONCURRENCY },
+      (_, index) => `flaky-${index + 1}`
+    );
     configService.listServers = mock(() =>
       Promise.resolve({
         ...Object.fromEntries(hanging.map((name) => [name, stdioConfig(name)])),
@@ -3200,7 +3203,10 @@ describe("MCPServerManager", () => {
     });
     const request = workspaceRequest(workspaceId);
     const startedAt = Date.now();
-    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request), 4);
+    await servers.expireStartupDeadline(
+      () => manager.getToolsForWorkspace(request),
+      MCP_STARTUP_CONCURRENCY
+    );
     const settledAt = Date.now();
     // The fixture shape itself: the timeouts finished a wave before the batch.
     expect(slowStartedAt - startedAt).toBeGreaterThanOrEqual(MCP_STARTUP_TIMEOUT_MS);
