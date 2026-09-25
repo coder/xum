@@ -47,6 +47,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { jsonSchema, type Tool } from "ai";
+import { MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS } from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 
 interface MCPServerManagerTestAccess {
@@ -2325,277 +2326,240 @@ describe("MCPServerManager", () => {
   });
 
   test("startSingleServer times out when startup never finishes", async () => {
-    const never = Promise.withResolvers<unknown>();
-    const startSingleServerImplMock = mock(() => never.promise);
-    access.startSingleServerImpl = startSingleServerImplMock;
+    configService.listServers = mock(() =>
+      Promise.resolve({ "stuck-server": stdioConfig("never") })
+    );
+    servers.serve("never", { hang: true });
+    const request = workspaceRequest("ws-stuck-startup");
 
-    const originalSetTimeout = globalThis.setTimeout;
-    const setTimeoutSpy = spyOn(globalThis, "setTimeout");
-    setTimeoutSpy.mockImplementation(((
-      callback: Parameters<typeof setTimeout>[0],
-      delay?: Parameters<typeof setTimeout>[1],
-      ...args: unknown[]
-    ) => originalSetTimeout(callback, delay === 60_000 ? 1 : delay, ...args)) as typeof setTimeout);
+    const result = await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
 
-    try {
-      let caught: unknown;
-      try {
-        await access.startSingleServer(
-          "stuck-server",
-          stdioConfig("never"),
-          TEST_RUNTIME,
-          PROJECT_PATH,
-          WORKSPACE_PATH,
-          undefined,
-          () => undefined
-        );
-      } catch (error) {
-        caught = error;
-      }
-
-      expect(startSingleServerImplMock).toHaveBeenCalledTimes(1);
-      expect(caught).toBeInstanceOf(Error);
-      expect((caught as Error).message).toContain("stuck-server");
-      expect((caught as Error).message).toContain("timed out");
-    } finally {
-      setTimeoutSpy.mockRestore();
-    }
+    expect(servers.connectCount("never")).toBe(1);
+    expect(result.stats.failedServerNames).toEqual(["stuck-server"]);
+    // Surfaced as a startup timeout: retried once its backoff elapses.
+    elapseTimedOutRetryBackoff();
+    servers.serve("never", { tools: { ping: testTool() } });
+    const retried = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(retried.tools)).toHaveLength(1);
   });
 
-  test("startSingleServer waits for abort cleanup before surfacing timeout", async () => {
-    const cleanup = Promise.withResolvers<void>();
-    const startSingleServerImplMock = mock((...args: unknown[]) => {
-      const signal = args[7] as AbortSignal;
-      const registerAbortCleanup = args[8] as ((cleanupPromise: Promise<void>) => void) | undefined;
-
-      return new Promise<null>((resolve) => {
-        const onAbort = () => {
-          const cleanupPromise = cleanup.promise;
-          registerAbortCleanup?.(cleanupPromise);
-          cleanupPromise.then(
-            () => resolve(null),
-            () => resolve(null)
-          );
-        };
-
-        if (signal.aborted) {
-          onAbort();
-          return;
-        }
-
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
-    });
-    access.startSingleServerImpl = startSingleServerImplMock;
-
-    const originalSetTimeout = globalThis.setTimeout;
-    const setTimeoutSpy = spyOn(globalThis, "setTimeout");
-    setTimeoutSpy.mockImplementation(((
-      callback: Parameters<typeof setTimeout>[0],
-      delay?: Parameters<typeof setTimeout>[1],
+  /**
+   * Hold every setTimeout armed with one of `delays` until the test fires it,
+   * so a startup deadline expires exactly when the startup is parked where
+   * the test wants it (expireStartupDeadline only fires once a connect hangs).
+   * Other timers run for real.
+   */
+  function holdTimers(delays: number[]): { fire: (delay: number) => void } & Disposable {
+    const realSetTimeout = globalThis.setTimeout;
+    const held: Array<{ delay: number; run: () => void }> = [];
+    const spy = spyOn(globalThis, "setTimeout").mockImplementation(((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
       ...args: unknown[]
-    ) => originalSetTimeout(callback, delay === 60_000 ? 1 : delay, ...args)) as typeof setTimeout);
+    ) => {
+      if (delay === undefined || !delays.includes(delay)) {
+        return realSetTimeout(callback, delay, ...args);
+      }
+      held.push({ delay, run: () => callback(...args) });
+      // A real (never-firing) handle, so production can unref/clear it.
+      return realSetTimeout(() => undefined, 2 ** 31 - 1);
+    }) as typeof setTimeout);
+    return {
+      fire: (delay) => {
+        const due = held.filter((timer) => timer.delay === delay);
+        if (due.length === 0) throw new Error(`holdTimers: no ${delay} ms timer armed`);
+        for (const timer of due) {
+          held.splice(held.indexOf(timer), 1);
+          timer.run();
+        }
+      },
+      [Symbol.dispose]: () => spy.mockRestore(),
+    };
+  }
 
-    try {
-      let settled = false;
-      let caught: unknown;
+  /** Mirrors mcpServerManager's fail-safe wait for a timed-out startup's abort cleanup. */
+  const STARTUP_CLEANUP_WAIT_MS = MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS;
 
-      const startPromise = access
-        .startSingleServer(
-          "cleanup-server",
-          stdioConfig("never"),
-          TEST_RUNTIME,
-          PROJECT_PATH,
-          WORKSPACE_PATH,
-          undefined,
-          () => undefined
-        )
-        .then(
-          () => {
-            settled = true;
-          },
-          (error) => {
-            settled = true;
-            caught = error;
-          }
-        );
+  test("startSingleServer waits for abort cleanup before surfacing timeout", async () => {
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
+    configService.listServers = mock(() =>
+      Promise.resolve({ "cleanup-server": stdioConfig("never") })
+    );
+    // Startup stalls on tools/list after connecting, so the deadline's abort
+    // must close the connected client before the timeout surfaces.
+    const listing = Promise.withResolvers<void>();
+    const cleanup = Promise.withResolvers<undefined>();
+    const closing = Promise.withResolvers<void>();
+    const close = mock(() => {
+      closing.resolve();
+      return cleanup.promise;
+    });
+    servers.serve("never", {
+      listTools: () => {
+        listing.resolve();
+        return new Promise<never>(() => undefined);
+      },
+      close,
+    });
+    const request = workspaceRequest("ws-cleanup-wait");
+    let settled = false;
+    const serve = manager.getToolsForWorkspace(request).finally(() => {
+      settled = true;
+    });
 
-      await new Promise<void>((resolve) => originalSetTimeout(resolve, 5));
-      expect(settled).toBe(false);
+    await listing.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    // The abort cleanup has started; drain queued continuations so a timeout
+    // that did not wait for it would already have settled the serve.
+    await closing.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
 
-      cleanup.resolve();
-      await startPromise;
-
-      expect(startSingleServerImplMock).toHaveBeenCalledTimes(1);
-      expect(caught).toBeInstanceOf(Error);
-      expect((caught as Error).message).toContain("cleanup-server");
-      expect((caught as Error).message).toContain("timed out");
-    } finally {
-      setTimeoutSpy.mockRestore();
-    }
+    cleanup.resolve(undefined);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["cleanup-server"]);
+    // Surfaced as a startup timeout: retried once its backoff elapses.
+    elapseTimedOutRetryBackoff();
+    servers.serve("never", { tools: { ping: testTool() } });
+    const retried = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(retried.tools)).toHaveLength(1);
   });
 
   test("startSingleServer still times out when abort cleanup hangs", async () => {
-    const startSingleServerImplMock = mock((...args: unknown[]) => {
-      const signal = args[7] as AbortSignal;
-      const registerAbortCleanup = args[8] as ((cleanupPromise: Promise<void>) => void) | undefined;
-      const cleanupNever = new Promise<void>(() => undefined);
-
-      return new Promise<null>(() => {
-        const onAbort = () => {
-          registerAbortCleanup?.(cleanupNever);
-        };
-
-        if (signal.aborted) {
-          onAbort();
-          return;
-        }
-
-        signal.addEventListener("abort", onAbort, { once: true });
-      });
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS, STARTUP_CLEANUP_WAIT_MS]);
+    configService.listServers = mock(() =>
+      Promise.resolve({ "cleanup-hang-server": stdioConfig("never") })
+    );
+    const listing = Promise.withResolvers<void>();
+    const closing = Promise.withResolvers<void>();
+    const close = mock(() => {
+      closing.resolve();
+      return new Promise<never>(() => undefined);
     });
-    access.startSingleServerImpl = startSingleServerImplMock;
+    servers.serve("never", {
+      listTools: () => {
+        listing.resolve();
+        return new Promise<never>(() => undefined);
+      },
+      close,
+    });
+    const request = workspaceRequest("ws-cleanup-hang");
+    let settled = false;
+    const serve = manager.getToolsForWorkspace(request).finally(() => {
+      settled = true;
+    });
 
-    const originalSetTimeout = globalThis.setTimeout;
-    const setTimeoutSpy = spyOn(globalThis, "setTimeout");
-    setTimeoutSpy.mockImplementation(((
-      callback: Parameters<typeof setTimeout>[0],
-      _delay?: Parameters<typeof setTimeout>[1],
-      ...args: unknown[]
-    ) => originalSetTimeout(callback, 1, ...args)) as typeof setTimeout);
+    await listing.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    // The abort cleanup has started (and never settles); drain queued
+    // continuations so only the fail-safe deadline can settle the serve.
+    await closing.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(settled).toBe(false);
 
-    try {
-      let caught: unknown;
-      try {
-        await access.startSingleServer(
-          "cleanup-hang-server",
-          stdioConfig("never"),
-          TEST_RUNTIME,
-          PROJECT_PATH,
-          WORKSPACE_PATH,
-          undefined,
-          () => undefined
-        );
-      } catch (error) {
-        caught = error;
-      }
-
-      expect(startSingleServerImplMock).toHaveBeenCalledTimes(1);
-      expect(caught).toBeInstanceOf(Error);
-      expect((caught as Error).message).toContain("cleanup-hang-server");
-      expect((caught as Error).message).toContain("timed out");
-    } finally {
-      setTimeoutSpy.mockRestore();
-    }
+    // The cleanup never settles; the fail-safe deadline surfaces the timeout.
+    timers.fire(STARTUP_CLEANUP_WAIT_MS);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["cleanup-hang-server"]);
+    elapseTimedOutRetryBackoff();
+    servers.serve("never", { tools: { ping: testTool() } });
+    const retried = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(retried.tools)).toHaveLength(1);
   });
 
   test("startServers overlaps slow startups instead of stacking them serially", async () => {
-    let active = 0;
-    let maxActive = 0;
-    access.startSingleServer = mock(async (name: unknown) => {
-      active += 1;
-      maxActive = Math.max(maxActive, active);
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      active -= 1;
-      return testInstance(String(name));
-    });
-
-    const result = await access.startServers(
-      {
-        a: stdioConfig("cmd-a"),
-        b: stdioConfig("cmd-b"),
-        c: stdioConfig("cmd-c"),
-      },
-      TEST_RUNTIME,
-      PROJECT_PATH,
-      WORKSPACE_PATH,
-      undefined,
-      () => undefined
+    const names = ["a", "b", "c"];
+    configService.listServers = mock(() =>
+      Promise.resolve(Object.fromEntries(names.map((name) => [name, stdioConfig(`cmd-${name}`)])))
     );
-
-    expect(maxActive).toBeGreaterThan(1);
-    // Concurrent completion order must not perturb the deterministic Map order.
-    expect([...result.instances.keys()]).toEqual(["a", "b", "c"]);
-  });
-
-  test("startServers only marks startup timeouts as retryable", async () => {
-    const never = Promise.withResolvers<unknown>();
-    access.startSingleServerImpl = mock((name: unknown) => {
-      if (name === "slow-server") {
-        return never.promise;
-      }
-
-      if (name === "broken-server") {
-        return Promise.reject(new Error("invalid MCP server config"));
-      }
-
-      return Promise.resolve(testInstance(String(name)));
-    });
-
-    const originalSetTimeout = globalThis.setTimeout;
-    const setTimeoutSpy = spyOn(globalThis, "setTimeout");
-    setTimeoutSpy.mockImplementation(((
-      callback: Parameters<typeof setTimeout>[0],
-      delay?: Parameters<typeof setTimeout>[1],
-      ...args: unknown[]
-    ) => originalSetTimeout(callback, delay === 60_000 ? 1 : delay, ...args)) as typeof setTimeout);
-
-    try {
-      const result = await access.startServers(
-        {
-          "slow-server": stdioConfig("slow"),
-          "broken-server": stdioConfig("broken"),
+    const gates = names.map(() => Promise.withResolvers<void>());
+    let connecting = 0;
+    names.forEach((name, index) => {
+      servers.serve(`cmd-${name}`, {
+        tools: { t: testTool() },
+        connect: () => {
+          connecting += 1;
+          return gates[index].promise;
         },
-        TEST_RUNTIME,
-        PROJECT_PATH,
-        WORKSPACE_PATH,
-        undefined,
-        () => undefined
-      );
-
-      expect(result.failedServerNames.sort()).toEqual(["broken-server", "slow-server"]);
-      expect(result.timedOutServerNames).toEqual(["slow-server"]);
-    } finally {
-      setTimeoutSpy.mockRestore();
-    }
-  });
-
-  test("startSingleServerImpl closes spawned stdio stream when aborted after exec", async () => {
-    const controller = new AbortController();
-    const stdinClose = mock(() => Promise.resolve(undefined));
-    const stdoutCancel = mock(() => Promise.resolve(undefined));
-    const stderrCancel = mock(() => Promise.resolve(undefined));
-
-    const exec = mock((_command: string) => {
-      controller.abort();
-
-      return Promise.resolve({
-        stdin: new WritableStream<Uint8Array>({
-          close: stdinClose,
-        }),
-        stdout: new ReadableStream<Uint8Array>({
-          cancel: stdoutCancel,
-        }),
-        stderr: new ReadableStream<Uint8Array>({
-          cancel: stderrCancel,
-        }),
-        exitCode: Promise.resolve(0),
-        duration: Promise.resolve(0),
       });
     });
 
-    const result = await access.startSingleServerImpl(
-      "stdio-aborted-after-exec",
-      stdioConfig("never"),
-      { exec } as unknown as Runtime,
-      PROJECT_PATH,
-      WORKSPACE_PATH,
-      undefined,
-      () => undefined,
-      controller.signal
-    );
+    const serve = manager.getToolsForWorkspace(workspaceRequest("ws-overlap"));
+    // Startups overlap: at least two are in flight at once (the startup semaphore may
+    // queue the rest, so do not require every slot).
+    await waitFor(() => connecting >= 2);
+    // Finish in reverse order: concurrent completion order must not perturb
+    // the served tool order.
+    for (const gate of [...gates].reverse()) {
+      gate.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const result = await serve;
 
-    expect(result).toBeNull();
+    expect(Object.keys(result.tools)).toEqual(["a_t", "b_t", "c_t"]);
+  });
+
+  test("startServers only marks startup timeouts as retryable", async () => {
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        "slow-server": stdioConfig("slow"),
+        "broken-server": stdioConfig("broken"),
+      })
+    );
+    servers.serve("slow", { hang: true });
+    servers.serve("broken", {
+      connect: () => Promise.reject(new Error("invalid MCP server config")),
+    });
+    const request = workspaceRequest("ws-timeout-classification");
+
+    const result = await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    expect(result.stats.failedServerNames.sort()).toEqual(["broken-server", "slow-server"]);
+
+    // Once the backoff elapses only the timed-out server is retried.
+    elapseTimedOutRetryBackoff();
+    servers.serve("slow");
+    servers.serve("broken");
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("slow")).toBe(1);
+    expect(servers.connectCount("broken")).toBe(0);
+  });
+
+  test("startSingleServerImpl closes spawned stdio stream when aborted after exec", async () => {
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS]);
+    configService.listServers = mock(() =>
+      Promise.resolve({ "stdio-aborted-after-exec": stdioConfig("never") })
+    );
+    const execStarted = Promise.withResolvers<void>();
+    const spawned = Promise.withResolvers<void>();
+    const stdinClose = mock(() => Promise.resolve(undefined));
+    const stdoutCancel = mock(() => Promise.resolve(undefined));
+    const stderrCancel = mock(() => Promise.resolve(undefined));
+    // runtime.exec() hands back a process spawned after the startup aborted.
+    const exec = mock(async (_command: string) => {
+      execStarted.resolve();
+      await spawned.promise;
+      return {
+        stdin: new WritableStream<Uint8Array>({ close: stdinClose }),
+        stdout: new ReadableStream<Uint8Array>({ cancel: stdoutCancel }),
+        stderr: new ReadableStream<Uint8Array>({ cancel: stderrCancel }),
+        exitCode: Promise.resolve(0),
+        duration: Promise.resolve(0),
+      };
+    });
+    const request = workspaceRequest("ws-abort-after-exec", {
+      runtime: { exec } as unknown as Runtime,
+    });
+
+    const serve = manager.getToolsForWorkspace(request);
+    await execStarted.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["stdio-aborted-after-exec"]);
+
+    spawned.resolve();
+    await waitFor(() => stderrCancel.mock.calls.length > 0);
     expect(exec).toHaveBeenCalledTimes(1);
     expect(stdinClose).toHaveBeenCalledTimes(1);
     expect(stdoutCancel).toHaveBeenCalledTimes(1);
@@ -2820,96 +2784,61 @@ describe("MCPServerManager", () => {
   });
 
   test("startSingleServerImpl cleans up client that resolves after abort", async () => {
-    const controller = new AbortController();
-    const stdinClose = mock(() => Promise.resolve(undefined));
-    const stdoutCancel = mock(() => Promise.resolve(undefined));
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS]);
+    configService.listServers = mock(() =>
+      Promise.resolve({ "stdio-late-client-cleanup": stdioConfig("never") })
+    );
+    const connecting = Promise.withResolvers<void>();
+    const handshake = Promise.withResolvers<void>();
     const lateClientClose = mock(() => Promise.resolve(undefined));
-    const createClient =
-      Promise.withResolvers<Awaited<ReturnType<typeof mcpSdk.createMCPClient>>>();
-
-    const createMCPClientSpy = spyOn(mcpSdk, "createMCPClient").mockImplementation(() => {
-      controller.abort();
-      return createClient.promise;
+    servers.serve("never", {
+      connect: () => {
+        connecting.resolve();
+        return handshake.promise;
+      },
+      close: lateClientClose,
     });
 
-    try {
-      const exec = mock((_command: string) =>
-        Promise.resolve({
-          stdin: new WritableStream<Uint8Array>({
-            close: stdinClose,
-          }),
-          stdout: new ReadableStream<Uint8Array>({
-            cancel: stdoutCancel,
-          }),
-          stderr: new ReadableStream<Uint8Array>(),
-          exitCode: Promise.resolve(0),
-          duration: Promise.resolve(0),
-        })
-      );
+    const serve = manager.getToolsForWorkspace(workspaceRequest("ws-stdio-late-client"));
+    await connecting.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["stdio-late-client-cleanup"]);
+    expect(lateClientClose).toHaveBeenCalledTimes(0);
 
-      const startup = access.startSingleServerImpl(
-        "stdio-late-client-cleanup",
-        stdioConfig("never"),
-        { exec } as unknown as Runtime,
-        "/tmp/project",
-        "/tmp/workspace",
-        undefined,
-        () => undefined,
-        controller.signal
-      );
-
-      createClient.resolve({
-        close: lateClientClose,
-        tools: mock(() => Promise.resolve({})),
-      } as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>);
-
-      const result = await startup;
-
-      expect(result).toBeNull();
-      expect(exec).toHaveBeenCalledTimes(1);
-      expect(stdinClose).toHaveBeenCalledTimes(1);
-      expect(stdoutCancel).toHaveBeenCalledTimes(1);
-      expect(lateClientClose).toHaveBeenCalledTimes(1);
-    } finally {
-      createMCPClientSpy.mockRestore();
-    }
+    // The client finishes connecting only after the abort: closed, not adopted.
+    handshake.resolve();
+    await waitFor(() => lateClientClose.mock.calls.length > 0);
+    expect(lateClientClose).toHaveBeenCalledTimes(1);
   });
 
   test("startSingleServerImpl cleans up HTTP client that resolves after abort", async () => {
-    const controller = new AbortController();
+    using timers = holdTimers([MCP_STARTUP_TIMEOUT_MS]);
+    const url = "https://example.com/mcp";
+    configService.listServers = mock(() =>
+      Promise.resolve({ "http-late-client-cleanup": { transport: "http" as const, url } })
+    );
+    const connecting = Promise.withResolvers<void>();
+    const handshake = Promise.withResolvers<void>();
     const lateClientClose = mock(() => Promise.resolve(undefined));
-    const createClient =
-      Promise.withResolvers<Awaited<ReturnType<typeof mcpSdk.createMCPClient>>>();
-
-    const createMCPClientSpy = spyOn(mcpSdk, "createMCPClient").mockImplementation(() => {
-      controller.abort();
-      return createClient.promise;
+    servers.serve(url, {
+      connect: () => {
+        connecting.resolve();
+        return handshake.promise;
+      },
+      close: lateClientClose,
     });
 
-    try {
-      const startup = access.startSingleServerImpl(
-        "http-late-client-cleanup",
-        { transport: "http", url: "https://example.com/mcp" },
-        TEST_RUNTIME,
-        PROJECT_PATH,
-        WORKSPACE_PATH,
-        undefined,
-        () => undefined,
-        controller.signal
-      );
+    const serve = manager.getToolsForWorkspace(workspaceRequest("ws-http-late-client"));
+    await connecting.promise;
+    timers.fire(MCP_STARTUP_TIMEOUT_MS);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual(["http-late-client-cleanup"]);
+    expect(lateClientClose).toHaveBeenCalledTimes(0);
 
-      createClient.resolve({
-        close: lateClientClose,
-        tools: mock(() => Promise.resolve({})),
-      } as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>);
-
-      const result = await startup;
-
-      expect(result).toBeNull();
-      expect(lateClientClose).toHaveBeenCalledTimes(1);
-    } finally {
-      createMCPClientSpy.mockRestore();
-    }
+    handshake.resolve();
+    await waitFor(() => lateClientClose.mock.calls.length > 0);
+    expect(lateClientClose).toHaveBeenCalledTimes(1);
   });
 
   test("startSingleServerImpl respawns stdio server as legacy after probe crash", async () => {
