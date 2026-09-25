@@ -2,10 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { INSTRUCTION_SCOPE } from "@/common/types/instructions";
-import {
-  readClaudeCompatGlobalInstructionSet,
-  readInstructionSet,
-} from "./instructionFiles";
+import { readClaudeCompatGlobalInstructionSet, readInstructionSet } from "./instructionFiles";
 
 describe("instructionFiles", () => {
   let tempDir: string;

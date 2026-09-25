@@ -151,16 +151,22 @@ describe("findAssistedCandidateMatch", () => {
   });
 
   it("matches overlapping new-side range", () => {
-    expect(findMatch(baseHunk(), [{ path: "src/foo.ts", range: { start: 12, end: 13 } }])).not.toBeNull();
+    expect(
+      findMatch(baseHunk(), [{ path: "src/foo.ts", range: { start: 12, end: 13 } }])
+    ).not.toBeNull();
   });
 
   it("rejects non-overlapping range", () => {
-    expect(findMatch(baseHunk(), [{ path: "src/foo.ts", range: { start: 100, end: 200 } }])).toBeNull();
+    expect(
+      findMatch(baseHunk(), [{ path: "src/foo.ts", range: { start: 100, end: 200 } }])
+    ).toBeNull();
   });
 
   it("falls back to old-side span for pure deletions", () => {
     const deletion = baseHunk({ newLines: 0, oldStart: 50, oldLines: 4 });
-    expect(findMatch(deletion, [{ path: "src/foo.ts", range: { start: 52, end: 52 } }])).not.toBeNull();
+    expect(
+      findMatch(deletion, [{ path: "src/foo.ts", range: { start: 52, end: 52 } }])
+    ).not.toBeNull();
   });
 
   it("matches via oldPath when file was renamed", () => {
