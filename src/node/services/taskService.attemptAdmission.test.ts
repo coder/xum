@@ -15,7 +15,6 @@ import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { SecretsStore } from "@/node/config";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
@@ -29,17 +28,19 @@ import {
 import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
 import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import * as subagentReportArtifacts from "@/node/services/subagentReportArtifacts";
-import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
+import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
   createAIServiceMocks,
-  createMockInitStateManager,
+  createTaskServiceStack,
   createTestConfig,
   createTestProject,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspaces,
+  streamEnd,
   stubStableIds,
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
@@ -48,10 +49,10 @@ import type {
   TurnAdmissionToken,
   WorkspaceHost,
 } from "@/node/services/taskWorkspaceSeam";
-import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 import type { AIService } from "@/node/services/aiService";
+import type { StreamEndEvent } from "@/common/types/stream";
 import { EventEmitter } from "events";
 import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -126,8 +127,6 @@ interface Internals {
     failure: { errorType: string; errorMessage: string },
     options: { expectedAttemptId: string | null }
   ) => Promise<void>;
-  /** The production stream-end listener's handler (entry-time origin capture for direct callers). */
-  handleStreamEnd: (event: unknown) => Promise<void>;
   /** The direct create's rollback: the only deleter of a failed launch's row, checkout and session. */
   rollbackFailedTaskCreate: (...args: unknown[]) => Promise<void>;
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
@@ -135,7 +134,11 @@ interface Internals {
 const internals = (service: TaskService) => service as unknown as Internals;
 
 /** A child's stream ending on a successful terminal `agent_report` (the ordinary report path). */
-function reportingStreamEnd(taskId: string, messageId: string, reportMarkdown: string) {
+function reportingStreamEnd(
+  taskId: string,
+  messageId: string,
+  reportMarkdown: string
+): StreamEndEvent {
   return {
     type: "stream-end",
     workspaceId: taskId,
@@ -247,35 +250,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     overrides?: { aiService?: AIService; workspaceService?: WorkspaceHost }
   ) {
     assert(config === fixture.config, "createHarness expects the fixture's config");
-    const historyService = fixture.historyService;
-    const aiService = overrides?.aiService ?? createAIServiceMocks(config).aiService;
-    const workspaceService =
-      overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
-    const initStateManager = createMockInitStateManager();
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const taskService = new TaskService(
-      config,
-      historyService,
-      aiService,
-      workspaceService,
-      initStateManager,
-      undefined,
-      undefined,
-      new SecretsStore(config.rootDir),
-      terminalAttentionStore
-    );
-    const workspaceTurnManager = new WorkspaceTurnManager(
-      config,
-      historyService,
-      aiService,
-      workspaceService,
-      initStateManager,
-      taskService,
-      terminalAttentionStore,
-      aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7]
-    );
-    taskService.setWorkspaceTurnManager(workspaceTurnManager);
-    return { taskService, aiService, workspaceService };
+    return createTaskServiceStack(config, { historyService: fixture.historyService, ...overrides });
   }
 
   /** WorkspaceHost mocks that also expose the turn-settled/superseded listeners TaskService bound. */
@@ -722,7 +697,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const reportedAttemptId = entryOf(config, taskId)!.taskAttemptId!;
       expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(reportedAttemptId);
-      await svc.handleStreamEnd(reportingStreamEnd(taskId, "assistant-report-1", "done"));
+      await streamEnd(taskService, reportingStreamEnd(taskId, "assistant-report-1", "done"));
       expect(entryOf(config, taskId)).toMatchObject({
         taskStatus: "reported",
         taskAttemptId: reportedAttemptId,

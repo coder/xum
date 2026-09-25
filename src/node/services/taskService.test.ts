@@ -60,8 +60,8 @@ import {
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
 } from "@/constants/taskMessages";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
-import { TaskService, ForegroundWaitBackgroundedError } from "@/node/services/taskService";
-import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
+import type { TaskService } from "@/node/services/taskService";
+import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import {
   isActiveWorkspaceTurnTaskStatus,
   TaskHandleStore,
@@ -128,8 +128,8 @@ import { InitStateManager as RealInitStateManager } from "@/node/services/initSt
 import assert from "node:assert";
 import {
   createAIServiceMocks,
-  createMockInitStateManager,
   createTestConfig,
+  createTaskServiceStack,
   createTestProject,
   createWorkspaceServiceMocks,
   makeWorkspaceTurnCreateMock,
@@ -140,6 +140,7 @@ import {
   saveLocalParentWorkspace,
   saveTestConfig,
   saveWorkspaces,
+  streamEnd,
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
@@ -243,58 +244,9 @@ function createTaskServiceHarness(
     workspaceGoalService?: WorkspaceGoalService;
     desktopInputCoordinator?: DesktopInputCoordinator;
   }
-): {
-  historyService: HistoryService;
-  partialService: HistoryService;
-  taskService: TaskService;
-  aiService: AIService;
-  workspaceService: WorkspaceHost;
-  initStateManager: InitStateManager;
-} {
-  const historyService = overrides?.historyService ?? new HistoryService(config);
-  const partialService = historyService;
-
-  const aiService = overrides?.aiService ?? createAIServiceMocks(config).aiService;
-  const workspaceService =
-    overrides?.workspaceService ?? createWorkspaceServiceMocks().workspaceService;
-  const initStateManager = overrides?.initStateManager ?? createMockInitStateManager();
-
-  const streamManager = aiService as unknown as ConstructorParameters<
-    typeof WorkspaceTurnManager
-  >[7];
-  const terminalAttentionStore = new TerminalAttentionStore(config);
-  const taskService = new TaskService(
-    config,
-    historyService,
-    aiService,
-    workspaceService,
-    initStateManager,
-    overrides?.sessionUsageService,
-    overrides?.workspaceGoalService,
-    new SecretsStore(config.rootDir),
-    terminalAttentionStore,
-    overrides?.desktopInputCoordinator
-  );
-  const workspaceTurnManager = new WorkspaceTurnManager(
-    config,
-    historyService,
-    aiService,
-    workspaceService,
-    initStateManager,
-    taskService,
-    terminalAttentionStore,
-    streamManager,
-    overrides?.desktopInputCoordinator
-  );
-  taskService.setWorkspaceTurnManager(workspaceTurnManager);
-  return {
-    historyService,
-    partialService,
-    taskService,
-    aiService,
-    workspaceService,
-    initStateManager,
-  };
+) {
+  const stack = createTaskServiceStack(config, overrides);
+  return { ...stack, partialService: stack.historyService };
 }
 
 function reserveFamilyMessageTargetSlots(
@@ -4070,7 +4022,7 @@ describe("TaskService", () => {
           metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
           parts: [{ type: "text", text: "Finished with the corrections" }],
         };
-        await handleTaskServiceStreamEndForTest(taskService, finalEvent);
+        await streamEnd(taskService, finalEvent);
         expect(findWorkspaceInConfig(config, childId)?.taskStatus).not.toBe("reported");
         await taskService.sendMessageToDescendantAgentTask(
           "parent",
@@ -4092,7 +4044,7 @@ describe("TaskService", () => {
         await sends[2]?.[3]?.onAccepted?.();
         expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
         await historyService.deletePartial(childId);
-        await handleTaskServiceStreamEndForTest(taskService, finalEvent);
+        await streamEnd(taskService, finalEvent);
         expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("reported");
       } finally {
         await session.dispose();
@@ -4170,7 +4122,7 @@ describe("TaskService", () => {
         await settled[1].promise;
         expect(findWorkspaceInConfig(config, childId)?.taskPendingGuidance).toBeUndefined();
         expect(findWorkspaceInConfig(config, childId)?.taskStatus).toBe("awaiting_report");
-        await handleTaskServiceStreamEndForTest(taskService, {
+        await streamEnd(taskService, {
           type: "stream-end",
           workspaceId: childId,
           messageId: "after-user-resume",
@@ -4734,7 +4686,7 @@ describe("TaskService", () => {
         "turn-end"
       );
       expect(resumed).toMatchObject({ success: true, data: { delivery: "accepted" } });
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: childId,
         messageId: "fresh-final",
@@ -5371,7 +5323,7 @@ describe("TaskService", () => {
       })
     );
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentId,
       messageId: "bare-compact-output",
@@ -5425,7 +5377,7 @@ describe("TaskService", () => {
       waitForPendingCompactionCompletionDecision,
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "child-compaction-agent-id",
@@ -5436,7 +5388,7 @@ describe("TaskService", () => {
       },
       parts: [{ type: "text", text: "Compacted child context" }],
     });
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "child-compaction-mode",
@@ -5461,7 +5413,7 @@ describe("TaskService", () => {
       child.taskStatus = "awaiting_report";
       return cfg;
     });
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "standalone-child-compaction",
@@ -5487,7 +5439,7 @@ describe("TaskService", () => {
       return cfg;
     });
     sendMessage.mockClear();
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "failed-child-compaction",
@@ -10829,7 +10781,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -10899,7 +10851,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -10967,7 +10919,7 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11047,7 +10999,7 @@ describe("TaskService", () => {
     });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11114,7 +11066,7 @@ describe("TaskService", () => {
     );
     expect(appendManualUser.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11177,7 +11129,7 @@ describe("TaskService", () => {
     );
     expect(appendReset.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11237,7 +11189,7 @@ describe("TaskService", () => {
     );
     expect(appendManualUser.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11307,7 +11259,7 @@ describe("TaskService", () => {
       ).success
     ).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: assistantMessageId,
@@ -11386,7 +11338,7 @@ describe("TaskService", () => {
 
     // The stream ends after the superseding user turn, so its workflow_resume output re-attaches
     // the agent to the run and the auto-resume nudge must be delivered.
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: assistantMessageId,
@@ -11460,7 +11412,7 @@ describe("TaskService", () => {
     );
     expect(appendManualUser.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11536,7 +11488,7 @@ describe("TaskService", () => {
     );
     expect(appendCompaction.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11610,7 +11562,7 @@ describe("TaskService", () => {
     );
     expect(appendCompaction.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11696,7 +11648,7 @@ describe("TaskService", () => {
     );
     expect(appendTaskAwaitDiscovery.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11739,7 +11691,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11783,7 +11735,7 @@ describe("TaskService", () => {
     });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11833,7 +11785,7 @@ describe("TaskService", () => {
     const waitError = await waitPromise.catch((error: unknown) => error);
     expect(waitError).toBeInstanceOf(ForegroundWaitBackgroundedError);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11876,7 +11828,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     for (const messageId of ["assistant-root-1", "assistant-root-2"]) {
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: rootWorkspaceId,
         messageId,
@@ -11925,7 +11877,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -11975,7 +11927,7 @@ describe("TaskService", () => {
     expect(waitError).toBeInstanceOf(ForegroundWaitBackgroundedError);
 
     for (const messageId of ["assistant-root-1", "assistant-root-2"]) {
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: rootWorkspaceId,
         messageId,
@@ -12052,7 +12004,7 @@ describe("TaskService", () => {
     expect(waitAError).toBeInstanceOf(ForegroundWaitBackgroundedError);
     expect(waitBError).toBeInstanceOf(ForegroundWaitBackgroundedError);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root-1",
@@ -12062,7 +12014,7 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root-2",
@@ -12114,7 +12066,7 @@ describe("TaskService", () => {
       ?.workspaces.find((w) => w.id === childTaskId);
     expect(persisted?.taskAttentionPolicy).toBe("notify_on_terminal");
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -12173,7 +12125,7 @@ describe("TaskService", () => {
       expect(secondWaitError.message).toBe("Timed out waiting for agent_report");
     }
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root-renewed",
@@ -12239,7 +12191,7 @@ describe("TaskService", () => {
     const waitError = await waitPromise.catch((error: unknown) => error);
     expect(waitError).toBeInstanceOf(ForegroundWaitBackgroundedError);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -12295,7 +12247,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -12358,7 +12310,7 @@ describe("TaskService", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -12407,7 +12359,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: rootWorkspaceId,
       messageId: "assistant-root",
@@ -12472,7 +12424,7 @@ describe("TaskService", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "assistant-child-output",
@@ -12557,7 +12509,7 @@ describe("TaskService", () => {
     // Real impl runs (no live mount for this scope => harmless no-op); calls are recorded.
     const postSpy = spyOn(sandboxHostService, "postTaskTerminalEvent");
     try {
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: childTaskId,
         messageId: "assistant-child-output",
@@ -12629,7 +12581,7 @@ describe("TaskService", () => {
         requestingWorkspaceId: parentWorkspaceId,
       });
 
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: childTaskId,
         messageId: "assistant-child-output",
@@ -12692,7 +12644,7 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "assistant-child-report-settings",
@@ -12753,7 +12705,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "assistant-workflow-child-output",
@@ -15979,7 +15931,7 @@ describe("TaskService", () => {
     );
 
     const { taskService } = createTaskServiceHarness(config);
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "assistant-stale-report",
@@ -20527,7 +20479,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -20577,7 +20529,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -20623,7 +20575,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -20698,7 +20650,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -20743,7 +20695,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -20996,7 +20948,7 @@ describe("TaskService", () => {
     const commitChildPartial = await partialService.commitPartial(childId);
     expect(commitChildPartial.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-partial",
@@ -21168,17 +21120,6 @@ describe("TaskService", () => {
       .filter((id): id is string => typeof id === "string");
   }
 
-  async function handleTaskServiceStreamEndForTest(
-    taskService: TaskService,
-    event: StreamEndEvent
-  ): Promise<void> {
-    await (
-      taskService as unknown as {
-        handleStreamEnd: (streamEndEvent: StreamEndEvent) => Promise<void>;
-      }
-    ).handleStreamEnd(event);
-  }
-
   async function flushTerminalAttentionDrains(taskService: TaskService): Promise<void> {
     // Terminal wake-ups are delivered by an async drain; await any in-flight drains, then await
     // again in case a drain scheduled another (idempotent, settles quickly).
@@ -21250,7 +21191,7 @@ describe("TaskService", () => {
     );
     expect((await params.partialService.commitPartial(params.childId)).success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(params.taskService, {
+    await streamEnd(params.taskService, {
       type: "stream-end",
       workspaceId: params.childId,
       messageId: `assistant-${params.childId}-partial`,
@@ -21874,7 +21815,7 @@ describe("TaskService", () => {
     expect((await partialService.writePartial(childOneId, childPartial)).success).toBe(true);
     expect((await partialService.commitPartial(childOneId)).success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childOneId,
       messageId: `assistant-${childOneId}-partial`,
@@ -22007,7 +21948,7 @@ describe("TaskService", () => {
       expect((await partialService.writePartial(childId, childPartial)).success).toBe(true);
       expect((await partialService.commitPartial(childId)).success).toBe(true);
 
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: childId,
         messageId: `assistant-${childId}-partial`,
@@ -22030,14 +21971,14 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTwoId,
       messageId: "assistant-child-two-interrupted",
       metadata: { model: "test-model", finishReason: "stop" },
       parts: [],
     });
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTwoId,
       messageId: "assistant-child-two-interrupted-repeat",
@@ -22156,7 +22097,7 @@ describe("TaskService", () => {
       requestingWorkspaceId: parentId,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-partial",
@@ -22336,7 +22277,7 @@ describe("TaskService", () => {
       requestingWorkspaceId: parentId,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-partial",
@@ -22491,7 +22432,7 @@ describe("TaskService", () => {
       requestingWorkspaceId: parentId,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-partial",
@@ -22626,7 +22567,7 @@ describe("TaskService", () => {
     const writeChildPartial = await partialService.writePartial(childId, childPartial);
     expect(writeChildPartial.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-partial",
@@ -22726,7 +22667,7 @@ describe("TaskService", () => {
     const writeParentPartial = await partialService.writePartial(parentId, parentPartial);
     expect(writeParentPartial.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -22873,7 +22814,7 @@ describe("TaskService", () => {
         reasoning: { tokens: 0, cost_usd: 0 },
         model: childModel,
       });
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: input.workspaceId,
         messageId: input.messageId,
@@ -22994,7 +22935,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23081,7 +23022,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23146,11 +23087,10 @@ describe("TaskService", () => {
     });
 
     const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       completedReportsByTaskId: Map<string, unknown>;
     };
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23237,7 +23177,7 @@ describe("TaskService", () => {
 
     childStreaming = false;
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23301,7 +23241,7 @@ describe("TaskService", () => {
       "maybeStartQueuedTasks"
     ).mockResolvedValue(undefined);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23486,7 +23426,7 @@ describe("TaskService", () => {
       return Promise.resolve();
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-final",
@@ -23591,7 +23531,7 @@ describe("TaskService", () => {
     const writeParentPartial = await partialService.writePartial(parentId, parentPartial);
     expect(writeParentPartial.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23736,7 +23676,7 @@ describe("TaskService", () => {
     );
     expect((await historyService.appendToHistory(childId, progressMessage)).success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23810,7 +23750,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23909,7 +23849,7 @@ describe("TaskService", () => {
       ).success
     ).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -23992,7 +23932,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24083,7 +24023,7 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24208,7 +24148,7 @@ describe("TaskService", () => {
       expect((await historyService.appendToHistory(childId, message)).success).toBe(true);
     }
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-recovery-output",
@@ -24285,7 +24225,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24372,7 +24312,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24538,7 +24478,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24626,7 +24566,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24687,7 +24627,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24762,7 +24702,7 @@ describe("TaskService", () => {
     const writeParentPartial = await partialService.writePartial(parentId, parentPartial);
     expect(writeParentPartial.success).toBe(true);
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24770,7 +24710,7 @@ describe("TaskService", () => {
       parts: [],
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-output",
@@ -24874,7 +24814,7 @@ describe("TaskService", () => {
       workspaceService,
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentId,
       messageId: "assistant-parent-cleanup-recheck",
@@ -25004,7 +24944,7 @@ describe("TaskService", () => {
       });
     }
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentId,
       messageId: "assistant-parent-pending-group-target",
@@ -25126,7 +25066,7 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentId,
       messageId: "assistant-parent-stale-single-group",
@@ -25244,7 +25184,7 @@ describe("TaskService", () => {
       nowMs: Date.now(),
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentId,
       messageId: "assistant-parent-finalize-ready",
@@ -26345,10 +26285,6 @@ describe("TaskService", () => {
     const { aiService, createModel } = createAIServiceMocks(config, options?.aiServiceOverrides);
     const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
 
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-
     return {
       config,
       projectPath,
@@ -26357,7 +26293,6 @@ describe("TaskService", () => {
       replaceHistory,
       createModel,
       taskService,
-      internal,
     };
   }
 
@@ -26381,10 +26316,10 @@ describe("TaskService", () => {
   }
 
   test("stream-end with propose_plan success triggers handoff instead of awaiting_report reminder", async () => {
-    const { config, childId, sendMessage, replaceHistory, internal } =
+    const { config, childId, sendMessage, replaceHistory, taskService } =
       await setupPlanModeStreamEndHarness();
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(replaceHistory).toHaveBeenCalledWith(
       childId,
@@ -26420,12 +26355,12 @@ describe("TaskService", () => {
   });
 
   test("plan handoff uses the transitioning workspace Exec choice, not its parent", async () => {
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness({
       childAiSettingsByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
       parentAiSettingsByAgent: { exec: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" } },
       agentAiDefaults: { exec: { modelString: "anthropic:claude-opus-4-6" } },
     });
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
     expect(sendMessage).toHaveBeenCalledWith(
       childId,
       expect.any(String),
@@ -26438,13 +26373,13 @@ describe("TaskService", () => {
   test("plan handoff preserves a pro mode persisted under the plan agent bucket", async () => {
     // A PRO toggle during the plan phase lands in aiSettingsByAgent.plan;
     // legacy workspace.aiSettings still holds the original standard setting.
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness({
       childAiSettingsByAgent: {
         plan: { model: "openai:gpt-5.6-sol", thinkingLevel: "high", reasoningMode: "pro" },
       },
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
@@ -26463,13 +26398,13 @@ describe("TaskService", () => {
   });
 
   test("plan handoff applies a configured exec reasoning default when the plan phase ran standard", async () => {
-    const { childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+    const { childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness({
       subagentAiDefaults: {
         exec: { reasoningMode: "pro" },
       },
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
@@ -26481,7 +26416,7 @@ describe("TaskService", () => {
   });
 
   test("stream-end with propose_plan success uses global exec defaults for handoff", async () => {
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness({
       parentAiSettingsByAgent: {
         exec: {
           model: "anthropic:claude-sonnet-4-5",
@@ -26496,7 +26431,7 @@ describe("TaskService", () => {
       },
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
@@ -26521,7 +26456,7 @@ describe("TaskService", () => {
   });
 
   test("stream-end with propose_plan success uses subagent exec defaults before global exec defaults", async () => {
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness({
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness({
       agentAiDefaults: {
         exec: {
           modelString: "openai:gpt-5.2",
@@ -26536,7 +26471,7 @@ describe("TaskService", () => {
       },
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
@@ -26561,7 +26496,7 @@ describe("TaskService", () => {
   });
 
   test("stream-end handoff ignores a whitespace inherited task model", async () => {
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness();
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness();
 
     const preCfg = config.loadConfigOrDefault();
     const childEntry = Array.from(preCfg.projects.values())
@@ -26573,7 +26508,7 @@ describe("TaskService", () => {
     childEntry.taskModelString = "   ";
     await config.editConfig(() => preCfg);
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     // The whitespace frozen model must not be used verbatim; resolution falls
     // through to the plan workspace's own persisted settings.
@@ -26597,12 +26532,12 @@ describe("TaskService", () => {
   });
 
   test("stream-end with propose_plan success triggers handoff for custom plan-like agents", async () => {
-    const { config, childId, sendMessage, replaceHistory, internal } =
+    const { config, childId, sendMessage, replaceHistory, taskService } =
       await setupPlanModeStreamEndHarness({
         childAgentId: "custom_plan_runner",
       });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(replaceHistory).toHaveBeenCalledWith(
       childId,
@@ -26639,7 +26574,7 @@ describe("TaskService", () => {
 
     const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
     try {
-      const { config, childId, sendMessage, replaceHistory, taskService, internal } =
+      const { config, childId, sendMessage, replaceHistory, taskService } =
         await setupPlanModeStreamEndHarness({
           projectName,
           workflowTask: { runId: "wfr_plan_step", stepId: "plan" },
@@ -26647,7 +26582,7 @@ describe("TaskService", () => {
 
       const waiter = taskService.waitForAgentReport(childId, { timeoutMs: 5_000 });
 
-      await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+      await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
       const report = await waiter;
       expect(report).toEqual({
@@ -26681,7 +26616,7 @@ describe("TaskService", () => {
     await fsPromises.rm(planPath, { force: true });
 
     const workflowRunId = "wfr_plan_missing";
-    const { config, childId, sendMessage, replaceHistory, internal } =
+    const { config, childId, sendMessage, replaceHistory, taskService } =
       await setupPlanModeStreamEndHarness({
         projectName,
         workflowTask: { runId: workflowRunId, stepId: "plan" },
@@ -26703,7 +26638,7 @@ describe("TaskService", () => {
       now: "2026-05-29T00:00:00.000Z",
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(replaceHistory).not.toHaveBeenCalled();
     expect(sendMessage).toHaveBeenCalledTimes(1);
@@ -26728,14 +26663,14 @@ describe("TaskService", () => {
     );
 
     try {
-      const { config, childId, replaceHistory, sendMessage, taskService, internal } =
+      const { config, childId, replaceHistory, sendMessage, taskService } =
         await setupPlanModeStreamEndHarness({
           projectName,
           childTaskStatus: "interrupted",
           workflowTask: { runId: "wfr_plan_interrupted", stepId: "plan" },
         });
 
-      await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+      await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
       const report = await taskService.waitForAgentReport(childId, { timeoutMs: 5_000 });
       expect(report).toEqual({
@@ -26753,7 +26688,7 @@ describe("TaskService", () => {
   });
 
   test("workflow-owned plan with output schema fails instead of retrying propose_plan", async () => {
-    const { config, childId, replaceHistory, sendMessage, taskService, internal } =
+    const { config, childId, replaceHistory, sendMessage, taskService } =
       await setupPlanModeStreamEndHarness({
         workflowTask: {
           runId: "wfr_plan_schema_fallback",
@@ -26766,7 +26701,7 @@ describe("TaskService", () => {
       .waitForAgentReport(childId, { timeoutMs: 5_000 })
       .catch((error: unknown) => error);
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     const waiterError = await waiter;
     expect(waiterError).toBeInstanceOf(Error);
@@ -26784,7 +26719,7 @@ describe("TaskService", () => {
   });
 
   test("plan-to-exec auto-handoff resets the persisted recovery budget", async () => {
-    const { config, childId, internal } = await setupPlanModeStreamEndHarness();
+    const { config, childId, taskService } = await setupPlanModeStreamEndHarness();
 
     // Budget consumed by propose_plan recovery prompts during the plan phase.
     await config.editConfig((cfg) => {
@@ -26797,7 +26732,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     // A successful propose_plan is a successful completion-tool outcome: the
     // exec phase starts with a fresh budget instead of inheriting the plan's.
@@ -26812,7 +26747,7 @@ describe("TaskService", () => {
     { name: "new-style", pins: { model: "openai:gpt-5.2", thinkingLevel: "high" as const } },
     { name: "legacy", pins: undefined },
   ])("plan-to-exec auto-handoff clears plan-phase pins ($name)", async (row) => {
-    const { config, childId, internal } = await setupPlanModeStreamEndHarness();
+    const { config, childId, taskService } = await setupPlanModeStreamEndHarness();
     await config.editConfig((cfg) => {
       for (const project of cfg.projects.values()) {
         const workspace = project.workspaces.find((ws) => ws.id === childId);
@@ -26823,7 +26758,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     const updatedTask = Array.from(config.loadConfigOrDefault().projects.values())
       .flatMap((project) => project.workspaces)
@@ -26834,9 +26769,9 @@ describe("TaskService", () => {
   });
 
   test("plan task stream-end with final assistant text still requires propose_plan", async () => {
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness();
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness();
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-plan-output",
@@ -26858,9 +26793,9 @@ describe("TaskService", () => {
   });
 
   test("plan task stream-end without propose_plan sends propose_plan reminder (not agent_report)", async () => {
-    const { config, childId, sendMessage, internal } = await setupPlanModeStreamEndHarness();
+    const { config, childId, sendMessage, taskService } = await setupPlanModeStreamEndHarness();
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-plan-output",
@@ -26909,11 +26844,10 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
     };
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child",
@@ -26989,11 +26923,10 @@ describe("TaskService", () => {
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
 
     const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       handleTaskStreamError: (event: ErrorEvent) => Promise<void>;
     };
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child",
@@ -27644,7 +27577,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
     // Stream ends without a report: first recovery prompt consumes budget.
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child",
@@ -27706,7 +27639,7 @@ describe("TaskService", () => {
     const { workspaceService } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "assistant-child-report",
@@ -27892,11 +27825,11 @@ describe("TaskService", () => {
     const sendMessageFailure = mock(
       (): Promise<Result<void>> => Promise.resolve(Err("kickoff failed"))
     );
-    const { config, childId, internal } = await setupPlanModeStreamEndHarness({
+    const { config, childId, taskService } = await setupPlanModeStreamEndHarness({
       sendMessageOverride: sendMessageFailure,
     });
 
-    await internal.handleStreamEnd(makeSuccessfulProposePlanStreamEndEvent(childId));
+    await streamEnd(taskService, makeSuccessfulProposePlanStreamEndEvent(childId));
 
     expect(sendMessageFailure).toHaveBeenCalledTimes(1);
 
@@ -28600,10 +28533,6 @@ describe("TaskService", () => {
         workspaceService,
       });
 
-      const internal = taskService as unknown as {
-        handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-      };
-
       const makeStreamEndEvent = (): StreamEndEvent => ({
         type: "stream-end",
         workspaceId: rootWorkspaceId,
@@ -28615,7 +28544,6 @@ describe("TaskService", () => {
       return {
         config,
         taskService,
-        internal,
         sendMessage,
         rootWorkspaceId,
         childTaskId,
@@ -28625,39 +28553,39 @@ describe("TaskService", () => {
     }
 
     test("stops auto-resuming after MAX_CONSECUTIVE_PARENT_AUTO_RESUMES (3)", async () => {
-      const { internal, sendMessage, makeStreamEndEvent } =
+      const { taskService, sendMessage, makeStreamEndEvent } =
         await setupParentWithActiveChild(rootDir);
 
       // First 3 calls should trigger sendMessage (limit is 3)
       for (let i = 0; i < 3; i++) {
-        await internal.handleStreamEnd(makeStreamEndEvent());
+        await streamEnd(taskService, makeStreamEndEvent());
       }
       expect(sendMessage).toHaveBeenCalledTimes(3);
 
       // 4th call should NOT trigger sendMessage (limit exceeded)
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(3); // still 3
     });
 
     test("resetAutoResumeCount allows more resumes after limit", async () => {
-      const { internal, sendMessage, taskService, rootWorkspaceId, makeStreamEndEvent } =
+      const { sendMessage, taskService, rootWorkspaceId, makeStreamEndEvent } =
         await setupParentWithActiveChild(rootDir);
 
       // Exhaust the auto-resume limit
       for (let i = 0; i < 3; i++) {
-        await internal.handleStreamEnd(makeStreamEndEvent());
+        await streamEnd(taskService, makeStreamEndEvent());
       }
       expect(sendMessage).toHaveBeenCalledTimes(3);
 
       // Blocked (limit reached)
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(3);
 
       // User sends a message → resets the counter
       taskService.resetAutoResumeCount(rootWorkspaceId);
 
       // Now auto-resume should work again
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(4);
     });
 
@@ -28708,9 +28636,6 @@ describe("TaskService", () => {
       const { aiService } = createAIServiceMocks(config);
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-      const internal = taskService as unknown as {
-        handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-      };
       const makeStreamEndEvent = (): StreamEndEvent => ({
         type: "stream-end",
         workspaceId: rootWorkspaceId,
@@ -28720,14 +28645,14 @@ describe("TaskService", () => {
       });
 
       for (let i = 0; i < 3; i++) {
-        await internal.handleStreamEnd(makeStreamEndEvent());
+        await streamEnd(taskService, makeStreamEndEvent());
       }
       expect(sendMessage).toHaveBeenCalledTimes(3);
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(3);
 
       await runStore.appendStatus(firstRunId, "completed", "2026-06-04T00:00:02.000Z");
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(3);
 
       await runStore.createRun({
@@ -28750,7 +28675,7 @@ describe("TaskService", () => {
         createdAtMs: 3_000,
       });
 
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(4);
       expect(sendMessage).toHaveBeenLastCalledWith(
         rootWorkspaceId,
@@ -28761,17 +28686,17 @@ describe("TaskService", () => {
     });
 
     test("markParentWorkspaceInterrupted suppresses parent auto-resume until reset", async () => {
-      const { internal, sendMessage, taskService, rootWorkspaceId, makeStreamEndEvent } =
+      const { sendMessage, taskService, rootWorkspaceId, makeStreamEndEvent } =
         await setupParentWithActiveChild(rootDir);
 
       taskService.markParentWorkspaceInterrupted(rootWorkspaceId);
 
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).not.toHaveBeenCalled();
 
       taskService.resetAutoResumeCount(rootWorkspaceId);
 
-      await internal.handleStreamEnd(makeStreamEndEvent());
+      await streamEnd(taskService, makeStreamEndEvent());
       expect(sendMessage).toHaveBeenCalledTimes(1);
     });
 
@@ -28824,7 +28749,7 @@ describe("TaskService", () => {
 
       // Exhaust limit on workspace A
       for (let i = 0; i < 3; i++) {
-        await handleTaskServiceStreamEndForTest(taskService, {
+        await streamEnd(taskService, {
           type: "stream-end",
           workspaceId: rootA,
           messageId: `a-${i}`,
@@ -28835,7 +28760,7 @@ describe("TaskService", () => {
       expect(sendMessage).toHaveBeenCalledTimes(3);
 
       // Workspace A is now blocked
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: rootA,
         messageId: "a-blocked",
@@ -28845,7 +28770,7 @@ describe("TaskService", () => {
       expect(sendMessage).toHaveBeenCalledTimes(3); // still 3
 
       // Workspace B should still work (independent counter)
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: rootB,
         messageId: "b-0",
@@ -28897,9 +28822,7 @@ describe("TaskService", () => {
     expect(created).toMatchObject({ success: true, data: { workspaceId: childWorkspaceId } });
     if (!created.success) return;
 
-    await (
-      taskService as unknown as { handleStreamEnd: (event: StreamEndEvent) => Promise<void> }
-    ).handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childWorkspaceId,
       messageId: "msg-continuation-result",
@@ -29075,9 +28998,7 @@ describe("TaskService", () => {
       encoding: "utf-8",
     }).trim();
 
-    await (
-      taskService as unknown as { handleStreamEnd: (event: StreamEndEvent) => Promise<void> }
-    ).handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childId,
       messageId: "msg-exec-continuation-result",
@@ -29171,9 +29092,7 @@ describe("TaskService", () => {
       ownerWorkspaceId: directParentTaskId,
       timeoutMs: 5_000,
     });
-    await (
-      taskService as unknown as { handleStreamEnd: (event: StreamEndEvent) => Promise<void> }
-    ).handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "msg-nested-continuation-result",
@@ -29250,9 +29169,7 @@ describe("TaskService", () => {
       ownerWorkspaceId: rootWorkspaceId,
       timeoutMs: 5_000,
     });
-    await (
-      taskService as unknown as { handleStreamEnd: (event: StreamEndEvent) => Promise<void> }
-    ).handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "msg-owner-wake-result",
@@ -29314,10 +29231,7 @@ describe("TaskService", () => {
     });
     expect(created.success).toBe(true);
 
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_1",
@@ -29408,10 +29322,9 @@ describe("TaskService", () => {
     );
 
     const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       pendingTerminalAttentionDrains: Set<Promise<void>>;
     };
-    await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
+    await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
 
     // Drain runs asynchronously; await any in-flight drains before asserting.
     await Promise.all([...internal.pendingTerminalAttentionDrains]);
@@ -29491,11 +29404,10 @@ describe("TaskService", () => {
     );
 
     const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       pendingTerminalAttentionDrains: Set<Promise<void>>;
       drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
     };
-    await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
+    await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
     await Promise.all([...internal.pendingTerminalAttentionDrains]);
 
     // No wake-up sent while a queued/preparing turn exists.
@@ -30079,11 +29991,9 @@ describe("TaskService", () => {
 
   test("workspace-turn stream-end with non-stop finish marks the handle error", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_truncated", "Partial", { finishReason: "length" })
     );
 
@@ -30107,12 +30017,9 @@ describe("TaskService", () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest({
       hasPendingBashMonitorWakeContinuation,
     });
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
     const correlation = workspaceTurnMuxMetadata(parentId);
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_queue_cut",
@@ -30132,7 +30039,7 @@ describe("TaskService", () => {
     // The continuation stream inherits the correlation metadata (see
     // AgentSession.inheritOpenWorkspaceTurnMetadata); its terminal stream-end
     // settles the turn with the real outcome.
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_continuation_final",
@@ -30193,10 +30100,7 @@ describe("TaskService", () => {
       muxMetadata: correlation,
     });
 
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_nested_report_cut",
@@ -30224,7 +30128,7 @@ describe("TaskService", () => {
     });
 
     hasPendingWorkspaceTurnContinuation.mockReturnValue(false);
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_nested_report_final",
@@ -30406,11 +30310,9 @@ describe("TaskService", () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest({
       hasPendingQueuedOrPreparingTurn,
     });
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_superseded_cut", "Cut mid-work", {
         finishReason: "tool-calls",
       })
@@ -30466,11 +30368,8 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation((workspaceId: string) =>
       workspaceId === "childworkspace" ? ownerFollowUpCutter(parentId, "wst_successor") : undefined
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_owner_follow_up_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_owner_follow_up_cut"));
 
     const settled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(settled, "settled handle must exist");
@@ -30518,11 +30417,8 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter("ancestorownerws", "wst_ancestor_follow_up")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_cross_owner_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_cross_owner_cut"));
 
     const settled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(settled, "settled handle must exist");
@@ -30552,11 +30448,8 @@ describe("TaskService", () => {
       ...ownerFollowUpCutter(parentId, "wst_successor"),
       dispatchMode: "turn-end" as const,
     }));
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_turn_end_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_turn_end_cut"));
 
     expect(
       await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
@@ -30576,11 +30469,8 @@ describe("TaskService", () => {
       stage: "preparing" as const,
       muxMetadata: undefined,
     }));
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_engaged_manual_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_engaged_manual_cut"));
 
     expect(
       await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
@@ -30608,11 +30498,8 @@ describe("TaskService", () => {
           }
         : undefined
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_streaming_successor_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_streaming_successor_cut"));
 
     const settled = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
     expect(settled).toMatchObject({ status: "interrupted" });
@@ -30625,9 +30512,6 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
     const waited = workspaceTurnManagerFor(taskService)
       .waitForWorkspaceTurn("wst_handle", {
         requestingWorkspaceId: parentId,
@@ -30638,7 +30522,7 @@ describe("TaskService", () => {
         (error: unknown) => error
       );
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_waiter_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_waiter_cut"));
 
     const error = await waited;
     expect(error).toBeInstanceOf(Error);
@@ -30654,10 +30538,7 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_late_waiter_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_late_waiter_cut"));
 
     let error: unknown;
     try {
@@ -30710,10 +30591,7 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_chain_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_chain_cut"));
     expect(
       (await taskHandleStore.getWorkspaceTurn(parentId, "wst_successor"))?.disposableWorkspace
     ).toBe(true);
@@ -30753,10 +30631,7 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_owner_follow_up_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_owner_follow_up_cut"));
     expect(await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle")).toMatchObject({
       status: "interrupted",
     });
@@ -30765,7 +30640,8 @@ describe("TaskService", () => {
     // Late correlated evidence proves the turn actually completed: the quiet
     // supersede stays self-heal eligible and the corrected outcome re-arms the
     // (non-suppressed) wake.
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_late_final", "Late done")
     );
 
@@ -30792,10 +30668,7 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_stop_noop_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_stop_noop_cut"));
     aiMocks.stopStream.mockClear();
 
     const repeat = await workspaceTurnManagerFor(taskService).interruptWorkspaceTurn(
@@ -30828,11 +30701,8 @@ describe("TaskService", () => {
         ? { stage: "preparing" as const, muxMetadata: undefined }
         : ownerFollowUpCutter(parentId, "wst_successor");
     });
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_snapshot_race_cut"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_snapshot_race_cut"));
 
     expect(cutterReads).toBeGreaterThanOrEqual(1);
     expect(
@@ -30864,11 +30734,8 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_disposable_transfer"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_disposable_transfer"));
 
     const settled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     expect(settled).toMatchObject({ status: "interrupted", disposableWorkspace: false });
@@ -30891,11 +30758,8 @@ describe("TaskService", () => {
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_missing_successor")
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_disposable_no_successor"));
+    await streamEnd(taskService, ownerFollowUpCutEvent(parentId, "msg_disposable_no_successor"));
 
     expect(
       await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
@@ -30918,16 +30782,13 @@ describe("TaskService", () => {
       ...running,
       attentionPolicy: "notify_on_terminal",
     });
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
     // Length-truncated correlated final settles the handle as error and arms a wake.
     const truncated = workspaceTurnStreamEndEvent(parentId, "msg_truncated_error", "Truncated", {
       finishReason: "length",
     });
     truncated.metadata.historySequence = 1;
-    await internal.handleStreamEnd(truncated);
+    await streamEnd(taskService, truncated);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     expect(errored.status).toBe("error");
@@ -30945,7 +30806,7 @@ describe("TaskService", () => {
     );
     const cut = ownerFollowUpCutEvent(parentId, "msg_quiet_resettle_cut");
     cut.metadata.historySequence = 2;
-    await internal.handleStreamEnd(cut);
+    await streamEnd(taskService, cut);
 
     const resettled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(resettled, "resettled handle must exist");
@@ -31000,11 +30861,11 @@ describe("TaskService", () => {
       attentionPolicy: "notify_on_terminal",
     });
     const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       pendingTerminalAttentionDrains: Set<Promise<void>>;
       drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
     };
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_truncated_before_quiet", "Truncated", {
         finishReason: "length",
       })
@@ -31065,11 +30926,9 @@ describe("TaskService", () => {
       dispatchMode: "turn-end" as const,
       muxMetadata: workspaceTurnMuxMetadata(parentId, "wst_successor", "turn2"),
     }));
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_natural_completion", "Done")
     );
 
@@ -31100,9 +30959,6 @@ describe("TaskService", () => {
       return cfg;
     });
     const taskHandleStore = new TaskHandleStore(config);
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
     const truncated = workspaceTurnStreamEndEvent(
       parentId,
       "msg_truncated_direct_parent",
@@ -31112,7 +30968,7 @@ describe("TaskService", () => {
       }
     );
     truncated.metadata.historySequence = 1;
-    await internal.handleStreamEnd(truncated);
+    await streamEnd(taskService, truncated);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     expect(errored.status).toBe("error");
@@ -31136,7 +30992,7 @@ describe("TaskService", () => {
     const successor = ownerFollowUpCutEvent(parentId, "msg_quiet_direct_parent_cut");
     // Durable ordering proves this cut follows the truncated response.
     successor.metadata.historySequence = 2;
-    await internal.handleStreamEnd(successor);
+    await streamEnd(taskService, successor);
 
     const resettled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(resettled, "resettled handle must exist");
@@ -31162,11 +31018,9 @@ describe("TaskService", () => {
           }
         : undefined
     );
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_queue_cut_streaming", "Cut mid-work", {
         finishReason: "tool-calls",
       })
@@ -31186,11 +31040,8 @@ describe("TaskService", () => {
     const { parentId, taskService, created } = await startWorkspaceTurnForTest({
       waitForPendingCompactionCompletionDecision: mock(() => Promise.resolve(false)),
     });
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: created.workspaceId,
       messageId: "msg_compaction_summary",
@@ -31212,11 +31063,9 @@ describe("TaskService", () => {
     // not a queue cut (e.g. a successful required-tool stop condition); it must
     // keep the truncation error handling rather than claim a supersede.
     const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_tool_calls_terminal", "Partial", {
         finishReason: "tool-calls",
       })
@@ -31233,11 +31082,8 @@ describe("TaskService", () => {
 
   test("parent stream-end auto-resumes for active background workspace turns", async () => {
     const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentId,
       messageId: "parent_msg_1",
@@ -31272,10 +31118,8 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_1", "Premature final text")
     );
 
@@ -31303,10 +31147,8 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_notify_only", "Final text despite background work")
     );
 
@@ -31348,11 +31190,8 @@ describe("TaskService", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_prehandoff",
@@ -31411,11 +31250,8 @@ describe("TaskService", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_prehandoff",
@@ -31480,11 +31316,8 @@ describe("TaskService", () => {
       ownerWorkspaceId: parentId,
       turnId: "turn",
     };
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_retry_final",
@@ -31537,11 +31370,8 @@ describe("TaskService", () => {
       ownerWorkspaceId: parentId,
       turnId: "turn",
     };
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_retry_final",
@@ -31587,11 +31417,8 @@ describe("TaskService", () => {
       ownerWorkspaceId: parentId,
       turnId: "turn",
     };
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_truncated_replay",
@@ -31629,11 +31456,8 @@ describe("TaskService", () => {
       ownerWorkspaceId: parentId,
       turnId: "turn",
     };
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_late_final",
@@ -31667,11 +31491,8 @@ describe("TaskService", () => {
       ownerWorkspaceId: parentId,
       turnId: "turn",
     };
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_second",
@@ -31739,9 +31560,6 @@ describe("TaskService", () => {
     const postSettlementDeliveryStarted = new Promise<void>((resolve) => {
       signalPostSettlementDelivery = resolve;
     });
-    const streamHost = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
     const internal = workspaceTurnManagerFor(taskService) as unknown as {
       deliverPersistentChildWorkspaceTurnResult: (
         record: WorkspaceTurnTaskHandleRecord,
@@ -31760,7 +31578,8 @@ describe("TaskService", () => {
       signalPostSettlementDelivery();
       await postSettlementDeliveryBlocked;
     });
-    const settling = streamHost.handleStreamEnd(
+    const settling = streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(
         parentId,
         "msg_concurrent_resettle",
@@ -31833,11 +31652,8 @@ describe("TaskService", () => {
       })
     );
     expect(appendResult.success).toBe(true);
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_prehandoff",
@@ -31915,9 +31731,7 @@ describe("TaskService", () => {
     );
     expect(appendResult.success).toBe(true);
 
-    await (
-      taskService as unknown as { handleStreamEnd: (event: StreamEndEvent) => Promise<void> }
-    ).handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_workflow_blocked",
@@ -31962,9 +31776,10 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    await (
-      taskService as unknown as { handleStreamEnd: (event: StreamEndEvent) => Promise<void> }
-    ).handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Premature final text"));
+    await streamEnd(
+      taskService,
+      workspaceTurnStreamEndEvent(parentId, "msg_1", "Premature final text")
+    );
 
     expect(workspaceMocks.sendMessage).toHaveBeenCalledTimes(2);
     expect(workspaceMocks.sendMessage.mock.calls[1]?.[2]).toMatchObject({
@@ -31974,11 +31789,8 @@ describe("TaskService", () => {
 
   test("workspace-turn stream-end ignores unrelated mux metadata", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
 
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "compaction_msg",
@@ -32015,10 +31827,7 @@ describe("TaskService", () => {
     });
     expect(created.success).toBe(true);
 
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await internal.handleStreamEnd({
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "childworkspace",
       messageId: "msg_1",
@@ -32044,7 +31853,6 @@ describe("TaskService", () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
     const internal = taskService as unknown as {
       handleStreamAbort: (event: StreamAbortEvent) => Promise<void>;
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
 
     await internal.handleStreamAbort({
@@ -32058,7 +31866,8 @@ describe("TaskService", () => {
       workspaceId: "childworkspace",
     });
 
-    await internal.handleStreamEnd(
+    await streamEnd(
+      taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_resumed", "Resumed done")
     );
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
@@ -32090,9 +31899,6 @@ describe("TaskService", () => {
 
   test("waitForWorkspaceTurn handles completion racing with waiter registration", async () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
-    const internal = taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
     const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
     const originalGetWorkspaceTurn = store.getWorkspaceTurn.bind(store);
     const completionHandled = Promise.withResolvers<void>();
@@ -32103,7 +31909,7 @@ describe("TaskService", () => {
         const record = await originalGetWorkspaceTurn(ownerWorkspaceId, handleId);
         if (!triggered && handleId === "wst_handle" && record?.status === "running") {
           triggered = true;
-          await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
+          await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
           completionHandled.resolve();
         }
         return record;
@@ -32137,10 +31943,8 @@ describe("TaskService", () => {
       completed.parentId
     );
     assert(staleRunningRecord, "expected running workspace-turn record");
-    const completedInternal = completed.taskService as unknown as {
-      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-    };
-    await completedInternal.handleStreamEnd(
+    await streamEnd(
+      completed.taskService,
       workspaceTurnStreamEndEvent(completed.parentId, "msg_done", "Done")
     );
     await (
@@ -32227,11 +32031,10 @@ describe("TaskService", () => {
       disposable: true,
       remove: completedRemove,
     });
-    await (
-      completed.taskService as unknown as {
-        handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-      }
-    ).handleStreamEnd(workspaceTurnStreamEndEvent(completed.parentId, "msg_completed", "Done"));
+    await streamEnd(
+      completed.taskService,
+      workspaceTurnStreamEndEvent(completed.parentId, "msg_completed", "Done")
+    );
     expect(completedRemove).toHaveBeenCalledWith("childworkspace", true);
 
     const errorRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
@@ -33620,7 +33423,7 @@ describe("TaskService", () => {
 
       // Drive the real settlement path using correlation captured at the send boundary,
       // not a hand-authored continuation that would hide a missing metadata regression.
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: childTaskId,
         messageId: "before-parent-guidance",
@@ -33670,7 +33473,7 @@ describe("TaskService", () => {
         return;
       }
       await guidance[3]?.onAccepted?.();
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: childTaskId,
         messageId: "after-parent-guidance",
@@ -33852,7 +33655,7 @@ describe("TaskService", () => {
         return result;
       });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "reactivated-final",
@@ -33927,7 +33730,7 @@ describe("TaskService", () => {
     const activeRecord = await taskHandleStore.getWorkspaceTurn(parentWorkspaceId, handleId);
     assert(activeRecord, "reactivated workspace-turn record is required");
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "reactivated-compaction-summary",
@@ -33950,7 +33753,7 @@ describe("TaskService", () => {
       taskExecutionStatus: "running",
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: childTaskId,
       messageId: "reactivated-post-compaction-result",
@@ -34153,7 +33956,7 @@ describe("TaskService", () => {
       }
     );
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -34227,7 +34030,7 @@ describe("TaskService", () => {
       }
     );
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: parentTaskId,
       messageId: "assistant-parent-task",
@@ -34590,7 +34393,7 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    await handleTaskServiceStreamEndForTest(taskService, {
+    await streamEnd(taskService, {
       type: "stream-end",
       workspaceId: "nested-terminal-agent",
       messageId: "assistant-nested-terminal-agent",
@@ -34885,14 +34688,7 @@ describe("TaskService", () => {
         removeQueuedMessagesByDedupeKeyPrefix,
         ...hostOverrides,
       });
-      const streamEndListeners: Array<(event: StreamEndEvent) => void> = [];
-      const errorListeners: Array<(event: ErrorEvent) => void> = [];
-      const aiMocks = createAIServiceMocks(config, {
-        on: mock((name: string, listener: (event: StreamEndEvent | ErrorEvent) => void) => {
-          if (name === "stream-end") streamEndListeners.push(listener);
-          if (name === "error") errorListeners.push(listener);
-        }),
-      });
+      const aiMocks = createAIServiceMocks(config);
       const harness = createTaskServiceHarness(config, {
         workspaceService: mocks.workspaceService,
         aiService: aiMocks.aiService,
@@ -34910,10 +34706,10 @@ describe("TaskService", () => {
         receiptFake,
         child,
         emitStreamEnd: (event: StreamEndEvent) => {
-          for (const listener of streamEndListeners) listener(event);
+          aiMocks.events.emit("stream-end", event);
         },
         emitError: (event: ErrorEvent) => {
-          for (const listener of errorListeners) listener(event);
+          aiMocks.events.emit("error", event);
         },
         settleEventLock,
         removeQueuedMessagesByDedupeKeyPrefix,
@@ -34954,7 +34750,7 @@ describe("TaskService", () => {
         const t = await setupChildTask();
         t.receiptFake.register("entry-1", successor);
 
-        await handleTaskServiceStreamEndForTest(
+        await streamEnd(
           t.taskService,
           cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
         );
@@ -34996,7 +34792,7 @@ describe("TaskService", () => {
         ]) {
           t.receiptFake.register("parent-entry", successor);
           t.receiptFake.register("unrelated-entry");
-          await handleTaskServiceStreamEndForTest(t.taskService, cutEvent(t.parentId, stopCause));
+          await streamEnd(t.taskService, cutEvent(t.parentId, stopCause));
           expect(t.receiptFake.receipts.has("parent-entry")).toBe(false);
           expect(t.receiptFake.receipts.has("unrelated-entry")).toBe(true);
         }
@@ -35014,7 +34810,7 @@ describe("TaskService", () => {
       t.receiptFake.register("compact-entry");
       const event = cutEvent(t.childId, { kind: "queued-input", entryId: "compact-entry" });
       event.metadata.agentId = "compact";
-      await handleTaskServiceStreamEndForTest(t.taskService, event);
+      await streamEnd(t.taskService, event);
       expect(t.receiptFake.receipts.size).toBe(0);
       expect(t.sendMessage).not.toHaveBeenCalled();
     });
@@ -35023,7 +34819,7 @@ describe("TaskService", () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1", "streaming");
 
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
@@ -35042,7 +34838,7 @@ describe("TaskService", () => {
         const t = await setupChildTask();
         t.receiptFake.register("entry-1", successor);
 
-        await handleTaskServiceStreamEndForTest(
+        await streamEnd(
           t.taskService,
           cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
         );
@@ -35072,7 +34868,7 @@ describe("TaskService", () => {
       // The failure notification recovered first (disposed); the source handler runs last.
       t.receiptFake.register("entry-1", "prestream-failed", true);
 
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
@@ -35091,7 +34887,7 @@ describe("TaskService", () => {
         const t = await setupChildTask();
         t.receiptFake.register("continue-entry", successor);
 
-        await handleTaskServiceStreamEndForTest(
+        await streamEnd(
           t.taskService,
           cutEvent(t.childId, {
             kind: "context-budget",
@@ -35113,7 +34909,7 @@ describe("TaskService", () => {
     ])("%s keeps the existing recovery path", async (_label, stopCause) => {
       const t = await setupChildTask();
 
-      await handleTaskServiceStreamEndForTest(t.taskService, cutEvent(t.childId, stopCause));
+      await streamEnd(t.taskService, cutEvent(t.childId, stopCause));
 
       expect(t.sendMessage).toHaveBeenCalledTimes(1);
       expect(t.child()?.taskStatus).toBe("awaiting_report");
@@ -35126,7 +34922,7 @@ describe("TaskService", () => {
       async (successor) => {
         const t = await setupChildTask();
         t.receiptFake.register("entry-1");
-        await handleTaskServiceStreamEndForTest(
+        await streamEnd(
           t.taskService,
           cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
         );
@@ -35160,7 +34956,7 @@ describe("TaskService", () => {
     test("a deferred stream end settles when the successor streams, and its own end classifies normally", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1");
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
@@ -35172,10 +34968,7 @@ describe("TaskService", () => {
       expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
 
       // The successor's genuine incomplete end (no cut) still recovers.
-      await handleTaskServiceStreamEndForTest(
-        t.taskService,
-        cutEvent(t.childId, undefined, "assistant-successor")
-      );
+      await streamEnd(t.taskService, cutEvent(t.childId, undefined, "assistant-successor"));
       expect(t.sendMessage).toHaveBeenCalledTimes(1);
       expect(t.child()?.taskStatus).toBe("awaiting_report");
     });
@@ -35183,7 +34976,7 @@ describe("TaskService", () => {
     test("a terminal interruption clears the deferral, disposes the cut, and removes queued prompts", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1");
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
@@ -35213,12 +35006,12 @@ describe("TaskService", () => {
     test("a genuine completion clears the deferral so a withdrawn continuation never recovers", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1");
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
 
-      await handleTaskServiceStreamEndForTest(t.taskService, {
+      await streamEnd(t.taskService, {
         type: "stream-end",
         workspaceId: t.childId,
         messageId: "assistant-final",
@@ -35253,15 +35046,12 @@ describe("TaskService", () => {
     test("an unrelated turn ending cannot discard the still-pending cut continuation", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1");
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
       t.receiptFake.advanceTurn();
-      await handleTaskServiceStreamEndForTest(
-        t.taskService,
-        cutEvent(t.childId, undefined, "unrelated-incomplete-turn")
-      );
+      await streamEnd(t.taskService, cutEvent(t.childId, undefined, "unrelated-incomplete-turn"));
       expect(t.child()?.taskStatus).toBe("running");
       expect(t.sendMessage).not.toHaveBeenCalled();
       t.receiptFake.record("entry-1", "canceled");
@@ -35315,7 +35105,7 @@ describe("TaskService", () => {
     test("a delayed startup error and its failure notification share one recovery disposition", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1");
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
@@ -35352,7 +35142,7 @@ describe("TaskService", () => {
     test("explicit Stop discards a withdrawn continuation without recovery", async () => {
       const t = await setupChildTask();
       t.receiptFake.register("entry-1");
-      await handleTaskServiceStreamEndForTest(
+      await streamEnd(
         t.taskService,
         cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
       );
@@ -35669,7 +35459,7 @@ describe("TaskService", () => {
           },
           parts: [],
         };
-        await handleTaskServiceStreamEndForTest(taskService, budgetCut);
+        await streamEnd(taskService, budgetCut);
         expect(mocks.sendMessage).not.toHaveBeenCalled();
         completions[0].settle({ status: "completed", streamEnd: budgetCut });
 
@@ -35714,7 +35504,7 @@ describe("TaskService", () => {
           },
           parts: [agentReportPart],
         };
-        await handleTaskServiceStreamEndForTest(taskService, queuedInputCut);
+        await streamEnd(taskService, queuedInputCut);
         expect(mocks.sendMessage).not.toHaveBeenCalled();
         completions[1].settle({ status: "completed", streamEnd: queuedInputCut });
 
@@ -35728,7 +35518,7 @@ describe("TaskService", () => {
           metadata: { model: childModel, agentId: "exec", finishReason: "stop" },
           parts: [{ type: "text", text: "Sources listed; verdict stands." }],
         };
-        await handleTaskServiceStreamEndForTest(taskService, finalTurn);
+        await streamEnd(taskService, finalTurn);
         completions[2].settle({ status: "completed", streamEnd: finalTurn });
         await flushTerminalAttentionDrains(taskService);
 
@@ -36926,10 +36716,7 @@ describe("TaskService", () => {
           });
         }
 
-        await handleTaskServiceStreamEndForTest(
-          taskService,
-          reportStreamEnd(taskId, "final answer")
-        );
+        await streamEnd(taskService, reportStreamEnd(taskId, "final answer"));
 
         expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
         expect(internals.ownedAttemptByTaskId.has(taskId)).toBe(false);
@@ -36998,10 +36785,7 @@ describe("TaskService", () => {
           restore = () => spy.mockRestore();
         }
         try {
-          const publication = handleTaskServiceStreamEndForTest(
-            taskService,
-            reportStreamEnd(taskId, "older report")
-          );
+          const publication = streamEnd(taskService, reportStreamEnd(taskId, "older report"));
           await blocked.promise;
           if (successor !== "reawakened") {
             // Control: nothing replaced the attempt, so its own late report still completes it.
@@ -37069,7 +36853,7 @@ describe("TaskService", () => {
       const attempt = internals.ownedAttemptByTaskId.get(taskId);
       expect(attempt).toBeDefined();
 
-      await handleTaskServiceStreamEndForTest(taskService, reportStreamEnd(taskId, "lost report"));
+      await streamEnd(taskService, reportStreamEnd(taskId, "lost report"));
 
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
       expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
@@ -37093,7 +36877,7 @@ describe("TaskService", () => {
       expect(attempt).toBeDefined();
 
       // Cut short by the stop: no explicit `stop` finish, so nothing is promoted to a report.
-      await handleTaskServiceStreamEndForTest(taskService, {
+      await streamEnd(taskService, {
         type: "stream-end",
         workspaceId: taskId,
         messageId: `assistant-${taskId}`,
@@ -37819,14 +37603,13 @@ describe("TaskService", () => {
           status: string,
           options?: { onlyFromStatus?: string }
         ) => Promise<boolean>;
-        handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
       };
       // Every admitted launch completes immediately through the real publication path.
       const launched: string[] = [];
       spyOn(internals, "startReservedAgentTask").mockImplementation(async (plan) => {
         launched.push(plan.taskId);
         await internals.setTaskStatus(plan.taskId, "running", { onlyFromStatus: "starting" });
-        await internals.handleStreamEnd({
+        await streamEnd(taskService, {
           type: "stream-end",
           workspaceId: plan.taskId,
           messageId: `${plan.taskId}-final`,

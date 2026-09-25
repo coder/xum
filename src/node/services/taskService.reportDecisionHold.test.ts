@@ -6,7 +6,6 @@ import * as path from "path";
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok } from "@/common/types/result";
-import { SecretsStore } from "@/node/config";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
   TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE,
@@ -20,9 +19,9 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
 import { readSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
-import { TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
 import {
-  createMockInitStateManager,
+  createTaskServiceStack,
   createTestConfig,
   createTestProject,
   findWorkspaceInConfig,
@@ -31,7 +30,6 @@ import {
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
-import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
@@ -237,30 +235,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       sessionHarness.session
     );
     ledger.host = workspaceService as unknown as EventEmitter;
-    const terminalAttentionStore = new TerminalAttentionStore(config);
-    const taskService = new TaskService(
-      config,
+    const { taskService } = createTaskServiceStack(config, {
       historyService,
       aiService,
-      workspaceService as unknown as WorkspaceHost,
-      createMockInitStateManager(),
-      undefined,
-      undefined,
-      new SecretsStore(config.rootDir),
-      terminalAttentionStore
-    );
-    taskService.setWorkspaceTurnManager(
-      new WorkspaceTurnManager(
-        config,
-        historyService,
-        aiService,
-        workspaceService as unknown as WorkspaceHost,
-        createMockInitStateManager(),
-        taskService,
-        terminalAttentionStore,
-        aiService as unknown as ConstructorParameters<typeof WorkspaceTurnManager>[7]
-      )
-    );
+      workspaceService: workspaceService as unknown as WorkspaceHost,
+    });
     const svc = internals(taskService);
     ledger.svc = svc;
     workspaceService.setAgentTaskIntegration(
