@@ -27,7 +27,6 @@ import { createTestPluginInstallEntry } from "./agentPlugins/testFixtures";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
-  MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
   MCPServerManager,
   flattenMcpPrompt,
   isClosedClientError,
@@ -48,6 +47,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { jsonSchema, type Tool } from "ai";
+import { MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS } from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 
 interface MCPServerManagerTestAccess {

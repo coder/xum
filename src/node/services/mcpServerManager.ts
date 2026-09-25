@@ -88,7 +88,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
-import { MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
+import { MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS, MCP_STARTUP_TIMEOUT_MS } from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
@@ -106,7 +106,6 @@ const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
 // Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
 // while several unhealthy servers' startup deadlines overlap instead of stacking.
 const MCP_STARTUP_CONCURRENCY = 4;
-export const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
 /**
  * Timed-out servers are restarted from the cached same-signature path, and
  * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
