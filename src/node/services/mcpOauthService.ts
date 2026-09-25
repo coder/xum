@@ -1463,12 +1463,9 @@ export class McpOauthService {
       const result = await auth(provider, {
         serverUrl: flow.serverUrlForDiscovery,
         authorizationCode: input.code,
-        // RFC 9207: authorization servers that advertise
-        // authorization_response_iss_parameter_supported return `iss` on the
-        // callback, and the SDK rejects the exchange unless it sees a matching
-        // value (mix-up defense). Forward it verbatim and let the SDK validate;
-        // never normalize or check it here. null -> undefined because the SDK
-        // treats only undefined as "absent".
+        // RFC 9207 mix-up defense: the SDK rejects the exchange unless `iss`
+        // matches an issuer that advertises support. Forward it unmodified;
+        // null -> undefined because the SDK treats only undefined as absent.
         iss: input.iss ?? undefined,
         scope: flow.scope,
         resourceMetadataUrl: flow.resourceMetadataUrl,

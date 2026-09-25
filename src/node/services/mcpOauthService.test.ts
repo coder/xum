@@ -882,9 +882,7 @@ describe("McpOauthService OAuth flows", () => {
   }
 
   // The first case also proves discovery is reused across start and exchange
-  // (separate AS host). The RFC 9207 cases guard against dropping the callback's
-  // `iss` (Linear login failed with "expected ..., received undefined") while
-  // keeping the SDK's mix-up defense for a wrong issuer.
+  // (separate AS host).
   test.each([
     ["no RFC 9207 support, iss omitted", false, "omit"],
     ["RFC 9207 support, matching iss", true, "match"],
