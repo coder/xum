@@ -2144,7 +2144,10 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           expect(entryOf(config, spawnedId)?.taskLaunchError).toContain("provider unavailable");
           if (!outlives) {
             // The captured owners settled within the bound: record released, attempt settled.
-            expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
+            // The release follows the settlement receipt's real disk write, which this test's
+            // compressed settle bound can outrun; the record still releases on its own (nothing
+            // below disposes a token or settles a turn), so wait for it instead of racing it.
+            await waitForStopRelease(taskService, spawnedId);
             expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
             expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
               phase: "settled",
