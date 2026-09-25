@@ -57,8 +57,11 @@ describe("createOnChatReplayTimer", () => {
       })
       .catch((error: unknown) => error);
     expect(failure).toEqual(new Error("init failed"));
+    // A start() whose stop() never runs (the block threw) is closed by finish().
+    timer.start("streamReplay");
+    clock.advance(4);
 
-    expect(timer.finish().phasesMs).toEqual({ emitRows: 2, initReplay: 6 });
+    expect(timer.finish().phasesMs).toEqual({ emitRows: 2, initReplay: 6, streamReplay: 4 });
   });
 
   test("splits a locked read into wait and work at the lock-acquired callback", async () => {

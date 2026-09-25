@@ -66,14 +66,20 @@ export function createOnChatReplayTimer(
     phasesMs[phase] = (phasesMs[phase] ?? 0) + elapsedMs;
   };
 
+  // Phases started but not stopped yet. finish() closes them so a replay that throws between
+  // start() and stop() still reports the phase it failed in.
+  const openPhases = new Set<() => void>();
   const start = (phase: OnChatReplayPhase): (() => void) => {
     const phaseStartedAt = now();
     let stopped = false;
-    return () => {
+    const stop = () => {
       assert(!stopped, `onChat replay phase ${phase} stopped twice`);
       stopped = true;
+      openPhases.delete(stop);
       add(phase, now() - phaseStartedAt);
     };
+    openPhases.add(stop);
+    return stop;
   };
 
   return {
@@ -109,6 +115,7 @@ export function createOnChatReplayTimer(
       }
     },
     finish() {
+      for (const stop of [...openPhases]) stop();
       const rounded: Partial<Record<OnChatReplayPhase, number>> = {};
       for (const [phase, elapsedMs] of Object.entries(phasesMs) as Array<
         [OnChatReplayPhase, number]
