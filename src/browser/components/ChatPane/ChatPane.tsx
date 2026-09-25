@@ -595,9 +595,11 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     const operationalBundle = operationalBundleInfos?.[index];
     return operationalBundle === undefined || operationalBundle.position === "head";
   };
-  // Keep rendering trustworthy cached transcript rows during incremental catch-up so
-  // workspace switches feel stable; rows known to be missing backend content hide behind
-  // the skeleton instead of painting and jumping on caught-up. The stream/monitor barrier
+  // Keep rendering cached transcript rows during incremental (since) catch-up so workspace
+  // switches feel stable, even when they are known to be missing backend content: the server
+  // verified every row up to the cursor, and rows after it are swapped for the server's
+  // copies at caught-up, so the missing content mostly appends. Stale rows
+  // under a full replay hide behind the skeleton instead. The stream/monitor barrier
   // lives in the composer dock, so it never vetoes the skeleton. The skeleton
   // additionally holds until decoration data sources are known so the transcript and all
   // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
@@ -607,6 +609,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       chatViewDataReady,
       hasRenderableMessages: deferredMessages.length > 0,
       isTranscriptStale: workspaceState.isTranscriptStale,
+      isIncrementalCatchUp: workspaceState.isIncrementalCatchUp,
     });
   // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
   // it: it would otherwise mount the whole transcript in the one commit that replaces the
@@ -628,6 +631,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!hasCommittedTranscriptRow) return;
     return markChatSwitchMilestoneOnNextFrame(workspaceId, "first-row");
   }, [workspaceId, hasCommittedTranscriptRow]);
+  // Streaming rows render synchronously while older chunks still mount (see
+  // TranscriptBackfillContext). Gated on an active stream so a switch to an idle chat never
+  // flips the value, which would re-render every mounted markdown row once the reveal ends.
+  const isTranscriptBackfillingDuringStream = canInterrupt && !isFullyRevealed;
   // Older pages prepend above rows the reveal has not reached yet; offer them once it has.
   const shouldRenderLoadOlderMessagesButton =
     hasOlderHistory && isFullyRevealed && !isPixelSnapshotEnvironment();
@@ -1589,7 +1596,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 </div>
               ) : (
                 <BashCollapsedSummaryModeProvider>
-                  <MessageListProvider value={messageListContextValue}>
+                  <MessageListProvider
+                    value={messageListContextValue}
+                    isTranscriptBackfilling={isTranscriptBackfillingDuringStream}
+                  >
                     {shouldRenderLoadOlderMessagesButton && (
                       <div className="flex justify-center py-3">
                         <TooltipIfPresent

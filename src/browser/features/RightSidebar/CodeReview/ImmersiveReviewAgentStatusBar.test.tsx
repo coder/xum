@@ -51,6 +51,7 @@ function buildState(workspaceId: string, input: SeedInput): WorkspaceState {
     transcriptReplayFailed: false,
     isHydratingTranscript: false,
     isTranscriptStale: false,
+    isIncrementalCatchUp: false,
     hasOlderHistory: false,
     loadingOlderHistory: false,
     muxMessages: [],
