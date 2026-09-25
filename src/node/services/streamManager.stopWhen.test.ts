@@ -1,12 +1,16 @@
-import { describe, test, expect, mock } from "bun:test";
-import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/streamStopCause";
+import { describe, test, expect, afterEach, mock } from "bun:test";
+import type { StreamStopCause } from "@/common/types/streamStopCause";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
-import { StreamManager, type TurnExecutionOptions } from "./streamManager";
-import { tool, type LanguageModel, type Tool } from "ai";
+import type { TurnExecutionOptions } from "./streamManager";
+import { tool } from "ai";
 import { z } from "zod";
-import { engineInternals, onTurnEngineEvent } from "./streamManager.testHarness";
+import {
+  createStreamManagerForTests,
+  fakeStreamText,
+  onTurnEngineEvent,
+} from "./streamManager.testHarness";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import {
   installStreamManagerTestHistory,
@@ -15,33 +19,92 @@ import {
   TEST_STREAM_MODEL_ID,
   appendPartialAssistantForTests,
   createStreamResultForTests,
-  createStreamInfoForTests,
+  testStartOptions,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
 
 describe("StreamManager - stopWhen configuration", () => {
   type StopWhenCondition = (options: { steps: unknown[] }) => boolean | Promise<boolean>;
-  type BuildStopWhenCondition = (request: {
-    stopCause?: StreamStopCause;
-    getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-    toolPolicy?: ToolPolicy;
-    onStepSettled?: TurnExecutionOptions["onStepSettled"];
-    modelString?: string;
-    tools?: Record<string, Tool>;
-    contextBudgetMemoryWritable?: boolean;
-  }) => StopWhenCondition[];
+  type StreamEndMetadataForTests = ReturnType<typeof StreamEndEventSchema.parse>["metadata"];
 
-  function buildStopWhenForTests(streamManager = new StreamManager(historyService)) {
-    return engineInternals(streamManager).createStopWhenCondition;
+  interface StopWhenTurnForTests {
+    /** The stopWhen conditions startStream handed to streamText, in order. */
+    stopWhen: StopWhenCondition[];
+    /** Lets the held stream finish and returns its stream-end metadata. */
+    finish: (finishReason?: string) => Promise<StreamEndMetadataForTests>;
   }
 
-  function requiredToolConditionForTests(toolPolicy: ToolPolicy): StopWhenCondition {
-    const [, , requiredToolCondition] = buildStopWhenForTests()({
-      hasQueuedMessages: () => false,
-      toolPolicy,
+  let stopWhenTurnCounter = 0;
+  const openTurns: Array<() => Promise<unknown>> = [];
+
+  afterEach(async () => {
+    for (const finish of openTurns.splice(0)) await finish();
+  });
+
+  /**
+   * Starts a turn through startStream with an injected streamText that captures
+   * the real stopWhen conditions. The stream holds after its first text part so
+   * a stop cause recorded by a condition lands on the stream-end record.
+   */
+  async function startStopWhenTurnForTests(
+    options: Partial<TurnExecutionOptions> & { workspaceId?: string } = {}
+  ): Promise<StopWhenTurnForTests> {
+    stopWhenTurnCounter += 1;
+    const workspaceId = options.workspaceId ?? `stop-when-${stopWhenTurnCounter}`;
+    const messageId = `${workspaceId}-message`;
+    let finishReason = "stop";
+    const release = Promise.withResolvers<void>();
+    const streamText = mock((_options: { stopWhen?: unknown }) =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "Intermediate result" };
+          await release.promise;
+          yield { type: "finish", finishReason };
+        })()
+      )
+    );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(streamText),
     });
+    const streamEnds: unknown[] = [];
+    onTurnEngineEvent(streamManager, "stream-end", (event) => streamEnds.push(event));
+    await appendPartialAssistantForTests(workspaceId, messageId, 1);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        model: createTestLanguageModel(),
+        providedRuntimeTempDir: "",
+        ...options,
+        workspaceId,
+        messageId,
+      })
+    );
+    if (!result.success) throw new Error("Expected stream to start");
+    const completion = result.data.completion;
+    let finished: Promise<StreamEndMetadataForTests> | undefined;
+    const finish = (reason = "stop") => {
+      finished ??= (async () => {
+        finishReason = reason;
+        release.resolve();
+        await completion;
+        expect(streamEnds).toHaveLength(1);
+        return StreamEndEventSchema.parse(streamEnds[0]).metadata;
+      })();
+      return finished;
+    };
+    openTurns.push(finish);
+    const stopWhen = streamText.mock.calls[0]?.[0]?.stopWhen;
+    if (!Array.isArray(stopWhen))
+      throw new Error("Expected startStream to pass stopWhen conditions");
+    // The SDK types conditions over full StepResults; these tests feed the fields they read.
+    return { stopWhen: stopWhen as StopWhenCondition[], finish };
+  }
+
+  async function requiredToolConditionForTests(toolPolicy: ToolPolicy): Promise<StopWhenCondition> {
+    const {
+      stopWhen: [, , requiredToolCondition],
+    } = await startStopWhenTurnForTests({ hasQueuedMessages: () => false, toolPolicy });
     return requiredToolCondition;
   }
 
@@ -51,15 +114,6 @@ describe("StreamManager - stopWhen configuration", () => {
 
   test("persists the queue stop decision after the session clears the cutter", async () => {
     const { session, cleanup } = await createAgentSessionHarness({ workspaceId: "stop-decision" });
-    const manager = new StreamManager(historyService);
-    const request: Parameters<BuildStopWhenCondition>[0] & {
-      model: LanguageModel;
-      messages: never[];
-    } = {
-      model: createTestLanguageModel(),
-      messages: [],
-      getQueuedInputStopCause: session.getQueuedInputStopCause.bind(session),
-    };
     try {
       const correlation = {
         type: "workspace-turn-task" as const,
@@ -72,39 +126,21 @@ describe("StreamManager - stopWhen configuration", () => {
         agentId: "exec",
         muxMetadata: correlation,
       });
-      const [, stop] = buildStopWhenForTests(manager)(request);
+      const turn = await startStopWhenTurnForTests({
+        workspaceId: "stop-decision",
+        getQueuedInputStopCause: session.getQueuedInputStopCause.bind(session),
+      });
+      const cause = session.getQueuedInputStopCause();
+      expect(cause).toMatchObject({ kind: "queued-input", muxMetadata: correlation });
+      const [, stop] = turn.stopWhen;
       expect(await stop({ steps: [] })).toBe(true);
-      const cause = request.stopCause;
-      expect(cause?.kind).toBe("queued-input");
       session.clearQueue();
       session.queueMessage("replacement");
       expect(session.getQueuedInputStopCause()?.entryId).not.toBe(
         cause?.kind === "queued-input" ? cause.entryId : undefined
       );
-      expect(request.stopCause).toMatchObject({ muxMetadata: correlation });
-      const messageId = "stop-decision-message";
-      await appendPartialAssistantForTests("stop-decision", messageId, 1);
-      const events: unknown[] = [];
-      onTurnEngineEvent(manager, "stream-end", (event) => events.push(event));
-      const info = createStreamInfoForTests({
-        messageId,
-        request,
-        parts: [{ type: "text", text: "Intermediate result" }],
-        streamResult: createStreamResultForTests(
-          (async function* () {
-            await Promise.resolve();
-            yield { type: "finish", finishReason: "tool-calls" };
-          })()
-        ),
-      });
-      await engineInternals(manager).processStreamWithCleanup.call(
-        manager,
-        "stop-decision",
-        info,
-        1
-      );
-      expect(events).toHaveLength(1);
-      expect(StreamEndEventSchema.parse(events[0]).metadata.stopCause).toEqual(cause);
+      // The stop decision recorded when the condition fired survives the queue change.
+      expect((await turn.finish("tool-calls")).stopCause).toEqual(cause);
       const history = await historyService.getHistoryFromLatestBoundary("stop-decision");
       expect(history.success).toBe(true);
       if (!history.success) throw new Error(history.error);
@@ -116,53 +152,63 @@ describe("StreamManager - stopWhen configuration", () => {
     }
   });
 
-  test.each([
-    { cause: { kind: "required-tool" } as const, expected: "stop" },
+  const downgradeCases: Array<{
+    cause: StreamStopCause;
+    expected: string;
+    options: Partial<TurnExecutionOptions>;
+    condition: number;
+    steps: { steps: unknown[] };
+  }> = [
     {
-      cause: { kind: "queued-input", entryId: "pending-input" } as const,
-      expected: "tool-calls",
+      cause: { kind: "required-tool" },
+      expected: "stop",
+      options: { toolPolicy: [{ regex_match: "agent_report", action: "require" }] },
+      condition: 2,
+      steps: stepsWithToolResult("agent_report", { success: true }),
     },
-  ])("persists a downgrade-compatible finish for $cause.kind", async ({ cause, expected }) => {
-    const manager = new StreamManager(historyService);
-    const workspaceId = "finish-compatibility";
-    const messageId = "finished-message";
-    await appendPartialAssistantForTests(workspaceId, messageId, 1);
-    const events: unknown[] = [];
-    onTurnEngineEvent(manager, "stream-end", (event) => events.push(event));
-    const info = createStreamInfoForTests({
-      messageId,
-      request: { model: createTestLanguageModel(), messages: [], stopCause: cause },
-      parts: [{ type: "text", text: "Tool result" }],
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "tool-calls" };
-        })()
-      ),
-    });
-    await engineInternals(manager).processStreamWithCleanup.call(manager, workspaceId, info, 1);
-    expect(StreamEndEventSchema.parse(events[0]).metadata.finishReason).toBe(expected);
-    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-    if (!history.success) throw new Error(history.error);
-    expect(history.data.at(-1)?.metadata?.finishReason).toBe(expected);
-    expect(history.data.at(-1)?.metadata?.stopCause).toEqual(cause);
-  });
+    {
+      cause: { kind: "queued-input", entryId: "pending-input" },
+      expected: "tool-calls",
+      options: {
+        getQueuedInputStopCause: () => ({ kind: "queued-input", entryId: "pending-input" }),
+      },
+      condition: 1,
+      steps: { steps: [] },
+    },
+  ];
+  test.each(downgradeCases)(
+    "persists a downgrade-compatible finish for $cause.kind",
+    async ({ cause, expected, options, condition, steps }) => {
+      const workspaceId = "finish-compatibility";
+      const turn = await startStopWhenTurnForTests({
+        workspaceId,
+        hasQueuedMessages: () => false,
+        ...options,
+      });
+      expect(await turn.stopWhen[condition](steps)).toBe(true);
+      expect((await turn.finish("tool-calls")).finishReason).toBe(expected);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.at(-1)?.metadata?.finishReason).toBe(expected);
+      expect(history.data.at(-1)?.metadata?.stopCause).toEqual(cause);
+    }
+  );
 
   test("records required-tool completion instead of a queued replacement", async () => {
-    const request: Parameters<BuildStopWhenCondition>[0] = {
+    const turn = await startStopWhenTurnForTests({
       toolPolicy: [{ regex_match: "agent_report", action: "require" }],
       getQueuedInputStopCause: () => ({ kind: "queued-input", entryId: "replacement" }),
-    };
-    const [, queueStop, requiredStop] = buildStopWhenForTests()(request);
+    });
+    const [, queueStop, requiredStop] = turn.stopWhen;
     const step = stepsWithToolResult("agent_report", { success: true });
     expect(await queueStop(step)).toBe(false);
     expect(await requiredStop(step)).toBe(true);
-    expect(request.stopCause?.kind).toBe("required-tool");
+    expect((await turn.finish("tool-calls")).stopCause?.kind).toBe("required-tool");
   });
 
   test("returns step-cap and queued-message conditions with no policy", async () => {
     let queued = false;
-    const stopWhen = buildStopWhenForTests()({ hasQueuedMessages: () => queued });
+    const { stopWhen } = await startStopWhenTurnForTests({ hasQueuedMessages: () => queued });
     expect(stopWhen).toHaveLength(3);
 
     const [maxStepCondition, queuedMessageCondition, requiredToolCondition] = stopWhen;
@@ -184,7 +230,9 @@ describe("StreamManager - stopWhen configuration", () => {
         Promise.resolve({ decision })
       );
       const sessionHistory = tool({ inputSchema: z.object({}) });
-      const [, stop] = buildStopWhenForTests()({
+      const {
+        stopWhen: [, stop],
+      } = await startStopWhenTurnForTests({
         // The ordinary queue condition must be false; the budget decision itself stops the SDK.
         hasQueuedMessages: (mode?: "tool-end" | "turn-end") => mode === "turn-end",
         onStepSettled,
@@ -234,13 +282,13 @@ describe("StreamManager - stopWhen configuration", () => {
   ] as const)(
     "budget %s binds the session's designated continuation into the stop cause",
     async (decision, expectedEntryId) => {
-      const request: Parameters<BuildStopWhenCondition>[0] = {
+      const turn = await startStopWhenTurnForTests({
         hasQueuedMessages: () => false,
         // The session names its successor with the decision; a blocked stop hands over to none.
         onStepSettled: () => Promise.resolve({ decision, continuationEntryId: "continue-entry" }),
         modelString: "anthropic:claude-sonnet-4-5",
-      };
-      const [, stop] = buildStopWhenForTests()(request);
+      });
+      const [, stop] = turn.stopWhen;
       const step = { steps: [{ usage: undefined, toolResults: [] }] };
       if (decision === "block") {
         let thrown: unknown;
@@ -253,7 +301,7 @@ describe("StreamManager - stopWhen configuration", () => {
       } else {
         expect(await stop(step)).toBe(true);
       }
-      expect(request.stopCause).toEqual({
+      expect((await turn.finish("tool-calls")).stopCause).toEqual({
         kind: "context-budget",
         decision,
         ...(expectedEntryId != null ? { continuationEntryId: expectedEntryId } : {}),
@@ -265,7 +313,9 @@ describe("StreamManager - stopWhen configuration", () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
       Promise.resolve({ decision: "rollover" })
     );
-    const [, stop] = buildStopWhenForTests()({
+    const {
+      stopWhen: [, stop],
+    } = await startStopWhenTurnForTests({
       hasQueuedMessages: () => false,
       onStepSettled,
       modelString: "anthropic:claude-sonnet-4-5",
@@ -287,7 +337,9 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(onStepSettled.mock.calls[0][0].newContextRequested).toBe(true);
     // Even a policy that "requires" new_context cannot turn its success into a terminal
     // completion that would skip the settled-step callback.
-    const [, stopRequired, required] = buildStopWhenForTests()({
+    const {
+      stopWhen: [, stopRequired, required],
+    } = await startStopWhenTurnForTests({
       hasQueuedMessages: () => false,
       onStepSettled,
       modelString: "anthropic:claude-sonnet-4-5",
@@ -316,7 +368,9 @@ describe("StreamManager - stopWhen configuration", () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
       Promise.resolve({ decision: "rollover" })
     );
-    const [, stop, required] = buildStopWhenForTests()({
+    const {
+      stopWhen: [, stop, required],
+    } = await startStopWhenTurnForTests({
       onStepSettled,
       modelString: TEST_STREAM_MODEL_ID,
       toolPolicy: [{ regex_match: "agent_report", action: "require" }],
@@ -401,8 +455,10 @@ describe("StreamManager - stopWhen configuration", () => {
   ];
 
   for (const requiredToolCase of requiredToolCases) {
-    test(requiredToolCase.name, () => {
-      const requiredToolCondition = requiredToolConditionForTests(requiredToolCase.toolPolicy);
+    test(requiredToolCase.name, async () => {
+      const requiredToolCondition = await requiredToolConditionForTests(
+        requiredToolCase.toolPolicy
+      );
       for (const assertion of requiredToolCase.assertions) {
         expect(
           requiredToolCondition(stepsWithToolResult(assertion.toolName, assertion.output))
