@@ -25,7 +25,7 @@ import { ChatHarness } from "../harness";
 
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getDraftScopeId, getModelKey, getProjectScopeId } from "@/common/constants/storage";
-import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
+import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
@@ -102,6 +102,47 @@ describeIntegration("Creation slash commands", () => {
       await cleanupView(view, cleanupDom);
     }
   }, 30_000);
+
+  test("/<model> one-shot sends the first message with that model only", async () => {
+    getSharedEnv().services.aiService.enableMockMode();
+    const { env, projectPath, view, cleanupDom, chat } = await setupCreationView();
+    const modelKey = getModelKey(getProjectScopeId(projectPath));
+    const projectModelBefore = readPersistedState(modelKey, "");
+    let workspaceId: string | undefined;
+
+    try {
+      await chat.send("/haiku hello from creation");
+
+      const createdWorkspaceId = await waitFor(
+        async () => {
+          const workspaces = await env.orpc.workspace.list({ archived: false });
+          const created = workspaces.find((workspace) => workspace.projectPath === projectPath);
+          if (!created) throw new Error("Created workspace not found yet");
+          return created.id;
+        },
+        { timeout: 20_000 }
+      );
+      workspaceId = createdWorkspaceId;
+
+      // The command prefix is stripped from the sent text and the one-shot model is used...
+      await waitFor(
+        () => {
+          expect(view.container.textContent ?? "").toContain("Mock response: hello from creation");
+        },
+        { timeout: 20_000 }
+      );
+      expect(env.services.aiService.mockAiStreamPlayer?.debugGetLastModel(createdWorkspaceId)).toBe(
+        KNOWN_MODELS.HAIKU.id
+      );
+      // ...without changing the project's model preference.
+      expect(readPersistedState(modelKey, "")).toBe(projectModelBefore);
+    } finally {
+      if (workspaceId) {
+        await env.orpc.workspace.remove({ workspaceId, options: { force: true } });
+      }
+      await cleanupView(view, cleanupDom);
+    }
+  }, 60_000);
 
   test("workspace-only commands show a toast and keep input", async () => {
     const { view, cleanupDom, chat } = await setupCreationView();

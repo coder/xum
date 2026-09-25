@@ -209,7 +209,7 @@ import {
   CREATION_COLUMN_MAX_WIDTH_CLASS,
 } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
-import { prepareMessagePayload } from "./prepareMessagePayload";
+import { getModelOneShotOverrides, prepareMessagePayload } from "./prepareMessagePayload";
 import {
   estimateBase64DataUrlBytes,
   isPdfAttachment,
@@ -1701,16 +1701,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     // /<model-alias> ... is a *send modifier* (one-shot model override), not a command with its own
-    // side effects. Let the normal send flow handle it so post-send behavior can't drift.
+    // side effects. Let the normal send flow (workspace or creation) handle it so post-send
+    // behavior can't drift.
     if (parsed.type === "model-oneshot") {
-      if (variant !== "workspace") {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: "Model one-shot is only available in workspace view",
-        });
-        return true;
-      }
       return false;
     }
 
@@ -2117,9 +2110,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
       }
 
+      const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
+      const oneShot = modelOneShot
+        ? getModelOneShotOverrides(
+            modelOneShot,
+            messageText,
+            attachments,
+            modelOneShot.modelString ?? baseModel
+          )
+        : undefined;
+      // Parsing makes a one-shot and a slash skill mutually exclusive, so the one-shot's
+      // metadata only ever combines with inline skill refs below.
+      const oneShotMetadata: MuxMessageMetadata | undefined = oneShot && {
+        type: "normal",
+        ...oneShot.metadata,
+      };
       let creationMessageTextForSend =
-        initialSlashCommand?.type === "goal-set" ? initialSlashCommand.objective : messageText;
-      let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
+        initialSlashCommand?.type === "goal-set"
+          ? initialSlashCommand.objective
+          : (modelOneShot?.message ?? messageText);
+      let creationOptionsOverride: Partial<SendMessageOptions> | undefined = oneShot && {
+        ...oneShot.options,
+        muxMetadata: oneShotMetadata,
+      };
 
       if (skillInvocation) {
         if (!api) {
@@ -2137,13 +2150,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               skillInvocation.descriptor,
               skillInvocation.argumentText
             )
-          : undefined;
+          : oneShotMetadata;
         const muxMetadata = withAgentSkillRefs(baseMetadata, combinedSkillRefs);
         if (!muxMetadata) {
           throw new Error("Expected skill metadata when skill refs are present");
         }
 
         creationOptionsOverride = {
+          ...oneShot?.options,
           muxMetadata,
           // In the creation flow, project-scoped skills may not exist in the new worktree.
           // Force project-path discovery for this send so resolution matches suggestions.
@@ -2175,6 +2189,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       );
 
       if (creationResult.success) {
+        if (modelOneShot) {
+          trackCommandUsed("model");
+        }
         if (isMountedRef.current) {
           setInput("");
           setAttachments([]);
@@ -2214,13 +2231,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // drafts (raw /goal text + staged/pending chips) retry through here.
       const goalCommandBypassedForAttachments =
         parsed?.type === "goal-set" && attachments.length > 0;
-      const commandHandled =
-        modelOneShot || goalCommandBypassedForAttachments
-          ? false
-          : await executeParsedCommand(parsed, input, {
-              goalInterventionPolicy: overrides?.goalInterventionPolicy,
-              queueDispatchMode: overrides?.queueDispatchMode,
-            });
+      const commandHandled = goalCommandBypassedForAttachments
+        ? false
+        : await executeParsedCommand(parsed, input, {
+            goalInterventionPolicy: overrides?.goalInterventionPolicy,
+            queueDispatchMode: overrides?.queueDispatchMode,
+          });
       if (commandHandled) {
         return;
       }
