@@ -58,6 +58,20 @@ describe("WorkspaceService sendMessage status clearing", () => {
     onMetadataEvent: ReturnType<typeof mock>;
   };
   let persistSettings: ReturnType<typeof mock>;
+  let getOrCreateSessionSpy: ReturnType<typeof spyOn<WorkspaceService, "getOrCreateSession">>;
+
+  /**
+   * A real session built and registered by the service (so it carries the service's
+   * preflight probe), while sends keep reaching the fake session.
+   */
+  function createRegisteredRealSession(): AgentSession {
+    getOrCreateSessionSpy.mockRestore();
+    const realSession = workspaceService.getOrCreateSession("test-workspace");
+    getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
+      fakeSession as unknown as AgentSession
+    );
+    return realSession;
+  }
 
   beforeEach(async () => {
     harness = await createWorkspaceServiceHarness({
@@ -94,7 +108,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       onMetadataEvent: mock(() => () => undefined),
     };
 
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
+    getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
       fakeSession as unknown as AgentSession
     );
 
@@ -477,9 +491,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // OWN saved follow-up. The probe must see unrelated preflights (round-37
     // semantics) but release the originating send at its session handoff.
     fakeSession.isBusy.mockReturnValue(false);
-    const realSession = (
-      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
-    ).createSession("test-workspace");
+    const realSession = createRegisteredRealSession();
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
     expect(probe).toBeDefined();
@@ -549,9 +561,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // with the resumed stream — the reservation must survive until the session
     // call settles.
     fakeSession.isBusy.mockReturnValue(false);
-    const realSession = (
-      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
-    ).createSession("test-workspace");
+    const realSession = createRegisteredRealSession();
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
     expect(probe).toBeDefined();
@@ -587,9 +597,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // completing goal-scoped follow-up be admitted ahead of the user's
     // intervention; the reservation must survive until the fallback settles.
     fakeSession.isBusy.mockReturnValue(false);
-    const realSession = (
-      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
-    ).createSession("test-workspace");
+    const realSession = createRegisteredRealSession();
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
     expect(probe).toBeDefined();
@@ -1298,6 +1306,16 @@ describe("WorkspaceService idle compaction dispatch", () => {
     workspaceService = harness.service;
   });
 
+  /** Mark the workspace through the real idle-compaction dispatch: idle before the send, streaming after it. */
+  async function markIdleCompacting(workspaceId: string): Promise<void> {
+    spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+    let busyChecks = 0;
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
+      isBusy: () => ++busyChecks >= 2,
+    } as unknown as AgentSession);
+    await workspaceService.executeIdleCompaction(workspaceId);
+  }
+
   /** Emit a provider stream error and collect the idle-compaction outcomes it reports. */
   async function reportedOutcomesOnStreamError(workspaceId: string) {
     const outcomes: Array<{ workspaceId: string; outcome: IdleCompactionOutcome }> = [];
@@ -1508,28 +1526,31 @@ describe("WorkspaceService idle compaction dispatch", () => {
       lastThinkingLevel: null,
     };
 
+    await markIdleCompacting(workspaceId);
     const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockResolvedValue(
       snapshot
     );
     const emitWorkspaceActivity = spyOn(workspaceService, "emitWorkspaceActivity");
 
-    const internals = workspaceService as unknown as {
-      idleCompactingWorkspaces: Set<string>;
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-    };
+    aiEvents.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: "compact-1",
+      model: "claude-sonnet-4",
+      startTime: Date.now(),
+    });
+    await waitForCondition(() => emitWorkspaceActivity.mock.calls.length === 1);
 
-    internals.idleCompactingWorkspaces.add(workspaceId);
-
-    await internals.updateStreamingStatus(workspaceId, true);
-
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, {});
+    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, {
+      model: "claude-sonnet-4",
+      generation: 1,
+    });
     expect(emitWorkspaceActivity).toHaveBeenCalledTimes(1);
     expect(emitWorkspaceActivity).toHaveBeenCalledWith(workspaceId, snapshot);
-    expect(internals.idleCompactingWorkspaces.has(workspaceId)).toBe(true);
+    // The marker survives the streaming=true update: a stream error still reports the outcome.
+    expect(await reportedOutcomesOnStreamError(workspaceId)).toEqual([
+      { workspaceId, outcome: { success: false, modelNotFound: true } },
+    ]);
   });
 
   test("passes through stream-start thinkingLevel without re-deriving it from config", async () => {
@@ -1567,30 +1588,25 @@ describe("WorkspaceService idle compaction dispatch", () => {
   test("clears idle marker when streaming=false metadata update fails", async () => {
     const workspaceId = "idle-streaming-false-failure";
 
+    await markIdleCompacting(workspaceId);
     const setStreaming = spyOn(harness.extensionMetadata, "setStreaming").mockRejectedValue(
       new Error("setStreaming failed")
     );
 
-    const internals = workspaceService as unknown as {
-      idleCompactingWorkspaces: Set<string>;
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-    };
+    aiEvents.emit("stream-abort", { type: "stream-abort", workspaceId, messageId: "compact-1" });
+    await waitForCondition(() => setStreaming.mock.calls.length > 0);
 
-    internals.idleCompactingWorkspaces.add(workspaceId);
-
-    await internals.updateStreamingStatus(workspaceId, false);
-
-    expect(internals.idleCompactingWorkspaces.has(workspaceId)).toBe(false);
     // todoStatus is intentionally NOT passed when there are no todos —
     // passing null would delete an AgentStatusService-written AI summary
     // from the same slot. Explicit clears happen via setTodoStatus.
     expect(setStreaming).toHaveBeenCalledWith(workspaceId, false, {
+      generation: 0,
       hasTodos: false,
     });
+    // Let the failed write's cleanup run, then prove the marker is gone: a later stream
+    // error no longer reports an idle-compaction outcome.
+    await drainPendingDispatches();
+    expect(await reportedOutcomesOnStreamError(workspaceId)).toEqual([]);
   });
 
   test("stream-stop with no todos does NOT clear todoStatus (preserves AI summary)", async () => {
@@ -1700,28 +1716,23 @@ describe("WorkspaceService streaming generation guard", () => {
 
     spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
 
-    const internals = workspaceService as unknown as {
-      streamingGenerations: Map<string, number>;
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-    };
-
-    internals.streamingGenerations.set(workspaceId, 1);
-    const staleStopPromise = internals.updateStreamingStatus(workspaceId, false, {
-      generation: 1,
-    });
-
-    internals.streamingGenerations.set(workspaceId, 2);
-    await internals.updateStreamingStatus(workspaceId, true, { model: "openai:gpt-4o" });
+    emitAiEvent("stream-start", { workspaceId, messageId: "a1", model: "openai:gpt-4o" });
+    // The stop for stream 1 parks in its todo read...
+    emitAiEvent("stream-abort", { workspaceId, messageId: "a1" });
+    await waitForCondition(() => todoReadCalls === 1);
+    // ...while stream 2 starts.
+    emitAiEvent("stream-start", { workspaceId, messageId: "a2", model: "openai:gpt-4o" });
+    await waitForCondition(() => setStreaming.mock.calls.length === 2);
 
     todoReadDeferred.resolve([]);
-    await staleStopPromise;
+    await drainPendingDispatches();
 
-    expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, { model: "openai:gpt-4o" });
+    expect(setStreaming).toHaveBeenCalledTimes(2);
+    expect(setStreaming).toHaveBeenLastCalledWith(workspaceId, true, {
+      model: "openai:gpt-4o",
+      generation: 2,
+    });
+    expect(setStreaming).not.toHaveBeenCalledWith(workspaceId, false, expect.anything());
   });
 
   test("todo snapshot refreshes run in call order for consecutive updates", async () => {
@@ -1758,12 +1769,10 @@ describe("WorkspaceService streaming generation guard", () => {
 
     spyOn(harness.extensionMetadata, "setTodoStatus").mockImplementation(setTodoStatus);
 
-    const internals = workspaceService as unknown as {
-      updateTodoStatusFromStorage: (workspaceId: string) => Promise<void>;
-    };
-
-    const firstRefresh = internals.updateTodoStatusFromStorage(workspaceId);
-    const secondRefresh = internals.updateTodoStatusFromStorage(workspaceId);
+    // Two successful todo_write calls each trigger a refresh.
+    const todoWriteEnd = { workspaceId, toolName: "todo_write", result: { success: true } };
+    emitAiEvent("tool-call-end", todoWriteEnd);
+    emitAiEvent("tool-call-end", todoWriteEnd);
 
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(setTodoStatus).toHaveBeenCalledTimes(1);
@@ -1778,7 +1787,7 @@ describe("WorkspaceService streaming generation guard", () => {
       hasTodos: true,
     });
 
-    await Promise.all([firstRefresh, secondRefresh]);
+    await waitForCondition(() => setTodoStatus.mock.calls.length === 2);
 
     expect(setTodoStatus).toHaveBeenCalledTimes(2);
     expect(setTodoStatus.mock.calls[0]).toEqual([
@@ -1810,71 +1819,76 @@ describe("WorkspaceService streaming generation guard", () => {
 
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
 
-    const internals = workspaceService as unknown as {
-      streamingGenerations: Map<string, number>;
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-      updateRecencyTimestamp: (workspaceId: string, timestamp?: number) => Promise<void>;
-      handleStreamCompletion: (workspaceId: string) => Promise<void>;
-    };
-
     spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-    internals.updateRecencyTimestamp = mock(() => recencyDeferred.promise);
+    const updateRecency = spyOn(harness.extensionMetadata, "updateRecency").mockImplementation(
+      async (_id, recency) => {
+        await recencyDeferred.promise;
+        return {
+          recency: recency ?? 0,
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+        };
+      }
+    );
 
-    internals.streamingGenerations.set(workspaceId, 1);
-    const completionPromise = internals.handleStreamCompletion(workspaceId);
-
-    internals.streamingGenerations.set(workspaceId, 2);
-    await internals.updateStreamingStatus(workspaceId, true, { model: "openai:gpt-4o-mini" });
+    emitAiEvent("stream-start", { workspaceId, messageId: "a1", model: "openai:gpt-4o-mini" });
+    // Stream 1's completion parks in its recency write...
+    emitAiEvent("stream-end", { workspaceId, messageId: "a1", parts: [], metadata: {} });
+    await waitForCondition(() => updateRecency.mock.calls.length === 1);
+    // ...while stream 2 starts.
+    emitAiEvent("stream-start", { workspaceId, messageId: "a2", model: "openai:gpt-4o-mini" });
+    await waitForCondition(() => setStreaming.mock.calls.length === 2);
 
     recencyDeferred.resolve();
-    await completionPromise;
+    await waitForCondition(() => readTodosSpy!.mock.calls.length === 1);
+    await drainPendingDispatches();
 
-    expect(internals.updateRecencyTimestamp).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledTimes(1);
-    expect(setStreaming).toHaveBeenCalledWith(workspaceId, true, { model: "openai:gpt-4o-mini" });
+    expect(updateRecency).toHaveBeenCalledTimes(1);
+    expect(setStreaming).toHaveBeenCalledTimes(2);
+    expect(setStreaming).toHaveBeenLastCalledWith(workspaceId, true, {
+      model: "openai:gpt-4o-mini",
+      generation: 2,
+    });
+    expect(setStreaming).not.toHaveBeenCalledWith(workspaceId, false, expect.anything());
   });
   test("tags matching compaction stop snapshots and clears the generation marker", async () => {
     const workspaceId = "ws-compaction-stream-stop";
+    let stops = 0;
     const setStreaming = mock(
       (_workspaceId: string, streaming: boolean, update: ExtensionMetadataStreamingUpdate = {}) =>
         Promise.resolve({
           recency: Date.now(),
           streaming,
-          lastModel: update.model ?? null,
+          // Label each stop snapshot so its emission can be told apart from other activity.
+          lastModel: streaming ? (update.model ?? null) : `stop-${++stops}`,
           lastThinkingLevel: update.thinkingLevel ?? null,
           hasTodos: update.hasTodos,
           agentStatus: null,
         })
     );
     const emitWorkspaceActivity = spyOn(workspaceService, "emitWorkspaceActivity");
+    const emittedStop = (label: string) =>
+      emitWorkspaceActivity.mock.calls.find(([, snapshot]) => snapshot?.lastModel === label)?.[1];
 
     readTodosSpy = spyOn(todoStorageModule, "readTodosForSessionDir").mockResolvedValue([]);
-
-    const internals = workspaceService as unknown as {
-      streamingGenerations: Map<string, number>;
-      compactionStreamGenerations: Map<string, number>;
-      updateStreamingStatus: (
-        workspaceId: string,
-        streaming: boolean,
-        options?: ExtensionMetadataStreamingUpdate
-      ) => Promise<void>;
-    };
-
     spyOn(harness.extensionMetadata, "setStreaming").mockImplementation(setStreaming);
-    internals.streamingGenerations.set(workspaceId, 3);
-    internals.compactionStreamGenerations.set(workspaceId, 3);
 
-    await internals.updateStreamingStatus(workspaceId, false, { generation: 3 });
-
-    expect(emitWorkspaceActivity).toHaveBeenCalledWith(
+    emitAiEvent("stream-start", {
       workspaceId,
-      expect.objectContaining({ streaming: false, isCompaction: true })
-    );
-    expect(internals.compactionStreamGenerations.has(workspaceId)).toBe(false);
+      messageId: "compact-1",
+      model: "openai:gpt-4o",
+      agentId: "compact",
+    });
+    emitAiEvent("stream-abort", { workspaceId, messageId: "compact-1" });
+    await waitForCondition(() => emittedStop("stop-1") !== undefined);
+
+    expect(emittedStop("stop-1")).toMatchObject({ streaming: false, isCompaction: true });
+
+    // The marker is turn-scoped: a later stop of the same generation is no longer tagged.
+    emitAiEvent("stream-abort", { workspaceId, messageId: "compact-1" });
+    await waitForCondition(() => emittedStop("stop-2") !== undefined);
+    expect(emittedStop("stop-2")).not.toHaveProperty("isCompaction");
   });
 
   test("handleStreamCompletion skips recency updates for idle compaction", async () => {
@@ -2017,13 +2031,13 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
   test("debounces multiple refresh requests into a single metadata emit", async () => {
     const workspaceId = "ws-post-compaction";
 
-    const emitMetadata = mock(() => undefined);
-
-    workspaceService.registerSession(workspaceId, {
-      emitMetadata,
-      onChatEvent: () => () => undefined,
-      onMetadataEvent: () => () => undefined,
-    } as unknown as AgentSession);
+    // A real session wired by the service: its post-compaction state changes schedule the
+    // refresh, and its metadata emissions surface as the service's "metadata" events.
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    const emitted: unknown[] = [];
+    workspaceService.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId === workspaceId) emitted.push(event.metadata);
+    });
 
     const fakeMetadata: FrontendWorkspaceMetadata = {
       id: workspaceId,
@@ -2047,26 +2061,23 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       "getPostCompactionState"
     ).mockResolvedValue(postCompactionState);
 
-    // Only the session's onCompactionComplete callback schedules this refresh; calling it
-    // directly is the cheap way to issue a burst without a real compaction.
-    const svc = workspaceService as unknown as {
-      schedulePostCompactionMetadataRefresh: (workspaceId: string) => void;
-    };
-    svc.schedulePostCompactionMetadataRefresh(workspaceId);
-    svc.schedulePostCompactionMetadataRefresh(workspaceId);
-    svc.schedulePostCompactionMetadataRefresh(workspaceId);
+    try {
+      await session.clearPostCompactionState();
+      await session.clearPostCompactionState();
+      await session.clearPostCompactionState();
 
-    // Debounce is short, but use a safe buffer.
-    await new Promise((resolve) => setTimeout(resolve, 150));
+      // Debounce is short, but use a safe buffer.
+      await new Promise((resolve) => setTimeout(resolve, 150));
 
-    expect(getInfoMock).toHaveBeenCalledTimes(1);
-    expect(getPostCompactionStateMock).toHaveBeenCalledTimes(1);
-    expect(emitMetadata).toHaveBeenCalledTimes(1);
+      expect(getInfoMock).toHaveBeenCalledTimes(1);
+      expect(getPostCompactionStateMock).toHaveBeenCalledTimes(1);
+      expect(emitted).toHaveLength(1);
 
-    const enriched = (emitMetadata as ReturnType<typeof mock>).mock.calls[0][0] as {
-      postCompaction?: { planPath: string | null };
-    };
-    expect(enriched.postCompaction?.planPath).toBe(postCompactionState.planPath);
+      const enriched = emitted[0] as { postCompaction?: { planPath: string | null } };
+      expect(enriched.postCompaction?.planPath).toBe(postCompactionState.planPath);
+    } finally {
+      await workspaceService.disposeSession(workspaceId);
+    }
   });
 });
 

@@ -10,6 +10,7 @@ import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
+import { BashMonitorWakeReconciler } from "./bashMonitorWakeReconciler";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "./aiService";
@@ -1256,14 +1257,9 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     if (location === "legacy") legacyPlans.push(planPath);
     await fsPromises.mkdir(path.dirname(planPath), { recursive: true });
     await fsPromises.writeFile(planPath, "# Plan\n\nBefore the clear.\n");
+    // The plan deletion is the hold point a capture has to land on; nothing public runs there.
     const internals = clearer as unknown as {
       deletePlanFilesForWorkspace: (id: string) => Promise<Result<void>>;
-      clearHistoryThroughCompactionCancellation: (
-        id: string,
-        percentage: number,
-        onCancellationFailure: (error: string) => void
-      ) => Promise<Result<number[]>>;
-      bashMonitorWakeReconciler: { finishFullHistoryClear: (token: unknown) => Promise<void> };
     };
     const snapshotCount = async () => {
       const state = await getPlanReviewState(other, workspaceId);
@@ -1455,11 +1451,12 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
         try {
           // Bookkeeping after the commit can still throw (a full clear rethrows, a replace returns
           // Err); the plan was deleted before the commit and nothing restores it.
-          spyOn(
-            t.internals.bashMonitorWakeReconciler,
+          const finishClear = spyOn(
+            BashMonitorWakeReconciler.prototype,
             "finishFullHistoryClear"
           ).mockRejectedValueOnce(new Error("monitor bookkeeping failed"));
           const outcome = await discard.run(t).catch((error: unknown) => error);
+          finishClear.mockRestore();
           expect(outcome instanceof Error || (outcome as Result<void>).success === false).toBe(
             true
           );
@@ -1479,8 +1476,8 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
     // plan is never put back for a later capture to read.
     const t = await setup("plan-clear-commit-fails");
     try {
-      spyOn(t.internals, "clearHistoryThroughCompactionCancellation").mockResolvedValueOnce(
-        Err("history write failed")
+      spyOn(t.historyService, "clearCompactionHistoryUnderHistoryLock").mockRejectedValueOnce(
+        new Error("history write failed")
       );
       const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
       expect(cleared.success).toBe(false);

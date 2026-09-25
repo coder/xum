@@ -38,6 +38,7 @@ import {
   createStartedTurnHandle,
   createStreamLifecycleMocks,
   runSessionTerminalPolicy,
+  seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
 import { waitForCondition } from "./testDispatchHelpers";
 
@@ -179,6 +180,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     });
     return {
       session,
+      config,
       historyService,
       aiService,
       streamMessage,
@@ -215,6 +217,22 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     return muxMetadata?.type === "compaction-request"
       ? muxMetadata.parsed.followUpContent
       : undefined;
+  }
+
+  /** Settles the active turn the way the engine reports a completed response. */
+  function endTurn(
+    harness: Pick<Awaited<ReturnType<typeof createHarness>>, "session" | "aiService">,
+    model: string,
+    usage: { inputTokens: number; outputTokens: number; totalTokens: number },
+    text?: string
+  ) {
+    return runSessionTerminalPolicy(harness.session, harness.aiService as unknown as EventEmitter, {
+      type: "stream-end",
+      workspaceId: "ws-auto-routing",
+      messageId: "test-assistant",
+      parts: text == null ? [] : [{ type: "text", text }],
+      metadata: { model, agentId: "exec", finishReason: "stop", usage },
+    });
   }
 
   /** Context usage far past any catalogued window, so the real threshold check forces compaction. */
@@ -1458,12 +1476,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a send that never streams charges the evaluator by itself instead of the next turn", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, streamMessage, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
+    const { session, streamMessage, recordStreamAccounting } = harness;
     // Request preparation fails after classification: neither the tier model nor the
     // composer's fallback could be built.
     streamMessage.mockImplementation(() =>
@@ -1493,10 +1512,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       autoModelRouting: true,
     });
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const internals = session as unknown as {
-      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
-    };
-    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    await endTurn(harness, HARD_MODEL, usage);
     expect(recordStreamAccounting).toHaveBeenCalledTimes(2);
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
     expect((recordStreamAccounting.mock.calls[1]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
@@ -1507,13 +1523,14 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a compaction the user stops settles the evaluator spend it carried for its follow-up", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, historyService, aiService, streamMessage, recordStreamAccounting } =
-      await createHarness({
-        experimentEnabled: true,
-        unpricedModels: [],
-        evaluatorCostUsd: 0.0042,
-        classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
-      });
+    const harness = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
+    });
+    const { session, config, historyService, aiService, streamMessage, recordStreamAccounting } =
+      harness;
     // The delivered stream is an on-send compaction; the send behind its boundary is deferred.
     await seedContextPressure(historyService);
     streamMessage.mockImplementation((opts: StreamMessageOptions) => {
@@ -1553,12 +1570,16 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
     // Nothing is left over for the next unrelated turn.
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const accounting = session as unknown as {
-      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
-    };
     const callsBefore = recordStreamAccounting.mock.calls.length;
-    await accounting.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    // Turn auto-compaction off so the seeded pressure does not compact the unrelated turn too.
+    await seedAutoCompactionThreshold(config, HARD_MODEL, 100);
+    await session.sendMessage("Unrelated question", { model: HARD_MODEL, agentId: "exec" });
+    await endTurn(harness, HARD_MODEL, usage);
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(recordStreamAccounting.mock.calls[callsBefore]?.[0]).toMatchObject({
+      isCompaction: false,
+      streamOriginKind: "user",
+    });
     expect(
       (recordStreamAccounting.mock.calls[callsBefore]?.[0] as { costUsd: number }).costUsd
     ).toBeCloseTo(hardCost, 10);
@@ -1566,13 +1587,14 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a routed stream that fails terminally still charges the evaluator's spend", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, aiService, streamMessage, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
-    streamMessage.mockImplementation((opts: StreamMessageOptions) => {
+    const { session, aiService, streamMessage, recordStreamAccounting } = harness;
+    streamMessage.mockImplementationOnce((opts: StreamMessageOptions) => {
       aiService.emit("stream-start", {
         type: "stream-start",
         workspaceId: "ws-auto-routing",
@@ -1605,11 +1627,13 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
     // Nothing is left over for the next unrelated turn.
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const accounting = session as unknown as {
-      recordGoalAccountingFromUsage(input: { model: string; usage: typeof usage }): Promise<void>;
-    };
-    await accounting.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    await session.sendMessage("Unrelated question", { model: HARD_MODEL, agentId: "exec" });
+    await endTurn(harness, HARD_MODEL, usage);
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(recordStreamAccounting.mock.calls[1]?.[0]).toMatchObject({
+      isCompaction: false,
+      streamOriginKind: "user",
+    });
     expect((recordStreamAccounting.mock.calls[1]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
       hardCost,
       10
@@ -1618,40 +1642,42 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
 
   it("a compaction stream leaves the evaluator spend for the turn behind its boundary", async () => {
     const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
-    const { session, recordStreamAccounting } = await createHarness({
+    const harness = await createHarness({
       experimentEnabled: true,
       unpricedModels: [],
       evaluatorCostUsd: 0.0042,
       classify: () => Promise.resolve(Ok({ ...decision("hard"), usage: evaluatorUsage })),
     });
+    const { session, historyService, streamMessage, recordStreamAccounting } = harness;
+    await seedContextPressure(historyService);
     await session.sendMessage("Refactor the scheduler", {
       model: COMPOSER_MODEL,
       agentId: "exec",
       autoModelRouting: true,
     });
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    const internals = session as unknown as {
-      recordGoalAccountingFromUsage(input: {
-        model: string;
-        usage: typeof usage;
-        isCompaction?: boolean;
-      }): Promise<void>;
-    };
     // An on-send compaction streams first; its accounting never charges the goal.
-    await internals.recordGoalAccountingFromUsage({
-      model: COMPOSER_MODEL,
-      usage,
-      isCompaction: true,
-    });
-    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
-    await internals.recordGoalAccountingFromUsage({ model: HARD_MODEL, usage });
+    const compactionModel = streamMessage.mock.calls[0]?.[0]?.modelString;
+    if (compactionModel == null) throw new Error("Expected the compaction stream");
+    await endTurn(harness, compactionModel, usage, "Summary of the scheduler work so far.");
+    // The routed send behind the boundary dispatches next, then an unrelated turn.
+    await waitForCondition(() => streamMessage.mock.calls.length === 2, { timeoutMs: 2_000 });
+    expect(streamMessage.mock.calls[1]?.[0]?.autoModelRouting).toMatchObject({ tierId: "hard" });
+    await endTurn(harness, HARD_MODEL, usage);
+    await session.sendMessage("Unrelated question", { model: HARD_MODEL, agentId: "exec" });
+    await endTurn(harness, HARD_MODEL, usage);
     const costs = recordStreamAccounting.mock.calls.map(
       (call) => (call[0] as { costUsd: number }).costUsd
     );
-    const composerCost = getTotalCost(createDisplayUsage(usage, COMPOSER_MODEL)) ?? 0;
+    const compactionCost = getTotalCost(createDisplayUsage(usage, compactionModel)) ?? 0;
     const hardCost = getTotalCost(createDisplayUsage(usage, HARD_MODEL)) ?? 0;
+    expect(recordStreamAccounting.mock.calls.map((call) => call[0])).toMatchObject([
+      { isCompaction: true },
+      { isCompaction: false },
+      { isCompaction: false },
+    ]);
     expect(costs).toHaveLength(3);
-    expect(costs[0]).toBeCloseTo(composerCost, 10);
+    expect(costs[0]).toBeCloseTo(compactionCost, 10);
     // The turn behind the boundary carries the evaluator's spend, exactly once.
     expect(costs[1]).toBeCloseTo(hardCost + 0.0042, 10);
     expect(costs[2]).toBeCloseTo(hardCost, 10);

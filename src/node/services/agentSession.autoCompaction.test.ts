@@ -8,11 +8,7 @@ import type {
   SendMessageOptions,
   WorkspaceChatMessage,
 } from "@/common/orpc/types";
-import {
-  createMuxMessage,
-  type CompactionFollowUpRequest,
-  type MuxMessage,
-} from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -22,6 +18,7 @@ import type { CompactionMonitor } from "./compactionMonitor";
 import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import type { StreamMessageOptions } from "./turnRequestBuilder";
 import { waitForCondition } from "./testDispatchHelpers";
 
 type CompactionMonitorStub = Pick<
@@ -96,6 +93,41 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       await harness.config.editConfig((cfg) => ({ ...cfg, agentAiDefaults }));
     }
     return harness;
+  }
+
+  /**
+   * Sends one turn past the on-send threshold through the public send path and returns the
+   * internal compaction request as it reached the provider, plus its persisted request row.
+   */
+  async function captureOnSendCompaction(args: {
+    workspaceId: string;
+    options: SendMessageOptions;
+    agentAiDefaults?: AgentAiDefaults;
+  }) {
+    const streamMessage = mock((_request: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
+    );
+    const harness = await createSessionHarness({
+      workspaceId: args.workspaceId,
+      agentAiDefaults: args.agentAiDefaults,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      compactionMonitor: overThresholdMonitor({ usagePercentage: 95, thresholdPercentage: 70 }),
+    });
+    const result = await harness.session.sendMessage("hello", args.options);
+    expect(result.success).toBe(true);
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    const request = streamMessage.mock.calls[0][0];
+    const history = await harness.historyService.getHistoryFromLatestBoundary(args.workspaceId);
+    if (!history.success) throw new Error(String(history.error));
+    const metadata = history.data.find(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    )?.metadata?.muxMetadata;
+    if (metadata?.type !== "compaction-request") {
+      throw new Error("Expected a persisted on-send compaction request");
+    }
+    // The internal request streams the compaction row, not the caller's turn.
+    expect(request.messages.at(-1)?.metadata?.muxMetadata?.type).toBe("compaction-request");
+    return { session: harness.session, request, metadata };
   }
 
   test("does not persist or emit snapshots before forced on-send compaction", async () => {
@@ -598,212 +630,74 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   });
 
   test("compaction model inherit uses caller-provided baseOptions.model when no preferred model configured", async () => {
-    const workspaceId = "ws-auto-compaction-inherit-base-options-model";
-
-    const { session } = await createSessionHarness({ workspaceId });
-
     const inheritedModel = "anthropic:claude-sonnet-4-6";
-    const baseOptions: SendMessageOptions = {
-      model: inheritedModel,
-      agentId: "exec",
-    };
-    const followUpContent: CompactionFollowUpRequest = {
-      text: "Continue",
-      model: inheritedModel,
-      agentId: "exec",
-    };
-
-    const internals = session as unknown as {
-      buildAutoCompactionRequest: (params: {
-        followUpContent: CompactionFollowUpRequest;
-        baseOptions: SendMessageOptions;
-        reason: "on-send" | "mid-stream";
-      }) => {
-        sendOptions: SendMessageOptions;
-        metadata: {
-          requestedModel?: string;
-          parsed?: {
-            model?: string;
-          };
-        };
-      };
-    };
-
-    const compactionRequest = internals.buildAutoCompactionRequest({
-      followUpContent,
-      baseOptions,
-      reason: "mid-stream",
+    const { session, request, metadata } = await captureOnSendCompaction({
+      workspaceId: "ws-auto-compaction-inherit-base-options-model",
+      options: { model: inheritedModel, agentId: "exec" },
     });
 
-    expect(compactionRequest.sendOptions.model).toBe(inheritedModel);
-    expect(compactionRequest.metadata.requestedModel).toBe(inheritedModel);
-    expect(compactionRequest.metadata.parsed?.model).toBe(inheritedModel);
+    expect(request.modelString).toBe(inheritedModel);
+    expect(metadata.requestedModel).toBe(inheritedModel);
+    expect(metadata.parsed.model).toBe(inheritedModel);
 
     await session.dispose();
   });
 
   test("clears strictAgentResolution on the internal compact request", async () => {
-    const workspaceId = "ws-auto-compaction-clears-strict";
-
-    const { session } = await createSessionHarness({ workspaceId });
-
     // A strict explicit-agent workspace turn hitting auto-compaction: the internal
     // request intentionally runs the hidden compact agent, so the strict gate must not
     // apply to it (it would reject compact as not selectable and break compaction).
-    const baseOptions: SendMessageOptions = {
-      model: "anthropic:claude-sonnet-4-6",
-      agentId: "plan",
-      strictAgentResolution: true,
-    };
-    const followUpContent: CompactionFollowUpRequest = {
-      text: "Continue",
-      model: baseOptions.model,
-      agentId: "plan",
-    };
-
-    const internals = session as unknown as {
-      buildAutoCompactionRequest: (params: {
-        followUpContent: CompactionFollowUpRequest;
-        baseOptions: SendMessageOptions;
-        reason: "on-send" | "mid-stream";
-      }) => { sendOptions: SendMessageOptions };
-    };
-
-    const compactionRequest = internals.buildAutoCompactionRequest({
-      followUpContent,
-      baseOptions,
-      reason: "mid-stream",
+    const { session, request } = await captureOnSendCompaction({
+      workspaceId: "ws-auto-compaction-clears-strict",
+      options: {
+        model: "anthropic:claude-sonnet-4-6",
+        agentId: "plan",
+        strictAgentResolution: true,
+      },
     });
 
-    expect(compactionRequest.sendOptions.agentId).toBe("compact");
-    expect(compactionRequest.sendOptions.strictAgentResolution).toBeUndefined();
+    expect(request.agentId).toBe("compact");
+    expect(request.strictAgentResolution).toBeUndefined();
 
     await session.dispose();
   });
 
   test("compaction model explicit override takes priority over baseOptions.model", async () => {
-    const workspaceId = "ws-auto-compaction-explicit-model-overrides-base-model";
-
     const compactionModel = "openai:gpt-5.5";
-    const { session } = await createSessionHarness({
-      workspaceId,
+    const { session, request, metadata } = await captureOnSendCompaction({
+      workspaceId: "ws-auto-compaction-explicit-model-overrides-base-model",
       agentAiDefaults: { compact: { modelString: compactionModel } },
+      options: { model: "anthropic:claude-opus-4-6", agentId: "exec" },
     });
 
-    const baseOptions: SendMessageOptions = {
-      model: "anthropic:claude-opus-4-6",
-      agentId: "exec",
-    };
-    const followUpContent: CompactionFollowUpRequest = {
-      text: "Continue",
-      model: "anthropic:claude-sonnet-4-6",
-      agentId: "exec",
-    };
-
-    const internals = session as unknown as {
-      buildAutoCompactionRequest: (params: {
-        followUpContent: CompactionFollowUpRequest;
-        baseOptions: SendMessageOptions;
-        reason: "on-send" | "mid-stream";
-      }) => {
-        sendOptions: SendMessageOptions;
-        metadata: {
-          requestedModel?: string;
-          parsed?: {
-            model?: string;
-          };
-        };
-      };
-    };
-
-    const compactionRequest = internals.buildAutoCompactionRequest({
-      followUpContent,
-      baseOptions,
-      reason: "mid-stream",
-    });
-
-    expect(compactionRequest.sendOptions.model).toBe(compactionModel);
-    expect(compactionRequest.metadata.requestedModel).toBe(compactionModel);
-    expect(compactionRequest.metadata.parsed?.model).toBe(compactionModel);
+    expect(request.modelString).toBe(compactionModel);
+    expect(metadata.requestedModel).toBe(compactionModel);
+    expect(metadata.parsed.model).toBe(compactionModel);
 
     await session.dispose();
   });
 
   test("compaction thinking level prefers compact agent default over baseOptions", async () => {
-    const workspaceId = "ws-auto-compaction-compact-thinking-default";
-
-    const { session } = await createSessionHarness({
-      workspaceId,
+    const { session, request } = await captureOnSendCompaction({
+      workspaceId: "ws-auto-compaction-compact-thinking-default",
       agentAiDefaults: { compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" } },
-    });
-
-    const baseOptions: SendMessageOptions = {
-      model: "anthropic:claude-opus-4-6",
-      agentId: "exec",
-      thinkingLevel: "low",
-    };
-    const followUpContent: CompactionFollowUpRequest = {
-      text: "Continue",
-      model: "anthropic:claude-opus-4-6",
-      agentId: "exec",
-    };
-
-    const internals = session as unknown as {
-      buildAutoCompactionRequest: (params: {
-        followUpContent: CompactionFollowUpRequest;
-        baseOptions: SendMessageOptions;
-        reason: "on-send" | "mid-stream";
-      }) => {
-        sendOptions: SendMessageOptions;
-      };
-    };
-
-    const compactionRequest = internals.buildAutoCompactionRequest({
-      followUpContent,
-      baseOptions,
-      reason: "mid-stream",
+      options: { model: "anthropic:claude-opus-4-6", agentId: "exec", thinkingLevel: "low" },
     });
 
     // The compact agent's configured thinking level wins over the active stream's,
     // matching desktop /compact (applyCompactionOverrides).
-    expect(compactionRequest.sendOptions.thinkingLevel).toBe("high");
+    expect(request.thinkingLevel).toBe("high");
 
     await session.dispose();
   });
 
   test("compaction thinking level falls back to baseOptions when compact default is unset", async () => {
-    const workspaceId = "ws-auto-compaction-base-thinking-fallback";
-
-    const { session } = await createSessionHarness({ workspaceId });
-
-    const baseOptions: SendMessageOptions = {
-      model: "anthropic:claude-opus-4-6",
-      agentId: "exec",
-      thinkingLevel: "medium",
-    };
-    const followUpContent: CompactionFollowUpRequest = {
-      text: "Continue",
-      model: "anthropic:claude-opus-4-6",
-      agentId: "exec",
-    };
-
-    const internals = session as unknown as {
-      buildAutoCompactionRequest: (params: {
-        followUpContent: CompactionFollowUpRequest;
-        baseOptions: SendMessageOptions;
-        reason: "on-send" | "mid-stream";
-      }) => {
-        sendOptions: SendMessageOptions;
-      };
-    };
-
-    const compactionRequest = internals.buildAutoCompactionRequest({
-      followUpContent,
-      baseOptions,
-      reason: "on-send",
+    const { session, request } = await captureOnSendCompaction({
+      workspaceId: "ws-auto-compaction-base-thinking-fallback",
+      options: { model: "anthropic:claude-opus-4-6", agentId: "exec", thinkingLevel: "medium" },
     });
 
-    expect(compactionRequest.sendOptions.thinkingLevel).toBe("medium");
+    expect(request.thinkingLevel).toBe("medium");
 
     await session.dispose();
   });
@@ -1495,12 +1389,10 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
       })
     );
 
-    const outcome = await (
-      fixture.session as unknown as {
-        scheduleStartupAutoRetryIfNeeded: () => Promise<string>;
-      }
-    ).scheduleStartupAutoRetryIfNeeded();
-    expect(outcome).toBe("completed");
+    await fixture.session.ensureStartupAutoRetryCheck();
+    // Recovery settled by scheduling the resume (not deferring or abandoning it).
+    expect(fixture.events.filter((event) => event.type === "auto-retry-scheduled")).toHaveLength(1);
+    expect(fixture.events.some((event) => event.type === "auto-retry-abandoned")).toBe(false);
 
     // The resumed stream must still be tracked as a compaction request.
     await waitForCondition(() => fixture.streamHistories.length >= 1, { timeoutMs: 5000 });
