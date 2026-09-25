@@ -25,11 +25,11 @@ export function parseWorkflowName(source: string): string | null {
   }
 }
 
-export function parseWorkflowMetadataName(rawMetadata: unknown): string | null {
+function parseWorkflowMetadataName(rawMetadata: unknown): string | null {
   return readWorkflowMetadataString(rawMetadata, "name");
 }
 
-export function parseWorkflowMetadataDescription(rawMetadata: unknown): string | null {
+function parseWorkflowMetadataDescription(rawMetadata: unknown): string | null {
   return readWorkflowMetadataString(rawMetadata, "description");
 }
 

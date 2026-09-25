@@ -46,7 +46,7 @@ const MONITOR_TRUNCATION_MARKER = "… [truncated] …";
 const MONITOR_SETTLEMENT_TAIL_BYTES = 4_096;
 const MONITOR_SETTLEMENT_TAIL_MAX_LINES = 10;
 
-export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number): number {
+function computeTailStartOffset(fileSizeBytes: number, tailBytes: number): number {
   assert(
     Number.isFinite(fileSizeBytes) && fileSizeBytes >= 0,
     `computeTailStartOffset expected fileSizeBytes >= 0 (got ${fileSizeBytes})`
