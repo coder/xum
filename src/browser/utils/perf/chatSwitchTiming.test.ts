@@ -5,11 +5,18 @@ import {
   markChatSwitchStart,
 } from "./chatSwitchTiming";
 
-/** Sorted by name: every measure shares the start mark, so buffer order is unspecified. */
+const MILESTONES = ["caught-up", "first-row", "skeleton-hidden", "skeleton-shown"] as const;
+
+/**
+ * Sorted by name: every measure shares the start mark, so buffer order is unspecified.
+ * Reads by name, not getEntriesByType: happy-dom's window.performance IS the process-global
+ * performance, and WorkspaceContext.test.tsx overrides its getEntriesByType for the rest of
+ * the shared test process (it then returns [] for "measure").
+ */
 function recordedMeasures(): Array<{ name: string; workspaceId: string | undefined }> {
-  return performance
-    .getEntriesByType("measure")
-    .filter((entry) => entry.name.startsWith(CHAT_SWITCH_MARK_PREFIX))
+  return MILESTONES.flatMap((milestone) =>
+    performance.getEntriesByName(`${CHAT_SWITCH_MARK_PREFIX}${milestone}`, "measure")
+  )
     .map((entry) => ({
       name: entry.name.slice(CHAT_SWITCH_MARK_PREFIX.length),
       workspaceId: ((entry as PerformanceMeasure).detail as { workspaceId?: string } | null)
