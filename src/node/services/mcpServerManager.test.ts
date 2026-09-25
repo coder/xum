@@ -5278,7 +5278,11 @@ describe("MCPServerManager", () => {
     controller.abort();
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(promptPromise).rejects.toThrow("was aborted");
+    // The abort does not cancel the revival itself: let it finish, and wait for it
+    // through a serve queued behind it, so no startup outlives this test.
     releaseStartup();
+    await manager.getToolsForWorkspace(workspaceRequest("workspace"));
+    expect(servers.connectCount("cmd")).toBe(1);
   });
 
   test("flattens audio and binary resources as omission markers", () => {
