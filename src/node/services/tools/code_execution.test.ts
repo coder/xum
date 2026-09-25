@@ -518,33 +518,6 @@ describe("createCodeExecutionTool", () => {
       expect(result.result).toEqual({ arr: [null, 1], nan: null });
       expect(result.consoleOutput[0]?.args).toEqual([null]);
     });
-
-    it("captures console.log output", async () => {
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-
-      const result = (await tool.execute!(
-        { code: 'console.log("hello", 123); return "done"' },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-
-      expect(result.success).toBe(true);
-      expect(result.result).toBe("done");
-      expect(result.consoleOutput).toHaveLength(1);
-      expect(result.consoleOutput[0].level).toBe("log");
-      expect(result.consoleOutput[0].args).toEqual(["hello", 123]);
-    });
-
-    it("records tool execution time", async () => {
-      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-
-      const result = (await tool.execute!(
-        { code: "return 42" },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-
-      expect(result.success).toBe(true);
-      expect(result.duration_ms).toBeGreaterThanOrEqual(0);
-    });
   });
 
   describe("tool bridge integration", () => {

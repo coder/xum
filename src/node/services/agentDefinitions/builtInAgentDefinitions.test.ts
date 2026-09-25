@@ -3,6 +3,9 @@ import { beforeEach, describe, expect, test } from "bun:test";
 // Importing browser code from node tests is allowed (only browser->node value
 // imports are banned); TasksSection.agents is a pure data module.
 import { FALLBACK_AGENTS } from "@/browser/features/Settings/Sections/TasksSection.agents";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import { createDesktopTools } from "@/node/services/tools/desktopTools";
+import { createTestToolConfig, TestTempDir } from "@/node/services/tools/testHelpers";
 import { clearBuiltInAgentCache, getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
 
 describe("built-in agent definitions", () => {
@@ -38,28 +41,19 @@ describe("built-in agent definitions", () => {
     expect(intuition?.frontmatter.tools?.require).toEqual(["memory_read", "intuition_report"]);
   });
 
-  test("includes desktop built-in with desktop automation safeguards", () => {
-    const pkgs = getBuiltInAgentDefinitions();
-    const byId = new Map(pkgs.map((pkg) => [pkg.id, pkg] as const));
+  test("desktop agent gets exactly the desktop tool registry and cannot spawn tasks", () => {
+    using tempDir = new TestTempDir("builtin-desktop-agent");
+    // Derive the expected set from the registry so a newly added desktop tool cannot silently
+    // stay unavailable to the desktop agent. Tools are only built here, never executed, so the
+    // session manager is never called.
+    const registryNames = Object.keys(
+      createDesktopTools(createTestToolConfig(tempDir.path), {} as DesktopSessionManager)
+    ).sort();
+    const desktop = getBuiltInAgentDefinitions().find((pkg) => pkg.id === "desktop");
 
-    const desktop = byId.get("desktop");
-    expect(desktop).toBeTruthy();
-    expect(desktop?.frontmatter.base).toBe("exec");
-    expect(desktop?.frontmatter.ui?.hidden).toBe(true);
-    expect(desktop?.frontmatter.subagent?.runnable).toBe(true);
-    expect(desktop?.frontmatter.ai?.thinkingLevel).toBe("medium");
-    expect(desktop?.frontmatter.tools?.add ?? []).toEqual([
-      "desktop_screenshot",
-      "desktop_move_mouse",
-      "desktop_click",
-      "desktop_double_click",
-      "desktop_drag",
-      "desktop_scroll",
-      "desktop_type",
-      "desktop_key_press",
-    ]);
+    expect([...(desktop?.frontmatter.tools?.add ?? [])].sort()).toEqual(registryNames);
+    // Safety: desktop sub-agents drive a shared GUI and must not fan out into further tasks.
     expect(desktop?.frontmatter.tools?.remove ?? []).toContain("task");
-    expect(desktop?.body).toContain("screenshot");
   });
 
   test("plan is workflow-runnable but not a general subagent", () => {

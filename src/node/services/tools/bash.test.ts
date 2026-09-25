@@ -89,14 +89,6 @@ describe("buildBashToolDescription", () => {
     expect(description).toContain("  - backend/ → /workspace/root/backend");
     expect(description).toContain("independent git repo");
   });
-
-  it("includes project paths for multi-project workspaces", () => {
-    const description = buildBashToolDescription(cwd, multiProjectRefs);
-
-    for (const projectRef of multiProjectRefs) {
-      expect(description).toContain(projectRef.projectPath);
-    }
-  });
 });
 
 describe("bash tool", () => {

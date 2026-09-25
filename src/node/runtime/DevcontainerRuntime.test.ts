@@ -170,40 +170,61 @@ describe("DevcontainerRuntime.resolveHostPathForMounted", () => {
     expect(resolveHostPathForMounted(runtime, filePath)).toBe(filePath);
   });
 });
-describe("DevcontainerRuntime exec path translation", () => {
-  function mapPathForExec(runtime: DevcontainerRuntime, filePath: string): string {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-return
-    return (runtime as any).mapPathForExec(filePath);
+describe("DevcontainerRuntime.exec pathEnv", () => {
+  // Drive the real exec boundary against a fake `devcontainer` CLI on PATH that echoes its argv,
+  // so the forwarded --remote-env values are observable without Docker.
+  let binDir: string;
+  let originalPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await fs.mkdtemp(path.join(os.tmpdir(), "fake-devcontainer-"));
+    await fs.writeFile(path.join(binDir, "devcontainer"), '#!/bin/sh\nprintf "%s\\n" "$@"\n', {
+      mode: 0o755,
+    });
+    originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = originalPath;
+    await fs.rm(binDir, { recursive: true, force: true });
+  });
+
+  async function remoteEnvFor(state: RuntimeState, pathEnv: Record<string, string>) {
+    const stream = await createRuntime(state).exec("true", {
+      cwd: state.currentWorkspacePath!,
+      pathEnv,
+      timeout: 10,
+    });
+    const [argv, exitCode] = await Promise.all([
+      new Response(stream.stdout).text(),
+      stream.exitCode,
+    ]);
+    expect(exitCode).toBe(0);
+    const lines = argv.split("\n");
+    return lines.flatMap((line, index) => (lines[index - 1] === "--remote-env" ? [line] : []));
   }
 
-  it("maps workspace roots and nested paths into the container", () => {
-    const runtime = createRuntime({
-      remoteWorkspaceFolder: "/workspaces/project",
-      currentWorkspacePath: "/home/user/xum/project/branch",
-    });
+  it.skipIf(process.platform === "win32")(
+    "maps workspace paths into the container and keeps unmappable paths unchanged",
+    async () => {
+      // exec spawns the CLI with the host workspace as cwd, so it must exist.
+      const hostWorkspace = binDir;
+      const mapped = await remoteEnvFor(
+        { remoteWorkspaceFolder: "/workspaces/project", currentWorkspacePath: hostWorkspace },
+        { XUM_TEST_INSIDE: `${hostWorkspace}/nested/file`, XUM_TEST_OUTSIDE: "/tmp/other" }
+      );
+      expect(mapped).toContain("XUM_TEST_INSIDE=/workspaces/project/nested/file");
+      expect(mapped).toContain("XUM_TEST_OUTSIDE=/tmp/other");
 
-    expect(mapPathForExec(runtime, "/home/user/xum/project/branch")).toBe("/workspaces/project");
-    expect(mapPathForExec(runtime, "/home/user/xum/project/branch/nested/file")).toBe(
-      "/workspaces/project/nested/file"
-    );
-  });
-
-  it("keeps paths outside the workspace unchanged", () => {
-    const runtime = createRuntime({
-      remoteWorkspaceFolder: "/workspaces/project",
-      currentWorkspacePath: "/home/user/xum/project/branch",
-    });
-
-    expect(mapPathForExec(runtime, "/tmp/other")).toBe("/tmp/other");
-  });
-
-  it("keeps paths unchanged when the container workspace is unknown", () => {
-    const runtime = createRuntime({ currentWorkspacePath: "/home/user/xum/project/branch" });
-
-    expect(mapPathForExec(runtime, "/home/user/xum/project/branch/nested/file")).toBe(
-      "/home/user/xum/project/branch/nested/file"
-    );
-  });
+      // Before the container workspace is known, host paths pass through unchanged (#3709).
+      const unknown = await remoteEnvFor(
+        { currentWorkspacePath: hostWorkspace },
+        { XUM_TEST_INSIDE: `${hostWorkspace}/nested/file` }
+      );
+      expect(unknown).toContain(`XUM_TEST_INSIDE=${hostWorkspace}/nested/file`);
+    }
+  );
 });
 
 describe("DevcontainerRuntime.mapHostPathToContainer", () => {
