@@ -87,7 +87,7 @@ include fmt.mk
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
-.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook
+.PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
 .PHONY: benchmark-terminal
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-react-compiler
@@ -629,6 +629,11 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	$(check_node_version)
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
+
+storybook-budget: node_modules/.installed ## Enforce the Pixel snapshot budget (requires Storybook served; STORYBOOK_URL, default http://127.0.0.1:6006)
+	$(check_node_version)
+	@# Node, not Bun: it drives Playwright like pixel-storybook (see storybook-flake-check).
+	@node scripts/check-storybook-snapshot-budget.mjs --url $(or $(STORYBOOK_URL),http://127.0.0.1:6006)
 
 ## Benchmarks
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)

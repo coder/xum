@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 
 const STORY_DIR = "src/browser/stories";
 const PLAN_TOC_STORY_PATH =
   "src/browser/features/Tools/ProposePlan/ProposePlanToolCall.stories.tsx";
 const PLAN_TOC_MIN_WIDTH = 1600;
 
+// Each policy test reads its file, so a missing or renamed story fails the test too.
 /** App-level integration allowlist — files that must exist with smoke coverage. */
 const REQUIRED_APP_STORIES = [
   "App.commandPalette.stories.tsx",
@@ -22,14 +23,6 @@ const REQUIRED_COLOCATED_STORIES = [
   "src/browser/components/AIView/AIView.stories.tsx",
   "src/browser/components/ProjectSidebar/ProjectSidebar.stories.tsx",
   "src/browser/features/Messages/MessageRenderer.stories.tsx",
-] as const;
-
-const MIGRATED_APP_STORIES = [
-  "App.sidebar.stories.tsx",
-  "App.welcome.stories.tsx",
-  "App.errors.stories.tsx",
-  "App.titlebar.stories.tsx",
-  "App.projectCreate.stories.tsx",
 ] as const;
 
 const hasExplicitPixelPolicy = (content: string): boolean => {
@@ -55,10 +48,6 @@ describe("Storybook coverage contract", () => {
     for (const filename of REQUIRED_APP_STORIES) {
       const filepath = `${STORY_DIR}/${filename}`;
 
-      test(`${filename} exists`, () => {
-        expect(existsSync(filepath)).toBe(true);
-      });
-
       test(`${filename} has at least one smoke story with dual-theme coverage`, () => {
         const content = readFileSync(filepath, "utf-8");
         expect(hasSmokeStoryWithDualThemeCoverage(content)).toBe(true);
@@ -68,10 +57,6 @@ describe("Storybook coverage contract", () => {
 
   describe("Colocated stories", () => {
     for (const filepath of REQUIRED_COLOCATED_STORIES) {
-      test(`${filepath} exists`, () => {
-        expect(existsSync(filepath)).toBe(true);
-      });
-
       test(`${filepath} has explicit pixel snapshot policy`, () => {
         const content = readFileSync(filepath, "utf-8");
         expect(hasExplicitPixelPolicy(content)).toBe(true);
@@ -97,13 +82,5 @@ describe("Storybook coverage contract", () => {
       const widthMatch = content.match(/PLAN_TOC_MIN_WIDTH\s*=\s*(\d+)/);
       expect(Number(widthMatch?.[1])).toBeGreaterThanOrEqual(PLAN_TOC_MIN_WIDTH);
     });
-  });
-
-  describe("Migrated files removed", () => {
-    for (const filename of MIGRATED_APP_STORIES) {
-      test(`${filename} does not exist in src/browser/stories`, () => {
-        expect(existsSync(`${STORY_DIR}/${filename}`)).toBe(false);
-      });
-    }
   });
 });

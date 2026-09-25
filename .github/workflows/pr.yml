@@ -306,6 +306,8 @@ jobs:
           done
           # Fail the step if Storybook never became reachable.
           curl -sf http://127.0.0.1:6006 >/dev/null
+      # Separate step so a budget overrun is not mixed up with interaction-test failures.
+      - run: make storybook-budget
       - run: make test-storybook
 
   test-e2e:
