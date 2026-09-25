@@ -37,10 +37,29 @@ const ATTEMPT = "att_00000000000000c1";
 const RUN = { runId: "wfr_retire", stepId: "summarize", inputHash: "hash-1" };
 
 interface Internals {
-  startReservedAgentTask: (plan: unknown) => Promise<void>;
+  startReservedAgentTask: (...args: unknown[]) => Promise<void>;
   markTaskLaunchFailed: (...args: unknown[]) => Promise<void>;
-  materializeReservedTaskWorkspace: (...args: unknown[]) => Promise<unknown>;
-  cleanupMaterializedTaskWorkspace: (...args: unknown[]) => Promise<void>;
+}
+
+/**
+ * Pass-through spy on a private async step: the real method runs unchanged, and `firstCall`
+ * resolves (with the promise that call returned) as soon as the step is first entered, so a test
+ * awaits exactly the call it depends on instead of polling. With `hold`, the real call starts
+ * only once the test resolves it.
+ */
+function observeFirstCall(
+  svc: Internals,
+  key: keyof Internals,
+  hold?: Promise<void>
+): { spy: ReturnType<typeof spyOn>; firstCall: Promise<{ run: Promise<void> }> } {
+  const real = svc[key].bind(svc);
+  const entered = Promise.withResolvers<{ run: Promise<void> }>();
+  const spy = spyOn(svc, key).mockImplementation((...args: unknown[]) => {
+    const run = hold ? hold.then(() => real(...args)) : real(...args);
+    entered.resolve({ run });
+    return run;
+  });
+  return { spy, firstCall: entered.promise };
 }
 
 describe("TaskService claimed retirement (G2 PR B)", () => {
@@ -234,8 +253,14 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       const { taskService } = createTaskServiceStack(config, {
         historyService: fixture.historyService,
       });
-      spyOn(taskService as unknown as Internals, "startReservedAgentTask").mockImplementation(() =>
-        Promise.resolve()
+      // Held, not stubbed: the claim must be proven spent by the publishing write alone, so the
+      // real launch of the replacement waits until those assertions ran; the test then releases
+      // it and awaits it so it never outlives the temp root.
+      const releaseLaunch = Promise.withResolvers<void>();
+      const launch = observeFirstCall(
+        taskService as unknown as Internals,
+        "startReservedAgentTask",
+        releaseLaunch.promise
       );
       const stale = await taskService.claimRetiredAttempt("retired", ATTEMPT, RUN);
       const claim = await taskService.claimRetiredAttempt("retired", ATTEMPT, RUN);
@@ -272,6 +297,11 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       expect(second.success).toBe(false);
       expect(findWorkspaceInConfig(config, "replacementtwo")).toBeUndefined();
       expect((await taskService.claimRetiredAttempt("retired", ATTEMPT, RUN)).success).toBe(false);
+
+      releaseLaunch.resolve();
+      const { run: launched } = await launch.firstCall;
+      await launched;
+      expect(launch.spy).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -309,22 +339,10 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
         workspaceService,
       });
       const svc = taskService as unknown as Internals;
-      // Real launch, observed: the test awaits it so its cleanup never outlives the temp root.
-      const launch = spyOn(svc, "startReservedAgentTask");
-      const markFailed = spyOn(svc, "markTaskLaunchFailed");
-      spyOn(svc, "cleanupMaterializedTaskWorkspace").mockImplementation(() => Promise.resolve());
-      spyOn(svc, "materializeReservedTaskWorkspace").mockImplementation(() =>
-        Promise.resolve({
-          workspacePath: config.srcDir,
-          trunkBranch: "main",
-          forkedRuntimeConfig: { type: "local" },
-          runtimeForTaskWorkspace: {
-            deleteWorkspace: mock(() => Promise.resolve(Ok(undefined))),
-            getWorkspacePath: () => config.srcDir,
-          },
-          inheritedProjects: undefined,
-        })
-      );
+      // Real launch and real project-dir materialization (the local runtime "forks" into the
+      // project directory), observed through pass-through spies the test awaits.
+      const launch = observeFirstCall(svc, "startReservedAgentTask");
+      const markFailed = observeFirstCall(svc, "markTaskLaunchFailed");
 
       const claim = await taskService.claimRetiredAttempt("retiredlaunch", ATTEMPT, RUN);
       assert(claim.success, "claim must succeed");
@@ -343,20 +361,24 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
         { retires: [{ taskId: "retiredlaunch", attemptId: ATTEMPT, nonce: claim.data.nonce }] }
       );
       expect(created.success).toBe(true);
-      const settled = () =>
-        sanitizeResult === undefined
-          ? calls.includes("send:replacementlaunch")
-          : // A reserved launch that cannot sanitize reclaims its checkout and unpublishes the row.
-            findWorkspaceInConfig(config, "replacementlaunch") === undefined;
-      for (let i = 0; i < 400 && !settled(); i++) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
+      const { run: launched } = await launch.firstCall;
+      if (sanitizeResult === undefined) {
+        await launched;
+      } else {
+        // A reserved launch that cannot sanitize rejects; the dispatcher then marks it failed.
+        const failure = await launched.then(
+          () => null,
+          (error: unknown) => error
+        );
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toBe(sanitizeResult);
+        const { run: markingFailed } = await markFailed.firstCall;
+        await markingFailed;
+        // It reclaims its checkout and unpublishes the row.
+        expect(findWorkspaceInConfig(config, "replacementlaunch")).toBeUndefined();
       }
-      expect(settled()).toBe(true);
-      expect(launch).toHaveBeenCalledTimes(1);
-      await (launch.mock.results[0]?.value as Promise<void>).catch(() => undefined);
-      // A rejected launch is then marked failed by the dispatcher; wait for that write too.
-      await Promise.all(markFailed.mock.results.map((result) => result.value as Promise<void>));
-      expect(markFailed).toHaveBeenCalledTimes(sanitizeResult === undefined ? 0 : 1);
+      expect(launch.spy).toHaveBeenCalledTimes(1);
+      expect(markFailed.spy).toHaveBeenCalledTimes(sanitizeResult === undefined ? 0 : 1);
 
       expect(calls).toEqual(
         sanitizeResult === undefined
