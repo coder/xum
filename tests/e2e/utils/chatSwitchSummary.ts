@@ -61,7 +61,7 @@ export interface ChatSwitchPerfSummary {
 
 export type ChatSwitchLegMedians = Record<string, number | null> & { count: number };
 
-export function median(values: ReadonlyArray<number | null | undefined>): number | null {
+function median(values: ReadonlyArray<number | null | undefined>): number | null {
   const sorted = values
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
     .sort((left, right) => left - right);

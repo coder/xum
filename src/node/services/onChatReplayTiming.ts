@@ -79,11 +79,11 @@ export function createOnChatReplayTimer(
   return {
     start,
     async time(phase, fn) {
-      const phaseStartedAt = now();
+      const stop = start(phase);
       try {
         return await fn();
       } finally {
-        add(phase, now() - phaseStartedAt);
+        stop();
       }
     },
     timeSync(phase, fn) {
