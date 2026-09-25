@@ -890,10 +890,12 @@ export class McpOauthService {
       const code = url.searchParams.get("code");
       const error = url.searchParams.get("error");
       const errorDescription = url.searchParams.get("error_description") ?? undefined;
+      const iss = url.searchParams.get("iss");
 
       void this.handleDesktopCallback({
         flowId,
         code,
+        iss,
         error,
         errorDescription,
         res,
@@ -1176,6 +1178,7 @@ export class McpOauthService {
   async handleServerCallbackAndExchange(input: {
     state: string | null;
     code: string | null;
+    iss?: string | null;
     error: string | null;
     errorDescription?: string;
   }): Promise<Result<void, string>> {
@@ -1197,6 +1200,7 @@ export class McpOauthService {
 
     const result = await this.exchangeAuthorizationCode(flow, {
       code: input.code,
+      iss: input.iss,
       error: input.error,
       errorDescription: input.errorDescription,
     });
@@ -1393,6 +1397,7 @@ export class McpOauthService {
   private async handleDesktopCallback(input: {
     flowId: string;
     code: string | null;
+    iss: string | null;
     error: string | null;
     errorDescription?: string;
     res: http.ServerResponse;
@@ -1409,6 +1414,7 @@ export class McpOauthService {
 
     const result = await this.exchangeAuthorizationCode(flow, {
       code: input.code,
+      iss: input.iss,
       error: input.error,
       errorDescription: input.errorDescription,
     });
@@ -1433,7 +1439,12 @@ export class McpOauthService {
 
   private async exchangeAuthorizationCode(
     flow: OAuthFlowBase,
-    input: { code: string | null; error: string | null; errorDescription?: string }
+    input: {
+      code: string | null;
+      iss?: string | null;
+      error: string | null;
+      errorDescription?: string;
+    }
   ): Promise<Result<void, string>> {
     if (input.error) {
       const message = input.errorDescription
@@ -1452,6 +1463,13 @@ export class McpOauthService {
       const result = await auth(provider, {
         serverUrl: flow.serverUrlForDiscovery,
         authorizationCode: input.code,
+        // RFC 9207: authorization servers that advertise
+        // authorization_response_iss_parameter_supported return `iss` on the
+        // callback, and the SDK rejects the exchange unless it sees a matching
+        // value (mix-up defense). Forward it verbatim and let the SDK validate;
+        // never normalize or check it here. null -> undefined because the SDK
+        // treats only undefined as "absent".
+        iss: input.iss ?? undefined,
         scope: flow.scope,
         resourceMetadataUrl: flow.resourceMetadataUrl,
       });

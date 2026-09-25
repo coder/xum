@@ -1395,12 +1395,15 @@ export async function createOrpcServer({
 
     const state = getStringParamFromQueryOrBody(req, "state");
     const code = getStringParamFromQueryOrBody(req, "code");
+    // RFC 9207 issuer; the MCP SDK validates it during the code exchange.
+    const iss = getStringParamFromQueryOrBody(req, "iss");
     const error = getStringParamFromQueryOrBody(req, "error");
     const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
 
     const result = await context.mcpOauthService.handleServerCallbackAndExchange({
       state,
       code,
+      iss,
       error,
       errorDescription,
     });

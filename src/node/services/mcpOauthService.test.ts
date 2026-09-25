@@ -749,7 +749,19 @@ describe("McpOauthService OAuth flows", () => {
     }
   });
 
-  test("reuses authorization server discovery when exchanging the callback code", async () => {
+  /**
+   * Resource server + separate authorization server fixture. The AS metadata
+   * optionally advertises RFC 9207 `authorization_response_iss_parameter_supported`
+   * (Linear's shape), which makes the SDK require a matching `iss` on the callback.
+   */
+  async function withSeparateIssuerServers(
+    options: { issParameterSupported: boolean },
+    run: (fixture: {
+      authorizationServerUrl: string;
+      serverName: string;
+      getTokenRequest: () => URLSearchParams | undefined;
+    }) => Promise<void>
+  ): Promise<void> {
     let authorizationServerUrl = "";
     let resourceServerUrl = "";
     let resourceMetadataUrl = "";
@@ -769,6 +781,9 @@ describe("McpOauthService OAuth flows", () => {
               registration_endpoint: `${authorizationServerUrl}/register`,
               response_types_supported: ["code"],
               code_challenge_methods_supported: ["S256"],
+              ...(options.issParameterSupported
+                ? { authorization_response_iss_parameter_supported: true }
+                : {}),
             })
           );
           return;
@@ -857,31 +872,92 @@ describe("McpOauthService OAuth flows", () => {
       });
       expect(addResult).toEqual({ success: true, data: undefined });
 
-      const startResult = await service.startServerFlow({
-        projectPath,
-        serverName,
-        redirectUri: "https://xum.example/callback",
-      });
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) {
-        throw new Error(startResult.error);
-      }
-
-      const callbackResult = await service.handleServerCallbackAndExchange({
-        state: startResult.data.flowId,
-        code: "test-authorization-code",
-        error: null,
-      });
-
-      expect(callbackResult).toEqual({ success: true, data: undefined });
-      expect(tokenRequest?.get("code")).toBe("test-authorization-code");
-      expect(tokenRequest?.get("code_verifier")).toBeTruthy();
+      await run({ authorizationServerUrl, serverName, getTokenRequest: () => tokenRequest });
     } finally {
       await Promise.all([
         new Promise<void>((resolve) => authorizationServer.close(() => resolve())),
         new Promise<void>((resolve) => resourceServer.close(() => resolve())),
       ]);
     }
+  }
+
+  // The first case also proves discovery is reused across start and exchange
+  // (separate AS host). The RFC 9207 cases guard against dropping the callback's
+  // `iss` (Linear login failed with "expected ..., received undefined") while
+  // keeping the SDK's mix-up defense for a wrong issuer.
+  test.each([
+    ["no RFC 9207 support, iss omitted", false, "omit"],
+    ["RFC 9207 support, matching iss", true, "match"],
+    ["RFC 9207 support, wrong iss", true, "wrong"],
+  ] as const)(
+    "server callback exchanges the code via the discovered AS (%s)",
+    async (_name, issParameterSupported, iss) => {
+      await withSeparateIssuerServers(
+        { issParameterSupported },
+        async ({ authorizationServerUrl, serverName, getTokenRequest }) => {
+          const startResult = await service.startServerFlow({
+            projectPath,
+            serverName,
+            redirectUri: "https://xum.example/callback",
+          });
+          expect(startResult.success).toBe(true);
+          if (!startResult.success) {
+            throw new Error(startResult.error);
+          }
+
+          const callbackResult = await service.handleServerCallbackAndExchange({
+            state: startResult.data.flowId,
+            code: "test-authorization-code",
+            iss:
+              iss === "omit"
+                ? null
+                : iss === "match"
+                  ? authorizationServerUrl
+                  : "https://attacker.example",
+            error: null,
+          });
+
+          if (iss === "wrong") {
+            expect(callbackResult.success).toBe(false);
+            if (callbackResult.success) return;
+            expect(callbackResult.error).toContain("Issuer mismatch");
+            expect(callbackResult.error).toContain("https://attacker.example");
+            expect(getTokenRequest()).toBeUndefined();
+            return;
+          }
+
+          expect(callbackResult).toEqual({ success: true, data: undefined });
+          expect(getTokenRequest()?.get("code")).toBe("test-authorization-code");
+          expect(getTokenRequest()?.get("code_verifier")).toBeTruthy();
+        }
+      );
+    }
+  );
+
+  test("desktop loopback callback forwards RFC 9207 iss to the code exchange", async () => {
+    await withSeparateIssuerServers(
+      { issParameterSupported: true },
+      async ({ authorizationServerUrl, serverName, getTokenRequest }) => {
+        const startResult = await service.startDesktopFlow({ projectPath, serverName });
+        expect(startResult.success).toBe(true);
+        if (!startResult.success) {
+          throw new Error(startResult.error);
+        }
+
+        const callbackUrl = new URL(startResult.data.redirectUri);
+        callbackUrl.searchParams.set("state", startResult.data.flowId);
+        callbackUrl.searchParams.set("code", "test-authorization-code");
+        callbackUrl.searchParams.set("iss", authorizationServerUrl);
+        const response = await fetch(callbackUrl);
+        expect(response.status).toBe(200);
+
+        const waitResult = await service.waitForDesktopFlow(startResult.data.flowId, {
+          timeoutMs: 5000,
+        });
+        expect(waitResult).toEqual({ success: true, data: undefined });
+        expect(getTokenRequest()?.get("code")).toBe("test-authorization-code");
+      }
+    );
   });
 
   test("preserves trailing slashes for OAuth discovery under a base path", async () => {
