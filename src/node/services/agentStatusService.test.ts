@@ -366,7 +366,8 @@ describe("AgentStatusService", () => {
     expect(after).toContain("Assistant: Proposed the plan");
     expect(after).toContain("User: Looks good, continue");
     expect(after).not.toContain("mux_plan_review");
-  });
+    // ~80 real history appends: the default 5s budget flaked once under a loaded host.
+  }, 20_000);
 
   test("the status transcript never crosses a durable manual context reset", async () => {
     // A manual reset is a privacy floor: everything before the reset marker is discarded
