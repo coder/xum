@@ -80,41 +80,6 @@ export function createDeferred<T>() {
   return { promise, resolve, reject };
 }
 
-// NOTE: This test file uses bun:test mocks (not Jest).
-
-export const mockInitStateManager: Partial<InitStateManager> = {
-  on: mock(() => undefined as unknown as InitStateManager),
-  off: mock(() => undefined as unknown as InitStateManager),
-  getInitState: mock(() => undefined),
-  waitForInit: mock(() => Promise.resolve()),
-  clearInMemoryState: mock(() => undefined),
-};
-
-export const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
-  isWorkspaceDeleted: mock(() => false),
-  clearTombstonesForRegisteredIds: mock(() => undefined),
-  getTombstonedIds: mock((): ReadonlyMap<string, number> => new Map()),
-  setTombstoneClearedListener: mock(() => undefined),
-  setStreaming: mock(() =>
-    Promise.resolve({
-      recency: Date.now(),
-      streaming: false,
-      lastModel: null,
-      lastThinkingLevel: null,
-      agentStatus: null,
-    })
-  ),
-  updateRecency: mock(() =>
-    Promise.resolve({
-      recency: Date.now(),
-      streaming: false,
-      lastModel: null,
-      lastThinkingLevel: null,
-      agentStatus: null,
-    })
-  ),
-};
-
 /** Real manager with no processes; its output dir is only created if a test spawns one. */
 export function createTestBackgroundProcessManager(): BackgroundProcessManager {
   return new BackgroundProcessManager(

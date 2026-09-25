@@ -14,7 +14,6 @@ import {
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
-  createTestAgentSession,
   seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
@@ -2327,7 +2326,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const session = createTestAgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,

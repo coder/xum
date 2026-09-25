@@ -1,14 +1,13 @@
-import { describe, expect, test, mock, spyOn } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
-import type { InitStateManager } from "./initStateManager";
+import { InitStateManager } from "./initStateManager";
 import { createMuxMessage } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
-  mockInitStateManager,
   createWorkspaceServiceForTest,
   createWorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
@@ -60,25 +59,24 @@ describe("WorkspaceService.stageAttachment", () => {
         namedWorkspacePath: workspacePath,
       });
 
-      let releaseInit: () => void = () => undefined;
-      const initGate = new Promise<void>((resolve) => {
-        releaseInit = resolve;
-      });
+      // Real init manager with init still running: waitForInit blocks until endInit.
+      const initStateManager = new InitStateManager(config);
+      initStateManager.startInit(workspaceId, projectPath);
       let barrierReached: () => void = () => undefined;
       const barrierReachedGate = new Promise<void>((resolve) => {
         barrierReached = resolve;
       });
-      const waitForInit = mock(() => {
-        barrierReached();
-        return initGate;
-      });
+      const realWaitForInit = initStateManager.waitForInit.bind(initStateManager);
+      const waitForInit = spyOn(initStateManager, "waitForInit").mockImplementation(
+        (id, abortSignal) => {
+          barrierReached();
+          return realWaitForInit(id, abortSignal);
+        }
+      );
       const workspaceService = createWorkspaceServiceForTest({
         config,
         historyService,
-        initStateManager: {
-          ...mockInitStateManager,
-          waitForInit,
-        } as unknown as InitStateManager,
+        initStateManager,
       });
 
       const stagePromise = workspaceService.stageAttachment({
@@ -95,7 +93,7 @@ describe("WorkspaceService.stageAttachment", () => {
       const entriesBeforeInit = await fsPromises.readdir(workspacePath);
       expect(entriesBeforeInit).toEqual([]);
 
-      releaseInit();
+      await initStateManager.endInit(workspaceId, 0);
       const result = await stagePromise;
       expect(result.success).toBe(true);
       if (!result.success) throw new Error(result.error);

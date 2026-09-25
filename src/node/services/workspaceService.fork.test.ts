@@ -1,8 +1,6 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import { generateForkBranchName, generateForkTitle } from "./workspaceService";
 import type { AgentSession } from "./agentSession";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -12,13 +10,12 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { SessionUsageService } from "./sessionUsageService";
-import type { AIService } from "./aiService";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ExperimentsService } from "./experimentsService";
 import { awaitPendingBranchSummary } from "./branchSummary";
-import { InitStateManager, type InitStatus } from "./initStateManager";
+import { InitStateManager } from "./initStateManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { createMuxMessage } from "@/common/types/message";
@@ -27,9 +24,7 @@ import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator"
 import * as runtimeExecHelpers from "@/node/utils/runtime/helpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import {
-  mockExtensionMetadataService,
   createMockAIService,
-  createTestBackgroundProcessManager,
   createWorkspaceServiceForTest,
   setWorkspaceGoalOk,
 } from "./workspaceService.testHarness";
@@ -168,32 +163,17 @@ describe("WorkspaceService fork", () => {
       streamOriginKind: "goal_continuation",
     });
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
+    const mockAIService = createMockAIService({
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
+    });
 
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: mock(() => undefined),
-      endInit: mock(() => Promise.resolve()),
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const workspaceService = new WorkspaceService(
+    const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      mockAIService,
-      new ContextManagementService({ config, historyService, aiService: mockAIService }),
-      mockInitStateManager as InitStateManager,
+      aiService: mockAIService,
       extensionMetadata,
-      createTestBackgroundProcessManager()
-    );
+    });
     workspaceService.setWorkspaceGoalService(goalService);
 
     const targetRuntime = {
@@ -351,40 +331,17 @@ describe("WorkspaceService fork", () => {
     const sourceUsage = await sessionUsageService.getSessionUsage(sourceWorkspaceId);
     expect(sourceUsage?.byModel["claude-sonnet-4-20250514"]?.input.tokens).toBe(100);
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
+    const mockAIService = createMockAIService({
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
+    });
 
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: mock(() => undefined),
-      endInit: mock(() => Promise.resolve()),
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const workspaceService = new WorkspaceService(
+    const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      mockAIService,
-      new ContextManagementService({
-        config,
-        historyService,
-        aiService: mockAIService,
-        sessionUsageService,
-      }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadataService as ExtensionMetadataService,
-      createTestBackgroundProcessManager(),
-      sessionUsageService
-    );
+      aiService: mockAIService,
+      sessionUsageService,
+    });
 
     const targetRuntime = {
       getWorkspacePath: mock(() => path.join(sourceProjectPath, "fork-child")),
@@ -478,32 +435,16 @@ describe("WorkspaceService fork", () => {
     const writePartialResult = await historyService.writePartial(sourceWorkspaceId, sourcePartial);
     expect(writePartialResult.success).toBe(true);
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
+    const mockAIService = createMockAIService({
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-    } as unknown as AIService;
+    });
 
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: mock(() => undefined),
-      endInit: mock(() => Promise.resolve()),
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const workspaceService = new WorkspaceService(
+    const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      mockAIService,
-      new ContextManagementService({ config, historyService, aiService: mockAIService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadataService as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
+      aiService: mockAIService,
+    });
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
@@ -590,34 +531,16 @@ describe("WorkspaceService fork", () => {
       return current;
     });
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
+    const mockAIService = createMockAIService({
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
+    });
 
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: mock(() => undefined),
-      endInit: mock(() => Promise.resolve()),
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const workspaceService = new WorkspaceService(
+    const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      mockAIService,
-      new ContextManagementService({ config, historyService, aiService: mockAIService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadataService as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
+      aiService: mockAIService,
+    });
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
@@ -702,34 +625,16 @@ describe("WorkspaceService fork", () => {
       return current;
     });
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
+    const mockAIService = createMockAIService({
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
+    });
 
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: mock(() => undefined),
-      endInit: mock(() => Promise.resolve()),
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const workspaceService = new WorkspaceService(
+    const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      mockAIService,
-      new ContextManagementService({ config, historyService, aiService: mockAIService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadataService as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
+      aiService: mockAIService,
+    });
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
@@ -813,34 +718,16 @@ describe("WorkspaceService fork", () => {
       return current;
     });
 
-    const mockAIService = {
-      ...createStreamLifecycleMocks(),
+    const mockAIService = createMockAIService({
       isStreaming: mock(() => false),
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      on: mock(() => {}),
-      // eslint-disable-next-line @typescript-eslint/no-empty-function
-      off: mock(() => {}),
-    } as unknown as AIService;
+    });
 
-    const mockInitStateManager: Partial<InitStateManager> = {
-      on: mock(() => undefined as unknown as InitStateManager),
-      getInitState: mock(() => ({ status: "running" }) as unknown as InitStatus),
-      startInit: mock(() => undefined),
-      endInit: mock(() => Promise.resolve()),
-      appendOutput: mock(() => undefined),
-      enterHookPhase: mock(() => undefined),
-    };
-
-    const workspaceService = new WorkspaceService(
+    const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      mockAIService,
-      new ContextManagementService({ config, historyService, aiService: mockAIService }),
-      mockInitStateManager as InitStateManager,
-      mockExtensionMetadataService as ExtensionMetadataService,
-      createTestBackgroundProcessManager()
-    );
+      aiService: mockAIService,
+    });
 
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
@@ -1053,10 +940,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
           },
         },
       ];
-      const aiService = {
-        ...createStreamLifecycleMocks(),
-        on: mock(() => undefined),
-        off: mock(() => undefined),
+      const aiService = createMockAIService({
         isStreaming: mock(() => false),
         getWorkspaceMetadata: mock((workspaceId: string) =>
           Promise.resolve(
@@ -1074,17 +958,7 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
             })
           )
         ),
-      } as unknown as AIService;
-      const initStateManager = {
-        on: mock(() => undefined),
-        off: mock(() => undefined),
-        getInitState: mock(() => undefined),
-        startInit: mock(() => undefined),
-        appendOutput: mock(() => undefined),
-        endInit: mock(() => Promise.resolve()),
-        enterHookPhase: mock(() => undefined),
-        clearInMemoryState: mock(() => undefined),
-      } as unknown as InitStateManager;
+      });
       // Failure injection: the usage reset (the LAST failure-prone setup
       // step) rejects, driving the fork into its rollback path.
       const sessionUsageService = {
@@ -1100,7 +974,6 @@ describe("WorkspaceService.fork branch-summary rollback ordering", () => {
         config,
         historyService,
         aiService,
-        initStateManager,
         sessionUsageService,
         experimentsService,
       });

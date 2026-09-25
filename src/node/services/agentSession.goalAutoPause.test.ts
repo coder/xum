@@ -22,9 +22,9 @@ import {
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
 import {
+  createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
-  createTestAgentSession,
 } from "./agentSession.testHarness";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-goal-test-project";
@@ -124,7 +124,7 @@ async function createSessionHarness(
   } as unknown as BackgroundProcessManager;
 
   const aiService = createAiService(workspaceId, () => session.closingSignal);
-  const session = createTestAgentSession({
+  const { session } = await createAgentSessionHarness({
     workspaceId,
     config,
     historyService,
