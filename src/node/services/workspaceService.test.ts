@@ -15590,22 +15590,19 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
     }
   });
 
-  test("a queued send pins only when its entry is accepted", async () => {
+  test("a queued send pins when it is enqueued", async () => {
     const fixture = await setupPinFixture({ ...CHILD, busy: true });
     try {
-      await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
+      const result = await fixture.workspaceService.sendMessage(fixture.workspaceId, "hi", {
         agentId: "exec",
         model: GPT,
         thinkingLevel: "high",
         aiSelectionIntent: { model: true },
       });
-      expect(fixture.readEntry()?.taskAiPins).toEqual({});
-      const queuedInternal = (
-        fixture.fakeSession.queueMessage.mock.calls.at(-1) as unknown[] | undefined
-      )?.[2] as { onAccepted?: () => Promise<void> } | undefined;
-      const commitPins = queuedInternal?.onAccepted;
-      expect(commitPins).toBeDefined();
-      await commitPins?.();
+      // The renderer consumes the pick on this success, so the pin must already be durable
+      // even if the queued entry is cleared before it dispatches.
+      expect(result.success).toBe(true);
+      expect(fixture.fakeSession.queueMessage).toHaveBeenCalled();
       expect(fixture.readEntry()?.taskAiPins).toEqual({ model: GPT });
     } finally {
       await fixture.cleanup();

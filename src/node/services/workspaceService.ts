@@ -12100,9 +12100,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const normalizedOptions = this.normalizeSendMessageAgentId(options);
-      // Pins commit only once the session accepts this send: a manual send refused by a
-      // later admission check (stale epoch, a Stop winning admission) must not leave its
-      // picks pinned. A failed pin write is logged and never fails the accepted turn.
+      // Pins commit when the workspace takes this send: at session acceptance for a direct
+      // send (a later admission refusal — stale epoch, a Stop winning — must not pin), and
+      // at enqueue for a queued one, because the renderer consumes the pick on IPC success
+      // and a queued entry that is later cleared would otherwise lose the pick entirely.
+      // A failed pin write is logged and never fails the send.
       // Eligibility is decided NOW, before preflight persistence records this send's agent as
       // the selected one: only a send for the task's own agent may pin (legacy tasks never).
       const pinTaskEntry =
@@ -12114,21 +12116,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         internal?.synthetic !== true &&
         normalizeAgentId(normalizedOptions.agentId, WORKSPACE_DEFAULTS.agentId) ===
           resolveTaskAgentIdForResume(pinTaskEntry);
+      const commitAiSelectionPins = async (): Promise<void> => {
+        if (!pinEligible) return;
+        try {
+          await this.maybePersistAISettingsFromOptions(
+            workspaceId,
+            normalizedOptions,
+            pinIntent,
+            true
+          );
+        } catch (error) {
+          log.warn("sendMessage: failed to persist AI selection pins", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      };
       const onAccepted = pinEligible
         ? async () => {
-            try {
-              await this.maybePersistAISettingsFromOptions(
-                workspaceId,
-                normalizedOptions,
-                pinIntent,
-                true
-              );
-            } catch (error) {
-              log.warn("sendMessage: failed to persist AI selection pins at acceptance", {
-                workspaceId,
-                error: getErrorMessage(error),
-              });
-            }
+            await commitAiSelectionPins();
             await internal?.onAccepted?.();
           }
         : internal?.onAccepted;
@@ -12400,7 +12406,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: continuationSendState.onCanceled,
-            onAccepted,
+            onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
             preTurnMessages: internal?.preTurnMessages,
             onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
@@ -12430,6 +12436,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         if (effectiveQueueDispatchMode != null) taskTurnHandedToQueue = true;
         else taskTurnAdmission?.onDisposed("no-work");
+        if (effectiveQueueDispatchMode != null) await commitAiSelectionPins();
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
           this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
