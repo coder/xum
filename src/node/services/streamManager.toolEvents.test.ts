@@ -1,19 +1,13 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, setSystemTime } from "bun:test";
+import { tool, type Tool, type ToolExecutionOptions } from "ai";
+import { z } from "zod";
 import { ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
-import type {
-  CompletedMessagePart,
-  ToolCallEndEvent,
-  ToolCallExecutionStartEvent,
-  ToolCallStartEvent,
-  WorkflowRunAttachedEvent,
-} from "@/common/types/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
-import { StreamManager } from "./streamManager";
+import type { TurnEngineEvent, TurnExecutionOptions } from "./streamManager";
 import {
   createStreamManagerForTests,
-  engineInternals,
   fakeStreamText,
-  onTurnEngineEvent,
+  type StreamManagerTestDeps,
 } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
@@ -22,10 +16,137 @@ import {
   testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
-  createStreamInfoForTests,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
+
+const END_OF_STREAM = Symbol("end-of-stream");
+
+/**
+ * A provider fullStream the test feeds one chunk at a time. push() resolves only
+ * after StreamManager finished processing each chunk and asked for the next one,
+ * so tests observe (and replay) a live stream at an exact point.
+ */
+function createChunkFeed() {
+  let deliver: ((chunk: unknown) => void) | undefined;
+  let signalWaiting!: () => void;
+  let waiting = new Promise<void>((resolve) => (signalWaiting = resolve));
+  async function* fullStream() {
+    while (true) {
+      const chunk = await new Promise<unknown>((resolve) => {
+        deliver = resolve;
+        signalWaiting();
+      });
+      if (chunk === END_OF_STREAM) return;
+      yield chunk;
+    }
+  }
+  const send = async (chunk: unknown) => {
+    await waiting;
+    waiting = new Promise<void>((resolve) => (signalWaiting = resolve));
+    const next = deliver;
+    deliver = undefined;
+    if (next == null) throw new Error("chunk feed has no waiting consumer");
+    next(chunk);
+  };
+  return {
+    fullStream: fullStream(),
+    waiting: () => waiting,
+    push: async (...chunks: unknown[]) => {
+      for (const chunk of chunks) {
+        await send(chunk);
+        await waiting;
+      }
+    },
+    end: () => send(END_OF_STREAM),
+  };
+}
+
+interface LiveStream {
+  push: (...chunks: unknown[]) => Promise<void>;
+  /** Ends the stream normally and waits for its completion. */
+  finish: () => Promise<void>;
+}
+
+type LiveStreamOptions = Partial<TurnExecutionOptions> &
+  Pick<TurnExecutionOptions, "workspaceId" | "messageId">;
+
+/**
+ * A real StreamManager whose provider streams come from chunk feeds. Every
+ * engine event lands in `events`; `tools()` returns the tool set StreamManager
+ * handed to the provider (wrapped by withSequentialExecution), so a test can
+ * run execute() the way the AI SDK would.
+ */
+function createLiveStreamHarness(deps: StreamManagerTestDeps = {}) {
+  const events: TurnEngineEvent[] = [];
+  let feed: ReturnType<typeof createChunkFeed> | undefined;
+  let providerTools: Record<string, Tool> = {};
+  const streamManager = createStreamManagerForTests(historyService, {
+    ...deps,
+    eventSink: (event) => {
+      events.push(event);
+    },
+    streamText: fakeStreamText((options) => {
+      providerTools = (options.tools ?? {}) as Record<string, Tool>;
+      // Each started stream consumes its feed once; a retry would see an empty stream.
+      const fullStream =
+        feed?.fullStream ??
+        (async function* () {
+          // No feed left: an unexpected second request streams nothing.
+        })();
+      feed = undefined;
+      return createStreamResultForTests(fullStream);
+    }),
+  });
+  return {
+    streamManager,
+    events,
+    tools: () => providerTools,
+    /** Starts a stream and waits until StreamManager awaits its first chunk. */
+    async start(options: LiveStreamOptions): Promise<LiveStream> {
+      const streamFeed = createChunkFeed();
+      feed = streamFeed;
+      await appendPartialAssistantForTests(options.workspaceId, options.messageId, 1);
+      const result = await streamManager.startStream(
+        testStartOptions({
+          model: createTestLanguageModel(),
+          providedRuntimeTempDir: "",
+          ...options,
+        })
+      );
+      if (!result.success) throw new Error("Expected stream to start");
+      await streamFeed.waiting();
+      return {
+        push: streamFeed.push,
+        finish: async () => {
+          await streamFeed.push({ type: "finish", finishReason: "stop" });
+          await streamFeed.end();
+          await result.data.completion;
+        },
+      };
+    },
+  };
+}
+
+function eventsOfType<T extends TurnEngineEvent["type"]>(
+  events: readonly TurnEngineEvent[],
+  type: T
+): Array<Extract<TurnEngineEvent, { type: T }>> {
+  return events.filter((event): event is Extract<TurnEngineEvent, { type: T }> => {
+    return event.type === type;
+  });
+}
+
+function dynamicToolCall(toolCallId: string, toolName: string, input: unknown = {}) {
+  return { type: "tool-call", toolCallId, toolName, input };
+}
+
+/** The live parts of the workspace's active stream (getStreamInfo returns the live array). */
+function liveParts(harness: ReturnType<typeof createLiveStreamHarness>, workspaceId: string) {
+  const parts = harness.streamManager.getStreamInfo(workspaceId)?.parts;
+  if (parts == null) throw new Error("Expected an active stream");
+  return parts as Array<Record<string, unknown>>;
+}
 
 function createWorkflowRunRecordForTests(runId: string, workspaceId: string): WorkflowRunRecord {
   return {
@@ -92,35 +213,22 @@ describe("StreamManager - event sink rejection containment", () => {
 
 describe("StreamManager - workflow run attachments", () => {
   test("persists attached workflow run metadata to partial immediately", async () => {
-    const streamManager = new StreamManager(historyService);
+    const harness = createLiveStreamHarness();
     const workspaceId = "workflow-attachment-workspace";
     const messageId = "workflow-attachment-message";
+    const live = await harness.start({ workspaceId, messageId });
+    await live.push(
+      dynamicToolCall("workflow-call-1", "workflow_run", { name: "deep-research", args: {} })
+    );
     const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      lastPartialWriteTime: timestamp,
-      pendingWorkflowRunAttachments: undefined,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "workflow-call-1",
-          toolName: "workflow_run",
-          input: { name: "deep-research", args: {} },
-          state: "input-available",
-          timestamp,
-        },
-      ],
-    });
 
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-
-    const attached = await streamManager.attachWorkflowRunToToolCall({
+    const attached = await harness.streamManager.attachWorkflowRunToToolCall({
       type: "workflow-run-attached",
       workspaceId,
       messageId,
       toolCallId: "workflow-call-1",
       runId: "wfr_attached",
-      timestamp: timestamp + 1,
+      timestamp,
     });
 
     expect(attached).toBe(true);
@@ -129,46 +237,34 @@ describe("StreamManager - workflow run attachments", () => {
     if (part?.type !== "dynamic-tool") {
       throw new Error("Expected workflow tool part in persisted partial");
     }
-    expect(part.workflowRun).toEqual({
-      runId: "wfr_attached",
-      timestamp: timestamp + 1,
-    });
+    expect(part.workflowRun).toEqual({ runId: "wfr_attached", timestamp });
+    await live.finish();
   });
 
   test("persists workflow attachments onto nested kernel tool calls", async () => {
-    const streamManager = new StreamManager(historyService);
+    const harness = createLiveStreamHarness();
     const workspaceId = "workflow-nested-attachment-workspace";
     const messageId = "workflow-nested-attachment-message";
+    const live = await harness.start({ workspaceId, messageId });
+    await live.push(
+      dynamicToolCall("code-exec-1", "code_execution", { code: "mux.workflow_run({...})" })
+    );
     const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      lastPartialWriteTime: timestamp,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "code-exec-1",
-          toolName: "code_execution",
-          input: { code: "mux.workflow_run({...})" },
-          state: "input-available",
-          timestamp,
-          nestedCalls: [
-            {
-              toolCallId: "nested-workflow-1",
-              toolName: "workflow_run",
-              // Kernel bounding replaced the launch args with a marker; the
-              // attachment is the only durable run identity for this call.
-              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
-              state: "input-available",
-              timestamp,
-            },
-          ],
-        },
-      ],
-    });
+    harness.streamManager.emitNestedToolEvent(
+      { workspaceId, messageId, token: "test" },
+      {
+        type: "tool-call-start",
+        callId: "nested-workflow-1",
+        toolName: "workflow_run",
+        // Kernel bounding replaced the launch args with a marker; the
+        // attachment is the only durable run identity for this call.
+        args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+        parentToolCallId: "code-exec-1",
+        startTime: timestamp,
+      }
+    );
 
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-
-    const attached = await streamManager.attachWorkflowRunToToolCall({
+    const attached = await harness.streamManager.attachWorkflowRunToToolCall({
       type: "workflow-run-attached",
       workspaceId,
       messageId,
@@ -192,95 +288,63 @@ describe("StreamManager - workflow run attachments", () => {
       runId: "wfr_nested",
       timestamp: timestamp + 1,
     });
-    // The attachment landed on the nested record, not the pending map.
-    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+    await live.finish();
   });
 
   test("persists workflow attachments that arrive before the tool part", async () => {
-    const streamManager = new StreamManager(historyService);
+    const harness = createLiveStreamHarness();
     const workspaceId = "workflow-attachment-race-workspace";
     const messageId = "workflow-attachment-race-message";
+    const live = await harness.start({ workspaceId, messageId });
     const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      lastPartialWriteTime: timestamp,
-      parts: [],
-    });
 
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-
-    const attached = await streamManager.attachWorkflowRunToToolCall({
+    const attached = await harness.streamManager.attachWorkflowRunToToolCall({
       type: "workflow-run-attached",
       workspaceId,
       messageId,
       toolCallId: "workflow-call-race",
       runId: "wfr_race",
-      timestamp: timestamp + 1,
+      timestamp,
     });
 
     expect(attached).toBe(true);
     expect(await historyService.readPartial(workspaceId)).toBeNull();
+    const pushStart = harness.events.length;
 
-    const appendPartAndEmit = engineInternals(streamManager).appendPartAndEmit;
-
-    const replayedAttachments: WorkflowRunAttachedEvent[] = [];
-    onTurnEngineEvent(streamManager, "workflow-run-attached", (event: WorkflowRunAttachedEvent) => {
-      replayedAttachments.push(event);
-    });
-
-    await appendPartAndEmit.call(
-      streamManager,
-      workspaceId,
-      streamInfo,
-      {
-        type: "dynamic-tool",
-        toolCallId: "workflow-call-race",
-        toolName: "workflow_run",
-        input: { name: "deep-research", args: {} },
-        state: "input-available",
-        timestamp: timestamp + 2,
-      },
-      false
+    await live.push(
+      dynamicToolCall("workflow-call-race", "workflow_run", { name: "deep-research", args: {} })
     );
 
-    expect(replayedAttachments).toEqual([
+    expect(eventsOfType(harness.events.slice(pushStart), "workflow-run-attached")).toEqual([
       {
         type: "workflow-run-attached",
         workspaceId,
         messageId,
         toolCallId: "workflow-call-race",
         runId: "wfr_race",
-        timestamp: timestamp + 1,
+        timestamp,
       },
     ]);
-
     const partial = await historyService.readPartial(workspaceId);
     const part = partial?.parts[0];
     if (part?.type !== "dynamic-tool") {
       throw new Error("Expected workflow tool part in persisted partial");
     }
-    expect(part.workflowRun).toEqual({
-      runId: "wfr_race",
-      timestamp: timestamp + 1,
-    });
+    expect(part.workflowRun).toEqual({ runId: "wfr_race", timestamp });
+    await live.finish();
   });
 });
 
 describe("StreamManager - nested kernel call race and replay", () => {
   test("buffers nested events that beat the parent part and persists them (with run identity) on merge", async () => {
-    const streamManager = new StreamManager(historyService);
+    const harness = createLiveStreamHarness();
     const workspaceId = "nested-race-workspace";
     const messageId = "nested-race-message";
+    const live = await harness.start({ workspaceId, messageId });
     const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      lastPartialWriteTime: timestamp,
-      parts: [],
-    });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
 
     // execute() wins the race: nested start arrives before the parent part exists.
-    streamManager.emitNestedToolEvent(
+    harness.streamManager.emitNestedToolEvent(
       { workspaceId, messageId, token: "test" },
       {
         type: "tool-call-start",
@@ -293,7 +357,7 @@ describe("StreamManager - nested kernel call race and replay", () => {
     );
 
     // The workflow attachment lands while the nested record is still buffered.
-    const attached = await streamManager.attachWorkflowRunToToolCall({
+    const attached = await harness.streamManager.attachWorkflowRunToToolCall({
       type: "workflow-run-attached",
       workspaceId,
       messageId,
@@ -306,32 +370,22 @@ describe("StreamManager - nested kernel call race and replay", () => {
     // Nothing persisted yet: the parent part has not landed.
     expect(await historyService.readPartial(workspaceId)).toBeNull();
 
-    const appendPartAndEmit = engineInternals(streamManager).appendPartAndEmit;
     // The renderer dropped the original raced events, so the merge must
     // re-deliver them once the parent part exists.
-    const reEmittedStarts: ToolCallStartEvent[] = [];
-    const reEmittedAttachments: WorkflowRunAttachedEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-start", (event) => reEmittedStarts.push(event));
-    onTurnEngineEvent(streamManager, "workflow-run-attached", (event) =>
-      reEmittedAttachments.push(event)
+    const pushStart = harness.events.length;
+    await live.push(
+      dynamicToolCall("code-exec-race", "code_execution", { code: "mux.workflow_run({...})" })
     );
-    await appendPartAndEmit.call(
-      streamManager,
-      workspaceId,
-      streamInfo,
-      {
-        type: "dynamic-tool",
-        toolCallId: "code-exec-race",
-        toolName: "code_execution",
-        input: { code: "mux.workflow_run({...})" },
-        state: "input-available",
-        timestamp: timestamp + 2,
-      },
-      false
+    const merged = harness.events.slice(pushStart);
+    const reEmittedStart = eventsOfType(merged, "tool-call-start").find(
+      (e) => e.toolCallId === "nested-race-workflow"
     );
-    const reEmittedStart = reEmittedStarts.find((e) => e.toolCallId === "nested-race-workflow");
     expect(reEmittedStart?.parentToolCallId).toBe("code-exec-race");
-    expect(reEmittedAttachments.some((e) => e.toolCallId === "nested-race-workflow")).toBe(true);
+    expect(
+      eventsOfType(merged, "workflow-run-attached").some(
+        (e) => e.toolCallId === "nested-race-workflow"
+      )
+    ).toBe(true);
 
     const partial = await historyService.readPartial(workspaceId);
     const part = partial?.parts[0];
@@ -345,227 +399,151 @@ describe("StreamManager - nested kernel call race and replay", () => {
       runId: "wfr_race_nested",
       timestamp: timestamp + 1,
     });
-    // Both holding areas were consumed.
-    expect((streamInfo.pendingNestedCalls as Map<string, unknown>).size).toBe(0);
-    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+    await live.finish();
   });
 
   test("replays persisted nested calls (start, attachment, end) with the parent part", async () => {
-    const streamManager = new StreamManager(historyService);
+    const harness = createLiveStreamHarness();
     const workspaceId = "nested-replay-workspace";
     const messageId = "nested-replay-message";
+    const scope = { workspaceId, messageId, token: "test" };
+    const live = await harness.start({ workspaceId, messageId });
+    await live.push(
+      dynamicToolCall("code-exec-replay", "code_execution", { code: "mux.workflow_run({...})" })
+    );
     const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
+    const nested = {
+      callId: "nested-replay-workflow",
+      toolName: "workflow_run",
+      args: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+      parentToolCallId: "code-exec-replay",
+      startTime: timestamp,
+    };
+    harness.streamManager.emitNestedToolEvent(scope, { ...nested, type: "tool-call-start" });
+    await harness.streamManager.attachWorkflowRunToToolCall({
+      type: "workflow-run-attached",
+      workspaceId,
       messageId,
-      lastPartialWriteTime: timestamp,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "code-exec-replay",
-          toolName: "code_execution",
-          input: { code: "mux.workflow_run({...})" },
-          state: "input-available",
-          timestamp,
-          nestedCalls: [
-            {
-              toolCallId: "nested-replay-workflow",
-              toolName: "workflow_run",
-              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
-              state: "output-available",
-              output: { __kernelBounded: true, runId: "wfr_replay", status: "running" },
-              timestamp: timestamp + 1,
-              workflowRun: { runId: "wfr_replay", timestamp: timestamp + 2 },
-            },
-          ],
-        },
-      ],
+      toolCallId: "nested-replay-workflow",
+      runId: "wfr_replay",
+      timestamp: timestamp + 2,
     });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
+    harness.streamManager.emitNestedToolEvent(scope, {
+      ...nested,
+      type: "tool-call-end",
+      endTime: timestamp + 1,
+      result: { __kernelBounded: true, runId: "wfr_replay", status: "running" },
+    });
+    const replayStart = harness.events.length;
 
-    const starts: ToolCallStartEvent[] = [];
-    const attachments: WorkflowRunAttachedEvent[] = [];
-    const ends: ToolCallEndEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
-    onTurnEngineEvent(streamManager, "workflow-run-attached", (event) => attachments.push(event));
-    onTurnEngineEvent(streamManager, "tool-call-end", (event) => ends.push(event));
+    await harness.streamManager.replayStream(workspaceId);
 
-    await streamManager.replayStream(workspaceId);
-
-    const nestedStart = starts.find((e) => e.toolCallId === "nested-replay-workflow");
+    const replayed = harness.events.slice(replayStart);
+    const nestedStart = eventsOfType(replayed, "tool-call-start").find(
+      (e) => e.toolCallId === "nested-replay-workflow"
+    );
     expect(nestedStart?.parentToolCallId).toBe("code-exec-replay");
     expect(nestedStart?.replay).toBe(true);
-    const nestedAttach = attachments.find((e) => e.toolCallId === "nested-replay-workflow");
+    const nestedAttach = eventsOfType(replayed, "workflow-run-attached").find(
+      (e) => e.toolCallId === "nested-replay-workflow"
+    );
     expect(nestedAttach?.runId).toBe("wfr_replay");
-    const nestedEnd = ends.find((e) => e.toolCallId === "nested-replay-workflow");
+    const nestedEnd = eventsOfType(replayed, "tool-call-end").find(
+      (e) => e.toolCallId === "nested-replay-workflow"
+    );
     expect(nestedEnd?.parentToolCallId).toBe("code-exec-replay");
+    await live.finish();
   });
+
+  /** Starts a stream whose only part is a code_execution parent; returns its part timestamp. */
+  async function startNestedParentStream(workspaceId: string) {
+    const harness = createLiveStreamHarness();
+    const messageId = `${workspaceId}-message`;
+    const scope = { workspaceId, messageId, token: "test" };
+    const live = await harness.start({ workspaceId, messageId });
+    await live.push(dynamicToolCall("code-exec", "code_execution", { code: "…" }));
+    const parentTimestamp = eventsOfType(harness.events, "tool-call-start")[0]?.timestamp;
+    if (parentTimestamp == null) throw new Error("Expected the parent tool-call-start");
+    const emitNested = (callId: string, startTime: number, endTime?: number): void => {
+      const nested = { callId, toolName: "workflow_run", args: {}, parentToolCallId: "code-exec" };
+      harness.streamManager.emitNestedToolEvent(scope, {
+        ...nested,
+        type: "tool-call-start",
+        startTime,
+      });
+      if (endTime != null) {
+        harness.streamManager.emitNestedToolEvent(scope, {
+          ...nested,
+          type: "tool-call-end",
+          startTime,
+          endTime,
+          result: { runId: "wfr_done" },
+        });
+      }
+    };
+    /** Nested call ids the incremental replay after `cursor` re-sent. */
+    const replayedNestedStarts = async (cursor: number): Promise<string[]> => {
+      const replayStart = harness.events.length;
+      await harness.streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
+      return eventsOfType(harness.events.slice(replayStart), "tool-call-start")
+        .filter((event) => event.parentToolCallId === "code-exec")
+        .map((event) => event.toolCallId);
+    };
+    return { harness, live, parentTimestamp, emitNested, replayedNestedStarts };
+  }
 
   test("incremental replay notices a nested call that completed while disconnected", async () => {
-    const streamManager = new StreamManager(historyService);
-    const workspaceId = "nested-replay-completion-workspace";
-    const messageId = "nested-replay-completion-message";
-    const timestamp = Date.now();
-    const makeStreamInfo = (completedAt: number) =>
-      createStreamInfoForTests({
-        messageId,
-        lastPartialWriteTime: timestamp,
-        toolCompletionTimestamps: new Map([["nested-completed-workflow", completedAt]]),
-        parts: [
-          {
-            type: "dynamic-tool",
-            toolCallId: "code-exec-completion",
-            toolName: "code_execution",
-            input: { code: "mux.workflow_run({...})" },
-            state: "input-available",
-            timestamp,
-            nestedCalls: [
-              {
-                toolCallId: "nested-completed-workflow",
-                toolName: "workflow_run",
-                input: {},
-                state: "output-available",
-                output: { runId: "wfr_done" },
-                // Start predates the cursor; only the completion is fresh.
-                timestamp,
-              },
-            ],
-          },
-        ],
-      });
-    const cursor = timestamp + 50;
-
-    // Completed after the cursor: the parent must replay.
-    engineInternals(streamManager).workspaceStreams.set(
-      workspaceId,
-      makeStreamInfo(timestamp + 100)
-    );
-    const starts: ToolCallStartEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
-    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
-    expect(starts.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(true);
+    const { live, parentTimestamp, emitNested, replayedNestedStarts } =
+      await startNestedParentStream("nested-replay-completion-workspace");
+    // Both nested starts predate the cursor; only their completions differ.
+    const cursor = parentTimestamp + 1_000;
 
     // Completed before the cursor: nothing fresh, no replay.
-    engineInternals(streamManager).workspaceStreams.set(
-      workspaceId,
-      makeStreamInfo(timestamp + 10)
-    );
-    starts.length = 0;
-    await streamManager.replayStream(workspaceId, { afterTimestamp: cursor });
-    expect(starts.some((e) => e.toolCallId === "nested-completed-workflow")).toBe(false);
+    emitNested("nested-completed-before", parentTimestamp, cursor - 10);
+    expect(await replayedNestedStarts(cursor)).toEqual([]);
+
+    // Completed after the cursor: the parent (with its nested rows) must replay.
+    emitNested("nested-completed-after", parentTimestamp, cursor + 50);
+    expect(await replayedNestedStarts(cursor)).toContain("nested-completed-after");
+    await live.finish();
   });
 
-  test("emitNestedToolEvent records nested completion timestamps", () => {
-    const streamManager = new StreamManager(historyService);
-    const workspaceId = "nested-completion-record-workspace";
-    const messageId = "nested-completion-record-message";
-    const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "code-exec-ts",
-          toolName: "code_execution",
-          input: {},
-          state: "input-available",
-          timestamp,
-          nestedCalls: [
-            {
-              toolCallId: "nested-ts",
-              toolName: "bash",
-              input: {},
-              state: "input-available",
-              timestamp,
-            },
-          ],
-        },
-      ],
-    });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-
-    streamManager.emitNestedToolEvent(
-      { workspaceId, messageId, token: "test" },
-      {
-        type: "tool-call-end",
-        callId: "nested-ts",
-        toolName: "bash",
-        args: {},
-        parentToolCallId: "code-exec-ts",
-        startTime: timestamp,
-        endTime: timestamp + 5,
-        result: { ok: true },
-      }
+  test("emitNestedToolEvent records nested completion timestamps", async () => {
+    const { harness, live, parentTimestamp, emitNested } = await startNestedParentStream(
+      "nested-completion-record-workspace"
     );
 
-    expect((streamInfo.toolCompletionTimestamps as Map<string, number>).get("nested-ts")).toBe(
-      timestamp + 5
-    );
+    emitNested("nested-ts", parentTimestamp, parentTimestamp + 5);
+
+    const streamInfo = harness.streamManager.getStreamInfo("nested-completion-record-workspace");
+    expect(streamInfo?.toolCompletionTimestamps.get("nested-ts")).toBe(parentTimestamp + 5);
+    await live.finish();
   });
 
   test("incremental replay keeps a parent whose only fresh activity is nested", async () => {
-    const streamManager = new StreamManager(historyService);
-    const workspaceId = "nested-replay-cursor-workspace";
-    const messageId = "nested-replay-cursor-message";
-    const timestamp = Date.now();
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      lastPartialWriteTime: timestamp,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "code-exec-cursor",
-          toolName: "code_execution",
-          input: { code: "mux.workflow_run({...})" },
-          state: "input-available",
-          // Parent part predates the reconnect cursor...
-          timestamp,
-          nestedCalls: [
-            {
-              toolCallId: "nested-cursor-workflow",
-              toolName: "workflow_run",
-              input: {},
-              state: "input-available",
-              // ...but the nested workflow started after it.
-              timestamp: timestamp + 100,
-            },
-          ],
-        },
-      ],
-    });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
+    const { live, parentTimestamp, emitNested, replayedNestedStarts } =
+      await startNestedParentStream("nested-replay-cursor-workspace");
 
-    const starts: ToolCallStartEvent[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-start", (event) => starts.push(event));
+    // The parent part predates the reconnect cursor, but the nested workflow started after it.
+    emitNested("nested-cursor-workflow", parentTimestamp + 100);
 
-    await streamManager.replayStream(workspaceId, { afterTimestamp: timestamp + 50 });
-
-    expect(starts.some((e) => e.toolCallId === "nested-cursor-workflow")).toBe(true);
+    expect(await replayedNestedStarts(parentTimestamp + 50)).toEqual(["nested-cursor-workflow"]);
+    await live.finish();
   });
 });
 
 describe("StreamManager - nested tool call normalization", () => {
-  test("normalizes zero-arg nested calls to {} for the persisted record and the wire event", () => {
-    const streamManager = new StreamManager(historyService);
+  test("normalizes zero-arg nested calls to {} for the persisted record and the wire event", async () => {
+    const harness = createLiveStreamHarness();
     const workspaceId = "nested-normalize-workspace";
     const messageId = "nested-normalize-message";
-    const timestamp = Date.now();
-    const parts: CompletedMessagePart[] = [
-      {
-        type: "dynamic-tool",
-        toolCallId: "parent-1",
-        toolName: "code_execution",
-        input: { code: "mux.linear_list_teams()" },
-        state: "input-available",
-        timestamp,
-      },
-    ];
-    const streamInfo = createStreamInfoForTests({ messageId, parts });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
+    const live = await harness.start({ workspaceId, messageId });
+    await live.push(
+      dynamicToolCall("parent-1", "code_execution", { code: "mux.linear_list_teams()" })
+    );
+    const emitStart = harness.events.length;
 
-    const events: unknown[] = [];
-    onTurnEngineEvent(streamManager, "tool-call-start", (event: unknown) => events.push(event));
-
-    streamManager.emitNestedToolEvent(
+    harness.streamManager.emitNestedToolEvent(
       { workspaceId, messageId, token: "test" },
       {
         type: "tool-call-start",
@@ -575,58 +553,56 @@ describe("StreamManager - nested tool call normalization", () => {
         // persisted record and the wire event must carry {} instead.
         args: undefined,
         parentToolCallId: "parent-1",
-        startTime: timestamp,
+        startTime: Date.now(),
       }
     );
 
-    const parentPart = parts[0] as { nestedCalls?: Array<{ input?: unknown }> };
+    const parentPart = liveParts(harness, workspaceId)[0] as {
+      nestedCalls?: Array<{ input?: unknown }>;
+    };
     expect(parentPart.nestedCalls).toHaveLength(1);
     expect(parentPart.nestedCalls?.[0]?.input).toEqual({});
 
     // The live event must survive oRPC output validation (args key required).
+    const events = harness.events.slice(emitStart);
     expect(events).toHaveLength(1);
     expect(ToolCallStartEventSchema.safeParse(events[0]).success).toBe(true);
     expect((events[0] as { args?: unknown }).args).toEqual({});
+    await live.finish();
   });
 });
 
 describe("StreamManager - tool execution start timing", () => {
-  test("stamps executionStartedAt and emits tool-call-execution-start when the part already exists", () => {
-    const streamManager = new StreamManager(historyService);
+  const bash = tool({ inputSchema: z.object({}), execute: () => ({ ok: true }) });
+
+  async function executeTool(
+    harness: ReturnType<typeof createLiveStreamHarness>,
+    toolCallId: string
+  ): Promise<void> {
+    const options: ToolExecutionOptions<unknown> = { toolCallId, messages: [], context: undefined };
+    await harness.tools().bash.execute?.({}, options);
+  }
+
+  test("stamps executionStartedAt and emits tool-call-execution-start when the part already exists", async () => {
+    const harness = createLiveStreamHarness();
     const workspaceId = "execution-start-workspace";
     const messageId = "execution-start-message";
-    // Seed the monotonic stream clock ahead of wall time: a raw Date.now() execution
-    // start would be <= the tool-call timestamp and reconnect replay's
-    // `executionStartedAt > cursor` repair predicate would never fire.
-    const timestamp = Date.now() + 60_000;
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      lastPartTimestamp: timestamp,
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "tool-call-1",
-          toolName: "bash",
-          input: { command: "echo hi" },
-          state: "input-available",
-          timestamp,
-        },
-      ],
-    });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
+    const live = await harness.start({ workspaceId, messageId, tools: { bash } });
 
-    const events: ToolCallExecutionStartEvent[] = [];
-    onTurnEngineEvent(
-      streamManager,
-      "tool-call-execution-start",
-      (event: ToolCallExecutionStartEvent) => {
-        events.push(event);
-      }
-    );
+    // Freeze the wall clock so a raw Date.now() execution start would equal the
+    // tool-call part timestamp; reconnect replay's `executionStartedAt > cursor`
+    // repair predicate would then never fire for a cursor at that part.
+    setSystemTime(new Date(Date.now()));
+    let partTimestamp: number | undefined;
+    try {
+      await live.push(dynamicToolCall("tool-call-1", "bash"));
+      partTimestamp = eventsOfType(harness.events, "tool-call-start")[0]?.timestamp;
+      await executeTool(harness, "tool-call-1");
+    } finally {
+      setSystemTime();
+    }
 
-    const handleToolExecutionStart = engineInternals(streamManager).handleToolExecutionStart;
-    handleToolExecutionStart.call(streamManager, workspaceId, messageId, "tool-call-1");
-
+    const events = eventsOfType(harness.events, "tool-call-execution-start");
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: "tool-call-execution-start",
@@ -636,54 +612,28 @@ describe("StreamManager - tool execution start timing", () => {
     });
     // Cursor-monotonic: strictly after the tool-call part timestamp even when the wall
     // clock has not advanced past it.
-    expect(events[0].timestamp).toBeGreaterThan(timestamp);
-
-    const parts = streamInfo.parts as Array<Record<string, unknown>>;
-    expect(parts[0].executionStartedAt).toBe(events[0].timestamp);
+    if (partTimestamp == null) throw new Error("Expected tool-call-start");
+    expect(events[0].timestamp).toBeGreaterThan(partTimestamp);
+    expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
+    await live.finish();
   });
 
   test("applies execution starts that arrive before the tool part lands", async () => {
-    const streamManager = new StreamManager(historyService);
+    const harness = createLiveStreamHarness();
     const workspaceId = "execution-start-race-workspace";
     const messageId = "execution-start-race-message";
-    const streamInfo = createStreamInfoForTests({ messageId, parts: [] });
-    engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-
-    const events: ToolCallExecutionStartEvent[] = [];
-    onTurnEngineEvent(
-      streamManager,
-      "tool-call-execution-start",
-      (event: ToolCallExecutionStartEvent) => {
-        events.push(event);
-      }
-    );
+    const live = await harness.start({ workspaceId, messageId, tools: { bash } });
 
     // execute() wins the race: no part yet, so the start is parked as pending.
-    const handleToolExecutionStart = engineInternals(streamManager).handleToolExecutionStart;
-    handleToolExecutionStart.call(streamManager, workspaceId, messageId, "tool-call-race");
-    expect(events).toHaveLength(0);
+    await executeTool(harness, "tool-call-race");
+    expect(eventsOfType(harness.events, "tool-call-execution-start")).toHaveLength(0);
 
-    const appendPartAndEmit = engineInternals(streamManager).appendPartAndEmit;
-    await appendPartAndEmit.call(
-      streamManager,
-      workspaceId,
-      streamInfo,
-      {
-        type: "dynamic-tool",
-        toolCallId: "tool-call-race",
-        toolName: "bash",
-        input: { command: "echo hi" },
-        state: "input-available",
-        timestamp: Date.now(),
-      },
-      false
-    );
+    await live.push(dynamicToolCall("tool-call-race", "bash"));
 
+    const events = eventsOfType(harness.events, "tool-call-execution-start");
     expect(events).toHaveLength(1);
     expect(events[0].toolCallId).toBe("tool-call-race");
-
-    const parts = streamInfo.parts as Array<Record<string, unknown>>;
-    expect(parts[0].executionStartedAt).toBe(events[0].timestamp);
-    expect((streamInfo.pendingToolExecutionStarts as Map<string, number>).size).toBe(0);
+    expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
+    await live.finish();
   });
 });
