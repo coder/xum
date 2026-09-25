@@ -905,6 +905,9 @@ interface WorkspaceStreamInfo {
   terminalCompletion?: TurnCompletion;
 }
 
+/** Type-only export: test fixtures type hand-built stream state against it. */
+export type { WorkspaceStreamInfo };
+
 // Ensure per-stream part timestamps are strictly monotonic.
 //
 // Date.now() is millisecond-granularity, so two distinct chunks with identical text emitted in the

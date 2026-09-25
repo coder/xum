@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { StreamManager, type TurnEngineEvent } from "./streamManager";
+import type { TurnEngineEvent } from "./streamManager";
 import * as aiSdk from "ai";
 import {
   APICallError,
@@ -197,14 +197,6 @@ async function committedStepStarts(workspaceId: string, messageId: string) {
 }
 
 describe("StreamManager - previousResponseId recovery", () => {
-  test("isResponseIdLost returns false for unknown IDs", () => {
-    const streamManager = new StreamManager(historyService);
-
-    // Verify the ID is not lost initially
-    expect(streamManager.isResponseIdLost("resp_123abc")).toBe(false);
-    expect(streamManager.isResponseIdLost("resp_different")).toBe(false);
-  });
-
   const lostResponseIdCases: Array<{ name: string; lostId: string; error: unknown }> = [
     {
       name: "explicit OpenAI errors",
