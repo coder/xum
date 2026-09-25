@@ -667,6 +667,20 @@ interface TaskCreateManyOptions {
    * completion, never detached. The Result error is NOT the "Task interrupted" restart sentinel.
    */
   abortSignal?: AbortSignal;
+  /**
+   * Single-use publication (G2, #4452 gap 2), aligned with the args: the i-th child replaces the
+   * retired attempt named here. The publishing config commit verifies, in the same write, that
+   * the prior row still names that attempt, carries this claim nonce and has no replacement yet,
+   * and records the child as its replacementTaskId. Any mismatch fails the whole reservation.
+   */
+  retires?: ReadonlyArray<TaskRetiresClaim | undefined>;
+}
+
+/** The claim a replacement child consumes (claimRetiredAttempt's result). */
+export interface TaskRetiresClaim {
+  taskId: string;
+  attemptId: string;
+  nonce: string;
 }
 
 /** Last stage a reservation entered; carried into abort/timeout diagnostics and the stall warning. */
@@ -1043,6 +1057,38 @@ function rowSupersedes(
   expectedAttemptId: string | null | undefined
 ): boolean {
   return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
+}
+
+/**
+ * Why a workflow claim on `attemptId` must be refused (see TaskService.claimRetiredAttempt), or
+ * undefined when it may be granted (or re-stamped, for the same run/step before any replacement).
+ */
+function retiredAttemptClaimRefusal(
+  row: WorkspaceConfigEntry,
+  attemptId: string,
+  claimant: { runId: string; stepId: string }
+): string | undefined {
+  if (row.taskAttemptId !== attemptId) {
+    return `claim lost: the task now names attempt ${row.taskAttemptId ?? "none"}`;
+  }
+  if (row.taskStatus !== "interrupted") return `attempt is ${row.taskStatus ?? "running"}`;
+  const task = row.workflowTask;
+  if (task?.runId !== claimant.runId || task.stepId !== claimant.stepId) {
+    return "the task does not belong to this workflow step";
+  }
+  const existing = row.taskAttemptRetiredBy;
+  if (existing == null) return undefined;
+  if (existing.replacementTaskId != null) {
+    return `the retired attempt already has replacement ${existing.replacementTaskId}`;
+  }
+  if (
+    existing.runId !== claimant.runId ||
+    existing.stepId !== claimant.stepId ||
+    existing.attemptId !== attemptId
+  ) {
+    return "the attempt was retired by another workflow step";
+  }
+  return undefined;
 }
 
 /**
@@ -3627,6 +3673,132 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  /**
+   * Cross-process evidence (G2) that the task's CURRENT attempt ended without a report, for an
+   * attempt this process does not own (another backend, or this one before a restart). Called
+   * only after the report artifact read positively found none: a receipt never outranks a report.
+   *
+   * Attempt identity: the receipt must name the row's current taskAttemptId. The workflow journal
+   * names only the child task, and every admission of that task rotates the id, so the current
+   * id is the only attempt that can still run; a receipt for an older attempt says nothing about
+   * it. Only the PARENT's receipt copy counts (the copy lineage reads; ancestor copies are fan-out
+   * and never evidence on their own), and it must name that parent. Every read is strict, and
+   * the row is re-read after the receipt so an admission landing in between is never missed.
+   */
+  private async readUnownedSettlementProof(
+    taskId: string
+  ): Promise<{ kind: "proven"; attemptId: string } | { kind: "unproven"; reason: string }> {
+    const unproven = (reason: string) => ({ kind: "unproven" as const, reason });
+    const readRow = () =>
+      findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId)
+        ?.workspace;
+    let row: WorkspaceConfigEntry | undefined;
+    try {
+      row = readRow();
+    } catch (error: unknown) {
+      return unproven(`config unreadable: ${getErrorMessage(error)}`);
+    }
+    if (row == null) return unproven("no task record");
+    const attemptId = row.taskAttemptId;
+    if (!isTaskAttemptId(attemptId)) return unproven("no attempt id (pre-identity entry)");
+    if (row.taskStatus !== "interrupted") return unproven(`status ${row.taskStatus ?? "missing"}`);
+    if (row.taskAttemptUnproven === true) return unproven("lineage marked unproven");
+    const parentWorkspaceId = coerceNonEmptyString(row.parentWorkspaceId);
+    if (parentWorkspaceId == null) return unproven("no parent");
+    const receipt = await readSubagentAttemptSettlementReceiptStrict(
+      path.join(this.config.sessionsDir, parentWorkspaceId),
+      taskId,
+      attemptId
+    );
+    if (receipt.kind === "not_found") return unproven(`no settlement receipt for ${attemptId}`);
+    if (receipt.kind === "unreadable") {
+      return unproven(`settlement receipt unreadable: ${receipt.error}`);
+    }
+    if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
+      return unproven(`settlement receipt names parent ${receipt.receipt.parentWorkspaceId}`);
+    }
+    let latest: WorkspaceConfigEntry | undefined;
+    try {
+      latest = readRow();
+    } catch (error: unknown) {
+      return unproven(`config unreadable: ${getErrorMessage(error)}`);
+    }
+    if (
+      latest?.taskAttemptId !== attemptId ||
+      latest.taskStatus !== "interrupted" ||
+      latest.taskAttemptUnproven === true
+    ) {
+      return unproven("the attempt changed while its receipt was read");
+    }
+    return { kind: "proven", attemptId };
+  }
+
+  /**
+   * Workflow claim that retires `attemptId` of `taskId` so exactly one replacement can be
+   * published for it (G2). A pure compare-and-swap fence: the classifier (readAttemptOutcome)
+   * decided the attempt ended without a report; the claim only makes that decision exclusive.
+   * Granted while the row still names the attempt, is interrupted, belongs to this run/step and
+   * has no replacement yet; an earlier claim of the same run/step is re-stamped with a fresh
+   * nonce (a stale runner holding the old nonce can then no longer publish). Every admission
+   * already refuses a retired attempt. Confirmed by a strict re-read, since a config edit that
+   * fails to write is not always surfaced to its caller.
+   */
+  async claimRetiredAttempt(
+    taskId: string,
+    attemptId: string,
+    claimant: { runId: string; stepId: string; inputHash: string }
+  ): Promise<Result<{ nonce: string }, string>> {
+    assert(taskId.length > 0, "claimRetiredAttempt: taskId must be non-empty");
+    assertTaskAttemptId(attemptId, "claimRetiredAttempt");
+    assert(claimant.runId.length > 0 && claimant.stepId.length > 0, "claimRetiredAttempt: claimant");
+    return await this.workspaceEventLocks.withLock(taskId, async () => {
+      if (
+        this.isWorkspaceStopInProgress(taskId) ||
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
+        this.aiService.isStreaming(taskId) ||
+        this.workspaceService.getActiveTurnGeneration(taskId) != null
+      ) {
+        return Err("attempt is live");
+      }
+      const nonce = randomUUID();
+      let refusal: string | undefined = "task record not found";
+      try {
+        await this.editWorkspaceEntry(
+          taskId,
+          (ws) => {
+            refusal = retiredAttemptClaimRefusal(ws, attemptId, claimant);
+            if (refusal != null) return;
+            ws.taskAttemptRetiredBy = {
+              runId: claimant.runId,
+              stepId: claimant.stepId,
+              inputHash: claimant.inputHash,
+              childTaskId: taskId,
+              attemptId,
+              mode: "no-report",
+              at: new Date().toISOString(),
+              nonce,
+            };
+          },
+          { allowMissing: true }
+        );
+      } catch (error: unknown) {
+        return Err(`claim write failed: ${getErrorMessage(error)}`);
+      }
+      if (refusal != null) return Err(refusal);
+      let row: WorkspaceConfigEntry | undefined;
+      try {
+        row = findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId)
+          ?.workspace;
+      } catch (error: unknown) {
+        return Err(`claim unconfirmed: config unreadable: ${getErrorMessage(error)}`);
+      }
+      if (row?.taskAttemptId !== attemptId || row.taskAttemptRetiredBy?.nonce !== nonce) {
+        return Err("claim lost");
+      }
+      return Ok({ nonce });
+    });
+  }
+
   private async inspectAttemptOutcome(
     taskId: string,
     options?: { requestingWorkspaceId?: string }
@@ -3699,10 +3871,21 @@ export class TaskService implements AgentTaskIntegration {
     const status = entry?.workspace.taskStatus ?? (entry != null ? "running" : undefined);
     const owned = this.ownedAttemptByTaskId.get(taskId);
     if (owned == null) {
+      if (entry == null) {
+        return indeterminate("no task record and no attempt owned by this process");
+      }
+      // Report first: this branch runs only once the report artifact read positively found none.
+      if (reportPositivelyAbsent) {
+        const proof = await this.readUnownedSettlementProof(taskId);
+        if (proof.kind === "proven") {
+          return { kind: "terminal-no-report", attemptId: proof.attemptId };
+        }
+        return indeterminate(
+          `task status ${status ?? "running"} without an attempt owned by this process: ${proof.reason}`
+        );
+      }
       return indeterminate(
-        entry == null
-          ? "no task record and no attempt owned by this process"
-          : `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
+        `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
       );
     }
     // The row names another writer's attempt (a second backend sharing this Xum root re-admitted
@@ -3724,7 +3907,10 @@ export class TaskService implements AgentTaskIntegration {
           "attempt settled but no session directory names where its report would be"
         );
       }
-      return { kind: "terminal-no-report" };
+      return {
+        kind: "terminal-no-report",
+        ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
+      };
     }
     if (status != null && ACTIVE_AGENT_TASK_STATUSES.has(status)) {
       // Reserved/queued/launching/running under this process's ownership; no stream yet.
@@ -5799,9 +5985,14 @@ export class TaskService implements AgentTaskIntegration {
           await options.onTaskReserved?.(index, result);
         }
         progress.enter("config-commit");
-        await this.commitReservations(plans, signal, () => {
-          canceledInsideCommit = true;
-        });
+        await this.commitReservations(
+          plans,
+          signal,
+          () => {
+            canceledInsideCommit = true;
+          },
+          options.retires
+        );
       } catch (error: unknown) {
         await this.settleFailedReservations(plans, ownedAttempts, signal, error);
         throw error;
@@ -5900,9 +6091,33 @@ export class TaskService implements AgentTaskIntegration {
       TaskLaunchPlan & { status: "queued" | "starting"; sharedWorkspacePath?: string }
     >,
     signal: AbortSignal | undefined,
-    onCanceledInsideCommit: () => void
+    onCanceledInsideCommit: () => void,
+    retires?: ReadonlyArray<TaskRetiresClaim | undefined>
   ): Promise<void> {
+    assert(
+      retires == null || retires.length <= plans.length,
+      "commitReservations: retires must align with the plans"
+    );
     await this.config.editConfig((config) => {
+      // Single-use publication (#4452 gap 2), in the same write that publishes the children: each
+      // replacement consumes its claim. A stale runner whose claim was re-stamped, or a second
+      // replacement of the same retired attempt, throws here and nothing of this batch is written.
+      for (const [index, claim] of (retires ?? []).entries()) {
+        if (claim == null) continue;
+        const prior = findWorkspaceEntry(config, claim.taskId)?.workspace;
+        const retiredBy = prior?.taskAttemptRetiredBy;
+        if (
+          prior?.taskAttemptId !== claim.attemptId ||
+          retiredBy?.attemptId !== claim.attemptId ||
+          retiredBy.nonce !== claim.nonce ||
+          retiredBy.replacementTaskId != null
+        ) {
+          throw new Error(
+            `Task.createMany: the retired attempt ${claim.attemptId} of ${claim.taskId} was re-claimed or already replaced`
+          );
+        }
+        prior.taskAttemptRetiredBy = { ...retiredBy, replacementTaskId: plans[index].taskId };
+      }
       // Fence inside the mutator: an abort that landed while waiting for the config lock (or
       // during the checkpoint) persists the plans interrupted instead of live reservations.
       const canceledInsideCommit = signal?.aborted === true;

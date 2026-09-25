@@ -290,6 +290,11 @@ export const WorkspaceConfigSchema = z.object({
       attemptId: z.string(),
       mode: z.enum(["no-report", "retire-reported"]),
       at: z.string(),
+      // Single-use publication (G2): a fresh nonce per claim, and the one replacement the claim
+      // published. createMany's publishing commit checks the nonce and sets replacementTaskId in
+      // the same config write; a later claim may re-stamp the nonce only while it is unset.
+      nonce: z.string().optional(),
+      replacementTaskId: z.string().optional(),
     })
     .optional()
     .meta({

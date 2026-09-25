@@ -13,7 +13,12 @@ export type TaskAttemptOutcome<Report> =
   | { kind: "live"; executionId: string }
   | { kind: "cleanup-pending" }
   | { kind: "indeterminate"; reason: string }
-  | { kind: "terminal-no-report" };
+  /**
+   * `attemptId`: the attempt that ended (the owned attempt, or the row's current attempt named
+   * by the parent's settlement receipt). A replacement may retire exactly this attempt
+   * (claimRetiredAttempt); absent for a pre-identity owned attempt, which is never replaced.
+   */
+  | { kind: "terminal-no-report"; attemptId?: string };
 
 /** A bounded settlement wait never turns unresolved cleanup into permission to replace a child. */
 export type TaskAttemptSettlement<Report> = TaskAttemptOutcome<Report> | { kind: "timeout" };
