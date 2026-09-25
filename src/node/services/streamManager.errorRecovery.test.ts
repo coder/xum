@@ -1,5 +1,5 @@
-import { describe, test, expect, mock } from "bun:test";
-import { StreamManager } from "./streamManager";
+import { describe, test, expect } from "bun:test";
+import { StreamManager, type TurnEngineEvent } from "./streamManager";
 import * as aiSdk from "ai";
 import {
   APICallError,
@@ -9,22 +9,15 @@ import {
   type ModelMessage,
 } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
-import { createAnthropic } from "@ai-sdk/anthropic";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
-import {
-  createStreamManagerForTests,
-  engineInternals,
-  fakeStreamText,
-  onTurnEngineEvent,
-} from "./streamManager.testHarness";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
   installStreamManagerTestHistory,
   historyService,
   createTestLanguageModel,
   TEST_USAGE,
+  testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
-  createStreamInfoForTests,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -49,6 +42,160 @@ function createApiCallErrorForTests(overrides: {
   });
 }
 
+type StreamTextOptions = Parameters<typeof aiSdk.streamText>[0];
+type ErrorEvent = Extract<TurnEngineEvent, { type: "error" }>;
+type StreamEndEvent = Extract<TurnEngineEvent, { type: "stream-end" }>;
+
+interface AttemptContext {
+  /** Requests a soft interrupt, as the session does for a queued user stop. */
+  softStop: () => Promise<void>;
+  /** Starts a hard stop without awaiting it: the stop waits for this attempt to exit. */
+  hardStop: () => void;
+}
+
+/**
+ * One provider attempt. The fake streamText hands it the request StreamManager
+ * built, so the first call is the initial request and later calls are retries.
+ */
+type Attempt = (
+  options: StreamTextOptions,
+  context: AttemptContext
+) => AsyncGenerator<unknown, void, unknown>;
+
+/** Plays the SDK's per-step preparation so the engine records that step's transcript. */
+async function prepareStep(
+  options: StreamTextOptions,
+  messages: ModelMessage[],
+  stepNumber: number
+): Promise<void> {
+  const prepare = options.prepareStep;
+  if (!prepare) throw new Error("Expected StreamManager to pass prepareStep");
+  await prepare({
+    messages,
+    stepNumber,
+    model: options.model,
+    steps: [],
+    initialMessages: messages,
+    responseMessages: [],
+    instructions: undefined,
+    initialInstructions: undefined,
+    toolsContext: {},
+    runtimeContext: {},
+  });
+}
+
+function failingAttempt(error: unknown): Attempt {
+  return async function* () {
+    await Promise.resolve();
+    yield { type: "error", error };
+  };
+}
+
+function textAttempt(text: string, usage: unknown = TEST_USAGE): Attempt {
+  return async function* () {
+    await Promise.resolve();
+    yield { type: "start-step" };
+    yield { type: "text-delta", text };
+    yield { type: "finish-step", usage };
+    yield { type: "finish", finishReason: "stop" };
+  };
+}
+
+/**
+ * Drives turns through startStream with scripted provider attempts and records
+ * every emitted engine event. Turns on one harness share a StreamManager, so a
+ * later turn observes state (lost response IDs, retry budgets) the earlier left.
+ */
+function createRecoveryHarness() {
+  const events: TurnEngineEvent[] = [];
+  let attempts: Attempt[] = [];
+  let calls: StreamTextOptions[] = [];
+  let streamUsage: unknown = TEST_USAGE;
+  let workspaceId = "";
+  let stops: Array<Promise<unknown>> = [];
+  const context: AttemptContext = {
+    softStop: async () => {
+      const result = await streamManager.stopStream(workspaceId, { soft: true });
+      expect(result.success).toBe(true);
+    },
+    hardStop: () => {
+      stops.push(streamManager.stopStream(workspaceId, { abortReason: "user" }));
+    },
+  };
+  const streamManager = createStreamManagerForTests(historyService, {
+    eventSink: (event) => {
+      events.push(event);
+    },
+    streamText: fakeStreamText((options) => {
+      calls.push(options);
+      const attempt = attempts.shift();
+      if (!attempt) throw new Error(`Unexpected provider attempt ${calls.length}`);
+      // Set usage explicitly: createStreamResultForTests defaults an undefined total.
+      return {
+        ...createStreamResultForTests(attempt(options, context)),
+        usage: Promise.resolve(streamUsage),
+        totalUsage: Promise.resolve(streamUsage),
+      };
+    }),
+  });
+
+  async function run(input: {
+    workspaceId: string;
+    attempts: Attempt[];
+    historySequence?: number;
+    model?: LanguageModel;
+    modelString?: string;
+    messages?: ModelMessage[];
+    providerOptions?: Record<string, unknown>;
+    /** SDK-reported total usage for every attempt of this turn. */
+    streamUsage?: unknown;
+  }) {
+    const historySequence = input.historySequence ?? 1;
+    const messageId = `${input.workspaceId}-${historySequence}`;
+    workspaceId = input.workspaceId;
+    attempts = [...input.attempts];
+    calls = [];
+    stops = [];
+    streamUsage = "streamUsage" in input ? input.streamUsage : TEST_USAGE;
+    await appendPartialAssistantForTests(input.workspaceId, messageId, historySequence);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: input.workspaceId,
+        messageId,
+        historySequence,
+        model: input.model ?? createTestLanguageModel(),
+        ...(input.modelString != null ? { modelString: input.modelString } : {}),
+        ...(input.messages != null ? { messages: input.messages } : {}),
+        providerOptions: input.providerOptions,
+        providedRuntimeTempDir: "",
+      })
+    );
+    if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result)}`);
+    const completion = await result.data.completion;
+    await Promise.all(stops);
+    return { calls, completion, messageId };
+  }
+
+  return {
+    streamManager,
+    run,
+    events,
+    errors: () => events.filter((event): event is ErrorEvent => event.type === "error"),
+    streamEnds: () =>
+      events.filter((event): event is StreamEndEvent => event.type === "stream-end"),
+  };
+}
+
+function partTexts(streamEnd: StreamEndEvent | undefined): string[] {
+  return (streamEnd?.parts ?? []).flatMap((part) => (part.type === "text" ? [part.text] : []));
+}
+
+async function committedStepStarts(workspaceId: string, messageId: string) {
+  const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+  if (!history.success) throw new Error(history.error);
+  return history.data.find((message) => message.id === messageId)?.metadata?.stepStartPartIndices;
+}
+
 describe("StreamManager - previousResponseId recovery", () => {
   test("isResponseIdLost returns false for unknown IDs", () => {
     const streamManager = new StreamManager(historyService);
@@ -58,41 +205,9 @@ describe("StreamManager - previousResponseId recovery", () => {
     expect(streamManager.isResponseIdLost("resp_different")).toBe(false);
   });
 
-  test("extractPreviousResponseIdFromError extracts ID from various error formats", () => {
-    const streamManager = new StreamManager(historyService);
-
-    // Get the private method via reflection
-    const extractMethod = engineInternals(streamManager).extractPreviousResponseIdFromError;
-    expect(typeof extractMethod).toBe("function");
-
-    // Test extraction from APICallError with responseBody
-    const apiError = new APICallError({
-      message: "Previous response with id 'resp_abc123' not found.",
-      url: "https://api.openai.com/v1/responses",
-      requestBodyValues: {},
-      statusCode: 400,
-      responseHeaders: {},
-      responseBody:
-        '{"error":{"message":"Previous response with id \'resp_abc123\' not found.","code":"previous_response_not_found"}}',
-      isRetryable: false,
-      data: { error: { code: "previous_response_not_found" } },
-    });
-    expect(extractMethod.call(streamManager, apiError)).toBe("resp_abc123");
-
-    // Test extraction from error message
-    const errorWithMessage = new Error("Previous response with id 'resp_def456' not found.");
-    expect(extractMethod.call(streamManager, errorWithMessage)).toBe("resp_def456");
-
-    // Test when no ID is present
-    const errorWithoutId = new Error("Some other error");
-    expect(extractMethod.call(streamManager, errorWithoutId)).toBeUndefined();
-  });
-
-  const lostResponseIdCases = [
+  const lostResponseIdCases: Array<{ name: string; lostId: string; error: unknown }> = [
     {
       name: "explicit OpenAI errors",
-      workspaceId: "workspace-1",
-      messageId: "msg-1",
       lostId: "resp_deadbeef",
       error: createApiCallErrorForTests({
         message: "Previous response with id 'resp_deadbeef' not found.",
@@ -104,8 +219,6 @@ describe("StreamManager - previousResponseId recovery", () => {
     },
     {
       name: "500 errors referencing previous responses",
-      workspaceId: "workspace-2",
-      messageId: "msg-2",
       lostId: "resp_cafebabe",
       error: createApiCallErrorForTests({
         message: "Internal error: Previous response with id 'resp_cafebabe' not found.",
@@ -115,184 +228,171 @@ describe("StreamManager - previousResponseId recovery", () => {
         data: { error: { code: "server_error" } },
       }),
     },
+    {
+      // A structured stream error frame (not an Error): only its message names the ID.
+      name: "stream error frames whose message names the ID",
+      lostId: "resp_def456",
+      error: { message: "Previous response with id 'resp_def456' not found.", statusCode: 400 },
+    },
   ];
 
   for (const lostResponseIdCase of lostResponseIdCases) {
-    test(`recordLostResponseIdIfApplicable records IDs for ${lostResponseIdCase.name}`, () => {
-      const streamManager = new StreamManager(historyService);
-      const recordMethod = engineInternals(streamManager).recordLostResponseIdIfApplicable;
+    test(`a failed stream records lost previousResponseIds for ${lostResponseIdCase.name}`, async () => {
+      const harness = createRecoveryHarness();
 
-      recordMethod.call(streamManager, lostResponseIdCase.workspaceId, lostResponseIdCase.error, {
-        messageId: lostResponseIdCase.messageId,
-        model: "openai:gpt-mini",
+      // No previousResponseId was sent, so there is nothing to retry without.
+      const { calls } = await harness.run({
+        workspaceId: "lost-response-id",
+        attempts: [failingAttempt(lostResponseIdCase.error)],
       });
 
-      expect(streamManager.isResponseIdLost(lostResponseIdCase.lostId)).toBe(true);
+      expect(calls).toHaveLength(1);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.streamManager.isResponseIdLost(lostResponseIdCase.lostId)).toBe(true);
     });
   }
 
-  test("retryStreamWithoutPreviousResponseId retries at step boundary with existing parts", async () => {
-    const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(() => ({
-        fullStream: (async function* () {
-          await Promise.resolve();
-          yield* [];
-        })(),
-        totalUsage: Promise.resolve(undefined),
-        usage: Promise.resolve(undefined),
-        providerMetadata: Promise.resolve(undefined),
-        steps: Promise.resolve([]),
-      })),
+  test("an error that names no response ID neither retries nor records the sent ID", async () => {
+    const harness = createRecoveryHarness();
+
+    const { calls } = await harness.run({
+      workspaceId: "unrelated-400",
+      providerOptions: { openai: { previousResponseId: "resp_abc123" } },
+      attempts: [
+        failingAttempt(
+          createApiCallErrorForTests({
+            message: "Some other error",
+            statusCode: 400,
+            responseBody: '{"error":{"message":"Some other error"}}',
+            isRetryable: false,
+          })
+        ),
+      ],
     });
 
-    const retryMethod = engineInternals(streamManager).retryStreamWithoutPreviousResponseId;
+    expect(calls).toHaveLength(1);
+    expect(harness.errors()).toHaveLength(1);
+    expect(harness.streamManager.isResponseIdLost("resp_abc123")).toBe(false);
+  });
 
-    const model = createAnthropic({ apiKey: "test" })("claude-sonnet-4-5");
-    const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+  test("retries without previousResponseId at a step boundary, keeping earlier parts and usage", async () => {
+    const harness = createRecoveryHarness();
+    const workspaceId = "previous-response-step";
     const stepMessages: ModelMessage[] = [{ role: "user", content: "next step" }];
 
-    const streamInfo = {
-      state: "streaming",
-      streamResult: {},
-      abortController: new AbortController(),
-      messageId: "msg-1",
-      token: "token",
-      startTime: Date.now(),
-      model: "mux-gateway:openai/gpt-5.2-codex",
-      historySequence: 1,
-      stepTracker: { latestMessages: stepMessages },
-      didRetryPreviousResponseIdAtStep: false,
-      currentStepStartIndex: 1,
-      stepStartIndices: [0, 1, 2],
-      request: {
-        model,
-        messages: [{ role: "user", content: "original" }],
-        system: "system",
-        providerOptions: { openai: { previousResponseId: "resp_abc123" } },
-      },
-      parts: [
-        {
-          type: "dynamic-tool",
-          toolCallId: "tool-1",
-          toolName: "test",
-          state: "output-available",
-          input: {},
-          output: {},
+    const { calls, messageId } = await harness.run({
+      workspaceId,
+      providerOptions: { openai: { previousResponseId: "resp_abc123" } },
+      // The SDK total covers only the restarted stream, not the completed first step.
+      streamUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      attempts: [
+        async function* (options) {
+          yield { type: "start-step" };
+          yield { type: "text-delta", text: "step one" };
+          yield { type: "finish-step", usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
+          await prepareStep(options, stepMessages, 1);
+          yield {
+            type: "error",
+            error: createApiCallErrorForTests({
+              message: "Previous response with id 'resp_abc123' not found.",
+              statusCode: 400,
+              responseBody: "Previous response with id 'resp_abc123' not found.",
+              isRetryable: false,
+              data: { error: { code: "previous_response_not_found" } },
+            }),
+          };
         },
+        textAttempt("step two", { inputTokens: 4, outputTokens: 5, totalTokens: 9 }),
       ],
-      lastPartialWriteTime: 0,
-      processingPromise: Promise.resolve(),
-      softInterrupt: { pending: false },
-      runtimeTempDir: "/tmp",
-      runtime,
-      cumulativeUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
-      cumulativeProviderMetadata: { openai: {} },
-    };
-
-    const apiError = createApiCallErrorForTests({
-      message: "Previous response with id 'resp_abc123' not found.",
-      statusCode: 400,
-      responseBody: "Previous response with id 'resp_abc123' not found.",
-      isRetryable: false,
-      data: { error: { code: "previous_response_not_found" } },
     });
 
-    const retried = await retryMethod.call(streamManager, "ws-step", streamInfo, apiError, false);
-    expect(retried).toBe(true);
-    expect(streamInfo.parts).toHaveLength(1);
-    expect(streamInfo.didRetryPreviousResponseIdAtStep).toBe(true);
-    expect(streamInfo.stepStartIndices).toEqual([0, 1]);
-    expect(streamInfo.request.messages as ModelMessage[]).toBe(stepMessages);
-
-    const openaiOptions = streamInfo.request.providerOptions as {
-      openai?: Record<string, unknown>;
-    };
-    expect(openaiOptions.openai?.previousResponseId).toBeUndefined();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.messages).toEqual(stepMessages);
+    expect(
+      (calls[1]?.providerOptions as { openai?: Record<string, unknown> }).openai?.previousResponseId
+    ).toBeUndefined();
+    expect(harness.errors()).toEqual([]);
+    const [streamEnd] = harness.streamEnds();
+    expect(partTexts(streamEnd)).toEqual(["step one", "step two"]);
+    // Step-boundary retries report the per-step accumulation, not the restarted SDK total.
+    expect(streamEnd?.metadata.usage).toMatchObject({
+      inputTokens: 5,
+      outputTokens: 7,
+      totalTokens: 12,
+    });
+    // The retried step reuses its start index instead of recording a duplicate.
+    expect(await committedStepStarts(workspaceId, messageId)).toEqual([0, 1]);
+    expect(harness.streamManager.isResponseIdLost("resp_abc123")).toBe(true);
   });
+
+  function emptyAttempt(usage: unknown): Attempt {
+    return async function* () {
+      await Promise.resolve();
+      yield { type: "start-step" };
+      yield { type: "finish-step", usage };
+      yield { type: "finish", finishReason: "stop" };
+    };
+  }
 
   const totalUsageCases: Array<{
     name: string;
-    streamInfo: Record<string, unknown>;
-    totalUsage: Record<string, number> | undefined;
+    attempts: Attempt[];
+    streamUsage: Record<string, number> | undefined;
     expected: Record<string, number>;
   }> = [
     {
-      name: "falls back to cumulative usage when stream total is missing",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: false,
-        cumulativeUsage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
-      },
+      name: "falls back to per-step usage when the SDK total is missing",
+      attempts: [textAttempt("answer", { inputTokens: 4, outputTokens: 5, totalTokens: 9 })],
       // getStreamMetadata's totalUsage read can time out (slow SDK settlement)
       // even though the provider billed the turn.
-      totalUsage: undefined,
+      streamUsage: undefined,
       expected: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
     },
     {
-      name: "falls back to cumulative usage when stream total has zero tokens",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: false,
-        cumulativeUsage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
-      },
-      totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      name: "falls back to per-step usage when the SDK total has zero tokens",
+      attempts: [textAttempt("answer", { inputTokens: 4, outputTokens: 5, totalTokens: 9 })],
+      streamUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
       expected: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
     },
     {
-      name: "prefers cumulative usage after step retry",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: true,
-        cumulativeUsage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
-      },
-      totalUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
-      expected: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
-    },
-    {
-      name: "prefers cumulative usage after empty-output retry",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: false,
-        didRetryAfterEmptyOutput: true,
-        cumulativeUsage: { inputTokens: 6, outputTokens: 5, totalTokens: 11 },
-      },
-      totalUsage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
+      name: "prefers per-step usage after an empty-output retry",
+      attempts: [
+        emptyAttempt({ inputTokens: 2, outputTokens: 0, totalTokens: 2 }),
+        textAttempt("answer", { inputTokens: 4, outputTokens: 5, totalTokens: 9 }),
+      ],
+      streamUsage: { inputTokens: 2, outputTokens: 2, totalTokens: 4 },
       expected: { inputTokens: 6, outputTokens: 5, totalTokens: 11 },
     },
     {
-      name: "prefers cumulative usage after a reasoning-replay step retry",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: false,
-        didRetryReasoningReplayAtStep: true,
-        cumulativeUsage: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
-      },
-      totalUsage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
-      expected: { inputTokens: 8, outputTokens: 3, totalTokens: 11 },
-    },
-    {
-      name: "treats non-zero fields as valid usage",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: true,
-        cumulativeUsage: { inputTokens: 4, outputTokens: 1, totalTokens: 0 },
-      },
-      totalUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      name: "treats any non-zero field as usage after a retry",
+      attempts: [
+        emptyAttempt({ inputTokens: 4, outputTokens: 0, totalTokens: 0 }),
+        textAttempt("answer", { inputTokens: 0, outputTokens: 1, totalTokens: 0 }),
+      ],
+      streamUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
       expected: { inputTokens: 4, outputTokens: 1, totalTokens: 0 },
     },
     {
-      name: "keeps stream total without step retry",
-      streamInfo: {
-        didRetryPreviousResponseIdAtStep: false,
-        cumulativeUsage: { inputTokens: 4, outputTokens: 5, totalTokens: 9 },
-      },
-      totalUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
+      name: "keeps the SDK total without a retry",
+      attempts: [textAttempt("answer", { inputTokens: 4, outputTokens: 5, totalTokens: 9 })],
+      streamUsage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
       expected: { inputTokens: 1, outputTokens: 2, totalTokens: 3 },
     },
   ];
 
   for (const usageCase of totalUsageCases) {
-    test(`resolveTotalUsageForStreamEnd ${usageCase.name}`, () => {
-      const streamManager = new StreamManager(historyService);
-      const resolveMethod = engineInternals(streamManager).resolveTotalUsageForStreamEnd;
+    test(`stream-end usage ${usageCase.name}`, async () => {
+      const harness = createRecoveryHarness();
 
-      expect(resolveMethod.call(streamManager, usageCase.streamInfo, usageCase.totalUsage)).toEqual(
-        usageCase.expected
-      );
+      const { calls } = await harness.run({
+        workspaceId: "stream-end-usage",
+        attempts: usageCase.attempts,
+        streamUsage: usageCase.streamUsage,
+      });
+
+      expect(calls).toHaveLength(usageCase.attempts.length);
+      const [streamEnd] = harness.streamEnds();
+      expect(streamEnd?.metadata.usage).toMatchObject(usageCase.expected);
     });
   }
 });
@@ -352,88 +452,46 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
     { role: "user", content: "now" },
   ];
 
-  async function* failingStream(error: unknown) {
-    await Promise.resolve();
-    yield { type: "error", error };
-  }
+  const successfulAttempt = textAttempt("repaired answer");
 
-  async function* successfulStream() {
-    await Promise.resolve();
-    yield { type: "start-step" };
-    yield { type: "text-delta", text: "repaired answer" };
-    yield { type: "finish-step", usage: TEST_USAGE };
-    yield { type: "finish", finishReason: "stop" };
-  }
-
-  function createRecoveryHarness(workspaceId: string) {
-    // Each run() installs a fresh retry-stream factory so callers can count its calls.
-    let createStreamResult = mock((): unknown => undefined);
-    const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(() => createStreamResult()),
-    });
-    const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
-    const streamEndEvents: unknown[] = [];
-    onTurnEngineEvent(streamManager, "error", (data) => {
-      errorEvents.push(data as { messageId: string; error: string; errorType?: string });
-    });
-    onTurnEngineEvent(streamManager, "stream-end", (data) => streamEndEvents.push(data));
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const run = async (
-      streamInfo: Record<string, unknown>,
-      nextStreams: Array<() => AsyncGenerator<unknown, void, unknown>>
-    ) => {
-      createStreamResult = mock(() => {
-        const next = nextStreams.shift();
-        expect(next).toBeDefined();
-        return createStreamResultForTests(next!());
-      });
-      const historySequence = streamInfo.historySequence as number;
-      await appendPartialAssistantForTests(
-        workspaceId,
-        streamInfo.messageId as string,
-        historySequence
-      );
-      await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
-      return createStreamResult;
-    };
-    return { streamManager, errorEvents, streamEndEvents, run };
-  }
-
-  function replayStreamInfo(
-    firstStream: AsyncGenerator<unknown, void, unknown>,
-    overrides: Record<string, unknown> = {}
-  ): Record<string, unknown> {
-    return createStreamInfoForTests({
-      messageId: `replay-${Math.random().toString(36).slice(2, 8)}`,
-      streamResult: createStreamResultForTests(firstStream),
-      model: "openai:gpt-5.2-codex",
-      metadataModel: "openai:gpt-5.2-codex",
-      request: {
-        model: openAIResponsesModel,
-        messages: requestMessagesWithReplay(),
-        providerOptions: undefined,
-      },
-      ...overrides,
+  /** An OpenAI Responses turn whose transcript replays stale encrypted reasoning. */
+  function runReplayTurn(
+    harness: ReturnType<typeof createRecoveryHarness>,
+    input: {
+      workspaceId: string;
+      attempts: Attempt[];
+      historySequence?: number;
+      model?: LanguageModel;
+      modelString?: string;
+      messages?: ModelMessage[];
+    }
+  ) {
+    return harness.run({
+      model: openAIResponsesModel,
+      modelString: "openai:gpt-5.2-codex",
+      messages: requestMessagesWithReplay(),
+      ...input,
     });
   }
 
   for (const rejection of openAIReasoningReplayRejections) {
     test(`repairs ${rejection.name} once without surfacing an intermediate error`, async () => {
-      const { errorEvents, streamEndEvents, run } = createRecoveryHarness("replay-repair");
-      const streamInfo = replayStreamInfo(failingStream(rejection.error));
+      const harness = createRecoveryHarness();
 
-      const createStreamResult = await run(streamInfo, [successfulStream]);
+      const { calls } = await runReplayTurn(harness, {
+        workspaceId: "replay-repair",
+        attempts: [failingAttempt(rejection.error), successfulAttempt],
+      });
 
-      expect(createStreamResult).toHaveBeenCalledTimes(1);
-      expect((streamInfo.request as { messages: ModelMessage[] }).messages).toEqual(
-        repairedRequestMessages
-      );
-      expect(errorEvents).toEqual([]);
-      expect(streamEndEvents).toHaveLength(1);
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.messages).toEqual(requestMessagesWithReplay());
+      expect(calls[1]?.messages).toEqual(repairedRequestMessages);
+      expect(harness.errors()).toEqual([]);
+      expect(harness.streamEnds()).toHaveLength(1);
     });
 
     test(`repairs ${rejection.name} from the prepared first-step transcript`, async () => {
-      const { errorEvents, streamEndEvents, run } = createRecoveryHarness("replay-prepared-first");
+      const harness = createRecoveryHarness();
       // prepareStep can replace the initial transcript before any output exists.
       // Recovery must not restore the context discarded by that preparation.
       const preparedMessages: ModelMessage[] = [
@@ -444,48 +502,55 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
         },
         { role: "user", content: "now" },
       ];
-      const streamInfo = replayStreamInfo(failingStream(rejection.error), {
-        stepTracker: { latestMessages: preparedMessages },
+
+      const { calls } = await runReplayTurn(harness, {
+        workspaceId: "replay-prepared-first",
+        attempts: [
+          async function* (options) {
+            await prepareStep(options, preparedMessages, 0);
+            yield { type: "error", error: rejection.error };
+          },
+          successfulAttempt,
+        ],
       });
-      expect(streamInfo.parts).toEqual([]);
 
-      const createStreamResult = await run(streamInfo, [successfulStream]);
-
-      expect(createStreamResult).toHaveBeenCalledTimes(1);
-      expect((streamInfo.request as { messages: ModelMessage[] }).messages).toEqual([
+      expect(calls).toHaveLength(2);
+      expect(calls[1]?.messages).toEqual([
         { role: "user", content: "compacted summary" },
         { role: "assistant", content: [{ type: "text", text: "retained answer" }] },
         { role: "user", content: "now" },
       ]);
-      expect(errorEvents).toEqual([]);
-      expect(streamEndEvents).toHaveLength(1);
+      expect(harness.errors()).toEqual([]);
+      expect(harness.streamEnds()).toHaveLength(1);
     });
 
     test(`surfaces a repeated ${rejection.name} as terminal reasoning_rejected after one repair`, async () => {
       const workspaceId = "replay-repeat";
-      const { errorEvents, streamEndEvents, run } = createRecoveryHarness(workspaceId);
-      const streamInfo = replayStreamInfo(failingStream(rejection.error));
+      const harness = createRecoveryHarness();
 
-      const createStreamResult = await run(streamInfo, [() => failingStream(rejection.error)]);
-
-      expect(createStreamResult).toHaveBeenCalledTimes(1);
-      expect(streamEndEvents).toHaveLength(0);
-      expect(errorEvents).toHaveLength(1);
-      expect(errorEvents[0]).toMatchObject({
-        messageId: streamInfo.messageId,
-        errorType: "reasoning_rejected",
+      const { calls, messageId } = await runReplayTurn(harness, {
+        workspaceId,
+        attempts: [failingAttempt(rejection.error), failingAttempt(rejection.error)],
       });
+
+      expect(calls).toHaveLength(2);
+      expect(harness.streamEnds()).toHaveLength(0);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]).toMatchObject({ messageId, errorType: "reasoning_rejected" });
       expect((await historyService.readPartial(workspaceId))?.metadata?.errorType).toBe(
         "reasoning_rejected"
       );
 
       // The one-shot budget is per stream attempt, not persisted: a manual
       // continuation on the same workspace gets its own repair.
-      const retry = replayStreamInfo(failingStream(rejection.error), { historySequence: 2 });
-      const retryCreateStreamResult = await run(retry, [successfulStream]);
-      expect(retryCreateStreamResult).toHaveBeenCalledTimes(1);
-      expect(errorEvents).toHaveLength(1);
-      expect(streamEndEvents).toHaveLength(1);
+      const continuation = await runReplayTurn(harness, {
+        workspaceId,
+        historySequence: 2,
+        attempts: [failingAttempt(rejection.error), successfulAttempt],
+      });
+      expect(continuation.calls).toHaveLength(2);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.streamEnds()).toHaveLength(1);
     });
   }
 
@@ -532,20 +597,24 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       expect(APICallError.isInstance(apiError)).toBe(true);
       expect(apiError).toMatchObject({ statusCode: code ? 400 : 500 });
 
-      const { errorEvents, streamEndEvents, run } = createRecoveryHarness("replay-streamed");
-      const repaired = await run(replayStreamInfo(failingStream(errors[0])), [successfulStream]);
-      expect(repaired).toHaveBeenCalledTimes(1);
-      expect(errorEvents).toEqual([]);
-      expect(streamEndEvents).toHaveLength(1);
+      const harness = createRecoveryHarness();
+      const repaired = await runReplayTurn(harness, {
+        workspaceId: "replay-streamed",
+        attempts: [failingAttempt(errors[0]), successfulAttempt],
+      });
+      expect(repaired.calls).toHaveLength(2);
+      expect(harness.errors()).toEqual([]);
+      expect(harness.streamEnds()).toHaveLength(1);
 
-      const repeated = await run(
-        replayStreamInfo(failingStream(errors[0]), { historySequence: 2 }),
-        [() => failingStream(errors[0])]
-      );
-      expect(repeated).toHaveBeenCalledTimes(1);
-      expect(errorEvents).toHaveLength(1);
-      expect(errorEvents[0]).toMatchObject({ errorType: "reasoning_rejected" });
-      expect(streamEndEvents).toHaveLength(1);
+      const repeated = await runReplayTurn(harness, {
+        workspaceId: "replay-streamed",
+        historySequence: 2,
+        attempts: [failingAttempt(errors[0]), failingAttempt(errors[0])],
+      });
+      expect(repeated.calls).toHaveLength(2);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]).toMatchObject({ errorType: "reasoning_rejected" });
+      expect(harness.streamEnds()).toHaveLength(1);
     });
   }
 
@@ -555,30 +624,31 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
     [429, "rate_limit"],
   ] as const) {
     test(`a later ${statusCode} after the repair keeps its ordinary classification`, async () => {
-      const { errorEvents, run } = createRecoveryHarness(`replay-then-${statusCode}`);
+      const harness = createRecoveryHarness();
       const laterError = createApiCallErrorForTests({
         message: "The next request failed",
         statusCode,
         responseBody: '{"error":{"message":"The next request failed"}}',
         isRetryable: statusCode !== 401,
       });
-      const streamInfo = replayStreamInfo(failingStream(openAIReasoningReplayRejections[1].error));
 
-      const createStreamResult = await run(streamInfo, [() => failingStream(laterError)]);
+      const { calls } = await runReplayTurn(harness, {
+        workspaceId: `replay-then-${statusCode}`,
+        attempts: [
+          failingAttempt(openAIReasoningReplayRejections[1].error),
+          failingAttempt(laterError),
+        ],
+      });
 
-      expect(createStreamResult).toHaveBeenCalledTimes(1);
-      expect(errorEvents).toHaveLength(1);
-      expect(errorEvents[0]).toMatchObject({ errorType });
+      expect(calls).toHaveLength(2);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]).toMatchObject({ errorType });
     });
   }
 
   test("step-boundary repair keeps prior-step parts and usage and replays the stripped step messages", async () => {
-    const createStreamResult = mock(() => createStreamResultForTests(successfulStream()));
-    const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
-    });
-    const retryMethod = engineInternals(streamManager).retryStreamWithoutOpenAIReasoningReplay;
-
+    const workspaceId = "replay-step";
+    const harness = createRecoveryHarness();
     const toolCall = {
       type: "tool-call" as const,
       toolCallId: "call-1",
@@ -613,125 +683,121 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
       },
       toolResult,
     ];
-    const priorParts = [
-      {
-        type: "dynamic-tool",
-        toolCallId: "call-1",
-        toolName: "bash",
-        state: "output-available",
-        input: { script: "pwd" },
-        output: "/tmp",
-      },
-    ];
-    const cumulativeUsage = { inputTokens: 40, outputTokens: 9, totalTokens: 49 };
-    const streamInfo = replayStreamInfo(failingStream(undefined), {
-      parts: priorParts,
-      currentStepStartIndex: 1,
-      stepStartIndices: [0, 1],
-      stepTracker: { latestMessages: stepMessages },
-      cumulativeUsage,
+
+    const { calls, messageId } = await runReplayTurn(harness, {
+      workspaceId,
+      attempts: [
+        async function* (options) {
+          yield { type: "start-step" };
+          yield { type: "text-delta", text: "step one" };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 40, outputTokens: 9, totalTokens: 49 },
+          };
+          await prepareStep(options, stepMessages, 1);
+          yield { type: "error", error: openAIReasoningReplayRejections[0].error };
+        },
+        successfulAttempt,
+      ],
     });
 
-    const retried = await retryMethod.call(
-      streamManager,
-      "replay-step",
-      streamInfo,
-      openAIReasoningReplayRejections[0].error,
-      false
-    );
-
-    expect(retried).toBe(true);
-    expect(streamInfo.parts).toBe(priorParts);
-    expect(streamInfo.cumulativeUsage).toEqual(cumulativeUsage);
-    expect(streamInfo.didRetryReasoningReplayAtStep).toBe(true);
-    expect(streamInfo.stepStartIndices).toEqual([0, 1]);
-    expect(createStreamResult).toHaveBeenCalledTimes(1);
-    expect((streamInfo.request as { messages: ModelMessage[] }).messages).toEqual([
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.messages).toEqual([
       ...repairedRequestMessages,
       { role: "assistant", content: [toolCall] },
       toolResult,
     ]);
+    expect(harness.errors()).toEqual([]);
+    const [streamEnd] = harness.streamEnds();
+    expect(partTexts(streamEnd)).toEqual(["step one", "repaired answer"]);
+    // Prior-step usage survives the repair and wins over the restarted SDK total.
+    expect(streamEnd?.metadata.usage).toMatchObject({
+      inputTokens: 41,
+      outputTokens: 10,
+      totalTokens: 51,
+    });
+    expect(await committedStepStarts(workspaceId, messageId)).toEqual([0, 1]);
   });
 
   const unsafeRepairCases: Array<{
     name: string;
-    overrides: Record<string, unknown>;
-    prepare?: (streamInfo: Record<string, unknown>) => void;
+    attempt: Attempt;
+    messages?: ModelMessage[];
   }> = [
     {
-      name: "aborted stream",
-      overrides: {},
-      prepare: (streamInfo) => (streamInfo.abortController as AbortController).abort(),
-    },
-    { name: "pending soft interrupt", overrides: { softInterrupt: { pending: true } } },
-    {
-      name: "current step already emitted parts",
-      overrides: {
-        parts: [{ type: "text", text: "partial", timestamp: 1 }],
-        currentStepStartIndex: 0,
-        stepStartIndices: [0],
-        stepTracker: { latestMessages: requestMessagesWithReplay() },
+      // A matching rejection that reaches failure handling while a soft stop
+      // is pending must not stay in the auto-retryable `api` class, or the
+      // outer loop replays it forever.
+      name: "a soft interrupt is pending",
+      attempt: async function* (_options, context) {
+        await context.softStop();
+        yield { type: "error", error: openAIReasoningReplayRejections[1].error };
       },
     },
     {
-      name: "missing step snapshot after a completed step",
-      overrides: {
-        parts: [{ type: "text", text: "step one", timestamp: 1 }],
-        currentStepStartIndex: 1,
-        stepStartIndices: [0, 1],
-        stepTracker: {},
+      name: "the current step already emitted parts",
+      attempt: async function* () {
+        await Promise.resolve();
+        yield { type: "start-step" };
+        yield { type: "text-delta", text: "partial" };
+        yield { type: "error", error: openAIReasoningReplayRejections[1].error };
       },
     },
     {
-      name: "nothing to strip",
-      overrides: {
-        request: {
-          model: openAIResponsesModel,
-          messages: repairedRequestMessages,
-          providerOptions: undefined,
-        },
+      name: "a completed step left no step snapshot",
+      attempt: async function* () {
+        await Promise.resolve();
+        yield { type: "start-step" };
+        yield { type: "text-delta", text: "step one" };
+        yield { type: "finish-step", usage: TEST_USAGE };
+        yield { type: "error", error: openAIReasoningReplayRejections[1].error };
       },
+    },
+    {
+      name: "there is nothing to strip",
+      attempt: failingAttempt(openAIReasoningReplayRejections[1].error),
+      messages: repairedRequestMessages,
     },
   ];
 
   for (const unsafeCase of unsafeRepairCases) {
-    test(`does not replay when ${unsafeCase.name}`, async () => {
-      const createStreamResult = mock(() => createStreamResultForTests(successfulStream()));
-      const streamManager = createStreamManagerForTests(historyService, {
-        streamText: fakeStreamText(createStreamResult),
+    test(`does not replay when ${unsafeCase.name} and classifies the rejection reasoning_rejected`, async () => {
+      const harness = createRecoveryHarness();
+
+      const { calls } = await runReplayTurn(harness, {
+        workspaceId: "replay-unsafe",
+        attempts: [unsafeCase.attempt],
+        ...(unsafeCase.messages != null ? { messages: unsafeCase.messages } : {}),
       });
-      const retryMethod = engineInternals(streamManager).retryStreamWithoutOpenAIReasoningReplay;
-      const streamInfo = replayStreamInfo(failingStream(undefined), unsafeCase.overrides);
-      unsafeCase.prepare?.(streamInfo);
-      const originalMessages = (streamInfo.request as { messages: ModelMessage[] }).messages;
 
-      const retried = await retryMethod.call(
-        streamManager,
-        "replay-unsafe",
-        streamInfo,
-        openAIReasoningReplayRejections[1].error,
-        false
-      );
-
-      expect(retried).toBe(false);
-      expect(createStreamResult).not.toHaveBeenCalled();
-      expect((streamInfo.request as { messages: ModelMessage[] }).messages).toBe(originalMessages);
+      expect(calls).toHaveLength(1);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]).toMatchObject({ errorType: "reasoning_rejected" });
     });
   }
 
-  test("an unrepairable matching rejection is still classified reasoning_rejected", async () => {
-    // Soft interrupt makes the repair unsafe; the final error must not stay
-    // in the auto-retryable `api` class or the outer loop replays it forever.
-    const { errorEvents, run } = createRecoveryHarness("replay-unsafe-final");
-    const streamInfo = replayStreamInfo(failingStream(openAIReasoningReplayRejections[0].error), {
-      softInterrupt: { pending: true },
+  test("does not replay a rejection that surfaces after the stream was stopped", async () => {
+    const harness = createRecoveryHarness();
+
+    const { calls, completion } = await runReplayTurn(harness, {
+      workspaceId: "replay-stopped",
+      attempts: [
+        async function* (options, context) {
+          yield* [];
+          context.hardStop();
+          await new Promise<void>((resolve) => {
+            if (options.abortSignal?.aborted) resolve();
+            options.abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+          // The transport rejects the iterator once the request is cancelled.
+          throw openAIReasoningReplayRejections[1].error;
+        },
+      ],
     });
 
-    const createStreamResult = await run(streamInfo, []);
-
-    expect(createStreamResult).not.toHaveBeenCalled();
-    expect(errorEvents).toHaveLength(1);
-    expect(errorEvents[0]).toMatchObject({ errorType: "reasoning_rejected" });
+    expect(calls).toHaveLength(1);
+    expect(completion.status).toBe("aborted");
+    expect(harness.errors()).toEqual([]);
   });
 
   const nonMatchingRejections: Array<{ name: string; model: LanguageModel; error: unknown }> = [
@@ -819,64 +885,62 @@ describe("StreamManager - OpenAI reasoning replay recovery", () => {
 
   for (const nonMatching of nonMatchingRejections) {
     test(`leaves ${nonMatching.name} to ordinary error handling`, async () => {
-      const { errorEvents, run } = createRecoveryHarness("replay-non-matching");
-      const streamInfo = replayStreamInfo(failingStream(nonMatching.error), {
-        request: {
-          model: nonMatching.model,
-          messages: requestMessagesWithReplay(),
-          providerOptions: undefined,
-        },
+      const harness = createRecoveryHarness();
+
+      const { calls } = await runReplayTurn(harness, {
+        workspaceId: "replay-non-matching",
+        model: nonMatching.model,
+        attempts: [failingAttempt(nonMatching.error)],
       });
 
-      const createStreamResult = await run(streamInfo, []);
-
-      expect(createStreamResult).not.toHaveBeenCalled();
-      expect(errorEvents).toHaveLength(1);
-      expect(errorEvents[0]?.errorType).not.toBe("reasoning_rejected");
+      expect(calls).toHaveLength(1);
+      expect(harness.errors()).toHaveLength(1);
+      expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
     });
   }
 
-  test("Xum gateway OpenAI models are eligible while other gateway upstreams are not", async () => {
-    const createStreamResult = mock(() => createStreamResultForTests(successfulStream()));
-    const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
-    });
-    const retryMethod = engineInternals(streamManager).retryStreamWithoutOpenAIReasoningReplay;
+  for (const [modelId, repaired] of [
+    ["openai/gpt-5.2-codex", true],
+    ["anthropic/claude-opus-4-5", false],
+  ] as const) {
+    test(`Xum gateway ${modelId} ${repaired ? "is" : "is not"} eligible for the repair`, async () => {
+      const harness = createRecoveryHarness();
 
-    for (const [modelId, expected] of [
-      ["openai/gpt-5.2-codex", true],
-      ["anthropic/claude-opus-4-5", false],
-    ] as const) {
-      const streamInfo = replayStreamInfo(failingStream(undefined), {
-        model: `mux-gateway:${modelId}`,
-        request: {
-          model: createTestLanguageModel(modelId, "gateway"),
-          messages: requestMessagesWithReplay(),
-          providerOptions: undefined,
-        },
+      const { calls } = await runReplayTurn(harness, {
+        workspaceId: "replay-gateway",
+        model: createTestLanguageModel(modelId, "gateway"),
+        modelString: `mux-gateway:${modelId}`,
+        attempts: repaired
+          ? [failingAttempt(openAIReasoningReplayRejections[0].error), successfulAttempt]
+          : [failingAttempt(openAIReasoningReplayRejections[0].error)],
       });
-      expect(
-        await retryMethod.call(
-          streamManager,
-          "replay-gateway",
-          streamInfo,
-          openAIReasoningReplayRejections[0].error,
-          false
-        )
-      ).toBe(expected);
-    }
-    expect(createStreamResult).toHaveBeenCalledTimes(1);
-  });
+
+      expect(calls).toHaveLength(repaired ? 2 : 1);
+      expect(harness.streamEnds()).toHaveLength(repaired ? 1 : 0);
+      expect(harness.errors()).toHaveLength(repaired ? 0 : 1);
+      expect(harness.errors()[0]?.errorType).not.toBe("reasoning_rejected");
+    });
+  }
 });
 
-describe("StreamManager - categorizeError", () => {
-  function categorizeErrorForTests(error: unknown): unknown {
-    const streamManager = new StreamManager(historyService);
-    const categorizeMethod = engineInternals(streamManager).categorizeError;
-    return categorizeMethod.call(streamManager, error);
+describe("StreamManager - stream error classification", () => {
+  /** Fails one stream with `error` and returns the errorType the turn surfaced. */
+  async function errorTypeForStreamFailure(error: unknown): Promise<unknown> {
+    const harness = createRecoveryHarness();
+    const { calls, messageId } = await harness.run({
+      workspaceId: "classify-error",
+      attempts: [failingAttempt(error)],
+    });
+    expect(calls).toHaveLength(1);
+    expect(harness.errors()).toHaveLength(1);
+    // The persisted partial carries the same classification the event reported.
+    const partial = await historyService.readPartial("classify-error");
+    expect(partial?.id).toBe(messageId);
+    expect(partial?.metadata?.errorType).toBe(harness.errors()[0]?.errorType);
+    return harness.errors()[0]?.errorType;
   }
 
-  test("unwraps RetryError.lastError to classify model_not_found", () => {
+  test("unwraps RetryError.lastError to classify model_not_found", async () => {
     const apiError = createApiCallErrorForTests({
       message: "The model `gpt-5.2-codex` does not exist or you do not have access to it.",
       statusCode: 400,
@@ -891,10 +955,10 @@ describe("StreamManager - categorizeError", () => {
       errors: [apiError],
     });
 
-    expect(categorizeErrorForTests(retryError)).toBe("model_not_found");
+    expect(await errorTypeForStreamFailure(retryError)).toBe("model_not_found");
   });
 
-  test("classifies OpenAI 404 model_not_found by error code", () => {
+  test("classifies OpenAI 404 model_not_found by error code", async () => {
     const apiError = createApiCallErrorForTests({
       message: "The model `gpt-nonexistent` does not exist or you do not have access to it.",
       statusCode: 404,
@@ -904,7 +968,7 @@ describe("StreamManager - categorizeError", () => {
       data: { error: { type: "invalid_request_error", code: "model_not_found" } },
     });
 
-    expect(categorizeErrorForTests(apiError)).toBe("model_not_found");
+    expect(await errorTypeForStreamFailure(apiError)).toBe("model_not_found");
   });
 
   const categorizeCases: Array<{ name: string; error: unknown; expected: string }> = [
@@ -973,8 +1037,8 @@ describe("StreamManager - categorizeError", () => {
   ];
 
   for (const categorizeCase of categorizeCases) {
-    test(categorizeCase.name, () => {
-      expect(categorizeErrorForTests(categorizeCase.error)).toBe(categorizeCase.expected);
+    test(categorizeCase.name, async () => {
+      expect(await errorTypeForStreamFailure(categorizeCase.error)).toBe(categorizeCase.expected);
     });
   }
 });
