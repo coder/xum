@@ -10,6 +10,8 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
 import { describe, test, expect, mock } from "bun:test";
+import * as RealLogModule from "@/node/services/log";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import { openaiDirectProviderOptionsAvailable } from "./openaiProviderOptionsAvailability";
 import {
   buildProviderOptions,
@@ -22,7 +24,10 @@ import {
   MUX_WORKSPACE_ID_HEADER,
 } from "./providerOptions";
 
-// Mock the log module to avoid console noise
+// Mock the log module to avoid console noise. The stub covers only what this file
+// needs, so restore the real logger once the suite ends: bun keeps module mocks for
+// every later file in the process, which then crashed on log.withFields/debug_obj.
+restoreModulesAfterSuite([["@/node/services/log", { ...RealLogModule }]]);
 void mock.module("@/node/services/log", () => ({
   log: {
     debug: (): void => undefined,
