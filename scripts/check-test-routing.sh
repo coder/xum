@@ -41,9 +41,11 @@ if ! bun x jest --listTests >"$tmp/jest.raw" 2>"$tmp/jest.err"; then
   cat "$tmp/jest.err" >&2
   exit 1
 fi
-# Strip the checkout prefix literally: $PWD may contain sed/regex metacharacters.
+# Jest prints real paths, so strip the physical checkout path (the logical $PWD may go
+# through a symlink). Strip it literally: it may contain sed/regex metacharacters.
+root=$(pwd -P)
 while IFS= read -r file; do
-  file=${file#"$PWD/"}
+  file=${file#"$root/"}
   [[ "$file" != tests/* ]] || printf '%s\n' "$file"
 done <"$tmp/jest.raw" | LC_ALL=C sort >"$tmp/jest"
 { grep '^tests/e2e/' "$tmp/all" || true; } >"$tmp/e2e"
