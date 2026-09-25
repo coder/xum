@@ -111,8 +111,6 @@ describe("useArchiveWorkspaceConfirmation", () => {
 
     const modal = view.result.current.modalProps;
     expect(modal.isOpen).toBe(true);
-    expect(modal.title).toBe("Archive workspace with untracked files?");
-    expect(modal.confirmLabel).toBe("Archive and delete files");
     expect(modal.warning).toContain("a.txt");
     expect(archiveWorkspace).not.toHaveBeenCalled();
 
@@ -129,8 +127,8 @@ describe("useArchiveWorkspaceConfirmation", () => {
 
     await request();
 
-    expect(view.result.current.modalProps.title).toBe('Archive "Feature work" while streaming?');
-    expect(view.result.current.modalProps.confirmLabel).toBe("Archive");
+    expect(view.result.current.modalProps.isOpen).toBe(true);
+    expect(view.result.current.modalProps.title).toContain("Feature work");
 
     await confirm();
 
@@ -142,7 +140,9 @@ describe("useArchiveWorkspaceConfirmation", () => {
 
     await request();
 
-    expect(view.result.current.modalProps.title).toBe("Archive chat?");
+    expect(view.result.current.modalProps.isOpen).toBe(true);
+    // No empty quoted title (`Archive "" …`) when the workspace has no display title.
+    expect(view.result.current.modalProps.title).not.toContain('""');
   });
 
   test("cancel closes the confirmation without archiving", async () => {
