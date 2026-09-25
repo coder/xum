@@ -6470,11 +6470,6 @@ describe("MCPServerManager", () => {
     expect(executeTool).not.toHaveBeenCalled();
   });
 
-  // Agent Plugin launches need a real PLUGIN_DATA directory: give each fixture
-  // a private one. Fake plugin servers are keyed by PLUGIN_COMMAND (above).
-  const pluginStdioConfigIn = (dataDir: string) =>
-    pluginStdioConfig({ env: { PLUGIN_ROOT: "/plugins/demo", PLUGIN_DATA: dataDir } });
-
   test("an invalidated workspace whose overrides stay unreadable fails closed until disk answers", async () => {
     using tmp = new DisposableTempDir("mcp-fail-closed-plugin");
     manager.dispose();
@@ -6491,7 +6486,7 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() =>
       Promise.resolve({
         ordinary: stdioConfig("node ordinary.js"),
-        ...pluginStdioConfigIn(tmp.path),
+        ...launchablePluginConfig(tmp.path),
       })
     );
     servers.serve("node ordinary.js");
@@ -6536,7 +6531,7 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() =>
       Promise.resolve({
         ordinary: stdioConfig("node ordinary.js"),
-        ...pluginStdioConfigIn(tmp.path),
+        ...launchablePluginConfig(tmp.path),
       })
     );
     servers.serve("node ordinary.js");
@@ -6565,11 +6560,14 @@ describe("MCPServerManager", () => {
     const during = await manager.getToolsForWorkspace(prunedSnapshot);
     expect(during.stats.enabledServerCount).toBe(0);
 
-    // Disk recovers: the invalidation survived the sweep and the revocation
-    // is observed from the authoritative read.
-    diskOverrides = {};
+    // Disk recovers to a state the scrubbed snapshot does not match (the
+    // parent re-enabled the plugin): the invalidation survived the sweep, so
+    // this serve re-reads disk instead of matching a repopulated cache.
+    const readsBeforeRecovery = readWorkspaceOverrides.mock.calls.length;
+    diskOverrides = { enabledServers: [PLUGIN_KEY] };
     const after = await manager.getToolsForWorkspace(prunedSnapshot);
-    expect(after.stats.enabledServerCount).toBe(1);
+    expect(readWorkspaceOverrides.mock.calls.length).toBeGreaterThan(readsBeforeRecovery);
+    expect(after.stats.enabledServerCount).toBe(2);
   });
 
   test("an authoritative publication retires the invalidation and the fail-closed state", async () => {
@@ -7719,7 +7717,7 @@ describe("MCPServerManager", () => {
       );
       const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
         agentPluginsMcpProvider: () =>
-          Promise.resolve(pluginStdioConfigIn(path.join(tmp.path, "data"))),
+          Promise.resolve(launchablePluginConfig(path.join(tmp.path, "data"))),
       });
       manager.dispose();
       manager = new MCPServerManager(pluginConfigService);
@@ -7895,7 +7893,7 @@ describe("MCPServerManager", () => {
   ) {
     const deps = {
       agentPluginsMcpProvider: () =>
-        Promise.resolve(pluginStdioConfigIn(path.join(rootDir, "data"))),
+        Promise.resolve(launchablePluginConfig(path.join(rootDir, "data"))),
     };
     const writer = new MCPConfigService(new Config(rootDir), deps);
     const reader = new MCPConfigService(new Config(rootDir), deps);
@@ -8190,7 +8188,7 @@ describe("MCPServerManager", () => {
     );
     const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
       agentPluginsMcpProvider: () =>
-        Promise.resolve(pluginStdioConfigIn(path.join(tmp.path, "data"))),
+        Promise.resolve(launchablePluginConfig(path.join(tmp.path, "data"))),
     });
     manager.dispose();
     manager = new MCPServerManager(pluginConfigService);
@@ -8215,7 +8213,7 @@ describe("MCPServerManager", () => {
     using tmp = new DisposableTempDir("mcp-plugin-global-toggle");
     const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
       agentPluginsMcpProvider: () =>
-        Promise.resolve(pluginStdioConfigIn(path.join(tmp.path, "data"))),
+        Promise.resolve(launchablePluginConfig(path.join(tmp.path, "data"))),
     });
     manager.dispose();
     manager = new MCPServerManager(pluginConfigService);
