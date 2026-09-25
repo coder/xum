@@ -2090,6 +2090,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
+    // One-shot model overrides apply to both variants; the model also governs thinking/PDF policy.
+    const modelOneShot = parsed?.type === "model-oneshot" ? parsed : undefined;
+    const policyModel = modelOneShot?.modelString ?? baseModel;
+
     // Route to creation handler for creation variant
     if (variant === "creation") {
       // The initial /goal path sets a goal without sending a user message, so
@@ -2110,15 +2114,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
       }
 
-      const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
-      const oneShot = modelOneShot
-        ? getModelOneShotOverrides(
-            modelOneShot,
-            messageText,
-            attachments,
-            modelOneShot.modelString ?? baseModel
-          )
-        : undefined;
+      const oneShot =
+        modelOneShot &&
+        getModelOneShotOverrides(modelOneShot, messageText, attachments, policyModel);
       // Parsing makes a one-shot and a slash skill mutually exclusive, so the one-shot's
       // metadata only ever combines with inline skill refs below.
       const oneShotMetadata: MuxMessageMetadata | undefined = oneShot && {
@@ -2224,7 +2222,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const runWorkspaceSend = async () => {
-      const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
       // Mirror the creation-composer /goal bypass: with attachments present,
       // send the raw text as a normal message instead of processing the
       // command, which would drop the files. Transferred staging-failure
@@ -2245,8 +2242,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // command completion. If that older command fails after this send clears
       // the composer, it must not restore stale command text over the newer turn.
       asyncCommandTokenRef.current++;
-
-      const modelOverride = modelOneShot?.modelString;
 
       // Regular message (or /<model-alias> one-shot override) - send directly via API
       const messageTextForSend =
@@ -2301,8 +2296,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             commandPrefix: `/${mcpPromptInvocation.descriptor.commandKey}`,
           }
         : undefined;
-
-      const policyModel = modelOverride ?? baseModel;
 
       // Preflight: if the message includes PDFs, ensure the selected model can accept them.
       const pdfAttachments = attachments.filter(isPdfAttachment);

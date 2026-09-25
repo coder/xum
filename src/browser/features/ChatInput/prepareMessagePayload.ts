@@ -69,7 +69,7 @@ interface PrepareMessagePayloadInput {
   compactionOptions?: Partial<SendMessageOptions>;
   compactionMessageText?: string;
   appendStagedNotice?: boolean;
-  modelOneShot?: ModelOneShot | null;
+  modelOneShot?: ModelOneShot;
   policyModel: string;
   transferredDraftProjectDiscovery: boolean;
   additionalSystemContextHydrated: boolean;
