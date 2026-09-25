@@ -16,6 +16,7 @@ import {
   type WorkflowServiceContext,
 } from "./WorkflowService";
 import { WorkflowArgsValidationError } from "./workflowArgs";
+import { setWorkflowArchiveAdmissionGuard } from "./workflowArchiveAdmission";
 import { WorkflowDeclaredPhasesValidationError } from "./workflowMetadata";
 
 interface TestWorkspaceService {
@@ -34,6 +35,11 @@ describe("WorkflowService request orchestration", () => {
   let projectPath: string;
 
   beforeEach(async () => {
+    // The archive admission guard is process-global, and every WorkspaceService
+    // constructor installs one bound to its own config. A WorkspaceService test
+    // earlier in the same bun process (built on a partial config double) leaves
+    // that guard behind, so reset it to "admit everything" for these tests.
+    setWorkflowArchiveAdmissionGuard(() => null);
     temp = new DisposableTempDir("workflow-service-context");
     config = new Config(temp.path);
     projectPath = path.join(temp.path, "project");
