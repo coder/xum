@@ -3,7 +3,7 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { createTaskStopTool } from "./task_stop";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import type { TaskService } from "@/node/services/taskService";
 import { Err, Ok, type Result } from "@/common/types/result";
 
@@ -169,13 +169,13 @@ describe("task_stop tool", () => {
         Promise.resolve(Ok({ workspaceId: "child-workspace" }))
     );
     const taskService = {
-      interruptWorkspaceTurn,
       stopDescendantAgentTask: mock(() => {
         throw new Error("workspace turn IDs must not reach agent task termination");
       }),
     } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ interruptWorkspaceTurn });
 
-    const tool = createTaskStopTool({ ...baseConfig, taskService });
+    const tool = createTaskStopTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["wst_turn"] }, mockToolCallOptions)
@@ -204,13 +204,13 @@ describe("task_stop tool", () => {
         Promise.resolve(Err("Workspace turn not found or out of scope"))
     );
     const taskService = {
-      interruptWorkspaceTurn,
       stopDescendantAgentTask: mock(() => {
         throw new Error("workspace turn IDs must not reach agent task termination");
       }),
     } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ interruptWorkspaceTurn });
 
-    const tool = createTaskStopTool({ ...baseConfig, taskService });
+    const tool = createTaskStopTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ task_ids: ["wst_foreign"] }, mockToolCallOptions)

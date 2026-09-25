@@ -3,9 +3,9 @@ import type { ToolExecutionOptions } from "ai";
 
 import { Ok, type Result } from "@/common/types/result";
 import { TaskWorkspaceLifecycleToolInputSchema } from "@/common/utils/tools/toolDefinitions";
-import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceLifecycleResult } from "@/node/services/taskWorkspaceSeam";
 import { createTaskWorkspaceLifecycleTool } from "./task_workspace_lifecycle";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -19,13 +19,15 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<unknown, string>> =>
+      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
         Promise.resolve(
           Ok({ status: "archived" as const, action: "archive" as const, workspaceId: "child-a" })
         )
     );
-    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -53,13 +55,15 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<unknown, string>> =>
+      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
         Promise.resolve(
           Ok({ status: "archived" as const, action: "archive" as const, workspaceId: "child-a" })
         )
     );
-    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -82,7 +86,7 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const unarchiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<unknown, string>> =>
+      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
         Promise.resolve(
           Ok({
             status: "unarchived" as const,
@@ -92,8 +96,10 @@ describe("task_workspace_lifecycle tool", () => {
           })
         )
     );
-    const taskService = { unarchiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      unarchiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     // interrupt_active applies to archive only; unarchive must never receive it.
     const result: unknown = await Promise.resolve(
@@ -123,7 +129,7 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<unknown, string>> =>
+      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
         Promise.resolve(
           Ok({
             status: "archived" as const,
@@ -133,8 +139,10 @@ describe("task_workspace_lifecycle tool", () => {
           })
         )
     );
-    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     await Promise.resolve(
       tool.execute!(
@@ -186,7 +194,10 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (_owner: string, target: { workspaceId?: string }): Promise<Result<unknown, string>> => {
+      (
+        _owner: string,
+        target: { workspaceId?: string }
+      ): Promise<Result<WorkspaceLifecycleResult, string>> => {
         if (target.workspaceId === "child-b") {
           throw new Error("unexpected lifecycle failure");
         }
@@ -195,8 +206,10 @@ describe("task_workspace_lifecycle tool", () => {
         );
       }
     );
-    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -226,13 +239,15 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<unknown, string>> =>
+      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
         Promise.resolve(
           Ok({ status: "archived" as const, action: "archive" as const, workspaceId: "child-a" })
         )
     );
-    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     // The input schema treats a whitespace-only identifier as absent; target normalization must
     // apply the same trimmed-presence rule instead of selecting the blank taskId and failing
@@ -259,10 +274,13 @@ describe("task_workspace_lifecycle tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<unknown, string>> => Promise.reject(new Error("must not be called"))
+      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
+        Promise.reject(new Error("must not be called"))
     );
-    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      archiveOwnedWorkspaceTurnWorkspace,
+    });
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!(
@@ -290,7 +308,6 @@ describe("task_workspace_lifecycle tool", () => {
     const tool = createTaskWorkspaceLifecycleTool({
       ...baseConfig,
       planFileOnly: true,
-      taskService: {} as unknown as TaskService,
     });
 
     let caught: unknown;

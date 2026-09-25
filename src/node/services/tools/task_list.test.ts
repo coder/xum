@@ -4,7 +4,7 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { createTaskListTool } from "./task_list";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import { Config, type Workspace } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
 import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
@@ -333,9 +333,11 @@ describe("task_list tool", () => {
           },
         })
       ),
-      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     expect(
       await Promise.resolve(tool.execute!({ statuses: ["running"] }, mockToolCallOptions))
@@ -383,9 +385,11 @@ describe("task_list tool", () => {
             },
           })
       ),
-      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result = (await Promise.resolve(
       tool.execute!({ statuses: ["failed", "interrupted"] }, mockToolCallOptions)
@@ -454,9 +458,9 @@ describe("task_list tool", () => {
       isDescendantAgentTask: mock((_ancestorWorkspaceId: string, candidateWorkspaceId: string) =>
         Promise.resolve(candidateWorkspaceId === "child-agent")
       ),
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     expect(
       await Promise.resolve(tool.execute!({ statuses: ["completed"] }, mockToolCallOptions))
@@ -468,27 +472,29 @@ describe("task_list tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const listDescendantAgentTasks = mock(() => []);
-    const listWorkspaceTurnTasks = mock(() => [
-      {
-        kind: "workspace_turn" as const,
-        handleId: "wst_turn",
-        ownerWorkspaceId: "root-workspace",
-        workspaceId: "child-workspace",
-        turnId: "turn-1",
-        status: "running" as const,
-        createdAt: "2026-06-19T00:00:00.000Z",
-        updatedAt: "2026-06-19T00:00:01.000Z",
-        createdWorkspace: true,
-        disposableWorkspace: false,
-        title: "Summary",
-      },
-    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        {
+          kind: "workspace_turn" as const,
+          handleId: "wst_turn",
+          ownerWorkspaceId: "root-workspace",
+          workspaceId: "child-workspace",
+          turnId: "turn-1",
+          status: "running" as const,
+          createdAt: "2026-06-19T00:00:00.000Z",
+          updatedAt: "2026-06-19T00:00:01.000Z",
+          createdWorkspace: true,
+          disposableWorkspace: false,
+          title: "Summary",
+        },
+      ])
+    );
     const taskService = {
       listDescendantAgentTasks,
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
 
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ statuses: ["running"] }, mockToolCallOptions)
@@ -539,18 +545,20 @@ describe("task_list tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const listDescendantAgentTasks = mock(() => []);
-    const listWorkspaceTurnTasks = mock(() => [
-      buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
-      buildWorkspaceTurn("turn-archived-running", "archived-running-workspace", "running"),
-      buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
-      buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
-      buildWorkspaceTurn("turn-missing-completed", "missing-turn-workspace", "completed"),
-    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
+        buildWorkspaceTurn("turn-archived-running", "archived-running-workspace", "running"),
+        buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
+        buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
+        buildWorkspaceTurn("turn-missing-completed", "missing-turn-workspace", "completed"),
+      ])
+    );
     const taskService = {
       listDescendantAgentTasks,
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ statuses: ["completed", "failed", "running"] }, mockToolCallOptions)
@@ -587,16 +595,18 @@ describe("task_list tool", () => {
     ]);
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
     const listDescendantAgentTasks = mock(() => []);
-    const listWorkspaceTurnTasks = mock(() => [
-      buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
-      buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
-      buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
-    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
+        buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
+        buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
+      ])
+    );
     const taskService = {
       listDescendantAgentTasks,
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const defaultResult: unknown = await Promise.resolve(
       tool.execute!({ statuses: ["completed", "failed"] }, mockToolCallOptions)
