@@ -96,7 +96,7 @@ export class WorkflowPriorAttemptUnresolvedError extends Error {
   constructor(
     readonly stepId: string,
     readonly taskId: string,
-    readonly outcome: "indeterminate" | "cleanup-pending" | "timeout",
+    readonly outcome: "indeterminate" | "cleanup-pending" | "timeout" | "claim-refused",
     detail: string
   ) {
     // Avoid the word "interrupted": the sandbox normalizes any such error text.
@@ -137,8 +137,19 @@ type WorkflowAttemptDisposition =
 type WorkflowPriorAttemptPlan =
   | { kind: "adopt"; report: WorkflowAgentResult }
   | { kind: "reattach" }
-  | { kind: "replace" }
+  /** `attemptId`: the ended attempt the replacement must retire (see reserveAgentTasks). */
+  | { kind: "replace"; attemptId: string | undefined }
   | { kind: "rethrow" };
+
+/**
+ * The checkpointed child a replacement retires (G2). Its attempt is claimed before the
+ * replacement is reserved, and the replacement's publishing commit consumes that claim once.
+ */
+interface WorkflowPriorChild {
+  taskId: string;
+  /** Undefined only for a pre-identity owned attempt: never replaced (unresolved instead). */
+  attemptId: string | undefined;
+}
 
 export interface WorkflowAgentTimeoutSpec {
   softMs: number;
@@ -281,8 +292,20 @@ export interface WorkflowTaskAdapter {
        * checkpoint and config writes are owned to completion regardless.
        */
       abortSignal?: AbortSignal;
+      /** Per spec, the claimed prior attempt the child replaces (single-use publication). */
+      retires?: ReadonlyArray<{ taskId: string; attemptId: string; nonce: string } | undefined>;
     }
   ): Promise<Array<{ taskId: string; status: "queued" | "starting" | "running" }>>;
+  /**
+   * Retire a checkpointed child's attempt so exactly one replacement can be published for it.
+   * Absent → no replacement is ever reserved: the step stays unresolved (never an unclaimed
+   * replacement).
+   */
+  claimRetiredAttempt?(
+    taskId: string,
+    attemptId: string,
+    claimant: { stepId: string; inputHash: string }
+  ): Promise<{ success: true; nonce: string } | { success: false; error: string }>;
   waitForAgentTask?(
     taskId: string,
     spec: WorkflowAgentSpec,
@@ -1365,6 +1388,7 @@ export class WorkflowRunner {
       "pipeline requires workflow task adapter support for nonblocking agent starts"
     );
     const priorTaskId = existingStep?.status === "started" ? existingStep.taskId : undefined;
+    let priorReplace: WorkflowPriorChild | undefined;
     if (priorTaskId != null) {
       assert(existingStep != null, "started pipeline step must have an existing step record");
       const resultSpec = options.allowLegacyMissingOutputSchema
@@ -1411,6 +1435,7 @@ export class WorkflowRunner {
         options.startedAgentSteps.set(handleId, state);
         return { handleId };
       }
+      priorReplace = { taskId: priorTaskId, attemptId: plan.attemptId };
     }
 
     const resultSpec = normalizeWorkflowAgentSpecForExecution(spec, {
@@ -1419,7 +1444,15 @@ export class WorkflowRunner {
     const startedAt =
       priorTaskId == null && existingStep != null ? existingStep.startedAt : this.clock.nowIso();
     const [taskId] = await this.reserveAgentTasks(runId, sequence, {
-      steps: [{ spec: resultSpec, inputHash, startedAt, title: spec.title }],
+      steps: [
+        {
+          spec: resultSpec,
+          inputHash,
+          startedAt,
+          title: spec.title,
+          ...(priorReplace != null ? { priorChild: priorReplace } : {}),
+        },
+      ],
       abortSignal: options.waitOptions?.abortSignal,
       runAbortSignal: options.waitOptions?.abortSignal,
       leaseGuard: options.leaseGuard,
@@ -2345,15 +2378,18 @@ export class WorkflowRunner {
       runAbortSignal?: AbortSignal;
       allowMissingOutputSchema: boolean;
       leaseGuard: WorkflowRunnerLeaseGuard;
+      /** Set by a replacement restart: the ended child the new reservation retires. */
+      priorChild?: WorkflowPriorChild;
     }
   ): Promise<WorkflowAgentRunResult> {
     step.leaseGuard.throwIfLost();
-    const restart = async (): Promise<WorkflowAgentRunResult> =>
+    const restart = async (priorChild: WorkflowPriorChild): Promise<WorkflowAgentRunResult> =>
       await this.runOrResumeAgentStep(runId, sequence, {
         ...step,
         startedAt: this.clock.nowIso(),
         taskId: undefined,
         reservedInThisRun: false,
+        priorChild,
       });
     const settleWaitFailure = async (
       attempt: OwnedWorkflowAgentAttempt,
@@ -2370,7 +2406,7 @@ export class WorkflowRunner {
         case "adopt":
           return { rawResult: plan.report, resultSpec: attempt.resultSpec, taskId: attempt.taskId };
         case "replace":
-          return await restart();
+          return await restart({ taskId: attempt.taskId, attemptId: plan.attemptId });
         case "reattach":
         case "rethrow":
           throw error;
@@ -2412,7 +2448,7 @@ export class WorkflowRunner {
           return { rawResult: plan.report, resultSpec, taskId: attempt.taskId };
         }
         if (plan.kind === "replace") {
-          return await restart();
+          return await restart({ taskId: attempt.taskId, attemptId: plan.attemptId });
         }
         assert(
           plan.kind === "reattach",
@@ -2462,6 +2498,7 @@ export class WorkflowRunner {
             inputHash: step.inputHash,
             startedAt: step.startedAt,
             title: step.spec.title,
+            ...(step.priorChild != null ? { priorChild: step.priorChild } : {}),
           },
         ],
         abortSignal: step.waitOptions?.abortSignal,
@@ -2496,6 +2533,15 @@ export class WorkflowRunner {
     }
 
     step.leaseGuard.throwIfLost();
+    if (step.priorChild != null) {
+      // runAgent creates children one by one (create()), which cannot consume a claim.
+      throw new WorkflowPriorAttemptUnresolvedError(
+        step.spec.id,
+        step.priorChild.taskId,
+        "claim-refused",
+        "replacing a previous attempt requires reservation support (createAgentTasks)"
+      );
+    }
     let recordedTaskId: string | undefined;
     let rawResult: WorkflowAgentResult;
     try {
@@ -2845,6 +2891,8 @@ export class WorkflowRunner {
         inputHash: string;
         startedAt: string;
         title?: string;
+        /** The checkpointed child this reservation replaces (see claimPriorChildren). */
+        priorChild?: WorkflowPriorChild;
       }>;
       abortSignal?: AbortSignal;
       runAbortSignal?: AbortSignal;
@@ -2858,6 +2906,7 @@ export class WorkflowRunner {
     );
     const createAgentTasks = this.taskAdapter.createAgentTasks.bind(this.taskAdapter);
     const stepIds = input.steps.map((step) => step.spec.id);
+    const retires = await this.claimPriorChildren(input.steps, input.leaseGuard);
     for (const step of input.steps) {
       await this.recordAgentReservationEventIfMissing(runId, sequence, {
         stepId: step.spec.id,
@@ -2962,6 +3011,7 @@ export class WorkflowRunner {
         input.steps.map((step) => step.spec),
         {
           abortSignal: reservation.signal,
+          ...(retires != null ? { retires } : {}),
           onTaskCreated: async (index, taskId) => {
             if (reservation.signal.aborted) {
               // Last cancellation point: nothing durable exists for this task yet.
@@ -3021,6 +3071,61 @@ export class WorkflowRunner {
   }
 
   /**
+   * The single chokepoint for replacements (G2): before any reservation event or child exists,
+   * claim every prior child's ended attempt. The classifier decided the attempt ended without a
+   * report; the claim makes that decision exclusive, and the reservation's publishing commit
+   * consumes it once (#4452 gap 2). Any refusal leaves the step unresolved — never retried here,
+   * never replaced unclaimed. This includes this process's own settled attempts, so a
+   * pre-identity owned attempt (no attempt id to claim) is no longer replaced automatically.
+   *
+   * Interim gap until failed-checkpoint consultation lands (G2 PR B2): a crash between
+   * recordStartedAttemptFailed and this claim leaves a failed checkpoint, whose re-run reserves a
+   * fresh child without consulting the old one (the pre-G2 behavior).
+   */
+  private async claimPriorChildren(
+    steps: ReadonlyArray<{
+      spec: WorkflowAgentSpec;
+      inputHash: string;
+      priorChild?: WorkflowPriorChild;
+    }>,
+    leaseGuard: WorkflowRunnerLeaseGuard
+  ): Promise<Array<{ taskId: string; attemptId: string; nonce: string } | undefined> | undefined> {
+    if (!steps.some((step) => step.priorChild != null)) return undefined;
+    const retires: Array<{ taskId: string; attemptId: string; nonce: string } | undefined> = [];
+    for (const step of steps) {
+      const prior = step.priorChild;
+      if (prior == null) {
+        retires.push(undefined);
+        continue;
+      }
+      const unresolved = (detail: string) =>
+        new WorkflowPriorAttemptUnresolvedError(
+          step.spec.id,
+          prior.taskId,
+          "claim-refused",
+          detail
+        );
+      if (prior.attemptId == null) {
+        throw unresolved("the previous attempt has no attempt identity, so it cannot be retired");
+      }
+      if (this.taskAdapter.claimRetiredAttempt == null) {
+        throw unresolved("the task adapter cannot retire attempts");
+      }
+      leaseGuard.throwIfLost();
+      const claim = await this.taskAdapter.claimRetiredAttempt(prior.taskId, prior.attemptId, {
+        stepId: step.spec.id,
+        inputHash: step.inputHash,
+      });
+      leaseGuard.throwIfLost();
+      if (!claim.success) {
+        throw unresolved(`retiring the previous attempt was refused: ${claim.error}`);
+      }
+      retires.push({ taskId: prior.taskId, attemptId: prior.attemptId, nonce: claim.nonce });
+    }
+    return retires;
+  }
+
+  /**
    * Decides what a resumed step does with its checkpointed prior attempt before reattaching or
    * discarding it. Never replaces a child whose report may still arrive: only a positively
    * absent report after settlement yields `replace`.
@@ -3052,7 +3157,7 @@ export class WorkflowRunner {
           attempt,
           `agent ${attempt.stepId} task ${attempt.taskId} ended without a report`
         );
-        return { kind: "replace" };
+        return { kind: "replace", attemptId: outcome.attemptId };
       case "indeterminate":
         await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {
           stepId: attempt.stepId,
@@ -3150,7 +3255,7 @@ export class WorkflowRunner {
           `agent ${attempt.stepId} task ${attempt.taskId} ended without a report: ${getErrorMessage(error)}`
         );
         return options.allowReplacement && shouldRestartUnrecoverableStartedTask(error)
-          ? { kind: "replace" }
+          ? { kind: "replace", attemptId: outcome.attemptId }
           : { kind: "rethrow" };
       case "indeterminate":
         await this.recordAgentAttemptIndeterminateEventIfMissing(runId, sequence, {

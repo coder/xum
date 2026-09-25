@@ -385,9 +385,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       });
       expect(
         await taskService.readAttemptOutcome(taskId, { requestingWorkspaceId: midId })
-      ).toEqual({
-        kind: "terminal-no-report",
-      });
+      ).toMatchObject({ kind: "terminal-no-report" });
       await expectReceiptEverywhere(config, taskId, attemptId, "execution-settled", true);
     });
 
