@@ -11,7 +11,11 @@ interface KnownModelDefinition {
   provider: ModelProvider;
   /** Provider-specific model name (no provider prefix) */
   providerModelId: string;
-  /** Aliases that should resolve to this model */
+  /**
+   * Aliases that should resolve to this model. User-facing family aliases are
+   * pinned by family (not exact id) in knownModels.test.ts, so moving one to a
+   * newer tier of the same family needs no test change.
+   */
   aliases?: string[];
   /** Preload tokenizer encodings at startup */
   warm?: boolean;
