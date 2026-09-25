@@ -310,3 +310,99 @@ describe("derivePlanReviewState untrusted persisted fields", () => {
     expect(state.threads.map((t) => t.threadId)).toEqual([hostileId]);
   });
 });
+
+describe("derivePlanReviewState partially accepted feedback", () => {
+  test("a later copy of the same feedback record fills in the items an earlier copy lacked", () => {
+    const skipped: string[] = [];
+    // Crash-duplicated pair where the first copy is authentic but damaged: one comment anchor
+    // points past the snapshot, and its reply names a thread that is not known yet.
+    const damaged: PlanReviewRecord = {
+      ...feedback2,
+      comments: [{ ...feedback2.comments[0], anchor: { startLine: 99, endLine: 99 } }],
+    };
+    const state = derivePlanReviewState(
+      [
+        recordRow(snapshotA),
+        recordRow(snapshotB),
+        recordRow(damaged),
+        recordRow(feedback1),
+        // Intact copy: fills in thr_3 and the reply; nothing it shares is duplicated.
+        recordRow(feedback2),
+        // Once complete, further copies stay inert.
+        recordRow(feedback2),
+      ],
+      { onSkip: (reason) => skipped.push(reason) }
+    );
+
+    expect(state.feedbacks.map((feedback) => [feedback.feedbackId, feedback.threadIds])).toEqual([
+      ["fb_2", ["thr_3"]],
+      ["fb_1", ["thr_1", "thr_2"]],
+    ]);
+    expect(state.threads.map((thread) => thread.threadId).sort()).toEqual([
+      "thr_1",
+      "thr_2",
+      "thr_3",
+    ]);
+    const thr1 = state.threads.find((thread) => thread.threadId === "thr_1");
+    expect(thr1?.replies.map((reply) => reply.replyId)).toEqual(["rpl_1"]);
+    // Filled-in items keep the sequence of the first accepted copy.
+    const fb2 = state.feedbacks.find((feedback) => feedback.feedbackId === "fb_2");
+    expect(state.threads.find((thread) => thread.threadId === "thr_3")?.historySequence).toBe(
+      fb2?.historySequence
+    );
+    expect(skipped).toEqual(["anchor-out-of-range", "dangling-reply-thread", "duplicate-record"]);
+  });
+
+  test("an item the earlier copy accepted is not duplicated by a later partial copy", () => {
+    // First copy accepts thr_1 but not thr_2 (bad anchor); the second copy damages thr_1 instead.
+    const firstCopy: PlanReviewRecord = {
+      ...feedback1,
+      comments: [
+        feedback1.comments[0],
+        { ...feedback1.comments[1], anchor: { startLine: 99, endLine: 99 } },
+      ],
+    };
+    const secondCopy: PlanReviewRecord = {
+      ...feedback1,
+      comments: [
+        { ...feedback1.comments[0], anchor: { startLine: 99, endLine: 99 } },
+        feedback1.comments[1],
+      ],
+    };
+    const state = derivePlanReviewState([
+      recordRow(snapshotA),
+      recordRow(firstCopy),
+      recordRow(secondCopy),
+    ]);
+    expect(state.feedbacks.map((feedback) => feedback.threadIds)).toEqual([["thr_1", "thr_2"]]);
+    expect(state.threads.map((thread) => [thread.threadId, thread.anchor.startLine])).toEqual([
+      ["thr_1", 3],
+      ["thr_2", 4],
+    ]);
+  });
+
+  test("a copy that names another feedback or snapshot under the same record id is ignored", () => {
+    const skipped: string[] = [];
+    const partial: PlanReviewRecord = {
+      ...feedback1,
+      comments: [
+        feedback1.comments[0],
+        { ...feedback1.comments[1], anchor: { startLine: 99, endLine: 99 } },
+      ],
+    };
+    const state = derivePlanReviewState(
+      [
+        recordRow(snapshotA),
+        recordRow(snapshotB),
+        recordRow(partial),
+        recordRow({ ...feedback2, recordId: feedback1.recordId }),
+        recordRow(resolve(feedback1.recordId, "thr_1")),
+      ],
+      { onSkip: (reason) => skipped.push(reason) }
+    );
+    expect(state.feedbacks.map((feedback) => feedback.feedbackId)).toEqual(["fb_1"]);
+    expect(state.threads.map((thread) => thread.threadId)).toEqual(["thr_1"]);
+    expect(state.threads[0].resolved).toBe(false);
+    expect(skipped).toEqual(["anchor-out-of-range", "duplicate-record", "duplicate-record"]);
+  });
+});

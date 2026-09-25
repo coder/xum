@@ -81,7 +81,8 @@ export function createEmptyPlanReviewState(): PlanReviewState {
  * Replay record rows in the given (history) order. A row counts only when it is authentic
  * (metadata and envelope agree, see getAuthenticPlanReviewRecord); everything else is skipped
  * so a corrupt or forged row can never create, resolve, or hide a thread (self-healing).
- * Compaction tail copies and duplicate recordIds are inert.
+ * Compaction tail copies and duplicate recordIds are inert, except that a later copy of
+ * partially accepted feedback fills in the items the earlier copy lacked.
  */
 export function derivePlanReviewState(
   messages: Iterable<MuxMessage>,
@@ -92,6 +93,14 @@ export function derivePlanReviewState(
   const snapshotsById = new Map<string, PlanReviewSnapshot>();
   const threadsById = new Map<string, PlanReviewThread>();
   const seenRecordIds = new Set<string>();
+  // Feedback accepted with item-level skips (a damaged comment anchor, a reply whose thread is
+  // not known yet, a thread id already taken). Its record id stays open so a later copy of the
+  // same record (e.g. the intact half of a crash-duplicated archive/active pair) can fill in the
+  // missing items; items already accepted from an earlier copy are inert, never duplicated.
+  const partialFeedbacks = new Map<
+    string,
+    { feedback: PlanReviewFeedback; acceptedReplyIds: Set<string> }
+  >();
   let index = -1;
 
   for (const message of messages) {
@@ -106,7 +115,14 @@ export function derivePlanReviewState(
       skip("invalid-record", message.id);
       continue;
     }
-    if (seenRecordIds.has(record.recordId)) {
+    const partial = partialFeedbacks.get(record.recordId);
+    if (
+      seenRecordIds.has(record.recordId) ||
+      (partial !== undefined &&
+        (record.kind !== "feedback" ||
+          record.feedbackId !== partial.feedback.feedbackId ||
+          record.snapshotId !== partial.feedback.snapshotId))
+    ) {
       skip("duplicate-record", message.id);
       continue;
     }
@@ -156,14 +172,28 @@ export function derivePlanReviewState(
           skip("dangling-feedback-snapshot", message.id);
           break;
         }
-        const threadIds: string[] = [];
+        // A later copy extends the entry of the first accepted copy, at that copy's sequence.
+        const entry = partial ?? {
+          feedback: {
+            feedbackId: record.feedbackId,
+            snapshotId: snapshot.snapshotId,
+            threadIds: [],
+            historySequence,
+          },
+          acceptedReplyIds: new Set<string>(),
+        };
+        const { feedback, acceptedReplyIds } = entry;
+        let complete = true;
         for (const comment of record.comments) {
+          if (feedback.threadIds.includes(comment.threadId)) continue;
           if (threadsById.has(comment.threadId)) {
             skip("duplicate-thread", message.id);
+            complete = false;
             continue;
           }
           if (!isAnchorWithinSnapshot(comment.anchor, snapshot.content)) {
             skip("anchor-out-of-range", message.id);
+            complete = false;
             continue;
           }
           const thread: PlanReviewThread = {
@@ -173,34 +203,37 @@ export function derivePlanReviewState(
             quote: comment.quote,
             body: comment.body,
             feedbackId: record.feedbackId,
-            historySequence,
+            historySequence: feedback.historySequence,
             replies: [],
             resolved: false,
           };
           threadsById.set(thread.threadId, thread);
           state.threads.push(thread);
-          threadIds.push(thread.threadId);
+          feedback.threadIds.push(thread.threadId);
         }
         for (const reply of record.replies) {
+          if (acceptedReplyIds.has(reply.replyId)) continue;
           const thread = threadsById.get(reply.threadId);
           if (thread === undefined) {
             skip("dangling-reply-thread", message.id);
+            complete = false;
             continue;
           }
           thread.replies.push({
             replyId: reply.replyId,
             author: "user",
             body: reply.body,
-            historySequence,
+            historySequence: feedback.historySequence,
           });
+          acceptedReplyIds.add(reply.replyId);
         }
-        state.feedbacks.push({
-          feedbackId: record.feedbackId,
-          snapshotId: snapshot.snapshotId,
-          threadIds,
-          historySequence,
-        });
-        seenRecordIds.add(record.recordId);
+        if (partial === undefined) state.feedbacks.push(feedback);
+        if (complete) {
+          partialFeedbacks.delete(record.recordId);
+          seenRecordIds.add(record.recordId);
+        } else {
+          partialFeedbacks.set(record.recordId, entry);
+        }
         break;
       }
       case "resolve":
