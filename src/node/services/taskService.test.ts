@@ -143,6 +143,7 @@ import {
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnManagerInternals,
   workspaceTurnMuxMetadata,
   workspaceTurnRecord,
   workspaceTurnSnapshot,
@@ -169,13 +170,7 @@ async function registerLiveWorkspaceTurnHandle(
   // model that pre-acceptance window.
   accepted = true
 ): Promise<void> {
-  const internals = taskService as unknown as {
-    activeWorkspaceTurnHandleByWorkspaceId: Map<
-      string,
-      { handleId: string; ownerWorkspaceId: string; accepted: boolean }
-    >;
-    taskHandleStore: TaskHandleStore;
-  };
+  const internals = workspaceTurnManagerInternals(taskService);
   await internals.taskHandleStore.upsertWorkspaceTurn(
     workspaceTurnRecord(ownerWorkspaceId, workspaceId, handleId, "running", {
       turnId: `${handleId}-turn`,
@@ -292,28 +287,6 @@ function createTaskServiceHarness(
     overrides?.desktopInputCoordinator
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);
-  const managerInternals = workspaceTurnManager as unknown as {
-    taskHandleStore: TaskHandleStore;
-    activeWorkspaceTurnHandleByWorkspaceId: Map<
-      string,
-      { handleId: string; ownerWorkspaceId: string; accepted: boolean }
-    >;
-  };
-  Object.defineProperties(taskService, {
-    taskHandleStore: { value: managerInternals.taskHandleStore },
-    activeWorkspaceTurnHandleByWorkspaceId: {
-      value: managerInternals.activeWorkspaceTurnHandleByWorkspaceId,
-    },
-  });
-  const managerRecord = workspaceTurnManager as unknown as Record<string, unknown>;
-  for (const name of Object.getOwnPropertyNames(WorkspaceTurnManager.prototype)) {
-    if (name === "constructor" || name in taskService) continue;
-    const method = managerRecord[name];
-    if (typeof method === "function") {
-      Object.defineProperty(taskService, name, { value: method.bind(workspaceTurnManager) });
-    }
-  }
-
   return {
     historyService,
     partialService,
@@ -7163,9 +7136,7 @@ describe("TaskService", () => {
       assert(!result.success, "Expected reawaken to fail");
       expect(result.error.code).toBe("send_failed");
       expect(sendMessage).not.toHaveBeenCalled();
-      const turns = await (
-        taskService as unknown as { taskHandleStore: TaskHandleStore }
-      ).taskHandleStore.listWorkspaceTurns(parentId);
+      const turns = await new TaskHandleStore(config).listWorkspaceTurns(parentId);
       expect(turns).toEqual([]);
       const history = await historyService.getHistoryFromLatestBoundary(childTaskId);
       expect(history).toEqual(Ok([]));
@@ -9903,9 +9874,10 @@ describe("TaskService", () => {
       await restarted.taskService.initialize();
       const executionId = cutChild?.taskExecutionId;
       assert(executionId != null, "the cut must leave an execution mirror behind");
-      const handle = await (
-        restarted.taskService as unknown as { taskHandleStore: TaskHandleStore }
-      ).taskHandleStore.getWorkspaceTurn(parentId, executionId);
+      const handle = await new TaskHandleStore(restartedConfig).getWorkspaceTurn(
+        parentId,
+        executionId
+      );
       return {
         crashRoot,
         cutChild,
@@ -10008,7 +9980,6 @@ describe("TaskService", () => {
     }, 20_000);
 
     interface AttemptLedger {
-      taskHandleStore: TaskHandleStore;
       beginOwnedTaskAttempt(
         taskId: string,
         source: string,
@@ -10052,7 +10023,7 @@ describe("TaskService", () => {
         const busy = admitQueued(workspaceService, childId);
         const ledger = taskService as unknown as AttemptLedger;
         const previousAttempt = ledger.ownedAttemptByTaskId.get(childId);
-        const store = ledger.taskHandleStore;
+        const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
         const originalUpsert = store.upsertWorkspaceTurn.bind(store);
         let reactivationAttempt: unknown;
         let successor: unknown;
@@ -13884,7 +13855,6 @@ describe("TaskService", () => {
         const { taskService } = createTaskServiceHarness(config, { workspaceService });
         const internals = taskService as unknown as {
           agentPeerMessageBroker: AgentPeerMessageBroker;
-          activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
         };
         const reserve = spyOn(internals.agentPeerMessageBroker, "reserveBudget");
         await registerLiveWorkspaceTurnHandle(
@@ -13906,7 +13876,9 @@ describe("TaskService", () => {
           expect(reserve).not.toHaveBeenCalled();
           expect(sendMessage).not.toHaveBeenCalled();
           // Existing ownership is separate from ancestry; finishing the delegation opens messaging.
-          internals.activeWorkspaceTurnHandleByWorkspaceId.delete("target");
+          workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+            "target"
+          );
           expect(
             await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input")
           ).toEqual(
@@ -13946,7 +13918,6 @@ describe("TaskService", () => {
         });
         const internals = taskService as unknown as {
           resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
-          activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
         };
         reserveFamilyMessageTargetSlots(
           taskService,
@@ -13997,7 +13968,9 @@ describe("TaskService", () => {
             expect(sendMessage).not.toHaveBeenCalled();
           }
           expect(await collectFullHistory(historyService, "target")).toEqual([]);
-          internals.activeWorkspaceTurnHandleByWorkspaceId.delete("target");
+          workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+            "target"
+          );
           // One available budget slot proves that either cancellation path refunded the first send.
           expect(
             (await taskService.sendAgentTreeMessage("sender", "target", "After delegation")).success
@@ -15375,9 +15348,7 @@ describe("TaskService", () => {
         release();
       }
       taskService.resetAutoResumeCount("stopped");
-      const internals = taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
-      };
+      const internals = workspaceTurnManagerInternals(taskService);
       internals.activeWorkspaceTurnHandleByWorkspaceId.delete("pending");
       internals.activeWorkspaceTurnHandleByWorkspaceId.delete("accepted");
       expect(
@@ -28965,8 +28936,7 @@ describe("TaskService", () => {
       expect.objectContaining({ agentInitiated: true })
     );
 
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     const terminalRecord = await taskHandleStore.getWorkspaceTurn(parentId, created.data.taskId);
     assert(terminalRecord, "terminal continuation record must exist");
     const attentionGenerationId = `${terminalRecord.handleId}:${terminalRecord.status}:${terminalRecord.updatedAt}`;
@@ -29418,8 +29388,7 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     const createdAt = "2026-06-19T00:00:00.000Z";
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "running", {
@@ -29429,17 +29398,14 @@ describe("TaskService", () => {
         attentionPolicy: "notify_on_terminal",
       })
     );
-    (
-      taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<
-          string,
-          { handleId: string; ownerWorkspaceId: string }
-        >;
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+      "childworkspace",
+      {
+        handleId: "wst_handle",
+        ownerWorkspaceId: parentId,
+        accepted: false,
       }
-    ).activeWorkspaceTurnHandleByWorkspaceId.set("childworkspace", {
-      handleId: "wst_handle",
-      ownerWorkspaceId: parentId,
-    });
+    );
 
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
@@ -29505,8 +29471,7 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     const createdAt = "2026-06-19T00:00:00.000Z";
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "running", {
@@ -29516,17 +29481,14 @@ describe("TaskService", () => {
         attentionPolicy: "notify_on_terminal",
       })
     );
-    (
-      taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<
-          string,
-          { handleId: string; ownerWorkspaceId: string }
-        >;
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+      "childworkspace",
+      {
+        handleId: "wst_handle",
+        ownerWorkspaceId: parentId,
+        accepted: false,
       }
-    ).activeWorkspaceTurnHandleByWorkspaceId.set("childworkspace", {
-      handleId: "wst_handle",
-      ownerWorkspaceId: parentId,
-    });
+    );
 
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
@@ -29843,8 +29805,7 @@ describe("TaskService", () => {
     const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
     const { taskService } = createTaskServiceHarness(config, { aiService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, childTaskId, "wst_unreferenced", "running", {
         turnId: "turn-unreferenced",
@@ -29887,8 +29848,7 @@ describe("TaskService", () => {
       const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
       const { aiService } = createAIServiceMocks(config, { isStreaming });
       const { taskService } = createTaskServiceHarness(config, { aiService });
-      const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-        .taskHandleStore;
+      const taskHandleStore = new TaskHandleStore(config);
       await taskHandleStore.upsertWorkspaceTurn(
         workspaceTurnRecord(parentId, childTaskId, "wst_old", previousStatus, {
           turnId: "turn-old",
@@ -29933,8 +29893,7 @@ describe("TaskService", () => {
     const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
     const { taskService } = createTaskServiceHarness(config, { aiService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, childTaskId, "wst_invalid_timestamp", "completed", {
         turnId: "turn-invalid-timestamp",
@@ -29976,8 +29935,7 @@ describe("TaskService", () => {
     const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
     const { taskService } = createTaskServiceHarness(config, { aiService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, childTaskId, "wst_write_failure", "running", {
         turnId: "turn-write-failure",
@@ -30032,8 +29990,7 @@ describe("TaskService", () => {
     const isStreaming = mock((workspaceId: string) => workspaceId === childTaskId);
     const { aiService } = createAIServiceMocks(config, { isStreaming });
     const { taskService } = createTaskServiceHarness(config, { aiService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentTaskId, childTaskId, "wst_nested_execution", "running", {
         turnId: "turn-nested-execution",
@@ -30104,17 +30061,14 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    (
-      taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<
-          string,
-          { handleId: string; ownerWorkspaceId: string }
-        >;
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+      "childworkspace",
+      {
+        handleId: "wst_blocking_active",
+        ownerWorkspaceId: parentId,
+        accepted: false,
       }
-    ).activeWorkspaceTurnHandleByWorkspaceId.set("childworkspace", {
-      handleId: "wst_blocking_active",
-      ownerWorkspaceId: parentId,
-    });
+    );
 
     await taskService.initialize();
     await flushTerminalAttentionDrains(taskService);
@@ -31395,10 +31349,6 @@ describe("TaskService", () => {
     );
     expect(appendResult.success).toBe(true);
     const internal = taskService as unknown as {
-      activeWorkspaceTurnHandleByWorkspaceId: Map<
-        string,
-        { handleId: string; ownerWorkspaceId: string }
-      >;
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
 
@@ -31419,7 +31369,7 @@ describe("TaskService", () => {
       status: "running",
       deferredMessageIds: ["msg_prehandoff"],
     });
-    internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.clear();
     const recovered = await workspaceTurnSnapshot(taskService, parentId);
     expect(recovered).toMatchObject({
       status: "interrupted",
@@ -31462,10 +31412,6 @@ describe("TaskService", () => {
     );
     expect(appendResult.success).toBe(true);
     const internal = taskService as unknown as {
-      activeWorkspaceTurnHandleByWorkspaceId: Map<
-        string,
-        { handleId: string; ownerWorkspaceId: string }
-      >;
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
 
@@ -31481,7 +31427,7 @@ describe("TaskService", () => {
       },
       parts: [{ type: "text", text: "Recovered final text" }],
     });
-    internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.clear();
     expect(await workspaceTurnSnapshot(taskService, parentId)).toMatchObject({
       status: "interrupted",
       error: "Workspace turn interrupted after restart",
@@ -32146,28 +32092,23 @@ describe("TaskService", () => {
     const { parentId, taskService } = await startWorkspaceTurnForTest();
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-      taskHandleStore: {
-        getWorkspaceTurn: WorkspaceTurnManager["getWorkspaceTurnSnapshot"];
-      };
     };
-    const originalGetWorkspaceTurn = internal.taskHandleStore.getWorkspaceTurn.bind(
-      internal.taskHandleStore
-    );
+    const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
+    const originalGetWorkspaceTurn = store.getWorkspaceTurn.bind(store);
     const completionHandled = Promise.withResolvers<void>();
     const abortController = new AbortController();
     let triggered = false;
-    const getWorkspaceTurnSpy = spyOn(
-      internal.taskHandleStore,
-      "getWorkspaceTurn"
-    ).mockImplementation(async (ownerWorkspaceId: string, handleId: string) => {
-      const record = await originalGetWorkspaceTurn(ownerWorkspaceId, handleId);
-      if (!triggered && handleId === "wst_handle" && record?.status === "running") {
-        triggered = true;
-        await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
-        completionHandled.resolve();
+    const getWorkspaceTurnSpy = spyOn(store, "getWorkspaceTurn").mockImplementation(
+      async (ownerWorkspaceId: string, handleId: string) => {
+        const record = await originalGetWorkspaceTurn(ownerWorkspaceId, handleId);
+        if (!triggered && handleId === "wst_handle" && record?.status === "running") {
+          triggered = true;
+          await internal.handleStreamEnd(workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
+          completionHandled.resolve();
+        }
+        return record;
       }
-      return record;
-    });
+    );
 
     const reportPromise = workspaceTurnManagerFor(taskService).waitForWorkspaceTurn("wst_handle", {
       requestingWorkspaceId: parentId,
@@ -32198,12 +32139,15 @@ describe("TaskService", () => {
     assert(staleRunningRecord, "expected running workspace-turn record");
     const completedInternal = completed.taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
-      settleWorkspaceTurn: (params: unknown) => Promise<void>;
     };
     await completedInternal.handleStreamEnd(
       workspaceTurnStreamEndEvent(completed.parentId, "msg_done", "Done")
     );
-    await completedInternal.settleWorkspaceTurn({
+    await (
+      workspaceTurnManagerFor(completed.taskService) as unknown as {
+        settleWorkspaceTurn: (params: unknown) => Promise<void>;
+      }
+    ).settleWorkspaceTurn({
       cause: { kind: "user-stream-abort" },
       record: staleRunningRecord,
       next: {
@@ -32243,7 +32187,7 @@ describe("TaskService", () => {
     ).interruptWorkspaceTurn(interrupted.parentId, "wst_secondhandle");
     expect(interruptResult.success).toBe(true);
     await (
-      interrupted.taskService as unknown as {
+      workspaceTurnManagerFor(interrupted.taskService) as unknown as {
         settleWorkspaceTurn: (params: unknown) => Promise<void>;
       }
     ).settleWorkspaceTurn({
@@ -32339,8 +32283,7 @@ describe("TaskService", () => {
     const { aiService } = createAIServiceMocks(config);
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(rootWorkspaceId, "childworkspace", handleId, "completed", {
         reportMarkdown: "Done before notify policy persisted",
@@ -32759,16 +32702,13 @@ describe("TaskService", () => {
     // every admission-visible marker refuses on its own.
     const internals = taskService as unknown as {
       workspaceStopsInProgress: Map<string, number>;
-      taskHandleStore: {
-        upsertWorkspaceTurn: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>;
-      };
     };
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // A STALE handle settling for the same workspace is NOT settlement for the live execution:
     // the mirror still points at wst_leaf, so releasing here would let the still-running child
     // resume peer messaging with nothing admission-visible refusing it.
-    await internals.taskHandleStore.upsertWorkspaceTurn(
+    await new TaskHandleStore(config).upsertWorkspaceTurn(
       workspaceTurnRecord("tree-root", "leaf-a", "wst_stale", "running", {
         turnId: "wst_stale-turn",
         createdAt: "2026-08-24T00:00:00.000Z",
@@ -32905,12 +32845,6 @@ describe("TaskService", () => {
     interruptSpy.mockRestore();
     const internals = taskService as unknown as {
       workspaceStopsInProgress: Map<string, number>;
-      activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
-      updateAgentTaskExecutionState: (
-        workspaceId: string,
-        handleId: string,
-        status: "interrupted"
-      ) => Promise<void>;
     };
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
@@ -32923,13 +32857,19 @@ describe("TaskService", () => {
       config as unknown as { saveConfig: (config: unknown) => Promise<void> },
       "saveConfig"
     ).mockImplementation(() => Promise.resolve());
-    await internals.updateAgentTaskExecutionState("leaf-a", "wst_leaf", "interrupted");
+    await workspaceTurnManagerFor(taskService).updateAgentTaskExecutionState(
+      "leaf-a",
+      "wst_leaf",
+      "interrupted"
+    );
     saveSpy.mockRestore();
 
     // The stale mirror really is still on disk...
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskExecutionStatus).toBe("running");
     // ...but the registration is gone and the latch released: admission refuses on its own.
-    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.has("leaf-a")).toBe(false);
+    expect(
+      workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("leaf-a")
+    ).toBeUndefined();
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
 
     taskService.resetAutoResumeCount("branch-a");
@@ -32990,9 +32930,10 @@ describe("TaskService", () => {
     });
     const internals = taskService as unknown as {
       workspaceStopsInProgress: Map<string, number>;
-      activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
     };
-    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.has("leaf-a")).toBe(false);
+    expect(
+      workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("leaf-a")
+    ).toBeUndefined();
     expect(stopStream).toHaveBeenCalledWith(
       "leaf-a",
       expect.objectContaining({ abandonPartial: false })
@@ -33576,8 +33517,7 @@ describe("TaskService", () => {
       hasPendingQueuedOrPreparingTurn,
     });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentTaskId, childTaskId, executionTaskId, "queued", {
         turnId: "turn-nested-active-guidance",
@@ -33863,8 +33803,7 @@ describe("TaskService", () => {
     );
     expect(reactivated.success).toBe(true);
     const handleId = "wst_settlehandle";
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     const activeRecord = await taskHandleStore.getWorkspaceTurn(parentWorkspaceId, handleId);
     assert(activeRecord, "reactivated workspace-turn record is required");
 
@@ -33984,8 +33923,7 @@ describe("TaskService", () => {
       data: { delivery: "reactivated", executionTaskId: "wst_compactionhandle" },
     });
     const handleId = "wst_compactionhandle";
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     const activeRecord = await taskHandleStore.getWorkspaceTurn(parentWorkspaceId, handleId);
     assert(activeRecord, "reactivated workspace-turn record is required");
 
@@ -34206,17 +34144,14 @@ describe("TaskService", () => {
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ remove });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    (
-      taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<
-          string,
-          { handleId: string; ownerWorkspaceId: string }
-        >;
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+      workspaceTurnId,
+      {
+        handleId: workspaceTurnHandleId,
+        ownerWorkspaceId: parentTaskId,
+        accepted: false,
       }
-    ).activeWorkspaceTurnHandleByWorkspaceId.set(workspaceTurnId, {
-      handleId: workspaceTurnHandleId,
-      ownerWorkspaceId: parentTaskId,
-    });
+    );
 
     await handleTaskServiceStreamEndForTest(taskService, {
       type: "stream-end",
@@ -34283,17 +34218,14 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    (
-      taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<
-          string,
-          { handleId: string; ownerWorkspaceId: string }
-        >;
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+      workspaceTurnId,
+      {
+        handleId: workspaceTurnHandleId,
+        ownerWorkspaceId: parentTaskId,
+        accepted: false,
       }
-    ).activeWorkspaceTurnHandleByWorkspaceId.set(workspaceTurnId, {
-      handleId: workspaceTurnHandleId,
-      ownerWorkspaceId: parentTaskId,
-    });
+    );
 
     await handleTaskServiceStreamEndForTest(taskService, {
       type: "stream-end",
@@ -34342,17 +34274,14 @@ describe("TaskService", () => {
 
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    (
-      taskService as unknown as {
-        activeWorkspaceTurnHandleByWorkspaceId: Map<
-          string,
-          { handleId: string; ownerWorkspaceId: string }
-        >;
+    workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
+      workspaceTurnId,
+      {
+        handleId: workspaceTurnHandleId,
+        ownerWorkspaceId: parentTaskId,
+        accepted: false,
       }
-    ).activeWorkspaceTurnHandleByWorkspaceId.set(workspaceTurnId, {
-      handleId: workspaceTurnHandleId,
-      ownerWorkspaceId: parentTaskId,
-    });
+    );
 
     await taskService.initialize();
 
@@ -34425,8 +34354,7 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ resumeStream, sendMessage });
     const { historyService, taskService } = createTaskServiceHarness(config, { workspaceService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentWorkspaceId, childTaskId, handleId, "completed", {
         turnId: "turn-continuation-report",
@@ -34512,8 +34440,7 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { historyService, taskService } = createTaskServiceHarness(config, { workspaceService });
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentWorkspaceId, childTaskId, handleId, "completed", {
         turnId: "turn-continuation-fallback",
@@ -34734,8 +34661,7 @@ describe("TaskService", () => {
     );
 
     const { historyService, taskService } = createTaskServiceHarness(config);
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, workspaceTurnId, "wst_restart_backfill", "running", {
         turnId: "turn-restart-backfill",
@@ -34807,8 +34733,7 @@ describe("TaskService", () => {
     );
 
     const { historyService, taskService } = createTaskServiceHarness(config);
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, workspaceTurnId, "wst_restart_preserve", "running", {
         turnId: "turn-restart-preserve",

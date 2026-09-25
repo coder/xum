@@ -20,7 +20,10 @@ import { makeWorkspaceHostFake } from "@/node/services/taskWorkspaceSeam.testUti
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TaskService } from "@/node/services/taskService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
-import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
+import type {
+  TaskHandleStore,
+  WorkspaceTurnTaskHandleRecord,
+} from "@/node/services/taskHandleStore";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { MuxMessageMetadata } from "@/common/types/message";
 
@@ -412,6 +415,21 @@ export function workspaceTurnManagerFor(
   return (
     service as unknown as { getWorkspaceTurnManager(): WorkspaceTurnManager }
   ).getWorkspaceTurnManager();
+}
+
+/**
+ * Private WorkspaceTurnManager state for tests that seed or spy on it. Production registers live
+ * handles only inside createWorkspaceTurn/reawakening, so tests that seed that state (or spy on
+ * the exact TaskHandleStore instance the manager uses) must reach the owner's private fields.
+ */
+export function workspaceTurnManagerInternals(service: TaskService | WorkspaceTurnManager) {
+  return workspaceTurnManagerFor(service) as unknown as {
+    taskHandleStore: TaskHandleStore;
+    activeWorkspaceTurnHandleByWorkspaceId: Map<
+      string,
+      NonNullable<ReturnType<WorkspaceTurnManager["getLiveWorkspaceTurnRegistration"]>>
+    >;
+  };
 }
 
 export function workspaceTurnRecord(
