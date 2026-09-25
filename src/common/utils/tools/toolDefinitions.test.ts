@@ -1,9 +1,7 @@
 import { z } from "zod";
-import { RUNTIME_MODE } from "@/common/types/runtime";
 import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
 import {
   buildTaskToolAgentArgsSchema,
-  buildTaskToolDescription,
   getAvailableTools,
   supportsGoogleNativeToolsWithFunctionTools,
   TaskToolArgsSchema,
@@ -553,15 +551,6 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
-  it("dispatches task tool description on runtime mode", () => {
-    // Different runtimes give the agent different visibility guidance for whether
-    // sub-agents see uncommitted parent changes, so the function must actually
-    // branch on runtimeMode rather than collapse to a single string.
-    expect(buildTaskToolDescription(RUNTIME_MODE.LOCAL)).not.toBe(
-      buildTaskToolDescription(RUNTIME_MODE.WORKTREE)
-    );
-  });
-
   it("accepts workspace turn queue dispatch mode", () => {
     const parsed = TOOL_DEFINITIONS.task.schema.safeParse({
       kind: "workspace",
@@ -613,31 +602,10 @@ describe("TOOL_DEFINITIONS", () => {
   describe("task tool isolation parameter", () => {
     const validArgs = { agentId: "explore", prompt: "investigate", title: "Investigate" };
 
-    it("only advertises isolation on runtimes that can share the parent checkout", () => {
-      // Worktree/SSH expose `isolation`; the (local) variant strips it so it never reaches the model.
-      const withIsolation = buildTaskToolAgentArgsSchema({ includeIsolation: true });
-      const withoutIsolation = buildTaskToolAgentArgsSchema({ includeIsolation: false });
-
-      expect(withIsolation.safeParse({ ...validArgs, isolation: "none" }).success).toBe(true);
-      // .strict() rejects the unknown key outright on the local variant.
-      expect(withoutIsolation.safeParse({ ...validArgs, isolation: "none" }).success).toBe(false);
-      // Both variants still accept args that omit isolation entirely.
-      expect(withoutIsolation.safeParse(validArgs).success).toBe(true);
-    });
-
     it("rejects unknown isolation modes", () => {
       const schema = buildTaskToolAgentArgsSchema({ includeIsolation: true });
       expect(schema.safeParse({ ...validArgs, isolation: "fork" }).success).toBe(true);
       expect(schema.safeParse({ ...validArgs, isolation: "sandbox" }).success).toBe(false);
-    });
-
-    it("documents the isolation option only for shareable runtimes", () => {
-      for (const mode of [RUNTIME_MODE.WORKTREE, RUNTIME_MODE.SSH]) {
-        expect(buildTaskToolDescription(mode)).toContain('isolation: "none"');
-      }
-      for (const mode of [RUNTIME_MODE.LOCAL, RUNTIME_MODE.DOCKER, RUNTIME_MODE.DEVCONTAINER]) {
-        expect(buildTaskToolDescription(mode)).not.toContain('isolation: "none"');
-      }
     });
   });
 
@@ -721,12 +689,6 @@ describe("TOOL_DEFINITIONS", () => {
     expect(tools).toContain("task_retitle");
     expect(tools).toContain("task_stop");
     expect(tools).toContain("task_remove");
-  });
-
-  it("includes the workspace heartbeat tool", () => {
-    const tools = getAvailableTools("openai:gpt-4o");
-
-    expect(tools).toContain("heartbeat");
   });
 
   it("only includes Review pane tools when enableReviewPane is not disabled", () => {

@@ -76,24 +76,24 @@ describe("task tool", () => {
       isolation: "none",
     });
 
-  it("omits the isolation parameter from the schema on local runtimes", () => {
-    using tempDir = new TestTempDir("test-task-tool-local-isolation-schema");
+  // One owner for the runtime-dependent isolation contract: the schema accepts `isolation` and
+  // the description documents it only on runtimes that can share the parent checkout.
+  it.each([
+    ["worktree", true],
+    ["ssh", true],
+    ["local", false],
+    ["docker", false],
+    ["devcontainer", false],
+  ] as const)("offers isolation only on shareable runtimes (%s)", (runtime, shared) => {
+    using tempDir = new TestTempDir(`test-task-tool-${runtime}-isolation`);
     const tool = createTaskTool({
       ...createTestToolConfig(tempDir.path),
-      xumEnv: { MUX_RUNTIME: "local" },
+      xumEnv: { MUX_RUNTIME: runtime },
     });
 
-    expect(parseWithIsolation(tool).success).toBe(false);
-  });
-
-  it("advertises the isolation parameter in the schema on worktree runtimes", () => {
-    using tempDir = new TestTempDir("test-task-tool-worktree-isolation-schema");
-    const tool = createTaskTool({
-      ...createTestToolConfig(tempDir.path),
-      xumEnv: { MUX_RUNTIME: "worktree" },
-    });
-
-    expect(parseWithIsolation(tool).success).toBe(true);
+    expect(parseWithIsolation(tool).success).toBe(shared);
+    if (shared) expect(tool.description).toContain('isolation: "none"');
+    else expect(tool.description).not.toContain('isolation: "none"');
   });
 
   // Multi-project workspaces run through a runtime that derives every checkout from the task's own
