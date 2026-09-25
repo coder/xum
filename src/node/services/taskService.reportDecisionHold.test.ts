@@ -1917,4 +1917,49 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await stack.cleanup();
     }
   }, 20_000);
+
+  // A workflow step with an output schema ends its turn with plain text and no agent_report. That
+  // final response is a report candidate, so the stream-end decision is still pending when schema
+  // validation rejects it; the completion prompt must decide it first or its admission is refused
+  // and the step waits for a report forever.
+  test("a workflow step whose final response fails its output schema still gets its completion prompt", async () => {
+    const childId = "schemastep01";
+    const stack = await createStack(childId, {
+      agentType: "exec",
+      agentId: "exec",
+      workflowTask: {
+        runId: "wfr_schema_step",
+        stepId: "implement",
+        outputSchema: {
+          type: "object",
+          required: ["summary"],
+          properties: { summary: { type: "string" } },
+        },
+      },
+    });
+    const { config, taskService, svc, workspaceService, completions, streamStarts } = stack;
+    try {
+      // The owning workflow run is active in production; the harness has no run store.
+      spyOn(
+        taskService as unknown as { getInactiveWorkflowTaskOwnerForRecovery: () => unknown },
+        "getInactiveWorkflowTaskOwnerForRecovery"
+      ).mockImplementation(() => Promise.resolve(null));
+      expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
+      const attemptA = entryOf(config, childId)!.taskAttemptId!;
+      expect(
+        await workspaceService.sendMessage(childId, "implement it", { model, agentId: "exec" })
+      ).toEqual(Ok(undefined));
+      expect(completions).toHaveLength(1);
+      stack.endStream(0, {}, true);
+      await until(() => completions.length === 2, "the completion prompt turn started");
+      expect(streamStarts[1]).toMatchObject({
+        row: attemptA,
+        owner: attemptA,
+        status: "awaiting_report",
+      });
+      expect(outstanding(svc, childId)).toHaveLength(0);
+    } finally {
+      await stack.cleanup();
+    }
+  }, 20_000);
 });
