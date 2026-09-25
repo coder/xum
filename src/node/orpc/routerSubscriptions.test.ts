@@ -10,9 +10,9 @@ import {
 import { expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { TestClock } from "effect/testing";
+import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscriptions";
 import { disposeAppRuntime, makeAppRuntime } from "@/node/services/di/appRuntime";
 import type { ORPCContext } from "./context";
-import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "./streamBridge";
 import {
   subscribeWorkspaceActivity,
   subscribeDesignExperiment,
