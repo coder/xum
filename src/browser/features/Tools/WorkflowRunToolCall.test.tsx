@@ -4,6 +4,7 @@ import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import * as RealExperimentsContextModule from "@/browser/contexts/ExperimentsContext";
 import {
   cloneElement,
   createContext,
@@ -57,7 +58,12 @@ interface MockDialogTriggerChildProps {
   "aria-haspopup"?: "dialog";
 }
 
-restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
+restoreModulesAfterSuite([
+  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
+  // The experiments stub below exports only useExperimentValue; without a restore, later
+  // suites that render the real ExperimentsProvider/useExperiment would see it too.
+  ["@/browser/contexts/ExperimentsContext", { ...RealExperimentsContextModule }],
+]);
 
 void mock.module("@/browser/components/Dialog/Dialog", () => ({
   Dialog: (props: {

@@ -1,16 +1,10 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { copyFile, readFile, rm, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
 import React from "react";
-import { requireTestModule } from "@/browser/testUtils";
-import type * as APIModule from "@/browser/contexts/API";
-import type { APIClient } from "@/browser/contexts/API";
-import type * as ProjectContextModule from "@/browser/contexts/ProjectContext";
-import type * as ThinkingContextModule from "@/browser/contexts/ThinkingContext";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { ProjectProvider } from "@/browser/contexts/ProjectContext";
+import { ThinkingProvider } from "@/browser/contexts/ThinkingContext";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   DEFAULT_MODEL_KEY,
@@ -23,131 +17,7 @@ import {
   getRuntimeKey,
 } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
-import type * as DraftWorkspaceSettingsModule from "./useDraftWorkspaceSettings";
-
-let APIProvider!: typeof APIModule.APIProvider;
-let ProjectProvider!: typeof ProjectContextModule.ProjectProvider;
-let ThinkingProvider!: typeof ThinkingContextModule.ThinkingProvider;
-let useDraftWorkspaceSettings!: typeof DraftWorkspaceSettingsModule.useDraftWorkspaceSettings;
-let isolatedModulePaths: string[] = [];
-
-const hooksDir = dirname(fileURLToPath(import.meta.url));
-const contextsDir = join(hooksDir, "../contexts");
-
-async function importIsolatedDraftWorkspaceSettingsModules() {
-  const suffix = randomUUID();
-  const isolatedApiPath = join(contextsDir, `API.real.${suffix}.tsx`);
-  const isolatedProjectPath = join(contextsDir, `ProjectContext.real.${suffix}.tsx`);
-  const isolatedThinkingPath = join(contextsDir, `ThinkingContext.real.${suffix}.tsx`);
-  const isolatedThinkingLevelPath = join(hooksDir, `useThinkingLevel.real.${suffix}.ts`);
-  const isolatedReasoningModePath = join(hooksDir, `useReasoningMode.real.${suffix}.ts`);
-  const isolatedHookPath = join(hooksDir, `useDraftWorkspaceSettings.real.${suffix}.ts`);
-
-  await copyFile(join(contextsDir, "API.tsx"), isolatedApiPath);
-
-  const projectContextSource = await readFile(join(contextsDir, "ProjectContext.tsx"), "utf8");
-  const isolatedProjectContextSource = projectContextSource.replace(
-    'from "@/browser/contexts/API";',
-    `from "./API.real.${suffix}.tsx";`
-  );
-
-  if (isolatedProjectContextSource === projectContextSource) {
-    throw new Error("Failed to rewrite ProjectContext API import for the isolated test copy");
-  }
-
-  await writeFile(isolatedProjectPath, isolatedProjectContextSource);
-
-  const thinkingContextSource = await readFile(join(contextsDir, "ThinkingContext.tsx"), "utf8");
-  const isolatedThinkingContextSource = thinkingContextSource.replace(
-    'from "@/browser/contexts/API";',
-    `from "./API.real.${suffix}.tsx";`
-  );
-
-  if (isolatedThinkingContextSource === thinkingContextSource) {
-    throw new Error("Failed to rewrite ThinkingContext API import for the isolated test copy");
-  }
-
-  await writeFile(isolatedThinkingPath, isolatedThinkingContextSource);
-
-  const thinkingLevelSource = await readFile(join(hooksDir, "useThinkingLevel.ts"), "utf8");
-  const isolatedThinkingLevelSource = thinkingLevelSource.replace(
-    'from "@/browser/contexts/ThinkingContext";',
-    `from "../contexts/ThinkingContext.real.${suffix}.tsx";`
-  );
-
-  if (isolatedThinkingLevelSource === thinkingLevelSource) {
-    throw new Error("Failed to rewrite useThinkingLevel ThinkingContext import");
-  }
-
-  await writeFile(isolatedThinkingLevelPath, isolatedThinkingLevelSource);
-
-  // useReasoningMode reads the same ThinkingContext; without this rewrite the
-  // hook copy would resolve the canonical context (a different React context
-  // instance than the isolated ThinkingProvider in the wrapper) and throw.
-  const reasoningModeSource = await readFile(join(hooksDir, "useReasoningMode.ts"), "utf8");
-  const isolatedReasoningModeSource = reasoningModeSource.replace(
-    'from "@/browser/contexts/ThinkingContext";',
-    `from "../contexts/ThinkingContext.real.${suffix}.tsx";`
-  );
-
-  if (isolatedReasoningModeSource === reasoningModeSource) {
-    throw new Error("Failed to rewrite useReasoningMode ThinkingContext import");
-  }
-
-  await writeFile(isolatedReasoningModePath, isolatedReasoningModeSource);
-
-  const hookSource = await readFile(join(hooksDir, "useDraftWorkspaceSettings.ts"), "utf8");
-  const hookWithIsolatedThinkingLevel = hookSource.replace(
-    'from "./useThinkingLevel";',
-    `from "./useThinkingLevel.real.${suffix}.ts";`
-  );
-
-  if (hookWithIsolatedThinkingLevel === hookSource) {
-    throw new Error("Failed to rewrite useDraftWorkspaceSettings thinking hook import");
-  }
-
-  const hookWithIsolatedReasoningMode = hookWithIsolatedThinkingLevel.replace(
-    'from "./useReasoningMode";',
-    `from "./useReasoningMode.real.${suffix}.ts";`
-  );
-
-  if (hookWithIsolatedReasoningMode === hookWithIsolatedThinkingLevel) {
-    throw new Error("Failed to rewrite useDraftWorkspaceSettings reasoning-mode hook import");
-  }
-
-  const isolatedHookSource = hookWithIsolatedReasoningMode.replace(
-    'from "@/browser/contexts/ProjectContext";',
-    `from "../contexts/ProjectContext.real.${suffix}.tsx";`
-  );
-
-  if (isolatedHookSource === hookWithIsolatedReasoningMode) {
-    throw new Error("Failed to rewrite useDraftWorkspaceSettings project context import");
-  }
-
-  await writeFile(isolatedHookPath, isolatedHookSource);
-
-  ({ APIProvider } = requireTestModule<{ APIProvider: typeof APIModule.APIProvider }>(
-    isolatedApiPath
-  ));
-  ({ ProjectProvider } = requireTestModule<{
-    ProjectProvider: typeof ProjectContextModule.ProjectProvider;
-  }>(isolatedProjectPath));
-  ({ ThinkingProvider } = requireTestModule<{
-    ThinkingProvider: typeof ThinkingContextModule.ThinkingProvider;
-  }>(isolatedThinkingPath));
-  ({ useDraftWorkspaceSettings } = requireTestModule<{
-    useDraftWorkspaceSettings: typeof DraftWorkspaceSettingsModule.useDraftWorkspaceSettings;
-  }>(isolatedHookPath));
-
-  return [
-    isolatedApiPath,
-    isolatedProjectPath,
-    isolatedThinkingPath,
-    isolatedThinkingLevelPath,
-    isolatedReasoningModePath,
-    isolatedHookPath,
-  ];
-}
+import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
 
 function createStubApiClient(): APIClient {
   // useModelLRU() only needs providers.getConfig + providers.onConfigChanged.
@@ -186,9 +56,7 @@ describe("useDraftWorkspaceSettings", () => {
   let originalDocument: typeof globalThis.document;
   let originalLocalStorage: typeof globalThis.localStorage;
 
-  beforeEach(async () => {
-    isolatedModulePaths = await importIsolatedDraftWorkspaceSettingsModules();
-
+  beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalLocalStorage = globalThis.localStorage;
@@ -199,17 +67,12 @@ describe("useDraftWorkspaceSettings", () => {
     globalThis.localStorage.clear();
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup();
     mock.restore();
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.localStorage = originalLocalStorage;
-
-    for (const modulePath of isolatedModulePaths) {
-      await rm(modulePath, { force: true });
-    }
-    isolatedModulePaths = [];
   });
 
   test("uses global default agent when project preference is unset", async () => {
