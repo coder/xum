@@ -3651,6 +3651,11 @@ describe("WorkspaceStore", () => {
       releaseActivityStop();
       await tick(0);
       expect(rowListener).toHaveBeenCalledTimes(2);
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { streamingMessageStore } = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(streamingMessageStore.has(`${workspaceId}\u0000${liveRow.id}`)).toBe(false);
       unsubscribe();
     });
 
@@ -4586,6 +4591,13 @@ describe("WorkspaceStore", () => {
       expect(state.muxMessages.map((message) => message.id)).toEqual(["live-compaction-summary"]);
       expect(state.hasOlderHistory).toBe(true);
       expect(state.loadingOlderHistory).toBe(false);
+
+      // hasOlder is true either way, so the next load's cursor proves which state won.
+      await store.loadOlderHistory(workspaceId);
+      expect(mockHistoryLoadMore).toHaveBeenLastCalledWith({
+        workspaceId,
+        cursor: { beforeHistorySequence: 6, beforeMessageId: "live-compaction-summary" },
+      });
     });
   });
 
@@ -6318,6 +6330,11 @@ describe("WorkspaceStore", () => {
       // The delete-time sweep must release the keyed channel as well (which notifies its
       // subscriber): with the transient entry gone, no later sweep can rediscover this key.
       expect(advisorListener).toHaveBeenCalledTimes(1);
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { advisorLiveStore } = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-output-delete`)).toBe(false);
       unsubscribe();
     });
 
@@ -6361,6 +6378,11 @@ describe("WorkspaceStore", () => {
       // so the reset itself must release the keyed channel (notifying its subscriber).
       expect(advisorListener).toHaveBeenCalledTimes(1);
       expect(store.getAdvisorToolLiveOutput(workspaceId, "call-advisor-replay-reset")).toBeNull();
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { advisorLiveStore } = getInternal<{
+        advisorLiveStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(advisorLiveStore.has(`${workspaceId}\u0000call-advisor-replay-reset`)).toBe(false);
       unsubscribe();
       mockChatScript([], { keepOpen: true });
     });
