@@ -609,7 +609,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(first?.receiptEligible).toBe(false);
       // Stop settles THIS process's attempt; the next reawaken's predecessor is settled here.
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       // ...but the predecessor is marked, and the marker is inherited: still not eligible.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       expect(svc.ownedAttemptByTaskId.get(taskId)?.receiptEligible).toBe(false);
@@ -1336,7 +1338,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           phase: "settled",
         });
         expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+        });
       }
     );
 
@@ -1507,7 +1511,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // ...and an explicit Stop settles whatever is owned: the outcome recovers to terminal, the
       // id is closed, and the next reawaken is admitted (still marked, as the marker is inherited).
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId: rotated,
         phase: "settled",
@@ -1738,7 +1744,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           phase: "settled",
           source: "stop-settled",
         });
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+        });
         expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
           kind: "refused",
           message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
@@ -1786,7 +1794,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId: fresh,
         phase: "settled",
       });
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
     });
 
     test("a Stop that completes while a reawaken is still evaluating overtakes it: refused, nothing rotated or owned; a fresh reawaken then proceeds", async () => {
@@ -2003,7 +2013,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // unowned id, and that settlement proves the next reawaken's lineage.
       await taskService.terminateAllDescendantAgentTasks(rootId);
       await waitForStopRelease(taskService, spawnedId);
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       expect(await taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
       expect(svc.ownedAttemptByTaskId.get(spawnedId)).toMatchObject({
         source: "reawaken",
@@ -2117,7 +2129,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
               phase: "settled",
             });
-            expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+            expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
+              kind: "terminal-no-report",
+            });
             return;
           }
           // The captured owner outlived the bound: NO settlement proof — the latch holds and the
@@ -2146,7 +2160,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             source: "stop-settled",
           });
           expect(svc.admittedSendsByTaskId.has(spawnedId)).toBe(false);
-          expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+          expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
+            kind: "terminal-no-report",
+          });
           // Deferred means deferred: the interrupted workspace remains for the user or parent to
           // remove; nothing deletes it behind their back.
           expect(rollbackSpy).not.toHaveBeenCalled();
@@ -2638,7 +2654,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       // Legitimate reawaken publishes a fresh id; the fence admits it and installs ownership.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const fresh = admitted(
@@ -2698,7 +2716,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
       expect(svc.attemptSettlementByTaskId.get(taskId)?.phase).toBe("settled");
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       // Settlement closed the attempt: a continuation is refused; only a reawaken reopens.
       expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "automatic" })).toEqual(
         {
@@ -2750,7 +2770,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(send.state).toBe("discharged");
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
     });
 
     test("a queued token is refused while a stop is in progress and stays refused once the attempt settled", async () => {
@@ -2815,7 +2837,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         phase: "settled",
         source: "launch-failed",
       });
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       expect(
         taskService.admitTaskWorkspaceTurn(spawnedId, { acceptanceOrigin: "automatic" })
       ).toEqual({
@@ -2875,7 +2899,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         attemptId,
         phase: "settled",
       });
-      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(spawnedId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
     });
 
     test("an idle stop treats a pending admission as live and closes the attempt only once it is dispositioned", async () => {
@@ -2908,7 +2934,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         phase: "settled",
         source: "user-stop-idle",
       });
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
     });
 
     test("a Stop of an unowned prior-process attempt closes its id without minting settlement evidence", async () => {
@@ -3024,7 +3052,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
       expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       // The stop is not permanent: a later reawaken mints a fresh id and is admitted again.
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       const fresh = taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
@@ -3116,7 +3146,9 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         phase: "settled",
         source: "stop-settled",
       });
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
     });
 
     test("a reactivation while a Stop is in progress is refused before it publishes an attempt", async () => {

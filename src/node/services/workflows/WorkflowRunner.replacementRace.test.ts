@@ -232,7 +232,8 @@ describe("two runners race to replace one retired attempt (G2)", () => {
     const ids: string[] = [];
     for (const project of config.loadConfigOrDefault().projects.values()) {
       for (const ws of project.workspaces) {
-        if (ws.workflowTask?.stepId === STEP_ID && ws.id !== PRIOR) ids.push(ws.id);
+        if (ws.workflowTask?.stepId === STEP_ID && ws.id != null && ws.id !== PRIOR)
+          ids.push(ws.id);
       }
     }
     return ids.sort();

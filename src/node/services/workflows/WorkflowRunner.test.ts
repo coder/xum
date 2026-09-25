@@ -107,7 +107,6 @@ const acceptClaim = async () => ({ success: true as const, nonce: "nonce-test" }
  */
 function withReservedReplacement(adapter: WorkflowTaskAdapter): WorkflowTaskAdapter {
   const results = new Map<string, WorkflowAgentResult>();
-  const waitForPrior = adapter.waitForAgentTask;
   return {
     ...adapter,
     async createAgentTasks(specs, lifecycle) {
@@ -123,8 +122,11 @@ function withReservedReplacement(adapter: WorkflowTaskAdapter): WorkflowTaskAdap
     async waitForAgentTask(taskId, spec, waitOptions) {
       const result = results.get(taskId);
       if (result != null) return result;
-      assert(waitForPrior != null, "withReservedReplacement: the prior attempt needs a wait");
-      return await waitForPrior(taskId, spec, waitOptions);
+      assert(
+        adapter.waitForAgentTask != null,
+        "withReservedReplacement: the prior attempt needs a wait"
+      );
+      return await adapter.waitForAgentTask(taskId, spec, waitOptions);
     },
   };
 }

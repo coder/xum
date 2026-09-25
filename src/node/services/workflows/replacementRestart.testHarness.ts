@@ -140,7 +140,7 @@ async function resume(root: string) {
     claimRetiredAttempt: (taskId, attemptId, claimant) =>
       taskService.claimRetiredAttempt(taskId, attemptId, claimant),
     // Stands in for the replacement's model turn.
-    waitForAgentReport: async (taskId) => ({ reportMarkdown: `report from ${taskId}` }),
+    waitForAgentReport: (taskId) => Promise.resolve({ reportMarkdown: `report from ${taskId}` }),
   };
   const store = new WorkflowRunStore({ sessionDir: sessionDir(config) });
   const runner = new WorkflowRunner({
@@ -158,7 +158,7 @@ async function resume(root: string) {
   const children: string[] = [];
   for (const project of config.loadConfigOrDefault().projects.values()) {
     for (const ws of project.workspaces) {
-      if (ws.workflowTask?.stepId === FIXTURE_STEP_ID) children.push(ws.id);
+      if (ws.workflowTask?.stepId === FIXTURE_STEP_ID && ws.id != null) children.push(ws.id);
     }
   }
   const run = await store.getRun(FIXTURE_RUN_ID);
@@ -179,6 +179,8 @@ try {
   process.stdout.write(`FIXTURE_RESULT ${JSON.stringify(output)}\n`);
   process.exit(0);
 } catch (error: unknown) {
-  process.stderr.write(`FIXTURE_ERROR ${error instanceof Error ? error.stack : String(error)}\n`);
+  process.stderr.write(
+    `FIXTURE_ERROR ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`
+  );
   process.exit(1);
 }

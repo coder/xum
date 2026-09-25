@@ -3750,7 +3750,10 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<Result<{ nonce: string }, string>> {
     assert(taskId.length > 0, "claimRetiredAttempt: taskId must be non-empty");
     assertTaskAttemptId(attemptId, "claimRetiredAttempt");
-    assert(claimant.runId.length > 0 && claimant.stepId.length > 0, "claimRetiredAttempt: claimant");
+    assert(
+      claimant.runId.length > 0 && claimant.stepId.length > 0,
+      "claimRetiredAttempt: claimant"
+    );
     return await this.workspaceEventLocks.withLock(taskId, async () => {
       if (
         this.isWorkspaceStopInProgress(taskId) ||
@@ -3787,8 +3790,10 @@ export class TaskService implements AgentTaskIntegration {
       if (refusal != null) return Err(refusal);
       let row: WorkspaceConfigEntry | undefined;
       try {
-        row = findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId)
-          ?.workspace;
+        row = findWorkspaceEntry(
+          this.config.loadConfigOrDefault({ throwOnError: true }),
+          taskId
+        )?.workspace;
       } catch (error: unknown) {
         return Err(`claim unconfirmed: config unreadable: ${getErrorMessage(error)}`);
       }
