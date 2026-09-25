@@ -561,6 +561,44 @@ describe("plan-review feedback whose snapshot or threads leave history before it
     expect(siblingStream).not.toHaveBeenCalled();
     expect(authenticFeedbackRows(await h.allRows())).toHaveLength(1);
   });
+
+  test("(11) an intact copy repairs an earlier partial copy of the same record", async () => {
+    const h = await fixture();
+    setMonitor(h, false);
+    await seedSnapshot(h);
+    // A damaged crash duplicate of the same record: its only comment anchor points past the
+    // snapshot, so the projection accepts the feedback without its thread (partial).
+    assert(feedback.kind === "feedback");
+    const damaged: PlanReviewRecord = {
+      ...feedback,
+      comments: [{ ...feedback.comments[0], anchor: { startLine: 99, endLine: 99 } }],
+    };
+    expect(
+      (
+        await h.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("pr-feedback-damaged", "user", formatPlanReviewEnvelope(damaged), {
+            timestamp: Date.now(),
+            muxMetadata: buildPlanReviewMetadata(damaged),
+          })
+        )
+      ).success
+    ).toBe(true);
+    expect(planReviewThreads(await getPlanReviewState(h.historyService, workspaceId))).toEqual([]);
+
+    const sent = await h.session.sendMessage(feedbackText, {
+      ...options,
+      muxMetadata: feedbackMeta,
+    });
+    expect(sent.success).toBe(true);
+    expect(h.stream).toHaveBeenCalledTimes(1);
+    const state = await getPlanReviewState(h.historyService, workspaceId);
+    expect(planReviewThreads(state)).toEqual(["thr_1"]);
+    assert(state.success);
+    expect(state.data.feedbacks.map((entry) => [entry.feedbackId, entry.threadIds])).toEqual([
+      ["fb_1", ["thr_1"]],
+    ]);
+  });
 });
 
 describe("plan-review feedback refused before it streams", () => {

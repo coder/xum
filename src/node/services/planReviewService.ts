@@ -593,36 +593,35 @@ export function createPlanReviewFeedbackPrecondition(
   if (carried.length === 0) return undefined;
   return (history) => {
     const prior = history.filter(isPlanReviewRow);
-    const priorRecordIds = new Set(
-      prior.flatMap((row) => {
-        const muxMetadata = row.metadata?.muxMetadata;
-        return muxMetadata?.type === PLAN_REVIEW_METADATA_TYPE ? [muxMetadata.recordId] : [];
-      })
-    );
+    const options = { hashContent: hashPlanSnapshotContent };
+    const priorState = derivePlanReviewState(prior, options);
     return carried.every((candidate) => {
       const record = getAuthenticPlanReviewRecord(candidate);
       assert(record?.kind === "feedback", "carried plan-review feedback must stay authentic");
-      // A row with this record id already in history means another dispatch (e.g. a sibling
-      // backend recovering the same compaction follow-up) appended it first. Replay would ignore
-      // this candidate as a duplicate while the earlier copy satisfies every check below, so a
-      // second provider-visible row and model turn would slip through. Only plan-review rows are
-      // in `prior`: the compaction request and summary that carry the deferred follow-up are not,
-      // so the follow-up's own append after compaction still passes.
-      if (priorRecordIds.has(record.recordId)) return false;
-      const state = derivePlanReviewState([...prior, candidate], {
-        hashContent: hashPlanSnapshotContent,
-      });
-      const feedback = state.feedbacks.find((entry) => entry.feedbackId === record.feedbackId);
-      if (feedback === undefined || feedback.threadIds.length !== record.comments.length) {
-        return false;
-      }
-      return record.replies.every((reply) =>
-        state.threads.some(
-          (thread) =>
-            thread.threadId === reply.threadId &&
-            thread.replies.some((entry) => entry.replyId === reply.replyId)
-        )
-      );
+      // History already holding this feedback fully accepted means another dispatch (e.g. a
+      // sibling backend recovering the same compaction follow-up) appended it first; the check
+      // below would pass on that copy alone and start a duplicate model turn. A PARTIAL earlier
+      // copy (a damaged crash duplicate) is not refused: this intact candidate is what lets the
+      // projection fill in its missing items. Only plan-review rows are in `prior`, so the
+      // compaction request and summary that carry the deferred follow-up never count here.
+      if (isFeedbackFullyAccepted(priorState, record)) return false;
+      return isFeedbackFullyAccepted(derivePlanReviewState([...prior, candidate], options), record);
     });
   };
+}
+
+/** Whether `state` holds `record` with every comment thread and every reply accepted. */
+function isFeedbackFullyAccepted(
+  state: PlanReviewState,
+  record: PlanReviewFeedbackRecord
+): boolean {
+  const feedback = state.feedbacks.find((entry) => entry.feedbackId === record.feedbackId);
+  if (feedback === undefined || feedback.threadIds.length !== record.comments.length) return false;
+  return record.replies.every((reply) =>
+    state.threads.some(
+      (thread) =>
+        thread.threadId === reply.threadId &&
+        thread.replies.some((entry) => entry.replyId === reply.replyId)
+    )
+  );
 }
