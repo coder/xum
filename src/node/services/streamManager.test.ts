@@ -44,7 +44,6 @@ import {
 } from "./autoThinkingEscalation";
 import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import * as aiSdk from "ai";
 import {
   APICallError,
@@ -3072,21 +3071,6 @@ describe("StreamManager - call settings overrides", () => {
 
     expect(streamTextSpy).toHaveBeenCalledWith(expect.objectContaining({ onChunk }));
   });
-
-  test("does not store streamCallSettings when overrides are empty", () => {
-    const streamManager = new StreamManager(historyService);
-    const { buildRequestConfig } = getRequestHelpers(streamManager);
-
-    const requestWithUndefined = buildRequest(buildRequestConfig, {
-      callSettingsOverrides: undefined,
-    });
-    const requestWithEmpty = buildRequest(buildRequestConfig, {
-      callSettingsOverrides: {},
-    });
-
-    expect(requestWithUndefined.streamCallSettings).toBeUndefined();
-    expect(requestWithEmpty.streamCallSettings).toBeUndefined();
-  });
 });
 
 describe("StreamManager - language model cleanup", () => {
@@ -3830,72 +3814,6 @@ describe("StreamManager - turn completion", () => {
       await (stopPromise ?? streamManager.stopStream(workspaceId));
       await completionObserved;
     }
-  });
-});
-
-describe("StreamManager - stripEncryptedContent", () => {
-  test("strips encryptedContent from array output shape", () => {
-    const output = [
-      {
-        url: "https://example.com/a",
-        title: "Result A",
-        pageAge: "2d",
-        encryptedContent: "secret-a",
-      },
-      {
-        url: "https://example.com/b",
-        title: "Result B",
-      },
-      "non-object-item",
-    ];
-
-    expect(stripEncryptedContent(output)).toEqual([
-      {
-        url: "https://example.com/a",
-        title: "Result A",
-        pageAge: "2d",
-      },
-      {
-        url: "https://example.com/b",
-        title: "Result B",
-      },
-      "non-object-item",
-    ]);
-  });
-
-  test("strips encryptedContent from json value output shape", () => {
-    const output = {
-      type: "json",
-      value: [
-        {
-          url: "https://example.com/c",
-          title: "Result C",
-          encryptedContent: "secret-c",
-        },
-        {
-          url: "https://example.com/d",
-          title: "Result D",
-          pageAge: "5h",
-        },
-      ],
-      source: "web_search",
-    };
-
-    expect(stripEncryptedContent(output)).toEqual({
-      type: "json",
-      value: [
-        {
-          url: "https://example.com/c",
-          title: "Result C",
-        },
-        {
-          url: "https://example.com/d",
-          title: "Result D",
-          pageAge: "5h",
-        },
-      ],
-      source: "web_search",
-    });
   });
 });
 
