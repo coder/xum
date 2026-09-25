@@ -16,8 +16,8 @@ import {
   createStreamManagerForTests,
   engineInternals,
   fakeStreamText,
-  onTurnEngineEvent,
 } from "./streamManager.testHarness";
+import type { EffectRunner } from "./di/effectRunner";
 import {
   installStreamManagerTestHistory,
   historyService,
@@ -222,55 +222,121 @@ describe("StreamManager - stream resource scope", () => {
     ]);
   });
 
+  /** Virtual time far past the partial-write throttle window. */
+  const PAST_THROTTLE_WINDOW_MS = 60_000;
+
+  /**
+   * Streams "first" (written immediately: nothing was written yet), waits until
+   * that write stamped the throttle clock, then streams "second" inside the
+   * throttle window so it is debounced instead of written. `tail` decides whether
+   * the stream then finishes or stays open until it is stopped.
+   */
+  async function startDebouncedPartialStream(input: {
+    workspaceId: string;
+    tail: "finish" | "open";
+    runner?: EffectRunner;
+    aroundSecondDelta?: { before: () => void; after: () => void };
+  }) {
+    const secondDeltaProcessed = Promise.withResolvers<number>();
+    const writePartial = historyService.writePartial.bind(historyService);
+    // One resolver per write, settled once that write completed on disk.
+    const writesCompleted: Array<{ promise: Promise<void>; resolve: () => void }> = [];
+    const writeResolver = (count: number) => {
+      while (writesCompleted.length < count) writesCompleted.push(Promise.withResolvers<void>());
+      return writesCompleted[count - 1];
+    };
+    const writeCompleted = (count: number): Promise<void> => writeResolver(count).promise;
+    let completedWrites = 0;
+    const writePartialSpy = spyOn(historyService, "writePartial").mockImplementation(
+      async (...args) => {
+        const result = await writePartial(...args);
+        completedWrites += 1;
+        writeResolver(completedWrites).resolve();
+        return result;
+      }
+    );
+    const streamManager = createStreamManagerForTests(historyService, {
+      runner: input.runner,
+      streamText: fakeStreamText(({ abortSignal }) =>
+        createStreamResultForTests(
+          (async function* () {
+            yield { type: "text-delta", text: "first" };
+            await writeCompleted(1);
+            // flushPartialWrite stamps the throttle clock in a microtask
+            // continuation of that write; one macrotask hop drains it.
+            await new Promise((resolve) => setImmediate(resolve));
+            input.aroundSecondDelta?.before();
+            yield { type: "text-delta", text: "second" };
+            // The consumer fully processed "second" before pulling the next part.
+            input.aroundSecondDelta?.after();
+            secondDeltaProcessed.resolve(writePartialSpy.mock.calls.length);
+            if (input.tail === "finish") {
+              yield { type: "finish", finishReason: "stop" };
+              return;
+            }
+            await new Promise<void>((resolve) =>
+              abortSignal!.addEventListener("abort", () => resolve(), { once: true })
+            );
+          })()
+        )
+      ),
+    });
+    const messageId = `${input.workspaceId}-msg`;
+    await appendPartialAssistantForTests(input.workspaceId, messageId, 1);
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: input.workspaceId,
+        messageId,
+        model: createTestLanguageModel(),
+        tools: {},
+        providedRuntimeTempDir: "",
+      })
+    );
+    if (!result.success) throw new Error("Expected stream to start");
+    return {
+      streamManager,
+      handle: result.data,
+      writePartialSpy,
+      // Resolves once the count-th partial write completed.
+      writeCompleted,
+      // Resolves with the partial-write count right after "second" was processed.
+      writesAfterSecondDelta: secondDeltaProcessed.promise,
+    };
+  }
+
+  async function partialText(workspaceId: string): Promise<string | undefined> {
+    const partial = await historyService.readPartial(workspaceId);
+    return partial?.parts
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("");
+  }
+
   test("interrupts a pending debounced partial write when the stream ends", async () => {
     // A debounced partial flush scheduled during streaming is tied to the
     // stream's resource scope. Once the stream ends, the pending flush must be
     // interrupted with the scope — a late write would resurrect partial state
     // for a dead stream. The debounce sleeps on the injected runner's
-    // TestClock, so "later" is a virtual-time adjust, not a real wait.
+    // TestClock, so "later" is a virtual-time adjust, not a real wait. The
+    // injected-clock test below proves this same setup arms a debounce.
     const testRunner = makeTestEffectRunner();
     try {
       const workspaceId = "scope-debounce-interrupt-workspace";
-      let debounceArmedBeforeFinish = false;
-      const streamManager = createStreamManagerForTests(historyService, {
-        runner: testRunner.runner,
-        streamText: fakeStreamText(() =>
-          createStreamResultForTests(
-            (async function* () {
-              // First delta writes immediately (lastPartialWriteTime starts at 0).
-              yield { type: "text-delta", text: "first" };
-              // Wait until that write stamps the throttle clock so the second
-              // delta deterministically lands inside the throttle window.
-              while ((streamInfoForTests()?.lastPartialWriteTime ?? 0) === 0) {
-                await new Promise((resolve) => setTimeout(resolve, 5));
-              }
-              yield { type: "text-delta", text: "second" };
-              // The consumer fully processed the second delta before pulling the
-              // next part, and the debounce arms synchronously.
-              debounceArmedBeforeFinish = streamInfoForTests()?.partialWriteFiber != null;
-              yield { type: "finish", finishReason: "stop" };
-            })()
-          )
-        ),
-      });
+      const { handle, writePartialSpy, writesAfterSecondDelta } = await startDebouncedPartialStream(
+        {
+          workspaceId,
+          tail: "finish",
+          runner: testRunner.runner,
+        }
+      );
 
-      const workspaceStreams = engineInternals(streamManager).workspaceStreams;
-      const streamInfoForTests = () =>
-        workspaceStreams.get(workspaceId) as
-          | { lastPartialWriteTime?: number; partialWriteFiber?: unknown }
-          | undefined;
-      const writePartialSpy = spyOn(historyService, "writePartial");
-
-      const throttleMs: unknown = engineInternals(streamManager).PARTIAL_WRITE_THROTTLE_MS;
-      if (typeof throttleMs !== "number") {
-        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
-      }
-
-      await runLifecycleStreamForTests(streamManager, workspaceId);
-
-      expect(debounceArmedBeforeFinish).toBe(true);
+      // "second" was debounced, not written, before the stream finished.
+      expect(await writesAfterSecondDelta).toBe(1);
+      expect(await handle.completion).toMatchObject({ status: "completed" });
+      // Let the fire-and-forget scope close settle.
+      await new Promise((resolve) => setTimeout(resolve, 0));
       const writesAtStreamEnd = writePartialSpy.mock.calls.length;
-      await testRunner.adjust(throttleMs * 2);
+      await testRunner.adjust(PAST_THROTTLE_WINDOW_MS);
       // A flush that survived the scope close would settle on the next macrotask.
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(writePartialSpy.mock.calls.length).toBe(writesAtStreamEnd);
@@ -281,53 +347,53 @@ describe("StreamManager - stream resource scope", () => {
 
   test("a debounced partial write arms a real setTimeout through the default runner", async () => {
     // Default-runner smoke: with nothing injected the debounce sleeps on
-    // Effect's default clock, i.e. a real setTimeout. Intercepting the timer
-    // registration (as the RetryManager smoke does) keeps this deterministic:
-    // no wall-clock window that a loaded host could overrun.
+    // Effect's default clock, i.e. a real setTimeout. Intercepting the timers
+    // registered while "second" is processed (as the RetryManager smoke does)
+    // keeps this deterministic: no wall-clock window that a loaded host could
+    // overrun.
     const realSetTimeout = globalThis.setTimeout;
     const timers: Array<{ delayMs: number; fire: () => void }> = [];
+    let capturing = false;
     const setTimeoutSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
       handler: TimerHandler,
-      timeout?: number
+      timeout?: number,
+      ...args: unknown[]
     ) => {
+      if (!capturing) return realSetTimeout(handler, timeout, ...args);
       if (typeof handler !== "function") {
         throw new Error("debounce smoke only supports function timer handlers");
       }
       timers.push({ delayMs: timeout ?? 0, fire: handler as () => void });
       return timers.length as unknown as ReturnType<typeof setTimeout>;
     }) as unknown as typeof setTimeout);
+    const workspaceId = "default-runner-debounce-workspace";
+    const { streamManager, writePartialSpy, writeCompleted, writesAfterSecondDelta } =
+      await startDebouncedPartialStream({
+        workspaceId,
+        tail: "open",
+        aroundSecondDelta: {
+          before: () => {
+            capturing = true;
+          },
+          after: () => {
+            capturing = false;
+          },
+        },
+      });
     try {
-      const streamManager = new StreamManager(historyService);
-      const workspaceId = "default-runner-debounce-workspace";
-      const throttleMs: unknown = engineInternals(streamManager).PARTIAL_WRITE_THROTTLE_MS;
-      if (typeof throttleMs !== "number") {
-        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
-      }
-      // A write just happened: the whole throttle window is still ahead.
-      const streamInfo = createStreamInfoForTests({ lastPartialWriteTime: Date.now() });
-      engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-      const schedulePartialWrite = engineInternals(streamManager).schedulePartialWrite;
-      const writePartialSpy = spyOn(historyService, "writePartial");
-
-      await schedulePartialWrite.call(streamManager, workspaceId, streamInfo);
-      expect(streamInfo.partialWriteFiber).toBeDefined();
-      expect(writePartialSpy).not.toHaveBeenCalled();
+      expect(await writesAfterSecondDelta).toBe(1);
       // Exactly one timer, for the remaining throttle window.
       expect(timers).toHaveLength(1);
       expect(timers[0].delayMs).toBeGreaterThan(0);
-      expect(timers[0].delayMs).toBeLessThanOrEqual(throttleMs);
 
       timers[0].fire();
-      setTimeoutSpy.mockRestore();
       // The flush's Effect.promise settles asynchronously.
-      const deadline = Date.now() + 2_000;
-      while (writePartialSpy.mock.calls.length === 0 && Date.now() < deadline) {
-        await new Promise((resolve) => realSetTimeout(resolve, 5));
-      }
-      expect(writePartialSpy).toHaveBeenCalledTimes(1);
-      expect(streamInfo.partialWriteFiber).toBeUndefined();
+      await writeCompleted(2);
+      expect(writePartialSpy).toHaveBeenCalledTimes(2);
+      expect(await partialText(workspaceId)).toBe("firstsecond");
     } finally {
       setTimeoutSpy.mockRestore();
+      await streamManager.stopStream(workspaceId);
     }
   });
 
@@ -336,38 +402,30 @@ describe("StreamManager - stream resource scope", () => {
     // runtime's clock in production), not the global runtime: a TestClock
     // runner fires the flush only when the test clock advances.
     const testRunner = makeTestEffectRunner();
+    const workspaceId = "runner-debounce-workspace";
+    const { streamManager, writePartialSpy, writeCompleted, writesAfterSecondDelta } =
+      await startDebouncedPartialStream({
+        workspaceId,
+        tail: "open",
+        runner: testRunner.runner,
+      });
     try {
-      const streamManager = new StreamManager(
-        historyService,
-        undefined,
-        undefined,
-        undefined,
-        testRunner.runner
-      );
       expect(streamManager.effectRunner).toBe(testRunner.runner);
-      const workspaceId = "runner-debounce-workspace";
-      // Inside the throttle window, so the write is debounced rather than immediate.
-      const streamInfo = createStreamInfoForTests({ lastPartialWriteTime: Date.now() });
-      engineInternals(streamManager).workspaceStreams.set(workspaceId, streamInfo);
-      const schedulePartialWrite = engineInternals(streamManager).schedulePartialWrite;
-      const writePartialSpy = spyOn(historyService, "writePartial");
-      const throttleMs: unknown = engineInternals(streamManager).PARTIAL_WRITE_THROTTLE_MS;
-      if (typeof throttleMs !== "number") {
-        throw new Error("Expected StreamManager.PARTIAL_WRITE_THROTTLE_MS to be a number");
-      }
-
-      await schedulePartialWrite.call(streamManager, workspaceId, streamInfo);
-      expect(streamInfo.partialWriteFiber).toBeDefined();
-      // Real time passes; the virtual clock has not, so nothing flushes.
+      expect(await writesAfterSecondDelta).toBe(1);
+      // Real time passes; the virtual clock has not, so nothing flushes. A fixed
+      // negative window, not a wait: the adjust below is the positive signal.
       await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(writePartialSpy).not.toHaveBeenCalled();
-
-      await testRunner.adjust(throttleMs);
-      // The flush's Effect.promise settles on the next macrotask.
-      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(writePartialSpy).toHaveBeenCalledTimes(1);
-      expect(streamInfo.partialWriteFiber).toBeUndefined();
+
+      await testRunner.adjust(PAST_THROTTLE_WINDOW_MS);
+      // The flush's Effect.promise starts the write on the next macrotask, well
+      // before a real-clock sleep could have elapsed.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(writePartialSpy).toHaveBeenCalledTimes(2);
+      await writeCompleted(2);
+      expect(await partialText(workspaceId)).toBe("firstsecond");
     } finally {
+      await streamManager.stopStream(workspaceId);
       await testRunner.dispose();
     }
   });
@@ -394,31 +452,31 @@ describe("StreamManager - language model cleanup", () => {
     workspaceId: string;
     messageId: string;
     model: LanguageModel;
-    streamInfoOverrides?: Record<string, unknown>;
+    fullStream: (abortSignal: AbortSignal) => AsyncGenerator<unknown, void, unknown>;
+    usage?: unknown;
+    stopWhileStreaming?: boolean;
   }): Promise<void> {
-    const streamManager = new StreamManager(historyService);
-    const historySequence = 1;
-
-    await appendPartialAssistantForTests(params.workspaceId, params.messageId, historySequence);
-
-    const streamInfo = createStreamInfoForTests({
-      messageId: params.messageId,
-      token: `${params.messageId}-token`,
-      model: "openai:gpt-4.1-mini",
-      metadataModel: "openai:gpt-4.1-mini",
-      historySequence,
-      request: { model: params.model, messages: [], providerOptions: undefined },
-      runtime,
-      ...params.streamInfoOverrides,
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: fakeStreamText(({ abortSignal }) =>
+        createStreamResultForTests(params.fullStream(abortSignal!), params.usage)
+      ),
     });
-    engineInternals(streamManager).workspaceStreams.set(params.workspaceId, streamInfo);
+    await appendPartialAssistantForTests(params.workspaceId, params.messageId, 1);
 
-    await engineInternals(streamManager).processStreamWithCleanup.call(
-      streamManager,
-      params.workspaceId,
-      streamInfo,
-      historySequence
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: params.workspaceId,
+        messageId: params.messageId,
+        model: params.model,
+        runtime,
+        providedRuntimeTempDir: "",
+      })
     );
+    if (!result.success) throw new Error("Expected stream to start");
+    if (params.stopWhileStreaming) {
+      expect((await streamManager.stopStream(params.workspaceId)).success).toBe(true);
+    }
+    await result.data.completion;
   }
 
   const cleanupLifecycleCases: Array<{
@@ -426,88 +484,81 @@ describe("StreamManager - language model cleanup", () => {
     modelId: string;
     workspaceId: string;
     messageId: string;
-    streamInfoOverrides: (getCleanupCalls: () => number) => Record<string, unknown>;
+    fullStream: (
+      getCleanupCalls: () => number,
+      abortSignal: AbortSignal
+    ) => AsyncGenerator<unknown, void, unknown>;
+    usage?: unknown;
+    stopWhileStreaming?: boolean;
   }> = [
     {
       name: "runs model cleanup when stream processing finishes",
       modelId: "cleanup-model",
       workspaceId: "cleanup-workspace",
       messageId: "cleanup-message",
-      streamInfoOverrides: () => ({
-        streamResult: createStreamResultForTests(
-          (async function* () {
-            await Promise.resolve();
-            yield { type: "finish", finishReason: "stop" };
-          })()
-        ),
-        parts: [{ type: "text" as const, text: "done", timestamp: Date.now() }],
-      }),
+      fullStream: () =>
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "done" };
+          yield { type: "finish", finishReason: "stop" };
+        })(),
     },
     {
       name: "keeps model cleanup until a multi-step tool stream finishes",
       modelId: "cleanup-multistep-model",
       workspaceId: "cleanup-multistep-workspace",
       messageId: "cleanup-multistep-message",
-      streamInfoOverrides: (getCleanupCalls) => ({
-        streamResult: createStreamResultForTests(
-          (async function* () {
-            await Promise.resolve();
-            yield {
-              type: "tool-call",
-              toolCallId: "call-1",
-              toolName: "test_tool",
-              input: { value: 1 },
-            };
-            expect(getCleanupCalls()).toBe(0);
-            yield {
-              type: "tool-result",
-              toolCallId: "call-1",
-              toolName: "test_tool",
-              output: { ok: true },
-            };
-            expect(getCleanupCalls()).toBe(0);
-            yield { type: "text-delta", text: "done" };
-            expect(getCleanupCalls()).toBe(0);
-            yield { type: "finish", finishReason: "stop" };
-          })()
-        ),
-      }),
+      fullStream: (getCleanupCalls) =>
+        (async function* () {
+          await Promise.resolve();
+          yield {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "test_tool",
+            input: { value: 1 },
+          };
+          expect(getCleanupCalls()).toBe(0);
+          yield {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "test_tool",
+            output: { ok: true },
+          };
+          expect(getCleanupCalls()).toBe(0);
+          yield { type: "text-delta", text: "done" };
+          expect(getCleanupCalls()).toBe(0);
+          yield { type: "finish", finishReason: "stop" };
+        })(),
     },
     {
       name: "runs model cleanup when stream processing fails",
       modelId: "cleanup-error-model",
       workspaceId: "cleanup-error-workspace",
       messageId: "cleanup-error-message",
-      streamInfoOverrides: () => ({
-        streamResult: createStreamResultForTests(
-          (async function* () {
-            await Promise.resolve();
-            throw new Error("stream failed before output");
-            yield* [] as unknown[];
-          })(),
-          { inputTokens: 1, outputTokens: 0, totalTokens: 1 }
-        ),
-      }),
+      fullStream: () =>
+        (async function* () {
+          await Promise.resolve();
+          throw new Error("stream failed before output");
+          yield* [] as unknown[];
+        })(),
+      usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 },
     },
     {
       name: "runs model cleanup when stream processing is aborted",
       modelId: "cleanup-abort-model",
       workspaceId: "cleanup-abort-workspace",
       messageId: "cleanup-abort-message",
-      streamInfoOverrides: () => {
-        const abortController = new AbortController();
-        abortController.abort(new Error("test abort"));
-        return {
-          abortController,
-          streamResult: createStreamResultForTests(
-            (async function* () {
-              await Promise.resolve();
-              yield* [];
-            })(),
-            { inputTokens: 1, outputTokens: 0, totalTokens: 1 }
-          ),
-        };
-      },
+      fullStream: (getCleanupCalls, abortSignal) =>
+        (async function* () {
+          // Still streaming when the stop lands: cleanup must wait for the abort.
+          expect(getCleanupCalls()).toBe(0);
+          await new Promise<void>((resolve) =>
+            abortSignal.addEventListener("abort", () => resolve(), { once: true })
+          );
+          yield* [];
+        })(),
+      usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+      stopWhileStreaming: true,
     },
   ];
 
@@ -519,7 +570,9 @@ describe("StreamManager - language model cleanup", () => {
         workspaceId: cleanupCase.workspaceId,
         messageId: cleanupCase.messageId,
         model,
-        streamInfoOverrides: cleanupCase.streamInfoOverrides(getCleanupCalls),
+        fullStream: (abortSignal) => cleanupCase.fullStream(getCleanupCalls, abortSignal),
+        usage: cleanupCase.usage,
+        stopWhileStreaming: cleanupCase.stopWhileStreaming,
       });
 
       expect(getCleanupCalls()).toBe(1);
@@ -556,7 +609,10 @@ describe("StreamManager - language model cleanup", () => {
     const runtime = createRuntime({ type: "local", srcBaseDir: "/tmp" });
     spyOn(runtime, "resolvePath").mockResolvedValue(tempDir.path);
     const workspaceId = `admission-${timing}`;
-    const streamManager = new StreamManager(historyService);
+    const events: unknown[] = [];
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      if (event.type === "stream-start") events.push(event);
+    });
     const { model, getCleanupCalls } = createCleanupModel(workspaceId);
     if (typeof model === "string" || !("doStream" in model))
       throw new Error("Expected provider model");
@@ -582,8 +638,6 @@ describe("StreamManager - language model cleanup", () => {
       new HistoryService(historyConfig).getCompactionCancellationStorage(workspaceId)
     );
     const abort = new AbortController();
-    const events: unknown[] = [];
-    onTurnEngineEvent(streamManager, "stream-start", (event) => events.push(event));
     const acquire = streamManager.createTempDirForStream.bind(streamManager);
     spyOn(streamManager, "createTempDirForStream").mockImplementationOnce(async (...args) => {
       const dir = await acquire(...args);
@@ -644,10 +698,11 @@ describe("StreamManager - language model cleanup", () => {
   });
 
   test("interrupt during onStreamConstructed skips processing and preserves a replacement registration", async () => {
-    const streamManager = new StreamManager(historyService);
-    const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
     const startEvents: unknown[] = [];
-    onTurnEngineEvent(streamManager, "stream-start", (event) => startEvents.push(event));
+    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
+      if (event.type === "stream-start") startEvents.push(event);
+    });
+    const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
 
     const workspaceId = "constructed-abort-workspace";
     const replacementSentinel = { replacement: true };
@@ -657,6 +712,8 @@ describe("StreamManager - language model cleanup", () => {
       // processingPromise, and deletes the registration…
       await streamManager.stopStream(workspaceId);
       // …after which a replacement stream can occupy the workspace slot.
+      // Kept whitebox: the start lock is held across onStreamConstructed, so no
+      // public start can register that replacement here; seed the registry.
       const streams = engineInternals(streamManager).workspaceStreams;
       streams.set(workspaceId, replacementSentinel);
     };
@@ -747,6 +804,8 @@ describe("StreamManager - language model cleanup", () => {
   test("throwing startup envelope cleanup preserves a replacement registration", async () => {
     const workspaceId = "throwing-envelope-replacement";
     const streamManager = new StreamManager(historyService);
+    // Kept whitebox: the start lock is held across onStreamConstructed, so no
+    // public start can register the replacement; seed the registry directly.
     const streams = engineInternals(streamManager).workspaceStreams;
     const replacement = createStreamInfoForTests({ messageId: "replacement" });
     const { model, getCleanupCalls } = createCleanupModel("throwing-envelope");
