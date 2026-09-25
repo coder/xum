@@ -398,6 +398,16 @@ export interface SendMessageInternalOptions {
    * heartbeat's model/agent.
    */
   yieldToQueuedMessages?: boolean;
+  /**
+   * For opportunistic promoted tool-end wakes (busy-owner sub-agent report cuts): quietly drop
+   * the send (success) when another send is in preflight, or when, at the enqueue point, the
+   * promoted entry would not become the queue head. Unlike yieldToQueuedMessages, hidden
+   * turn-end entries do not block it. A preflight manual send is invisible to the queue but may
+   * carry stricter caller restrictions; queued behind it, this wake would run after it with the
+   * older grants it captured. The in-preflight recheck also rides the entry to its dispatch
+   * gates, like the other preflight-yielding sends.
+   */
+  yieldToPreflightSends?: boolean;
 }
 
 export interface WorkspaceTurnHost {
@@ -458,6 +468,12 @@ export interface TurnAdmissionHost {
    * live only in that session, so removing the workspace would silently lose them.
    */
   hasPendingUserInput(workspaceId: string): boolean;
+  /**
+   * Whether a promoteAheadOfHiddenTurnEnd tool-end send would become the queue head (the queue is
+   * empty or holds only hidden turn-end entries), so it would cut the active stream. False while
+   * any user-authored entry or tool-end entry is queued.
+   */
+  promotedToolEndWouldLeadQueue(workspaceId: string): boolean;
   hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
   /**
    * Re-run the workspace's idle queue drain. Called by the task layer when a stream-end decision

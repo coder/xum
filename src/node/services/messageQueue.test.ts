@@ -760,6 +760,41 @@ describe("MessageQueue", () => {
       expect(queue.getMessages()).toEqual(["peer message"]);
     });
 
+    it("predicts whether a promoted tool-end add becomes the head", () => {
+      const promote = () =>
+        queue.add(
+          "promoted",
+          { ...validOptions, queueDispatchMode: "tool-end" },
+          { ...hidden, promoteAheadOfHiddenTurnEnd: true }
+        );
+      const scenarios: Array<[string, () => void, boolean]> = [
+        ["empty", () => undefined, true],
+        [
+          "hidden turn-end only",
+          () => queue.add("peer", { ...validOptions, queueDispatchMode: "turn-end" }, hidden),
+          true,
+        ],
+        [
+          "user-authored entry",
+          () => queue.add("user", { ...validOptions, queueDispatchMode: "turn-end" }),
+          false,
+        ],
+        [
+          "hidden tool-end entry",
+          () => queue.add("tool-end", { ...validOptions, queueDispatchMode: "tool-end" }, hidden),
+          false,
+        ],
+      ];
+      for (const [name, seed, expected] of scenarios) {
+        queue = new MessageQueue();
+        seed();
+        expect([name, queue.promotedToolEndWouldLead()]).toEqual([name, expected]);
+        promote();
+        // The prediction must agree with where the promoted entry actually lands.
+        expect([name, queue.getMessages()[0] === "promoted"]).toEqual([name, expected]);
+      }
+    });
+
     it("never overtakes a user-authored turn-end entry", () => {
       queue.add("hidden turn-end", { ...validOptions, queueDispatchMode: "turn-end" }, hidden);
       queue.add("user wait for turn end", { ...validOptions, queueDispatchMode: "turn-end" });

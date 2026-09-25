@@ -6,6 +6,8 @@ import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
+import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import {
   buildWorkflowRunCardMessage,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
@@ -16,6 +18,7 @@ import {
   createTestConfig,
   createWorkspaceServiceMocks,
   projectWorkspace,
+  saveLocalParentWorkspace,
   saveWorkspaces,
   streamEnd,
   testTaskSettings,
@@ -1750,6 +1753,227 @@ describe("TaskService", () => {
     expect(serializedParentHistory).toContain("structuredOutput");
     expect(serializedParentHistory).toContain("claims");
     expect(serializedParentHistory).not.toContain("Background sub-agent task(s) have completed");
+  });
+
+  test("terminal report cuts a busy parent's turn with one coalesced tool-end wake", async () => {
+    const config = await createTestConfig(rootDir);
+
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-busy-111";
+    const childTaskId = "task-busy-222";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        },
+      ],
+      testTaskSettings()
+    );
+
+    // The parent is mid-turn (for example blocked in a task_await on other tasks).
+    let parentStreaming = true;
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock(
+        (workspaceId: string) => workspaceId === parentWorkspaceId && parentStreaming
+      ),
+    });
+    const liveTurn = Symbol("parent-turn");
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks({
+      getActiveTurnGeneration: mock(() => (parentStreaming ? liveTurn : undefined)),
+    });
+    const { historyService, taskService } = createTaskServiceHarness(config, {
+      aiService,
+      workspaceService,
+    });
+    // The launch turn disabled bash. The wake starts a fresh turn at a time the child's report
+    // chooses, so it must keep that restriction like the idle drain's wake does.
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+    await historyService.appendToHistory(
+      parentWorkspaceId,
+      createMuxMessage("manual-restricted", "user", "coordinate the children", {
+        timestamp: 1_000,
+        toolPolicy: restrictedPolicy,
+      })
+    );
+    const drainAll = async () => {
+      await Promise.all([
+        ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
+          .pendingTerminalAttentionDrains,
+      ]);
+    };
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "agent-report-call-1",
+          toolName: "agent_report",
+          input: { reportMarkdown: "Hello from child", title: "Result" },
+          state: "output-available",
+          output: {
+            success: true,
+            report: { reportMarkdown: "Hello from child", title: "Result" },
+          },
+        },
+        { type: "text", text: "Hello from child" },
+      ],
+    });
+    await drainAll();
+
+    // The report is durable in history, and a tool-end wake is queued instead of waiting for idle.
+    const parentHistory = JSON.stringify(
+      await collectFullHistory(historyService, parentWorkspaceId)
+    );
+    expect(parentHistory).toContain("<mux_subagent_report>");
+    expect(resumeStream).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      // The shared opening is what classifies the row as a background wake in the UI/timeline.
+      expect.stringContaining(BACKGROUND_WORK_WAKE_OPENINGS.subagentsCompleted),
+      expect.objectContaining({ queueDispatchMode: "tool-end", toolPolicy: restrictedPolicy }),
+      expect.objectContaining({
+        synthetic: true,
+        agentInitiated: true,
+        promoteAheadOfHiddenTurnEnd: true,
+        yieldToPreflightSends: true,
+      })
+    );
+    // Keyed so reports arriving before the wake dispatches coalesce into one queued turn.
+    const wakeInternal = sendMessage.mock.calls[0]?.[3] as { queueDedupeKey?: unknown } | undefined;
+    expect(typeof wakeInternal?.queueDedupeKey).toBe("string");
+
+    // Edge-triggered: later busy drains (sweeps, other stream-ends) do not re-cut for the same report.
+    taskService.scheduleTerminalAttentionDrain(parentWorkspaceId);
+    await drainAll();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    // Once idle, the normal drain still owns delivery for reports no turn has answered yet.
+    parentStreaming = false;
+    taskService.scheduleTerminalAttentionDrain(parentWorkspaceId);
+    await drainAll();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(resumeStream).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      expect.anything(),
+      expect.objectContaining({ acceptanceOrigin: "automatic" })
+    );
+  });
+
+  for (const [name, wakeWouldLead, replaceTurnAfterDelivery, expectCut] of [
+    // Hidden turn-end entries (peer messages, heartbeats) are overtaken by the promoted wake.
+    ["only hidden turn-end work is queued", true, false, true],
+    // Security: a queued user-authored message may carry stricter restrictions not yet in
+    // history, and the wake could not overtake it.
+    ["user input is already queued", false, false, false],
+    // The delivery-time turn ended and a successor (which loaded the report) is streaming.
+    ["the delivery-time turn was replaced", true, true, false],
+  ] satisfies Array<[string, boolean, boolean, boolean]>) {
+    test(`busy parent cut when ${name}: ${expectCut ? "cuts" : "defers to idle"}`, async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-nocut-111";
+      const childTaskId = "task-nocut-222";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+            aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+          }),
+          {
+            path: path.join(projectPath, "child-task"),
+            id: childTaskId,
+            name: "agent_explore_child",
+            parentWorkspaceId,
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: "openai:gpt-5.2",
+            taskThinkingLevel: "medium",
+          },
+        ],
+        testTaskSettings()
+      );
+      const { aiService } = createAIServiceMocks(config, {
+        isStreaming: mock((workspaceId: string) => workspaceId === parentWorkspaceId),
+      });
+      const deliveryTurn = Symbol("delivery-turn");
+      const successorTurn = Symbol("successor-turn");
+      let replaced = false;
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+        getActiveTurnGeneration: mock(() => (replaced ? successorTurn : deliveryTurn)),
+        hasQueuedMessages: mock(() => true),
+        promotedToolEndWouldLeadQueue: mock(() => wakeWouldLead),
+        // The parent never goes idle in this test; without this the busy drain would re-poll.
+        waitForIdleAndNoQueuedMessages: mock(() => new Promise<void>(() => undefined)),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      // Swap the live turn right after the notification is enqueued (and its turn captured),
+      // before the drain it schedules can cut.
+      const enqueue = taskService.enqueueTerminalAttention.bind(taskService);
+      spyOn(taskService, "enqueueTerminalAttention").mockImplementation(async (params) => {
+        await enqueue(params);
+        replaced = replaceTurnAfterDelivery;
+      });
+
+      await streamEnd(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "assistant-child-output",
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [{ type: "text", text: "Hello from child" }],
+      });
+      await Promise.all([
+        ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
+          .pendingTerminalAttentionDrains,
+      ]);
+
+      expect(sendMessage).toHaveBeenCalledTimes(expectCut ? 1 : 0);
+    });
+  }
+
+  test("a report left pending from an earlier delivery never cuts a later busy turn", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((workspaceId: string) => workspaceId === parentId),
+    });
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    // Pending on disk but not delivered by this process (e.g. across a restart, or correlated
+    // with an older delegated continuation): the idle drain owns it, not a mid-turn cut.
+    const notification = await new TerminalAttentionStore(config).enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "agent_task",
+      sourceId: "earlier-child",
+    });
+    assert(notification);
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await Promise.all([
+      ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
+        .pendingTerminalAttentionDrains,
+    ]);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(resumeStream).not.toHaveBeenCalled();
   });
 
   // Track 2 r5: mux.events() in the parent's persistent sandbox mount depends on
