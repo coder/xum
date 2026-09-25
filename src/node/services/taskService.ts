@@ -4444,7 +4444,10 @@ export class TaskService implements AgentTaskIntegration {
       const pendingGuidance = task.taskPendingGuidance ?? [];
       const queueOnly = states.get(task.id) === "question";
       if (queueOnly && pendingGuidance.length === 0) continue;
-      const alreadyStreaming = this.aiService.isStreaming(task.id);
+      // A busy session counts as active: re-drive sends return once accepted, so an earlier
+      // recovery pass's nudge can still be preparing (not yet streaming) when this pass runs.
+      const alreadyStreaming =
+        this.aiService.isStreaming(task.id) || this.workspaceService.isBusyForMessage(task.id);
       // Guidance must queue even for active tasks; generic restart nudges must not.
       if (alreadyStreaming && pendingGuidance.length === 0) {
         skippedRunningAlreadyStreaming += 1;
@@ -5993,6 +5996,20 @@ export class TaskService implements AgentTaskIntegration {
       log.error("Failed to launch reserved task", { taskId: plan.taskId, error });
       void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error));
     });
+  }
+
+  /**
+   * Settles (never rejects) once the in-flight queue drain settles, including the launches it
+   * awaits. Shutdown joins it: startup recovery schedules its drain instead of awaiting it, so
+   * the recovery promise alone no longer covers those launches.
+   */
+  queueDrainSettled(): Promise<void> {
+    return (
+      this.maybeStartQueuedTasksInFlight?.then(
+        () => undefined,
+        () => undefined
+      ) ?? Promise.resolve()
+    );
   }
 
   scheduleMaybeStartQueuedTasks(): void {

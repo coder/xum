@@ -4816,6 +4816,53 @@ describe("TaskService", () => {
     expect(messagedWorkspaceIds).not.toContain(streamingTaskId);
   });
 
+  test("recovery does not re-drive a running task whose accepted turn is still preparing", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-restart-preparing";
+    const preparingTaskId = "child-running-preparing";
+    const idleTaskId = "child-running-idle";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "preparing", preparingTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+        projectWorkspace(projectPath, "idle", idleTaskId, {
+          parentWorkspaceId,
+          agentId: "exec",
+          agentType: "exec",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // An earlier pass's background nudge is accepted but not yet streaming: the session is busy.
+    const isBusyForMessage = mock((workspaceId: string) => workspaceId === preparingTaskId);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({ isBusyForMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const attemptBefore = findWorkspaceInConfig(config, preparingTaskId)?.taskAttemptId;
+
+    await taskService.recoverInterruptedTasks();
+
+    const messagedWorkspaceIds = (
+      sendMessage as unknown as { mock: { calls: unknown[][] } }
+    ).mock.calls.map((call) => call[0]);
+    expect(messagedWorkspaceIds).toContain(idleTaskId);
+    expect(messagedWorkspaceIds).not.toContain(preparingTaskId);
+    // Rotating would hand the preparing turn's result to a superseded attempt.
+    expect(findWorkspaceInConfig(config, preparingTaskId)?.taskAttemptId).toBe(attemptBefore);
+  });
+
   test("startup phases stay partitioned: recovery resumes tasks, housekeeping prunes reported ones", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -7712,6 +7759,11 @@ describe("TaskService", () => {
     await launchSendStarted.promise;
     try {
       expect((await raceWithAbortAndTimeout(recovery, { timeoutMs: 5_000 })).kind).toBe("ok");
+      // Shutdown joins the drain instead: it still covers the hanging launch.
+      const drainSettled = taskService.queueDrainSettled();
+      expect((await raceWithAbortAndTimeout(drainSettled, { timeoutMs: 50 })).kind).toBe("timeout");
+      launchSend.resolve(Ok(undefined));
+      expect((await raceWithAbortAndTimeout(drainSettled, { timeoutMs: 5_000 })).kind).toBe("ok");
     } finally {
       launchSend.resolve(Ok(undefined));
       await recovery;

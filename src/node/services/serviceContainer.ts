@@ -812,6 +812,9 @@ export class ServiceContainer {
     const housekeepingSettled = Promise.all([
       this.startupHousekeepingSettled,
       this.taskRecoverySettled,
+      // Recovery schedules its queue drain instead of awaiting it (see
+      // TaskService.recoverInterruptedTasks), so its launches are joined separately.
+      this.taskService.queueDrainSettled(),
     ]);
     await shutdownStep("startupHousekeeping.join", async () => {
       const joined = await raceWithAbortAndTimeout(housekeepingSettled, {
