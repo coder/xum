@@ -6387,16 +6387,7 @@ describe("MCPServerManager", () => {
       inputSchema: { type: "object", properties: {} },
       execute: executeTool,
     } as unknown as Tool;
-    access.startServers = mock((servers) =>
-      Promise.resolve(
-        startResult(
-          Object.keys(servers as Record<string, unknown>).map((name) => [
-            name,
-            { tools: { ping: dummyTool } },
-          ])
-        )
-      )
-    );
+    servers.serve("cmd-1", { tools: { ping: dummyTool } });
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const serverTool = result.tools.server_ping;
     if (!serverTool?.execute) {
@@ -6443,16 +6434,7 @@ describe("MCPServerManager", () => {
       inputSchema: { type: "object", properties: {} },
       execute: executeTool,
     } as unknown as Tool;
-    access.startServers = mock((servers) =>
-      Promise.resolve(
-        startResult(
-          Object.keys(servers as Record<string, unknown>).map((name) => [
-            name,
-            { tools: { ping: dummyTool } },
-          ])
-        )
-      )
-    );
+    servers.serve("cmd-1", { tools: { ping: dummyTool } });
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const serverTool = result.tools.server_ping;
     if (!serverTool?.execute) {
@@ -6470,6 +6452,26 @@ describe("MCPServerManager", () => {
     // its recorded options are installed but its repair is still pending.
     // The gate must not dispatch on the pre-publication enabled set.
     const workspaceId = "ws-gate-late-publication";
+    // The publication starts inside the call's revalidation bracket (its
+    // cross-process token read), with a repair that never completes (stalled
+    // config read).
+    let publishOnTokenRead = false;
+    let publication: Promise<void> | undefined;
+    manager.dispose();
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => {
+          if (publishOnTokenRead) {
+            configService.listServers = mock(() => new Promise(() => undefined));
+            publication ??= manager.applyWorkspaceOverrides(workspaceId, {
+              disabledServers: ["server"],
+            });
+          }
+          return Promise.resolve("epoch-1");
+        },
+      },
+    });
     configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd-1") }));
     const executeTool = mock(() => Promise.resolve({ content: [{ type: "text", text: "ok" }] }));
     const dummyTool = {
@@ -6477,44 +6479,25 @@ describe("MCPServerManager", () => {
       inputSchema: { type: "object", properties: {} },
       execute: executeTool,
     } as unknown as Tool;
-    access.startServers = mock((servers) =>
-      Promise.resolve(
-        startResult(
-          Object.keys(servers as Record<string, unknown>).map((name) => [
-            name,
-            { tools: { ping: dummyTool } },
-          ])
-        )
-      )
-    );
+    servers.serve("cmd-1", { tools: { ping: dummyTool } });
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const serverTool = result.tools.server_ping;
     if (!serverTool?.execute) {
       throw new Error("Expected served tool to include execute");
     }
-    // Hook the revalidation bracket: the publication starts inside it, with a
-    // repair that never completes (stalled config read).
-    const realRun = access.runWithStablePluginEpoch.bind(manager);
-    let publication: Promise<void> | undefined;
-    spyOn(access, "runWithStablePluginEpoch").mockImplementation(
-      async (operation: () => Promise<unknown>) => {
-        const value = await realRun(operation);
-        configService.listServers = mock(() => new Promise(() => undefined));
-        publication ??= manager.applyWorkspaceOverrides(workspaceId, {
-          disabledServers: ["server"],
-        });
-        return value;
-      }
-    );
+    publishOnTokenRead = true;
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(serverTool.execute({}, {} as never)).rejects.toThrow("server 'server'");
+    expect(publication).toBeDefined();
     expect(executeTool).not.toHaveBeenCalled();
   });
 
   test("a superseded publication repair cannot restore an older enabled set", async () => {
     // Publication #1 (enables) stalls in listServers past the publisher's
-    // bound; publication #2 (disables) completes. #1's late completion must
-    // not overwrite the live entry's enablement.
+    // bound; publication #2 completes after the server left the config. #1's
+    // late completion must not overwrite the live entry's enablement. #2
+    // names no override for the server, so the call-time gate can refuse it
+    // only through that enablement (an override disable would mask it).
     const workspaceId = "ws-stale-repair";
     configService.listServers = mock(() =>
       Promise.resolve({ server: stdioConfig("cmd-1"), stable: stdioConfig("cmd-stable") })
@@ -6525,16 +6508,8 @@ describe("MCPServerManager", () => {
       inputSchema: { type: "object", properties: {} },
       execute: executeTool,
     } as unknown as Tool;
-    access.startServers = mock((servers) =>
-      Promise.resolve(
-        startResult(
-          Object.keys(servers as Record<string, unknown>).map((name) => [
-            name,
-            { tools: { ping: dummyTool } },
-          ])
-        )
-      )
-    );
+    servers.serve("cmd-1", { tools: { ping: dummyTool } });
+    servers.serve("cmd-stable", { tools: { ping: dummyTool } });
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const serverTool = result.tools.server_ping;
     if (!serverTool?.execute) {
@@ -6552,14 +6527,10 @@ describe("MCPServerManager", () => {
     const first = manager.applyWorkspaceOverrides(workspaceId, { enabledServers: ["server"] });
     await new Promise((resolve) => setTimeout(resolve, 5));
     configService.listServers = mock(() => Promise.resolve({ stable: stdioConfig("cmd-stable") }));
-    await manager.applyWorkspaceOverrides(workspaceId, { disabledServers: ["server"] });
+    await manager.applyWorkspaceOverrides(workspaceId, {});
     releaseFirst();
     await first;
 
-    const entry = access.workspaceServers.get(workspaceId) as
-      | { enabledServerNames: Set<string> }
-      | undefined;
-    expect(entry?.enabledServerNames.has("server")).toBe(false);
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(serverTool.execute({}, {} as never)).rejects.toThrow("server 'server'");
     expect(executeTool).not.toHaveBeenCalled();
@@ -6708,13 +6679,12 @@ describe("MCPServerManager", () => {
       })
     );
     const workspaceId = "ws-revoked-mid-startup";
-    spyOn(access, "startServers").mockImplementation(async (...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
+    servers.serve("node other.js", { tools: { echo: testTool() } });
+    servers.serve("node ordinary.js", {
+      tools: { echo: testTool() },
       // A parent save publishes a disable while these servers are starting.
-      await manager.applyWorkspaceOverrides(workspaceId, { disabledServers: ["ordinary"] });
-      return startResult(
-        Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }])
-      );
+      connect: () =>
+        manager.applyWorkspaceOverrides(workspaceId, { disabledServers: ["ordinary"] }),
     });
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(result.tools)).toEqual(["other_echo"]);
@@ -6984,126 +6954,115 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(
-        startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
-      );
-    });
     const workspaceId = "ws-publish-after-repair";
+    let publishOnPromptRefresh = false;
+    let publication: Promise<void> | undefined;
+    servers.serve("node ordinary.js", {
+      tools: { echo: testTool() },
+      // A warm serve spawns its background prompt refresh after its final
+      // enablement repair and before its return gate; prompts/list is issued
+      // synchronously, so the publication's synchronous part (recorded
+      // options replaced, marker retired) lands exactly in that gap.
+      listPrompts: () => {
+        if (publishOnPromptRefresh) {
+          publication ??= manager.applyWorkspaceOverrides(workspaceId, {
+            disabledServers: ["ordinary"],
+          });
+        }
+        return Promise.resolve([]);
+      },
+    });
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    const repairAccess = access as unknown as {
-      repairEnablementAfterConcurrentMutation: (...args: unknown[]) => Promise<unknown>;
-    };
-    const realRepair = repairAccess.repairEnablementAfterConcurrentMutation.bind(manager);
-    let publication: Promise<void> | undefined;
-    spyOn(repairAccess, "repairEnablementAfterConcurrentMutation").mockImplementation(
-      async (...args: unknown[]) => {
-        const derivedFrom = await realRepair(...args);
-        // Emulate the gap: the publication's synchronous part (recorded
-        // options replaced, marker retired) runs before the caller resumes.
-        publication ??= manager.applyWorkspaceOverrides(workspaceId, {
-          disabledServers: ["ordinary"],
-        });
-        return derivedFrom;
-      }
-    );
+    publishOnPromptRefresh = true;
     const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(publication).toBeDefined();
     expect(Object.keys(served.tools)).toHaveLength(0);
     await publication;
 
     // The publication's own completion repaired the entry for later serves.
-    spyOn(repairAccess, "repairEnablementAfterConcurrentMutation").mockImplementation(realRepair);
     const next = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(next.tools)).toHaveLength(0);
     expect(next.stats.enabledServerCount).toBe(0);
   });
 
   test("getPrompt does not dispatch when a publication lands between the final serve and dispatch", async () => {
-    configService.listServers = mock(() =>
-      Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
-    );
+    const configured = { ordinary: stdioConfig("node ordinary.js") };
+    configService.listServers = mock(() => Promise.resolve(configured));
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { prompts: [{ name: "status" }], getPrompt }]))
-      );
-    });
+    servers.serve("node ordinary.js", { prompts: [{ name: "status" }], getPrompt });
     const workspaceId = "ws-prompt-publish-gap";
+    let publishOnDispatchLock = false;
+    let publication: Promise<void> | undefined;
+    const publicationRead = Promise.withResolvers<void>();
+    manager.dispose();
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("epoch-1"),
+        readOverridesEpoch: () => Promise.resolve("overrides-1"),
+        readWorkspaceOverrides: () => Promise.resolve({}),
+        // Acquired right after the dispatch-time serve passed its gate: a
+        // parent publication's synchronous part (recorded options replaced,
+        // marker retired; its own listServers still pending) lands before
+        // getPrompt dispatches.
+        acquireOverridesLock: () => {
+          if (publishOnDispatchLock && publication === undefined) {
+            configService.listServers = mock(() => publicationRead.promise.then(() => configured));
+            publication = manager.applyWorkspaceOverrides(workspaceId, {
+              disabledServers: ["ordinary"],
+            });
+          }
+          return Promise.resolve(() => Promise.resolve());
+        },
+      },
+    });
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     await manager.getPrompt(workspaceId, "ordinary", "status", {});
     expect(getPrompt).toHaveBeenCalledTimes(1);
 
-    // Emulate the gap: the dispatch-time serve passed its gate, and a parent
-    // publication's synchronous part (recorded options replaced, marker
-    // retired; its own listServers still pending) runs before getPrompt resumes.
-    const realEnsure = access.ensureWorkspaceServers.bind(manager);
-    let publication: Promise<void> | undefined;
-    let ensureCalls = 0;
-    spyOn(access, "ensureWorkspaceServers").mockImplementation(async (...args: unknown[]) => {
-      const served = await realEnsure(...args);
-      // getPrompt calls ensure twice: stabilization, then dispatch-time.
-      if (++ensureCalls === 2) {
-        publication = manager.applyWorkspaceOverrides(workspaceId, {
-          disabledServers: ["ordinary"],
-        });
-      }
-      return served;
-    });
+    publishOnDispatchLock = true;
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "ordinary", "status", {})).rejects.toThrow(
-      /unavailable|disabled/
+      /unavailable/
     );
+    expect(publication).toBeDefined();
     expect(getPrompt).toHaveBeenCalledTimes(1);
+    publicationRead.resolve();
     await publication;
   });
 
   test("a serve whose enablement repair fails after a publication fails closed", async () => {
-    const servers = { ordinary: stdioConfig("node ordinary.js") };
-    configService.listServers = mock(() => Promise.resolve(servers));
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { tools: { echo: testTool() } }]))
-      );
-    });
+    const configured = { ordinary: stdioConfig("node ordinary.js") };
+    configService.listServers = mock(() => Promise.resolve(configured));
+    servers.serve("node ordinary.js", { tools: { echo: testTool() } });
     const workspaceId = "ws-repair-fails";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    const repairAccess = access as unknown as {
-      repairEnablementAfterConcurrentMutation: (...args: unknown[]) => Promise<unknown>;
-    };
-    const realRepair = repairAccess.repairEnablementAfterConcurrentMutation.bind(manager);
     let publication: Promise<void> | undefined;
     let releasePublication: () => void = () => undefined;
-    spyOn(repairAccess, "repairEnablementAfterConcurrentMutation").mockImplementation(
-      async (...args: unknown[]) => {
-        if (publication === undefined) {
-          // A publication replaces the recorded options; its own listServers
-          // stays pending until after the serve returns…
-          configService.listServers = mock(
-            () =>
-              new Promise<typeof servers>((resolve) => {
-                releasePublication = () => resolve(servers);
-              })
-          );
-          publication = manager.applyWorkspaceOverrides(workspaceId, {
-            disabledServers: ["ordinary"],
-          });
-        }
-        // …and the repair's own re-derivation fails.
-        configService.listServers = mock(() => Promise.reject(new Error("config unreadable")));
-        try {
-          return await realRepair(...args);
-        } finally {
-          configService.listServers = mock(() => Promise.resolve(servers));
-        }
+    let configReads = 0;
+    configService.listServers = mock(() => {
+      configReads += 1;
+      if (configReads === 1) {
+        // The next serve's own config read: a publication replaces the
+        // recorded options meanwhile…
+        publication = manager.applyWorkspaceOverrides(workspaceId, {
+          disabledServers: ["ordinary"],
+        });
+        return Promise.resolve(configured);
       }
-    );
+      if (configReads === 2) {
+        // …its own listServers stays pending until after the serve returns…
+        return new Promise<typeof configured>((resolve) => {
+          releasePublication = () => resolve(configured);
+        });
+      }
+      // …and the serve's enablement re-derivation fails.
+      return Promise.reject(new Error("config unreadable"));
+    });
     const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     // The stale enabled set must not be filtered through as if re-derived.
     expect(Object.keys(served.tools)).toHaveLength(0);
@@ -7132,16 +7091,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve({}),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { tools: { echo: testTool() } }]))
-      );
-    });
+    servers.serve("node ordinary.js", { tools: { echo: testTool() } });
     const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(Object.keys(first.tools)).toHaveLength(1);
 
@@ -7156,7 +7109,12 @@ describe("MCPServerManager", () => {
   test("getToolsForWorkspace fails closed for a non-empty serve without enablement provenance", async () => {
     // A recursive serve that lost its provenance (or any path that cannot
     // vouch for what enablement was derived from) must not hand out tools.
-    spyOn(access, "ensureWorkspaceServers").mockImplementation(() =>
+    // Private call: every public serve path attaches provenance, so only a
+    // stubbed internal serve can pin this defense-in-depth wrapper check.
+    spyOn(
+      manager as unknown as { ensureWorkspaceServers: (...args: unknown[]) => Promise<unknown> },
+      "ensureWorkspaceServers"
+    ).mockImplementation(() =>
       Promise.resolve({
         tools: { ordinary_echo: testTool() },
         toolServerNames: { ordinary_echo: "ordinary" },
@@ -7175,28 +7133,32 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { prompts: [{ name: "status" }], getPrompt }]))
-      );
-    });
+    servers.serve("node ordinary.js", { prompts: [{ name: "status" }], getPrompt });
     const workspaceId = "ws-prompt-forget-gap";
+    let forgetOnDispatchLock = false;
+    manager.dispose();
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("epoch-1"),
+        readOverridesEpoch: () => Promise.resolve("overrides-1"),
+        readWorkspaceOverrides: () => Promise.resolve({}),
+        // Acquired right after the dispatch-time serve passed its gate. A
+        // forget leaves the recorded options in place and only sets the marker.
+        acquireOverridesLock: () => {
+          if (forgetOnDispatchLock) manager.forgetWorkspaceOverrides(workspaceId);
+          return Promise.resolve(() => Promise.resolve());
+        },
+      },
+    });
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     await manager.getPrompt(workspaceId, "ordinary", "status", {});
     expect(getPrompt).toHaveBeenCalledTimes(1);
 
-    // A forget leaves the recorded options in place and only sets the marker.
-    const realEnsure = access.ensureWorkspaceServers.bind(manager);
-    let ensureCalls = 0;
-    spyOn(access, "ensureWorkspaceServers").mockImplementation(async (...args: unknown[]) => {
-      const served = await realEnsure(...args);
-      if (++ensureCalls === 2) manager.forgetWorkspaceOverrides(workspaceId);
-      return served;
-    });
+    forgetOnDispatchLock = true;
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "ordinary", "status", {})).rejects.toThrow(
-      /unavailable|disabled/
+      /unavailable/
     );
     expect(getPrompt).toHaveBeenCalledTimes(1);
   });
