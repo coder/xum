@@ -14,7 +14,7 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 // sufficient — goals graduated to GA, so there is no longer an experiment
 // flag to flip.
 import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1 } from "@/common/types/goal";
 
@@ -54,6 +54,18 @@ function createAiService(workspaceId: string, getClosingSignal: () => AbortSigna
     ),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
+    // Goal/budget gating does not depend on experiments or model creation.
+    isExperimentEnabled: mock((_experimentId: string) => false),
+    createModelWithPinnedOptions: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
+    createModelWithPinnedMetadata: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
     getWorkspaceMetadata: mock((_workspaceId: string) =>
       Promise.resolve(
         Ok({

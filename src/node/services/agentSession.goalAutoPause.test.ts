@@ -11,7 +11,7 @@ import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import { createMuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1, GoalStatus } from "@/common/types/goal";
 import {
@@ -65,6 +65,18 @@ function createAiService(
     ),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
+    // Goal/budget gating does not depend on experiments or model creation.
+    isExperimentEnabled: mock((_experimentId: string) => false),
+    createModelWithPinnedOptions: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
+    createModelWithPinnedMetadata: mock(() =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      )
+    ),
     getWorkspaceMetadata: mock((_workspaceId: string) =>
       Promise.resolve(
         Ok({

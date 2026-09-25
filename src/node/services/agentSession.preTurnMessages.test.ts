@@ -1,25 +1,10 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import { EventEmitter } from "events";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import type { InitStateManager } from "@/node/services/initStateManager";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import type { Config } from "@/node/config";
 import { createMuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
-import { createTestHistoryService } from "./testHistoryService";
-import {
-  createStartedTurnHandle,
-  createStreamLifecycleMocks,
-  createTestAgentSession,
-} from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
-const config = {
-  rootDir: "/tmp",
-  sessionsDir: "/tmp",
-  srcDir: "/tmp",
-  loadConfigOrDefault: () => ({}),
-} as unknown as Config;
 
 // r30: family-message payload rows ride sendMessage as pre-turn rows so they
 // persist inside turn admission (payload immediately before the trigger's user
@@ -29,36 +14,17 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
   async function createSessionHarness(workspaceId: string) {
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
     const streamMessage = mock((opts: StreamMessageOptions) =>
       Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
     );
-    const aiService = Object.assign(new EventEmitter(), {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
-
-    return {
-      historyService,
-      streamMessage,
-      session: createTestAgentSession({
-        workspaceId,
-        config,
-        historyService,
-        aiService,
-        initStateManager: new EventEmitter() as unknown as InitStateManager,
-        backgroundProcessManager: {
-          cleanup: mock((_workspaceId: string) => Promise.resolve()),
-          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
-            void _queued;
-          }),
-        } as unknown as BackgroundProcessManager,
-      }),
-    };
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    historyCleanup = harness.cleanup;
+    return { historyService: harness.historyService, streamMessage, session: harness.session };
   }
 
   afterEach(async () => {
