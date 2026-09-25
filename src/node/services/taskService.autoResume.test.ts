@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
@@ -26,12 +26,18 @@ import {
 import {
   collectFullHistory,
   createTaskServiceHarness,
-  registerTaskServiceTestRoot,
-  rootDir,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("auto-resumes a parent workspace until background tasks finish", async () => {
     const config = await createTestConfig(rootDir);

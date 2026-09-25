@@ -1,6 +1,6 @@
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { type ProjectsConfig } from "@/node/config";
 import * as subagentGitPatchArtifacts from "@/node/services/subagentGitPatchArtifacts";
@@ -30,13 +30,19 @@ import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
   registerLiveWorkspaceTurnHandle,
-  registerTaskServiceTestRoot,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
-  rootDir,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test.each([
     { taskStatus: "running", compacted: false },

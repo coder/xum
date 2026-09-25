@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
@@ -33,13 +33,19 @@ import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
   registerLiveWorkspaceTurnHandle,
-  registerTaskServiceTestRoot,
-  rootDir,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("sendAgentTreeMessage rechecks hard interruption at admission after awaited lookups", async () => {
     const config = await createTestConfig(rootDir);
@@ -2312,7 +2318,7 @@ describe("TaskService", () => {
 
   test("terminal nested agent report resumes a workspace turn with correlation", async () => {
     const { config, parentId, taskService, workspaceMocks, historyService } =
-      await startWorkspaceTurnForTest();
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = cfg.projects.get(path.join(rootDir, "repo"));
       assert(project, "test project must exist");

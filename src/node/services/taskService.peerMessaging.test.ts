@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -30,13 +30,19 @@ import {
   collectFullHistory,
   createTaskServiceHarness,
   registerLiveWorkspaceTurnHandle,
-  registerTaskServiceTestRoot,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   reserveFamilyMessageTargetSlots,
-  rootDir,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("retitleDescendantAgentTask renames active or inactive persistent descendants", async () => {
     const config = await createTestConfig(rootDir);

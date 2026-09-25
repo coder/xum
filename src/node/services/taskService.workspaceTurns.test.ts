@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 import {
@@ -44,13 +44,19 @@ import {
 import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
-  registerTaskServiceTestRoot,
-  rootDir,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("continuation settlement delivers a stable child report and suppresses the private wake", async () => {
     const config = await createTestConfig(rootDir);
@@ -1262,7 +1268,7 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn stream-end with non-stop finish marks the handle error", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
 
     await streamEnd(
       taskService,
@@ -1286,7 +1292,7 @@ describe("TaskService", () => {
     const hasPendingBashMonitorWakeContinuation = mock(
       (workspaceId: string) => workspaceId === "childworkspace"
     );
-    const { parentId, taskService } = await startWorkspaceTurnForTest({
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
       hasPendingBashMonitorWakeContinuation,
     });
     const correlation = workspaceTurnMuxMetadata(parentId);
@@ -1342,9 +1348,12 @@ describe("TaskService", () => {
         metadata.taskHandleId === "wst_handle" &&
         metadata.turnId === "turn"
     );
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      hasPendingWorkspaceTurnContinuation,
-    });
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        hasPendingWorkspaceTurnContinuation,
+      }
+    );
     const correlation = workspaceTurnMuxMetadata(parentId);
 
     await config.editConfig((cfg) => {
@@ -1436,7 +1445,9 @@ describe("TaskService", () => {
         return Ok(undefined);
       }
     );
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest({ sendMessage });
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
+      sendMessage,
+    });
 
     await config.editConfig((cfg) => {
       const project = cfg.projects.get(path.join(rootDir, "repo"));
@@ -1478,7 +1489,9 @@ describe("TaskService", () => {
         return Ok(undefined);
       }
     );
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest({ sendMessage });
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
+      sendMessage,
+    });
 
     await config.editConfig((cfg) => {
       const project = cfg.projects.get(path.join(rootDir, "repo"));
@@ -1523,7 +1536,9 @@ describe("TaskService", () => {
       }
       return Promise.resolve(Ok(undefined));
     });
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest({ sendMessage });
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
+      sendMessage,
+    });
 
     await config.editConfig((cfg) => {
       const project = cfg.projects.get(path.join(rootDir, "repo"));
@@ -1579,7 +1594,7 @@ describe("TaskService", () => {
     const hasPendingQueuedOrPreparingTurn = mock(
       (workspaceId: string) => workspaceId === "childworkspace"
     );
-    const { parentId, taskService } = await startWorkspaceTurnForTest({
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
       hasPendingQueuedOrPreparingTurn,
     });
 
@@ -1629,7 +1644,8 @@ describe("TaskService", () => {
     // follow-up), so the old handle settles interrupted with a reason naming
     // the successor and produces NO terminal-attention wake — the follow-up's
     // task tool result already announced this outcome.
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, workspaceMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     const taskHandleStore = new TaskHandleStore(config);
     const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(running, "running handle must exist");
@@ -1678,7 +1694,8 @@ describe("TaskService", () => {
   test("workspace-turn cut by a different owner's follow-up keeps the generic supersede wake", async () => {
     // Cross-owner ancestor cutter (allowAgentWorkspace descendant path): the
     // settling handle's owner did not cause the cut, so it must still be woken.
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, workspaceMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     const taskHandleStore = new TaskHandleStore(config);
     const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(running, "running handle must exist");
@@ -1715,7 +1732,8 @@ describe("TaskService", () => {
   test("same-owner follow-up queued at turn-end keeps the generic supersede reason", async () => {
     // A turn-end head did not cause a tool-boundary cut, so it must not claim
     // quiet owner-follow-up attribution.
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, workspaceMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       ...ownerFollowUpCutter(parentId, "wst_successor"),
       dispatchMode: "turn-end" as const,
@@ -1736,7 +1754,8 @@ describe("TaskService", () => {
     // A manual message in PREPARING is the engaged cutter even when a
     // same-owner follow-up sits queued behind it: the cutter reports stage
     // "preparing" with undefined metadata, which classifies generic (notify).
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, workspaceMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     workspaceMocks.getQueueCutCutter.mockImplementation(() => ({
       stage: "preparing" as const,
       muxMetadata: undefined,
@@ -1756,7 +1775,7 @@ describe("TaskService", () => {
   test("an already-streaming same-owner follow-up settles the cut handle quietly", async () => {
     // The queue drained before this stream-end was processed: the successor is
     // identified from the uncorrelated active stream's metadata instead.
-    const { config, parentId, taskService, aiMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, aiMocks } = await startWorkspaceTurnForTest(rootDir);
     aiMocks.getStreamInfo.mockImplementation((workspaceId: string) =>
       workspaceId === "childworkspace"
         ? {
@@ -1780,7 +1799,7 @@ describe("TaskService", () => {
   });
 
   test("foreground waiters on a quietly superseded handle reject with the successor id", async () => {
-    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(rootDir);
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
@@ -1806,7 +1825,7 @@ describe("TaskService", () => {
     // settlement misses the live waiter path; the terminal `interrupted`
     // branch must preserve the persisted reason (and its successor handle id)
     // instead of a generic message.
-    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(rootDir);
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
@@ -1833,10 +1852,13 @@ describe("TaskService", () => {
     // queued. Cleanup must forward ownership to C instead of deleting the
     // workspace under it, and only the last handle in the chain removes it.
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      disposable: true,
-      remove,
-    });
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        disposable: true,
+        remove,
+      }
+    );
     const taskHandleStore = new TaskHandleStore(config);
     const queuedBase = {
       kind: "workspace_turn" as const,
@@ -1892,7 +1914,8 @@ describe("TaskService", () => {
   });
 
   test("late correlated completion self-heals a quiet supersede and re-arms the corrected wake", async () => {
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, workspaceMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     const taskHandleStore = new TaskHandleStore(config);
     const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(running, "running handle must exist");
@@ -1936,7 +1959,8 @@ describe("TaskService", () => {
     // The widened supersede matcher must not change the interrupt gate: the
     // handle is already interrupted, so a stale task_stop must not stop the
     // target workspace's successor stream.
-    const { parentId, taskService, workspaceMocks, aiMocks } = await startWorkspaceTurnForTest();
+    const { parentId, taskService, workspaceMocks, aiMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_successor")
     );
@@ -1964,7 +1988,7 @@ describe("TaskService", () => {
         ? { stage: "preparing" as const, muxMetadata: undefined }
         : ownerFollowUpCutter("will-be-set-below", "wst_successor");
     });
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest({
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
       getQueueCutCutter,
     });
     getQueueCutCutter.mockImplementation(() => {
@@ -1991,10 +2015,13 @@ describe("TaskService", () => {
     // workspace out from under the announced successor. Ownership moves to the
     // successor handle, whose own terminal settlement cleans the workspace up.
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      disposable: true,
-      remove,
-    });
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        disposable: true,
+        remove,
+      }
+    );
     const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_successor", "queued", {
@@ -2023,10 +2050,13 @@ describe("TaskService", () => {
     // cannot inherit cleanup responsibility, so the old handle keeps it and
     // the disposable workspace is not leaked.
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      disposable: true,
-      remove,
-    });
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        disposable: true,
+        remove,
+      }
+    );
     workspaceMocks.getQueueCutCutter.mockImplementation(() =>
       ownerFollowUpCutter(parentId, "wst_missing_successor")
     );
@@ -2046,7 +2076,8 @@ describe("TaskService", () => {
     // Codex P2: an error settlement enqueued a pending wake; a later
     // correlated tool-calls resettle to the quiet owner-follow-up flavor must
     // delete that stale generation instead of letting the drain deliver it.
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, workspaceMocks } =
+      await startWorkspaceTurnForTest(rootDir);
     const taskHandleStore = new TaskHandleStore(config);
     const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(running, "running handle must exist");
@@ -2117,7 +2148,7 @@ describe("TaskService", () => {
     const hasPendingQueuedOrPreparingTurn = mock(
       (workspaceId: string): boolean => workspaceId === "owner"
     );
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest({
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir, {
       sendMessage,
       hasPendingQueuedOrPreparingTurn,
     });
@@ -2181,10 +2212,13 @@ describe("TaskService", () => {
     // ownership: the follow-up dispatches at this stream end and would
     // otherwise lose its workspace to the settlement cleanup.
     const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
-      disposable: true,
-      remove,
-    });
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(
+      rootDir,
+      {
+        disposable: true,
+        remove,
+      }
+    );
     const taskHandleStore = new TaskHandleStore(config);
     await taskHandleStore.upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_successor", "queued", {
@@ -2221,7 +2255,7 @@ describe("TaskService", () => {
     // invalidate the stale direct-parent generation itself instead of leaving
     // the parent to wake on the corrected-away failure.
     const { config, parentId, taskService, workspaceMocks, projectPath } =
-      await startWorkspaceTurnForTest();
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = cfg.projects.get(projectPath);
       assert(project, "test project must exist");
@@ -2276,7 +2310,7 @@ describe("TaskService", () => {
   test("workspace-turn tool-calls stream-end defers to a streaming inherited continuation", async () => {
     // The wake already dispatched: the active stream (a newer messageId)
     // inherited this turn's correlation, proving the turn is continuing.
-    const { parentId, taskService, aiMocks } = await startWorkspaceTurnForTest();
+    const { parentId, taskService, aiMocks } = await startWorkspaceTurnForTest(rootDir);
     aiMocks.getStreamInfo.mockImplementation((workspaceId: string) =>
       workspaceId === "childworkspace"
         ? {
@@ -2309,7 +2343,7 @@ describe("TaskService", () => {
     // still-running delegated turn. The compaction must NOT have transferred completion to a
     // durable follow-up: a transferred compaction returns before workspace-turn settlement, so
     // the uncorrelated-stream guard would never run.
-    const { parentId, taskService, created } = await startWorkspaceTurnForTest({
+    const { parentId, taskService, created } = await startWorkspaceTurnForTest(rootDir, {
       waitForPendingCompactionCompletionDecision: mock(() => Promise.resolve(false)),
     });
 
@@ -2334,7 +2368,7 @@ describe("TaskService", () => {
     // A "tool-calls" finish without any queued/preparing/streaming successor is
     // not a queue cut (e.g. a successful required-tool stop condition); it must
     // keep the truncation error handling rather than claim a supersede.
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
 
     await streamEnd(
       taskService,
@@ -2353,7 +2387,7 @@ describe("TaskService", () => {
   });
 
   test("parent stream-end auto-resumes for active background workspace turns", async () => {
-    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const { parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest(rootDir);
 
     await streamEnd(taskService, {
       type: "stream-end",
@@ -2374,7 +2408,7 @@ describe("TaskService", () => {
 
   test("workspace-turn stream-end waits for active descendants before finalizing", async () => {
     const { config, parentId, projectPath, taskService, workspaceMocks } =
-      await startWorkspaceTurnForTest();
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = Array.from(cfg.projects.values())[0];
       assert(project, "test project must exist");
@@ -2402,7 +2436,7 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn stream-end ignores nonblocking notify descendants", async () => {
-    const { config, parentId, projectPath, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, projectPath, taskService } = await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = Array.from(cfg.projects.values())[0];
       assert(project, "test project must exist");
@@ -2431,7 +2465,7 @@ describe("TaskService", () => {
 
   test("workspace-turn stale recovery skips deferred pre-handoff stream-end history", async () => {
     const { config, parentId, projectPath, taskService, historyService } =
-      await startWorkspaceTurnForTest();
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = Array.from(cfg.projects.values())[0];
       assert(project, "test project must exist");
@@ -2491,7 +2525,7 @@ describe("TaskService", () => {
 
   test("workspace-turn stale recovery repairs restart-interrupted deferred handles after descendants stop blocking", async () => {
     const { config, parentId, projectPath, taskService, historyService, workspaceMocks } =
-      await startWorkspaceTurnForTest({ disposable: true });
+      await startWorkspaceTurnForTest(rootDir, { disposable: true });
     await config.editConfig((cfg) => {
       const project = Array.from(cfg.projects.values())[0];
       assert(project, "test project must exist");
@@ -2561,7 +2595,8 @@ describe("TaskService", () => {
   });
 
   test("correlated stream-end corrects a stale error settlement after self-healed retry", async () => {
-    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, historyService } =
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const child = Array.from(cfg.projects.values())
         .flatMap((project) => project.workspaces)
@@ -2618,7 +2653,7 @@ describe("TaskService", () => {
   });
 
   test("resettled workspace turn re-arms a consumed notify_on_terminal wake-up", async () => {
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     await new TaskHandleStore(config).upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "error", {
         createdWorkspace: true,
@@ -2674,7 +2709,7 @@ describe("TaskService", () => {
   });
 
   test("duplicate correlated stream-end replay keeps a settled error handle unchanged", async () => {
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     await new TaskHandleStore(config).upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "error", {
         createdWorkspace: true,
@@ -2713,7 +2748,7 @@ describe("TaskService", () => {
   });
 
   test("late correlated stream-end does not resettle an explicitly interrupted workspace turn", async () => {
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     // Explicit interrupt (user Esc / task_terminate): status interrupted WITHOUT the
     // stale-restart marker. An in-flight stream-end completing after the cancel must not
     // make the canceled turn appear completed.
@@ -2749,7 +2784,7 @@ describe("TaskService", () => {
   });
 
   test("correlated stream-end never overwrites a completed workspace turn", async () => {
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     await new TaskHandleStore(config).upsertWorkspaceTurn(
       workspaceTurnRecord(parentId, "childworkspace", "wst_handle", "completed", {
         createdWorkspace: true,
@@ -2785,7 +2820,7 @@ describe("TaskService", () => {
   });
 
   test("direct-parent consumption suppresses a concurrently resettled workspace-turn wake", async () => {
-    const { config, parentId, taskService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const child = Array.from(cfg.projects.values())
         .flatMap((project) => project.workspaces)
@@ -2893,7 +2928,7 @@ describe("TaskService", () => {
 
   test("workspace-turn stale recovery uses deferred history after archived descendants stop blocking", async () => {
     const { config, parentId, projectPath, taskService, historyService } =
-      await startWorkspaceTurnForTest();
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = Array.from(cfg.projects.values())[0];
       assert(project, "test project must exist");
@@ -2962,7 +2997,8 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn deferred recovery waits for active workflow blockers", async () => {
-    const { config, parentId, taskService, historyService } = await startWorkspaceTurnForTest();
+    const { config, parentId, taskService, historyService } =
+      await startWorkspaceTurnForTest(rootDir);
     const runStore = new WorkflowRunStore({
       sessionDir: path.join(config.sessionsDir, "childworkspace"),
     });
@@ -3032,7 +3068,7 @@ describe("TaskService", () => {
 
   test("workspace-turn auto-resume preserves handle metadata", async () => {
     const { config, parentId, projectPath, taskService, workspaceMocks } =
-      await startWorkspaceTurnForTest();
+      await startWorkspaceTurnForTest(rootDir);
     await config.editConfig((cfg) => {
       const project = Array.from(cfg.projects.values())[0];
       assert(project, "test project must exist");
@@ -3060,7 +3096,7 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn stream-end ignores unrelated mux metadata", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
 
     await streamEnd(taskService, {
       type: "stream-end",
@@ -3122,7 +3158,7 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn system stream aborts keep the handle running for resume", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
 
     await streamAbort(taskService, {
       type: "stream-abort",
@@ -3147,7 +3183,7 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn stream aborts mark the handle interrupted", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
 
     await streamAbort(taskService, {
       type: "stream-abort",
@@ -3164,7 +3200,7 @@ describe("TaskService", () => {
   });
 
   test("waitForWorkspaceTurn handles completion racing with waiter registration", async () => {
-    const { parentId, taskService } = await startWorkspaceTurnForTest();
+    const { parentId, taskService } = await startWorkspaceTurnForTest(rootDir);
     const store = workspaceTurnManagerInternals(taskService).taskHandleStore;
     const originalGetWorkspaceTurn = store.getWorkspaceTurn.bind(store);
     const completionHandled = Promise.withResolvers<void>();
@@ -3203,7 +3239,7 @@ describe("TaskService", () => {
   });
 
   test("workspace-turn terminal settlements do not overwrite each other", async () => {
-    const completed = await startWorkspaceTurnForTest();
+    const completed = await startWorkspaceTurnForTest(rootDir);
     const staleRunningRecord = await workspaceTurnSnapshot(
       completed.taskService,
       completed.parentId
@@ -3233,7 +3269,7 @@ describe("TaskService", () => {
       reportMarkdown: "Done",
     });
 
-    const interrupted = await startWorkspaceTurnForTest({
+    const interrupted = await startWorkspaceTurnForTest(rootDir, {
       stableIds: ["secondhandle", "secondturn"],
     });
     const staleInterruptedRecord = await workspaceTurnSnapshot(
@@ -3293,7 +3329,7 @@ describe("TaskService", () => {
 
   test("disposable workspace turns are removed after completion, error, or interruption", async () => {
     const completedRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const completed = await startWorkspaceTurnForTest({
+    const completed = await startWorkspaceTurnForTest(rootDir, {
       disposable: true,
       remove: completedRemove,
     });
@@ -3304,7 +3340,10 @@ describe("TaskService", () => {
     expect(completedRemove).toHaveBeenCalledWith("childworkspace", true);
 
     const errorRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const failed = await startWorkspaceTurnForTest({ disposable: true, remove: errorRemove });
+    const failed = await startWorkspaceTurnForTest(rootDir, {
+      disposable: true,
+      remove: errorRemove,
+    });
     await streamError(failed.taskService, {
       type: "error",
       workspaceId: "childworkspace",
@@ -3315,7 +3354,7 @@ describe("TaskService", () => {
     expect(errorRemove).toHaveBeenCalledWith("childworkspace", true);
 
     const interruptedRemove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const interrupted = await startWorkspaceTurnForTest({
+    const interrupted = await startWorkspaceTurnForTest(rootDir, {
       disposable: true,
       remove: interruptedRemove,
       isStreaming: mock(() => true),

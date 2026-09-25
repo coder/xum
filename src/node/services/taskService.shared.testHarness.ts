@@ -4,7 +4,7 @@
 // per-test temp root are unchanged.
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
-import { expect, beforeEach, afterEach, mock } from "bun:test";
+import { expect, mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
@@ -40,18 +40,19 @@ import {
   workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
 
-// Live ESM binding: split files import it and read the value their beforeEach assigned.
-export let rootDir: string;
+/**
+ * Per-test temp root. Each split file owns its `rootDir` and installs it with
+ *   let rootDir: string;
+ *   beforeEach(async () => { rootDir = await createTaskServiceTestRoot(); });
+ *   afterEach(async () => { await removeTaskServiceTestRoot(rootDir); });
+ * so no mutable state is shared across files; helpers below take the root as a parameter.
+ */
+export async function createTaskServiceTestRoot(): Promise<string> {
+  return await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-"));
+}
 
-/** Installs the per-test temp root (the original describe-level beforeEach/afterEach). */
-export function registerTaskServiceTestRoot(): void {
-  beforeEach(async () => {
-    rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-"));
-  });
-
-  afterEach(async () => {
-    await fsPromises.rm(rootDir, { recursive: true, force: true });
-  });
+export async function removeTaskServiceTestRoot(rootDir: string): Promise<void> {
+  await fsPromises.rm(rootDir, { recursive: true, force: true });
 }
 
 export async function collectFullHistory(service: HistoryService, workspaceId: string) {
@@ -162,6 +163,7 @@ export function createNullInitLogger() {
 }
 
 export async function startWorkspaceTurnForTest(
+  rootDir: string,
   options: {
     stableIds?: string[];
     disposable?: boolean;
@@ -228,11 +230,12 @@ export interface BestOfTestChildWorkspace {
 }
 
 export async function createBestOfTaskServiceTestHarness(params: {
+  rootDir: string;
   parentId: string;
   children: readonly BestOfTestChildWorkspace[];
 }) {
-  const config = await createTestConfig(rootDir);
-  const projectPath = path.join(rootDir, "repo");
+  const config = await createTestConfig(params.rootDir);
+  const projectPath = path.join(params.rootDir, "repo");
 
   await saveWorkspaces(
     config,

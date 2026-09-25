@@ -1,5 +1,5 @@
 import * as path from "path";
-import { describe, test, expect, mock, spyOn } from "bun:test";
+import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
 import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
@@ -31,13 +31,19 @@ import {
   createAgentTask,
   createNullInitLogger,
   createTaskServiceHarness,
-  registerTaskServiceTestRoot,
+  createTaskServiceTestRoot,
+  removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
-  rootDir,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
-  registerTaskServiceTestRoot();
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
 
   test("task creation waits for ancestor lifecycle changes and rejects an archived parent", async () => {
     const config = await createTestConfig(rootDir);
