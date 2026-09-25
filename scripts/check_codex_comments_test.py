@@ -507,6 +507,11 @@ else:
             (BOT, BEFORE, 10),
             ("human-reviewer", AFTER, 10),
             (BOT, AFTER, 0),
+            # GitHub's GraphQL returns the reacting bot's User login with the
+            # [bot] suffix (comment authors come back without it).
+            (BOT + "[bot]", AFTER, 0),
+            (BOT + "[bot]", BEFORE, 10),
+            (BOT + "-impostor[bot]", AFTER, 10),
         ):
             with self.subTest(author=author, created_at=created_at):
                 data = snapshot(
