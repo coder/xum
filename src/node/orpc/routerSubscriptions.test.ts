@@ -17,6 +17,7 @@ import {
   subscribeWorkspaceActivity,
   subscribeDesignExperiment,
   subscribeMemoryChanges,
+  subscribeWorkspaceChat,
 } from "./routerSubscriptions";
 
 test("subscription handlers forward the oRPC runtime Clock", async () => {
@@ -39,6 +40,55 @@ test("subscription handlers forward the oRPC runtime Clock", async () => {
     await disposeAppRuntime(app.managed);
   }
   expect(workspaceService.listenerCount("activity")).toBe(0);
+});
+
+test("onChat streams replay rows and heartbeats while replayHistory is still running", async () => {
+  // #4506: a multi-second replay used to send nothing (not even heartbeats) until it finished,
+  // so the renderer's stall watchdog aborted and restarted it.
+  const app = makeAppRuntime(TestClock.layer());
+  const controller = new AbortController();
+  let finishReplay: (() => void) | undefined;
+  const session = {
+    setLegacyAutoRetryEnabledHint: () => undefined,
+    onChatEvent: () => () => undefined,
+    scheduleStartupRecovery: () => undefined,
+    replayHistory: async (listener: (event: { message: unknown }) => void) => {
+      listener({ message: { type: "message", id: "row-1" } });
+      await new Promise<void>((resolve) => (finishReplay = resolve));
+      listener({ message: { type: "caught-up" } });
+    },
+  };
+  const context = {
+    "effect/context": app.context,
+    workspaceService: { getOrCreateSession: () => session },
+  } as unknown as ORPCContext;
+  const events: unknown[] = [];
+  const consumed = (async () => {
+    const input = { workspaceId: "ws-1" };
+    for await (const event of subscribeWorkspaceChat(context, input, controller.signal)) {
+      events.push(event);
+    }
+  })();
+  try {
+    const waitForEvents = async (count: number) => {
+      while (events.length < count) await new Promise((resolve) => setTimeout(resolve, 1));
+    };
+    await waitForEvents(1);
+    await app.managed.runPromise(TestClock.adjust(2 * SUBSCRIPTION_HEARTBEAT_INTERVAL_MS));
+    await waitForEvents(3);
+    expect(events).toEqual([
+      { type: "message", id: "row-1" },
+      { type: "heartbeat" },
+      { type: "heartbeat" },
+    ]);
+    finishReplay?.();
+    await waitForEvents(4);
+    expect(events[3]).toEqual({ type: "caught-up" });
+  } finally {
+    controller.abort();
+    await consumed;
+    await disposeAppRuntime(app.managed);
+  }
 });
 
 test("memory subscriptions match workspace-scope events on the shared memory owner", async () => {

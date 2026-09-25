@@ -109,6 +109,13 @@ async function seedChat(
       ? workspace.demoProject
       : addDemoWorkspace(workspace.configRoot, workspace.demoProject, `perf-${profile}-${round}`);
   const history = await seedWorkspaceHistoryProfile({ demoProject: config, profile });
+  // Real workspaces keep session-usage.json current. Without one, the first open rebuilds it
+  // from the full history while holding the workspace history lock (~250-320 ms), and the
+  // cold-open replay measured that wait instead of the replay itself (#4506).
+  fs.writeFileSync(
+    path.join(config.sessionsDir, config.workspaceId, "session-usage.json"),
+    JSON.stringify({ byModel: {}, version: 1 })
+  );
   return { config, profile, history };
 }
 

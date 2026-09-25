@@ -3022,8 +3022,8 @@ export class AgentSession {
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
     // whether the history it closes is trustworthy (see CaughtUpMessageSchema).
     let historyReplayFailed = false;
-    // Phase timing for the one replay log line (#4504). The subscription delivers nothing until
-    // this method returns, so totalMs is the server's share of the switch-back skeleton window.
+    // Phase timing for the one replay log line (#4504). caught-up goes out only when this method
+    // returns, so totalMs is the server's share of the switch-back skeleton window.
     const replayTimer = createOnChatReplayTimer();
     let historyBytesRead = 0;
     let streamReplayed = false;
