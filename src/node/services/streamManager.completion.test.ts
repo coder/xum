@@ -1,8 +1,14 @@
 import { describe, test, expect, mock } from "bun:test";
+import { tool } from "ai";
+import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { Ok, Err } from "@/common/types/result";
-import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import {
+  StreamManager,
+  type ModelFallbackPrepareOptions,
+  type TurnExecutionOptions,
+} from "./streamManager";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -20,50 +26,88 @@ import {
   appendPartialAssistantForTests,
   createStreamResultForTests,
   createStreamInfoForTests,
+  testStartOptions,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
 
+type StreamResultFactoryForTests = () => Record<string, unknown>;
+
+/**
+ * Injected streamText: the first call returns the turn's own stream; later
+ * calls (the internal empty-output retry, refusal-fallback hops) go to `next`.
+ */
+function turnStreamTextForTests(
+  turnStream: StreamResultFactoryForTests,
+  next: (options: Parameters<Parameters<typeof fakeStreamText>[0]>[0]) => unknown = () => {
+    throw new Error("Unexpected extra streamText call");
+  }
+) {
+  let turnStarted = false;
+  return fakeStreamText((options) => {
+    if (turnStarted) return next(options);
+    turnStarted = true;
+    return turnStream();
+  });
+}
+
+/**
+ * Runs one turn through the public startStream boundary on an Anthropic model
+ * string and waits for its terminal outcome. The caller appends the partial.
+ */
+async function runTurnForTests(
+  streamManager: StreamManager,
+  options: Partial<TurnExecutionOptions> &
+    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "historySequence">
+) {
+  const result = await streamManager.startStream(
+    testStartOptions({
+      model: createTestLanguageModel(),
+      modelString: KNOWN_MODELS.SONNET.id,
+      initialMetadata: { agentId: "plan" },
+      providedRuntimeTempDir: "",
+      ...options,
+    })
+  );
+  if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result.error)}`);
+  return result.data.completion;
+}
+
 describe("StreamManager - exact step indices", () => {
   test("persists exact tool-only step boundaries through successful completion", async () => {
-    const streamManager = createStreamManagerForTests(historyService);
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(() =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            for (const toolCallId of ["first", "second"]) {
+              yield { type: "start-step" };
+              // An empty/repeated SDK start must not create duplicate indices.
+              yield { type: "start-step" };
+              yield { type: "tool-call", toolCallId, toolName: "bash", input: { script: "pwd" } };
+              yield { type: "tool-result", toolCallId, toolName: "bash", output: "/tmp" };
+              yield {
+                type: "finish-step",
+                usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
+              };
+            }
+            yield { type: "start-step" };
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        )
+      ),
+    });
     const workspaceId = "step-indices-workspace";
     const messageId = "step-indices-message";
     await appendPartialAssistantForTests(workspaceId, messageId, 1);
-    const streamInfo = createStreamInfoForTests({
-      messageId,
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          for (const toolCallId of ["first", "second"]) {
-            yield { type: "start-step" };
-            // An empty/repeated SDK start must not create duplicate indices.
-            yield { type: "start-step" };
-            yield { type: "tool-call", toolCallId, toolName: "bash", input: { script: "pwd" } };
-            yield { type: "tool-result", toolCallId, toolName: "bash", output: "/tmp" };
-            yield {
-              type: "finish-step",
-              usage: { inputTokens: 10, outputTokens: 1, totalTokens: 11 },
-            };
-          }
-          yield { type: "start-step" };
-          yield { type: "finish", finishReason: "stop" };
-        })()
-      ),
-    });
-    await engineInternals(streamManager).processStreamWithCleanup.call(
-      streamManager,
-      workspaceId,
-      streamInfo,
-      1
-    );
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence: 1 });
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success).toBe(true);
     if (!history.success) throw new Error(history.error);
     const committed = history.data.find((row) => row.id === messageId);
     expect(committed?.parts.map((part) => part.type)).toEqual(["dynamic-tool", "dynamic-tool"]);
+    // The trailing empty step start is not persisted.
     expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
-    expect(streamInfo.stepStartIndices).toEqual([0, 1, 2]);
   });
 
   test.each([true, false])(
@@ -101,8 +145,36 @@ describe("StreamManager - empty stream completions", () => {
         emptyUsage
       )
     );
+    // The turn's own stream settles one step with usage but no visible output: the
+    // silent placeholder case we saw in debug logs. Its usage must survive the retry.
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 },
+            providerMetadata: { openai: { cached_tokens: 2 } },
+          };
+        })(),
+        emptyUsage
+      );
+    const recordHeadlessUsage = mock(
+      (
+        _workspaceId: string,
+        _model: string,
+        _usage: unknown,
+        _providerMetadata: unknown,
+        _options: unknown
+      ) => Promise.resolve(undefined)
+    );
+    const sessionUsageService = {
+      recordUsage: mock(() => Promise.resolve(undefined)),
+      recordHeadlessUsage,
+    } as unknown as SessionUsageService;
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      sessionUsageService,
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
@@ -119,33 +191,9 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
     const emptyUsage = { inputTokens: 3, outputTokens: 0, totalTokens: 3 };
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          // No-op stream: this reproduces the silent placeholder case we saw in debug logs.
-        })(),
-        emptyUsage
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      request: { model: "ignored-model", messages: [], providerOptions: undefined },
-      runtime,
-      cumulativeUsage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 },
-      cumulativeProviderMetadata: { openai: { cached_tokens: 2 } },
-      lastStepUsage: { inputTokens: 7, outputTokens: 0, totalTokens: 7 },
-      lastStepProviderMetadata: { openai: { cached_tokens: 2 } },
-    });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(createStreamResult).toHaveBeenCalledTimes(1);
     expect(streamEndEvents).toHaveLength(0);
@@ -156,10 +204,18 @@ describe("StreamManager - empty stream completions", () => {
     });
     expect(errorEvents[0]?.error).toContain("before producing any assistant-visible output");
 
-    expect(streamInfo.cumulativeUsage).toEqual({ inputTokens: 7, outputTokens: 0, totalTokens: 7 });
-    expect(streamInfo.lastStepUsage).toEqual({ inputTokens: 7, outputTokens: 0, totalTokens: 7 });
-    expect(streamInfo.cumulativeProviderMetadata).toEqual({ openai: { cached_tokens: 2 } });
-    expect(streamInfo.lastStepProviderMetadata).toEqual({ openai: { cached_tokens: 2 } });
+    // The retry reset kept the first attempt's usage and provider metadata: the
+    // errored turn routes exactly that to the headless sidecar.
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage.mock.calls[0]?.[2]).toMatchObject({
+      inputTokens: 7,
+      outputTokens: 0,
+      totalTokens: 7,
+    });
+    expect(recordHeadlessUsage.mock.calls[0]?.[3]).toEqual({ openai: { cached_tokens: 2 } });
+    expect(recordHeadlessUsage.mock.calls[0]?.[4]).toMatchObject({
+      analyticsSource: "errored_stream",
+    });
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("empty_output");
@@ -174,7 +230,17 @@ describe("StreamManager - empty stream completions", () => {
   });
 
   test("persists retryable partial error when a non-empty stream closes before finish", async () => {
-    const streamManager = createStreamManagerForTests(historyService);
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "partial answer" };
+        })(),
+        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(turnStream),
+    });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
@@ -190,27 +256,8 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "partial answer" };
-        })(),
-        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(streamEndEvents).toHaveLength(0);
     expect(errorEvents).toHaveLength(1);
@@ -241,7 +288,21 @@ describe("StreamManager - empty stream completions", () => {
     // existing truncation guard fires a retryable `stream_truncated` error
     // rather than committing the partial output as a clean assistant
     // message.
-    const streamManager = createStreamManagerForTests(historyService);
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "partial answer" };
+          // The provider adapter never emitted its own finish (e.g. clean
+          // SSE EOF before response.completed / message_stop). The ai
+          // package's flush() synthesizes this one:
+          yield { type: "finish", finishReason: "other", rawFinishReason: undefined };
+        })(),
+        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(turnStream),
+    });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
@@ -257,31 +318,8 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "partial answer" };
-          // The provider adapter never emitted its own finish (e.g. clean
-          // SSE EOF before response.completed / message_stop). The ai
-          // package's flush() synthesizes this one:
-          yield { type: "finish", finishReason: "other", rawFinishReason: undefined };
-        })(),
-        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(streamEndEvents).toHaveLength(0);
     expect(errorEvents).toHaveLength(1);
@@ -302,7 +340,20 @@ describe("StreamManager - empty stream completions", () => {
     // (e.g. Anthropic's `"compaction"`). This test guards against the
     // discriminator widening into a false positive that would mis-fire the
     // truncation guard on a clean stream.
-    const streamManager = createStreamManagerForTests(historyService);
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "complete answer" };
+          // Real Anthropic compaction finish (or any other mapped-to-other
+          // stop reason) carries a defined raw value.
+          yield { type: "finish", finishReason: "other", rawFinishReason: "compaction" };
+        })(),
+        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(turnStream),
+    });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
@@ -318,30 +369,8 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "complete answer" };
-          // Real Anthropic compaction finish (or any other mapped-to-other
-          // stop reason) carries a defined raw value.
-          yield { type: "finish", finishReason: "other", rawFinishReason: "compaction" };
-        })(),
-        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(errorEvents).toHaveLength(0);
     expect(streamEndEvents).toHaveLength(1);
@@ -361,8 +390,16 @@ describe("StreamManager - empty stream completions", () => {
         })()
       )
     );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
@@ -379,30 +416,10 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     // Guard that no empty-stream recovery attempt re-creates the stream.
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(createStreamResult).not.toHaveBeenCalled();
     expect(streamEndEvents).toHaveLength(0);
@@ -436,34 +453,25 @@ describe("StreamManager - empty stream completions", () => {
   });
 
   test("zero-output refusal finishReason survives commit when usage is unavailable", async () => {
-    const streamManager = createStreamManagerForTests(historyService);
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(turnStream),
+    });
 
     const workspaceId = "refusal-no-usage-workspace";
     const messageId = "refusal-no-usage-message";
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("model_refusal");
@@ -502,34 +510,26 @@ describe("StreamManager - empty stream completions", () => {
       recordUsage,
       recordHeadlessUsage,
     } as unknown as SessionUsageService;
-    const streamManager = createStreamManagerForTests(historyService, { sessionUsageService });
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService,
+      streamText: turnStreamTextForTests(turnStream),
+    });
 
     const workspaceId = "refusal-zero-usage-sidecar-workspace";
     const messageId = "refusal-zero-usage-sidecar-message";
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     // A refusal the provider billed nothing for is still a refusal: exactly
     // one refused_stream analytics record with explicit zero usage…
@@ -565,7 +565,19 @@ describe("StreamManager - empty stream completions", () => {
       recordUsage,
       recordHeadlessUsage,
     } as unknown as SessionUsageService;
-    const streamManager = createStreamManagerForTests(historyService, { sessionUsageService });
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "partial answer before refusing" };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      sessionUsageService,
+      streamText: turnStreamTextForTests(turnStream),
+    });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
@@ -581,28 +593,8 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "partial answer before refusing" };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(streamEndEvents).toHaveLength(0);
     expect(errorEvents).toHaveLength(1);
@@ -649,18 +641,33 @@ describe("StreamManager - empty stream completions", () => {
   });
 
   test("zero-output refusal with a configured fallback chain swaps models without any error event", async () => {
-    const createStreamResult = mock(() =>
+    const createStreamResult = mock(
+      (_options: { tools?: Record<string, unknown>; system?: unknown }) =>
+        createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "text-delta", text: "fallback answer" };
+            yield { type: "finish", finishReason: "stop" };
+          })(),
+          { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
+        )
+    );
+    const turnStream = () =>
       createStreamResultForTests(
         (async function* () {
           await Promise.resolve();
-          yield { type: "text-delta", text: "fallback answer" };
-          yield { type: "finish", finishReason: "stop" };
+          // finish-step carries the refused attempt's usage (mirrors the SDK,
+          // which emits per-step usage even for zero-output refusals).
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
         })(),
-        { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
-      )
-    );
+        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: unknown[] = [];
     const streamEndEvents: Array<{
@@ -687,7 +694,6 @@ describe("StreamManager - empty stream completions", () => {
     const fallbackModel = KNOWN_MODELS.GPT.id;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     // The swapped-in stream: the fallback model answers normally.
 
@@ -701,7 +707,9 @@ describe("StreamManager - empty stream completions", () => {
     // Marker toolset proving the swapped request uses the tools rebuilt for the
     // fallback model (provider-specific web tools / MCP sanitization), not the
     // refused model's toolset.
-    const fallbackTools = { fallback_only_tool: { description: "rebuilt for fallback" } };
+    const fallbackTools = {
+      fallback_only_tool: tool({ description: "rebuilt for fallback", inputSchema: z.object({}) }),
+    };
     const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
       Promise.resolve(
         Ok({
@@ -718,26 +726,9 @@ describe("StreamManager - empty stream completions", () => {
     const refusedLanguageModel = createTestLanguageModel("refused-model");
     attachLanguageModelCleanup(refusedLanguageModel, refusedModelCleanup);
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          // finish-step carries the refused attempt's usage (mirrors the SDK,
-          // which emits per-step usage even for zero-output refusals).
-          yield {
-            type: "finish-step",
-            usage: { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 },
-          };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
       initialMetadata: {
         agentId: "plan",
@@ -751,17 +742,9 @@ describe("StreamManager - empty stream completions", () => {
           requestedFallbackModel: "anthropic:claude-3-5-haiku-latest",
         },
       },
-      runtime,
-      request: { model: refusedLanguageModel, messages: [], providerOptions: undefined },
-      modelFallback: {
-        options: { chain: [fallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      model: refusedLanguageModel,
+      modelFallback: { chain: [fallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     // No terminal failure: TaskService and waiters never observe the refusal.
     expect(errorEvents).toHaveLength(0);
@@ -805,10 +788,7 @@ describe("StreamManager - empty stream completions", () => {
     expect(fallbackModelCleanup).toHaveBeenCalledTimes(1);
     // The swapped request was built from the prepared per-model pieces (tools
     // may be re-wrapped for caching, so assert contents rather than identity).
-    const swappedRequest = streamInfo.request as {
-      tools?: Record<string, unknown>;
-      system?: unknown;
-    };
+    const swappedRequest = createStreamResult.mock.calls[0]?.[0] ?? {};
     expect(Object.keys(swappedRequest.tools ?? {})).toEqual(Object.keys(fallbackTools));
     expect(swappedRequest.system).toBe("fallback system");
   });
@@ -959,8 +939,22 @@ describe("StreamManager - empty stream completions", () => {
         { inputTokens: 7, outputTokens: 4, totalTokens: 11 }
       )
     );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "reasoning-delta", text: refusedReasoning };
+          yield { type: "text-delta", text: "partial answer" };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17 },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 12, outputTokens: 5, totalTokens: 17 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: unknown[] = [];
     const streamEndEvents: Array<{
@@ -986,7 +980,6 @@ describe("StreamManager - empty stream completions", () => {
     const expectedReasoningTokens = await countTokens(KNOWN_MODELS.SONNET.id, refusedReasoning);
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
       Promise.resolve(
@@ -1001,38 +994,12 @@ describe("StreamManager - empty stream completions", () => {
       )
     );
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "reasoning-delta", text: refusedReasoning };
-          yield { type: "text-delta", text: "partial answer" };
-          yield {
-            type: "finish-step",
-            usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17 },
-          };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 12, outputTokens: 5, totalTokens: 17 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [fallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      modelFallback: { chain: [fallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     expect(errorEvents).toHaveLength(0);
     expect(streamEndEvents).toHaveLength(1);
@@ -1045,7 +1012,23 @@ describe("StreamManager - empty stream completions", () => {
   });
 
   test("partial refusal skips fallback when a tool call is still incomplete", async () => {
-    const streamManager = createStreamManagerForTests(historyService);
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield {
+            type: "tool-call",
+            toolCallId: "tool-call-1",
+            toolName: "bash",
+            input: { script: "printf ok" },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 12, outputTokens: 1, totalTokens: 13 }
+      );
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: turnStreamTextForTests(turnStream),
+    });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
 
@@ -1071,39 +1054,13 @@ describe("StreamManager - empty stream completions", () => {
     );
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield {
-            type: "tool-call",
-            toolCallId: "tool-call-1",
-            toolName: "bash",
-            input: { script: "printf ok" },
-          };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 12, outputTokens: 1, totalTokens: 13 }
-      ),
-      messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
-      historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [fallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
-    });
 
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+    await runTurnForTests(streamManager, {
+      workspaceId,
+      messageId,
+      historySequence,
+      modelFallback: { chain: [fallbackModel], prepare },
+    });
 
     expect(prepare).not.toHaveBeenCalled();
     expect(streamEndEvents).toHaveLength(0);
@@ -1137,8 +1094,20 @@ describe("StreamManager - empty stream completions", () => {
           { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
         )
       );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: unknown[] = [];
     const streamEndEvents: Array<{
@@ -1166,7 +1135,6 @@ describe("StreamManager - empty stream completions", () => {
     const secondFallbackModel = KNOWN_MODELS.GEMINI_FLASH.id;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     // First swapped-in stream refuses too; the second answers.
 
@@ -1182,36 +1150,12 @@ describe("StreamManager - empty stream completions", () => {
       )
     );
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield {
-            type: "finish-step",
-            usage: { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 },
-          };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [firstFallbackModel, secondFallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      modelFallback: { chain: [firstFallbackModel, secondFallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     expect(errorEvents).toHaveLength(0);
     // Chain entries are attempted in configured order, one attempt each.
@@ -1272,8 +1216,33 @@ describe("StreamManager - empty stream completions", () => {
           { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
         )
       );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "text-delta", text: "partial answer" };
+          yield {
+            type: "tool-call",
+            toolCallId: "tool-call-1",
+            toolName: "bash",
+            input: { script: "printf ok" },
+          };
+          yield {
+            type: "tool-result",
+            toolCallId: "tool-call-1",
+            toolName: "bash",
+            output: { success: true, output: "ok" },
+          };
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17 },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 12, outputTokens: 5, totalTokens: 17 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: unknown[] = [];
     const streamEndEvents: Array<{
@@ -1302,7 +1271,6 @@ describe("StreamManager - empty stream completions", () => {
     const secondFallbackModel = KNOWN_MODELS.GEMINI_FLASH.id;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     const prepareCalls: Array<{
       nextModelString: string;
@@ -1321,49 +1289,12 @@ describe("StreamManager - empty stream completions", () => {
       );
     });
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "text-delta", text: "partial answer" };
-          yield {
-            type: "tool-call",
-            toolCallId: "tool-call-1",
-            toolName: "bash",
-            input: { script: "printf ok" },
-          };
-          yield {
-            type: "tool-result",
-            toolCallId: "tool-call-1",
-            toolName: "bash",
-            output: { success: true, output: "ok" },
-          };
-          yield {
-            type: "finish-step",
-            usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17 },
-          };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 12, outputTokens: 5, totalTokens: 17 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [firstFallbackModel, secondFallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      modelFallback: { chain: [firstFallbackModel, secondFallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     expect(errorEvents).toHaveLength(0);
     expect(prepareCalls.map((call) => call.nextModelString)).toEqual([
@@ -1434,9 +1365,21 @@ describe("StreamManager - empty stream completions", () => {
         { inputTokens: 10, outputTokens: 0, totalTokens: 10 }
       )
     );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield {
+            type: "finish-step",
+            usage: { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 },
+          };
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
       sessionUsageService,
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
     const streamEndEvents: unknown[] = [];
@@ -1452,7 +1395,6 @@ describe("StreamManager - empty stream completions", () => {
     const fallbackModel = KNOWN_MODELS.GPT.id;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     // The fallback model refuses too — the chain is then exhausted.
 
@@ -1468,36 +1410,12 @@ describe("StreamManager - empty stream completions", () => {
       )
     );
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield {
-            type: "finish-step",
-            usage: { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 },
-          };
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [fallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      modelFallback: { chain: [fallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(createStreamResult).toHaveBeenCalledTimes(1);
@@ -1543,8 +1461,16 @@ describe("StreamManager - empty stream completions", () => {
         })()
       )
     );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
 
@@ -1558,7 +1484,6 @@ describe("StreamManager - empty stream completions", () => {
     const fallbackModel = KNOWN_MODELS.GPT.id;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     // Silently skipping to the next chain entry would effectively create
     // fallback-on-auth/config errors, which is out of scope by design.
@@ -1568,32 +1493,12 @@ describe("StreamManager - empty stream completions", () => {
       )
     );
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [fallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      modelFallback: { chain: [fallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(createStreamResult).not.toHaveBeenCalled();
@@ -1615,8 +1520,16 @@ describe("StreamManager - empty stream completions", () => {
         })()
       )
     );
+    const turnStream = () =>
+      createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
+      );
     const streamManager = createStreamManagerForTests(historyService, {
-      streamText: fakeStreamText(createStreamResult),
+      streamText: turnStreamTextForTests(turnStream, createStreamResult),
     });
     const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
 
@@ -1630,7 +1543,6 @@ describe("StreamManager - empty stream completions", () => {
     const fallbackModel = KNOWN_MODELS.GPT.id;
 
     await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-    const processStreamWithCleanup = engineInternals(streamManager).processStreamWithCleanup;
 
     // A THROW (not an Err) must not escape into the generic stream-error path,
     // where it would be categorized as a retryable api/unknown error and
@@ -1639,32 +1551,12 @@ describe("StreamManager - empty stream completions", () => {
       Promise.reject(new Error("provider factory exploded"))
     );
 
-    const startTime = Date.now() - 250;
-    const streamInfo = createStreamInfoForTests({
-      streamResult: createStreamResultForTests(
-        (async function* () {
-          await Promise.resolve();
-          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
-        })(),
-        { inputTokens: 30000, outputTokens: 0, totalTokens: 30000 }
-      ),
+    await runTurnForTests(streamManager, {
+      workspaceId,
       messageId,
-      startTime,
-      lastPartTimestamp: startTime,
-      model: KNOWN_MODELS.SONNET.id,
-      metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
-      initialMetadata: { agentId: "plan" },
-      runtime,
-      modelFallback: {
-        options: { chain: [fallbackModel], prepare },
-        requestedModel: KNOWN_MODELS.SONNET.id,
-        refusedModels: [],
-        original: { maxOutputTokens: undefined },
-      },
+      modelFallback: { chain: [fallbackModel], prepare },
     });
-
-    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
 
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(createStreamResult).not.toHaveBeenCalled();
