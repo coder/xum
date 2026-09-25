@@ -22,13 +22,21 @@ import type {
   BackgroundableForegroundWaiter,
   WorkspaceHost,
   WorkspaceTurnManagerHost,
+  QueueCutAttributionSnapshot,
 } from "@/node/services/taskWorkspaceSeam";
 import {
   createAIServiceMocks,
   createMockInitStateManager,
   createWorkspaceServiceMocks,
   runWithTaskTreeHold,
+  createTestConfig,
+  makeWorkspaceTurnCreateMock,
+  saveLocalParentWorkspace,
+  stubStableIds,
 } from "@/node/services/taskService.testHarness";
+import type { mock } from "bun:test";
+import { expect } from "bun:test";
+import type { StreamEndEvent } from "@/common/types/stream";
 
 type WorkspaceTurnManagerHostFake = WorkspaceTurnManagerHost & {
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
@@ -218,4 +226,79 @@ export function createWorkspaceTurnManagerHarness(
     workspaceService,
     initStateManager,
   };
+}
+
+// Helpers shared by the workspaceTurnManager.*.test.ts section files, moved verbatim when
+// workspaceTurnManager.test.ts was split; the describe-level ones that used the suite's
+// rootDir now take it as their first parameter.
+export async function startWorkspaceTurnForTest(
+  rootDir: string,
+  options: {
+    stableIds?: string[];
+    disposable?: boolean;
+    sendMessage?: ReturnType<typeof mock>;
+    remove?: ReturnType<typeof mock>;
+    isStreaming?: ReturnType<typeof mock>;
+    hasQueuedMessages?: ReturnType<typeof mock>;
+    hasPendingQueuedOrPreparingTurn?: ReturnType<typeof mock>;
+    hasPendingBashMonitorWakeContinuation?: ReturnType<typeof mock>;
+    hasPendingWorkspaceTurnContinuation?: ReturnType<typeof mock>;
+    getQueueCutCutter?: ReturnType<typeof mock>;
+    hasPendingAutoRetry?: ReturnType<typeof mock>;
+    waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
+  } = {}
+) {
+  const config = await createTestConfig(rootDir);
+  stubStableIds(config, options.stableIds ?? ["handle", "turn"]);
+  const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+  const createWorkspace = makeWorkspaceTurnCreateMock(config, projectPath);
+  const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, ...options });
+  const aiMocks = createAIServiceMocks(config, {
+    ...(options.isStreaming != null ? { isStreaming: options.isStreaming } : {}),
+  });
+  const { historyService, taskService, taskHost } = createWorkspaceTurnManagerHarness(config, {
+    aiService: aiMocks.aiService,
+    workspaceService: workspaceMocks.workspaceService,
+  });
+
+  const created = await taskService.createWorkspaceTurn({
+    ownerWorkspaceId: parentId,
+    prompt: "Summarize",
+    title: "Workspace turn",
+    workspace: { mode: "new", ...(options.disposable === true ? { disposable: true } : {}) },
+  });
+  expect(created.success).toBe(true);
+  if (!created.success) {
+    throw new Error(created.error);
+  }
+
+  return {
+    config,
+    parentId,
+    projectPath,
+    taskService,
+    taskHost,
+    workspaceMocks,
+    aiMocks,
+    historyService,
+    created: created.data,
+  };
+}
+
+export async function finalizeWorkspaceTurnStreamEndForTest(
+  taskService: WorkspaceTurnManager,
+  event: StreamEndEvent
+): Promise<boolean> {
+  const internal = taskService as unknown as {
+    captureQueueCutAttributionSnapshot: (workspaceId: string) => QueueCutAttributionSnapshot;
+    finalizeWorkspaceTurnFromStreamEnd: (
+      event: StreamEndEvent,
+      queueCutSnapshot: QueueCutAttributionSnapshot
+    ) => Promise<boolean>;
+  };
+  return await internal.finalizeWorkspaceTurnFromStreamEnd(
+    event,
+    internal.captureQueueCutAttributionSnapshot(event.workspaceId)
+  );
 }
