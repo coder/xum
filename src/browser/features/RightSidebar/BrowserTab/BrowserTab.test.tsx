@@ -1,9 +1,9 @@
 import "../../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import type { ReactElement, ReactNode } from "react";
 
 import type {
   BrowserDiscoveredOtherSession,
@@ -40,19 +40,15 @@ const apiMock = {
     listSessions: listSessionsMock,
   },
 };
-const apiResultMock = {
-  api: apiMock,
-  status: "connected" as const,
-  error: null,
-  authenticate: () => undefined,
-  retry: () => undefined,
-};
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiMock as unknown as APIClient}>{props.children}</APIProvider>;
+}
 
-// Later full-app suites must not inherit this partial API client.
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => apiResultMock,
-}));
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
 // No usePersistedState module mock: each test gets a fresh happy-dom window, so the real
 // hook already returns the null default this suite relies on. A module replacement here
@@ -155,7 +151,7 @@ describe("BrowserTab", () => {
       otherSessions: [],
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(connectMock).toHaveBeenCalledWith("alpha");
@@ -179,7 +175,7 @@ describe("BrowserTab", () => {
       ],
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(view.getByText("Select session")).toBeTruthy();
@@ -207,7 +203,7 @@ describe("BrowserTab", () => {
       ],
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(connectMock).toHaveBeenCalledWith("current-alpha");
@@ -239,7 +235,7 @@ describe("BrowserTab", () => {
       return Promise.resolve({ success: true, error: undefined });
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(view.getByRole("tablist", { name: "Browser tabs" })).toBeTruthy();
@@ -292,7 +288,7 @@ describe("BrowserTab", () => {
       error: undefined,
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await view.findByRole("tablist", { name: "Browser tabs" });
     fireEvent.focus(view.getByTestId("browser-page-tab-t1"));
@@ -345,7 +341,7 @@ describe("BrowserTab", () => {
         })
     );
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await view.findByRole("tablist", { name: "Browser tabs" });
     fireEvent.click(view.getByTestId("browser-page-tab-t2"));
@@ -387,7 +383,7 @@ describe("BrowserTab", () => {
       return Promise.resolve({ success: true, error: undefined });
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(view.getByText("Select session")).toBeTruthy();
@@ -421,7 +417,7 @@ describe("BrowserTab", () => {
     });
     listTabsMock.mockResolvedValue({ tabs: [createPageTab()], error: undefined });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(listTabsMock).toHaveBeenCalledWith({
@@ -440,7 +436,7 @@ describe("BrowserTab", () => {
     });
     listTabsMock.mockResolvedValue({ tabs: [], error: "tab list failed" });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(view.getByRole("alert").textContent).toContain("tab list failed");
@@ -466,7 +462,7 @@ describe("BrowserTab", () => {
     });
     selectTabMock.mockResolvedValueOnce({ success: false, error: "tab switch failed" });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await view.findByTestId("browser-page-tab-t2");
     fireEvent.click(view.getByTestId("browser-page-tab-t2"));
@@ -507,7 +503,7 @@ describe("BrowserTab", () => {
       error: undefined,
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await view.findByRole("tablist", { name: "Browser tabs" });
     expect(view.getByTestId("browser-page-tab-t1").getAttribute("aria-label")).toBe(
@@ -535,7 +531,7 @@ describe("BrowserTab", () => {
       ],
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(connectMock).toHaveBeenCalledWith("current-alpha");
@@ -570,7 +566,7 @@ describe("BrowserTab", () => {
       ],
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect(view.getByText("Select session")).toBeTruthy();
@@ -601,7 +597,7 @@ describe("BrowserTab", () => {
       isPageLoading: true,
     });
 
-    const view = render(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
+    const view = renderWithApi(<BrowserTab workspaceId="workspace-1" projectPath="/project" />);
 
     await waitFor(() => {
       expect((view.getByLabelText("Browser URL") as HTMLInputElement).value).toBe(

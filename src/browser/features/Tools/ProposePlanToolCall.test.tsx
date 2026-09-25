@@ -1,10 +1,10 @@
-import type { ComponentProps } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
-import * as APIModule from "@/browser/contexts/API";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as UseOpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as UseReviewsModule from "@/browser/hooks/useReviews";
@@ -97,7 +97,6 @@ const useStartHereMock = mock(
 );
 
 const actualUseStartHereModule = { ...UseStartHereModule };
-const actualAPIModule = { ...APIModule };
 const actualUseOpenInEditorModule = { ...UseOpenInEditorModule };
 const actualWorkspaceContextModule = { ...WorkspaceContextModule };
 const actualUseReviewsModule = { ...UseReviewsModule };
@@ -108,10 +107,6 @@ async function installProposePlanModuleMocks() {
   await mock.module("@/browser/hooks/useStartHere", () => ({
     ...actualUseStartHereModule,
     useStartHere: useStartHereMock,
-  }));
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => ({ api: mockApi, status: "connected" as const, error: null }),
   }));
   await mock.module("@/browser/hooks/useOpenInEditor", () => ({
     ...actualUseOpenInEditorModule,
@@ -176,7 +171,6 @@ async function restoreProposePlanModuleMocks() {
   // Bun's mock.module() has no disposer, and mock.restore() does not undo module mocks.
   // Restore real exports so this test's renderer stubs do not leak into review suites.
   await mock.module("@/browser/hooks/useStartHere", () => actualUseStartHereModule);
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
   await mock.module("@/browser/hooks/useOpenInEditor", () => actualUseOpenInEditorModule);
   await mock.module("@/browser/contexts/WorkspaceContext", () => actualWorkspaceContextModule);
   await mock.module("@/browser/hooks/useReviews", () => actualUseReviewsModule);
@@ -239,8 +233,30 @@ function wrapToolCall(content: JSX.Element, agentId = "plan") {
   );
 }
 
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks into later-evaluated suites. The wrapper reads mockApi at render time (tests assign
+// it after beforeEach) and view.rerender() keeps it. A null mockApi means no backend client.
+function ApiWrapper(props: { children: ReactNode }) {
+  if (mockApi === null) {
+    return (
+      <APIContext.Provider
+        value={{
+          status: "connecting",
+          api: null,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    );
+  }
+  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+}
+
 function renderToolCall(content: JSX.Element, agentId = "plan") {
-  return render(wrapToolCall(content, agentId));
+  return render(wrapToolCall(content, agentId), { wrapper: ApiWrapper });
 }
 
 type ProposePlanProps = ComponentProps<typeof ProposePlanToolCall>;

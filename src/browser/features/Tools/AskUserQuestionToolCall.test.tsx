@@ -1,19 +1,20 @@
 import "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import type { ReactElement } from "react";
+import type { ReactElement, ReactNode } from "react";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 
 // ToolIcon renders a Radix Tooltip, which requires a TooltipProvider in the
-// React tree. Wrap each render so the icon can mount without throwing.
+// React tree. Wrap each render so the icon can mount without throwing. The API client is
+// injected through the wrapper, which view.rerender() keeps.
 function renderWithProviders(ui: ReactElement) {
-  return render(<TooltipProvider>{ui}</TooltipProvider>);
+  return render(<TooltipProvider>{ui}</TooltipProvider>, { wrapper: ApiWrapper });
 }
 
 let currentWorkspaceState: {
@@ -64,23 +65,19 @@ const setAutoRetryEnabled = mock((input: unknown) => {
   });
 });
 
-// Later full-app tests must not inherit this tool's partial, per-render API client.
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: {
-      workspace: {
-        answerAskUserQuestion,
-        resumeStream,
-        setAutoRetryEnabled,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+const apiClient = {
+  workspace: {
+    answerAskUserQuestion,
+    resumeStream,
+    setAutoRetryEnabled,
+  },
+} as unknown as APIClient;
+
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={apiClient}>{props.children}</APIProvider>;
+}
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const actualWorkspaceStore =

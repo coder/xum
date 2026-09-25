@@ -1,11 +1,10 @@
 import "../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import * as RealAPIModule from "@/browser/contexts/API";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 // Keep the fake transport and its events in one realm even after other UI tests install a DOM.
 import { GlobalWindow, EventTarget, Event, CustomEvent } from "happy-dom";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import type { ReactElement, ReactNode } from "react";
 
 import { watchDesktopViewerFixture } from "./desktopRfb.test-fixture";
 
@@ -20,11 +19,16 @@ const api = {
     detachViewer: () => Promise.resolve(),
   },
 };
-// Other UI suites need their provider's full API, not this desktop-only client.
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api }),
-}));
+// Inject this desktop-only client through the real provider: a module mock of contexts/API
+// is process-wide and other UI suites need their provider's full API. view.rerender() keeps
+// the wrapper.
+function ApiWrapper(props: { children: ReactNode }) {
+  return <APIProvider client={api as unknown as APIClient}>{props.children}</APIProvider>;
+}
+
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
 class FakeRfb extends EventTarget {
   static instances: FakeRfb[] = [];
@@ -101,7 +105,7 @@ describe("DesktopPanel binding", () => {
     async (interaction) => {
       Object.defineProperty(window, "api", { configurable: true, value: {} });
       getWindow.mockRejectedValueOnce(new Error("Initial manager failure"));
-      const view = render(<DesktopPanel workspaceId={`electron-recovery-${interaction}`} />);
+      const view = renderWithApi(<DesktopPanel workspaceId={`electron-recovery-${interaction}`} />);
       await waitFor(() =>
         expect(view.getByRole("alert").textContent).toContain("Initial manager failure")
       );
@@ -142,7 +146,7 @@ describe("DesktopPanel binding", () => {
         })
     );
     try {
-      render(<DesktopPanel workspaceId="electron-reserve" />);
+      renderWithApi(<DesktopPanel workspaceId="electron-reserve" />);
       // The manager lookup is a round trip during which nothing else would mark the pane
       // attached; the pane reserves itself first, without connecting.
       await waitFor(() => expect(watchViewer).toHaveBeenCalledTimes(1));
@@ -168,7 +172,9 @@ describe("DesktopPanel binding", () => {
       try {
         const open = mock(() => null);
         window.open = open;
-        const view = render(<DesktopPanel workspaceId={`browser-detach-gesture-${scheduling}`} />);
+        const view = renderWithApi(
+          <DesktopPanel workspaceId={`browser-detach-gesture-${scheduling}`} />
+        );
         await connectedViewer();
         const detachButton = view.getByRole("button", { name: "Detach" });
         await waitFor(() => expect(detachButton.hasAttribute("disabled")).toBe(false));
@@ -183,7 +189,7 @@ describe("DesktopPanel binding", () => {
   );
 
   test("shows bootstrap binding while connecting with the caller's bridge and token", async () => {
-    const view = render(<DesktopPanel workspaceId="caller" />);
+    const view = renderWithApi(<DesktopPanel workspaceId="caller" />);
     const viewer = await connectedViewer();
     expect(getBootstrap).toHaveBeenCalledWith({
       workspaceId: "caller",
@@ -198,13 +204,13 @@ describe("DesktopPanel binding", () => {
 
   test("does not show a shared target for an independent desktop", async () => {
     getBootstrap.mockResolvedValue({ ...sharedBootstrap, capability: ownCapability });
-    const view = render(<DesktopPanel workspaceId="isolated" />);
+    const view = renderWithApi(<DesktopPanel workspaceId="isolated" />);
     await connectedViewer();
     expect(view.queryByText(/Original desktop/)).toBeNull();
   });
 
   test("clears the binding after security failure and keeps it cleared when retry bootstrap fails", async () => {
-    const view = render(<DesktopPanel workspaceId="caller" />);
+    const view = renderWithApi(<DesktopPanel workspaceId="caller" />);
     const viewer = await connectedViewer();
     act(() => {
       viewer.dispatchEvent(
@@ -220,7 +226,7 @@ describe("DesktopPanel binding", () => {
   });
 
   test("clears disconnected target metadata before a reconnect gets a new bootstrap", async () => {
-    const view = render(<DesktopPanel workspaceId="caller" />);
+    const view = renderWithApi(<DesktopPanel workspaceId="caller" />);
     const viewer = await connectedViewer();
     act(() => {
       viewer.dispatchEvent(new CustomEvent("disconnect", { detail: { clean: false } }));
@@ -230,7 +236,7 @@ describe("DesktopPanel binding", () => {
   });
 
   test("disposes the previous binding and bootstraps the newly selected workspace", async () => {
-    const view = render(<DesktopPanel workspaceId="caller" />);
+    const view = renderWithApi(<DesktopPanel workspaceId="caller" />);
     const previousViewer = await connectedViewer();
     getBootstrap.mockResolvedValue({
       capability: ownCapability,
@@ -254,7 +260,7 @@ describe("DesktopPanel binding", () => {
   test("ignores a late bootstrap from the workspace that was switched away from", async () => {
     const pending = Promise.withResolvers<Bootstrap>();
     getBootstrap.mockReturnValueOnce(pending.promise);
-    const view = render(<DesktopPanel workspaceId="caller" />);
+    const view = renderWithApi(<DesktopPanel workspaceId="caller" />);
     // Bootstrap follows the viewer registration, so wait for the caller's request to be in
     // flight before switching workspaces underneath it.
     await waitFor(() =>
