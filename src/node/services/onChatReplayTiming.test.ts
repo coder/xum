@@ -18,7 +18,7 @@ function createClock() {
 }
 
 describe("createOnChatReplayTimer", () => {
-  test("sums repeated phases across sync and async calls and reports the total", async () => {
+  test("sums repeated phases across sync, async, and start/stop calls and reports the total", async () => {
     const clock = createClock();
     const timer = createOnChatReplayTimer(clock.now);
 
@@ -28,11 +28,14 @@ describe("createOnChatReplayTimer", () => {
       return Promise.resolve();
     });
     timer.timeSync("fingerprint", () => clock.advance(4));
+    const stopEmitRows = timer.start("emitRows");
+    clock.advance(8);
+    stopEmitRows();
     clock.advance(5); // unmeasured work still counts toward the total
 
     expect(timer.finish()).toEqual({
-      totalMs: 32,
-      phasesMs: { fingerprint: 7, streamReplay: 20 },
+      totalMs: 40,
+      phasesMs: { fingerprint: 7, streamReplay: 20, emitRows: 8 },
     });
   });
 

@@ -36,6 +36,11 @@ export interface OnChatReplayTimer {
   time<T>(phase: OnChatReplayPhase, fn: () => Promise<T>): Promise<T>;
   timeSync<T>(phase: OnChatReplayPhase, fn: () => T): T;
   /**
+   * Start timing `phase`; call the returned stop function exactly once when it ends. Lets a
+   * caller time a long inline block without wrapping (and re-indenting) it in a closure.
+   */
+  start(phase: OnChatReplayPhase): () => void;
+  /**
    * Time a locked read as two phases: `waitPhase` until `fn` reports the lock was acquired,
    * `workPhase` for the rest. If the lock is never reported, the whole call counts as wait.
    */
@@ -61,7 +66,18 @@ export function createOnChatReplayTimer(
     phasesMs[phase] = (phasesMs[phase] ?? 0) + elapsedMs;
   };
 
+  const start = (phase: OnChatReplayPhase): (() => void) => {
+    const phaseStartedAt = now();
+    let stopped = false;
+    return () => {
+      assert(!stopped, `onChat replay phase ${phase} stopped twice`);
+      stopped = true;
+      add(phase, now() - phaseStartedAt);
+    };
+  };
+
   return {
+    start,
     async time(phase, fn) {
       const phaseStartedAt = now();
       try {
@@ -71,11 +87,11 @@ export function createOnChatReplayTimer(
       }
     },
     timeSync(phase, fn) {
-      const phaseStartedAt = now();
+      const stop = start(phase);
       try {
         return fn();
       } finally {
-        add(phase, now() - phaseStartedAt);
+        stop();
       }
     },
     async timeLocked(waitPhase, workPhase, fn) {

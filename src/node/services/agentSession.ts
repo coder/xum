@@ -3184,38 +3184,38 @@ export class AgentSession {
           }
         }
 
-        replayTimer.timeSync("emitRows", () => {
-          for (const message of history) {
-            // Skip the placeholder message if we have a partial with the same historySequence.
-            // The placeholder has empty parts; the partial has the actual content.
-            // Without this, both get loaded and the empty placeholder may be shown as "last message".
+        const stopEmitRows = replayTimer.start("emitRows");
+        for (const message of history) {
+          // Skip the placeholder message if we have a partial with the same historySequence.
+          // The placeholder has empty parts; the partial has the actual content.
+          // Without this, both get loaded and the empty placeholder may be shown as "last message".
+          if (
+            partialHistorySequence !== undefined &&
+            message.metadata?.historySequence === partialHistorySequence
+          ) {
+            continue;
+          }
+
+          // Incremental replay skips strictly older persisted messages.
+          // We intentionally keep the cursor-boundary sequence (==) so reconnects can
+          // replace an in-flight placeholder with the finalized turn when the stream
+          // completed while the client was offline.
+          if (sinceHistorySequence !== undefined) {
+            const messageHistorySequence = message.metadata?.historySequence;
             if (
-              partialHistorySequence !== undefined &&
-              message.metadata?.historySequence === partialHistorySequence
+              messageHistorySequence !== undefined &&
+              messageHistorySequence < sinceHistorySequence
             ) {
               continue;
             }
-
-            // Incremental replay skips strictly older persisted messages.
-            // We intentionally keep the cursor-boundary sequence (==) so reconnects can
-            // replace an in-flight placeholder with the finalized turn when the stream
-            // completed while the client was offline.
-            if (sinceHistorySequence !== undefined) {
-              const messageHistorySequence = message.metadata?.historySequence;
-              if (
-                messageHistorySequence !== undefined &&
-                messageHistorySequence < sinceHistorySequence
-              ) {
-                continue;
-              }
-            }
-
-            // Add type: "message" for discriminated union (messages from chat.jsonl don't have it)
-            if (emitReplayMessage({ ...message, type: "message" })) {
-              sentRowCount += 1;
-            }
           }
-        });
+
+          // Add type: "message" for discriminated union (messages from chat.jsonl don't have it)
+          if (emitReplayMessage({ ...message, type: "message" })) {
+            sentRowCount += 1;
+          }
+        }
+        stopEmitRows();
 
         for (let index = history.length - 1; index >= 0; index -= 1) {
           const message = history[index];
