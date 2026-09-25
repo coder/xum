@@ -1,7 +1,7 @@
 import * as path from "path";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mock, spyOn } from "bun:test";
+import { mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import { execSync } from "node:child_process";
 
@@ -28,7 +28,6 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
-import { log } from "@/node/services/log";
 import type { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import type {
   TaskHandleStore,
@@ -613,7 +612,10 @@ export function createTaskServiceStack(
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);
   const events = overrides.aiEvents ?? aiServiceEvents.get(aiService);
-  if (events != null) taskServiceStreamEvents.set(taskService, events);
+  if (events != null) {
+    taskServiceStreamEvents.set(taskService, events);
+    recordHandlerFailures(taskService, "handleStreamEnd");
+  }
   return {
     historyService,
     taskService,
@@ -625,13 +627,34 @@ export function createTaskServiceStack(
   };
 }
 
-const STREAM_END_FAILURE_LOG = "TaskService.handleStreamEnd failed";
+/** Handler rejections keyed by the event object the listener handed to the handler. */
+const handlerFailures = new WeakMap<object, unknown>();
+
+/**
+ * Observe (never alter) a private stream handler: its listener only logs a rejection, so record it
+ * against the exact event, which keeps overlapping deliveries apart without a global logger spy.
+ */
+function recordHandlerFailures(taskService: TaskService, handler: "handleStreamEnd"): void {
+  const target = taskService as unknown as Record<
+    typeof handler,
+    (event: object, ...rest: unknown[]) => Promise<void>
+  >;
+  const original = target[handler].bind(taskService);
+  target[handler] = async (event, ...rest) => {
+    try {
+      await original(event, ...rest);
+    } catch (error) {
+      handlerFailures.set(event, error);
+      throw error;
+    }
+  };
+}
 
 /**
  * Deliver a stream-end the way StreamManager does: emit it on the AIService TaskService subscribed
  * to, so the listener captures the queue-cut snapshot and the attempt origin in the event's own
  * tick, registers the stream-end decision and serializes on the workspace event lock. Resolves once
- * that lock drained, and rethrows a handler failure the listener would otherwise only log.
+ * that lock drained, and rethrows this event's handler failure, which the listener only logs.
  */
 export async function streamEnd(taskService: TaskService, event: StreamEndEvent): Promise<void> {
   const events = taskServiceStreamEvents.get(taskService);
@@ -641,22 +664,10 @@ export async function streamEnd(taskService: TaskService, event: StreamEndEvent)
   );
   assert(events.listenerCount("stream-end") > 0, "TaskService is not subscribed to stream-end");
   // Draining needs the lock itself: the listener's chained handler is not otherwise observable.
+  // The handler (and its failure record) finishes inside the lock, before this wait resolves.
   const locks = (taskService as unknown as { workspaceEventLocks: MutexMap<string> })
     .workspaceEventLocks;
-  const logError = spyOn(log, "error");
-  const firstCall = logError.mock.calls.length;
-  let failures: unknown[];
-  try {
-    events.emit("stream-end", event);
-    await locks.withLock(event.workspaceId, () => Promise.resolve());
-    // The listener logs a rejected handler from a .catch continuation; let it run first.
-    await new Promise((resolve) => setImmediate(resolve));
-  } finally {
-    failures = logError.mock.calls
-      .slice(firstCall)
-      .filter((call) => call[0] === STREAM_END_FAILURE_LOG)
-      .map((call) => (call[1] as { error?: unknown } | undefined)?.error);
-    logError.mockRestore();
-  }
-  if (failures.length > 0) throw failures[0];
+  events.emit("stream-end", event);
+  await locks.withLock(event.workspaceId, () => Promise.resolve());
+  if (handlerFailures.has(event)) throw handlerFailures.get(event);
 }
