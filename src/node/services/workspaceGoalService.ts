@@ -30,6 +30,7 @@ import {
 } from "@/common/types/message";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import {
   hasBudgetedResumableGoal,
   modelHasPricingData,
@@ -836,7 +837,12 @@ export class WorkspaceGoalService {
       // artifacts (goal-cleared summaries, family-message payloads) are not
       // the manual turn's settled response — only a real, completed assistant
       // response proves the turn consumed the row.
-      const followerRow = historyResult.data[index + 1];
+      // Hidden plan-review records (a propose_plan snapshot captured mid-turn, resolve/reopen
+      // rows) can sit between the manual row and its response; they are state, not turns, so
+      // look past them for the settled response.
+      const followerRow = historyResult.data
+        .slice(index + 1)
+        .find((row) => !isPlanReviewRecordMessage(row));
       const manualRowProcessed =
         followerRow?.role === "assistant" &&
         followerRow.metadata?.partial !== true &&

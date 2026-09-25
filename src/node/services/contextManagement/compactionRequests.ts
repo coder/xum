@@ -1,6 +1,7 @@
 import type { ReviewNoteDataForDisplay } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { selectKeepRecentTailStartIndex } from "@/common/utils/messages/keepRecentTail";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { RLM_KEEP_RECENT_FLOOR_TOKENS } from "@/constants/rlmCompaction";
 import type { HistoryService } from "../historyService";
@@ -72,6 +73,9 @@ export function inheritOpenWorkspaceTurnMetadata(
 ): Extract<MuxMessageMetadata, { type: "workspace-turn-task" }> | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const message = messages[i];
+    // Model-hidden records (plan-review snapshot/resolve/reopen, workflow display rows) are
+    // UI state that can land after the correlated assistant cut; they are not turn boundaries.
+    if (isModelHiddenMessage(message)) continue;
     const muxMetadata = message.metadata?.muxMetadata;
     if (message.role === "assistant") {
       if (
@@ -115,7 +119,13 @@ export async function computeKeepRecentTailStamp(
     return undefined;
   }
 
-  const messages = historyResult.data;
+  // Size the tail over the rows a provider request would actually contain. Model-hidden rows
+  // (plan-review records, workflow display rows) are stripped from every request and from the
+  // preserved tail copies, yet a single plan snapshot can exceed the whole floor — charging it
+  // here would make the selector drop the entire visible tail. The selector's index points into
+  // this filtered array; the stamp below is the row's durable historySequence, which is why no
+  // index remapping is needed.
+  const messages = historyResult.data.filter((message) => !isModelHiddenMessage(message));
   const startIndex = selectKeepRecentTailStartIndex(messages, RLM_KEEP_RECENT_FLOOR_TOKENS);
   if (startIndex === -1) {
     return undefined;

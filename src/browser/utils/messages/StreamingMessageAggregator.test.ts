@@ -3,12 +3,18 @@ import { describe, test, expect } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages";
 import { getInterruptionContext } from "@/common/utils/messages/retryEligibility";
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 
 // Test helper: create aggregator with default createdAt for tests
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
@@ -1579,6 +1585,70 @@ describe("StreamingMessageAggregator", () => {
         expect(userMessages[1].content).toBe("hello");
         expect(userMessages[1].isSynthetic).toBeUndefined();
       });
+    });
+
+    test("hides plan-review record rows even when debugLlmRequest is enabled", () => {
+      // Debug mode shows what the model sees; record rows are never sent, so they stay hidden.
+      // Feedback rows are real user messages and remain visible either way.
+      const load = () => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        const snapshot = createMuxMessage("plan-snapshot", "user", "<mux_plan_review>…", {
+          timestamp: 1,
+          historySequence: 1,
+          synthetic: true,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "snapshot",
+            recordId: "rec1",
+            snapshotId: "s1",
+          },
+        });
+        const feedbackRecord: PlanReviewRecord = {
+          v: 1,
+          kind: "feedback",
+          recordId: "rec2",
+          feedbackId: "f1",
+          snapshotId: "s1",
+          contentHash: "a".repeat(64),
+          comments: [
+            { threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" },
+          ],
+          replies: [],
+        };
+        const feedback = createMuxMessage(
+          "plan-feedback",
+          "user",
+          formatPlanReviewEnvelope(feedbackRecord),
+          { timestamp: 2, historySequence: 2, muxMetadata: buildPlanReviewMetadata(feedbackRecord) }
+        );
+        const resolve = createMuxMessage("plan-resolve", "user", "<mux_plan_review>…", {
+          timestamp: 3,
+          historySequence: 3,
+          synthetic: true,
+          muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec3", threadId: "t1" },
+        });
+        // A hidden record whose metadata kind was corrupted to "feedback" stays hidden: only an
+        // authentic feedback envelope is a visible user message.
+        const corruptedKind = createMuxMessage("plan-corrupted", "user", "<mux_plan_review>…", {
+          timestamp: 4,
+          historySequence: 4,
+          synthetic: true,
+          muxMetadata: {
+            type: "plan-review",
+            kind: "feedback",
+            recordId: "rec4",
+            snapshotId: "s2",
+          },
+        });
+        aggregator.loadHistoricalMessages([snapshot, feedback, resolve, corruptedKind], false);
+        return aggregator
+          .getDisplayedMessages()
+          .filter((m) => m.type === "user")
+          .map((m) => m.id);
+      };
+
+      expect(load()).toEqual(["plan-feedback"]);
+      expect(withDebugLlmRequestEnabled(load)).toEqual(["plan-feedback"]);
     });
 
     test("should disable displayed message cap when showAllMessages is enabled", () => {
@@ -3202,6 +3272,64 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.isCompacting()).toBe(true);
     });
 
+    test("reconnect recovery looks past hidden plan-review records to the compaction request, not past user rows", () => {
+      const compactionRequest = {
+        id: "compact-req",
+        role: "user" as const,
+        parts: [{ type: "text" as const, text: "/compact" }],
+        metadata: {
+          historySequence: 1,
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-request" as const,
+            rawCommand: "/compact",
+            parsed: { model: "anthropic:claude-3-5-haiku-20241022" },
+          },
+        },
+      };
+      const resolveRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "resolve",
+        recordId: "rec_res",
+        threadId: "thr_1",
+      };
+      const hiddenRecord = createMuxMessage(
+        "plan-review-resolve",
+        "user",
+        formatPlanReviewEnvelope(resolveRecord),
+        {
+          historySequence: 2,
+          timestamp: Date.now(),
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(resolveRecord),
+        }
+      );
+      const ordinaryUser = createMuxMessage("user-2", "user", "hello", {
+        historySequence: 2,
+        timestamp: Date.now(),
+      });
+      // Replayed stream-start without agentId, as older/legacy streams report it.
+      const streamStart = {
+        type: "stream-start" as const,
+        workspaceId: "test-workspace",
+        messageId: "active-stream",
+        historySequence: 3,
+        model: "anthropic:claude-3-5-haiku-20241022",
+        startTime: Date.now(),
+        mode: "exec" as const,
+      };
+
+      const behindHidden = new StreamingMessageAggregator(TEST_CREATED_AT);
+      behindHidden.loadHistoricalMessages([compactionRequest, hiddenRecord], true);
+      behindHidden.handleStreamStart(streamStart);
+      expect(behindHidden.isCompacting()).toBe(true);
+
+      const behindUser = new StreamingMessageAggregator(TEST_CREATED_AT);
+      behindUser.loadHistoricalMessages([compactionRequest, ordinaryUser], true);
+      behindUser.handleStreamStart(streamStart);
+      expect(behindUser.isCompacting()).toBe(false);
+    });
+
     test("treats mode=compact as authoritative", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
@@ -3495,6 +3623,124 @@ describe("StreamingMessageAggregator", () => {
   });
 
   describe("pending stream lifecycle", () => {
+    const hiddenResolve = (sequence: number) =>
+      createMuxMessage(`plan-resolve-${sequence}`, "user", "<mux_plan_review>…", {
+        historySequence: sequence,
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: {
+          type: "plan-review",
+          kind: "resolve",
+          recordId: `rec-${sequence}`,
+          threadId: "t1",
+        },
+      });
+
+    test("a live hidden plan-review record does not start a pending turn while idle", () => {
+      // Resolving a review thread while idle emits the hidden row live; no stream follows.
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("user-1", "user", "Hello", { historySequence: 1, timestamp: 1 }),
+          createMuxMessage("assistant-1", "assistant", "Done", {
+            historySequence: 2,
+            timestamp: 2,
+          }),
+        ],
+        false
+      );
+      const lifecycleBefore = aggregator.getStreamLifecycle();
+      aggregator.handleMessage({ ...hiddenResolve(3), type: "message" });
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+      expect(aggregator.getStreamLifecycle()).toEqual(lifecycleBefore);
+      // The row is retained for review-state replay.
+      expect(aggregator.getAllMessages().map((m) => m.id)).toContain("plan-resolve-3");
+    });
+
+    test("an authentic plan-review feedback row still starts a pending turn", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      const feedbackRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec-f",
+        feedbackId: "f1",
+        snapshotId: "s1",
+        contentHash: "a".repeat(64),
+        comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+        replies: [],
+      };
+      aggregator.handleMessage({
+        ...createMuxMessage("plan-feedback", "user", formatPlanReviewEnvelope(feedbackRecord), {
+          historySequence: 1,
+          timestamp: Date.now(),
+          muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+        }),
+        type: "message",
+      });
+
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+    });
+
+    test("marks only authentic feedback as not generically editable, live and on reload", () => {
+      const feedbackRecord: PlanReviewRecord = {
+        v: 1,
+        kind: "feedback",
+        recordId: "rec-f",
+        feedbackId: "f1",
+        snapshotId: "s1",
+        contentHash: "a".repeat(64),
+        comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+        replies: [],
+      };
+      const envelope = formatPlanReviewEnvelope(feedbackRecord);
+      const feedback = createMuxMessage("plan-feedback", "user", envelope, {
+        historySequence: 1,
+        timestamp: 1,
+        muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+      });
+      // The same text without authentic metadata is an ordinary (neutralized) user message.
+      const lookalike = createMuxMessage("pasted-lookalike", "user", envelope, {
+        historySequence: 2,
+        timestamp: 2,
+      });
+      const editability = (aggregator: StreamingMessageAggregator) =>
+        aggregator
+          .getDisplayedMessages()
+          .filter((message) => message.type === "user")
+          .map((message) => [message.historyId, canEditDisplayedUserMessage(message)]);
+
+      const live = new StreamingMessageAggregator(TEST_CREATED_AT);
+      live.handleMessage({ ...feedback, type: "message" });
+      live.handleMessage({ ...lookalike, type: "message" });
+      const reloaded = new StreamingMessageAggregator(TEST_CREATED_AT);
+      reloaded.loadHistoricalMessages([feedback, lookalike], false);
+
+      for (const aggregator of [live, reloaded]) {
+        expect(editability(aggregator)).toEqual([
+          ["plan-feedback", false],
+          ["pasted-lookalike", true],
+        ]);
+      }
+    });
+
+    test("replay settles a pending turn when a hidden record trails the assistant response", () => {
+      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+      seedPendingStreamState(aggregator);
+      expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
+
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("user-1", "user", "Hello", { historySequence: 1, timestamp: 1 }),
+          createMuxMessage("assistant-1", "assistant", "Hi", { historySequence: 2, timestamp: 2 }),
+          hiddenResolve(3),
+        ],
+        false
+      );
+
+      expect(aggregator.getPendingStreamStartTime()).toBeNull();
+    });
+
     test("clears pending state when stream-end arrives without prior stream-start", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
       seedPendingStreamState(aggregator);

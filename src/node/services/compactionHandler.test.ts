@@ -1906,6 +1906,40 @@ describe("CompactionHandler", () => {
       expect(metadata?.preservedTailMessageCount).toBe(2);
     });
 
+    it("never copies model-hidden plan-review record rows into the preserved tail", async () => {
+      // Record rows are UI state that no provider request ever contains; a copy behind the
+      // boundary would only duplicate hidden state (and the projection ignores copies anyway).
+      handler = new CompactionHandler({
+        workspaceId,
+        historyService,
+        sessionDir,
+        telemetryService,
+        emitter: mockEmitter,
+      });
+
+      const record = createMuxMessage("plan-review-1", "user", "<mux_plan_review>…", {
+        synthetic: true,
+        muxMetadata: { type: "plan-review", kind: "resolve", recordId: "rec", threadId: "thr" },
+      });
+      await seedHistory(
+        createMuxMessage("u0", "user", "old head question"),
+        createMuxMessage("a0", "assistant", "old head answer"),
+        createMuxMessage("u1", "user", "tail question"),
+        createMuxMessage("a1", "assistant", "tail answer"),
+        record,
+        // seedHistory assigns sequences 0..5; the tail starts at u1 (seq 2).
+        createStampedCompactionRequest("compact-req", 2)
+      );
+
+      expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
+
+      const epochResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!epochResult.success) throw new Error(epochResult.error);
+      const copies = epochResult.data.filter((row) => row.metadata?.rlmPreservedTailCopy === true);
+      expect(copies.map((copy) => copy.role)).toEqual(["user", "assistant"]);
+      expect(copies.some((copy) => copy.metadata?.muxMetadata?.type === "plan-review")).toBe(false);
+    });
+
     it("rewrites MCP snapshot invoking IDs to the copy IDs of LATER tail rows", async () => {
       // MCP snapshot rows precede the user row they expand, so the invoking
       // row's copy ID must be preassigned before any copy is built — a

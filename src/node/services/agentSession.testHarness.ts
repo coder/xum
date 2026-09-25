@@ -192,6 +192,7 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "onTurnSuperseded"
   | "onBeforeTurnCompletion"
   | "compactionMonitor"
+  | "planSnapshotCaptureTimeoutMs"
 > {
   workspaceId: string;
   contextManagement?: ContextManagementService;
@@ -305,6 +306,7 @@ export async function createAgentSessionHarness(
     onTurnSuperseded: options.onTurnSuperseded,
     onBeforeTurnCompletion: options.onBeforeTurnCompletion,
     compactionMonitor: options.compactionMonitor,
+    planSnapshotCaptureTimeoutMs: options.planSnapshotCaptureTimeoutMs,
   });
 
   const events: WorkspaceChatMessage[] = [];

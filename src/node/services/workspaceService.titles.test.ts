@@ -13,6 +13,11 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { createMuxMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
 import {
   createCompactionAdmissionMocks,
@@ -595,6 +600,53 @@ describe("WorkspaceService regenerateTitle", () => {
 
   afterEach(async () => {
     await harness.cleanup();
+  });
+
+  test("hidden review rows cannot become title context or displace genuine feedback", async () => {
+    const workspaceId = "title-hidden-review";
+    const feedback: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "feedback",
+      feedbackId: "feedback",
+      snapshotId: "snapshot",
+      contentHash: "a".repeat(64),
+      summary: "visible feedback",
+      comments: [],
+      replies: [],
+    };
+    const feedbackText = formatPlanReviewEnvelope(feedback);
+    const hidden = (id: string) =>
+      createMuxMessage(id, "user", "HIDDEN_REVIEW_SENTINEL", {
+        muxMetadata: { type: "plan-review", kind: "snapshot", recordId: id },
+      });
+    const rows = [
+      hidden("hidden-first"),
+      createMuxMessage("objective", "user", "visible objective"),
+      createMuxMessage("answer", "assistant", "visible progress"),
+      createMuxMessage("feedback", "user", feedbackText, {
+        muxMetadata: buildPlanReviewMetadata(feedback),
+      }),
+      ...Array.from({ length: 5 }, (_, i) => hidden(`hidden-tail-${i}`)),
+    ];
+    for (const row of rows)
+      expect((await historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+    const generate = spyOn(workspaceTitleGenerator, "generateWorkspaceIdentity").mockResolvedValue(
+      Ok({ name: "visible-title", title: "Visible title", modelUsed: "test:model" })
+    );
+    const update = spyOn(workspaceService, "updateTitle").mockResolvedValueOnce(Ok(undefined));
+    try {
+      expect((await workspaceService.regenerateTitle(workspaceId)).success).toBe(true);
+      const call = generate.mock.calls[0];
+      expect(call?.[0]).toBe("visible objective");
+      expect(call?.[3]).toContain("visible progress");
+      expect(call?.[3]).toContain(feedbackText);
+      expect(call?.[3]).not.toContain("HIDDEN_REVIEW_SENTINEL");
+      expect(call?.[4]).toBe(feedbackText);
+    } finally {
+      update.mockRestore();
+      generate.mockRestore();
+    }
   });
 
   test("returns updateTitle error when persisting generated title fails", async () => {

@@ -5,6 +5,10 @@ import type { ProjectConfig, ProjectsConfig, Workspace } from "@/common/types/pr
 import { Ok } from "@/common/types/result";
 import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import {
   HEARTBEAT_DEFAULT_INTERVAL_MS,
   HEARTBEAT_DEFAULT_MESSAGE_BODY,
   HEARTBEAT_MIN_INTERVAL_MS,
@@ -164,6 +168,21 @@ describe("HeartbeatService", () => {
       createMuxMessage("1", "user", "Hello", { timestamp }),
       createMuxMessage("2", "assistant", "Hi!", { timestamp }),
     ];
+  }
+
+  /** Hidden plan-review record row (resolve/reopen appended while idle): user role, never a prompt. */
+  function makePlanReviewRecordRow(id: string): MuxMessage {
+    const record = {
+      v: 1 as const,
+      kind: "reopen" as const,
+      recordId: `rec_${id}`,
+      threadId: "thr_1",
+    };
+    return createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+      timestamp: staleTimestamp,
+      synthetic: true,
+      muxMetadata: buildPlanReviewMetadata(record),
+    });
   }
 
   function makeInteractiveAssistantMessage(timestamp = staleTimestamp): MuxMessage {
@@ -396,6 +415,41 @@ describe("HeartbeatService", () => {
           getChatHistoryMock.mockResolvedValueOnce([
             createMuxMessage("1", "user", "Hello", { timestamp: staleTimestamp }),
             makeInteractiveAssistantMessage(),
+          ]),
+        eligible: false,
+        reason: "awaiting_interactive_input",
+      },
+      {
+        // Hidden plan-review records (resolve/reopen while idle) are user-role rows but never a
+        // prompt awaiting a response; they must not disable scheduled heartbeats.
+        name: "hidden plan-review record rows follow a completed turn",
+        setup: () =>
+          getChatHistoryMock.mockResolvedValueOnce([
+            ...makeCompletedTurnHistory(),
+            makePlanReviewRecordRow("3"),
+            makePlanReviewRecordRow("4"),
+          ]),
+        eligible: true,
+        reason: undefined,
+      },
+      {
+        name: "hidden plan-review record rows follow an unanswered prompt",
+        setup: () =>
+          getChatHistoryMock.mockResolvedValueOnce([
+            ...makeCompletedTurnHistory(),
+            createMuxMessage("3", "user", "Another question?", { timestamp: staleTimestamp }),
+            makePlanReviewRecordRow("4"),
+          ]),
+        eligible: false,
+        reason: "awaiting_response",
+      },
+      {
+        name: "hidden plan-review record rows follow an interactive assistant turn",
+        setup: () =>
+          getChatHistoryMock.mockResolvedValueOnce([
+            createMuxMessage("1", "user", "Hello", { timestamp: staleTimestamp }),
+            makeInteractiveAssistantMessage(),
+            makePlanReviewRecordRow("3"),
           ]),
         eligible: false,
         reason: "awaiting_interactive_input",

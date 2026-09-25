@@ -1,3 +1,8 @@
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { describe, expect, it, spyOn } from "bun:test";
 
 import * as fsPromises from "node:fs/promises";
@@ -15,7 +20,7 @@ import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiment
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
-import { REFINE_SUMMARY_LABEL } from "@/constants/refine";
+import { REFINE_MAX_MESSAGES, REFINE_SUMMARY_LABEL } from "@/constants/refine";
 import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
@@ -354,6 +359,55 @@ describe("RefineService", () => {
     expect(refused.success).toBe(false);
     if (!refused.success) expect(refused.error).toContain("rlm-mode experiment is disabled");
     expect(enabledFixture.modelCalls).toHaveLength(0);
+  });
+
+  it("hidden review rows do not displace the visible refinement trajectory", async () => {
+    const prompts: string[] = [];
+    using fixture = await createFixture({
+      modelFactory: () => noOpModel((prompt) => prompts.push(prompt)),
+    });
+    await fixture.seedTrajectory(["visible older trajectory"]);
+    const feedback: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "feedback",
+      feedbackId: "feedback",
+      snapshotId: "snapshot",
+      contentHash: "a".repeat(64),
+      summary: "visible feedback",
+      comments: [],
+      replies: [],
+    };
+    expect(
+      (
+        await fixture.historyService.appendToHistory(
+          WORKSPACE_ID,
+          createMuxMessage("feedback", "user", formatPlanReviewEnvelope(feedback), {
+            muxMetadata: buildPlanReviewMetadata(feedback),
+          })
+        )
+      ).success
+    ).toBe(true);
+    for (let i = 0; i <= REFINE_MAX_MESSAGES; i++) {
+      expect(
+        (
+          await fixture.historyService.appendToHistory(
+            WORKSPACE_ID,
+            createMuxMessage(`hidden-${i}`, "user", "HIDDEN_REVIEW_SENTINEL", {
+              muxMetadata: { type: "plan-review", kind: "snapshot", recordId: `hidden-${i}` },
+            })
+          )
+        ).success
+      ).toBe(true);
+    }
+    const before = await fixture.readChat();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("visible older trajectory");
+    expect(prompts[0]).toContain("visible feedback");
+    expect(prompts[0]).not.toContain("HIDDEN_REVIEW_SENTINEL");
+    const originalIds = new Set(before.map((row) => row.id));
+    expect((await fixture.readChat()).filter((row) => originalIds.has(row.id))).toEqual(before);
   });
 
   it("neutralizes workspace_trajectory delimiters embedded in the transcript (r32)", async () => {

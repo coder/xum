@@ -30,6 +30,7 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
+import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 
 /**
@@ -386,6 +387,8 @@ function buildUserDisplayedMessages(options: {
       contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
+      isPlanReviewFeedback:
+        getAuthenticPlanReviewRecord(message)?.kind === "feedback" ? true : undefined,
       timestamp: baseTimestamp,
       agentSkill,
       mcpPromptRefs,

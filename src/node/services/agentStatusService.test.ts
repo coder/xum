@@ -1,11 +1,18 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
+import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
 import { Ok, Err } from "@/common/types/result";
 import { createMuxMessage } from "@/common/types/message";
 import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import {
+  AGENT_STATUS_MAX_TRAILING_MESSAGES,
   AGENT_STATUS_PROVIDER_FAILURE_IDLE_COOLDOWN_MS,
   AGENT_STATUS_PROVIDER_FAILURE_RETRY_ATTEMPTS,
 } from "@/constants/agentStatus";
@@ -18,6 +25,7 @@ import type { TokenizerService } from "./tokenizerService";
 import { AgentStatusService } from "./agentStatusService";
 import * as workspaceStatusGenerator from "./workspaceStatusGenerator";
 import { createTestHistoryService } from "./testHistoryService";
+import { createContextResetBoundaryMessageId } from "./utils/messageIds";
 
 interface AgentStatusServiceInternals {
   runTick(): Promise<void>;
@@ -249,6 +257,179 @@ describe("AgentStatusService", () => {
     await getInternals(service).runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(2);
     expect(generateSpy.mock.calls[1][0]).toContain("Assistant (in progress): Reading config files");
+  });
+
+  test("hidden plan-review record rows never reach the status transcript", async () => {
+    // Snapshot/resolve/reopen records are synthetic user rows that carry the
+    // whole plan text. They are UI state, not conversation: the status model
+    // must not see them, and appending one must not trigger a regeneration.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please propose the plan")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Proposed the plan")
+    );
+    const planContent = "# Secret plan\n\nDo the thing.\n";
+    const snapshot = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec-1",
+      snapshotId: "snap-1",
+      planPath: "/tmp/plan.md",
+      contentHash: "a".repeat(64),
+      proposalToolCallId: "call-1",
+      content: planContent,
+    };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-1", "user", formatPlanReviewEnvelope(snapshot), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Please propose the plan");
+    expect(transcript).toContain("Assistant: Proposed the plan");
+    expect(transcript).not.toContain("mux_plan_review");
+    expect(transcript).not.toContain("Secret plan");
+
+    // A later resolve record changes history but not the transcript → dedup holds.
+    const resolve = { v: 1 as const, kind: "resolve" as const, recordId: "rec-2", threadId: "t-1" };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-2", "user", formatPlanReviewEnvelope(resolve), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(resolve),
+      })
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("hidden plan-review records do not consume the status transcript window", async () => {
+    // Resolving/reopening many threads appends one hidden record row each. The trailing window
+    // is counted in VISIBLE rows: a burst of hidden records must neither evict the recent
+    // conversation from the transcript nor change its hash by evicting a visible row.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Please propose the plan")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a1", "assistant", "Proposed the plan")
+    );
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const before = generateSpy.mock.calls[0][0];
+    expect(before).toContain("User: Please propose the plan");
+
+    for (let i = 0; i < AGENT_STATUS_MAX_TRAILING_MESSAGES; i++) {
+      const record = {
+        v: 1 as const,
+        kind: "resolve" as const,
+        recordId: `rec-${i}`,
+        threadId: "t",
+      };
+      await historyHandle.historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(`pr-${i}`, "user", formatPlanReviewEnvelope(record), {
+          timestamp: Date.now(),
+          synthetic: true,
+          muxMetadata: buildPlanReviewMetadata(record),
+        })
+      );
+    }
+    // Same visible transcript → dedup holds (no regeneration) even though the last 80 rows are
+    // all hidden records.
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
+    // A new visible row regenerates with the whole recent conversation still present.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u2", "user", "Looks good, continue")
+    );
+    await getInternals(service).runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    const after = generateSpy.mock.calls[1][0];
+    expect(after).toContain("User: Please propose the plan");
+    expect(after).toContain("Assistant: Proposed the plan");
+    expect(after).toContain("User: Looks good, continue");
+    expect(after).not.toContain("mux_plan_review");
+    // ~80 real history appends: the default 5s budget flaked once under a loaded host.
+  }, 20_000);
+
+  test("the status transcript never crosses a durable manual context reset", async () => {
+    // A manual reset is a privacy floor: everything before the reset marker is discarded
+    // conversation and must not reach any provider request — including the sidebar status
+    // model. Provider-request assembly enforces this via
+    // sliceMessagesForProviderFromLatestContextBoundary; the trailing-window scan must stop at
+    // the same marker instead of refilling a short post-reset window with pre-reset rows.
+    // The reset lands via the same path WorkspaceService.resetContext uses (appendToHistory of
+    // a reset boundary row), which also rotates the sealed pre-reset prefix into
+    // chat-archive.jsonl — so this covers the archived case, not only an unrotated chat.jsonl.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u0", "user", "PRE-RESET-SECRET: my API token is hunter2")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("a0", "assistant", "PRE-RESET-SECRET: acknowledged the token")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage(createContextResetBoundaryMessageId(), "assistant", "", {
+        timestamp: Date.now(),
+        contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+      })
+    );
+    // Rotation is part of the reset write path: the discarded rows now live in the archive.
+    const archivePath = join(historyHandle.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME);
+    expect(existsSync(archivePath)).toBe(true);
+    expect(readFileSync(archivePath, "utf8")).toContain("PRE-RESET-SECRET");
+
+    // Post-reset epoch: fewer visible rows than the window, plus one hidden plan-review row so
+    // the visible-row counting has a reason to keep scanning.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Fresh start after reset")
+    );
+    const snapshot = {
+      v: 1 as const,
+      kind: "snapshot" as const,
+      recordId: "rec-post-reset",
+      snapshotId: "snap-post-reset",
+      planPath: "/tmp/plan.md",
+      contentHash: "b".repeat(64),
+      content: "# Post-reset plan\n",
+    };
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-post-reset", "user", formatPlanReviewEnvelope(snapshot), {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(snapshot),
+      })
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Fresh start after reset");
+    expect(transcript).not.toContain("mux_plan_review");
+    expect(transcript).not.toContain("PRE-RESET-SECRET");
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {

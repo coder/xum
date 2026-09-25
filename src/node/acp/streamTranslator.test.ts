@@ -3,6 +3,11 @@ import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 import { StreamTranslator } from "@/node/acp/streamTranslator";
 import { createMuxMessage } from "@/common/types/message";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 
 async function replayThrough(events: WorkspaceChatMessage[]): Promise<unknown[]> {
   const sessionUpdate = mock(() => Promise.resolve(undefined));
@@ -58,6 +63,71 @@ describe("StreamTranslator MCP prompt replay", () => {
 
     const updates = await replayThrough([{ ...snapshotMessage, type: "message" }]);
 
+    expect(updates).toEqual([]);
+  });
+});
+
+describe("StreamTranslator plan-review record replay", () => {
+  function recordEvent(record: PlanReviewRecord, replay?: true): WorkspaceChatMessage {
+    const message = createMuxMessage(
+      `row-${record.recordId}`,
+      "user",
+      formatPlanReviewEnvelope(record),
+      {
+        ...(record.kind === "feedback" ? {} : { synthetic: true }),
+        muxMetadata: buildPlanReviewMetadata(record),
+      }
+    );
+    return { ...message, type: "message", ...(replay ? { replay } : {}) };
+  }
+
+  const snapshot: PlanReviewRecord = {
+    v: 1,
+    kind: "snapshot",
+    recordId: "rec_snap",
+    snapshotId: "snap_1",
+    planPath: "/plans/p.md",
+    contentHash: "a".repeat(64),
+    content: "# Secret plan\n\nStep one\n",
+  };
+  const feedback: PlanReviewRecord = {
+    v: 1,
+    kind: "feedback",
+    recordId: "rec_fb",
+    feedbackId: "fb_1",
+    snapshotId: "snap_1",
+    contentHash: "a".repeat(64),
+    comments: [
+      { threadId: "thr_1", anchor: { startLine: 3, endLine: 3 }, quote: "Step one", body: "Why?" },
+    ],
+    replies: [],
+  };
+  const hiddenKinds: PlanReviewRecord[] = [
+    snapshot,
+    { v: 1, kind: "resolve", recordId: "rec_res", threadId: "thr_1" },
+    { v: 1, kind: "reopen", recordId: "rec_reo", threadId: "thr_1" },
+  ];
+
+  test("full-history replay forwards only user-visible rows, never hidden state records", async () => {
+    const visible = createMuxMessage("user-1", "user", "please plan");
+    const updates = await replayThrough([
+      { ...visible, type: "message" },
+      ...hiddenKinds.map((record) => recordEvent(record)),
+      recordEvent(feedback),
+    ]);
+
+    const texts = updates.map(
+      (update) => (update as { update: { content: { text: string } } }).update.content.text
+    );
+    expect(texts).toEqual(["please plan", formatPlanReviewEnvelope(feedback)]);
+  });
+
+  test("reconnect replay rows flagged `replay` stay suppressed after caught-up", async () => {
+    const caughtUp: WorkspaceChatMessage = { type: "caught-up", historyReplayStatus: "complete" };
+    const updates = await replayThrough([
+      caughtUp,
+      ...hiddenKinds.map((record) => recordEvent(record, true)),
+    ]);
     expect(updates).toEqual([]);
   });
 });

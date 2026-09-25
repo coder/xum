@@ -1,8 +1,19 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import { createMuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
+import {
+  createMuxMessage,
+  getCompactionFollowUpContent,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
+import { Err, Ok } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
+import { getPlanReviewState, hashPlanSnapshotContent } from "./planReviewService";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import { PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE } from "./agentSession";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 type StreamMessageHandler = AIService["streamMessage"];
@@ -132,6 +143,239 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
         "user-original",
         "assistant-original",
       ]);
+    }
+  });
+
+  it("refuses a direct edit of authentic plan-review feedback before touching history", async () => {
+    // An ordinary edit would resend only the envelope text, which is neutralized as an untrusted
+    // lookalike, so the threads this feedback opened would silently vanish from review state.
+    const workspaceId = "ws-edit-plan-feedback";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const envelope = formatPlanReviewEnvelope(feedbackRecord);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("plan-feedback", "user", envelope, {
+        historySequence: 0,
+        muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+      })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-reply", "assistant", "Revised the plan", { historySequence: 1 })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-ordinary", "user", "Also cover rollback", { historySequence: 2 })
+    );
+    const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
+    const ids = async () => {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      return history.success ? history.data.map((message) => message.id) : [];
+    };
+
+    const refused = await session.sendMessage("edited feedback", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "plan-feedback",
+    });
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toMatchObject({
+        type: "unknown",
+        raw: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+      });
+    }
+    expect(truncateAfterMessage).not.toHaveBeenCalled();
+    expect(streamMessage).not.toHaveBeenCalled();
+    expect(await ids()).toEqual(["plan-feedback", "assistant-reply", "user-ordinary"]);
+
+    // Control: ordinary messages after the feedback stay editable.
+    const edited = await session.sendMessage("Also cover rollback and retries", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "user-ordinary",
+    });
+    expect(edited.success).toBe(true);
+    await session.waitForIdle();
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    expect((await ids()).slice(0, 2)).toEqual(["plan-feedback", "assistant-reply"]);
+  });
+
+  it("refuses an edit of a compaction request whose follow-up carries plan-review feedback", async () => {
+    // On-send compaction defers feedback as the request's nested follow-up; that follow-up
+    // dispatches as the feedback row later. Editing the request would truncate it and drop the
+    // feedback (and its threads) exactly as editing the feedback row itself would.
+    const workspaceId = "ws-edit-compaction-feedback";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const compactionRequest = (followUpText: string, followUpMetadata?: MuxMessageMetadata) =>
+      ({
+        type: "compaction-request",
+        rawCommand: "/compact",
+        source: "auto-compaction",
+        parsed: {
+          followUpContent: {
+            text: followUpText,
+            model: TEST_MODEL,
+            agentId: "plan",
+            ...(followUpMetadata ? { muxMetadata: followUpMetadata } : {}),
+          },
+        },
+      }) satisfies MuxMessageMetadata;
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-feedback", "user", "Summarize the conversation", {
+        historySequence: 0,
+        muxMetadata: compactionRequest(
+          formatPlanReviewEnvelope(feedbackRecord),
+          buildPlanReviewMetadata(feedbackRecord)
+        ),
+      })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-ordinary", "user", "Summarize the conversation", {
+        historySequence: 1,
+        muxMetadata: compactionRequest("Also cover rollback"),
+      })
+    );
+    const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
+    const ids = async () => {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      return history.success ? history.data.map((message) => message.id) : [];
+    };
+
+    const refused = await session.sendMessage("edited", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "compaction-feedback",
+    });
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toMatchObject({
+        type: "unknown",
+        raw: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+      });
+    }
+    expect(truncateAfterMessage).not.toHaveBeenCalled();
+    expect(streamMessage).not.toHaveBeenCalled();
+    expect(await ids()).toEqual(["compaction-feedback", "compaction-ordinary"]);
+    // The deferred handoff still carries the feedback.
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    expect(
+      getCompactionFollowUpContent(history.data[0]?.metadata?.muxMetadata)?.muxMetadata
+    ).toEqual(buildPlanReviewMetadata(feedbackRecord));
+
+    // Control: a compaction request with an ordinary follow-up stays editable.
+    const edited = await session.sendMessage("Also cover retries", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "compaction-ordinary",
+    });
+    expect(edited.success).toBe(true);
+    await session.waitForIdle();
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    expect((await ids())[0]).toBe("compaction-feedback");
+    expect(await ids()).not.toContain("compaction-ordinary");
+  });
+
+  it("refuses an edit when the full-history read that classifies an archived target fails", async () => {
+    // A compaction boundary archives the feedback row, so only the full-history scan can see
+    // it. If that read fails, the edit must not proceed: a later successful read would truncate
+    // the authentic feedback and replace it with a neutralized plain-text wrapper, deleting its
+    // threads from review state.
+    const workspaceId = "ws-edit-plan-feedback-read-failure";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const planContent = "# Plan\n\nStep one.\n";
+    const snapshotRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "snapshot",
+      recordId: "rec-s",
+      snapshotId: "s1",
+      planPath: "/tmp/plan.md",
+      contentHash: hashPlanSnapshotContent(planContent),
+      content: planContent,
+    };
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: snapshotRecord.contentHash,
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    for (const [id, record] of [
+      ["plan-snapshot", snapshotRecord],
+      ["plan-feedback", feedbackRecord],
+    ] as const) {
+      const appended = await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+          synthetic: record.kind === "snapshot",
+          muxMetadata: buildPlanReviewMetadata(record),
+        })
+      );
+      expect(appended.success).toBe(true);
+    }
+    const compacted = await historyService.persistBoundaryWithTailCopies(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "summary", {
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      }),
+      [],
+      false
+    );
+    expect(compacted.success).toBe(true);
+    const latest = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(latest.success && latest.data.map((message) => message.id)).toEqual(["summary"]);
+
+    spyOn(historyService, "iterateFullHistory").mockResolvedValueOnce(Err("disk read failed"));
+    const refused = await session.sendMessage("edited feedback", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "plan-feedback",
+    });
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error.type).toBe("unknown");
+      expect(refused.error.type === "unknown" && refused.error.raw).toContain("disk read failed");
+    }
+    expect(streamMessage).not.toHaveBeenCalled();
+    const state = await getPlanReviewState(historyService, workspaceId);
+    expect(state.success).toBe(true);
+    if (state.success) {
+      expect(state.data.feedbacks.map((feedback) => feedback.feedbackId)).toEqual(["f1"]);
+      expect(state.data.threads.map((thread) => thread.threadId)).toEqual(["t1"]);
     }
   });
 

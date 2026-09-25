@@ -4,10 +4,29 @@ import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import type { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { ProjectConfig, ProjectsConfig } from "@/common/types/project";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
+
+/** Hidden plan-review record row (resolve/reopen appended while idle): user role, never a prompt. */
+function planReviewRecordRow(id: string, timestamp: number) {
+  const record = {
+    v: 1 as const,
+    kind: "resolve" as const,
+    recordId: `rec_${id}`,
+    threadId: "thr_1",
+  };
+  return createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
+    timestamp,
+    synthetic: true,
+    muxMetadata: buildPlanReviewMetadata(record),
+  });
+}
 
 describe("IdleCompactionService", () => {
   // Mock services
@@ -204,6 +223,63 @@ describe("IdleCompactionService", () => {
       const result = await service.checkEligibility(testWorkspaceId, threshold24h, now);
       expect(result.eligible).toBe(false);
       expect(result.reason).toBe("awaiting_response");
+    });
+
+    /** Persist rows on top of the answered turn the suite seeds in beforeEach. */
+    async function appendRows(rows: MuxMessage[]): Promise<void> {
+      for (const row of rows) {
+        const result = await historyService.appendToHistory(testWorkspaceId, row);
+        expect(result.success).toBe(true);
+      }
+    }
+
+    test("ignores hidden plan-review record rows when judging an unanswered tail", async () => {
+      // A resolve/reopen appended while idle sits after the assistant's answer; it is not a
+      // prompt awaiting a response, so background compaction must stay eligible.
+      const idleTimestamp = now - 25 * oneHourMs;
+      await appendRows([
+        planReviewRecordRow("3", idleTimestamp),
+        planReviewRecordRow("4", idleTimestamp),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+
+      // A real unanswered prompt followed by hidden rows keeps its protection.
+      await appendRows([
+        createMuxMessage("5", "user", "Another question?", { timestamp: idleTimestamp }),
+        planReviewRecordRow("6", idleTimestamp),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+    });
+
+    test("looks past a tail window made only of hidden record rows", async () => {
+      // More hidden rows than the bounded tail read: the window alone cannot tell whether the
+      // last real row is an answered turn or a pending prompt, so the check must consult the
+      // history since the latest boundary rather than guess either way.
+      const idleTimestamp = now - 25 * oneHourMs;
+      const fullSpy = spyOn(historyService, "getHistoryFromLatestBoundary");
+      const hiddenWindow = (prefix: string) =>
+        Array.from({ length: 50 }, (_, i) => planReviewRecordRow(`${prefix}${i}`, idleTimestamp));
+
+      await appendRows(hiddenWindow("h"));
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: true,
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(1);
+
+      await appendRows([
+        createMuxMessage("pending", "user", "Pending", { timestamp: idleTimestamp }),
+        ...hiddenWindow("p"),
+      ]);
+      expect(await service.checkEligibility(testWorkspaceId, threshold24h, now)).toEqual({
+        eligible: false,
+        reason: "awaiting_response",
+      });
+      expect(fullSpy).toHaveBeenCalledTimes(2);
     });
 
     test("returns ineligible when messages have no timestamps", async () => {

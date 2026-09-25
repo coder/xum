@@ -98,6 +98,7 @@ import {
   getContextBoundaryKind,
 } from "@/common/utils/messages/compactionBoundary";
 import { isWorkflowResultMessage } from "@/common/utils/workflowRunMessages";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 // Hidden synthetic snapshot rows (skill, MCP prompt, and @file materializations) precede the
 // durable first message and never render, so they must not drop the presentation-only pending
@@ -1223,6 +1224,8 @@ export class StreamingMessageAggregator {
         this.maybeTrackLoadedSkillFromAgentSkillSnapshot(message.metadata?.agentSkillSnapshot);
 
         if (message.role === "user") {
+          // Plan-review record rows are hidden UI state, not user turns (see handleMuxMessage).
+          if (isPlanReviewRecordMessage(message)) continue;
           // Mirror live behavior for status: clear transient status on new user turn
           // but keep persisted status for fallback on reload.
           this.agentStatus = undefined;
@@ -1283,7 +1286,10 @@ export class StreamingMessageAggregator {
     this.invalidateCache();
 
     if (!opts?.skipDerivedState && !hasActiveStream && this.pendingStreamStartTime !== null) {
-      const latestMessage = this.getAllMessages().at(-1);
+      // Hidden plan-review records can trail the settling assistant row; they are not turns.
+      const latestMessage = this.getAllMessages().findLast(
+        (message) => !isPlanReviewRecordMessage(message)
+      );
       const historySettledThePendingTurn =
         latestMessage?.role === "assistant" ||
         (latestMessage?.role === "user" && this.optimisticPendingStreamStart) ||
@@ -1685,6 +1691,9 @@ export class StreamingMessageAggregator {
         continue;
       }
       if (message.role !== "user") continue;
+      // Hidden plan-review records (snapshot/resolve/reopen) appended after the request are
+      // state, not user turns; they must not hide the request on reconnect recovery.
+      if (isPlanReviewRecordMessage(message)) continue;
       const muxMetadata = message.metadata?.muxMetadata;
       if (muxMetadata?.type === "compaction-request") {
         return sawCompletedCompaction
@@ -1716,7 +1725,8 @@ export class StreamingMessageAggregator {
   }
 
   private isDefaultPostCompactionContinueTurn(): boolean {
-    const messages = this.getAllMessages();
+    // A hidden plan-review record can sit between the summary and its follow-up row.
+    const messages = this.getAllMessages().filter((message) => !isPlanReviewRecordMessage(message));
     const latestMessage = messages.at(-1);
     const previousMessage = messages.at(-2);
     if (latestMessage?.role !== "user" || previousMessage?.role !== "assistant") {
@@ -3189,6 +3199,13 @@ export class StreamingMessageAggregator {
       return;
     }
 
+    if (isPlanReviewRecordMessage(incomingMessage)) {
+      // Plan-review snapshot/resolve/reopen rows are hidden UI state appended without starting
+      // a model turn (e.g. resolving a thread while idle). Keep the row for review-state replay
+      // but leave the lifecycle, agent status, compaction and pending-stream state untouched.
+      return;
+    }
+
     if (isDisplayOnlyCompletedSubagentReport(incomingMessage)) {
       // A terminal report card is appended for visibility after the parent already answered the
       // progress update. It intentionally starts no new parent turn, so preserve the idle lifecycle
@@ -3724,12 +3741,15 @@ export class StreamingMessageAggregator {
       // the live stream, the recovered partial, and the settled history row, so hide the
       // whole turn by that flag rather than by the text it happens to emit. A failed flush
       // stays visible: its error row and retry controls are the only explanation the user gets.
+      // Plan-review record rows stay hidden even in debug-LLM mode: that mode shows what the
+      // model sees, and these rows are never sent (isModelHiddenMessage).
       const shouldHideMessageFromTranscript = (message: MuxMessage): boolean =>
-        !showSyntheticMessages &&
-        ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
-          (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
-            message.metadata.error == null) ||
-          isWorkflowResultMessage(message));
+        isPlanReviewRecordMessage(message) ||
+        (!showSyntheticMessages &&
+          ((message.metadata?.synthetic === true && message.metadata?.uiVisible !== true) ||
+            (message.metadata?.muxMetadata?.contextBudgetFlush === true &&
+              message.metadata.error == null) ||
+            isWorkflowResultMessage(message)));
 
       // Retain hidden snapshots so referenced user messages can display their resolved content.
       const latestAgentSkillSnapshotByKey = new Map<string, AgentSkillSnapshotContent>();

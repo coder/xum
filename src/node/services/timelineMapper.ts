@@ -12,6 +12,7 @@ import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 import { getContextBoundaryKind } from "@/common/utils/messages/compactionBoundary";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
   parseSubagentReportEnvelope,
@@ -248,6 +249,12 @@ function mapMessage(
           ...(compactionSource != null ? { data: { reason: compactionSource } } : {}),
         },
       ];
+    }
+
+    // Snapshot/resolve/reopen records are state-only UI rows, not turns; authentic feedback is a
+    // real user message and stays on the feed.
+    if (isPlanReviewRecordMessage(event)) {
+      return [];
     }
 
     const machineAuthored = isMachineAuthoredTurn(event.metadata);

@@ -53,6 +53,7 @@ import {
   getKeepRecentTailStartHistorySequence,
 } from "@/common/utils/messages/keepRecentTail";
 import { createPreservedTailCopyMessageId } from "@/node/services/utils/messageIds";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import {
   mergeLoadedSkillSnapshots,
   extractLoadedSkillSnapshotsFromMessages,
@@ -534,7 +535,9 @@ export class CompactionHandler {
     const messages = historyResult.data;
     const compactionRequestMessage = compactionRequestMessageId
       ? messages.find((message) => message.id === compactionRequestMessageId)
-      : [...messages].reverse().find((message) => message.role === "user");
+      : [...messages]
+          .reverse()
+          .find((message) => message.role === "user" && !isModelHiddenMessage(message));
     const muxMeta = compactionRequestMessage?.metadata?.muxMetadata;
     const isCompaction =
       compactionRequestMessage?.role === "user" && muxMeta?.type === "compaction-request";
@@ -1129,13 +1132,15 @@ export class CompactionHandler {
 
     // Tail = rows between the stamped start and the compaction request.
     // Older compaction-request rows (failed prior attempts) are summarization
-    // prompts, not conversation — never preserve them.
+    // prompts, not conversation — never preserve them. Model-hidden rows
+    // (workflow display rows, plan-review records) never reach a request, so
+    // a copy would only duplicate UI state behind the boundary.
     const tailRows = messages.slice(0, requestIndex).filter((message) => {
       const sequence = message.metadata?.historySequence;
       if (!isNonNegativeInteger(sequence) || sequence < startHistorySequence) {
         return false;
       }
-      if (message.id === summaryMessageId) {
+      if (message.id === summaryMessageId || isModelHiddenMessage(message)) {
         return false;
       }
       return message.metadata?.muxMetadata?.type !== "compaction-request";

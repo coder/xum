@@ -8,6 +8,11 @@ import { createTestHistoryService } from "./testHistoryService";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { AIService } from "./aiService";
 import { createMuxMessage } from "@/common/types/message";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import {
   addToRenamingWorkspaces,
@@ -230,3 +235,80 @@ test.each([
     }
   }
 );
+
+test("a committed question stays answerable after a hidden plan-review record is appended", async () => {
+  // Resolving a review thread appends a model-hidden row with a higher sequence than the
+  // committed question. That row is UI state, not a conversational turn, so the staleness
+  // guard must not treat the still-current question as superseded.
+  const { config, historyService, cleanup } = await createTestHistoryService();
+  const workspaceId = "question-then-review-record";
+  const projectPath = path.join(config.rootDir, "repo");
+  await saveWorkspaces(config, projectPath, [projectWorkspace(projectPath, "child", workspaceId)]);
+  const { session, aiService } = await createAgentSessionHarness({
+    workspaceId,
+    config,
+    historyService,
+  });
+  const workspaceService = createWorkspaceServiceForTest({
+    config,
+    historyService,
+    aiService: aiService as unknown as AIService,
+  });
+  (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+    workspaceId,
+    session
+  );
+  const question = createMuxMessage("question", "assistant", "", {}, [
+    {
+      type: "dynamic-tool",
+      state: "input-available",
+      toolCallId: "ask-then-resolve",
+      toolName: "ask_user_question",
+      input: {
+        questions: [
+          {
+            header: "Choice",
+            question: "Which option?",
+            options: [
+              { label: "First", description: "Use first" },
+              { label: "Second", description: "Use second" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+    },
+  ]);
+  const resolveRecord: PlanReviewRecord = {
+    v: 1,
+    kind: "resolve",
+    recordId: "rec_after_question",
+    threadId: "thr_after_question",
+  };
+  try {
+    await historyService.appendToHistory(workspaceId, createMuxMessage("user", "user", "Work"));
+    await historyService.appendToHistory(workspaceId, question);
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("resolve-row", "user", formatPlanReviewEnvelope(resolveRecord), {
+        synthetic: true,
+        muxMetadata: buildPlanReviewMetadata(resolveRecord),
+      })
+    );
+    expect(
+      await workspaceService.answerAskUserQuestion(workspaceId, "ask-then-resolve", {
+        "Which option?": "First",
+      })
+    ).toEqual(Ok(undefined));
+    const history = await historyService.getLastMessages(workspaceId, 2);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      expect(history.data.find((m) => m.id === "question")?.parts[0]).toMatchObject({
+        state: "output-available",
+      });
+    }
+  } finally {
+    await session.dispose();
+    await cleanup();
+  }
+});

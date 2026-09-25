@@ -17,6 +17,11 @@ import {
   mapChatEventToTimeline,
   type TimelineMapperState,
 } from "./timelineMapper";
+import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
 
 const RECEIVED_AT = 1_700_000_000_500;
 
@@ -445,6 +450,58 @@ describe("mapChatEventToTimeline", () => {
     expect(skillSnapshot.drafts).toEqual([]);
     expect(fileSnapshot.drafts).toEqual([]);
     expect(goalContinuation.drafts).toEqual([]);
+  });
+
+  test("keeps state-only plan-review records off the feed but records authentic feedback", () => {
+    // Snapshot/resolve/reopen rows are UI state appended by proposals and thread actions; a
+    // turn row for each would log internal envelope digests as bogus synthetic turns.
+    const record = (sequence: number, kind: "snapshot" | "resolve" | "reopen") =>
+      map({
+        type: "message",
+        id: `plan-${kind}`,
+        role: "user",
+        parts: [{ type: "text", text: "<mux_plan_review>…</mux_plan_review>" }],
+        metadata: {
+          historySequence: sequence,
+          timestamp: 100,
+          synthetic: true,
+          muxMetadata: { type: "plan-review", kind, recordId: `rec-${kind}`, threadId: "t1" },
+        },
+      });
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const feedback = map({
+      type: "message",
+      id: "plan-feedback",
+      role: "user",
+      parts: [{ type: "text", text: formatPlanReviewEnvelope(feedbackRecord) }],
+      metadata: {
+        historySequence: 24,
+        timestamp: 100,
+        muxMetadata: buildPlanReviewMetadata(feedbackRecord),
+      },
+    });
+    const ordinary = map({
+      type: "message",
+      id: "user-ordinary",
+      role: "user",
+      parts: [{ type: "text", text: "Tighten step 2" }],
+      metadata: { historySequence: 25, timestamp: 100 },
+    });
+
+    expect(record(21, "snapshot").drafts).toEqual([]);
+    expect(record(22, "resolve").drafts).toEqual([]);
+    expect(record(23, "reopen").drafts).toEqual([]);
+    expect(feedback.drafts.map((draft) => draft.kind)).toEqual(["turn.user"]);
+    expect(ordinary.drafts.map((draft) => draft.kind)).toEqual(["turn.user"]);
   });
 
   test("classifies text-matched turns from the digest the mapper persists", () => {

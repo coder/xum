@@ -96,6 +96,8 @@ const LOCAL_COMMAND_STDOUT_CLOSE_TAG = "</local-command-stdout>";
 export const canEditDisplayedUserMessage = (message: DisplayedUserMessage): boolean => {
   if (message.isPendingSend === true) return false;
   if (message.isGoalContinuation === true || message.isBudgetLimitWrapup === true) return false;
+  // Feedback is re-sent through the plan-review endpoint, never as an ordinary edit (see the flag).
+  if (message.isPlanReviewFeedback === true) return false;
   if (message.content.startsWith(LOCAL_COMMAND_STDOUT_OPEN_TAG)) {
     return !message.content.endsWith(LOCAL_COMMAND_STDOUT_CLOSE_TAG);
   }

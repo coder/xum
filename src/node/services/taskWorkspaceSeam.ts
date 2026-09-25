@@ -376,6 +376,12 @@ export interface SendMessageInternalOptions {
   startStreamInBackground?: boolean;
   /** When true, reject instead of queueing if the workspace is busy. */
   requireIdle?: boolean;
+  /**
+   * Set only by WorkspaceService.planReviewSubmitFeedback, the one send allowed to carry
+   * plan-review muxMetadata (see carriesPlanReviewMetadata). Internal-only: no oRPC schema maps
+   * onto these options, so external callers cannot set it.
+   */
+  planReviewFeedback?: true;
   /** Preserve workspace-turn correlation only when this send is the next continuation. */
   workspaceTurnContinuation?: boolean;
   /** Coalescing for queued sends: drop the message when the same key is already queued. */

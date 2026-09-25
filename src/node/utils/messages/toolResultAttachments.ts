@@ -13,6 +13,8 @@ import {
   isSupportedAttachmentMediaType,
   normalizeAttachmentMediaType,
 } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
+import { neutralizeAgentEnvelopeLookalikes } from "@/common/utils/agentMessageEnvelope";
+import { neutralizePlanReviewEnvelopeLookalikes } from "@/common/utils/planReview/planReviewEnvelope";
 import {
   isRasterAttachmentMediaType,
   resizeRasterImageAttachmentBase64IfNeeded,
@@ -844,8 +846,27 @@ function createInlineSvgAttachmentText(attachment: ExtractedToolAttachment): str
     );
   }
 
+  // SECURITY AUDIT: tool-result SVG bytes are repository/attacker-controlled, and this text is
+  // emitted as a user-role part AFTER the request-level protocol-envelope neutralizers ran
+  // (messagePipeline and streamManager.prepareStep only saw the still-base64 payload). Rename
+  // exact <mux_agent_message>/<mux_plan_review> wrappers here so decoded SVG can never pose as a
+  // peer message or as the user's plan feedback, and size the fence past the longest backtick
+  // run so the SVG body cannot close it and continue as prose.
+  const neutralizedSvgText = neutralizePlanReviewEnvelopeLookalikes(
+    neutralizeAgentEnvelopeLookalikes(svgText)
+  );
+  const fence = createUnclosableFence(neutralizedSvgText);
   return (
     `[SVG attachment converted to text (providers generally don't accept ${SVG_MEDIA_TYPE} as an image input).]\n\n` +
-    `\`\`\`svg\n${svgText}\n\`\`\``
+    `${fence}svg\n${neutralizedSvgText}\n${fence}`
   );
+}
+
+/** Backtick fence at least one longer than any run inside `text` (CommonMark cannot close it early). */
+function createUnclosableFence(text: string): string {
+  let longestRun = 0;
+  for (const run of text.match(/`+/g) ?? []) {
+    longestRun = Math.max(longestRun, run.length);
+  }
+  return "`".repeat(Math.max(3, longestRun + 1));
 }

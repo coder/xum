@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { CompactionReplacementCapture } from "./compactionCancellation";
 import type { RestartBlocker } from "@/common/orpc/types";
@@ -417,6 +418,19 @@ import {
   upsertSubagentTranscriptArtifactIndexEntry,
 } from "@/node/services/subagentTranscriptArtifacts";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { PlanReviewError } from "@/common/types/errors";
+import type { PlanReviewState } from "@/common/utils/planReview/planReviewState";
+import {
+  PLAN_REVIEW_METADATA_RESERVED_MESSAGE,
+  carriesPlanReviewMetadata,
+  ensurePlanSnapshot,
+  getPlanReviewState,
+  preparePlanReviewFeedback,
+  setPlanReviewThreadResolved,
+  type EnsurePlanSnapshotResult,
+  type PlanReviewHistoryDeps,
+  type SubmitPlanReviewFeedbackInput,
+} from "@/node/services/planReviewService";
 
 /** Maximum number of retry attempts when workspace name collides */
 const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
@@ -865,8 +879,12 @@ function collectWorkspaceTitleContextTurns(
 ): WorkspaceTitleContextTurn[] {
   const turns: WorkspaceTitleContextTurn[] = [];
 
+  // Hidden records must not select the naming objective or consume the title's turn budget.
   for (const message of messages) {
-    if (message.role !== "user" && message.role !== "assistant") {
+    if (
+      isModelHiddenMessage(message) ||
+      (message.role !== "user" && message.role !== "assistant")
+    ) {
       continue;
     }
 
@@ -11671,6 +11689,145 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return (await this.getWorkflowInvocationCurrentness(workspaceId, runId)) === "current";
   }
 
+  // ---------------------------------------------------------------------------
+  // Native plan review (workspace.planReview.*): thin adapters over planReviewService.
+  // Record rows are appended without waking the agent and published like workflow rows.
+  // ---------------------------------------------------------------------------
+
+  private get planReviewHistoryDeps(): PlanReviewHistoryDeps {
+    return {
+      historyService: this.historyService,
+      emitChatEvent: (workspaceId, message) =>
+        this.getOrCreateSession(workspaceId).emitChatEvent({ ...message, type: "message" }),
+    };
+  }
+
+  planReviewGetState(workspaceId: string): Promise<Result<PlanReviewState, PlanReviewError>> {
+    return getPlanReviewState(this.historyService, workspaceId);
+  }
+
+  async planReviewEnsureSnapshot(
+    workspaceId: string,
+    proposalToolCallId?: string
+  ): Promise<Result<EnsurePlanSnapshotResult, PlanReviewError>> {
+    const metadata = await this.getInfo(workspaceId);
+    if (!metadata) {
+      return Err({ type: "plan_missing", message: `Workspace not found: ${workspaceId}` });
+    }
+    // No in-process fencing needed: ensurePlanSnapshot re-checks the generation and the plan
+    // file's existence under the history write lock (see its admission contract).
+    return ensurePlanSnapshot(this.planReviewHistoryDeps, {
+      workspaceId,
+      metadata,
+      ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
+    });
+  }
+
+  planReviewSetThreadResolved(
+    workspaceId: string,
+    threadId: string,
+    resolved: boolean
+  ): Promise<Result<PlanReviewState, PlanReviewError>> {
+    return setPlanReviewThreadResolved(this.planReviewHistoryDeps, {
+      workspaceId,
+      threadId,
+      resolved,
+    });
+  }
+
+  /**
+   * Validate and stamp the feedback, then send it as an ordinary user turn so the plan agent
+   * wakes with the envelope in its context. Feedback is only admitted as an immediate turn:
+   * while the workspace is busy it is refused instead of queued, because the generic queue's
+   * Stop/edit restoration returns queued input to the composer as plain text, which would drop
+   * the structured review metadata (a resent envelope is neutralized and never enters review
+   * state). The caller keeps its drafts and sends again once the turn finishes.
+   *
+   * Acceptance can be asynchronous: when the send trips on-send auto-compaction, only the
+   * compaction request is appended now, carrying the feedback (text and plan-review metadata)
+   * as its nested follow-up, and the authentic feedback row lands exactly once when that
+   * follow-up dispatches (also across failure, restart and Stop; see
+   * agentSession.planReviewCompactionHandoff.test.ts). The returned state reflects committed
+   * review records, so it omits such feedback until then; clients refresh from transcript events.
+   */
+  async planReviewSubmitFeedback(
+    workspaceId: string,
+    input: SubmitPlanReviewFeedbackInput & { options: SendMessageOptions }
+  ): Promise<Result<{ feedbackId: string; state: PlanReviewState | null }, PlanReviewError>> {
+    // The feedback binds snapshot/thread ids read from history BEFORE sendMessage's entry
+    // check, so a context clear/reset/replace committed in that gap (idle workspace, another
+    // window) would append a row whose references were just discarded — the projection would
+    // skip it as dangling while the transcript still shows it as sent. Compare the mutation
+    // epoch in the same synchronous block that enters sendMessage (which counts the send as
+    // in-preflight and re-probes the epoch itself), so a discard either lands before this check
+    // and is refused here, or is refused by acquireContextMutationAdmissionGuard until the row
+    // is admitted. The user re-sends against fresh state.
+    // The oRPC schema omits edit fields; assert for internal callers because an edit would
+    // truncate history at its target before the feedback row persists.
+    assert(
+      input.options.editMessageId === undefined &&
+        input.options.historyEditPrecondition === undefined &&
+        input.options.unfencedEdit === undefined,
+      "plan review feedback cannot carry edit semantics"
+    );
+    // Whether the referenced snapshot and threads still exist is checked where it can be
+    // decided: under the history write lock at the row's actual append (sendMessage's
+    // publication, see createPlanReviewFeedbackPrecondition), which also covers partial
+    // truncations, sibling backends and feedback deferred behind on-send compaction.
+    const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
+    const prepared = await preparePlanReviewFeedback(
+      this.historyService,
+      workspaceId,
+      input,
+      input.options
+    );
+    if (!prepared.success) return prepared;
+    if ((this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare) {
+      return Err({
+        type: "send_failed",
+        error: {
+          type: "unknown",
+          raw: "Plan review feedback was not sent: the workspace context was cleared or reset while it was being prepared. Review the current plan and send again.",
+        },
+      });
+    }
+    const sent = await this.sendMessage(
+      workspaceId,
+      prepared.data.text,
+      {
+        ...input.options,
+        muxMetadata: prepared.data.muxMetadata,
+      },
+      // Never queue feedback (see above): requireIdle refuses instead of queueing when busy.
+      { requireIdle: true, planReviewFeedback: true }
+    );
+    if (!sent.success) {
+      return Err({
+        type: "send_failed",
+        error:
+          sent.error.type === "unknown" && sent.error.raw === IDLE_ONLY_BUSY_SKIP_MESSAGE
+            ? {
+                type: "unknown",
+                raw: "Plan review feedback was not sent: the agent is busy. Send it again once the current turn finishes.",
+              }
+            : sent.error,
+      });
+    }
+    // The feedback row is durable (and may already drive a turn) once sendMessage succeeds. A
+    // failed refresh must not turn that into an error: a client keeping its drafts on failure
+    // would resend and duplicate the threads and the turn. Report success without state.
+    const state = await getPlanReviewState(this.historyService, workspaceId);
+    if (!state.success) {
+      log.warn("plan review: feedback sent but refreshing review state failed", {
+        workspaceId,
+        feedbackId: prepared.data.feedbackId,
+        error: state.error,
+      });
+      return Ok({ feedbackId: prepared.data.feedbackId, state: null });
+    }
+    return Ok({ feedbackId: prepared.data.feedbackId, state: state.data });
+  }
+
   /**
    * Three-state currentness: "indeterminate" means history/provenance could not be read or
    * ordered, so the answer is unknown rather than no. Callers that would permanently settle a
@@ -11994,6 +12151,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.agentInitiated !== true
         ? aiSelectionIntent
         : undefined;
+    // Plan-review rows may only come from the dedicated endpoints, which validate them first.
+    // Every generic send (oRPC/UI, CLI, ACP prompts, workflow continuations) enters here, and so
+    // does anything it later queues or defers behind compaction; refuse before any side effect.
+    if (internal?.planReviewFeedback !== true && carriesPlanReviewMetadata(options.muxMetadata)) {
+      return Err({ type: "unknown", raw: PLAN_REVIEW_METADATA_RESERVED_MESSAGE });
+    }
 
     let resumedInterruptedTask = false;
     // The attempt this call's own reawaken won: its failure rollback is CAS'd on it.
@@ -12660,8 +12823,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await continuationSendState.onAcceptedPreStreamFailure?.(error);
       };
 
+      // Feedback text is a review envelope quoting plan content, not the objective a pending
+      // auto-title is generated from; leave the title for a later ordinary message.
       const shouldRunPendingAutoTitle =
         internal?.synthetic !== true &&
+        internal?.planReviewFeedback !== true &&
         normalizedOptions.editMessageId == null &&
         workspaceConfig.pendingAutoTitle === true &&
         !this.autoTitlingWorkspaces.has(workspaceId);
@@ -13525,9 +13691,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           return Err(`Failed to answer ask_user_question: ${errorMessage}`);
         }
 
-        // Guard against answering stale tool calls.
+        // Guard against answering stale tool calls. Model-hidden records (plan-review
+        // snapshot/resolve/reopen rows, workflow display rows) are UI state, not conversational
+        // turns: resolving a review thread while a question is pending must not make the
+        // question unanswerable.
         const maxSeq = Math.max(
           ...historyResult.data
+            .filter((m) => !isModelHiddenMessage(m))
             .map((m) => m.metadata?.historySequence)
             .filter((n): n is number => typeof n === "number")
         );
@@ -13911,14 +14081,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Best-effort delete of plan files (new + legacy paths) for a workspace.
+   * Delete a workspace's plan files (new + legacy paths) before a history commit that discards
+   * them (full clear, replaceHistory with deletePlanFile). Missing files are fine; any other
+   * failure is returned so the caller refuses the mutation before committing it.
    *
-   * Why best-effort: plan files may not exist yet, or deletion may fail due to permissions.
+   * Why before the commit: ensurePlanSnapshot re-checks at its append, under the history write
+   * lock, that the plan still exists, so a capture (in this or a sibling backend) that read the
+   * plan earlier cannot land it in the new history. The deletion itself needs no history lock:
+   * the commit takes that lock afterwards, so an append ordered after the commit sees no plan and
+   * one ordered before it lands in the old history. Nothing ever restores the plan: when the
+   * commit then fails, history is kept without its plan. The user asked for the deletion, and
+   * snapshot rows already in history keep the reviewed content.
    */
-  private async deletePlanFilesForWorkspace(
-    workspaceId: string,
-    metadata: FrontendWorkspaceMetadata
-  ): Promise<void> {
+  private async deletePlanFilesForWorkspace(workspaceId: string): Promise<Result<void>> {
+    const metadata = await this.getInfo(workspaceId);
+    // No metadata: no plan path to derive, so there is nothing to delete.
+    if (!metadata) return Ok(undefined);
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
     const xumHome = runtime.getXumHome();
@@ -13942,8 +14120,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         ? expandTildeForSSH(legacyPlanPath)
         : shellQuote(expandTilde(legacyPlanPath));
 
-    if (isDocker || isSSH) {
-      try {
+    try {
+      if (isDocker || isSSH) {
         // Use exec to delete files since runtime doesn't have a deleteFile method.
         // Use runtime workspace path (not host projectPath) for Docker containers.
         const workspacePath = runtime.getWorkspacePath(metadata.projectPath, metadata.name);
@@ -13958,24 +14136,20 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           // Ignore stdin-close errors (e.g. already closed).
         }
 
-        await execStream.exitCode.catch(() => {
-          // Best-effort: ignore failures.
-        });
-      } catch {
-        // Plan files don't exist or can't be deleted - ignore
+        const exitCode = await execStream.exitCode;
+        if (exitCode !== 0) return Err(`Failed to delete the plan file (rm exited ${exitCode})`);
+        return Ok(undefined);
       }
 
-      return;
+      // Local runtimes: delete directly on the local filesystem (force: a missing file is fine).
+      await Promise.all([
+        fsPromises.rm(expandTilde(planPath), { force: true }),
+        fsPromises.rm(expandTilde(legacyPlanPath), { force: true }),
+      ]);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to delete the plan file: ${getErrorMessage(error)}`);
     }
-
-    // Local runtimes: delete directly on the local filesystem.
-    const planPathAbs = expandTilde(planPath);
-    const legacyPlanPathAbs = expandTilde(legacyPlanPath);
-
-    await Promise.allSettled([
-      fsPromises.rm(planPathAbs, { force: true }),
-      fsPromises.rm(legacyPlanPathAbs, { force: true }),
-    ]);
   }
 
   private async clearHistoryThroughCompactionCancellation(
@@ -14164,19 +14338,25 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // becoming a real cut skips reference retirement; a full clear leaving survivors would
     // apply full-clear-only discards while rows remain).
     let cancellationError: string | undefined;
-    const truncate = () =>
-      isFullClear
-        ? this.clearHistoryThroughCompactionCancellation(
-            workspaceId,
-            effectivePercentage,
-            (error) => {
-              cancellationError = error;
-            }
-          )
-        : this.historyService.truncateHistory(workspaceId, effectivePercentage, {
-            refuseFullDelete: truncationScope === "partial",
-            refuseRowRemoval: truncationScope === "none",
-          });
+    const truncate = async (): Promise<Result<number[]>> => {
+      if (!isFullClear) {
+        return this.historyService.truncateHistory(workspaceId, effectivePercentage, {
+          refuseFullDelete: truncationScope === "partial",
+          refuseRowRemoval: truncationScope === "none",
+        });
+      }
+      // After every refusal check above, right before the commit (#4420): see
+      // deletePlanFilesForWorkspace. A failed deletion refuses the clear with nothing committed.
+      const deleted = await this.deletePlanFilesForWorkspace(workspaceId);
+      if (!deleted.success) return Err(deleted.error);
+      return this.clearHistoryThroughCompactionCancellation(
+        workspaceId,
+        effectivePercentage,
+        (error) => {
+          cancellationError = error;
+        }
+      );
+    };
     const truncateResult =
       effectivePercentage > 0
         ? await this.clearHistoryWithRetiredBashMonitorWakes(workspaceId, truncate, {
@@ -14222,12 +14402,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
     }
 
-    // On full clear, also delete plan file and clear file change tracking
+    // On full clear (the plan file is already deleted), also clear file change tracking
     if (isFullClear) {
-      const metadata = await this.getInfo(workspaceId);
-      if (metadata) {
-        await this.deletePlanFilesForWorkspace(workspaceId, metadata);
-      }
       // A full chat clear removes the context the goal loop was using; require
       // one user re-engagement before later continuation slices resume it.
       try {
@@ -14447,6 +14623,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       deletePlanFile?: boolean;
     }
   ): Promise<Result<void>> {
+    // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
+    // from the dedicated endpoints; with a matching envelope this row would otherwise persist an
+    // authentic record that skipped their validation, directly or as a compaction summary's
+    // pending follow-up that recovery dispatches. Refused before anything is cleared.
+    if (carriesPlanReviewMetadata(summaryMessage.metadata?.muxMetadata)) {
+      return Err(PLAN_REVIEW_METADATA_RESERVED_MESSAGE);
+    }
     // Support both new enum ("user"|"idle") and legacy boolean (true)
     const isCompaction = !!summaryMessage.metadata?.compacted;
     // Non-compaction replaces hold the admission guard (r40): the destructive
@@ -14465,6 +14648,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     using _admissionGuard = admissionGuard;
 
     const replaceMode = options?.mode ?? "destructive";
+    // deletePlanFile deletes the plan right before this replacement's history commit, after its
+    // refusal checks (see deletePlanFilesForWorkspace); a failed deletion refuses it with nothing
+    // committed. Where the replacement keeps the context generation (compaction-boundary mode, or
+    // a compaction clear of empty history), this deletion plus ensurePlanSnapshot's existence
+    // check is the whole fence against an earlier plan read landing in the new history.
+    const deletePlanBeforeCommit = (): Promise<Result<void>> =>
+      options?.deletePlanFile === true
+        ? this.deletePlanFilesForWorkspace(workspaceId)
+        : Promise.resolve(Ok(undefined));
 
     try {
       let messageToAppend = summaryMessage;
@@ -14521,6 +14713,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           isPositiveInteger(messageToAppend.metadata?.compactionEpoch),
           "append-compaction-boundary replace mode must persist a positive compactionEpoch"
         );
+        // This mode's commit is the boundary append below.
+        const deleted = await deletePlanBeforeCommit();
+        if (!deleted.success) return Err(deleted.error);
       } else {
         assert(
           replaceMode === "destructive",
@@ -14588,12 +14783,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         let cancellationError: string | undefined;
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
-          () =>
-            isCompaction
+          async () => {
+            const deleted = await deletePlanBeforeCommit();
+            if (!deleted.success) return Err(deleted.error);
+            return isCompaction
               ? this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false })
               : this.clearHistoryThroughCompactionCancellation(workspaceId, 1, (error) => {
                   cancellationError = error;
-                }),
+                });
+          },
           { discardUnacceptedOnSuccess: true }
         );
         if (!clearResult.success) {
@@ -14692,14 +14890,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         this.emit("chat", { workspaceId, message: typedSummaryMessage });
       }
 
-      // Optional cleanup: delete plan file when caller explicitly requests it.
-      // Note: the propose_plan UI keeps the plan file on disk; this flag is reserved for
-      // explicit reset flows and backwards compatibility.
+      // Optional cleanup when the caller explicitly requests it (the plan file itself was
+      // deleted before the commit). Note: the propose_plan UI keeps the plan file on disk; this
+      // flag is reserved for explicit reset flows and backwards compatibility.
       if (options?.deletePlanFile === true) {
-        const metadata = await this.getInfo(workspaceId);
-        if (metadata) {
-          await this.deletePlanFilesForWorkspace(workspaceId, metadata);
-        }
         this.sessions.get(workspaceId)?.clearFileState();
       }
 

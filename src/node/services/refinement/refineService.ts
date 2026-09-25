@@ -1,3 +1,4 @@
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import * as path from "path";
 /**
  * /refine orchestration (RLM track, phase r11): user-invokable trajectory
@@ -948,7 +949,10 @@ export class RefineService {
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
     // transcript size.
-    const transcript = buildAbandonedBranchTranscript(activeSegment.slice(-REFINE_MAX_MESSAGES));
+    // Keep the raw fingerprints above, but do not spend the model's row budget on hidden state.
+    const transcript = buildAbandonedBranchTranscript(
+      activeSegment.filter((message) => !isModelHiddenMessage(message)).slice(-REFINE_MAX_MESSAGES)
+    );
     if (transcript.length === 0) {
       // Empty trajectory: a clean first-class no-op without spending a model call.
       return Ok({ applied: [], summary: "Nothing worth distilling.", noOp: true });

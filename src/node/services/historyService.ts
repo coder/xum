@@ -3515,6 +3515,53 @@ export class HistoryService {
     );
   }
 
+  /**
+   * Derive one new row from FULL history and append it under the SAME write lock.
+   *
+   * Plan-review mutations validate against a projection of every prior record (thread exists,
+   * snapshot hash unseen) before appending; holding the lock across read + append keeps two
+   * windows or backends from both passing that validation against the same stale state. `derive`
+   * returns `message: null` to append nothing (an idempotent no-op) while still returning its
+   * value. Reads the archive too, so reserve it for rare user actions, not hot paths.
+   *
+   * `generation` is the context generation (see captureCompactionReplacement) read under the
+   * same lock, so `derive` can refuse work that was prepared before a destructive mutation.
+   * `derive` may await a short check that must hold at the append (it runs under the lock).
+   */
+  async appendDerivedFromFullHistory<T>(
+    workspaceId: string,
+    derive: (
+      messages: MuxMessage[],
+      lockState: { generation: string | undefined }
+    ) =>
+      | { message: MuxMessage | null; value: T }
+      | Promise<{ message: MuxMessage | null; value: T }>
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append derived history",
+      async () => {
+        // Truncation recovery already ran inside withCrossProcessWriteLock, and the read-side
+        // recovery would re-acquire the (non-reentrant) file lock, so read unlocked here.
+        const messages: MuxMessage[] = [];
+        const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
+          messages.push(...chunk);
+        });
+        if (!scanned.success) return scanned;
+        const generation =
+          await this.getContinuousCompactionJournal(
+            workspaceId
+          ).captureGenerationUnderHistoryLock();
+        const derived = await derive(messages, { generation });
+        if (derived.message !== null) {
+          const appended = await this.appendToHistoryUnderWriteLock(workspaceId, derived.message);
+          if (!appended.success) return appended;
+        }
+        return Ok(derived.value);
+      }
+    );
+  }
+
   private async appendToHistoryUnderWriteLock(
     workspaceId: string,
     message: MuxMessage
@@ -3633,6 +3680,14 @@ export class HistoryService {
       onCommitted: (
         accepted: Extract<CompactionReplacementOutcome, { kind: "accepted" }>
       ) => undefined;
+      /**
+       * Append precondition on FULL history (archive included), evaluated under this write
+       * lock right before the append; `false` skips the append. The lock is cross-process, so
+       * no clear or truncation by this or a sibling backend can commit between the check and
+       * the write. Scans the archive: set it only for rare rows that depend on earlier rows
+       * (plan-review feedback).
+       */
+      admitsFullHistory?: (messages: MuxMessage[]) => boolean;
     }
   ): Promise<Result<CompactionReplacementOutcome>> {
     const expected = { ...capture };
@@ -3846,6 +3901,15 @@ export class HistoryService {
             return Ok(accepted);
           }
           trigger.metadata = { ...trigger.metadata, compactionReplacementNonce: replacementNonce };
+        }
+        // Last check before the write, so a `false` here is the only reason for this skip.
+        if (prepared.kind === "append" && observer.admitsFullHistory) {
+          const rows: MuxMessage[] = [];
+          const scanned = await this.iterateFullHistoryUnlocked(workspaceId, "forward", (chunk) => {
+            rows.push(...chunk);
+          });
+          if (!scanned.success) return scanned;
+          if (!observer.admitsFullHistory(rows)) return Ok({ kind: "skipped" });
         }
         let superseded = false;
         const rememberPublished = (): undefined => {

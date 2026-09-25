@@ -1862,6 +1862,45 @@ export const router = (authToken?: string) => {
         .input(schemas.workspace.resetContext.input)
         .output(schemas.workspace.resetContext.output)
         .handler(({ context, input }) => context.workspaceService.resetContext(input.workspaceId)),
+      planReview: {
+        getState: t
+          .input(schemas.workspace.planReview.getState.input)
+          .output(schemas.workspace.planReview.getState.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewGetState(input.workspaceId)
+          ),
+        ensureSnapshot: t
+          .input(schemas.workspace.planReview.ensureSnapshot.input)
+          .output(schemas.workspace.planReview.ensureSnapshot.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewEnsureSnapshot(
+              input.workspaceId,
+              input.proposalToolCallId ?? undefined
+            )
+          ),
+        setThreadResolved: t
+          .input(schemas.workspace.planReview.setThreadResolved.input)
+          .output(schemas.workspace.planReview.setThreadResolved.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewSetThreadResolved(
+              input.workspaceId,
+              input.threadId,
+              input.resolved
+            )
+          ),
+        submitFeedback: t
+          .input(schemas.workspace.planReview.submitFeedback.input)
+          .output(schemas.workspace.planReview.submitFeedback.output)
+          .handler(({ context, input }) =>
+            context.workspaceService.planReviewSubmitFeedback(input.workspaceId, {
+              snapshotId: input.snapshotId,
+              summary: input.summary ?? undefined,
+              comments: input.comments,
+              replies: input.replies,
+              options: input.options,
+            })
+          ),
+      },
       replaceChatHistory: t
         .input(schemas.workspace.replaceChatHistory.input)
         .output(schemas.workspace.replaceChatHistory.output)

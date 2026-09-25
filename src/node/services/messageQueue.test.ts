@@ -1584,6 +1584,48 @@ describe("MessageQueue", () => {
       }
     });
 
+    it("keeps plan-review feedback one-to-one with its metadata in both queue orderings", () => {
+      // The feedback row is authentic only when its metadata and its single envelope text
+      // describe the same record. Batching would either drop the metadata (an earlier message
+      // owns the entry) or append later text to the envelope — either way the projection
+      // rejects the persisted row and the submitted comments silently never appear.
+      const envelope = '<mux_plan_review>\n{"v": 1}\n</mux_plan_review>';
+      const feedbackMetadata: MuxMessageMetadata = {
+        type: "plan-review",
+        kind: "feedback",
+        recordId: "rec_1",
+        snapshotId: "snap_1",
+        feedbackId: "fb_1",
+      };
+      const options: SendMessageOptions = {
+        model: "claude-3-5-sonnet-20241022",
+        agentId: "plan",
+        muxMetadata: feedbackMetadata,
+      };
+
+      // Ordinary text first, feedback second.
+      queue.add("Also consider caching");
+      expect(queue.add(envelope, options)).toBe(true);
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("Also consider caching");
+      expect(first.options?.muxMetadata).toBeUndefined();
+      const second = queue.dequeueNext();
+      expect(second.message).toBe(envelope);
+      expect(second.options?.muxMetadata).toEqual(feedbackMetadata);
+      expect(queue.isEmpty()).toBe(true);
+
+      // Feedback first, ordinary text second.
+      expect(queue.add(envelope, options)).toBe(true);
+      queue.add("And rename the flag");
+      const feedback = queue.dequeueNext();
+      expect(feedback.message).toBe(envelope);
+      expect(feedback.options?.muxMetadata).toEqual(feedbackMetadata);
+      const followUp = queue.dequeueNext();
+      expect(followUp.message).toBe("And rename the flag");
+      expect(followUp.options?.muxMetadata).toBeUndefined();
+      expect(queue.isEmpty()).toBe(true);
+    });
+
     it("should queue an agent-skill invocation after a normal message as its own entry", () => {
       queue.add("First message");
 

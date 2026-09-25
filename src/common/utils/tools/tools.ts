@@ -219,6 +219,12 @@ export interface ToolConfiguration {
   memoryWritePath?: string;
   /** Callback to record file state for external edit detection (plan files) */
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
+  /**
+   * Hands the exact plan bytes a successful propose_plan read and validated to the session's
+   * plan-review snapshot capture, keyed by the tool call. Backend-owned: tool results can come
+   * from a delegated client, and the plan file can change after the tool read it.
+   */
+  recordProposedPlan?: (toolCallId: string, content: string) => void;
   /** Callback to notify that provider/config was written (triggers hot-reload). */
   onConfigChanged?: () => void;
   /** Best-effort callback for recording tool-initiated model usage in session totals. */

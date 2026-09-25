@@ -75,6 +75,15 @@ function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
   );
 }
 
+// Plan-review feedback is authentic only while its metadata and its single envelope text describe
+// the same record (getAuthenticPlanReviewRecord). Batched behind an earlier message it would lose
+// the metadata; batched ahead of a later message its envelope would gain trailing text — either
+// way the persisted row is rejected and the submitted comments never enter review state.
+function isPlanReviewMetadata(meta: unknown): boolean {
+  if (typeof meta !== "object" || meta === null) return false;
+  return (meta as Record<string, unknown>).type === "plan-review";
+}
+
 // Peer messages are sealed single-message entries (their sends use removable dedupe keys), so
 // counting entries by this metadata type is an exact count of queued peer messages.
 function isAgentPeerMessageMetadata(meta: unknown): boolean {
@@ -294,11 +303,11 @@ interface QueueEntry {
  * The queue holds ordered entries that dispatch one at a time (see dequeueNext):
  * - Plain messages batch into the newest open entry (texts joined, file parts
  *   accumulated, first muxMetadata preserved, latest options win).
- * - Compaction requests, agent-skill invocations, workspace-turn follow-ups, and
- *   callback-carrying internal sends each start their own entry, so queueing one
- *   never blocks later sends — they simply dispatch after it (no enqueue errors).
- * - Agent-skill / workspace-turn / callback entries are sealed: later messages
- *   start a new entry instead of adopting their metadata or callbacks.
+ * - Compaction requests, agent-skill invocations, workspace-turn follow-ups, plan-review
+ *   feedback, and callback-carrying internal sends each start their own entry, so queueing
+ *   one never blocks later sends — they simply dispatch after it (no enqueue errors).
+ * - Agent-skill / workspace-turn / plan-review / callback entries are sealed: later
+ *   messages start a new entry instead of adopting their metadata or callbacks.
  * - User-authored and background/agent-initiated messages never share an entry,
  *   so renderer/restoration projections can omit background work precisely.
  * - Compaction entries stay open: a follow-up typed behind a pending /compact
@@ -686,6 +695,7 @@ export class MessageQueue {
       internal?.removableDedupeKey === true ||
       isAgentSkillMetadata(options?.muxMetadata) ||
       isWorkspaceTurnMetadata(options?.muxMetadata) ||
+      isPlanReviewMetadata(options?.muxMetadata) ||
       hasSnapshotRefs(options?.muxMetadata) ||
       // Pre-turn rows must stay 1:1 with their triggering text: batching two
       // family sends would join their triggers while both payload rows pile

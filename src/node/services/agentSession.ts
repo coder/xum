@@ -13,7 +13,8 @@ import {
   isProviderEligibleMessage,
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
-import { isWorkflowDisplayOnlyMessage } from "@/common/utils/workflowRunMessages";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
@@ -89,6 +90,7 @@ import type {
   StreamErrorMessage,
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
 import {
   GOAL_BUDGET_LIMIT_KIND,
   GOAL_CONTINUATION_KIND,
@@ -179,6 +181,12 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
+import {
+  carriedPlanReviewFeedback,
+  carriesPlanReviewMetadata,
+  createPlanReviewFeedbackPrecondition,
+  ensurePlanSnapshot,
+} from "./planReviewService";
 import { MessageQueue, cancelReasonBeforeAcceptance } from "./messageQueue";
 import type { QueueCutCutter, QueuedInput, RefusedManualSend } from "./messageQueue";
 
@@ -364,15 +372,13 @@ type ResolvedSendMessageOptions = SendMessageOptions & {
 };
 
 /**
- * A user row the chat model itself would replay. Context-budget-rejected prompts and workflow
- * display rows stay in history for the UI but never reach a provider, so routing (evaluator
- * context, attachment gating) must not see them either.
+ * A user row the chat model itself would replay. Context-budget-rejected prompts and model-hidden
+ * records stay in history for the UI but never reach a provider, so routing (evaluator context,
+ * attachment gating) must use the same hidden-record filter as the chat request.
  */
 function isProviderVisibleUserRow(message: MuxMessage): boolean {
   return (
-    message.role === "user" &&
-    isProviderEligibleMessage(message) &&
-    !isWorkflowDisplayOnlyMessage(message)
+    message.role === "user" && isProviderEligibleMessage(message) && !isModelHiddenMessage(message)
   );
 }
 
@@ -469,6 +475,13 @@ function normalizeDelegatedToolNames(candidate: unknown): string[] | undefined {
   }
 
   return [...new Set(normalizedTools)];
+}
+
+/** Completion/routing tools report `{ success: true }`; anything else is not a completed proposal. */
+function isSuccessfulToolResult(result: unknown): boolean {
+  return (
+    typeof result === "object" && result !== null && "success" in result && result.success === true
+  );
 }
 
 function extractAcpPromptId(muxMetadata: unknown): string | undefined {
@@ -598,6 +611,12 @@ export async function clearProviderConfigFixableAbandonMarkers(
 export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
   "Workspace history is being cleared or reset. Please wait and try again.";
 const SESSION_SHUTDOWN_SEND_BLOCKED_MESSAGE = "Xum is shutting down; the message was not sent.";
+/** Refusal for a direct edit of authentic plan-review feedback (see isPlanReviewFeedbackEditTarget). */
+export const PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE =
+  "Plan-review feedback cannot be edited as a message. Send new review comments instead.";
+/** Refusal when plan-review feedback's snapshot or threads left history before its append. */
+export const PLAN_REVIEW_FEEDBACK_STALE_MESSAGE =
+  "Plan review feedback was not sent: the plan snapshot or review threads it refers to were removed from the conversation. Review the current plan and send again.";
 const EMPTY_RESUME_HISTORY_ERROR =
   "Cannot resume stream: workspace history is empty. Send a new message instead.";
 
@@ -763,6 +782,8 @@ interface AgentSessionOptions {
    * settles on its own, so waits bound to it move to the successor.
    */
   onTurnSuperseded?: (previous: symbol, next: symbol) => void;
+  /** Test seam for PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS (see completion policy). */
+  planSnapshotCaptureTimeoutMs?: number;
 }
 
 interface CachedMemoryContext {
@@ -945,6 +966,7 @@ export class AgentSession {
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
   private observedTurn: { id: symbol; idle: boolean } | undefined;
+  private readonly planSnapshotCaptureTimeoutMs: number;
   private readonly onBeforeTurnCompletion?: AgentSessionOptions["onBeforeTurnCompletion"];
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -992,6 +1014,13 @@ export class AgentSession {
     },
     policy: async (operation, messageId, outcome, started, notifyStartup) => {
       if (!this.coordinator.isCurrentOperation(operation)) return;
+      // Native plan review: a propose_plan snapshot capture started by this turn's tool-call-end
+      // listener runs detached from the engine. A completed turn settles it before completion
+      // policy so the turn cannot go idle (and a queued/next turn cannot revise the mutable plan
+      // file) while the snapshot keyed to this proposal is still being read — but only within a
+      // deadline, and never for a stopped/failed turn: a stalled remote plan read must not hold
+      // the workspace busy. Abandoned captures are refused at append admission (ensurePlanSnapshot).
+      await this.settlePendingPlanSnapshots(outcome.status === "completed");
       switch (outcome.status) {
         case "completed":
           await this.handleTurnSuccess({ ...outcome.streamEnd, messageId }, operation);
@@ -1020,6 +1049,19 @@ export class AgentSession {
   // Track known siblings and reserve soft interruption for that native-only boundary.
   private queuedProviderToolEndAbortInFlight = false;
   private readonly activeToolCallIds = new Set<string>();
+  /**
+   * Plan bytes each successful propose_plan read and validated, by tool call (see
+   * ToolConfiguration.recordProposedPlan); consumed by that proposal's snapshot capture.
+   */
+  private readonly proposedPlanContents = new Map<string, string>();
+  private readonly recordProposedPlan = (toolCallId: string, content: string): void => {
+    this.proposedPlanContents.set(toolCallId, content);
+  };
+  /** In-flight propose_plan snapshot captures; completion policy settles them (see policy). */
+  private readonly pendingPlanSnapshots = new Set<{
+    promise: Promise<void>;
+    controller: AbortController;
+  }>();
 
   private readonly messageQueue = new MessageQueue();
   /**
@@ -1296,6 +1338,7 @@ export class AgentSession {
       onTurnSettled,
       onTurnSuperseded,
       onBeforeTurnCompletion,
+      planSnapshotCaptureTimeoutMs,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -1333,6 +1376,12 @@ export class AgentSession {
     this.onTurnSettled = onTurnSettled;
     this.onTurnSuperseded = onTurnSuperseded;
     this.onBeforeTurnCompletion = onBeforeTurnCompletion;
+    this.planSnapshotCaptureTimeoutMs =
+      planSnapshotCaptureTimeoutMs ?? PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS;
+    assert(
+      Number.isFinite(this.planSnapshotCaptureTimeoutMs) && this.planSnapshotCaptureTimeoutMs > 0,
+      "planSnapshotCaptureTimeoutMs must be a positive number"
+    );
 
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Accessors must read live session state, not the host object's receiver.
     const session = this;
@@ -2141,6 +2190,41 @@ export class AgentSession {
       message.metadata?.synthetic === true &&
       message.metadata.muxMetadata?.type === "goal-pause-boundary"
     );
+  }
+
+  /**
+   * Whether an edit targets authentic plan-review feedback, judged from the persisted row (never
+   * from client flags or envelope-looking text), in getEditTruncateTargetId's lookup order. An
+   * ordinary edit resends only the envelope text, which is neutralized as an untrusted lookalike,
+   * so the threads that feedback opened would silently vanish from review state.
+   *
+   * Fails closed: an Err means the target could not be classified, and the caller must refuse
+   * the edit. Treating a failed read as "not feedback" let the edit proceed, and a later
+   * successful read could then truncate archived feedback and delete its threads.
+   */
+  private async isPlanReviewFeedbackEditTarget(
+    editMessageId: string
+  ): Promise<Result<boolean, string>> {
+    // An on-send compaction request that deferred feedback carries it as its follow-up, which
+    // dispatches as the feedback row later; editing the request would drop it just the same.
+    const isFeedback = (message: MuxMessage | undefined) =>
+      message !== undefined && carriedPlanReviewFeedback(message) !== null;
+    // A failed latest-boundary read falls through to the full scan, which also covers it.
+    const latest = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    const inLatest = latest.success
+      ? latest.data.find((message) => message.id === editMessageId)
+      : undefined;
+    if (inLatest) return Ok(isFeedback(inLatest));
+    let target: MuxMessage | undefined;
+    const scanned = await this.historyService.iterateFullHistory(
+      this.workspaceId,
+      "forward",
+      (messages) => {
+        target ??= messages.find((message) => message.id === editMessageId);
+      }
+    );
+    if (!scanned.success) return Err(scanned.error);
+    return Ok(isFeedback(target));
   }
 
   private async getEditTruncateTargetId(editMessageId: string): Promise<string> {
@@ -3089,10 +3173,12 @@ export class AgentSession {
         const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
         const streamCursor = mode?.type === "since" ? mode.cursor.stream : undefined;
 
+        // Persisted rows can predate writer validation. Never coerce malformed
+        // sequences into pagination arguments or reconnect cursor anchors.
         let oldestHistorySequence: number | undefined;
         for (const message of history) {
           const historySequence = message.metadata?.historySequence;
-          if (historySequence === undefined) {
+          if (!isNonNegativeInteger(historySequence)) {
             continue;
           }
 
@@ -3207,7 +3293,7 @@ export class AgentSession {
           if (sinceHistorySequence !== undefined) {
             const messageHistorySequence = message.metadata?.historySequence;
             if (
-              messageHistorySequence !== undefined &&
+              isNonNegativeInteger(messageHistorySequence) &&
               messageHistorySequence < sinceHistorySequence
             ) {
               continue;
@@ -3224,7 +3310,7 @@ export class AgentSession {
         for (let index = history.length - 1; index >= 0; index -= 1) {
           const message = history[index];
           const historySequence = message.metadata?.historySequence;
-          if (historySequence === undefined) {
+          if (!isNonNegativeInteger(historySequence)) {
             continue;
           }
 
@@ -3647,6 +3733,12 @@ export class AgentSession {
       const batch = [...stagedPrefixes, ...messages];
       attempt.inputPublication = messages.at(-1);
       assert(replacementCapture, "Publication requires its admission capture");
+      // Plan-review feedback (direct, or nested in an on-send compaction request) is admitted
+      // only while its snapshot and threads are still in history, checked under the history
+      // write lock at this append (see createPlanReviewFeedbackPrecondition). The flag is set
+      // only by that check, so a refusal is told apart from any other skipped publication.
+      const feedbackPrecondition = createPlanReviewFeedbackPrecondition(batch);
+      let feedbackDependenciesMissing = false;
       const publishing = this.historyService.acceptCompactionReplacement(
         this.workspaceId,
         replacementCapture,
@@ -3658,6 +3750,14 @@ export class AgentSession {
         {
           isCurrent: () =>
             !isAdmissionStale() && !shutdownRefusesBeforePersist() && !cancelSignal?.aborted,
+          ...(feedbackPrecondition !== undefined
+            ? {
+                admitsFullHistory: (history: MuxMessage[]) => {
+                  feedbackDependenciesMissing = !feedbackPrecondition(history);
+                  return !feedbackDependenciesMissing;
+                },
+              }
+            : {}),
           onContextResetCommitted: (predecessor, successor) => {
             this.advanceOwnedCompactionAdmission(predecessor, successor, attempt.admissionCapture);
           },
@@ -3686,7 +3786,11 @@ export class AgentSession {
         // A canceled ordinary append can now refuse under the publication lock before writing.
         // Its caller still owns cancellation notification and reservation release.
         if (await cancelBeforeAcceptance()) return Ok(undefined);
-        return Err(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+        return Err(
+          feedbackDependenciesMissing
+            ? PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+            : CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+        );
       }
       if (replacesCancellation) {
         // Retirement takes the same lock; join it only after publication releases that lock.
@@ -4029,6 +4133,19 @@ export class AgentSession {
         return refuseBeforeAcceptance(
           createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
         );
+      // The UI hides Edit for feedback rows; refuse direct API edits too, before the context
+      // reset, the interruption and the truncation can touch anything.
+      const feedbackTarget = await this.isPlanReviewFeedbackEditTarget(editMessageId);
+      if (!feedbackTarget.success)
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(
+            `Cannot edit: history could not be read to check the message (${feedbackTarget.error}). Try again.`
+          )
+        );
+      if (feedbackTarget.data)
+        return refuseBeforeAcceptance(
+          createUnknownSendMessageError(PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE)
+        );
       // Reserve before interrupting: terminal policy can otherwise start queued work
       // while stopStream settles, leaving this edit waiting on the wrong turn.
       attempt.editReservation = this.coordinator.reserve("edit");
@@ -4227,6 +4344,12 @@ export class AgentSession {
     const typedToolPolicy = options?.toolPolicy;
     // muxMetadata is z.any() in schema - cast to proper type
     const typedMuxMetadata = options?.muxMetadata as MuxMessageMetadata | undefined;
+    // Plan-review feedback text quotes plan content (repository- or model-written), so nothing
+    // may interpret it as a user command: an `@path` token in a quote would otherwise read that
+    // workspace file into the request, and the auto-model router would classify quoted text.
+    // Only the feedback endpoint (and its deferred compaction follow-up) can carry this metadata;
+    // generic sends with it are refused by WorkspaceService.sendMessage.
+    const isPlanReviewFeedbackSend = carriesPlanReviewMetadata(typedMuxMetadata);
     const acpPromptId =
       normalizeAcpPromptId(options?.acpPromptId) ?? extractAcpPromptId(typedMuxMetadata);
     const delegatedToolNames =
@@ -4257,7 +4380,8 @@ export class AgentSession {
     const classifyUserTurn =
       (routingDimensions.model || routingDimensions.thinkingLevel) &&
       !agentInitiated &&
-      internal?.synthetic !== true;
+      internal?.synthetic !== true &&
+      !isPlanReviewFeedbackSend;
     if (classifyUserTurn && !isCompactionRequest) {
       optionsForStream = await this.resolveAutoModelRouting(
         trimmedMessage,
@@ -4335,7 +4459,9 @@ export class AgentSession {
     // This ensures prompt-cache stability: we read files once and persist the content,
     // so subsequent turns don't re-read (which would change the prompt prefix if files changed).
     // File changes after this point are surfaced via <system-file-update> diffs instead.
-    const snapshotResult = await this.materializeFileAtMentionsSnapshot(trimmedMessage);
+    const snapshotResult = isPlanReviewFeedbackSend
+      ? null
+      : await this.materializeFileAtMentionsSnapshot(trimmedMessage);
 
     if (await cancelBeforeAcceptance()) {
       return Ok(undefined);
@@ -5791,6 +5917,7 @@ export class AgentSession {
           messages
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
+        recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments: null,
         resolveMemoryContext: (model, memoryOptions) =>
           this.resolveMemoryContext(
@@ -5919,6 +6046,14 @@ export class AgentSession {
     enqueuedAtMs?: number
   ): Promise<boolean> {
     if (this.coordinator.disposed) {
+      return false;
+    }
+    // Plan-review feedback is refused as a whole: planReviewSubmitFeedback reports send_failed
+    // and the client keeps its drafts to resend. The copy below keeps no metadata, so it would
+    // become an ordinary editable message that duplicates the visible turn on that retry and
+    // puts conflicting review context in front of the model. Surface the refusal only.
+    if (carriesPlanReviewMetadata(options?.muxMetadata)) {
+      this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(rejection)));
       return false;
     }
     const trimmed = message.trim();
@@ -7285,7 +7420,10 @@ export class AgentSession {
         const retryRequest = this.findLastRetryUserMessage(tail.data);
         if (retryRequest?.metadata?.contextBudgetRejected)
           return await refuseRejectedResume(retryRequest);
-        const target = tail.data.at(-1);
+        // Model-hidden records (plan-review snapshot/resolve/reopen rows) are UI state that can
+        // land after the resumable row without changing provider-visible history; resume from
+        // the newest visible row so such a record cannot silently cancel the request.
+        const target = tail.data.findLast((message) => !isModelHiddenMessage(message));
         if (!target) return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
         if (target.metadata?.contextBudgetRejected) return await refuseRejectedResume(target);
         if (target.role !== "assistant" && !this.shouldUseUserMessageForRetry(target))
@@ -7385,7 +7523,10 @@ export class AgentSession {
       // Non-partial trailing assistants indicate a missing user message upstream — inject a
       // [CONTINUE] sentinel so the model has a valid conversation to respond to. This is
       // defense-in-depth; callers should prefer sendMessage() which persists a real user message.
-      const lastMsg = requestMessages[requestMessages.length - 1];
+      // Judge the model-visible tail (same projection as the resume target above): request
+      // assembly drops model-hidden records, so a plan-review row after a completed assistant
+      // would otherwise suppress the sentinel and the request would end with the assistant.
+      const lastMsg = requestMessages.findLast((message) => !isModelHiddenMessage(message));
       if (lastMsg?.role === "assistant" && !lastMsg.metadata?.partial) {
         log.warn(
           "streamWithHistory: trailing non-partial assistant detected, injecting [CONTINUE]",
@@ -7597,6 +7738,7 @@ export class AgentSession {
           ? { ...(streamMuxMetadata ?? { type: "normal" }), contextBudgetFlush: true }
           : streamMuxMetadata,
         recordFileState,
+        recordProposedPlan: this.recordProposedPlan,
         postCompactionAttachments,
         // Invoked by AIService after runtime.ensureReady() (project-scope
         // listing needs a running runtime). Still ordered after the
@@ -9012,6 +9154,25 @@ export class AgentSession {
         if (payload.providerExecuted === true && this.activeToolCallIds.size === 0) {
           await this.requestQueuedProviderToolEndDispatch();
         }
+        // Native plan review: every successful proposal gets a snapshot row keyed by its tool
+        // call, so review anchors stay bound to the text as proposed even after the (mutable)
+        // plan file changes. Runs after the dispatch bookkeeping above and never throws, so it
+        // cannot stall tool-end handling or affect the tool result. The forward wrapper does
+        // not await this handler, so the capture is registered for the completion policy.
+        if (payload.toolName === "propose_plan" && isSuccessfulToolResult(payload.result)) {
+          const controller = new AbortController();
+          const capture = {
+            controller,
+            promise: this.snapshotProposedPlan(payload.toolCallId, controller.signal),
+          };
+          this.pendingPlanSnapshots.add(capture);
+          try {
+            await capture.promise;
+          } finally {
+            // No-op when completion policy already abandoned (detached) this capture.
+            this.pendingPlanSnapshots.delete(capture);
+          }
+        }
       }
     });
     forward("reasoning-delta", (payload) => {
@@ -9794,6 +9955,133 @@ export class AgentSession {
     return true;
   }
 
+  /**
+   * Settle every in-flight propose_plan capture before completion policy runs. A completed turn
+   * waits up to planSnapshotCaptureTimeoutMs for the row to become durable; on a stopped or
+   * failed turn, or once the deadline passes, the captures are aborted instead so settlement is
+   * never held hostage by a stalled plan read. Captures never reject.
+   */
+  private async settlePendingPlanSnapshots(waitForCompletion: boolean): Promise<void> {
+    if (this.pendingPlanSnapshots.size === 0) return;
+    // Abandoning aborts the capture AND detaches it from settlement tracking: a read that
+    // ignores the abort (a hung remote command) can stay pending for minutes, and while it sat
+    // in the set every later completed turn would wait through another full deadline. Its late
+    // result is still refused by ensurePlanSnapshot's admission checks on the aborted signal.
+    const abandonAll = () => {
+      for (const capture of this.pendingPlanSnapshots) {
+        capture.controller.abort();
+        this.pendingPlanSnapshots.delete(capture);
+      }
+    };
+    if (!waitForCompletion) {
+      abandonAll();
+      return;
+    }
+    const deadline = Promise.withResolvers<"deadline">();
+    const timer = setTimeout(() => deadline.resolve("deadline"), this.planSnapshotCaptureTimeoutMs);
+    try {
+      // Captures remove themselves from the set when they finish. The wait races the deadline
+      // rather than relying on the capture to notice the abort: the stall can be inside the
+      // plan read itself (a remote command can block for minutes), so the abandoned capture is
+      // left running, detached from the set, and its late result is refused at
+      // ensurePlanSnapshot's admission checks.
+      while (this.pendingPlanSnapshots.size > 0) {
+        const outcome = await Promise.race([
+          Promise.all([...this.pendingPlanSnapshots].map((capture) => capture.promise)).then(
+            () => "settled" as const
+          ),
+          deadline.promise,
+        ]);
+        if (outcome === "deadline") {
+          log.warn("plan review: snapshot capture exceeded its deadline; abandoning it", {
+            workspaceId: this.workspaceId,
+            timeoutMs: this.planSnapshotCaptureTimeoutMs,
+          });
+          abandonAll();
+          return;
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Snapshot the plan file after a successful `propose_plan` (see the tool-call-end listener).
+   * Fully non-throwing: a missing plan, an oversized plan, or a history failure only logs.
+   * Dedup by content hash makes a replayed or repeated proposal a no-op. `signal` is the
+   * completion policy's abandonment (deadline/Stop); session close aborts the capture as well.
+   */
+  private async snapshotProposedPlan(
+    proposalToolCallId: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    const captureSignal = AbortSignal.any([signal, this.closingSignal]);
+    // The capture belongs to this turn, so it is admitted under the turn's own frontier: a clear
+    // committed since the turn was admitted (a sibling backend's too; its busy guards cannot see
+    // this turn) refuses it, while the turn's own rollovers advance this live capture in place
+    // (advanceOwnedCompactionAdmission) and compaction leaves it alone.
+    const frontier = this.activeStreamContext?.admissionCapture;
+    // The bytes propose_plan validated, not a re-read of the mutable plan file. Absent only when
+    // the tool did not run here (e.g. a delegated result); then the file is read as before.
+    const proposedContent = this.proposedPlanContents.get(proposalToolCallId);
+    this.proposedPlanContents.delete(proposalToolCallId);
+    try {
+      // Guard for test mocks that may not implement getWorkspaceMetadata.
+      if (typeof this.aiService.getWorkspaceMetadata !== "function") return;
+      const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
+      if (captureSignal.aborted) {
+        log.debug("plan review: snapshot capture abandoned before the plan read", {
+          workspaceId: this.workspaceId,
+          proposalToolCallId,
+        });
+        return;
+      }
+      if (!metadata.success) {
+        log.warn("plan review: skipping snapshot, workspace metadata unavailable", {
+          workspaceId: this.workspaceId,
+          error: metadata.error,
+        });
+        return;
+      }
+      const result = await ensurePlanSnapshot(
+        {
+          historyService: this.historyService,
+          emitChatEvent: (_workspaceId, message) =>
+            this.emitChatEvent({ ...message, type: "message" }),
+        },
+        {
+          workspaceId: this.workspaceId,
+          metadata: metadata.data,
+          proposalToolCallId,
+          signal: captureSignal,
+          ...(frontier !== undefined ? { frontier } : {}),
+          ...(proposedContent !== undefined ? { proposedContent } : {}),
+        }
+      );
+      if (!result.success) {
+        if (result.error.type === "capture_aborted") {
+          log.debug("plan review: snapshot capture abandoned", {
+            workspaceId: this.workspaceId,
+            proposalToolCallId,
+          });
+          return;
+        }
+        log.warn("plan review: skipping snapshot after propose_plan", {
+          workspaceId: this.workspaceId,
+          proposalToolCallId,
+          error: result.error,
+        });
+      }
+    } catch (error) {
+      log.warn("plan review: snapshot after propose_plan failed", {
+        workspaceId: this.workspaceId,
+        proposalToolCallId,
+        error,
+      });
+    }
+  }
+
   private async requestQueuedProviderToolEndDispatch(): Promise<void> {
     if (
       this.coordinator.phase !== "streaming" ||
@@ -10298,10 +10586,15 @@ export class AgentSession {
       // writers (family-message and refine-summary rows) can append between
       // the compaction boundary committing and this stream-end dispatch. Any
       // non-copy row after the targeted summary means the follow-up would
-      // continue after unrelated content — do not fire.
+      // continue after unrelated content — do not fire. Model-hidden records
+      // (plan-review resolve/reopen/snapshot rows) are UI state, not content:
+      // resolving a thread in that window must not strand the follow-up.
       const onlyTailCopiesAfterSummary = historyResult.data
         .slice(summaryIndex + 1)
-        .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+        .every(
+          (message) =>
+            message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message)
+        );
       summaryMessage = historyResult.data[summaryIndex];
       const pending = pendingCompactionSummary(summaryMessage);
       if (
@@ -10328,6 +10621,34 @@ export class AgentSession {
       }
       summaryMessage = historyResult.data[0];
 
+      // Model-hidden records (plan-review resolve/reopen/snapshot rows) appended after the
+      // summary are UI state and must not hide it: only then, scan newest-first to the newest
+      // visible row (the common case keeps the single-row read above).
+      if (isModelHiddenMessage(summaryMessage)) {
+        let newestVisible: MuxMessage | undefined;
+        const scanned = await this.historyService.iterateFullHistory(
+          this.workspaceId,
+          "backward",
+          (chunk) => {
+            for (const message of chunk) {
+              if (isModelHiddenMessage(message)) continue;
+              newestVisible = message;
+              return false;
+            }
+            return true;
+          }
+        );
+        if (!scanned.success) {
+          throw new Error(
+            `Failed to read history for startup follow-up recovery: ${scanned.error}`
+          );
+        }
+        if (newestVisible === undefined) {
+          return false;
+        }
+        summaryMessage = newestVisible;
+      }
+
       // RLM keep-recent floor: preserved-tail copies sit after the boundary,
       // so "compaction just completed" means the epoch is exactly
       // [summary, ...tail copies]. Any non-copy row after the summary means
@@ -10346,7 +10667,10 @@ export class AgentSession {
         const boundary = epoch[0];
         const onlyTailCopiesAfterBoundary = epoch
           .slice(1)
-          .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+          .every(
+            (message) =>
+              message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message)
+          );
         if (boundary === undefined || !onlyTailCopiesAfterBoundary) {
           return false;
         }
@@ -10682,6 +11006,16 @@ export class AgentSession {
         return false;
       }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
+      // Deferred plan-review feedback whose snapshot or threads were removed while compaction
+      // ran was refused under the history lock. Removed record ids never come back, so leaving
+      // the handoff on the summary would only fail again on every startup: drop it, then report
+      // the failure like any other dispatch failure.
+      if (
+        sendResult.error.type === "unknown" &&
+        sendResult.error.raw === PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+      ) {
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+      }
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
     }
 

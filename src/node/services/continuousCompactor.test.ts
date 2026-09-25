@@ -14,7 +14,15 @@ import {
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { EAGER_LEAD_PERCENT } from "@/constants/continuousCompaction";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
-import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
+import {
+  buildPlanReviewMetadata,
+  formatPlanReviewEnvelope,
+} from "@/common/utils/planReview/planReviewEnvelope";
+import {
+  ContinuousCompactor,
+  fingerprint,
+  type ContinuousCompactionContext,
+} from "./continuousCompactor";
 import { CompactionHandler } from "./compactionHandler";
 import { createTestHistoryService } from "./testHistoryService";
 import { HistoryService } from "./historyService";
@@ -25,6 +33,23 @@ type Dependencies = ConstructorParameters<typeof ContinuousCompactor>[0];
 type LiveSnapshot = NonNullable<ReturnType<Dependencies["streamManager"]["getStreamInfo"]>> & {
   currentStepStartIndex: number;
 };
+
+/** A plan-review snapshot record: persisted UI state that never reaches a provider request. */
+function hiddenPlanSnapshot(id: string): MuxMessage {
+  const snapshot = {
+    v: 1 as const,
+    kind: "snapshot" as const,
+    recordId: "rec_snap",
+    snapshotId: "snap_1",
+    planPath: "/plans/p.md",
+    contentHash: "a".repeat(64),
+    content: `# Plan\n${"step ".repeat(30_000)}`,
+  };
+  return createMuxMessage(id, "user", formatPlanReviewEnvelope(snapshot), {
+    synthetic: true,
+    muxMetadata: buildPlanReviewMetadata(snapshot),
+  });
+}
 
 const releaseLatches: Array<() => void> = [];
 function deferred() {
@@ -219,6 +244,39 @@ describe("ContinuousCompactor", () => {
       expect((await rows())[0].id).toBe("old-user");
     });
   }
+
+  it("excludes model-hidden plan-review rows from cut selection and the summarized head", async () => {
+    // A plan snapshot row never reaches the provider, yet it sits in the recent tail cluster.
+    // Counting its text would push an otherwise valid rolling cut over the tail budget (no
+    // staging → forced fallback) and hand the summarizer text the model never saw.
+    const hidden = hiddenPlanSnapshot("plan-snapshot");
+    await seed(
+      createMuxMessage("old-user", "user", "Investigate the regression"),
+      createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+      hidden,
+      createMuxMessage("recent-user", "user", "Implement the fix"),
+      createMuxMessage("recent-answer", "assistant", "The fix is ready for review.")
+    );
+    await stage();
+    const summarizedHead = summarize.mock.calls[0][0].map((row) => row.id);
+    expect(summarizedHead).toEqual(["old-user", "old-answer"]);
+    expect(await compactor.observe(context.thresholdPercent, context)).toBe("applied");
+    // Summary + verbatim copies of the two recent rows; the hidden record is neither summarized
+    // nor copied behind the boundary.
+    const after = await rows();
+    expect(after[0].parts).toMatchObject([{ type: "text", text: summary.text }]);
+    expect(after).toHaveLength(3);
+    const afterText = JSON.stringify(after);
+    expect(afterText).toContain("Implement the fix");
+    expect(afterText).toContain("The fix is ready for review.");
+    expect(afterText).not.toContain("mux_plan_review");
+    // The record itself is durable UI state: still present in full history for review state.
+    const full: MuxMessage[] = [];
+    await store.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
+      full.push(...chunk);
+    });
+    expect(full.map((row) => row.id)).toContain("plan-snapshot");
+  });
 
   it("awaits compaction.prepare listener persistence before taking the head snapshot", async () => {
     await seedConversation();
@@ -565,7 +623,7 @@ describe("ContinuousCompactor", () => {
     expect(fastApply).not.toHaveBeenCalled();
   });
 
-  async function seedLiveTurn(committedTail = false, splitCommitted = false) {
+  async function seedLiveTurn(committedTail = false, splitCommitted = false, hiddenInHead = false) {
     const earlier = createMuxMessage("committed-tail", "assistant", "", {
       stepStartPartIndices: [0],
       partial: true,
@@ -597,6 +655,7 @@ describe("ContinuousCompactor", () => {
     }
     await seed(
       createMuxMessage("old-user", "user", "Investigate the regression"),
+      ...(hiddenInHead ? [hiddenPlanSnapshot("plan-snapshot")] : []),
       createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
       ...(committedTail
         ? [createMuxMessage("committed-user", "user", "Preserve this earlier task"), earlier]
@@ -631,9 +690,10 @@ describe("ContinuousCompactor", () => {
   async function activateJournaledSwap(
     committedTail = false,
     consumed = true,
-    splitCommitted = false
+    splitCommitted = false,
+    hiddenInHead = false
   ) {
-    const answer = await seedLiveTurn(committedTail, splitCommitted);
+    const answer = await seedLiveTurn(committedTail, splitCommitted, hiddenInHead);
     assert(live, "Live fixture missing");
     const toolPart: MuxMessage["parts"][number] = {
       type: "dynamic-tool",
@@ -740,6 +800,78 @@ describe("ContinuousCompactor", () => {
       expect(completed).not.toHaveBeenCalled();
     });
   }
+
+  it("recovers a journal whose summarized head contains a model-hidden plan-review row", async () => {
+    // The cut, and the head fingerprint the journal records, come from the model-visible
+    // projection. Recovery must rebuild the head from that same projection; comparing the raw
+    // rows (which still contain the record) would discard a valid journal and never fold it.
+    const { journal, journalStore } = await activateJournaledSwap(false, true, false, true);
+    const before = (await rows()).map((row) => row.id);
+    // The record sits inside the summarized head, so raw and visible heads differ.
+    expect(before.indexOf("plan-snapshot")).toBeGreaterThan(-1);
+    expect(before.indexOf("plan-snapshot")).toBeLessThan(before.indexOf(journal.headEnd.id));
+    streaming = false;
+    live = undefined;
+    expect(await compactor.recover()).toBe(true);
+    const after = await rows();
+    expect(after[0].id).toBe(journal.boundary.id);
+    expect(after.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+    expect(after.map((row) => row.id)).not.toContain("plan-snapshot");
+    expect(await journalStore.read()).toBeNull();
+  });
+
+  const hiddenResolve = (id: string) =>
+    createMuxMessage(id, "user", "<mux_plan_review>resolve</mux_plan_review>", {
+      synthetic: true,
+      muxMetadata: { type: "plan-review", kind: "resolve", recordId: `rec-${id}`, threadId: "t1" },
+    });
+
+  it("folds a consumed journal exactly once after a hidden record lands behind the live source", async () => {
+    // Resolving a review thread while the stream runs appends a hidden record after the live
+    // answer. The journal compares what the model saw, so restart recovery must still fold it,
+    // and the record itself must survive in full history.
+    const { journal, journalStore, dependencies } = await activateJournaledSwap();
+    await seed(hiddenResolve("resolve-mid-stream"));
+    compactor.reset("shutdown");
+    streaming = false;
+    live = undefined;
+    compactor = new ContinuousCompactor(dependencies);
+    expect(await compactor.recover()).toBe(true);
+    const after = await rows();
+    expect(after[0].id).toBe(journal.boundary.id);
+    expect(after.at(-1)?.id).toBe(journal.liveTailCopySpec.copyId);
+    expect(await journalStore.read()).toBeNull();
+    expect(await compactor.recover()).toBe(false);
+    expect(completed).toHaveBeenCalledTimes(1);
+    const full: MuxMessage[] = [];
+    await store.historyService.iterateFullHistory(workspaceId, "forward", (chunk) => {
+      full.push(...chunk);
+    });
+    expect(full.filter((row) => row.id === "resolve-mid-stream")).toHaveLength(1);
+    expect(full.filter((row) => row.id === journal.boundary.id)).toHaveLength(1);
+  });
+
+  it("recovers a journal whose source fingerprint an earlier build took over raw rows", async () => {
+    // Earlier builds fingerprinted the raw rows, including a hidden record inside the head.
+    // Such a persisted journal must still fold when nothing was appended after its source.
+    const { journal, journalStore } = await activateJournaledSwap(false, true, false, true);
+    const raw = await rows();
+    const source = raw.at(-1)!;
+    const legacyFingerprint = fingerprint([
+      ...raw.slice(0, -1),
+      { ...source, parts: source.parts.slice(0, journal.liveTailCopySpec.partIndex) },
+    ]);
+    expect(legacyFingerprint).not.toBe(journal.sourceFingerprint);
+    await writeFile(
+      journalStore.path,
+      JSON.stringify({ ...journal, sourceFingerprint: legacyFingerprint })
+    );
+    streaming = false;
+    live = undefined;
+    expect(await compactor.recover()).toBe(true);
+    expect((await rows())[0].id).toBe(journal.boundary.id);
+    expect(await journalStore.read()).toBeNull();
+  });
 
   it.each(["user-interrupt", "edit", "context-mutation"])(
     "%s does not recover an interrupted startup journal on the next attempt",

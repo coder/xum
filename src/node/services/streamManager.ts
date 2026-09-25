@@ -115,6 +115,7 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import type { SessionUsageService } from "./sessionUsageService";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
+import { neutralizeAgentEnvelopeLookalikesInModelToolParts } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { stripEncryptedContent } from "@/node/utils/messages/stripEncryptedContent";
 import { stripWorkflowRunRecordsFromModelMessages } from "@/node/utils/messages/stripWorkflowRunRecordsFromModelMessages";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
@@ -2771,11 +2772,15 @@ export class StreamManager {
       prepareStep: async ({ messages: stepMessages, stepNumber }) => {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
         // Strip workflow run records from same-turn tool results (history-level redaction in
-        // applyToolOutputRedaction can't see these), then extract supported attachments out of
-        // tool-result JSON so providers don't treat them as text.
-        const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
-        const rewritten =
-          await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
+        // applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in
+        // same-turn tool inputs/results (messagePipeline's neutralizer only sees persisted
+        // history), then extract supported attachments out of tool-result JSON so providers
+        // don't treat them as text.
+        const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(
+          neutralizeAgentEnvelopeLookalikesInModelToolParts(
+            stripWorkflowRunRecordsFromModelMessages(stepMessages)
+          )
+        );
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
         if (stepTracker?.prefixSwapInvalidated) {
           // Cross-family fallback must not send the old provider's cached prefix.
@@ -2905,7 +2910,9 @@ export class StreamManager {
             );
             // Same per-step transforms the construction-time messages receive.
             rebuiltFirstStepMessages = await extractToolMediaAsUserMessagesFromModelMessages(
-              stripWorkflowRunRecordsFromModelMessages(rebuilt)
+              neutralizeAgentEnvelopeLookalikesInModelToolParts(
+                stripWorkflowRunRecordsFromModelMessages(rebuilt)
+              )
             );
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;

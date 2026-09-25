@@ -22,9 +22,19 @@ import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
   ProjectRemoveErrorSchema,
   SendMessageErrorSchema,
 } from "./errors";
+import { PlanReviewAnchorSchema } from "@/common/utils/planReview/planReviewRecord";
+import {
+  PLAN_REVIEW_MAX_BODY_CHARS,
+  PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_QUOTE_CHARS,
+  PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK,
+  PLAN_REVIEW_MAX_SUMMARY_CHARS,
+} from "@/constants/planReview";
+import { PlanReviewStateSchema } from "@/common/utils/planReview/planReviewState";
 import { BranchListResultSchema, FilePartSchema, MuxMessageSchema } from "./message";
 import {
   GoalClearInputSchema,
@@ -1793,6 +1803,86 @@ export const workspace = {
   resetContext: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(z.enum(["reset", "noop"]), z.string()),
+  },
+  /**
+   * Native plan review (history-backed). Every mutation returns the fresh projection; the UI
+   * never composes `<mux_plan_review>` envelopes itself.
+   */
+  planReview: {
+    getState: {
+      input: z.object({ workspaceId: z.string() }),
+      output: ResultSchema(PlanReviewStateSchema, PlanReviewErrorSchema),
+    },
+    ensureSnapshot: {
+      input: z.object({
+        workspaceId: z.string(),
+        /** Bind the snapshot to a `propose_plan` call when snapshotting on behalf of its card. */
+        proposalToolCallId: z.string().min(1).nullish(),
+      }),
+      output: ResultSchema(
+        z.object({
+          snapshotId: z.string(),
+          contentHash: z.string(),
+          created: z.boolean(),
+          state: PlanReviewStateSchema,
+        }),
+        PlanReviewErrorSchema
+      ),
+    },
+    setThreadResolved: {
+      input: z.object({
+        workspaceId: z.string(),
+        threadId: z.string().min(1),
+        resolved: z.boolean(),
+      }),
+      output: ResultSchema(PlanReviewStateSchema, PlanReviewErrorSchema),
+    },
+    submitFeedback: {
+      input: z.object({
+        workspaceId: z.string(),
+        snapshotId: z.string().min(1),
+        // Bounded at the boundary: unresolved feedback is re-rendered into every plan turn's
+        // system prompt and persisted as one history row, so sizes are product limits, not
+        // storage details (see src/constants/planReview.ts).
+        summary: z.string().max(PLAN_REVIEW_MAX_SUMMARY_CHARS).nullish(),
+        comments: z
+          .array(
+            z.object({
+              anchor: PlanReviewAnchorSchema,
+              quote: z.string().max(PLAN_REVIEW_MAX_QUOTE_CHARS),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_COMMENTS_PER_FEEDBACK),
+        replies: z
+          .array(
+            z.object({
+              threadId: z.string().min(1),
+              body: z.string().min(1).max(PLAN_REVIEW_MAX_BODY_CHARS),
+            })
+          )
+          .max(PLAN_REVIEW_MAX_REPLIES_PER_FEEDBACK),
+        /**
+         * Agent/model/thinking for the resulting user turn, as the plan card's Implement sends
+         * them. Edit semantics are excluded: an edit truncates history before the row persists,
+         * which could delete the very snapshot/thread the feedback references.
+         */
+        options: SendMessageOptionsSchema.omit({
+          editMessageId: true,
+          historyEditPrecondition: true,
+          unfencedEdit: true,
+        }),
+      }),
+      output: ResultSchema(
+        z.object({
+          feedbackId: z.string(),
+          // null when the feedback was sent but refreshing review state afterwards failed: the
+          // mutation is committed, so callers must not retry it; refresh via getState instead.
+          state: PlanReviewStateSchema.nullable(),
+        }),
+        PlanReviewErrorSchema
+      ),
+    },
   },
   replaceChatHistory: {
     input: z.object({

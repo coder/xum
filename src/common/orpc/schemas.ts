@@ -81,6 +81,7 @@ export {
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
 } from "./schemas/errors";
 
 // Secrets schemas
