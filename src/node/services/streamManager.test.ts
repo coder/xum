@@ -32,6 +32,7 @@ import {
   testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
+  createExecRecordingRuntimeForTests,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -46,18 +47,6 @@ function untilAborted(signal: AbortSignal): AsyncGenerator<unknown, void, unknow
     }
     yield* [];
   })();
-}
-
-/** The local test runtime with exec commands recorded instead of run (temp-dir cleanup uses exec). */
-function createExecRecordingRuntimeForTests(): { runtime: Runtime; execCommands: string[] } {
-  const execCommands: string[] = [];
-  const runtime = Object.create(LOCAL_TEST_RUNTIME) as Runtime;
-  runtime.exec = (command) => {
-    execCommands.push(command);
-    // Cleanup is fire-and-forget; a never-settling exec keeps it quiet.
-    return new Promise<never>(() => undefined);
-  };
-  return { runtime, execCommands };
 }
 
 // Skip integration tests if TEST_INTEGRATION is not set
@@ -1145,7 +1134,7 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
         return createStreamResultForTests(untilAborted(abortSignal!));
       }),
     });
-    const { runtime, execCommands } = createExecRecordingRuntimeForTests();
+    const { runtime, execCalls } = createExecRecordingRuntimeForTests();
     const abortController = new AbortController();
     const tempDirStarted = Promise.withResolvers<void>();
     spyOn(streamManager, "createTempDirForStream").mockImplementation(() => {
@@ -1182,7 +1171,9 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     });
     expect(streamTextCalls).toBe(0);
     // The temp dir acquired while the abort landed is still released.
-    expect(execCommands).toEqual([`rm -rf ${shellQuote("abort-before-create-temp")}`]);
+    expect(execCalls.map((call) => call.command)).toEqual([
+      `rm -rf ${shellQuote("abort-before-create-temp")}`,
+    ]);
     expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });

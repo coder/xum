@@ -4,11 +4,7 @@ import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { Ok, Err } from "@/common/types/result";
-import {
-  StreamManager,
-  type ModelFallbackPrepareOptions,
-  type TurnExecutionOptions,
-} from "./streamManager";
+import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -26,7 +22,7 @@ import {
   appendPartialAssistantForTests,
   createStreamResultForTests,
   createStreamInfoForTests,
-  testStartOptions,
+  runTurnForTests,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -49,28 +45,6 @@ function turnStreamTextForTests(
     turnStarted = true;
     return turnStream();
   });
-}
-
-/**
- * Runs one turn through the public startStream boundary on an Anthropic model
- * string and waits for its terminal outcome. The caller appends the partial.
- */
-async function runTurnForTests(
-  streamManager: StreamManager,
-  options: Partial<TurnExecutionOptions> &
-    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "historySequence">
-) {
-  const result = await streamManager.startStream(
-    testStartOptions({
-      model: createTestLanguageModel(),
-      modelString: KNOWN_MODELS.SONNET.id,
-      initialMetadata: { agentId: "plan" },
-      providedRuntimeTempDir: "",
-      ...options,
-    })
-  );
-  if (!result.success) throw new Error(`Expected stream to start: ${JSON.stringify(result.error)}`);
-  return result.data.completion;
 }
 
 describe("StreamManager - exact step indices", () => {
@@ -99,7 +73,6 @@ describe("StreamManager - exact step indices", () => {
     });
     const workspaceId = "step-indices-workspace";
     const messageId = "step-indices-message";
-    await appendPartialAssistantForTests(workspaceId, messageId, 1);
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence: 1 });
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
     expect(history.success).toBe(true);
@@ -189,7 +162,6 @@ describe("StreamManager - empty stream completions", () => {
     const messageId = "empty-output-message";
     const historySequence = 1;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
     const emptyUsage = { inputTokens: 3, outputTokens: 0, totalTokens: 3 };
 
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
@@ -254,8 +226,6 @@ describe("StreamManager - empty stream completions", () => {
     const messageId = "truncated-stream-message";
     const historySequence = 1;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(streamEndEvents).toHaveLength(0);
@@ -316,8 +286,6 @@ describe("StreamManager - empty stream completions", () => {
     const messageId = "synthesized-finish-message";
     const historySequence = 1;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(streamEndEvents).toHaveLength(0);
@@ -367,8 +335,6 @@ describe("StreamManager - empty stream completions", () => {
     const messageId = "real-other-finish-message";
     const historySequence = 1;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
     expect(errorEvents).toHaveLength(0);
@@ -413,8 +379,6 @@ describe("StreamManager - empty stream completions", () => {
     const workspaceId = "refusal-workspace";
     const messageId = "refusal-message";
     const historySequence = 1;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     // Guard that no empty-stream recovery attempt re-creates the stream.
 
@@ -467,8 +431,6 @@ describe("StreamManager - empty stream completions", () => {
     const workspaceId = "refusal-no-usage-workspace";
     const messageId = "refusal-no-usage-message";
     const historySequence = 1;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
@@ -525,8 +487,6 @@ describe("StreamManager - empty stream completions", () => {
     const workspaceId = "refusal-zero-usage-sidecar-workspace";
     const messageId = "refusal-zero-usage-sidecar-message";
     const historySequence = 1;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
@@ -590,8 +550,6 @@ describe("StreamManager - empty stream completions", () => {
     const workspaceId = "refusal-partial-workspace";
     const messageId = "refusal-partial-message";
     const historySequence = 1;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     await runTurnForTests(streamManager, { workspaceId, messageId, historySequence });
 
@@ -691,8 +649,6 @@ describe("StreamManager - empty stream completions", () => {
     const messageId = "fallback-swap-message";
     const historySequence = 1;
     const fallbackModel = KNOWN_MODELS.GPT.id;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     // The swapped-in stream: the fallback model answers normally.
 
@@ -978,8 +934,6 @@ describe("StreamManager - empty stream completions", () => {
     const refusedReasoning = "Reasoning before refusal";
     const expectedReasoningTokens = await countTokens(KNOWN_MODELS.SONNET.id, refusedReasoning);
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
       Promise.resolve(
         Ok({
@@ -1051,8 +1005,6 @@ describe("StreamManager - empty stream completions", () => {
         })
       )
     );
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     await runTurnForTests(streamManager, {
       workspaceId,
@@ -1132,8 +1084,6 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
     const firstFallbackModel = KNOWN_MODELS.GPT.id;
     const secondFallbackModel = KNOWN_MODELS.GEMINI_FLASH.id;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     // First swapped-in stream refuses too; the second answers.
 
@@ -1269,8 +1219,6 @@ describe("StreamManager - empty stream completions", () => {
     const firstFallbackModel = KNOWN_MODELS.GPT.id;
     const secondFallbackModel = KNOWN_MODELS.GEMINI_FLASH.id;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     const prepareCalls: Array<{
       nextModelString: string;
       options?: ModelFallbackPrepareOptions;
@@ -1393,8 +1341,6 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
     const fallbackModel = KNOWN_MODELS.GPT.id;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     // The fallback model refuses too — the chain is then exhausted.
 
     const prepare = mock((nextModelString: string) =>
@@ -1482,8 +1428,6 @@ describe("StreamManager - empty stream completions", () => {
     const historySequence = 1;
     const fallbackModel = KNOWN_MODELS.GPT.id;
 
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
-
     // Silently skipping to the next chain entry would effectively create
     // fallback-on-auth/config errors, which is out of scope by design.
     const prepare = mock((_nextModelString: string) =>
@@ -1540,8 +1484,6 @@ describe("StreamManager - empty stream completions", () => {
     const messageId = "fallback-prepare-throw-message";
     const historySequence = 1;
     const fallbackModel = KNOWN_MODELS.GPT.id;
-
-    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
 
     // A THROW (not an Err) must not escape into the generic stream-error path,
     // where it would be categorized as a retryable api/unknown error and
