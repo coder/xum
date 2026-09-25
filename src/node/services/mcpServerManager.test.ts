@@ -2575,212 +2575,190 @@ describe("MCPServerManager", () => {
     let epoch = "epoch-1";
     let lockHeld = false;
     let gateLock: Promise<void> = Promise.resolve();
+    const acquireOverridesLock = mock(async () => {
+      await gateLock;
+      lockHeld = true;
+      return () => {
+        lockHeld = false;
+        return Promise.resolve();
+      };
+    });
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: {
         keyPrefix: "plugin:",
         readToken: () => Promise.resolve("plugins-1"),
         readOverridesEpoch: () => Promise.resolve(epoch),
         readWorkspaceOverrides: () => Promise.resolve({}),
-        acquireOverridesLock: async () => {
-          await gateLock;
-          lockHeld = true;
-          return () => {
-            lockHeld = false;
-            return Promise.resolve();
-          };
-        },
+        acquireOverridesLock,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     // Establish the epoch baseline (first preflight).
     configService.listServers = mock(() => Promise.resolve({}));
     await manager.getToolsForWorkspace(workspaceRequest("ws-spawn-fence-baseline"));
 
-    const controller = new AbortController();
-    let heldAtExec: boolean | undefined;
-    const exec = mock((_command: string) => {
-      heldAtExec = lockHeld;
-      // Abort right after the spawn so the startup stops there.
-      controller.abort();
-      return Promise.resolve({
-        stdin: new WritableStream<Uint8Array>({ close: () => Promise.resolve(undefined) }),
-        stdout: new ReadableStream<Uint8Array>({ cancel: () => Promise.resolve(undefined) }),
-        stderr: new ReadableStream<Uint8Array>({ cancel: () => Promise.resolve(undefined) }),
-        exitCode: Promise.resolve(0),
-        duration: Promise.resolve(0),
-      });
-    });
-    const start = () =>
-      access.startSingleServerImpl(
-        "fenced",
-        stdioConfig("never"),
-        { exec } as unknown as Runtime,
-        PROJECT_PATH,
-        WORKSPACE_PATH,
-        undefined,
-        () => undefined,
-        controller.signal
-      );
-    expect(await start()).toBeNull();
-    expect(exec).toHaveBeenCalledTimes(1);
-    expect(heldAtExec).toBe(true);
+    configService.listServers = mock(() => Promise.resolve({ fenced: stdioConfig("fenced-cmd") }));
+    servers.serve("fenced-cmd", { tools: { ping: testTool() } });
+    const heldAtExec: boolean[] = [];
+    const runtime = {
+      exec: (...args: Parameters<typeof servers.exec>) => {
+        heldAtExec.push(lockHeld);
+        return servers.exec(...args);
+      },
+    } as unknown as Runtime;
+
+    const started = await manager.getToolsForWorkspace(
+      workspaceRequest("ws-spawn-fence", { runtime })
+    );
+    expect(Object.keys(started.tools)).toHaveLength(1);
+    expect(heldAtExec).toEqual([true]);
     expect(lockHeld).toBe(false);
 
     // A sibling revocation holding the writer's lock commits its epoch before
     // releasing: the fenced read sees it and nothing is spawned.
-    let releaseSibling!: () => void;
-    gateLock = new Promise<void>((resolve) => {
-      releaseSibling = resolve;
-    });
-    const controller2 = new AbortController();
-    const racing = access.startSingleServerImpl(
-      "fenced",
-      stdioConfig("never"),
-      { exec } as unknown as Runtime,
-      PROJECT_PATH,
-      WORKSPACE_PATH,
-      undefined,
-      () => undefined,
-      controller2.signal
+    const sibling = Promise.withResolvers<void>();
+    gateLock = sibling.promise;
+    const locksBefore = acquireOverridesLock.mock.calls.length;
+    const racing = manager.getToolsForWorkspace(
+      workspaceRequest("ws-spawn-fence-race", { runtime })
     );
-    racing.catch(() => undefined);
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await waitFor(() => acquireOverridesLock.mock.calls.length > locksBefore);
     epoch = "epoch-2";
     gateLock = Promise.resolve();
-    releaseSibling();
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(racing).rejects.toThrow("about to start");
-    expect(exec).toHaveBeenCalledTimes(1);
+    sibling.resolve();
+    const raced = await racing;
+    expect(heldAtExec).toEqual([true]);
+    expect(raced.stats.failedServerNames).toEqual(["fenced"]);
     expect(lockHeld).toBe(false);
   });
 
-  test("a remote launch fence releases the writer's lock at its initiation deadline while the handshake is pending", async () => {
-    // Every settings save and prune would otherwise queue behind an
-    // endpoint-controlled handshake for the whole startup deadline.
-    using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
-    const f = await componentFixture(tmp.path);
-    let lockHeld = false;
-    let componentLockHeld = false;
+  /** Mirrors mcpServerManager's LAUNCH_INITIATION_FENCE_MS (remote connect lock hold). */
+  const LAUNCH_INITIATION_FENCE_MS = 2_000;
+  /** Mirrors mcpServerManager's STDIO_LAUNCH_FENCE_MS (stdio exec lock hold before abort). */
+  const STDIO_LAUNCH_FENCE_MS = 15_000;
+
+  /**
+   * Instrument a component fixture's invalidation with the override writer's
+   * lock and report whether each lock is held, then serve it from a manager
+   * with the real startup path.
+   */
+  async function launchFenceFixture(home: string) {
+    const f = await componentFixture(home);
+    const held = { overrides: false, component: false };
     const acquireComponentLock = f.invalidation.tryAcquireComponentPolicyLock!;
     f.invalidation.tryAcquireComponentPolicyLock = async (options) => {
       const release = await acquireComponentLock(options);
-      componentLockHeld = true;
+      held.component = true;
       return async () => {
         await release();
-        componentLockHeld = false;
+        held.component = false;
       };
     };
     f.invalidation.readOverridesEpoch = () => Promise.resolve("epoch-1");
     f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
     f.invalidation.acquireOverridesLock = () => {
-      lockHeld = true;
+      held.overrides = true;
       return Promise.resolve(() => {
-        lockHeld = false;
+        held.overrides = false;
         return Promise.resolve();
       });
     };
-    await manager.getToolsForWorkspace(workspaceRequest("ws-remote-fence-baseline"));
-    const fence = access as unknown as {
-      launchUnderOverrideFence: <T>(
-        name: string,
-        info: MCPServerInfo,
-        launch: () => Promise<T>,
-        signal: AbortSignal,
-        options?: { releaseAfterMs?: number }
-      ) => Promise<T>;
-    };
-    const handshake = Promise.withResolvers<string>();
+    manager.dispose();
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: f.invalidation,
+    });
+    // Establish the epoch baseline (first preflight) with nothing to start.
+    configService.listServers = mock(() => Promise.resolve({}));
+    await manager.getToolsForWorkspace(workspaceRequest("ws-launch-fence-baseline"));
+    return { ...f, held };
+  }
+
+  test("a remote launch fence releases the writer's lock at its initiation deadline while the handshake is pending", async () => {
+    // Every settings save and prune would otherwise queue behind an
+    // endpoint-controlled handshake for the whole startup deadline.
+    using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
+    const f = await launchFenceFixture(tmp.path);
+    using timers = holdTimers([LAUNCH_INITIATION_FENCE_MS]);
+    const serverKey = "plugin:instance:remove";
+    const url = "https://remove.example/mcp";
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        [serverKey]: { transport: "http" as const, url, plugin: f.configs[serverKey].plugin },
+      })
+    );
+    const handshake = Promise.withResolvers<void>();
     let heldAtLaunch: boolean | undefined;
-    const launched = fence.launchUnderOverrideFence(
-      "plugin:instance:remove",
-      f.configs["plugin:instance:remove"],
-      () => {
-        heldAtLaunch = lockHeld && componentLockHeld;
+    servers.serve(url, {
+      tools: { echo: testTool() },
+      connect: () => {
+        heldAtLaunch = f.held.overrides && f.held.component;
         return handshake.promise;
       },
-      new AbortController().signal,
-      { releaseAfterMs: 10 }
-    );
-    expect(heldAtLaunch).toBeUndefined();
-    await waitFor(() => !lockHeld && heldAtLaunch === true);
+    });
+
+    const serve = manager.getToolsForWorkspace(workspaceRequest("ws-remote-fence"));
+    await waitFor(() => heldAtLaunch !== undefined);
+    expect(heldAtLaunch).toBe(true);
+    // The handshake is still pending at the initiation deadline: release.
+    timers.fire(LAUNCH_INITIATION_FENCE_MS);
+    await waitFor(() => !f.held.overrides && !f.held.component);
     // A real component writer can commit while the admitted handshake is pending.
     await f.write(["keep"]);
-    expect(componentLockHeld).toBe(false);
-    handshake.resolve("connected");
-    expect(await launched).toBe("connected");
+    expect(f.held.component).toBe(false);
+    handshake.resolve();
+    const result = await serve;
+    expect(servers.connectCount(url)).toBe(1);
+    // The component the writer removed meanwhile is not served.
+    expect(result.tools).toEqual({});
   });
 
   test("a stdio launch still awaiting its exec at the fence deadline is aborted, not released", async () => {
     // Releasing would let an SSH exec still acquiring its connection send the
     // repository-configured command after a sibling's revocation committed.
     using tmp = new DisposableTempDir("mcp-component-launch-lifetime");
-    const f = await componentFixture(tmp.path);
-    let lockHeld = false;
-    let componentLockHeld = false;
-    const acquireComponentLock = f.invalidation.tryAcquireComponentPolicyLock!;
-    f.invalidation.tryAcquireComponentPolicyLock = async (options) => {
-      const release = await acquireComponentLock(options);
-      componentLockHeld = true;
-      return async () => {
-        await release();
-        componentLockHeld = false;
-      };
-    };
-    f.invalidation.readOverridesEpoch = () => Promise.resolve("epoch-1");
-    f.invalidation.readWorkspaceOverrides = () => Promise.resolve({});
-    f.invalidation.acquireOverridesLock = () => {
-      lockHeld = true;
-      return Promise.resolve(() => {
-        lockHeld = false;
-        return Promise.resolve();
-      });
-    };
-    await manager.getToolsForWorkspace(workspaceRequest("ws-stdio-fence-baseline"));
-    const fence = access as unknown as {
-      launchUnderOverrideFence: <T>(
-        name: string,
-        info: MCPServerInfo,
-        launch: (launchSignal: AbortSignal) => Promise<T>,
-        signal: AbortSignal,
-        options?: { abortAfterMs?: { ms: number; serverName: string } }
-      ) => Promise<T>;
-    };
+    const f = await launchFenceFixture(tmp.path);
+    using timers = holdTimers([STDIO_LAUNCH_FENCE_MS]);
+    const serverKey = "plugin:instance:remove";
+    configService.listServers = mock(() => Promise.resolve({ [serverKey]: f.configs[serverKey] }));
+    servers.serve("remove", { tools: { echo: testTool() } });
     let launchSignal: AbortSignal | undefined;
     let heldWhilePending: boolean | undefined;
-    const launched = fence.launchUnderOverrideFence(
-      "plugin:instance:remove",
-      f.configs["plugin:instance:remove"],
-      (signal) => {
+    let stallExec = true;
+    const runtime = {
+      exec: (...args: Parameters<typeof servers.exec>) => {
+        const signal = args[1].abortSignal;
         launchSignal = signal;
-        heldWhilePending = lockHeld && componentLockHeld;
+        heldWhilePending = f.held.overrides && f.held.component;
+        if (!stallExec) return servers.exec(...args);
         // Mirrors RemoteRuntime.exec: settles only through the abort.
         return new Promise<never>((_resolve, reject) => {
-          signal.addEventListener("abort", () => reject(new Error("Operation aborted")), {
+          signal?.addEventListener("abort", () => reject(new Error("Operation aborted")), {
             once: true,
           });
         });
       },
-      new AbortController().signal,
-      { abortAfterMs: { ms: 10, serverName: "slow-ssh" } }
-    );
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
-    await expect(launched).rejects.toThrow("MCP server 'slow-ssh' timed out after 10ms");
+    } as unknown as Runtime;
+    const request = workspaceRequest("ws-stdio-fence", { runtime });
+
+    const serve = manager.getToolsForWorkspace(request);
+    await waitFor(() => launchSignal !== undefined);
+    timers.fire(STDIO_LAUNCH_FENCE_MS);
+    const result = await serve;
+    expect(result.stats.failedServerNames).toEqual([serverKey]);
     expect(heldWhilePending).toBe(true);
     expect(launchSignal?.aborted).toBe(true);
-    expect(lockHeld).toBe(false);
-    expect(componentLockHeld).toBe(false);
+    expect(f.held.overrides).toBe(false);
+    expect(f.held.component).toBe(false);
 
-    // A launch that hands back its stream in time is unaffected and released.
-    const quick = await fence.launchUnderOverrideFence(
-      "plugin:instance:remove",
-      f.configs["plugin:instance:remove"],
-      (signal) => Promise.resolve(signal.aborted ? "aborted" : "spawned"),
-      new AbortController().signal,
-      { abortAfterMs: { ms: 1_000, serverName: "quick" } }
-    );
-    expect(quick).toBe("spawned");
-    expect(lockHeld).toBe(false);
-    expect(componentLockHeld).toBe(false);
+    // Failed as a startup timeout, so it is retried after the backoff; a
+    // launch that hands back its stream in time is unaffected and released.
+    stallExec = false;
+    elapseTimedOutRetryBackoff();
+    const retried = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(retried.tools)).toHaveLength(1);
+    expect(heldWhilePending).toBe(true);
+    expect(launchSignal?.aborted).toBe(false);
+    expect(f.held.overrides).toBe(false);
+    expect(f.held.component).toBe(false);
   });
 
   test("startSingleServerImpl cleans up client that resolves after abort", async () => {
