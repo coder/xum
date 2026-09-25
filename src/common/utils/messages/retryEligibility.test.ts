@@ -1,8 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import {
   getLastNonDecorativeMessage,
-  hasInterruptedStream,
-  isEligibleForAutoRetry,
+  getInterruptionContext,
   isNonRetryableSendError,
   isNonRetryableStreamError,
   isPreTokenInterruptedUserTurn,
@@ -105,13 +104,14 @@ describe("context budget retry suppression", () => {
     expect(isNonRetryableSendError({ type: "context_budget_blocked" })).toBe(true);
     expect(isNonRetryableStreamError({ type: "context_budget_blocked" })).toBe(true);
     expect(
-      isEligibleForAutoRetry([
+      getInterruptionContext([
         userMessage(),
         streamErrorMessage({ errorType: "context_budget_blocked" }),
-      ])
+      ]).isEligibleForAutoRetry
     ).toBe(false);
     expect(
-      isEligibleForAutoRetry([userMessage(), streamErrorMessage({ errorType: "network" })])
+      getInterruptionContext([userMessage(), streamErrorMessage({ errorType: "network" })])
+        .isEligibleForAutoRetry
     ).toBe(true);
   });
 });
@@ -122,38 +122,39 @@ describe("terminal budget rejection barriers", () => {
       assistantMessage({ isPartial: true }),
       userMessage({ contextBudgetRejected: true }),
     ];
-    expect(hasInterruptedStream(messages)).toBe(false);
-    expect(isEligibleForAutoRetry(messages)).toBe(false);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(false);
+    expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     expect(isPreTokenInterruptedUserTurn(messages.at(-1), { reason: "user", at: 1 })).toBe(false);
     expect(
-      hasInterruptedStream([
+      getInterruptionContext([
         ...messages,
         userMessage({ id: "next", historyId: "next", historySequence: 3 }),
-      ])
+      ]).hasInterruptedStream
     ).toBe(true);
   });
 
   it("does not advertise a live retry action for a terminal context-budget error", () => {
     expect(
-      hasInterruptedStream([
+      getInterruptionContext([
         userMessage(),
         streamErrorMessage({ errorType: "context_budget_blocked" }),
-      ])
+      ]).hasInterruptedStream
     ).toBe(false);
     expect(
-      hasInterruptedStream([userMessage(), streamErrorMessage({ errorType: "network" })])
+      getInterruptionContext([userMessage(), streamErrorMessage({ errorType: "network" })])
+        .hasInterruptedStream
     ).toBe(true);
   });
 });
 
 describe("hasInterruptedStream", () => {
   it("returns false for empty messages", () => {
-    expect(hasInterruptedStream([])).toBe(false);
+    expect(getInterruptionContext([]).hasInterruptedStream).toBe(false);
   });
 
   it("returns true for stream-error message", () => {
     const messages: DisplayedMessage[] = [userMessage(), streamErrorMessage()];
-    expect(hasInterruptedStream(messages)).toBe(true);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
   });
 
   it("ignores decorative compaction boundary rows when checking interruption", () => {
@@ -163,8 +164,8 @@ describe("hasInterruptedStream", () => {
       compactionBoundary(),
     ];
 
-    expect(hasInterruptedStream(messages)).toBe(true);
-    expect(isEligibleForAutoRetry(messages)).toBe(true);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
+    expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(true);
   });
 
   it("returns true for partial assistant message", () => {
@@ -172,7 +173,7 @@ describe("hasInterruptedStream", () => {
       userMessage(),
       assistantMessage({ content: "Incomplete response", isPartial: true }),
     ];
-    expect(hasInterruptedStream(messages)).toBe(true);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
   });
 
   it("returns false for executing ask_user_question (waiting state)", () => {
@@ -192,7 +193,7 @@ describe("hasInterruptedStream", () => {
       },
     ];
 
-    expect(hasInterruptedStream(messages)).toBe(false);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(false);
   });
   it("returns true for partial tool message", () => {
     const messages: DisplayedMessage[] = [
@@ -210,7 +211,7 @@ describe("hasInterruptedStream", () => {
         isLastPartOfMessage: true,
       },
     ];
-    expect(hasInterruptedStream(messages)).toBe(true);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
   });
 
   it("returns true for partial reasoning message", () => {
@@ -227,12 +228,12 @@ describe("hasInterruptedStream", () => {
         isLastPartOfMessage: true,
       },
     ];
-    expect(hasInterruptedStream(messages)).toBe(true);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
   });
 
   it("returns false for completed messages", () => {
     const messages: DisplayedMessage[] = [userMessage(), assistantMessage()];
-    expect(hasInterruptedStream(messages)).toBe(false);
+    expect(getInterruptionContext(messages).hasInterruptedStream).toBe(false);
   });
 
   it("returns true when last message is user message (app restarted during slow model)", () => {
@@ -246,7 +247,7 @@ describe("hasInterruptedStream", () => {
         historySequence: 3,
       }),
     ];
-    expect(hasInterruptedStream(messages, null)).toBe(true);
+    expect(getInterruptionContext(messages, null).hasInterruptedStream).toBe(true);
   });
 
   it("suppresses retry while runtime startup is still in progress", () => {
@@ -261,8 +262,10 @@ describe("hasInterruptedStream", () => {
       detail: "Starting workspace...",
     };
 
-    expect(hasInterruptedStream(messages, null, runtimeStatus)).toBe(false);
-    expect(isEligibleForAutoRetry(messages, null, runtimeStatus)).toBe(false);
+    expect(getInterruptionContext(messages, null, runtimeStatus).hasInterruptedStream).toBe(false);
+    expect(getInterruptionContext(messages, null, runtimeStatus).isEligibleForAutoRetry).toBe(
+      false
+    );
   });
 
   it("keeps retry eligible for non-runtime startup breadcrumbs", () => {
@@ -277,8 +280,8 @@ describe("hasInterruptedStream", () => {
       detail: "Loading tools...",
     };
 
-    expect(hasInterruptedStream(messages, null, runtimeStatus)).toBe(true);
-    expect(isEligibleForAutoRetry(messages, null, runtimeStatus)).toBe(true);
+    expect(getInterruptionContext(messages, null, runtimeStatus).hasInterruptedStream).toBe(true);
+    expect(getInterruptionContext(messages, null, runtimeStatus).isEligibleForAutoRetry).toBe(true);
   });
 
   it("returns false when message was sent very recently (within grace period)", () => {
@@ -294,24 +297,24 @@ describe("hasInterruptedStream", () => {
     ];
     // Message sent 1 second ago - still within grace window
     const recentTimestamp = Date.now() - (PENDING_STREAM_START_GRACE_PERIOD_MS - 1000);
-    expect(hasInterruptedStream(messages, recentTimestamp)).toBe(false);
+    expect(getInterruptionContext(messages, recentTimestamp).hasInterruptedStream).toBe(false);
   });
 
   it("returns true when user message has no response (slow model scenario)", () => {
     const messages: DisplayedMessage[] = [userMessage()];
-    expect(hasInterruptedStream(messages, null)).toBe(true);
+    expect(getInterruptionContext(messages, null).hasInterruptedStream).toBe(true);
   });
 
   it("returns false when user message just sent (within grace period)", () => {
     const messages: DisplayedMessage[] = [userMessage()];
     const justSent = Date.now() - (PENDING_STREAM_START_GRACE_PERIOD_MS - 500);
-    expect(hasInterruptedStream(messages, justSent)).toBe(false);
+    expect(getInterruptionContext(messages, justSent).hasInterruptedStream).toBe(false);
   });
 
   it("returns true when message sent beyond grace period (stream likely hung)", () => {
     const messages: DisplayedMessage[] = [userMessage()];
     const longAgo = Date.now() - (PENDING_STREAM_START_GRACE_PERIOD_MS + 1000);
-    expect(hasInterruptedStream(messages, longAgo)).toBe(true);
+    expect(getInterruptionContext(messages, longAgo).hasInterruptedStream).toBe(true);
   });
 
   describe("stream error types (all show manual retry UI)", () => {
@@ -320,7 +323,7 @@ describe("hasInterruptedStream", () => {
         userMessage(),
         streamErrorMessage({ error: "Invalid API key", errorType: "authentication" }),
       ];
-      expect(hasInterruptedStream(messages)).toBe(true);
+      expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
     });
 
     it("returns true for network errors", () => {
@@ -328,19 +331,19 @@ describe("hasInterruptedStream", () => {
         userMessage(),
         streamErrorMessage({ error: "Network connection failed" }),
       ];
-      expect(hasInterruptedStream(messages)).toBe(true);
+      expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
     });
   });
 });
 
 describe("isEligibleForAutoRetry", () => {
   it("returns false for empty messages", () => {
-    expect(isEligibleForAutoRetry([])).toBe(false);
+    expect(getInterruptionContext([]).isEligibleForAutoRetry).toBe(false);
   });
 
   it("returns false for completed messages", () => {
     const messages: DisplayedMessage[] = [userMessage(), assistantMessage()];
-    expect(isEligibleForAutoRetry(messages)).toBe(false);
+    expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
   });
 
   describe("non-retryable error types", () => {
@@ -349,7 +352,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Invalid API key", errorType: "authentication" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("returns false for quota errors (requires user to upgrade/wait)", () => {
@@ -357,7 +360,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Usage quota exceeded", errorType: "quota" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("returns false for model_not_found errors (requires user to select different model)", () => {
@@ -365,7 +368,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Model not found", errorType: "model_not_found" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("returns false for context_exceeded errors (requires user to reduce context)", () => {
@@ -373,7 +376,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Context length exceeded", errorType: "context_exceeded" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("keeps context_exceeded non-retryable when decorative boundaries are trailing", () => {
@@ -383,8 +386,8 @@ describe("isEligibleForAutoRetry", () => {
         compactionBoundary({ id: "boundary-end" }),
       ];
 
-      expect(hasInterruptedStream(messages)).toBe(true);
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("returns false for aborted errors (user cancelled)", () => {
@@ -392,7 +395,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Request aborted", errorType: "aborted" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
     it("returns false for runtime_not_ready errors (workspace needs attention)", () => {
       const messages: DisplayedMessage[] = [
@@ -402,7 +405,7 @@ describe("isEligibleForAutoRetry", () => {
           errorType: "runtime_not_ready",
         }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("returns false for model_refusal errors (retrying will refuse again)", () => {
@@ -413,7 +416,7 @@ describe("isEligibleForAutoRetry", () => {
           errorType: "model_refusal",
         }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
 
     it("keeps manual retry for a persisted reasoning_rejected error but never auto-retries it", () => {
@@ -426,8 +429,8 @@ describe("isEligibleForAutoRetry", () => {
           errorType: "reasoning_rejected",
         }),
       ];
-      expect(hasInterruptedStream(messages)).toBe(true);
-      expect(isEligibleForAutoRetry(messages)).toBe(false);
+      expect(getInterruptionContext(messages).hasInterruptedStream).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(false);
     });
   });
 
@@ -437,7 +440,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Network connection failed" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(true);
     });
 
     it("returns true for server errors", () => {
@@ -445,7 +448,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Internal server error", errorType: "server_error" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(true);
     });
 
     it("returns true for rate limit errors", () => {
@@ -453,7 +456,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Rate limit exceeded", errorType: "rate_limit" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(true);
     });
 
     it("returns true for runtime_start_failed errors (transient runtime start failures)", () => {
@@ -461,7 +464,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         streamErrorMessage({ error: "Failed to start runtime", errorType: "runtime_start_failed" }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(true);
     });
   });
 
@@ -471,7 +474,7 @@ describe("isEligibleForAutoRetry", () => {
         userMessage(),
         assistantMessage({ content: "Incomplete response", isPartial: true }),
       ];
-      expect(isEligibleForAutoRetry(messages)).toBe(true);
+      expect(getInterruptionContext(messages).isEligibleForAutoRetry).toBe(true);
     });
 
     it("returns true for trailing user messages (app restart scenario)", () => {
@@ -485,28 +488,36 @@ describe("isEligibleForAutoRetry", () => {
           historySequence: 3,
         }),
       ];
-      expect(isEligibleForAutoRetry(messages, null)).toBe(true);
+      expect(getInterruptionContext(messages, null).isEligibleForAutoRetry).toBe(true);
     });
 
     it("hides retry barrier for user-initiated abort (Ctrl+C)", () => {
       const messages: DisplayedMessage[] = [userMessage()];
       const lastAbortReason = { reason: "user" as const, at: Date.now() };
       // User abort = intentional action, not an error - no warning banner
-      expect(hasInterruptedStream(messages, null, null, lastAbortReason)).toBe(false);
-      expect(isEligibleForAutoRetry(messages, null, null, lastAbortReason)).toBe(false);
+      expect(
+        getInterruptionContext(messages, null, null, lastAbortReason).hasInterruptedStream
+      ).toBe(false);
+      expect(
+        getInterruptionContext(messages, null, null, lastAbortReason).isEligibleForAutoRetry
+      ).toBe(false);
     });
 
     it("hides retry barrier for startup abort", () => {
       const messages: DisplayedMessage[] = [userMessage()];
       const lastAbortReason = { reason: "startup" as const, at: Date.now() };
       // Startup abort = intentional action during app init, not an error
-      expect(hasInterruptedStream(messages, null, null, lastAbortReason)).toBe(false);
-      expect(isEligibleForAutoRetry(messages, null, null, lastAbortReason)).toBe(false);
+      expect(
+        getInterruptionContext(messages, null, null, lastAbortReason).hasInterruptedStream
+      ).toBe(false);
+      expect(
+        getInterruptionContext(messages, null, null, lastAbortReason).isEligibleForAutoRetry
+      ).toBe(false);
     });
     it("returns false when user message sent very recently (within grace period)", () => {
       const messages: DisplayedMessage[] = [userMessage()];
       const justSent = Date.now() - (PENDING_STREAM_START_GRACE_PERIOD_MS - 500);
-      expect(isEligibleForAutoRetry(messages, justSent)).toBe(false);
+      expect(getInterruptionContext(messages, justSent).isEligibleForAutoRetry).toBe(false);
     });
   });
 });

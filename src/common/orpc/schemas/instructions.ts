@@ -4,7 +4,7 @@ import { z } from "zod";
  * Schemas for instruction context (AGENTS.md, CLAUDE.md, AGENTS.local.md, …).
  *
  * These are the single source of truth for both:
- * - The internal data structure used by `buildSystemMessage` to compose the
+ * - The internal data structure used by `buildSystemMessageFromSources` to compose the
  *   system prompt (so each layer is typed instead of being string-soup).
  * - The IPC payload returned by `workspace.getInstructions` and consumed by
  *   the right-sidebar Instructions tab.

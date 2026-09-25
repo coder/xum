@@ -5,7 +5,7 @@ import * as os from "node:os";
 import { createHash } from "node:crypto";
 import { isReadableHistoryMessage } from "./historyScanner";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
-import { scanHistoryRows } from "./historyRowScanner";
+import { scanHistoryRows } from "./historyRowScanner.testHarness";
 import { createHistoryMessageEvidence } from "./historyMessageEvidence";
 
 const date = "2026-09-11T12:00:00Z";

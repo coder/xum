@@ -1,5 +1,5 @@
 import { createHash, type Hash } from "node:crypto";
-import * as fs from "node:fs/promises";
+import type * as fs from "node:fs/promises";
 import { finished } from "node:stream/promises";
 import { parser, type Token } from "stream-json/parser.js";
 import { SESSION_HISTORY_SCAN_CHUNK_BYTES } from "@/common/constants/contextBudget";
@@ -36,28 +36,8 @@ export interface HistoryRowVisitor {
  * chunk plus parser depth and per-object key fingerprints, not strictly constant for
  * arbitrarily deep/wide JSON. Visitors must keep their own accumulation bounded too.
  * A caller using descriptors as evidence must revalidate file stamps against concurrent writes.
- */
-export async function scanHistoryRows(
-  filePath: string,
-  beginRow: (start: number) => HistoryRowVisitor,
-  options: { signal?: AbortSignal; decoding?: "strict" | "replacement" } = {}
-): Promise<boolean> {
-  const { signal, decoding = "strict" } = options;
-  signal?.throwIfAborted();
-  try {
-    await using handle = await fs.open(filePath, "r");
-    signal?.throwIfAborted();
-    const { size } = await handle.stat();
-    signal?.throwIfAborted();
-    return await scanHistoryRowsFromHandle(handle, size, beginRow, { signal, decoding });
-  } finally {
-    // Resource disposal is asynchronous too; cancellation during cleanup must remain observable.
-    signal?.throwIfAborted();
-  }
-}
-
-/**
- * Scan a borrowed handle through its captured size, so callers can inspect the same
+ *
+ * Scans a borrowed handle through its captured size, so callers can inspect the same
  * inode for additional evidence. The caller owns the handle and its disposal.
  */
 export async function scanHistoryRowsFromHandle(

@@ -275,7 +275,7 @@ export function extractToolInstructions(
     enableAgentReport?: boolean;
     enableReviewPane?: boolean;
     enableMuxGlobalAgentsTools?: boolean;
-    /** Agent prompt sections, searched first (see buildSystemMessage options). */
+    /** Agent prompt sections, searched first (see buildSystemMessageFromSources options). */
     agentInstructions?: readonly string[];
   }
 ): Record<string, string> {
@@ -293,36 +293,6 @@ export function extractToolInstructions(
   }
 
   return toolInstructions;
-}
-
-/**
- * Read instruction sources and extract tool-specific instructions.
- * Convenience wrapper that combines loadInstructionSources and extractToolInstructions.
- *
- * @param metadata - Workspace metadata (contains projectPath)
- * @param runtime - Runtime for reading workspace files (supports SSH)
- * @param workspacePath - Workspace directory path
- * @param modelString - Active model identifier to determine available tools
- * @param agentInstructions - Optional agent definition body (searched first for tool sections)
- * @returns Map of tool names to their additional instructions
- */
-export async function readToolInstructions(
-  metadata: WorkspaceMetadata,
-  runtime: Runtime,
-  workspacePath: string,
-  modelString: string,
-  agentInstructions?: readonly string[],
-  projectConfigs?: Map<string, ProjectConfig>,
-  claudeSkillsCompatEnabled = false
-): Promise<Record<string, string>> {
-  const sources = await loadWorkspaceInstructionSources(
-    metadata,
-    runtime,
-    workspacePath,
-    projectConfigs,
-    claudeSkillsCompatEnabled
-  );
-  return extractToolInstructionsFromSources(sources, modelString, metadata, agentInstructions);
 }
 
 /**
@@ -647,74 +617,6 @@ function buildProjectSettingsInstructionSets(
   return sets;
 }
 
-/**
- * Builds a system message for the AI model by combining instruction sources.
- *
- * Instruction layers:
- * 1. Global: optional ~/.claude/CLAUDE.md compatibility source, then native ~/.xum/AGENTS.md
- * 2. Context: workspace/AGENTS.md (+ workspace/.xum/AGENTS.md) plus project repo instructions
- *    for multi-project workspaces, or workspace/AGENTS.md OR project/AGENTS.md for
- *    single-project workspaces, plus per-project `customInstructions` from
- *    ~/.xum/config.json when options.projectConfigs is provided
- * 3. Model: Extracts "Model: <regex>" sections from Xum-dedicated sources only
- *    (agent definition → .xum/AGENTS.md context files → ~/.xum/AGENTS.md), if modelString provided
- * 4. Mode: Extracts "Mode: <mode>" sections from the same Xum-dedicated sources for every
- *    options.modes candidate (effective mode + agent id). Shared AGENTS.md files never contribute
- *    Model:/Mode: sections — non-Xum agents read those files too, so the headings stay ordinary
- *    markdown there.
- *
- * File search order: AGENTS.md → AGENT.md → CLAUDE.md
- * Local variants: AGENTS.local.md appended if found (for .gitignored personal preferences)
- *
- * @param metadata - Workspace metadata (contains projectPath)
- * @param runtime - Runtime for reading workspace files (supports SSH)
- * @param workspacePath - Workspace directory path
- * @param additionalSystemInstructions - Optional instructions appended last
- * @param modelString - Active model identifier used for Model-specific sections
- * @param mcpServers - Optional MCP server configuration (name -> command)
- * @throws Error if metadata or workspacePath invalid
- */
-export async function buildSystemMessage(
-  metadata: WorkspaceMetadata,
-  runtime: Runtime,
-  workspacePath: string,
-  additionalSystemInstructions?: string,
-  modelString?: string,
-  mcpServers?: MCPServerMap,
-  options?: BuildSystemMessageFromSourcesOptions & {
-    /**
-     * Project configs from ~/.mux/config.json, used to append per-project
-     * `customInstructions` (Settings → Instructions) to the prompt.
-     */
-    projectConfigs?: Map<string, ProjectConfig>;
-    /** Read ~/.claude/CLAUDE.md as a lowest-precedence global compatibility source. */
-    claudeSkillsCompatEnabled?: boolean;
-  }
-): Promise<string> {
-  if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
-  if (!workspacePath) throw new Error("Invalid workspace path: workspacePath is required");
-
-  // Sub-project workspaces pass the execution path (root + subProject); the
-  // loader falls back to the resolved root so the parent project's AGENTS.md
-  // is still read. For non-sub-project workspaces this is a no-op.
-  const instructionSources = await loadWorkspaceInstructionSources(
-    metadata,
-    runtime,
-    workspacePath,
-    options?.projectConfigs,
-    options?.claudeSkillsCompatEnabled
-  );
-  return buildSystemMessageFromSources(
-    metadata,
-    instructionSources,
-    workspacePath,
-    additionalSystemInstructions,
-    modelString,
-    mcpServers,
-    options
-  );
-}
-
 export interface BuildSystemMessageFromSourcesOptions {
   /**
    * Resolved agent prompt as independently-authored sections (agent body,
@@ -733,9 +635,35 @@ export interface BuildSystemMessageFromSourcesOptions {
 }
 
 /**
- * Pure variant of `buildSystemMessage` over an already-loaded source snapshot
- * (see `loadWorkspaceInstructionSources`), so stream startup can share one
- * snapshot between the prompt and tool-scoped instruction extraction.
+ * Builds a system message for the AI model by combining instruction sources.
+ *
+ * Instruction layers:
+ * 1. Global: optional ~/.claude/CLAUDE.md compatibility source, then native ~/.xum/AGENTS.md
+ * 2. Context: workspace/AGENTS.md (+ workspace/.xum/AGENTS.md) plus project repo instructions
+ *    for multi-project workspaces, or workspace/AGENTS.md OR project/AGENTS.md for
+ *    single-project workspaces, plus per-project `customInstructions` from
+ *    ~/.xum/config.json (loaded by `loadWorkspaceInstructionSources` from projectConfigs)
+ * 3. Model: Extracts "Model: <regex>" sections from Xum-dedicated sources only
+ *    (agent definition → .xum/AGENTS.md context files → ~/.xum/AGENTS.md), if modelString provided
+ * 4. Mode: Extracts "Mode: <mode>" sections from the same Xum-dedicated sources for every
+ *    options.modes candidate (effective mode + agent id). Shared AGENTS.md files never contribute
+ *    Model:/Mode: sections — non-Xum agents read those files too, so the headings stay ordinary
+ *    markdown there.
+ *
+ * File search order: AGENTS.md → AGENT.md → CLAUDE.md
+ * Local variants: AGENTS.local.md appended if found (for .gitignored personal preferences)
+ *
+ * Runs over an already-loaded source snapshot (see `loadWorkspaceInstructionSources`),
+ * so stream startup can share one snapshot between the prompt and tool-scoped
+ * instruction extraction.
+ *
+ * @param metadata - Workspace metadata (contains projectPath)
+ * @param instructionSources - Snapshot from `loadWorkspaceInstructionSources`
+ * @param workspacePath - Workspace directory path
+ * @param additionalSystemInstructions - Optional instructions appended last
+ * @param modelString - Active model identifier used for Model-specific sections
+ * @param mcpServers - Optional MCP server configuration (name -> command)
+ * @throws Error if metadata or workspacePath invalid
  */
 export function buildSystemMessageFromSources(
   metadata: WorkspaceMetadata,

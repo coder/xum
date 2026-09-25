@@ -1,8 +1,7 @@
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { buildEditingStateFromDisplayed } from "@/browser/utils/chatEditing";
 import {
-  hasInterruptedStream,
-  isEligibleForAutoRetry,
+  getInterruptionContext,
   isPreTokenInterruptedUserTurn,
 } from "@/common/utils/messages/retryEligibility";
 import { describe, expect, test } from "bun:test";
@@ -188,8 +187,8 @@ describe("token-budget replay", () => {
       });
       if (capsule)
         expect(aggregator.getAllMessages().at(-1)).toMatchObject({ role: "assistant", parts: [] });
-      expect(hasInterruptedStream(displayed)).toBe(false);
-      expect(isEligibleForAutoRetry(displayed)).toBe(false);
+      expect(getInterruptionContext(displayed).hasInterruptedStream).toBe(false);
+      expect(getInterruptionContext(displayed).isEligibleForAutoRetry).toBe(false);
       expect(isPreTokenInterruptedUserTurn(tail, { reason: "startup", at: 1 })).toBe(false);
       aggregator.loadHistoricalMessages(
         [
@@ -199,7 +198,9 @@ describe("token-budget replay", () => {
         ],
         false
       );
-      expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(true);
+      expect(getInterruptionContext(aggregator.getDisplayedMessages()).hasInterruptedStream).toBe(
+        true
+      );
     }
   );
 
@@ -237,11 +238,13 @@ describe("token-budget replay", () => {
       id: original.id,
       pending: { content: "Editable input", fileParts: [{ filename: "image.png" }] },
     });
-    expect(hasInterruptedStream(displayed)).toBe(false);
+    expect(getInterruptionContext(displayed).hasInterruptedStream).toBe(false);
     expect(aggregator.getAllMessages().every((message) => message.parts.length === 0)).toBe(true);
     // An older duplicate cannot undo the authoritative quarantine.
     aggregator.addMessage(original);
-    expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(false);
+    expect(getInterruptionContext(aggregator.getDisplayedMessages()).hasInterruptedStream).toBe(
+      false
+    );
     expect(aggregator.getAllMessages().at(-1)?.parts).toEqual([]);
   });
 
