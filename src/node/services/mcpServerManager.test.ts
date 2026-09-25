@@ -2841,60 +2841,29 @@ describe("MCPServerManager", () => {
     expect(lateClientClose).toHaveBeenCalledTimes(1);
   });
 
+  /** Era priors passed to each createMCPClient call, as recorded by the harness's spy. */
+  const connectPriors = () =>
+    (mcpSdk.createMCPClient as unknown as ReturnType<typeof mock>).mock.calls.map(
+      ([config]) => (config as mcpSdk.MCPClientConfig).prior
+    );
+
   test("startSingleServerImpl respawns stdio server as legacy after probe crash", async () => {
     // Fragile legacy stdio servers can exit on the server/discover probe.
     // The manager must respawn the process once and reconnect with a legacy
     // era verdict so the server still comes up.
-    const controller = new AbortController();
-    const priors: unknown[] = [];
-    const tool = testTool();
-
-    const createMCPClientSpy = spyOn(mcpSdk, "createMCPClient").mockImplementation(
-      (config: mcpSdk.MCPClientConfig) => {
-        priors.push(config.prior);
-        if (priors.length === 1) {
-          // First attempt: probe kills the server -> connect fails.
-          return Promise.reject(new Error("Connection closed"));
-        }
-        return Promise.resolve({
-          tools: mock(() => Promise.resolve({ crashy_tool: tool })),
-          negotiatedProtocolVersion: () => "2025-11-25",
-          serverInfo: () => undefined,
-          priorDiscovery: () => ({ kind: "legacy" as const }),
-          close: mock(() => Promise.resolve(undefined)),
-        } as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>);
-      }
+    const command = "node crash-on-probe.js";
+    configService.listServers = mock(() => Promise.resolve({ crashy: stdioConfig(command) }));
+    servers.serve(command, (attempt) =>
+      attempt === 1
+        ? { connect: () => Promise.reject(new Error("Connection closed")) }
+        : { tools: { crashy_tool: testTool() } }
     );
 
-    const exec = mock(() =>
-      Promise.resolve({
-        stdin: new WritableStream<Uint8Array>({ close: () => undefined }),
-        stdout: new ReadableStream<Uint8Array>({ cancel: () => undefined }),
-        stderr: new ReadableStream<Uint8Array>({ cancel: () => undefined }),
-        exitCode: new Promise<number>(() => undefined),
-        duration: Promise.resolve(0),
-      })
-    );
+    const result = await manager.getToolsForWorkspace(workspaceRequest("ws-probe-crash"));
 
-    try {
-      const result = (await access.startSingleServerImpl(
-        "crashy",
-        stdioConfig("node crash-on-probe.js"),
-        { exec } as unknown as Runtime,
-        PROJECT_PATH,
-        WORKSPACE_PATH,
-        undefined,
-        () => undefined,
-        controller.signal
-      )) as { name: string; tools: Record<string, Tool> } | null;
-
-      expect(exec).toHaveBeenCalledTimes(2);
-      expect(priors).toEqual([undefined, { kind: "legacy" }]);
-      expect(result?.name).toBe("crashy");
-      expect(Object.keys(result?.tools ?? {})).toEqual(["crashy_tool"]);
-    } finally {
-      createMCPClientSpy.mockRestore();
-    }
+    expect(servers.exec).toHaveBeenCalledTimes(2);
+    expect(connectPriors()).toEqual([undefined, { kind: "legacy" }]);
+    expect(Object.keys(result.tools)).toEqual(["crashy_crashy_tool"]);
   });
 
   test("startSingleServerImpl re-probes when a cached legacy verdict is rejected", async () => {
@@ -2902,71 +2871,33 @@ describe("MCPServerManager", () => {
     // implementation that rejects the initialize handshake. The manager must
     // drop the cached verdict and re-probe instead of failing every startup
     // until the verdict TTL expires.
-    const controller = new AbortController();
-    const priors: unknown[] = [];
-    const tool = testTool();
-
-    const makeHandle = (era: "legacy" | "modern") =>
-      ({
-        tools: mock(() => Promise.resolve({ upgraded_tool: tool })),
-        negotiatedProtocolVersion: () => (era === "modern" ? "2026-07-28" : "2025-11-25"),
-        serverInfo: () => undefined,
-        priorDiscovery: () =>
-          era === "modern"
-            ? { kind: "modern" as const, discover: {} }
-            : { kind: "legacy" as const },
-        close: mock(() => Promise.resolve(undefined)),
-      }) as unknown as Awaited<ReturnType<typeof mcpSdk.createMCPClient>>;
-
-    const createMCPClientSpy = spyOn(mcpSdk, "createMCPClient").mockImplementation(
-      (config: mcpSdk.MCPClientConfig) => {
-        priors.push(config.prior);
-        // Call 1: fresh probe -> legacy verdict cached.
-        if (priors.length === 1) {
-          return Promise.resolve(makeHandle("legacy"));
-        }
-        // Call 2: cached legacy verdict -> server was upgraded and now
-        // rejects the initialize handshake.
-        if (priors.length === 2) {
-          return Promise.reject(new Error("initialize rejected: unsupported protocol version"));
-        }
-        // Call 3: fresh re-probe -> modern.
-        return Promise.resolve(makeHandle("modern"));
+    const command = "node upgraded-server.js";
+    configService.listServers = mock(() => Promise.resolve({ upgraded: stdioConfig(command) }));
+    const tools = { upgraded_tool: testTool() };
+    servers.serve(command, (attempt) => {
+      // Call 1: fresh probe -> legacy verdict cached.
+      if (attempt === 1) return { tools, era: "legacy" };
+      // Call 2: cached legacy verdict -> the upgraded server rejects the
+      // initialize handshake.
+      if (attempt === 2) {
+        return {
+          connect: () =>
+            Promise.reject(new Error("initialize rejected: unsupported protocol version")),
+        };
       }
-    );
+      // Call 3: fresh re-probe -> modern.
+      return { tools, era: "modern" };
+    });
+    const request = workspaceRequest("ws-legacy-verdict-rejected");
 
-    const exec = mock(() =>
-      Promise.resolve({
-        stdin: new WritableStream<Uint8Array>({ close: () => undefined }),
-        stdout: new ReadableStream<Uint8Array>({ cancel: () => undefined }),
-        stderr: new ReadableStream<Uint8Array>({ cancel: () => undefined }),
-        exitCode: new Promise<number>(() => undefined),
-        duration: Promise.resolve(0),
-      })
-    );
+    const first = await manager.getToolsForWorkspace(request);
+    expect(Object.keys(first.tools)).toEqual(["upgraded_upgraded_tool"]);
 
-    try {
-      const startOnce = () =>
-        access.startSingleServerImpl(
-          "upgraded",
-          stdioConfig("node upgraded-server.js"),
-          { exec } as unknown as Runtime,
-          PROJECT_PATH,
-          WORKSPACE_PATH,
-          undefined,
-          () => undefined,
-          controller.signal
-        ) as Promise<{ name: string; tools: Record<string, Tool> } | null>;
-
-      const first = await startOnce();
-      expect(Object.keys(first?.tools ?? {})).toEqual(["upgraded_tool"]);
-
-      const second = await startOnce();
-      expect(priors).toEqual([undefined, { kind: "legacy" }, undefined]);
-      expect(Object.keys(second?.tools ?? {})).toEqual(["upgraded_tool"]);
-    } finally {
-      createMCPClientSpy.mockRestore();
-    }
+    // The process exits, so the next serve restarts it under the cached verdict.
+    await servers.crash(command);
+    const second = await manager.getToolsForWorkspace(request);
+    expect(connectPriors()).toEqual([undefined, { kind: "legacy" }, undefined]);
+    expect(Object.keys(second.tools)).toEqual(["upgraded_upgraded_tool"]);
   });
 
   test("getToolsForWorkspace tracks failed server names in stats", async () => {
