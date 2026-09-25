@@ -4238,25 +4238,48 @@ describe("MCPServerManager", () => {
 
   test("closes late-started servers instead of caching them for a removed workspace", async () => {
     const workspaceId = "ws-removed-mid-startup";
+    configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd-1") }));
     const close = mock(() => Promise.resolve());
-    access.startServers = mock(async () => {
+    const getPrompt = mock(() =>
+      Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
+    );
+    servers.serve("cmd-1", {
+      tools: { echo: testTool() },
+      getPrompt,
+      close,
       // Workspace removal lands while startup is in flight: abort-abandoned
       // discovery keeps the startup running, and removal's stopServers finds
       // no cache entry to close.
-      await manager.stopServers(workspaceId);
-      return startResult([["server", { close }]]);
+      connect: () => manager.stopServers(workspaceId),
     });
 
     const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     expect(Object.keys(result.tools)).toEqual([]);
     expect(close).toHaveBeenCalledTimes(1);
-    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+    // Nothing was cached: a prompt request finds no connected instance.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(manager.getPrompt(workspaceId, "server", "review", {})).rejects.toThrow(
+      "is not connected"
+    );
+    expect(getPrompt).not.toHaveBeenCalled();
   });
 
   test("prompt discovery refreshes with resolver-provided secrets and retries on mid-flight rotation", async () => {
-    const request = workspaceRequest("workspace", { projectSecrets: { TOKEN: "recorded" } });
-    access.lastWorkspaceRequestOptions.set("workspace", request);
+    // The secret feeds a header, so each distinct token changes the start
+    // signature and reconnects the server: connection N reveals which token
+    // the Nth startup used.
+    const url = "https://example.com/mcp";
+    configService.listServers = mock(() =>
+      Promise.resolve({
+        coder: { transport: "http", url, headers: { Authorization: { secret: "TOKEN" } } },
+      })
+    );
+    servers.serve(url, (attempt) => ({ prompts: [{ name: `status-${attempt}` }] }));
+    // Connection 1 uses the recorded token.
+    await manager.getToolsForWorkspace(
+      workspaceRequest("workspace", { projectSecrets: { TOKEN: "recorded" } })
+    );
     // First resolution returns the pre-rotation token; every later one returns
     // the rotated token, so the post-refresh recheck must force one retry.
     let resolveCount = 0;
@@ -4264,26 +4287,13 @@ describe("MCPServerManager", () => {
       resolveCount += 1;
       return Promise.resolve({ TOKEN: resolveCount === 1 ? "old" : "new" });
     });
-    const ensureSpy = spyOn(access, "ensureWorkspaceServers").mockImplementation((options) => {
-      access.workspaceServers.set((options as { workspaceId: string }).workspaceId, {
-        enabledServerNames: new Set(["coder"]),
-        instances: new Map([["coder", testInstance("coder", { prompts: [{ name: "status" }] })]]),
-      });
-      // Mirrors serveResult: a serve that vouches for its enablement.
-      return Promise.resolve({
-        tools: {},
-        stats: cachedStats(),
-        enablementDerivedFrom: options as MCPWorkspaceRequestOptions,
-      });
-    });
 
     const descriptors = await manager.getPromptsForWorkspace(workspaceRequest("workspace"));
 
-    expect(descriptors.map((descriptor) => descriptor.promptName)).toEqual(["status"]);
-    expect(ensureSpy).toHaveBeenCalledTimes(2);
-    expect(ensureSpy.mock.calls[0]?.[0]).toEqual({ ...request, projectSecrets: { TOKEN: "old" } });
-    expect(ensureSpy.mock.calls[1]?.[0]).toEqual({ ...request, projectSecrets: { TOKEN: "new" } });
-    ensureSpy.mockRestore();
+    // Connection 2 used the resolver's "old" token; the rotation forced
+    // connection 3 with "new", whose catalog is the one returned.
+    expect(servers.connectCount(url)).toBe(3);
+    expect(descriptors.map((descriptor) => descriptor.promptName)).toEqual(["status-3"]);
   });
 
   test("forgotten project trust no longer overrides a re-registered project's snapshot", async () => {
@@ -4295,14 +4305,8 @@ describe("MCPServerManager", () => {
           : { stable: stdioConfig("cmd-stable") }
       )
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { prompts: [{ name: "review" }] }],
-          ["stable", { prompts: [{ name: "status" }] }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { prompts: [{ name: "review" }] });
+    servers.serve("cmd-stable", { prompts: [{ name: "status" }] });
 
     // A trust grant retained past project removal must not resurrect on the
     // same path's next registration, which starts untrusted.
@@ -4313,6 +4317,7 @@ describe("MCPServerManager", () => {
       workspaceRequest(workspaceId, { trusted: false })
     );
     expect(descriptors.map((descriptor) => descriptor.serverName)).toEqual(["stable"]);
+    expect(servers.connectCount("cmd-1")).toBe(0);
   });
 
   test("excludes servers reconfigured while leased from prompt discovery", async () => {
@@ -4327,14 +4332,8 @@ describe("MCPServerManager", () => {
 
     const staleRefresh = mock(() => Promise.resolve([{ name: "review" }]));
     const stableRefresh = mock(() => Promise.resolve([{ name: "status" }]));
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { prompts: [{ name: "review" }], refreshPrompts: staleRefresh }],
-          ["stable", { prompts: [{ name: "status" }], refreshPrompts: stableRefresh }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { listPrompts: staleRefresh });
+    servers.serve("cmd-stable", { listPrompts: stableRefresh });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     manager.acquireLease(workspaceId);
@@ -4377,26 +4376,8 @@ describe("MCPServerManager", () => {
         }
         return Promise.resolve(list);
       });
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          [
-            "server",
-            {
-              prompts: [{ name: "review" }],
-              refreshPrompts: revokingRefresh([{ name: "review" }]),
-            },
-          ],
-          [
-            "stable",
-            {
-              prompts: [{ name: "status" }],
-              refreshPrompts: revokingRefresh([{ name: "status" }]),
-            },
-          ],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { listPrompts: revokingRefresh([{ name: "review" }]) });
+    servers.serve("cmd-stable", { listPrompts: revokingRefresh([{ name: "status" }]) });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
@@ -4410,9 +4391,7 @@ describe("MCPServerManager", () => {
     const workspaceId = "ws-discovery-signal";
     configService.listServers = mock(() => Promise.resolve({ server: stdioConfig("cmd-1") }));
     const refreshPrompts = mock((_options?: { signal?: AbortSignal }) => Promise.resolve([]));
-    access.startServers = mock(() =>
-      Promise.resolve(startResult([["server", { refreshPrompts }]]))
-    );
+    servers.serve("cmd-1", { listPrompts: refreshPrompts });
 
     const controller = new AbortController();
     await manager.getPromptsForWorkspace(workspaceRequest(workspaceId), {
@@ -4446,17 +4425,16 @@ describe("MCPServerManager", () => {
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
     // Revoke in the gap after the prompt refresh resolves but before the
-    // enablement check runs.
-    const originalEnsure = access.ensureWorkspaceServers.bind(manager);
-    let revokeAfterRefresh = true;
-    access.ensureWorkspaceServers = async (...args: unknown[]) => {
-      const result = await originalEnsure(...args);
-      if (revokeAfterRefresh) {
-        revokeAfterRefresh = false;
+    // enablement check runs: the secret re-resolution is the refresh
+    // bracket's last await (resolution 1 runs before it, resolution 2 after).
+    let resolutions = 0;
+    manager.setSecretsResolver(() => {
+      resolutions += 1;
+      if (resolutions === 2) {
         manager.applyProjectTrust([{ projectPath: PROJECT_PATH, trusted: false }]);
       }
-      return result;
-    };
+      return Promise.resolve({});
+    });
 
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(manager.getPrompt(workspaceId, "server", "review", {})).rejects.toThrow(
