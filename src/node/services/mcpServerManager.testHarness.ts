@@ -167,10 +167,17 @@ export class FakeMcpServers {
       crash: () => {
         if (exited) return;
         exited = true;
-        stdout.close();
+        try {
+          stdout.close();
+        } catch {
+          // The transport already cancelled stdout.
+        }
         exit(1);
       },
     };
+    // Like a real exec, a later abort kills the process: an abandoned (e.g.
+    // timed-out) generation must not stay live and satisfy crash().
+    options.abortSignal?.addEventListener("abort", () => process.crash(), { once: true });
     this.processes.push(process);
     const decoder = new TextDecoder();
     return {
