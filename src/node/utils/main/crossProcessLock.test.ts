@@ -6,12 +6,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 
-import { probeProcessBirth } from "@/node/utils/concurrency/fileLock";
+import {
+  probeProcessBirth,
+  setSelfIdentityForTesting,
+} from "@/node/utils/concurrency/processLiveness";
 import {
   acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
   guardPath,
-  setSelfIdentityForTesting,
 } from "./crossProcessLock";
 
 async function tempLockPath(): Promise<string> {

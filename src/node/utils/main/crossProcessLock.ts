@@ -1,11 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
-import { readFileSync, readlinkSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { probeProcessBirth } from "@/node/utils/concurrency/fileLock";
+import {
+  getSelfIdentity,
+  judgeHolder,
+  parseProcessIdentity,
+  type ProcessIdentity,
+  type Verdict,
+} from "@/node/utils/concurrency/processLiveness";
 
 /**
  * Cross-process advisory file lock.
@@ -71,85 +75,12 @@ export interface CrossProcessLockOptions {
 /** Thrown when the acquire budget elapses; the message names the blocking holder. */
 export class CrossProcessLockTimeoutError extends Error {}
 
-/**
- * Process identity recorded in v2 holder records. Linux: `birth` is the
- * /proc starttime and `bootId`/`pidNs` define the PID domain in which a pid
- * is meaningful. `machineId` and `platform` count only when both sides have
- * them and they DIFFER (a positively different domain; see judge()). `hostname` is diagnostic only (shown
- * in the timeout error): macOS hostnames change with networks, so refusing on
- * a mismatch would keep a crashed holder's lock refused forever.
- */
-interface ProcessIdentity {
-  birth: string | null;
-  bootId: string | null;
-  pidNs: string | null;
-  machineId: string | null;
-  platform: string | null;
-  hostname: string | null;
-}
-
 interface LockHolder {
   pid: number;
   token: string;
   acquiredAt: number;
   /** Absent on legacy (pre-#4415, v1) records. */
   identity?: ProcessIdentity;
-}
-
-function readTrimmed(file: string): string | null {
-  try {
-    const value = readFileSync(file, "utf-8").trim();
-    return value.length > 0 ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Only Linux starttime is comparable evidence here: other encodings (macOS
- * `ps -o lstart`) depend on the probing process's locale/timezone, so a
- * mismatch would not prove a different process. Uncached on purpose — a
- * cached birth of a previous pid incarnation would read as "birth differs".
- */
-function linuxBirth(pid: number): string | null {
-  const birth = probeProcessBirth(pid);
-  return birth?.startsWith("linux-ticks:") ? birth : null;
-}
-
-let selfIdentity: ProcessIdentity | undefined;
-
-function getSelfIdentity(): ProcessIdentity {
-  if (selfIdentity === undefined) {
-    const linux = process.platform === "linux";
-    let pidNs: string | null = null;
-    let hostname: string | null = null;
-    try {
-      pidNs = linux ? readlinkSync("/proc/self/ns/pid") : null;
-    } catch {
-      pidNs = null;
-    }
-    try {
-      hostname = os.hostname() || null;
-    } catch {
-      hostname = null;
-    }
-    selfIdentity = {
-      birth: linux ? linuxBirth(process.pid) : null,
-      bootId: linux ? readTrimmed("/proc/sys/kernel/random/boot_id") : null,
-      pidNs,
-      machineId: linux
-        ? (readTrimmed("/etc/machine-id") ?? readTrimmed("/var/lib/dbus/machine-id"))
-        : null,
-      platform: process.platform,
-      hostname,
-    };
-  }
-  return selfIdentity;
-}
-
-/** Test seam: judge records as if this process had `identity` (undefined restores the probe). */
-export function setSelfIdentityForTesting(identity: ProcessIdentity | undefined): void {
-  selfIdentity = identity;
 }
 
 function holderRecord(token: string): string {
@@ -210,20 +141,7 @@ function parseHolder(text: string): LockHolder | undefined {
   if (record.v !== 2) {
     return { pid, token, acquiredAt };
   }
-  const str = (value: unknown) => (typeof value === "string" && value.length > 0 ? value : null);
-  return {
-    pid,
-    token,
-    acquiredAt,
-    identity: {
-      birth: str(record.birth),
-      bootId: str(record.bootId),
-      pidNs: str(record.pidNs),
-      machineId: str(record.machineId),
-      platform: str(record.platform),
-      hostname: str(record.hostname),
-    },
-  };
+  return { pid, token, acquiredAt, identity: parseProcessIdentity(record) };
 }
 
 /** Read `file` once. The generation key is the token, or a digest of corrupt bytes. */
@@ -271,92 +189,19 @@ async function observe(file: string): Promise<Observation> {
  */
 const CORRUPT_LOCK_GRACE_MS = 2_000;
 
-type Verdict = { dead: true } | { dead: false; why: string };
-const DEAD: Verdict = { dead: true };
-const refuse = (why: string): Verdict => ({ dead: false, why });
-
-function pidGone(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    // EPERM = exists but owned by another user; only ESRCH proves absence.
-    return hasErrorCode(error, "ESRCH");
-  }
-}
-
 /**
- * Death proof for a lock or guard record. Anything not judged dead is live or
- * indeterminate and is never reclaimed; age never reclaims.
- *
- * DEPLOYMENT CONTRACT (user decision, #4415): every cooperating Xum process
- * sharing one XUM_ROOT runs in one PID domain; a replaced domain (restarted
- * or replaced container, rebooted host) is retired and cannot resume before
- * a new one accesses the root. Concurrent cross-domain sharing is
- * unsupported, not prevented.
- *
- * 1. A POSITIVELY different PID domain is retired by contract ⇒ dead:
- *    machine-ids both present and different; platforms both recorded and
- *    different; on Linux (both sides naming boot id and PID namespace) a
- *    different boot id or namespace. Hostname is diagnostic, not evidence.
- * 2. UNKNOWN domain evidence is not dead ⇒ refuse: a v2 record missing its
- *    boot id/namespace while we have ours, or naming one we cannot read.
- * 3. Same domain (proven on Linux): ESRCH or a different starttime ⇒ dead;
- *    a live pid (or EPERM) ⇒ refuse.
- * 3a. macOS/Windows (no qualified PID-domain identity) and legacy v1 records:
- *    ASSUMES the holder shares this host's PID domain (the contract). ESRCH ⇒
- *    dead; a live pid (or EPERM) ⇒ refuse.
- * 4. Same pid (in a domain that passed the checks above) is this process or a
- *    previous one that had our pid: live only while the token is registered
- *    in liveTokens. Legacy records cannot be ours, so a legacy record with
- *    our (live) pid is refused like any live pid.
+ * Death proof for a lock or guard record: corrupt content after its grace,
+ * otherwise the shared judgeHolder() (deployment contract and per-platform
+ * evidence rules live there). Anything not judged dead is never reclaimed.
  */
 function judge(observation: Generation): Verdict {
   if (observation.kind === "corrupt") {
     return Date.now() - observation.mtimeMs > CORRUPT_LOCK_GRACE_MS
-      ? DEAD
-      : refuse("its content is unparseable and was written moments ago");
+      ? { dead: true }
+      : { dead: false, why: "its content is unparseable and was written moments ago" };
   }
-  const { pid, token, identity: record } = observation.holder;
-  if (record === undefined) {
-    return pidGone(pid)
-      ? DEAD
-      : refuse("it was written by an older Xum build and that pid is running");
-  }
-  const self = getSelfIdentity();
-  const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
-  // Positively different PID domain: retired by the deployment contract.
-  if (differs(record.platform, self.platform) || differs(record.machineId, self.machineId)) {
-    return DEAD;
-  }
-  const linuxDomain = self.bootId !== null && self.pidNs !== null;
-  if (linuxDomain) {
-    if (record.bootId === null || record.pidNs === null) {
-      return refuse("its boot or PID namespace is unknown");
-    }
-    if (record.bootId !== self.bootId || record.pidNs !== self.pidNs) {
-      return DEAD;
-    }
-  } else if (record.bootId !== null || record.pidNs !== null) {
-    return refuse("it names a PID domain this process cannot verify");
-  }
-  if (pid === process.pid) {
-    return liveTokens.has(token) ? refuse("it is held by this process") : DEAD;
-  }
-  if (pidGone(pid)) {
-    return DEAD;
-  }
-  if (!linuxDomain) {
-    return refuse("that pid is running");
-  }
-  if (record.birth === null) {
-    return refuse("its process start time is unknown");
-  }
-  const current = linuxBirth(pid);
-  if (current === null) {
-    return refuse("its process start time cannot be read");
-  }
-  return current === record.birth ? refuse("that process is running") : DEAD;
+  const { holder } = observation;
+  return judgeHolder(holder, liveTokens.has(holder.token));
 }
 
 /** Why an attempt did not get the lock; reported by the timeout error. */

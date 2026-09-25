@@ -8,11 +8,13 @@
  *   EEXIST when held), so a reader can never observe a token-less lock.
  * - Waiting is a bounded jittered poll — there is no portable cross-process
  *   wake primitive available here.
- * - Crash remnants are reclaimed when the recorded owner is provably gone:
- *   its pid is dead, OR the pid is alive but belongs to a DIFFERENT process
- *   (PID reuse, detected via a process-birth identity recorded in the
- *   token), OR staleness cannot be proven either way and the lock's mtime
- *   exceeds a generous lease.
+ * - Crash remnants are reclaimed only when the recorded owner is judged dead
+ *   by the shared rule in processLiveness.ts (#4415): its pid is gone or
+ *   reused in this PID domain, or it belongs to a positively different
+ *   (retired) PID domain under the single-PID-domain deployment contract. A
+ *   live or indeterminate owner is never reclaimed, however old the lock —
+ *   there is no lease fallback for a live pid. Only a malformed token (no
+ *   owner to judge) still ages out after the lease.
  * - Reclamation itself is serialized by a guard lockfile and verifies before
  *   displacing: under the guard the canonical token is re-read and must
  *   still equal the judged-stale token, so a lock released-and-reacquired
@@ -20,59 +22,53 @@
  *   concurrent reclaimers + a fresh acquirer could otherwise put two
  *   processes inside the protected section). Claim-by-rename then moves the
  *   verified-stale token aside; a post-rename mismatch (fresh owner
- *   displaced despite everything — possible only via the owner's own
- *   release inside the microsecond re-read→rename window of a lease-judged
- *   lock) restores it via link, and a failed restoration PRESERVES the
+ *   displaced despite everything — possible only via the stale-guard
+ *   double-remove residual below, or an older build's lease-based reclaim)
+ *   restores it via link, and a failed restoration PRESERVES the
  *   displaced record instead of destroying the owner's only evidence.
  * - Release is ownership-verified: a mismatched token means the lock was
  *   reclaimed and re-acquired by someone else; leave it alone.
  *
- * Invariant: at most one process can believe it owns the lock. On
- * birth-capable platforms (Linux/macOS) this holds outright: a live holder
+ * Invariant: at most one process can believe it owns the lock. A live holder
  * is never judged stale, and any canonical-token change between judgment
- * and displacement aborts the reclaim. On birth-less platforms live holders
- * renew the lease while held (r59), so lease expiry implies a crashed or
- * frozen owner rather than a slow one; the lease-judged residual window
- * (owner releasing exactly between the guarded re-read and the rename after
- * an event-loop freeze outlasting the lease) remains theoretically possible,
- * so holders also expose `assertStillOwned` for critical sections to
- * re-verify ownership immediately before irreversible mutations (mirrors the
- * rollback lock's commit-point doctrine in refinementRollback.ts).
+ * and displacement aborts the reclaim. Holders still expose
+ * `assertStillOwned` for critical sections to re-verify ownership
+ * immediately before irreversible mutations (mirrors the rollback lock's
+ * commit-point doctrine in refinementRollback.ts) — it also catches older
+ * builds, which still lease-break holders whose birth they cannot prove.
  */
 
 import assert from "node:assert";
-import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import { readFileSync } from "node:fs";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { log } from "@/node/services/log";
+import {
+  getSelfIdentity,
+  judgeHolder,
+  parseProcessIdentity,
+  probeProcessBirth,
+  type HolderEvidence,
+} from "@/node/utils/concurrency/processLiveness";
 
 /** Poll interval while another live process holds the lock. */
 const FILE_LOCK_RETRY_MS = 10;
 
 /**
- * Lease for locks whose staleness cannot be proven via pid + birth identity
- * (platforms without a birth probe, or pre-birth-format tokens). Most
- * legitimate holds are ms (appends) to seconds (blob-lock recovery sweeps),
- * and holds that CAN stall longer (target mutation locks wedged in slow
- * filesystem I/O) stay safe because live holders renew the lease below —
- * so an expired lease means the owner crashed or froze, never that it is
- * merely slow (r59). Recovery from PID reuse on birth-less platforms is
- * thus bounded by this lease instead of requiring manual lockfile cleanup.
+ * Age after which a MALFORMED token (no pid to judge) is reclaimed. Tokens
+ * are published atomically-with-content, so malformed content has no live
+ * writer. Never applied to a well-formed token (#4415): a live pid is never
+ * lease-broken, whatever its birth evidence. Older builds still apply this
+ * lease to live holders whose birth they cannot prove, which is why holders
+ * keep renewing below.
  */
 const FILE_LOCK_LEASE_MS = 5 * 60_000;
 
 /**
  * How often a live holder refreshes the lockfile mtime while holding the
- * lock (r59). Lease-based staleness is the ONLY reclaim guard on birth-less
- * platforms (e.g. Windows without a usable `ps`), so without renewal a live
- * holder whose critical section stalls past the lease — a target mutation
- * wedged in filesystem I/O — was judged stale and displaced, letting a
- * competing backend double-enter the same protected section. Renewal is
- * event-loop driven: async-I/O stalls keep renewing (the holder is alive and
- * will commit), while a crashed or frozen process stops and its lease
- * expires as before.
+ * lock (r59). This build never lease-breaks a live holder; renewal remains
+ * so builds predating #4415, which lease-break holders whose birth they
+ * cannot prove (e.g. Windows), never age out a healthy one.
  */
 const FILE_LOCK_RENEW_INTERVAL_MS = FILE_LOCK_LEASE_MS / 4;
 
@@ -113,28 +109,28 @@ export interface ProcessFileLock extends AsyncDisposable {
   assertStillOwned(): Promise<void>;
 }
 
-/** Build a `pid:nonce[:birthHex]` ownership token for lock/guard files. */
+/**
+ * Tokens this process may still write (lock or reclaim guard): registered
+ * before publication, retired after release or a failed acquisition. A
+ * token with our pid that is not registered here can never be written
+ * again (a leak, or a previous process with our pid) and is reclaimable.
+ */
+const liveTokens = new Set<string>();
+
+/**
+ * Build a `pid:nonce:birthHex:identityHex` ownership token for lock/guard
+ * files (hex-encoded: ps-derived birth strings contain spaces and colons).
+ * Older readers use only parts 0 and 2, so the identity segment (#4415) is
+ * additive; an empty birth segment reads as "no birth" to them.
+ */
 function makeOwnershipToken(): { token: string; nonce: string } {
   const nonce = crypto.randomBytes(8).toString("hex");
-  // Record our birth identity so a future reclaimer can distinguish "this
-  // pid is alive" from "this pid now belongs to someone else" (hex-encoded:
-  // ps-derived birth strings contain spaces and colons).
   const ownBirth = getProcessBirth(process.pid);
-  const token =
-    ownBirth === null
-      ? `${process.pid}:${nonce}`
-      : `${process.pid}:${nonce}:${Buffer.from(ownBirth).toString("hex")}`;
+  const birthHex = ownBirth === null ? "" : Buffer.from(ownBirth).toString("hex");
+  const identityHex = Buffer.from(JSON.stringify(getSelfIdentity())).toString("hex");
+  const token = `${process.pid}:${nonce}:${birthHex}:${identityHex}`;
+  liveTokens.add(token);
   return { token, nonce };
-}
-
-/** True when a signal-0 probe reaches the pid (EPERM = alive, not ours). */
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
 }
 
 /**
@@ -169,49 +165,51 @@ export function getProcessBirth(pid: number): string | null {
 }
 
 /**
- * Uncached probe behind getProcessBirth. Exported for crossProcessLock, which
- * must never compare against a cached birth of a previous pid incarnation.
+ * Parsed lock token, or null when malformed. The COMPLETE shape is checked,
+ * not just a numeric prefix: content that merely starts with a live pid
+ * ("1234", "1234:", "1234garbage") is corruption, not holder evidence, and
+ * must take the malformed-token lease path instead of being refused forever.
+ * Accepted shapes (everything this and previous builds write):
+ * - legacy `pid:nonce` and `pid:nonce:birthHex` (pre-#4415);
+ * - `pid:nonce:birthHex:identityHex`, birthHex possibly empty, identityHex
+ *   decoding to a JSON object (#4415).
  */
-export function probeProcessBirth(pid: number): string | null {
-  // Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot) is
-  // unique per pid incarnation. The comm field can embed spaces/parens, so
-  // fields are parsed after the LAST ')' where the format is well-defined
-  // (state is field 3 → starttime is offset 19).
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-    const rest = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const starttime = rest[19];
-    if (starttime !== undefined && /^\d+$/.test(starttime)) {
-      return `linux-ticks:${starttime}`;
-    }
-  } catch {
-    // Not Linux (or the process vanished); try the portable fallback.
+function parseLockToken(raw: string): HolderEvidence | null {
+  const parts = raw.split(":");
+  const [pidText, nonce, birthHex, identityHex] = parts;
+  const hex = /^(?:[0-9a-f]{2})+$/;
+  if (
+    parts.length < 2 ||
+    parts.length > 4 ||
+    !/^[1-9][0-9]*$/.test(pidText) ||
+    !/^[A-Za-z0-9_-]+$/.test(nonce) ||
+    (birthHex !== undefined && birthHex !== "" && !hex.test(birthHex)) ||
+    // A legacy 3-segment token was only ever written with a birth.
+    (parts.length === 3 && birthHex === "")
+  ) {
+    return null;
   }
-  // macOS/BSD: full start timestamp, stable per process incarnation.
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid)) {
+    return null;
+  }
+  const decode = (value: string | undefined) =>
+    value === undefined || value === "" ? null : Buffer.from(value, "hex").toString("utf-8");
+  if (identityHex === undefined) {
+    return { pid, legacyBirth: decode(birthHex) };
+  }
+  if (!hex.test(identityHex)) {
+    return null;
+  }
   try {
-    const out = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8" });
-    const line = out.stdout?.trim();
-    if (out.status === 0 && line !== undefined && line.length > 0) {
-      return `ps-lstart:${line}`;
+    const parsed = JSON.parse(decode(identityHex) ?? "") as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { pid, identity: parseProcessIdentity(parsed as Record<string, unknown>) };
     }
   } catch {
-    // ps unavailable (e.g. Windows): undeterminable, lease policy governs.
+    // Unparseable identity segment: malformed.
   }
   return null;
-}
-
-/** Parsed lock token. Legacy `pid:nonce` tokens have no birth (null). */
-function parseLockToken(raw: string): { pid: number | null; birth: string | null } {
-  const parts = raw.split(":");
-  const pid = Number.parseInt(parts[0], 10);
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
-    return { pid: null, birth: null };
-  }
-  const birthHex = parts[2];
-  if (birthHex === undefined || !/^[0-9a-f]+$/.test(birthHex)) {
-    return { pid, birth: null };
-  }
-  return { pid, birth: Buffer.from(birthHex, "hex").toString("utf-8") };
 }
 
 export async function acquireProcessFileLock(
@@ -223,15 +221,17 @@ export async function acquireProcessFileLock(
   const { token, nonce } = makeOwnershipToken();
   const tempPath = `${lockPath}.tmp-${process.pid}-${nonce}`;
   const deadline = Date.now() + timeoutMs;
-  await fs.mkdir(path.dirname(lockPath), { recursive: true });
-  await fs.writeFile(tempPath, token, "utf-8");
+  let acquired = false;
   try {
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    await fs.writeFile(tempPath, token, "utf-8");
     for (;;) {
       try {
         await fs.link(tempPath, lockPath);
+        acquired = true;
         // Lease renewal (r59, see FILE_LOCK_RENEW_INTERVAL_MS): keep a live
-        // holder's mtime fresh so birth-less-platform reclaim can never
-        // displace it mid-critical-section. unref'd — a held lock must not
+        // holder's mtime fresh so an older build's lease-based reclaim never
+        // displaces it mid-critical-section. unref'd — a held lock must not
         // keep the process alive; renewal only matters while real work
         // (which itself keeps the loop alive) is still running.
         const renewIntervalMs = options.renewIntervalMs ?? FILE_LOCK_RENEW_INTERVAL_MS;
@@ -254,6 +254,7 @@ export async function acquireProcessFileLock(
             clearInterval(renewTimer);
             if (renewInFlight !== null) await renewInFlight;
             await releaseFileLock(lockPath, token, label);
+            liveTokens.delete(token); // After release's last possible write.
           },
         };
       } catch (error) {
@@ -270,14 +271,16 @@ export async function acquireProcessFileLock(
       );
     }
   } finally {
+    if (!acquired) {
+      liveTokens.delete(token);
+    }
     await fs.unlink(tempPath).catch(() => undefined);
   }
 }
 
 /**
- * One lease-renewal tick (r59): refresh the held lock's mtime so the lease —
- * the only staleness guard on birth-less platforms — never expires under a
- * live holder. Only the current owner renews (token re-verified first); the
+ * One lease-renewal tick (r59): refresh the held lock's mtime so an older
+ * build's lease never expires under a live holder. Only the current owner renews (token re-verified first); the
  * residual read→utimes race can only refresh a successor's fresh lease,
  * never displace anyone. Never throws: a failed renewal degrades to the
  * pre-renewal exposure, still bounded by commit-point assertStillOwned.
@@ -315,26 +318,16 @@ async function assertLockOwned(lockPath: string, token: string, label: string): 
 }
 
 /**
- * True when the lock is provably or presumptively stale (see module doc):
- * dead pid; live pid with a mismatched birth identity (PID reuse); or
- * undeterminable liveness past the lease. A live pid whose birth VERIFIABLY
- * matches the token is never stale, regardless of age — displacing a live
- * holder risks double-entry, which no lease can justify.
+ * True when the lock's owner is judged dead by the shared rule (see
+ * processLiveness.judgeHolder). A live or indeterminate owner is never
+ * stale, regardless of age. Only a malformed token falls back to the lease.
  */
 async function isLockStale(lockPath: string, observed: string): Promise<boolean> {
-  const { pid, birth } = parseLockToken(observed);
-  if (pid === null) {
-    // Malformed token: no owner to probe; only the lease bounds it.
+  const holder = parseLockToken(observed);
+  if (holder === null) {
     return await lockLeaseExpired(lockPath);
   }
-  if (!isPidAlive(pid)) {
-    return true;
-  }
-  const currentBirth = getProcessBirth(pid);
-  if (birth !== null && currentBirth !== null) {
-    return currentBirth !== birth;
-  }
-  return await lockLeaseExpired(lockPath);
+  return judgeHolder(holder, liveTokens.has(observed)).dead;
 }
 
 /** True when the lockfile's mtime is older than the stale-lock lease. */
@@ -353,8 +346,8 @@ async function lockLeaseExpired(lockPath: string): Promise<boolean> {
  * forbidden interleaving — reclaimer 1 removes the stale token, a fresh
  * owner acquires, and reclaimer 2 (still acting on its pre-removal read)
  * renames the fresh lock aside. When the guard is busy, `fn` is skipped and
- * the caller's poll loop retries; a crash-remnant guard (stale by the same
- * pid/birth/lease policy as locks) is unlinked so it cannot deadlock
+ * the caller's poll loop retries; a crash-remnant guard (dead by the same
+ * judgment as locks) is unlinked so it cannot deadlock
  * reclamation. The unconditional unlink of a stale guard has its own
  * theoretical double-remove window (plain POSIX cannot compare-and-unlink);
  * the verify-before-displace re-read in reclaimStaleFileLock and holders'
@@ -389,6 +382,7 @@ async function withReclaimGuard(
       await releaseFileLock(guardPath, token, `${label} reclaim guard`);
     }
   } finally {
+    liveTokens.delete(token);
     await fs.unlink(tempPath).catch(() => undefined);
   }
 }
@@ -428,9 +422,9 @@ async function reclaimStaleFileLock(
     }
     const claimed = await fs.readFile(graveyard, "utf-8").catch(() => null);
     if (claimed !== null && claimed !== observed) {
-      // Despite the guard and the re-read, a lease-judged owner released and
-      // a fresh holder re-acquired inside the re-read→rename window: restore
-      // the displaced owner's lock.
+      // Despite the guard and the re-read, a fresh holder acquired inside the
+      // re-read→rename window (see the module doc's residuals): restore the
+      // displaced owner's lock.
       if (testOnlySeam !== undefined) {
         await testOnlySeam("pre-restore");
       }
