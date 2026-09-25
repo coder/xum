@@ -408,8 +408,11 @@ describe("refinementRollback", () => {
 
     // Simulate another process's in-flight rollback: our own PID is live, so
     // the lock must never be broken and the call must fail with a clear error.
+    // Tokens use the `pid:nonce` shape; a bare pid is malformed (#4464) and
+    // would only be refused while young, not because its owner is live.
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-    await fsPromises.writeFile(lockPath, String(process.pid), { encoding: "utf-8", flag: "wx" });
+    const liveToken = `${process.pid}:inflight`;
+    await fsPromises.writeFile(lockPath, liveToken, { encoding: "utf-8", flag: "wx" });
 
     const refused = await rollbackRefinement({
       sessionDir: fixture.sessionDir,
@@ -420,7 +423,7 @@ describe("refinementRollback", () => {
     if (refused.success) throw new Error("unreachable");
     expect(refused.error).toContain("Another rollback is in progress");
     // The live owner's lockfile survives the refusal.
-    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(String(process.pid));
+    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(liveToken);
 
     await fsPromises.unlink(lockPath);
     const retried = await rollbackRefinement({
@@ -442,7 +445,8 @@ describe("refinementRollback", () => {
     const child = spawnSync(process.execPath, ["--version"]);
     expect(child.pid).toBeGreaterThan(0);
     const lockPath = path.join(fixture.sessionDir, "refinement-rollback.lock");
-    await fsPromises.writeFile(lockPath, String(child.pid), { encoding: "utf-8", flag: "wx" });
+    // `pid:nonce` shape: a bare pid is malformed (#4464) and takes the lease path.
+    await fsPromises.writeFile(lockPath, `${child.pid}:crashed`, { encoding: "utf-8", flag: "wx" });
 
     const result = await rollbackRefinement({
       sessionDir: fixture.sessionDir,

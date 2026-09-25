@@ -117,6 +117,50 @@ describe("acquireProcessFileLock", () => {
     await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
   });
 
+  test("content that merely starts with a live pid is malformed: it ages out after the lease", async () => {
+    // Codex P2 on #4464: a numeric-prefix parse read these as legacy holder
+    // evidence, so a live unrelated pid refused the lock forever.
+    const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
+      stdio: "ignore",
+    });
+    const livePid = other.pid!;
+    try {
+      for (const content of [
+        `${livePid}`,
+        `${livePid}:`,
+        `${livePid}garbage`,
+        `${livePid}:nonce:nothex`,
+        `${livePid}:nonce:`,
+        `${livePid}:nonce::${Buffer.from("[1]").toString("hex")}`,
+        `${livePid}:nonce:ab:cd:ef`,
+      ]) {
+        using tmp = new DisposableTempDir("file-lock-test");
+        const lockPath = path.join(tmp.path, "x.lock");
+        await fs.writeFile(lockPath, content, "utf-8");
+        const ancient = new Date(Date.now() - 60 * 60 * 1000);
+        await fs.utimes(lockPath, ancient, ancient);
+        await (
+          await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" })
+        )[Symbol.asyncDispose]();
+      }
+      // Well-formed tokens naming the same live pid are still refused, however old.
+      for (const content of [
+        `${livePid}:cafe`,
+        `${livePid}:cafe:${Buffer.from(probeProcessBirth(livePid) ?? "x").toString("hex")}`,
+        v2Token(livePid, "cafe", { birth: probeProcessBirth(livePid) }),
+      ]) {
+        using tmp = new DisposableTempDir("file-lock-test");
+        const lockPath = path.join(tmp.path, "x.lock");
+        await fs.writeFile(lockPath, content, "utf-8");
+        const ancient = new Date(Date.now() - 60 * 60 * 1000);
+        await fs.utimes(lockPath, ancient, ancient);
+        await expectTimeout(lockPath);
+      }
+    } finally {
+      other.kill("SIGKILL");
+    }
+  });
+
   test("writes an additive identity segment older readers ignore", async () => {
     using tmp = new DisposableTempDir("file-lock-test");
     const lockPath = path.join(tmp.path, "x.lock");

@@ -164,27 +164,52 @@ export function getProcessBirth(pid: number): string | null {
   return birth;
 }
 
-/** Parsed lock token (null when malformed). Pre-#4415 tokens carry no identity. */
+/**
+ * Parsed lock token, or null when malformed. The COMPLETE shape is checked,
+ * not just a numeric prefix: content that merely starts with a live pid
+ * ("1234", "1234:", "1234garbage") is corruption, not holder evidence, and
+ * must take the malformed-token lease path instead of being refused forever.
+ * Accepted shapes (everything this and previous builds write):
+ * - legacy `pid:nonce` and `pid:nonce:birthHex` (pre-#4415);
+ * - `pid:nonce:birthHex:identityHex`, birthHex possibly empty, identityHex
+ *   decoding to a JSON object (#4415).
+ */
 function parseLockToken(raw: string): HolderEvidence | null {
   const parts = raw.split(":");
-  const pid = Number.parseInt(parts[0], 10);
-  if (!Number.isSafeInteger(pid) || pid <= 0) {
+  const [pidText, nonce, birthHex, identityHex] = parts;
+  const hex = /^(?:[0-9a-f]{2})+$/;
+  if (
+    parts.length < 2 ||
+    parts.length > 4 ||
+    !/^[1-9][0-9]*$/.test(pidText) ||
+    !/^[A-Za-z0-9_-]+$/.test(nonce) ||
+    (birthHex !== undefined && birthHex !== "" && !hex.test(birthHex)) ||
+    // A legacy 3-segment token was only ever written with a birth.
+    (parts.length === 3 && birthHex === "")
+  ) {
     return null;
   }
-  const decode = (hex: string | undefined) =>
-    hex !== undefined && /^[0-9a-f]+$/.test(hex) ? Buffer.from(hex, "hex").toString("utf-8") : null;
-  const identityJson = decode(parts[3]);
-  if (identityJson !== null) {
-    try {
-      const parsed = JSON.parse(identityJson) as unknown;
-      if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-        return { pid, identity: parseProcessIdentity(parsed as Record<string, unknown>) };
-      }
-    } catch {
-      // Unparseable identity: judged as a legacy token below.
-    }
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid)) {
+    return null;
   }
-  return { pid, legacyBirth: decode(parts[2]) };
+  const decode = (value: string | undefined) =>
+    value === undefined || value === "" ? null : Buffer.from(value, "hex").toString("utf-8");
+  if (identityHex === undefined) {
+    return { pid, legacyBirth: decode(birthHex) };
+  }
+  if (!hex.test(identityHex)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(decode(identityHex) ?? "") as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { pid, identity: parseProcessIdentity(parsed as Record<string, unknown>) };
+    }
+  } catch {
+    // Unparseable identity segment: malformed.
+  }
+  return null;
 }
 
 export async function acquireProcessFileLock(
