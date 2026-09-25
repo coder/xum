@@ -1655,6 +1655,35 @@ describe("WorkspaceStore", () => {
       expect(replaced).toBe(true);
     });
 
+    /**
+     * Leave live advisor output from a first (history-less) attempt, then end it so the
+     * retry is a full replay. The output is cleared only by resetChatStateForReplay, so
+     * its absence proves the reset ran.
+     */
+    const runFullReplayReset = async (workspaceId: string) => {
+      const endFirstAttempt = createReleaseGate();
+      const subscriptions = mockChatReconnectScript((attempt, signal) =>
+        attempt === 1
+          ? [
+              caughtUpEvent(),
+              Promise.resolve(),
+              advisorOutputEvent(workspaceId, "call-replay-probe", "partial advice", 1),
+              endFirstAttempt.wait,
+            ]
+          : [() => waitForAbortSignal(signal)]
+      );
+      expect(
+        await waitUntil(
+          () => store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe") !== null
+        )
+      ).toBe(true);
+      endFirstAttempt.release();
+      expect(await waitUntil(() => subscriptions() === 2)).toBe(true);
+      await tick(0);
+      expect(store.getAdvisorToolLiveOutput(workspaceId, "call-replay-probe")).toBeNull();
+      mockChatScript([], { keepOpen: true });
+    };
+
     it("carries a creation card without marking a pending stream", async () => {
       const workspaceId = "workspace-goal-creation-card";
 
@@ -1666,10 +1695,7 @@ describe("WorkspaceStore", () => {
         hookPath: "/project",
         timestamp: 1,
       });
-      // The subscription opens asynchronously; with no cached history it is a full
-      // replay, which resets chat state after the card was carried.
-      expect(await waitUntil(() => mockOnChat.mock.calls.length > 0)).toBe(true);
-      await tick(0);
+      await runFullReplayReset(workspaceId);
 
       const state = store.getWorkspaceState(workspaceId);
       expect(state.isStreamStarting).toBe(false);
@@ -1711,10 +1737,7 @@ describe("WorkspaceStore", () => {
 
       createAndAddWorkspace(store, workspaceId);
       store.markPendingInitialSend(workspaceId, requestedModel);
-
-      // The subscription's full replay (no cached history) resets chat state.
-      expect(await waitUntil(() => mockOnChat.mock.calls.length > 0)).toBe(true);
-      await tick(0);
+      await runFullReplayReset(workspaceId);
 
       const state = store.getWorkspaceState(workspaceId);
       expect(state.isStreamStarting).toBe(true);
