@@ -3137,76 +3137,85 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() =>
       Promise.resolve({ flaky: { transport: "stdio" as const, command, disabled: false } })
     );
-    const startServersMock = mock(() =>
-      Promise.resolve(
-        startResult([], { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] })
-      )
-    );
-    access.startServers = startServersMock;
+    servers.serve("cmd-1", { hang: true });
     const request = workspaceRequest(workspaceId);
-    const base = Date.now();
-    setSystemTime(new Date(base));
-    try {
-      // The initial startup timeout is the first failure: serves inside the
-      // base window (one startup timeout) do not pay a second timeout.
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(1);
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(1);
-      setSystemTime(new Date(base + 59_999));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(1);
-      setSystemTime(new Date(base + 60_000));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(2);
 
-      // One retry timeout: the window doubles.
-      setSystemTime(new Date(base + 60_000 + 119_999));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(2);
-      setSystemTime(new Date(base + 60_000 + 120_000));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(3);
+    // The initial startup timeout is the first failure: serves inside the
+    // base window (one startup timeout) do not pay a second timeout.
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    const firstTimeoutAt = Date.now();
+    expect(servers.connectCount("cmd-1")).toBe(1);
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("cmd-1")).toBe(1);
+    setSystemTime(new Date(firstTimeoutAt + 59_999));
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("cmd-1")).toBe(1);
+    setSystemTime(new Date(firstTimeoutAt + 60_000));
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    expect(servers.connectCount("cmd-1")).toBe(2);
 
-      // A config change restarts the server and clears its backoff, so the
-      // schedule restarts from the base window.
-      command = "cmd-2";
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(4);
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(4);
-      setSystemTime(new Date(base + 60_000 + 120_000 + 60_000));
-      await manager.getToolsForWorkspace(request);
-      expect(startServersMock).toHaveBeenCalledTimes(5);
-    } finally {
-      setSystemTime();
-    }
+    // One retry timeout: the window doubles.
+    const secondTimeoutAt = Date.now();
+    setSystemTime(new Date(secondTimeoutAt + 119_999));
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("cmd-1")).toBe(2);
+    setSystemTime(new Date(secondTimeoutAt + 120_000));
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    expect(servers.connectCount("cmd-1")).toBe(3);
+
+    // A config change restarts the server and clears its backoff, so the
+    // schedule restarts from the base window.
+    command = "cmd-2";
+    servers.serve("cmd-2", { hang: true });
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    expect(servers.connectCount("cmd-2")).toBe(1);
+    const restartTimeoutAt = Date.now();
+    await manager.getToolsForWorkspace(request);
+    expect(servers.connectCount("cmd-2")).toBe(1);
+    setSystemTime(new Date(restartTimeoutAt + 60_000));
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request));
+    expect(servers.connectCount("cmd-2")).toBe(2);
+    expect(servers.connectCount("cmd-1")).toBe(3);
   });
 
   test("timed-out retry backoff is measured from the attempt's own completion, not the batch's", async () => {
     const workspaceId = "ws-timeout-retry-attempt-time";
-    configService.listServers = mock(() => Promise.resolve({ flaky: stdioConfig("cmd") }));
-    const base = Date.now();
-    // A first-wave timeout finished 45 s before the batch settled (later
-    // waves were still running), so its window is already 45 s in.
-    const startServersMock = mock(() =>
+    // Four hanging servers fill every startup slot, so "slow" starts only
+    // after their first-wave timeouts and settles the batch 45 s later.
+    const hanging = ["flaky-1", "flaky-2", "flaky-3", "flaky-4"];
+    configService.listServers = mock(() =>
       Promise.resolve({
-        ...startResult([], { failedServerNames: ["flaky"], timedOutServerNames: ["flaky"] }),
-        timedOutAtMs: new Map([["flaky", base - 45_000]]),
+        ...Object.fromEntries(hanging.map((name) => [name, stdioConfig(name)])),
+        slow: stdioConfig("cmd-slow"),
       })
     );
-    access.startServers = startServersMock;
+    for (const name of hanging) servers.serve(name, { hang: true });
+    let slowStartedAt = 0;
+    servers.serve("cmd-slow", {
+      connect: () => {
+        slowStartedAt = Date.now();
+        setSystemTime(new Date(slowStartedAt + 45_000));
+        return Promise.resolve();
+      },
+    });
     const request = workspaceRequest(workspaceId);
-    setSystemTime(new Date(base));
-    await manager.getToolsForWorkspace(request);
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    const startedAt = Date.now();
+    await servers.expireStartupDeadline(() => manager.getToolsForWorkspace(request), 4);
+    const settledAt = Date.now();
+    // The fixture shape itself: the timeouts finished a wave before the batch.
+    expect(slowStartedAt - startedAt).toBeGreaterThanOrEqual(MCP_STARTUP_TIMEOUT_MS);
+    expect(settledAt).toBe(slowStartedAt + 45_000);
 
-    setSystemTime(new Date(base + 14_999));
+    // Their first window ends one startup timeout after they timed out,
+    // 15 s after the batch settled.
+    for (const name of hanging) servers.serve(name);
+    setSystemTime(new Date(settledAt + 14_999));
     await manager.getToolsForWorkspace(request);
-    expect(startServersMock).toHaveBeenCalledTimes(1);
-    setSystemTime(new Date(base + 15_000));
+    expect(servers.connectCount("flaky-1")).toBe(0);
+    setSystemTime(new Date(settledAt + 15_000));
     await manager.getToolsForWorkspace(request);
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    for (const name of hanging) expect(servers.connectCount(name)).toBe(1);
+    expect(servers.connectCount("cmd-slow")).toBe(1);
   });
 
   test("a closed companion's full restart keeps a backed-off server on its schedule", async () => {
@@ -3277,30 +3286,17 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() =>
       Promise.resolve({ legacy: stdioConfig("cmd-legacy"), modern: stdioConfig("cmd-modern") })
     );
-    const legacy = testInstance("legacy");
-    let legacyFetches = 0;
-    const legacyRefresh = mock(() => {
-      legacyFetches += 1;
-      return Promise.resolve([{ name: `legacy-v${legacyFetches}` }]);
-    });
-    (legacy as { refreshPrompts?: typeof legacyRefresh }).refreshPrompts = legacyRefresh;
-    const modern = testInstance("modern", { refreshTools: mock(() => Promise.resolve()) });
-    let modernFetches = 0;
-    const modernRefresh = mock(() => {
-      modernFetches += 1;
-      return Promise.resolve([{ name: `modern-v${modernFetches}` }]);
-    });
-    (modern as { refreshPrompts?: typeof modernRefresh }).refreshPrompts = modernRefresh;
-    access.startServers = mock(() =>
-      Promise.resolve({
-        instances: new Map([
-          ["legacy", legacy],
-          ["modern", modern],
-        ]),
-        failedServerNames: [],
-        timedOutServerNames: [],
-      })
-    );
+    const promptLister = (label: string) => {
+      let fetches = 0;
+      return mock(() => {
+        fetches += 1;
+        return Promise.resolve([{ name: `${label}-v${fetches}` }]);
+      });
+    };
+    const legacyPrompts = promptLister("legacy");
+    const modernPrompts = promptLister("modern");
+    servers.serve("cmd-legacy", { era: "legacy", listPrompts: legacyPrompts });
+    servers.serve("cmd-modern", { era: "modern", listPrompts: modernPrompts });
 
     const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
@@ -3308,8 +3304,8 @@ describe("MCPServerManager", () => {
     await Bun.sleep(0);
     const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    expect(legacyRefresh).toHaveBeenCalledTimes(3);
-    expect(modernRefresh).toHaveBeenCalledTimes(3);
+    expect(legacyPrompts).toHaveBeenCalledTimes(3);
+    expect(modernPrompts).toHaveBeenCalledTimes(3);
     expect(first.promptDescriptors.map((descriptor) => descriptor.promptName).sort()).toEqual([
       "legacy-v1",
       "modern-v1",
@@ -3329,7 +3325,7 @@ describe("MCPServerManager", () => {
     configService.listServers = mock(() => Promise.resolve({ coder: stdioConfig("cmd") }));
     let calls = 0;
     let resolveStale!: (prompts: Array<{ name: string }>) => void;
-    const refreshPrompts = mock(() => {
+    const listPrompts = mock(() => {
       calls += 1;
       // Call 1 seeds the cache, call 2 is held stale, and call 3 wins through
       // direct discovery. Later calls hang.
@@ -3341,7 +3337,7 @@ describe("MCPServerManager", () => {
       if (calls === 3) return Promise.resolve([{ name: "newer" }]);
       return new Promise<Array<{ name: string }>>(() => undefined);
     });
-    access.startServers = mock(() => Promise.resolve(startResult([["coder", { refreshPrompts }]])));
+    servers.serve("cmd", { listPrompts });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
@@ -3358,22 +3354,12 @@ describe("MCPServerManager", () => {
   test("getToolsForWorkspace does not block sends on a hung prompt refresh", async () => {
     const workspaceId = "ws-hung-prompt-refresh";
     configService.listServers = mock(() => Promise.resolve({ hung: stdioConfig("cmd") }));
-    const hung = testInstance("hung", { prompts: [{ name: "cached" }] });
-    let refreshCalls = 0;
-    const neverSettles = mock(() => {
-      refreshCalls += 1;
-      return refreshCalls === 1
+    const neverSettles = mock(() =>
+      neverSettles.mock.calls.length === 1
         ? Promise.resolve([{ name: "cached" }])
-        : new Promise<Array<{ name: string }>>(() => undefined);
-    });
-    (hung as { refreshPrompts?: typeof neverSettles }).refreshPrompts = neverSettles;
-    access.startServers = mock(() =>
-      Promise.resolve({
-        instances: new Map([["hung", hung]]),
-        failedServerNames: [],
-        timedOutServerNames: [],
-      })
+        : new Promise<Array<{ name: string }>>(() => undefined)
     );
+    servers.serve("cmd", { listPrompts: neverSettles });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
@@ -3381,7 +3367,7 @@ describe("MCPServerManager", () => {
 
     expect(second.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["cached"]);
     expect(third.promptDescriptors.map((descriptor) => descriptor.promptName)).toEqual(["cached"]);
-    expect(refreshCalls).toBe(2);
+    expect(neverSettles).toHaveBeenCalledTimes(2);
   });
 
   test("getToolsForWorkspace retries timed-out servers from cached workspace state", async () => {
@@ -3392,29 +3378,12 @@ describe("MCPServerManager", () => {
         serverB: stdioConfig("cmd-b"),
       })
     );
+    servers.serve("cmd-a", { tools: { toolA: testTool() } });
+    servers.serve("cmd-b", { hang: true });
 
-    const toolA = testTool();
-    const toolB = testTool();
-
-    const startServersMock = mock((servers: unknown) => {
-      const serverMap = servers as Record<string, unknown>;
-      if (startServersMock.mock.calls.length === 1) {
-        expect(Object.keys(serverMap)).toEqual(["serverA", "serverB"]);
-        return Promise.resolve(
-          startResult([["serverA", { tools: { toolA } }]], {
-            failedServerNames: ["serverB"],
-            timedOutServerNames: ["serverB"],
-          })
-        );
-      }
-
-      expect(Object.keys(serverMap)).toEqual(["serverB"]);
-      return Promise.resolve(startResult([["serverB", { tools: { toolB } }]]));
-    });
-
-    access.startServers = startServersMock;
-
-    const initial = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const initial = await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest(workspaceId))
+    );
 
     expect(initial.stats.failedServerCount).toBe(1);
     expect(initial.stats.failedServerNames).toEqual(["serverB"]);
@@ -3422,9 +3391,12 @@ describe("MCPServerManager", () => {
     expect(Object.keys(initial.tools)).toEqual(["servera_toola"]);
 
     elapseTimedOutRetryBackoff();
+    servers.serve("cmd-b", { tools: { toolB: testTool() } });
     const retried = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    // Only the timed-out server is retried; the healthy client is reused.
+    expect(servers.connectCount("cmd-a")).toBe(1);
+    expect(servers.connectCount("cmd-b")).toBe(1);
     expect(retried.stats.failedServerCount).toBe(0);
     expect(retried.stats.failedServerNames).toEqual([]);
     expect(retried.stats.startedServerCount).toBe(2);
@@ -3432,10 +3404,11 @@ describe("MCPServerManager", () => {
     expect(retriedToolNames).toContain("servera_toola");
     expect(retriedToolNames).toContain("serverb_toolb");
 
-    const cached = access.workspaceServers.get(workspaceId) as {
-      timedOutServerNames?: string[];
-    };
-    expect(cached.timedOutServerNames).toEqual([]);
+    // The retry cleared the timeout: later serves neither retry nor report it.
+    elapseTimedOutRetryBackoff();
+    const settled = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd-b")).toBe(1);
+    expect(settled.stats.failedServerNames).toEqual([]);
   });
 
   test("getToolsForWorkspace does not overlap timed-out retries for concurrent cached requests", async () => {
@@ -3445,60 +3418,43 @@ describe("MCPServerManager", () => {
         slow: stdioConfig("cmd-slow"),
       })
     );
+    servers.serve("cmd-slow", { hang: true });
+    await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest(workspaceId))
+    );
+    elapseTimedOutRetryBackoff();
 
     const retryStarted = Promise.withResolvers<void>();
-    const retryFinished = Promise.withResolvers<{
-      instances: Map<string, unknown>;
-      failedServerNames: string[];
-      timedOutServerNames: string[];
-    }>();
-    let hasSignaledRetryStart = false;
-
-    const slowTool = testTool();
-    const startServersMock = mock(() => {
-      if (!hasSignaledRetryStart) {
-        hasSignaledRetryStart = true;
+    const retryFinished = Promise.withResolvers<void>();
+    servers.serve("cmd-slow", {
+      tools: { tool: testTool() },
+      connect: () => {
         retryStarted.resolve();
-      }
-
-      return retryFinished.promise;
-    });
-    access.startServers = startServersMock;
-
-    access.workspaceServers.set(workspaceId, {
-      configSignature: JSON.stringify({
-        slow: { transport: "stdio", command: "cmd-slow", args: null, env: null, cwd: null },
-      }),
-      instances: new Map(),
-      enabledServerNames: new Set(["slow"]),
-      stats: cachedStats(),
-      timedOutServerNames: ["slow"],
-      lastActivity: Date.now(),
+        return retryFinished.promise;
+      },
     });
 
     const firstPromise = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     await retryStarted.promise;
 
-    const secondPromise = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // A concurrent request settles on the cached state instead of stacking a
+    // second startup attempt behind the in-flight retry.
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd-slow")).toBe(1);
+    expect(second.stats.failedServerNames).toEqual(["slow"]);
 
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    retryFinished.resolve();
+    const first = await firstPromise;
 
-    retryFinished.resolve(startResult([["slow", { tools: { tool: slowTool } }]]));
-
-    const [first] = await Promise.all([firstPromise, secondPromise]);
-
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount("cmd-slow")).toBe(1);
     expect(first.stats.failedServerCount).toBe(0);
     expect(Object.keys(first.tools)).toEqual(["slow_tool"]);
 
-    const cached = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, unknown>;
-      timedOutServerNames?: string[];
-      retryingTimedOutServerNames?: Set<string>;
-    };
-    expect(cached.instances.has("slow")).toBe(true);
-    expect(cached.timedOutServerNames).toEqual([]);
-    expect(cached.retryingTimedOutServerNames?.size).toBe(0);
+    // The retried client is cached and its retry marker released.
+    const cached = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("cmd-slow")).toBe(1);
+    expect(cached.stats.failedServerCount).toBe(0);
+    expect(Object.keys(cached.tools)).toEqual(["slow_tool"]);
   });
 
   test("getToolsForWorkspace closes timed-out retry results when cache entry is replaced mid-retry", async () => {
@@ -3509,89 +3465,48 @@ describe("MCPServerManager", () => {
         slow: { transport: "stdio", command, disabled: false },
       })
     );
+    servers.serve("cmd-1", { hang: true });
+    await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest(workspaceId))
+    );
+    elapseTimedOutRetryBackoff();
 
     const retryStarted = Promise.withResolvers<void>();
-    const retryFinished = Promise.withResolvers<{
-      instances: Map<string, unknown>;
-      failedServerNames: string[];
-      timedOutServerNames: string[];
-    }>();
-    let startServersCallCount = 0;
-
+    const retryFinished = Promise.withResolvers<void>();
     const retriedClose = mock(() => Promise.resolve(undefined));
     const replacementClose = mock(() => Promise.resolve(undefined));
-    const retriedInstance = testInstance("slow", {
+    servers.serve("cmd-1", {
       tools: { retry: testTool() },
       close: retriedClose,
-    });
-    const replacementInstance = testInstance("slow", {
-      tools: { active: testTool() },
-      close: replacementClose,
-    });
-
-    const startServersMock = mock((servers: unknown) => {
-      startServersCallCount += 1;
-      const serverMap = servers as Record<string, { command?: string }>;
-
-      if (startServersCallCount === 1) {
-        expect(Object.keys(serverMap)).toEqual(["slow"]);
-        expect(serverMap.slow?.command).toBe("cmd-1");
+      connect: () => {
         retryStarted.resolve();
         return retryFinished.promise;
-      }
-
-      expect(Object.keys(serverMap)).toEqual(["slow"]);
-      expect(serverMap.slow?.command).toBe("cmd-2");
-      return Promise.resolve({
-        instances: new Map([["slow", replacementInstance]]),
-        failedServerNames: [],
-        timedOutServerNames: [],
-      });
+      },
     });
-    access.startServers = startServersMock;
-
-    const staleEntry = {
-      configSignature: JSON.stringify({
-        slow: { transport: "stdio", command: "cmd-1", args: null, env: null, cwd: null },
-      }),
-      instances: new Map(),
-      stats: cachedStats(),
-      timedOutServerNames: ["slow"],
-      retryingTimedOutServerNames: new Set<string>(),
-      lastActivity: Date.now(),
-    };
-    access.workspaceServers.set(workspaceId, staleEntry);
+    servers.serve("cmd-2", { tools: { active: testTool() }, close: replacementClose });
 
     const retryPromise = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     await retryStarted.promise;
-
-    expect(staleEntry.retryingTimedOutServerNames.has("slow")).toBe(true);
 
     command = "cmd-2";
     const replacementResult = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
     expect(Object.keys(replacementResult.tools)).toEqual(["slow_active"]);
 
-    retryFinished.resolve(
-      startResult([["slow", { tools: retriedInstance.tools, close: retriedClose }]])
-    );
-
+    retryFinished.resolve();
     const retriedResult = await retryPromise;
 
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount("cmd-1")).toBe(1);
+    expect(servers.connectCount("cmd-2")).toBe(1);
     expect(retriedClose).toHaveBeenCalledTimes(1);
     expect(replacementClose).toHaveBeenCalledTimes(0);
     expect(Object.keys(retriedResult.tools)).toEqual(["slow_active"]);
 
-    const activeEntry = access.workspaceServers.get(workspaceId) as {
-      instances: Map<string, typeof replacementInstance>;
-      retryingTimedOutServerNames?: Set<string>;
-    };
-    expect(activeEntry).not.toBe(staleEntry);
-    expect(activeEntry.instances.get("slow")).toBe(replacementInstance);
-    expect(activeEntry.retryingTimedOutServerNames?.size).toBe(0);
-    expect(staleEntry.instances.size).toBe(0);
-    expect(staleEntry.retryingTimedOutServerNames.size).toBe(0);
+    // The replacement stays the cached client; the stale retry never lands.
+    const cached = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(cached.tools)).toEqual(["slow_active"]);
+    expect(servers.connectCount("cmd-2")).toBe(1);
+    expect(replacementClose).toHaveBeenCalledTimes(0);
   });
 
   test.each([false, true])(
