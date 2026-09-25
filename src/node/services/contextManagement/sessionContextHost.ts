@@ -11,6 +11,7 @@ import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCom
 import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import type { AgentSessionStreamManager } from "../agentSession";
 import type { TurnCoordinator } from "../turnCoordinator";
+import type { CompactionMonitor } from "../compactionMonitor";
 import type { TurnAcceptanceOrigin } from "../taskWorkspaceSeam";
 import type {
   ContextDispatchRequest,
@@ -24,6 +25,8 @@ export interface SessionContextHost {
   readonly workspaceId: string;
   readonly sessionDir: string;
   readonly emitter: EventEmitter;
+  /** Test seam: replaces the controller's default CompactionMonitor when set. */
+  readonly compactionMonitor?: CompactionMonitor;
   readonly coordinator: Pick<
     TurnCoordinator,
     | "recordCompactionSummary"
