@@ -160,10 +160,12 @@ describe("EventStore", () => {
     });
 
     it("should not throw when deleting non-existent persisted state", async () => {
-      // Should complete without throwing (logs error but doesn't throw)
-      await store.deletePersisted("non-existent");
-      // If we get here, it didn't throw
-      expect(true).toBe(true);
+      const state: TestState = { id: "kept", value: 1, items: [] };
+      await store.persist(testWorkspaceId, state);
+
+      // Logs the error but resolves, and leaves other workspaces' state alone.
+      await expect(store.deletePersisted("non-existent")).resolves.toBeUndefined();
+      expect(await store.readPersisted(testWorkspaceId)).toEqual(state);
     });
   });
 
