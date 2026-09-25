@@ -55,6 +55,18 @@ import {
   type WorkspaceTurnHost,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
+import {
+  ACTIVE_AGENT_TASK_STATUSES,
+  buildAgentTaskIndex,
+  countActiveAgentTasks,
+  hasActiveDescendantAgentTasksUsingIndex,
+  isActiveAgentTaskEntry,
+  isDescendantAgentTaskUsingParentById,
+  listAgentTaskWorkspaces,
+  resolveWorkspaceAISettings,
+  type AgentTaskIndex,
+  type AgentTaskWorkspaceEntry,
+} from "@/node/services/agentTaskIndex";
 import { readSubagentAttemptSettlementReceiptStrict } from "@/node/services/subagentAttemptSettlements";
 import { assertTaskAttemptId, isTaskAttemptId, newTaskAttemptId } from "@/node/utils/taskAttemptId";
 import type { HistoryService } from "@/node/services/historyService";
@@ -899,15 +911,6 @@ export interface DescendantAgentTaskInfo {
   depth: number;
 }
 
-type AgentTaskWorkspaceEntry = WorkspaceConfigEntry & { projectPath: string };
-
-const ACTIVE_AGENT_TASK_STATUSES = new Set<AgentTaskStatus>([
-  "queued",
-  "starting",
-  "running",
-  "awaiting_report",
-]);
-
 const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 
 /**
@@ -1106,12 +1109,6 @@ const RUNNING_TASK_TERMINAL_STREAM_ERRORS: ReadonlySet<StreamErrorType> = new Se
   // The child's in-stream repair failed or was unsafe; no automatic recovery remains.
   "reasoning_rejected",
 ]);
-
-interface AgentTaskIndex {
-  byId: Map<string, AgentTaskWorkspaceEntry>;
-  childrenByParent: Map<string, string[]>;
-  parentById: Map<string, string>;
-}
 
 type WorkflowTaskConfig = NonNullable<WorkspaceConfigEntry["workflowTask"]>;
 
@@ -3834,14 +3831,7 @@ export class TaskService implements AgentTaskIntegration {
     },
     agentId: string | undefined
   ): ResolvedWorkspaceAiSettings | undefined {
-    const normalizedAgentId =
-      typeof agentId === "string" && agentId.trim().length > 0
-        ? normalizeAgentId(agentId, "")
-        : undefined;
-    return (
-      (normalizedAgentId ? workspace.aiSettingsByAgent?.[normalizedAgentId] : undefined) ??
-      workspace.aiSettings
-    );
+    return resolveWorkspaceAISettings(workspace, agentId);
   }
 
   /**
@@ -13111,17 +13101,7 @@ export class TaskService implements AgentTaskIntegration {
     ancestorWorkspaceId: string,
     taskId: string
   ): boolean {
-    let current = taskId;
-    for (let i = 0; i < 32; i++) {
-      const parent = parentById.get(current);
-      if (!parent) return false;
-      if (parent === ancestorWorkspaceId) return true;
-      current = parent;
-    }
-
-    throw new Error(
-      `isDescendantAgentTaskUsingParentById: possible parentWorkspaceId cycle starting at ${taskId}`
-    );
+    return isDescendantAgentTaskUsingParentById(parentById, ancestorWorkspaceId, taskId);
   }
 
   /** Walks parentWorkspaceId chains up to the tree root (a workspace with no agent-task parent). */
@@ -13460,15 +13440,7 @@ export class TaskService implements AgentTaskIntegration {
   listAgentTaskWorkspaces(
     config: ReturnType<Config["loadConfigOrDefault"]>
   ): AgentTaskWorkspaceEntry[] {
-    const tasks: AgentTaskWorkspaceEntry[] = [];
-    for (const [projectPath, project] of config.projects) {
-      for (const workspace of project.workspaces) {
-        if (!workspace.id) continue;
-        if (!workspace.parentWorkspaceId) continue;
-        tasks.push({ ...workspace, projectPath });
-      }
-    }
-    return tasks;
+    return listAgentTaskWorkspaces(config);
   }
 
   isDescendantAgentTaskInConfig(
@@ -13490,24 +13462,7 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   buildAgentTaskIndex(config: ReturnType<Config["loadConfigOrDefault"]>): AgentTaskIndex {
-    const byId = new Map<string, AgentTaskWorkspaceEntry>();
-    const childrenByParent = new Map<string, string[]>();
-    const parentById = new Map<string, string>();
-
-    for (const task of this.listAgentTaskWorkspaces(config)) {
-      const taskId = task.id!;
-      byId.set(taskId, task);
-
-      const parent = task.parentWorkspaceId;
-      if (!parent) continue;
-
-      parentById.set(taskId, parent);
-      const list = childrenByParent.get(parent) ?? [];
-      list.push(taskId);
-      childrenByParent.set(parent, list);
-    }
-
-    return { byId, childrenByParent, parentById };
+    return buildAgentTaskIndex(config);
   }
 
   private isWorkflowOwnedTaskUsingIndex(index: AgentTaskIndex, taskId: string): boolean {
@@ -13667,58 +13622,14 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private isActiveAgentTaskEntry(task: AgentTaskWorkspaceEntry): boolean {
-    if (isActiveWorkspaceTurnTaskStatus(task.taskExecutionStatus)) {
-      return true;
-    }
-    const status: AgentTaskStatus = task.taskStatus ?? "running";
-    if (!ACTIVE_AGENT_TASK_STATUSES.has(status)) {
-      return false;
-    }
-
-    // Archiving a task stops its stream but intentionally leaves taskStatus untouched in
-    // persisted config. Treat archived, non-streaming tasks as inactive so stale status cannot
-    // keep ancestors/workspace-turn handles blocked forever.
-    if (isWorkspaceArchived(task.archivedAt, task.unarchivedAt)) {
-      return task.id != null && this.aiService.isStreaming(task.id);
-    }
-
-    return true;
+    return isActiveAgentTaskEntry(task, (id) => this.aiService.isStreaming(id));
   }
 
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number {
-    let activeCount = 0;
-    for (const task of this.listAgentTaskWorkspaces(config)) {
-      const status: AgentTaskStatus = task.taskStatus ?? "running";
-      // A reawakened persistent child is represented by its private workspace-turn handle in the
-      // workspace-turn count. Charging its mirrored execution status here would count one task twice.
-      if (
-        isWorkspaceTurnTaskId(task.taskExecutionId) &&
-        isActiveWorkspaceTurnTaskStatus(task.taskExecutionStatus)
-      ) {
-        continue;
-      }
-      // If this task workspace is blocked in a foreground wait, do not count it towards parallelism.
-      // This prevents deadlocks where a task spawns a nested task in the foreground while
-      // maxParallelAgentTasks is low (e.g. 1).
-      // Note: StreamManager can still report isStreaming() while a tool call is executing, so
-      // isStreaming is not a reliable signal for "actively doing work" here.
-      if (status === "running" && task.id && this.isForegroundAwaiting(task.id)) {
-        continue;
-      }
-      if (status !== "queued" && this.isActiveAgentTaskEntry(task)) {
-        activeCount += 1;
-        continue;
-      }
-
-      // Defensive: task status and runtime stream state can be briefly out of sync during
-      // termination/cleanup boundaries. Count streaming tasks as active so we never exceed
-      // the configured parallel limit.
-      if (task.id && this.aiService.isStreaming(task.id)) {
-        activeCount += 1;
-      }
-    }
-
-    return activeCount;
+    return countActiveAgentTasks(this.listAgentTaskWorkspaces(config), {
+      isStreaming: (id) => this.aiService.isStreaming(id),
+      isForegroundAwaiting: (id) => this.isForegroundAwaiting(id),
+    });
   }
 
   hasActiveDescendantAgentTasks(
@@ -13735,27 +13646,9 @@ export class TaskService implements AgentTaskIntegration {
     index: AgentTaskIndex,
     workspaceId: string
   ): boolean {
-    assert(
-      workspaceId.length > 0,
-      "hasActiveDescendantAgentTasksUsingIndex: workspaceId must be non-empty"
+    return hasActiveDescendantAgentTasksUsingIndex(index, workspaceId, (id) =>
+      this.aiService.isStreaming(id)
     );
-
-    const stack: string[] = [...(index.childrenByParent.get(workspaceId) ?? [])];
-    while (stack.length > 0) {
-      const next = stack.pop()!;
-      const entry = index.byId.get(next);
-      if (entry != null && this.isActiveAgentTaskEntry(entry)) {
-        return true;
-      }
-      const children = index.childrenByParent.get(next);
-      if (children) {
-        for (const child of children) {
-          stack.push(child);
-        }
-      }
-    }
-
-    return false;
   }
 
   private listBlockingActiveDescendantAgentTaskIdsUsingIndex(
