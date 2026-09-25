@@ -509,15 +509,23 @@ describe("AgentSession continuous compaction wiring", () => {
     });
     // The real startup retry resumes the recovered (still partial) live tail; the history it
     // schedules against must already be the folded one.
-    const retryScheduled = deferred<MuxMessage[]>();
+    // Read history when the retry is scheduled, but await the read from the test body so a
+    // failed read fails the test instead of leaving the deferred pending.
+    const retryScheduled = deferred<void>();
+    let historyAtRetry: Promise<MuxMessage[]> | undefined;
     h.session.onChatEvent(({ message }) => {
       if ("type" in message && message.type === "auto-retry-scheduled") {
         order.push("retry");
-        void rows(h).then(retryScheduled.resolve);
+        historyAtRetry = rows(h);
+        // Marked handled here; the await below still rethrows a rejection.
+        historyAtRetry.catch(() => undefined);
+        retryScheduled.resolve();
       }
     });
     await h.session.runStartupRecovery();
-    const history = await retryScheduled.promise;
+    await retryScheduled.promise;
+    if (historyAtRetry === undefined) throw new Error("auto-retry-scheduled never fired");
+    const history = await historyAtRetry;
     expect(history[0].id).toBe(journal.boundary.id);
     expect(history.at(-1)?.parts).toEqual(source.parts.slice(journal.liveTailCopySpec.partIndex));
     expect(order.slice(0, 2)).toEqual(["commit", "journal"]);
