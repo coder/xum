@@ -38,7 +38,9 @@
  */
 import type { Cause, Context } from "effect";
 import { Effect, Queue, Stream } from "effect";
-import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
+
+/** Default interval between subscription heartbeat events. */
+export const SUBSCRIPTION_HEARTBEAT_INTERVAL_MS = 5_000;
 
 /** Producer-facing handle. Safe to call from any non-Effect callsite. */
 export interface SubscriptionEmit<T> {

@@ -24,7 +24,6 @@ export {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
-  AgentPluginInstallsSchema,
 } from "./agentPluginInstalls";
 export type {
   AgentPluginGitSource,

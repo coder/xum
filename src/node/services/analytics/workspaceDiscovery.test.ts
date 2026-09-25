@@ -5,11 +5,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { log } from "@/node/services/log";
 import { CHAT_FILE_NAME } from "./etl";
-import {
-  discoverAllWorkspaces,
-  listArchivedSubagentWorkspaceIds,
-  listSessionWorkspaceIdsWithHistory,
-} from "./workspaceDiscovery";
+import { discoverAllWorkspaces } from "./workspaceDiscovery";
 
 const SUBAGENT_TRANSCRIPTS_DIR_NAME = "subagent-transcripts";
 const tempDirsToClean: string[] = [];
@@ -32,64 +28,7 @@ afterEach(async () => {
   );
 });
 
-describe("listSessionWorkspaceIdsWithHistory", () => {
-  test("returns only top-level workspace directories with chat.jsonl", async () => {
-    const sessionsDir = await createTempSessionsDir();
-    const workspaceWithHistory = "workspace-a";
-
-    const workspaceWithHistoryDir = path.join(sessionsDir, workspaceWithHistory);
-    await fs.mkdir(workspaceWithHistoryDir, { recursive: true });
-    await writeChatJsonl(workspaceWithHistoryDir);
-
-    await fs.mkdir(path.join(sessionsDir, "workspace-without-history"), { recursive: true });
-    await fs.writeFile(path.join(sessionsDir, "README.txt"), "not a workspace directory");
-
-    expect(await listSessionWorkspaceIdsWithHistory(sessionsDir)).toEqual([workspaceWithHistory]);
-  });
-
-  test("returns an empty list when sessionsDir does not exist", async () => {
-    const missingSessionsDir = path.join(
-      os.tmpdir(),
-      `mux-analytics-workspace-discovery-missing-${process.pid}-${randomUUID()}`
-    );
-
-    expect(await listSessionWorkspaceIdsWithHistory(missingSessionsDir)).toEqual([]);
-  });
-});
-
-describe("listArchivedSubagentWorkspaceIds", () => {
-  test("discovers archived child workspace IDs under each parent workspace", async () => {
-    const sessionsDir = await createTempSessionsDir();
-    const parentWorkspaceId = "parent-a";
-    const childWorkspaceId = "child-a";
-
-    const parentSessionDir = path.join(sessionsDir, parentWorkspaceId);
-    await fs.mkdir(parentSessionDir, { recursive: true });
-    await writeChatJsonl(parentSessionDir);
-
-    const archivedChildDir = path.join(
-      parentSessionDir,
-      SUBAGENT_TRANSCRIPTS_DIR_NAME,
-      childWorkspaceId
-    );
-    await fs.mkdir(archivedChildDir, { recursive: true });
-    await writeChatJsonl(archivedChildDir);
-
-    const sessionWorkspaceIds = await listSessionWorkspaceIdsWithHistory(sessionsDir);
-    expect(sessionWorkspaceIds).toEqual([parentWorkspaceId]);
-
-    const archivedWorkspaceIds = await listArchivedSubagentWorkspaceIds(
-      sessionsDir,
-      sessionWorkspaceIds
-    );
-    expect(archivedWorkspaceIds).toEqual([childWorkspaceId]);
-
-    // This mirrors the startup backfill check: archived child workspace IDs must
-    // count as known so their watermark rows do not trigger rebuildAll loops.
-    const knownWorkspaceIdSet = new Set([...sessionWorkspaceIds, ...archivedWorkspaceIds]);
-    expect(knownWorkspaceIdSet.has(childWorkspaceId)).toBe(true);
-  });
-
+describe("discoverAllWorkspaces", () => {
   test("skips unreadable archived transcript directories instead of throwing", async () => {
     const sessionsDir = await createTempSessionsDir();
     const parentWorkspaceId = "parent-a";
@@ -116,10 +55,8 @@ describe("listArchivedSubagentWorkspaceIds", () => {
     const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
 
     try {
-      const archivedWorkspaceIds = await listArchivedSubagentWorkspaceIds(sessionsDir, [
-        parentWorkspaceId,
-      ]);
-      expect(archivedWorkspaceIds).toEqual([]);
+      const discovered = await discoverAllWorkspaces(sessionsDir);
+      expect([...discovered.keys()]).toEqual([parentWorkspaceId]);
       expect(warnSpy).toHaveBeenCalledTimes(1);
     } finally {
       warnSpy.mockRestore();
@@ -142,11 +79,10 @@ describe("listArchivedSubagentWorkspaceIds", () => {
     );
     await fs.mkdir(archivedWithoutHistoryDir, { recursive: true });
 
-    expect(await listArchivedSubagentWorkspaceIds(sessionsDir, [parentWorkspaceId])).toEqual([]);
+    const discovered = await discoverAllWorkspaces(sessionsDir);
+    expect([...discovered.keys()]).toEqual([parentWorkspaceId]);
   });
-});
 
-describe("discoverAllWorkspaces", () => {
   test("returns top-level workspaces with correct sessionDir", async () => {
     const sessionsDir = await createTempSessionsDir();
     const workspaceId = "ws-a";
