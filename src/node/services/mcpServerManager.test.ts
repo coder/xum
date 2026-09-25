@@ -5257,7 +5257,13 @@ describe("MCPServerManager", () => {
     const startupGate = new Promise<void>((resolve) => {
       releaseStartup = resolve;
     });
-    servers.serve("cmd", { connect: () => startupGate });
+    const startupEntered = Promise.withResolvers<void>();
+    servers.serve("cmd", {
+      connect: () => {
+        startupEntered.resolve();
+        return startupGate;
+      },
+    });
     const controller = new AbortController();
     const promptPromise = manager.getPrompt(
       "workspace",
@@ -5266,6 +5272,9 @@ describe("MCPServerManager", () => {
       {},
       { signal: controller.signal }
     );
+    promptPromise.catch(() => undefined);
+    // Abort only once the revival is hung inside its startup.
+    await startupEntered.promise;
     controller.abort();
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
     await expect(promptPromise).rejects.toThrow("was aborted");
