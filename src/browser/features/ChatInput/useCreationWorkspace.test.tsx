@@ -1,5 +1,4 @@
-import type { APIClient } from "@/browser/contexts/API";
-import * as APIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -136,7 +135,6 @@ const useDraftWorkspaceSettingsMock = mock(
   }
 );
 
-const actualAPIModule = { ...APIModule };
 const actualDraftWorkspaceSettingsModule = { ...DraftWorkspaceSettingsModule };
 const actualProjectContextModule = { ...ProjectContextModule };
 const actualRouterContextModule = { ...RouterContextModule };
@@ -173,19 +171,6 @@ async function installUseCreationWorkspaceModuleMocks() {
       pendingSectionId: null,
       pendingDraftId: routerState.pendingDraftId,
     }),
-  }));
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => {
-      if (!currentORPCClient) {
-        return { api: null, status: "connecting" as const, error: null };
-      }
-      return {
-        api: currentORPCClient as APIClient,
-        status: "connected" as const,
-        error: null,
-      };
-    },
   }));
   await mock.module("@/browser/contexts/ProjectContext", () => ({
     ...actualProjectContextModule,
@@ -228,7 +213,6 @@ async function restoreUseCreationWorkspaceModuleMocks() {
     () => actualDraftWorkspaceSettingsModule
   );
   await mock.module("@/browser/contexts/RouterContext", () => actualRouterContextModule);
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
   await mock.module("@/browser/contexts/ProjectContext", () => actualProjectContextModule);
 }
 
@@ -2218,7 +2202,16 @@ function renderUseCreationWorkspace(options: HookOptions) {
     return null;
   }
 
-  render(<Harness {...options} />);
+  // Inject the client through the real provider; mocking the API module leaks
+  // process-wide into later suites.
+  if (!currentORPCClient) {
+    throw new Error("Tests must call setupWindow() before rendering the hook");
+  }
+  render(
+    <APIProvider client={currentORPCClient as APIClient}>
+      <Harness {...options} />
+    </APIProvider>
+  );
 
   return () => {
     if (!resultRef.current) {

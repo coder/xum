@@ -2,7 +2,7 @@ import type React from "react";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
-import * as ActualApiModule from "@/browser/contexts/API";
+import { APIContext } from "@/browser/contexts/API";
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualThinkingLevelModule from "@/browser/hooks/useThinkingLevel";
@@ -12,7 +12,6 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { installDom } from "../../../../tests/ui/dom";
 
 // Capture before installing module mocks; mock.restore() does not undo them.
-const actualApiModule = { ...ActualApiModule };
 const actualRoutingModule = { ...ActualRoutingModule };
 const actualProvidersConfigModule = { ...ActualProvidersConfigModule };
 const actualThinkingLevelModule = { ...ActualThinkingLevelModule };
@@ -21,10 +20,6 @@ const actualTooltipModule = { ...ActualTooltipModule };
 
 const setThinkingLevel = mock((_level: ThinkingLevel) => undefined);
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api: null }),
-  useOptionalAPI: () => null,
-}));
 void mock.module("@/browser/hooks/useProvidersConfig", () => ({
   useProvidersConfig: () => ({
     config: null,
@@ -56,6 +51,28 @@ import { ThinkingSelector, ThinkingSelectorControl } from "./ThinkingSelector";
 
 const MODEL = "anthropic:claude-opus-4-6";
 
+// The selector renders without a backend. Inject a disconnected API through the real
+// context instead of mocking the API module (module mocks leak across suites).
+function NoBackendAPIWrapper(props: { children: React.ReactNode }) {
+  return (
+    <APIContext.Provider
+      value={{
+        api: null,
+        status: "connecting",
+        error: null,
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
+function renderWithApi(ui: React.ReactElement) {
+  return render(ui, { wrapper: NoBackendAPIWrapper });
+}
+
 function openSelector(container: HTMLElement) {
   fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
 }
@@ -70,7 +87,6 @@ describe("ThinkingSelector auto routing", () => {
   let cleanupDom: (() => void) | null = null;
 
   afterAll(async () => {
-    await mock.module("@/browser/contexts/API", () => actualApiModule);
     await mock.module("@/browser/hooks/useRouting", () => actualRoutingModule);
     await mock.module("@/browser/hooks/useProvidersConfig", () => actualProvidersConfigModule);
     await mock.module("@/browser/hooks/useThinkingLevel", () => actualThinkingLevelModule);
@@ -90,7 +106,7 @@ describe("ThinkingSelector auto routing", () => {
   });
 
   test("renders no Auto row without the prop", () => {
-    const { container } = render(
+    const { container } = renderWithApi(
       <ThinkingSelectorControl
         modelString={MODEL}
         thinkingLevel="medium"
@@ -106,7 +122,7 @@ describe("ThinkingSelector auto routing", () => {
   test("selecting Auto calls onSelect without changing the concrete level", () => {
     const onThinkingLevelChange = mock((_level: ThinkingLevel) => undefined);
     const onSelect = mock(() => undefined);
-    const { container } = render(
+    const { container } = renderWithApi(
       <ThinkingSelectorControl
         modelString={MODEL}
         thinkingLevel="medium"
@@ -128,7 +144,7 @@ describe("ThinkingSelector auto routing", () => {
 
   test("while Auto is active the trigger reads Auto and no level row is selected", () => {
     const onThinkingLevelChange = mock((_level: ThinkingLevel) => undefined);
-    const { container } = render(
+    const { container } = renderWithApi(
       <ThinkingSelectorControl
         modelString={MODEL}
         thinkingLevel="medium"
@@ -154,7 +170,7 @@ describe("ThinkingSelector auto routing", () => {
 
   test("composer wrapper: Auto selects the flag, a concrete pick reaches the context", () => {
     const onSelect = mock(() => undefined);
-    const { container } = render(
+    const { container } = renderWithApi(
       <ThinkingSelector modelString={MODEL} autoRouting={{ active: false, onSelect }} />
     );
     openSelector(container);

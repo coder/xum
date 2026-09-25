@@ -5,10 +5,7 @@ import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { MAX_LOG_ENTRIES } from "@/common/constants/ui";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import * as realAPI from "@/browser/contexts/API";
-
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 
 type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -33,17 +30,20 @@ interface MockAPI {
 
 let mockApi: MockAPI | null = null;
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: mockApi ? ("connected" as const) : ("connecting" as const),
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
-
 import { OutputTab } from "../OutputTab/OutputTab";
+
+// Inject the per-test client through the real provider; mocking the API module leaks
+// process-wide into later suites.
+function renderOutputTab() {
+  if (!mockApi) {
+    throw new Error("Tests must assign mockApi before rendering OutputTab");
+  }
+  return render(
+    <APIProvider client={mockApi as unknown as APIClient}>
+      <OutputTab workspaceId="workspace-1" />
+    </APIProvider>
+  );
+}
 
 function formatEntryMessage(id: number): string {
   return `entry-${id.toString().padStart(4, "0")}`;
@@ -103,7 +103,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getAllByText(/^entry-\d{4}$/)).toHaveLength(5);
@@ -130,7 +130,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getAllByText(/^entry-\d{4}$/)).toHaveLength(MAX_LOG_ENTRIES);
@@ -164,7 +164,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getByText(formatEntryMessage(0))).toBeTruthy();
@@ -191,7 +191,7 @@ describe("OutputTab", () => {
         },
       };
 
-      const view = render(<OutputTab workspaceId="workspace-1" />);
+      const view = renderOutputTab();
       const deleteButton = view.getByRole("button", { name: "Delete output logs" });
 
       fireEvent.click(deleteButton);
@@ -230,7 +230,7 @@ describe("OutputTab", () => {
       },
     };
 
-    const view = render(<OutputTab workspaceId="workspace-1" />);
+    const view = renderOutputTab();
 
     await waitFor(() => {
       expect(view.getByText(formatEntryMessage(0))).toBeTruthy();

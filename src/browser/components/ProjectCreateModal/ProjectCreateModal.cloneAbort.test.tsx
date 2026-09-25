@@ -1,29 +1,22 @@
 import "../../../../tests/ui/dom";
 
 import { replicateAsyncIterator } from "@orpc/shared";
-import type { APIClient } from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import type { RecursivePartial } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import * as realAPI from "@/browser/contexts/API";
-
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
-
 let cleanupDom: (() => void) | null = null;
 let currentClientMock: RecursivePartial<APIClient> = {};
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: currentClientMock as APIClient,
-    status: "connected" as const,
-    error: null,
-  }),
-  APIProvider: ({ children }: { children: React.ReactNode }) => children,
-}));
 
 import { ProjectAddForm } from "../ProjectCreateModal/ProjectCreateModal";
+
+// Inject the per-test client through the real provider; mocking the API module leaks
+// process-wide into later suites.
+function renderWithApi(ui: React.ReactElement) {
+  return render(<APIProvider client={currentClientMock as APIClient}>{ui}</APIProvider>);
+}
 
 describe("ProjectAddForm", () => {
   beforeEach(() => {
@@ -58,7 +51,7 @@ describe("ProjectAddForm", () => {
     };
     const onSuccess = mock(() => undefined);
 
-    const { getByText, getByPlaceholderText } = render(
+    const { getByText, getByPlaceholderText } = renderWithApi(
       <ProjectAddForm isOpen onSuccess={onSuccess} />
     );
 
@@ -110,7 +103,7 @@ describe("ProjectAddForm", () => {
 
     const onIsCreatingChange = mock(() => undefined);
 
-    const { getByText, getByPlaceholderText, unmount } = render(
+    const { getByText, getByPlaceholderText, unmount } = renderWithApi(
       <ProjectAddForm isOpen onSuccess={() => undefined} onIsCreatingChange={onIsCreatingChange} />
     );
 

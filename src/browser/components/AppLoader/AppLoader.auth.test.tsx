@@ -31,6 +31,12 @@ void mock.module("lottie-react", () => ({
   default: () => <div data-testid="LottieMock" />,
 }));
 
+// Retained API module mock (restored after the suite above). Unlike other components,
+// AppLoader renders its own APIProvider, so an outer APIContext.Provider is shadowed, and
+// the provider only accepts a connected `client`. The auth_required/error/connecting states
+// under test are reachable only by driving the real WebSocket handshake (error needs a
+// failing oRPC ping over the socket), so replacing the provider here is the least brittle
+// option.
 void mock.module("@/browser/contexts/API", () => ({
   APIProvider: (props: { children: React.ReactNode }) => props.children,
   useAPI: () => {

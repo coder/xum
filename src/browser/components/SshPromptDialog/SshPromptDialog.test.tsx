@@ -11,12 +11,9 @@ import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
-import * as realAPI from "@/browser/contexts/API";
+import { APIContext, type APIClient } from "@/browser/contexts/API";
 
-restoreModulesAfterSuite([
-  ["@/browser/components/Dialog/Dialog", { ...RealDialogModule }],
-  ["@/browser/contexts/API", { ...realAPI }],
-]);
+restoreModulesAfterSuite([["@/browser/components/Dialog/Dialog", { ...RealDialogModule }]]);
 
 // Self-contained dialog stub — bun's mock.module is process-global, so other
 // test files may register incomplete Dialog stubs that omit
@@ -67,10 +64,34 @@ let respondMock: ReturnType<typeof mock>;
 let subscribeMock: ReturnType<typeof mock>;
 let mockSubscription: ControlledSubscription<SshPromptEvent>;
 
-// mock.module is hoisted by bun — the mock is active before static imports resolve.
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({ api }),
-}));
+// Inject the current `api` through the real context instead of mocking the API module
+// (module mocks leak across suites). The wrapper reads `api` on every render, so a test
+// that sets it to null and rerenders sees a disconnected backend without remounting.
+function MutableAPIWrapper(props: { children: ReactNode }) {
+  const authenticate = () => undefined;
+  const retry = () => undefined;
+  return (
+    <APIContext.Provider
+      value={
+        api
+          ? {
+              status: "connected",
+              api: api as unknown as APIClient,
+              error: null,
+              authenticate,
+              retry,
+            }
+          : { status: "reconnecting", api: null, error: null, attempt: 1, authenticate, retry }
+      }
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
+function renderDialog() {
+  return render(<SshPromptDialog />, { wrapper: MutableAPIWrapper });
+}
 
 const MOCK_REQUEST: SshPromptRequest = {
   requestId: "req-1",
@@ -129,7 +150,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("dequeues request on successful respond", async () => {
-    const { getByRole, queryByRole } = render(<SshPromptDialog />);
+    const { getByRole, queryByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -149,7 +170,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("renders credential prompt with input field", async () => {
-    const { container, getByRole, getByText } = render(<SshPromptDialog />);
+    const { container, getByRole, getByText } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
@@ -164,7 +185,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("credential submit sends typed response", async () => {
-    const { container, getByRole, queryByRole } = render(<SshPromptDialog />);
+    const { container, getByRole, queryByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
@@ -220,7 +241,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("credential cancel sends empty response", async () => {
-    const { getByRole } = render(<SshPromptDialog />);
+    const { getByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_CREDENTIAL_REQUEST);
@@ -247,7 +268,7 @@ describe("SshPromptDialog", () => {
       },
     };
 
-    const { getByRole, queryByRole } = render(<SshPromptDialog />);
+    const { getByRole, queryByRole } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
@@ -289,7 +310,7 @@ describe("SshPromptDialog", () => {
       },
     };
 
-    const { unmount } = render(<SshPromptDialog />);
+    const { unmount } = renderDialog();
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
 
     // Cleanup fires while subscribe() is still pending — iteratorRef is undefined.
@@ -306,7 +327,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("does not double-close iterator on normal cleanup", async () => {
-    const { unmount } = render(<SshPromptDialog />);
+    const { unmount } = renderDialog();
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);
 
@@ -322,7 +343,7 @@ describe("SshPromptDialog", () => {
   });
 
   it("clears pending queue when api becomes null", async () => {
-    const { queryByRole, rerender } = render(<SshPromptDialog />);
+    const { queryByRole, rerender } = renderDialog();
 
     await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
     await enqueueRequest(MOCK_REQUEST);

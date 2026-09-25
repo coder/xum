@@ -4,11 +4,10 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIContext } from "@/browser/contexts/API";
 import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
-import type * as APIModuleType from "@/browser/contexts/API";
 import type * as ProjectContextModuleType from "@/browser/contexts/ProjectContext";
 import type * as WorkspaceTitleEditContextModuleType from "@/browser/contexts/WorkspaceTitleEditContext";
 import type * as ContextMenuPositionModuleType from "@/browser/hooks/useContextMenuPosition";
@@ -41,10 +40,7 @@ import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
 
 // Restore the provider contexts after the suite; partial row stubs must not
 // replace the real contexts used by later full Settings renders.
-restoreModulesAfterSuite([
-  ["@/browser/contexts/API", { ...RealAPIModule }],
-  ["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }],
-]);
+restoreModulesAfterSuite([["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }]]);
 
 let AgentListItem!: typeof AgentListItemComponent;
 
@@ -179,7 +175,6 @@ function installAgentListItemTestDoubles() {
   const actualReactDnd = require("react-dnd?real=1") as typeof ReactDndModuleType;
   const actualReactDndHtml5Backend =
     require("react-dnd-html5-backend?real=1") as typeof ReactDndHtml5BackendModuleType;
-  const actualApi = require("@/browser/contexts/API?real=1") as typeof APIModuleType;
   const actualProjectContext =
     require("@/browser/contexts/ProjectContext?real=1") as typeof ProjectContextModuleType;
   const actualWorkspaceTitleEditContext =
@@ -210,17 +205,6 @@ function installAgentListItemTestDoubles() {
   void mock.module("react-dnd-html5-backend", () => ({
     ...actualReactDndHtml5Backend,
     getEmptyImage: () => new Image(),
-  }));
-
-  void mock.module("@/browser/contexts/API", () => ({
-    ...actualApi,
-    useAPI: () => ({
-      api: null,
-      status: "error" as const,
-      error: "API unavailable",
-      authenticate: () => undefined,
-      retry: () => undefined,
-    }),
   }));
 
   void mock.module("@/browser/contexts/ProjectContext", () => ({
@@ -290,6 +274,24 @@ function installAgentListItemTestDoubles() {
   }));
 }
 
+// Rows render without a backend: inject an unavailable API through the real context
+// instead of mocking the API module (process-wide module mocks leak into later suites).
+function UnavailableAPIWrapper(props: { children: ReactNode }) {
+  return (
+    <APIContext.Provider
+      value={{
+        api: null,
+        status: "error",
+        error: "API unavailable",
+        authenticate: () => undefined,
+        retry: () => undefined,
+      }}
+    >
+      {props.children}
+    </APIContext.Provider>
+  );
+}
+
 function renderWorkspaceItem(
   options: {
     metadata?: FrontendWorkspaceMetadata;
@@ -332,7 +334,8 @@ function renderWorkspaceItem(
       onForkWorkspace={() => Promise.resolve()}
       onArchiveWorkspace={() => Promise.resolve()}
       onCancelCreation={() => Promise.resolve()}
-    />
+    />,
+    { wrapper: UnavailableAPIWrapper }
   );
 
   return {
@@ -1080,7 +1083,7 @@ describe("AgentListItem", () => {
         onCancelCreation={() => Promise.resolve()}
       />
     );
-    const view = render(renderItem());
+    const view = render(renderItem(), { wrapper: UnavailableAPIWrapper });
     const getRow = () =>
       view.container.querySelector<HTMLElement>(
         `[data-workspace-id="${metadata.id}"][role="button"]`
