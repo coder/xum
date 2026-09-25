@@ -12,13 +12,11 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import type { AIService } from "@/node/services/aiService";
-import type { AgentSession } from "./agentSession";
+import type { AgentSession, AgentSessionAIService } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
-import type { StreamMessageOptions } from "./turnRequestBuilder";
 import { waitForCondition } from "./testDispatchHelpers";
 
 type CompactionMonitorStub = Pick<
@@ -75,7 +73,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
   async function createSessionHarness(args: {
     workspaceId: string;
-    streamMessage?: AIService["streamMessage"];
+    streamMessage?: AgentSessionAIService["streamMessage"];
     agentAiDefaults?: AgentAiDefaults;
     captureEvents?: boolean;
     compactionMonitor?: CompactionMonitor;
@@ -104,13 +102,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     options: SendMessageOptions;
     agentAiDefaults?: AgentAiDefaults;
   }) {
-    const streamMessage = mock((_request: StreamMessageOptions) =>
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
     );
     const harness = await createSessionHarness({
       workspaceId: args.workspaceId,
       agentAiDefaults: args.agentAiDefaults,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      streamMessage,
       compactionMonitor: overThresholdMonitor({ usagePercentage: 95, thresholdPercentage: 70 }),
     });
     const result = await harness.session.sendMessage("hello", args.options);
@@ -133,13 +131,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("does not persist or emit snapshots before forced on-send compaction", async () => {
     const workspaceId = "ws-auto-compaction-snapshot-deferral";
 
-    const streamMessage = mock((_history: MuxMessage[]) =>
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     const { session, historyService, events, backgroundProcessManager } =
       await createSessionHarness({
         workspaceId,
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
         captureEvents: true,
         compactionMonitor: overThresholdMonitor({ usagePercentage: 99, thresholdPercentage: 85 }),
       });
@@ -437,13 +435,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-on-send-threshold";
 
     const streamRequests: unknown[] = [];
-    const streamMessage = mock((request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
       streamRequests.push(request);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session } = await createSessionHarness({
       workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      streamMessage,
       compactionMonitor: overThresholdMonitor({
         usagePercentage: 72,
         thresholdPercentage: 70,
@@ -473,7 +471,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-preferred-model";
 
     const streamRequests: unknown[] = [];
-    const streamMessage = mock((request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
       streamRequests.push(request);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
@@ -481,7 +479,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const { session } = await createSessionHarness({
       workspaceId,
       agentAiDefaults: { compact: { modelString: compactionModel } },
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      streamMessage,
       compactionMonitor: overThresholdMonitor({ usagePercentage: 95, thresholdPercentage: 70 }),
     });
 
@@ -508,13 +506,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-preserved-1m-routing";
 
     const streamRequests: unknown[] = [];
-    const streamMessage = mock((request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
       streamRequests.push(request);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      streamMessage,
     });
 
     const appendSeedUsage = await historyService.appendToHistory(
@@ -571,13 +569,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-disabled-beta-1m";
 
     const streamRequests: unknown[] = [];
-    const streamMessage = mock((request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
       streamRequests.push(request);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const { session, historyService } = await createSessionHarness({
       workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      streamMessage,
     });
 
     const appendSeedUsage = await historyService.appendToHistory(
@@ -720,7 +718,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     };
 
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       const usage = {
         inputTokens: 42,
         outputTokens: 1,
@@ -763,7 +761,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       workspaceId,
       aiEmitter,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
         // AIService serves ProviderService's providers-config view; the session must thread it.
         getProvidersConfig: mock(() => providersConfig),
       },
@@ -841,7 +839,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(appendCurrentEpochUser.success).toBe(true);
 
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) =>
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
     const checkBeforeSend = mock((params: unknown) => {
@@ -862,7 +860,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       historyService,
       aiEmitter,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
       compactionMonitor: stubCompactionMonitor({ checkBeforeSend }),
     });
@@ -886,7 +884,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiEmitter = new EventEmitter();
     let streamCallCount = 0;
-    const streamMessage = mock((_request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       streamCallCount += 1;
       if (streamCallCount === 1) {
         const usage = {
@@ -935,7 +933,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       aiEmitter,
       aiServiceOverrides: {
         stopStream,
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
       compactionMonitor: stubCompactionMonitor({
         checkMidStream: () => {
@@ -993,7 +991,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const aiEmitter = new EventEmitter();
     const streamHistories: MuxMessage[][] = [];
     let streamCallCount = 0;
-    const streamMessage = mock((request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
       const requestMessages =
         typeof request === "object" && request !== null && "messages" in request
           ? (request as { messages?: unknown }).messages
@@ -1053,7 +1051,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       aiEmitter,
       aiServiceOverrides: {
         stopStream,
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
       compactionMonitor: stubCompactionMonitor({ checkMidStream }),
     });
@@ -1118,7 +1116,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
 
   interface GuidanceStreamFixture {
     session: AgentSession;
-    aiService: Pick<AIService, "getWorkspaceMetadata">;
+    aiService: Pick<AgentSessionAIService, "getWorkspaceMetadata">;
     historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"];
     aiEmitter: EventEmitter;
     streamHistories: MuxMessage[][];
@@ -1139,7 +1137,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     const streamHistories: MuxMessage[][] = [];
 
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((request: unknown) => {
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
       const requestMessages =
         typeof request === "object" && request !== null && "messages" in request
           ? (request as { messages?: unknown }).messages
@@ -1197,7 +1195,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
           // No real workspace behind the test session; skip @file snapshot materialization.
           Promise.resolve(Err("no workspace metadata in test"))
         ),
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     historyCleanup = harness.cleanup;
