@@ -35,6 +35,11 @@ describe("Known Models Integration", () => {
     ["haiku", /^anthropic:claude-haiku-/],
     // The flagship alias stays off the pricier Astra tier (Astra is additive).
     ["gpt", /^openai:gpt-(?!.*astra)/],
+    // GPT tier names users type with /model (tier, not version, so they survive releases).
+    ["sol", /^openai:gpt-[\d.]+-sol$/],
+    ["terra", /^openai:gpt-[\d.]+-terra$/],
+    ["luna", /^openai:gpt-[\d.]+-luna$/],
+    ["astra", /^openai:gpt-[\d.]+-astra$/],
     ["codex", /^openai:gpt-[\d.]+-codex$/],
     ["gemini", /^google:gemini-.*pro/],
     ["gemini-flash", /^google:gemini-.*flash/],
@@ -42,6 +47,7 @@ describe("Known Models Integration", () => {
     ["deepseek", /^deepseek:deepseek-.*pro/],
     ["kimi", /^moonshotai:kimi-/],
     ["glm", /^zai:glm-/],
+    ["glm-flash", /^zai:glm-.*flash/],
   ])("user-facing alias %s resolves within its model family", (alias, family) => {
     expect(MODEL_ABBREVIATIONS[alias]).toMatch(family);
   });
