@@ -1,6 +1,5 @@
 import "../../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -15,21 +14,13 @@ const controlMock = mock<() => Promise<BrowserControlResponse>>(() =>
   Promise.resolve({ success: true })
 );
 
-// Later full-app suites must not inherit this partial API client.
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...RealAPIModule }]]);
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: {
-      browser: {
-        control: controlMock,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+const apiClient = {
+  browser: {
+    control: controlMock,
+  },
+} as unknown as APIClient;
 
 import { BrowserToolbar } from "./BrowserToolbar";
 
@@ -37,16 +28,18 @@ function renderToolbar(overrides: Partial<ComponentProps<typeof BrowserToolbar>>
   const onSetPendingUrl = mock(() => undefined);
 
   const view = render(
-    <BrowserToolbar
-      workspaceId="workspace-1"
-      sessionName="session-a"
-      currentUrl="https://current.example.com"
-      pendingUrl={null}
-      isPageLoading={false}
-      isConnected={true}
-      onSetPendingUrl={onSetPendingUrl}
-      {...overrides}
-    />
+    <APIProvider client={apiClient}>
+      <BrowserToolbar
+        workspaceId="workspace-1"
+        sessionName="session-a"
+        currentUrl="https://current.example.com"
+        pendingUrl={null}
+        isPageLoading={false}
+        isConnected={true}
+        onSetPendingUrl={onSetPendingUrl}
+        {...overrides}
+      />
+    </APIProvider>
   );
 
   return { onSetPendingUrl, ...view };

@@ -1,11 +1,11 @@
 import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import * as RealAPIModule from "@/browser/contexts/API";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as RealClipboardModule from "@/browser/utils/clipboard";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import { useEffect, useState, type ComponentProps } from "react";
+import { useEffect, useState, type ComponentProps, type ReactElement, type ReactNode } from "react";
 
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
@@ -28,21 +28,36 @@ interface MockApiClient {
 let mockApi: MockApiClient;
 let clipboardWrites: string[] = [];
 
-// Later suites must not inherit this partial API client or the clipboard stub (which
-// swallowed clipboard.test.ts's copies when it ran later in the same process).
-restoreModulesAfterSuite([
-  ["@/browser/contexts/API", { ...RealAPIModule }],
-  ["@/browser/utils/clipboard", { ...RealClipboardModule }],
-]);
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: mockApi,
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Later suites must not inherit the clipboard stub (which swallowed clipboard.test.ts's
+// copies when it ran later in the same process).
+restoreModulesAfterSuite([["@/browser/utils/clipboard", { ...RealClipboardModule }]]);
+
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites. The wrapper reads mockApi at
+// render time because beforeEach replaces it; view.rerender() keeps the wrapper.
+function ApiWrapper(props: { children: ReactNode }) {
+  // A null mockApi models the backend being unavailable: the real context then carries api: null.
+  if (mockApi === null) {
+    return (
+      <APIContext.Provider
+        value={{
+          status: "connecting",
+          api: null,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    );
+  }
+  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+}
+
+function renderWithApi(ui: ReactElement) {
+  return render(ui, { wrapper: ApiWrapper });
+}
 
 void mock.module("@/browser/utils/clipboard", () => ({
   copyToClipboard: (text: string) => {
@@ -111,7 +126,7 @@ function renderImmersiveReview(
 ) {
   const hunk = createHunk();
 
-  return render(
+  return renderWithApi(
     <ThemeProvider forcedTheme="dark">
       <ImmersiveReviewView
         workspaceId="workspace-1"
@@ -338,7 +353,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView(assistedHunk.id));
+    const view = renderWithApi(renderView(assistedHunk.id));
 
     expect(view.container.querySelector('[data-assisted-banner-slot="true"]')).toBeTruthy();
     const banner = view.getByTestId("immersive-assisted-banner");
@@ -465,7 +480,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView([hunkA, hunkB], hunkA.id));
+    const view = renderWithApi(renderView([hunkA, hunkB], hunkA.id));
 
     // Full-file context hydrates and the loading cover clears (file is on screen).
     await waitFor(() => expect(view.container.textContent ?? "").toContain("file line 12"));
@@ -535,7 +550,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView(baseHunk));
+    const view = renderWithApi(renderView(baseHunk));
     // Full-file context hydrates: a context-only line from the file body is visible.
     await waitFor(() => expect(view.container.textContent ?? "").toContain("file line 12"));
     const readsAfterFirstHydration = readCount;
@@ -638,7 +653,7 @@ describe("ImmersiveReviewView", () => {
       </ThemeProvider>
     );
 
-    const view = render(renderView(firstHunk.id));
+    const view = renderWithApi(renderView(firstHunk.id));
     await waitFor(() => expect(mockApi.workspace.executeBash).toHaveBeenCalledTimes(1));
 
     view.rerender(renderView(secondHunk.id));
@@ -814,7 +829,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<ParentEchoHarness />);
+    const view = renderWithApi(<ParentEchoHarness />);
 
     const findMarkReadButton = () =>
       view.container.querySelector<HTMLButtonElement>('button[aria-label="Mark hunk as read"]');
@@ -990,7 +1005,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(
+    const view = renderWithApi(
       <ThemeProvider forcedTheme="dark">
         <ParentPanelHarness />
       </ThemeProvider>
@@ -1107,7 +1122,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<NavigationHarness />);
+    const view = renderWithApi(<NavigationHarness />);
 
     const copyButton = view.container.querySelector<HTMLButtonElement>(
       'button[aria-label="Copy file contents"]'
@@ -1188,7 +1203,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<InPlaceEditHarness />);
+    const view = renderWithApi(<InPlaceEditHarness />);
 
     const copyButton = view.container.querySelector<HTMLButtonElement>(
       'button[aria-label="Copy file contents"]'
@@ -1260,7 +1275,7 @@ describe("ImmersiveReviewView", () => {
       );
     }
 
-    const view = render(<NavigationHarness />);
+    const view = renderWithApi(<NavigationHarness />);
 
     const clickCopy = () => {
       const button = view.container.querySelector<HTMLButtonElement>(
