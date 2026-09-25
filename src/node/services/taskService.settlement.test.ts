@@ -1751,7 +1751,9 @@ describe("TaskService", () => {
         pending.get(taskId)!.resolve(Ok(undefined));
         await new Promise((resolve) => setTimeout(resolve, 0));
         expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+        });
       } finally {
         restoreTimers();
       }
@@ -1790,7 +1792,9 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       // A new attempt starts: the old settlement must not leak into it...
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
@@ -1822,7 +1826,9 @@ describe("TaskService", () => {
       const { taskService, aiService } = createTaskServiceHarness(config, { workspaceService });
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       const retiredAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
       expect(retiredAttemptId).toMatch(/^att_[0-9a-f]{16}$/);
 
@@ -1851,7 +1857,9 @@ describe("TaskService", () => {
           expect(outcome.reason).toContain("without settlement evidence");
         }
         await taskService.terminateAllDescendantAgentTasks(rootId);
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+        });
         expect(findWorkspaceInConfig(config, taskId)?.taskAttemptId).toBe(published);
       } finally {
         metadata.mockRestore();
@@ -1893,7 +1901,9 @@ describe("TaskService", () => {
         // A Stop settles THIS process's attempt (same-process authority, as on main for any
         // owned attempt); cross-process authority stays fail-closed through the marker.
         await taskService.terminateAllDescendantAgentTasks(rootId);
-        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+        });
         const owned = (
           taskService as unknown as {
             ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
@@ -1919,7 +1929,9 @@ describe("TaskService", () => {
       const { taskService, aiService } = createTaskServiceHarness(config);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
       let reawaken: Promise<boolean> | undefined;
       const metadata = spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(() => {
         // Direct input can reawaken while the rejected task send is awaiting metadata. Its
@@ -2171,7 +2183,9 @@ describe("TaskService", () => {
           // that follows makes it redundant.
           await taskService.terminateAllDescendantAgentTasks(rootId);
           expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
-          expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+          expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+            kind: "terminal-no-report",
+          });
         }
 
         await streamEnd(taskService, reportStreamEnd(taskId, "final answer"));
@@ -2346,7 +2360,9 @@ describe("TaskService", () => {
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
       expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
       expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({ kind: "terminal-no-report" });
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+      });
     });
   });
 
@@ -2937,11 +2953,14 @@ describe("TaskService", () => {
         await taskService.maybeStartQueuedTasks();
         await new Promise((resolve) => setTimeout(resolve, 5));
         expect(launch).not.toHaveBeenCalled();
-        // Control: the same persisted state seen by a fresh process stays indeterminate (no owner).
+        // Control: a fresh process owns nothing. It proves the no-report settlement only from the
+        // parent's receipt, which exists only when the failed commit's row was written (G2).
         const { taskService: legacyService } = createTaskServiceHarness(config);
         expect(
           (await legacyService.readAttemptOutcome(firstId, { requestingWorkspaceId: rootId })).kind
-        ).toBe("indeterminate");
+        ).toBe(
+          failure === "config-commit-throws-after-write" ? "terminal-no-report" : "indeterminate"
+        );
       }
     );
 
