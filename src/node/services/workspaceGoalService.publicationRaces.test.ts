@@ -18,6 +18,7 @@ import {
   goalFileExists,
   analyticsMock,
   continuationBridge,
+  driveOneContinuation,
 } from "./workspaceGoalService.testHarness";
 
 describe("WorkspaceGoalService", () => {
@@ -48,33 +49,6 @@ describe("WorkspaceGoalService", () => {
   afterEach(async () => {
     await cleanup();
   });
-
-  // Drive one real continuation so the goal leaves its kickoff window
-  // (lastContinuationFiredAtMs set + goal_continuation row in history).
-  async function driveOneContinuation(): Promise<void> {
-    const dispatcher = new IdleDispatcher();
-    service.registerGoalContinuationConsumer(
-      dispatcher,
-      continuationBridge(async (input) => {
-        await appendUserHistoryMessage(historyService, input.workspaceId, input.message, {
-          timestamp: Date.now(),
-          synthetic: true,
-          uiVisible: true,
-          kind: input.kind ?? GOAL_CONTINUATION_KIND,
-        });
-        return true;
-      })
-    );
-    await service.requestContinuationAfterStreamEnd({
-      workspaceId,
-      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
-      streamEndedAtMs: 10_000,
-    });
-    await waitForCondition(
-      async () => (await service.getGoal(workspaceId))?.lastContinuationFiredAtMs != null,
-      { timeoutMs: 1_000 }
-    );
-  }
 
   test("direct idle creation persists the publication stamp in a single durable write", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cDhNO): the previous re-stamp scheme wrote the
@@ -1188,7 +1162,7 @@ describe("WorkspaceGoalService", () => {
     // writing the resumed goal back to paused would discard the Resume with
     // no repair path (candidate restoration requires an active goal).
     await setGoalOk(service, { workspaceId, objective: "Driven then resumed" });
-    await driveOneContinuation();
+    await driveOneContinuation(service, historyService, workspaceId);
     // Keep the resume from arming a kickoff candidate so this exercises the
     // durable path (candidates are lost on restart/eviction anyway).
     (service as unknown as { suppressKickoffContinuation: boolean }).suppressKickoffContinuation =

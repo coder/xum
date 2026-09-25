@@ -30,6 +30,7 @@ import {
   PROJECT_PATH,
   analyticsMock,
   continuationBridge,
+  driveOneContinuation,
 } from "./workspaceGoalService.testHarness";
 
 describe("WorkspaceGoalService", () => {
@@ -60,33 +61,6 @@ describe("WorkspaceGoalService", () => {
   afterEach(async () => {
     await cleanup();
   });
-
-  // Drive one real continuation so the goal leaves its kickoff window
-  // (lastContinuationFiredAtMs set + goal_continuation row in history).
-  async function driveOneContinuation(): Promise<void> {
-    const dispatcher = new IdleDispatcher();
-    service.registerGoalContinuationConsumer(
-      dispatcher,
-      continuationBridge(async (input) => {
-        await appendUserHistoryMessage(historyService, input.workspaceId, input.message, {
-          timestamp: Date.now(),
-          synthetic: true,
-          uiVisible: true,
-          kind: input.kind ?? GOAL_CONTINUATION_KIND,
-        });
-        return true;
-      })
-    );
-    await service.requestContinuationAfterStreamEnd({
-      workspaceId,
-      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
-      streamEndedAtMs: 10_000,
-    });
-    await waitForCondition(
-      async () => (await service.getGoal(workspaceId))?.lastContinuationFiredAtMs != null,
-      { timeoutMs: 1_000 }
-    );
-  }
 
   test("does not write null activity snapshots for ordinary no-goal reads", async () => {
     // Goals are GA, so tool availability asks for the current goal on every
@@ -329,7 +303,7 @@ describe("WorkspaceGoalService", () => {
 
   test("getGoal reconciles driven active goals to paused when the latest user turn is not a continuation", async () => {
     await setGoalOk(service, { workspaceId, objective: "Follow chat tail" });
-    await driveOneContinuation();
+    await driveOneContinuation(service, historyService, workspaceId);
     await appendUserHistoryMessage(historyService, workspaceId, "Manual interruption");
 
     const reconciled = await service.getGoal(workspaceId);
@@ -621,7 +595,7 @@ describe("WorkspaceGoalService", () => {
     await setGoalOk(service, { workspaceId, objective: "Ignore maintenance rows" });
     // Drive a real continuation first so the goal is past its kickoff window
     // and the synthetic-row skip below is what keeps it active.
-    await driveOneContinuation();
+    await driveOneContinuation(service, historyService, workspaceId);
     await appendUserHistoryMessage(historyService, workspaceId, "Synthetic heartbeat", {
       timestamp: Date.now(),
       synthetic: true,

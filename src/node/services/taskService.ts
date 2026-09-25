@@ -696,9 +696,9 @@ type TaskReservationStage =
   | "launch";
 
 /** Prefix of every cancellation error createMany returns (never the restart sentinel). */
-export const TASK_RESERVATION_INTERRUPTED_PREFIX = "Interrupted";
+const TASK_RESERVATION_INTERRUPTED_PREFIX = "Interrupted";
 /** taskLaunchError persisted for a reservation canceled before its launch was admitted. */
-export const TASK_RESERVATION_CANCELED_MESSAGE = "Reservation canceled";
+const TASK_RESERVATION_CANCELED_MESSAGE = "Reservation canceled";
 
 /**
  * Stage tracking for one createMany call: the last entered stage is included in cancellation
