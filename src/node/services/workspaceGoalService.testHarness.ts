@@ -6,6 +6,9 @@ import type { Config } from "@/node/config";
 import type { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { type GoalContinuationRuntimeBridge } from "./workspaceGoalService";
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import { IdleDispatcher } from "./idleDispatcher";
+import { waitForCondition } from "./testDispatchHelpers";
 import type { HistoryService } from "./historyService";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { createMuxMessage } from "@/common/types/message";
@@ -95,4 +98,37 @@ export function continuationBridge(
     getRuntimeState: () => ({ isRuntimeCompatible: true }),
     executeGoalContinuation,
   };
+}
+
+/**
+ * Drive one real continuation so the goal leaves its kickoff window
+ * (lastContinuationFiredAtMs set + goal_continuation row in history).
+ */
+export async function driveOneContinuation(
+  service: WorkspaceGoalService,
+  historyService: HistoryService,
+  workspaceId: string
+): Promise<void> {
+  const dispatcher = new IdleDispatcher();
+  service.registerGoalContinuationConsumer(
+    dispatcher,
+    continuationBridge(async (input) => {
+      await appendUserHistoryMessage(historyService, input.workspaceId, input.message, {
+        timestamp: Date.now(),
+        synthetic: true,
+        uiVisible: true,
+        kind: input.kind ?? GOAL_CONTINUATION_KIND,
+      });
+      return true;
+    })
+  );
+  await service.requestContinuationAfterStreamEnd({
+    workspaceId,
+    sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+    streamEndedAtMs: 10_000,
+  });
+  await waitForCondition(
+    async () => (await service.getGoal(workspaceId))?.lastContinuationFiredAtMs != null,
+    { timeoutMs: 1_000 }
+  );
 }
