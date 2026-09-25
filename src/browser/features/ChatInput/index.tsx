@@ -194,6 +194,7 @@ import {
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
+import type { ChatAttachment } from "./ChatAttachments";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import {
   COMPOSER_CONTROL_HEIGHT_CLASS,
@@ -268,6 +269,19 @@ async function forEachProviderConfigChange(
   } catch {
     // Subscription cancelled via abort signal - expected on cleanup
   }
+}
+
+/** Composer attachments for a restored or edited message (provider files, then staged files). */
+function pendingChatAttachments(
+  pending: PendingUserMessage,
+  attachmentKeyPrefix: string
+): ChatAttachment[] {
+  const providerAttachments = filePartsToChatAttachments(pending.fileParts, attachmentKeyPrefix);
+  const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
+    ...attachment,
+    id: `${attachmentKeyPrefix}-staged-${index}`,
+  }));
+  return [...providerAttachments, ...stagedAttachments];
 }
 
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
@@ -478,6 +492,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const workspaceIdForComposerClear = variant === "workspace" ? props.workspaceId : null;
   const onDetachAllReviewsForComposerClear =
     variant === "workspace" ? props.onDetachAllReviews : undefined;
+  const onAddReviewForRestore = variant === "workspace" ? props.onAddReview : undefined;
 
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
@@ -1128,17 +1143,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const applyDraftFromPending = useCallback(
     (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
-      const providerAttachments = filePartsToChatAttachments(
-        pending.fileParts,
-        attachmentKeyPrefix
-      );
-      const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
-        ...attachment,
-        id: `${attachmentKeyPrefix}-staged-${index}`,
-      }));
       setDraft({
         text: pending.content,
-        attachments: [...providerAttachments, ...stagedAttachments],
+        attachments: pendingChatAttachments(pending, attachmentKeyPrefix),
       });
     },
     [setDraft]
@@ -1394,7 +1401,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const handler = (e: Event) => {
       const customEvent = e as CustomEvent<{
         text: string;
-        mode?: "append" | "replace";
+        mode?: "append" | "replace" | "restore";
         fileParts?: FilePart[];
         reviews?: ReviewNoteDataForDisplay[];
         workspaceId?: string;
@@ -1419,7 +1426,38 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const hasStagedAttachments = restoredPending.stagedAttachments.length > 0;
       const hasReviews = restoredPending.reviews.length > 0;
 
-      if (mode === "replace") {
+      if (mode === "restore") {
+        // A queued message returned by Stop (#4431). It must not destroy a newer draft the user
+        // typed while it waited, so it goes in front of whatever the composer holds: it was
+        // written, and would have been sent, first. An empty composer ends up with exactly the
+        // restored message, as the old replace did. Functional updates merge with the current
+        // draft rather than the one this listener was registered with.
+        // Like "replace", never inject into a historical-message edit (e.g. canceling compaction
+        // enters edit mode before its interrupt restores the queue).
+        if (editingMessageForUi) {
+          return;
+        }
+        const restoredAttachments = pendingChatAttachments(restoredPending, restoredIdPrefix);
+        setInput((current) =>
+          [restoredPending.content, current].filter((part) => part.trim().length > 0).join("\n\n")
+        );
+        if (restoredAttachments.length > 0) {
+          setAttachments((current) => [...restoredAttachments, ...current]);
+        }
+        if (restoredPending.reviews.length > 0) {
+          if (draftReviews === null && onAddReviewForRestore) {
+            // The draft's notes live in the review store: add the restored ones there too, as
+            // new attached notes. A detached copy in the override would hide later store
+            // changes, and a send in flight checks off only the notes it captured, not these.
+            // Called here, not in a state updater, which may run more than once.
+            for (const review of restoredPending.reviews) onAddReviewForRestore(review);
+          } else {
+            // An active override (e.g. a queued-message edit) owns the composer's notes.
+            setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
+          }
+        }
+        focusMessageInput();
+      } else if (mode === "replace") {
         if (editingMessageForUi) {
           return;
         }
@@ -1453,6 +1491,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     getDraft,
     editingMessageForUi,
     workspaceIdForComposerClear,
+    setInput,
+    setAttachments,
+    draftReviews,
+    setDraftReviews,
+    onAddReviewForRestore,
+    focusMessageInput,
   ]);
 
   useEffect(() => {

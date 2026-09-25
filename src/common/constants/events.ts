@@ -150,7 +150,8 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.UPDATE_CHAT_INPUT]: {
     text: string;
-    mode?: "replace" | "append";
+    /** "restore": put a returned queued message in front of the current draft (never replaces it). */
+    mode?: "replace" | "append" | "restore";
     fileParts?: FilePart[];
     reviews?: ReviewNoteDataForDisplay[];
     /** When set, only the matching workspace composer may apply this update. */
