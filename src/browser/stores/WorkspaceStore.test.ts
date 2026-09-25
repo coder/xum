@@ -3527,9 +3527,10 @@ describe("WorkspaceStore", () => {
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).not.toBeNull();
       // Releasing the keyed channel notifies its row subscriber; nothing else does on stream-end.
       const releasedRow = mock(() => undefined);
+      const liveRowId = trailingRowId();
       const unsubscribeLiveRow = store.subscribeStreamingMessage(
         workspaceId,
-        trailingRowId(),
+        liveRowId,
         releasedRow
       );
 
@@ -3542,6 +3543,11 @@ describe("WorkspaceStore", () => {
       // so transcript-level transforms (e.g. merged stream errors) survive.
       expect(releasedRow).toHaveBeenCalledTimes(1);
       expect(store.getStreamingMessage(workspaceId, streamingRow.id, messageId)).toBeNull();
+      // Private on purpose: deletion (not a bump) is the leak guard, with no public observable.
+      const { streamingMessageStore } = getInternal<{
+        streamingMessageStore: { has: (key: string) => boolean };
+      }>(store);
+      expect(streamingMessageStore.has(`${workspaceId}\u0000${liveRowId}`)).toBe(false);
       unsubscribeLiveRow();
       unsubscribeStats();
       unsubscribeWorkspace();
