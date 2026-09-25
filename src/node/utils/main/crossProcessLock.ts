@@ -16,9 +16,11 @@ import { probeProcessBirth } from "@/node/utils/concurrency/fileLock";
  * read-modify-write transactions on shared files can interleave and the last
  * writer silently drops the other's changes.
  *
- * FAIL-CLOSED LIVENESS (#4415): a lock is never taken from a holder that is
- * live, or whose death cannot be established (see judge() for exactly what
- * counts as evidence on each platform). Age is NOT evidence of death: a holder
+ * FAIL-CLOSED LIVENESS (#4415): within one PID domain a lock is never taken
+ * from a live holder, or one whose death cannot be established; records from
+ * a positively different PID domain are treated as retired under the
+ * single-PID-domain deployment contract (see judge() for exactly what counts
+ * as evidence on each platform). Age is NOT evidence of death: a holder
  * whose libuv threadpool is starved by hung fs calls, that is SIGSTOPped, or
  * that is suspended stops renewing yet resumes and keeps writing. The former
  * "older than staleMs ⇒ reclaimable" lease let a sibling take the lock while
@@ -71,9 +73,9 @@ export class CrossProcessLockTimeoutError extends Error {}
 
 /**
  * Process identity recorded in v2 holder records. Linux: `birth` is the
- * /proc starttime, `bootId`/`pidNs` define the PID domain in which a pid is
- * meaningful, and `machineId` is a mismatch check (plus reboot recovery).
- * `platform` is a MISMATCH check only. `hostname` is diagnostic only (shown
+ * /proc starttime and `bootId`/`pidNs` define the PID domain in which a pid
+ * is meaningful. `machineId` and `platform` count only when both sides have
+ * them and they DIFFER (a positively different domain; see judge()). `hostname` is diagnostic only (shown
  * in the timeout error): macOS hostnames change with networks, so refusing on
  * a mismatch would keep a crashed holder's lock refused forever.
  */
@@ -287,20 +289,23 @@ function pidGone(pid: number): boolean {
  * Death proof for a lock or guard record. Anything not judged dead is live or
  * indeterminate and is never reclaimed; age never reclaims.
  *
- * 1. Mismatch-only evidence: a different platform or machine-id (each
- *    compared only when both sides have it) means another machine or OS ⇒
- *    refuse. Equality proves nothing by itself. Hostname is not evidence.
- * 2. Linux, with our boot id and PID namespace readable: the record must name
- *    both. Same boot + same namespace ⇒ the pid is comparable: ESRCH or a
- *    different starttime ⇒ dead. Different boot with equal machine-ids ⇒ an
- *    earlier boot of this machine ⇒ dead (reboot recovery; cloned VMs sharing
- *    one network XUM_ROOT with equal machine-ids are outside the contract).
- *    Any other boot/namespace mismatch or missing value ⇒ refuse.
- * 3. macOS/Windows (no qualified PID-domain identity) and legacy v1 records:
- *    ASSUMES the holder shares this host's PID domain. ESRCH ⇒ dead; a live
- *    pid (or EPERM) ⇒ refuse. A holder on another host sharing the home, or
- *    in another PID domain, is misjudged dead when its pid is absent locally
- *    — only a recorded platform mismatch catches that.
+ * DEPLOYMENT CONTRACT (user decision, #4415): every cooperating Xum process
+ * sharing one XUM_ROOT runs in one PID domain; a replaced domain (restarted
+ * or replaced container, rebooted host) is retired and cannot resume before
+ * a new one accesses the root. Concurrent cross-domain sharing is
+ * unsupported, not prevented.
+ *
+ * 1. A POSITIVELY different PID domain is retired by contract ⇒ dead:
+ *    machine-ids both present and different; platforms both recorded and
+ *    different; on Linux (both sides naming boot id and PID namespace) a
+ *    different boot id or namespace. Hostname is diagnostic, not evidence.
+ * 2. UNKNOWN domain evidence is not dead ⇒ refuse: a v2 record missing its
+ *    boot id/namespace while we have ours, or naming one we cannot read.
+ * 3. Same domain (proven on Linux): ESRCH or a different starttime ⇒ dead;
+ *    a live pid (or EPERM) ⇒ refuse.
+ * 3a. macOS/Windows (no qualified PID-domain identity) and legacy v1 records:
+ *    ASSUMES the holder shares this host's PID domain (the contract). ESRCH ⇒
+ *    dead; a live pid (or EPERM) ⇒ refuse.
  * 4. Same pid (in a domain that passed the checks above) is this process or a
  *    previous one that had our pid: live only while the token is registered
  *    in liveTokens. Legacy records cannot be ours, so a legacy record with
@@ -320,21 +325,17 @@ function judge(observation: Generation): Verdict {
   }
   const self = getSelfIdentity();
   const differs = (a: string | null, b: string | null) => a !== null && b !== null && a !== b;
+  // Positively different PID domain: retired by the deployment contract.
   if (differs(record.platform, self.platform) || differs(record.machineId, self.machineId)) {
-    return refuse("it was written on another machine or OS");
+    return DEAD;
   }
   const linuxDomain = self.bootId !== null && self.pidNs !== null;
   if (linuxDomain) {
     if (record.bootId === null || record.pidNs === null) {
       return refuse("its boot or PID namespace is unknown");
     }
-    if (record.bootId !== self.bootId) {
-      return record.machineId !== null && record.machineId === self.machineId
-        ? DEAD
-        : refuse("it comes from another boot and its machine cannot be verified as this one");
-    }
-    if (record.pidNs !== self.pidNs) {
-      return refuse("it belongs to another PID namespace (container)");
+    if (record.bootId !== self.bootId || record.pidNs !== self.pidNs) {
+      return DEAD;
     }
   } else if (record.bootId !== null || record.pidNs !== null) {
     return refuse("it names a PID domain this process cannot verify");
@@ -442,8 +443,11 @@ const MAX_SUPERSEDE_DEPTH = 8;
  * made (a) by K's owner (renewal/release of the lock, deletion of its own
  * guard), (b) by the process holding guardPath(file, K) after re-reading K,
  * or (c) by link-create, which needs the path absent. judge() declares K dead
- * only when K's owner can never write again (its pid is gone, it predates
- * this boot, or it is an unregistered token of this process). So once we
+ * only when K's owner can never write again: its pid is gone or reused, it
+ * is an unregistered token of this process, or it belongs to a positively
+ * different PID domain — that last case holds ONLY under the deployment
+ * contract's retirement assumption (a replaced domain never resumes; see
+ * judge()), not by observation. So once we
  * hold the guard and re-read K, the file cannot change before our rename:
  * (a) is impossible, (b) is us — our guard record is live, so it is never
  * superseded — and (c) needs absence. Hence:

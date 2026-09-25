@@ -396,62 +396,36 @@ describe("Linux identity judgment", () => {
     }
   );
 
+  // Formerly refused: under the single-PID-domain deployment contract a
+  // POSITIVELY different domain is retired, so its record is dead even when a
+  // process with that pid number is running here (the pid means nothing).
   test.skipIf(linuxOnly)(
-    "foreign PID namespace or machine-id is refused even when the pid is gone locally; hostname alone is not",
+    "positively foreign PID domain (namespace, boot, machine-id) is retired: reclaimed",
     async () => {
       const lockPath = await tempLockPath();
       const identity = await ownIdentity();
-      await writeRecord(lockPath, {
-        ...identity,
-        pid: deadPid(),
-        pidNs: "pid:[1]",
-        token: "container",
-      });
-      expect((await expectRefused(lockPath)).message).toContain("PID namespace");
-      await writeRecord(lockPath, {
-        ...identity,
-        pid: deadPid(),
-        machineId: "0".repeat(32),
-        token: "other-machine",
-      });
-      expect((await expectRefused(lockPath)).message).toContain("another machine");
-      // Hostname is diagnostic only: a renamed host alone does not refuse.
-      await writeRecord(lockPath, {
-        ...identity,
-        pid: deadPid(),
-        hostname: "some-other-host",
-        token: "renamed-host",
-      });
-      await expectAcquired(lockPath);
-    }
-  );
-
-  test.skipIf(linuxOnly)(
-    "different boot: reclaimed only when both machine-ids are present and equal",
-    async () => {
-      const lockPath = await tempLockPath();
-      const identity = await ownIdentity();
-      const holder = liveProcess(); // a live pid number is irrelevant across boots
+      const unrelated = liveProcess();
       try {
-        if (identity.machineId !== null) {
-          await writeRecord(lockPath, {
-            ...identity,
-            pid: holder.pid,
-            bootId: "earlier-boot",
-            token: "reboot",
-          });
+        const foreign: Array<[string, Record<string, unknown>]> = [
+          ["other-namespace-same-boot", { pidNs: "pid:[1]" }],
+          ["other-boot-no-machine-id", { bootId: "earlier-boot", machineId: null }],
+          ["other-boot-same-machine", { bootId: "earlier-boot" }],
+          ["other-machine", { machineId: "0".repeat(32) }],
+        ];
+        for (const [token, fields] of foreign) {
+          await writeRecord(lockPath, { ...identity, pid: unrelated.pid, token, ...fields });
           await expectAcquired(lockPath);
         }
+        // Hostname is diagnostic only: a renamed host alone changes nothing.
         await writeRecord(lockPath, {
           ...identity,
-          pid: holder.pid,
-          bootId: "earlier-boot",
-          machineId: null,
-          token: "unknown-machine",
+          pid: deadPid(),
+          hostname: "some-other-host",
+          token: "renamed-host",
         });
-        expect((await expectRefused(lockPath)).message).toContain("another boot");
+        await expectAcquired(lockPath);
       } finally {
-        holder.stop();
+        unrelated.stop();
       }
     }
   );
@@ -470,16 +444,17 @@ describe("Linux identity judgment", () => {
     }
   );
 
-  test.skipIf(linuxOnly)("a v2 record without boot/namespace evidence is refused", async () => {
-    const lockPath = await tempLockPath();
-    await writeRecord(lockPath, {
-      ...(await ownIdentity()),
-      pid: deadPid(),
-      pidNs: null,
-      token: "no-ns",
-    });
-    expect((await expectRefused(lockPath)).message).toContain("unknown");
-  });
+  test.skipIf(linuxOnly)(
+    "a v2 record missing boot id or namespace is unknown evidence: refused",
+    async () => {
+      const lockPath = await tempLockPath();
+      const identity = await ownIdentity();
+      for (const missing of [{ pidNs: null }, { bootId: null }]) {
+        await writeRecord(lockPath, { ...identity, pid: deadPid(), token: "unknown", ...missing });
+        expect((await expectRefused(lockPath)).message).toContain("unknown");
+      }
+    }
+  );
 });
 
 describe("macOS/Windows rule (simulated identity; not natively qualified)", () => {
@@ -492,7 +467,7 @@ describe("macOS/Windows rule (simulated identity; not natively qualified)", () =
     hostname: "mac-a",
   };
 
-  test("dead pid reclaimed (even after a hostname change); live pid or a Linux record refused", async () => {
+  test("dead pid reclaimed (even after a hostname change); live pid refused; a Linux record is retired", async () => {
     setSelfIdentityForTesting(darwin);
     const holder = liveProcess();
     try {
@@ -515,10 +490,13 @@ describe("macOS/Windows rule (simulated identity; not natively qualified)", () =
         platform: "linux",
         bootId: "b",
         pidNs: "n",
-        pid: deadPid(),
+        pid: holder.pid, // a live local pid is irrelevant: a positively foreign domain
         token: "linux",
       });
-      await expectRefused(lockPath);
+      await expectAcquired(lockPath);
+      // A macOS record naming a PID domain we cannot read is unknown evidence.
+      await writeRecord(lockPath, { v: 2, ...darwin, bootId: "b", pid: deadPid(), token: "odd" });
+      expect((await expectRefused(lockPath)).message).toContain("cannot verify");
     } finally {
       holder.stop();
       setSelfIdentityForTesting(undefined);
