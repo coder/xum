@@ -1,56 +1,14 @@
 import type { ReactElement } from "react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { APIContext } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import * as OriginalWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import * as OriginalWorkflowToolSharedModule from "@/browser/features/Tools/WorkflowToolShared";
-import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 
 import { installDom } from "../../../../../tests/ui/dom";
-import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-
-// Restore the real modules once this suite ends: the overlay below otherwise stays registered
-// for every later file in the bun process (ModelsSection.discovery timed out behind it).
-// Spread before mocking; the namespace imports are live bindings the mocks would replace.
-restoreModulesAfterSuite([
-  ["@/browser/stores/WorkspaceStore", { ...OriginalWorkspaceStoreModule }],
-  ["@/browser/features/Tools/WorkflowToolShared", { ...OriginalWorkflowToolSharedModule }],
-]);
-
-void mock.module("@/browser/features/Tools/WorkflowToolShared", () => ({
-  WorkflowJsonBlock: (props: { value: unknown; ariaLabel: string }) => (
-    <pre aria-label={props.ariaLabel}>{JSON.stringify(props.value)}</pre>
-  ),
-}));
-
-let workflowTaskWorkspaces = new Map<string, FrontendWorkspaceMetadata>();
-let navigateToWorkspace: (workspaceId: string) => void = () => undefined;
-const workspaceStoreSubscribers = new Set<() => void>();
-
-/* eslint-disable @typescript-eslint/no-require-imports */
-const actualWorkspaceStore =
-  require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-/* eslint-enable @typescript-eslint/no-require-imports */
-
-// Spread the real module and overlay (not replace) the raw store, so code this suite does not
-// control keeps working against a complete store while the mock is registered.
-void mock.module("@/browser/stores/WorkspaceStore", () => ({
-  ...actualWorkspaceStore,
-  useWorkspaceStoreRaw: () =>
-    overlayWorkspaceStoreRaw(actualWorkspaceStore.useWorkspaceStoreRaw(), {
-      subscribeDerived: (listener: () => void) => {
-        workspaceStoreSubscribers.add(listener);
-        return () => workspaceStoreSubscribers.delete(listener);
-      },
-      getWorkspaceMetadata: (workspaceId: string) => workflowTaskWorkspaces.get(workspaceId),
-      navigateToWorkspace: (workspaceId: string) => navigateToWorkspace(workspaceId),
-    }),
-}));
-
 import type { WorkflowRunView } from "./projectWorkflowRun";
 import { WorkflowTimeline } from "./WorkflowTimeline";
 
@@ -65,13 +23,6 @@ function createWorkflowTaskWorkspaceMetadata(workspaceId: string): FrontendWorks
     createdAt: "2026-05-29T00:00:00.000Z",
     runtimeConfig: { type: "local", srcBaseDir: "/tmp/mux-src" },
   };
-}
-
-function syncWorkflowTaskWorkspaces(nextWorkspaces: Map<string, FrontendWorkspaceMetadata>): void {
-  workflowTaskWorkspaces = nextWorkspaces;
-  for (const subscriber of workspaceStoreSubscribers) {
-    subscriber();
-  }
 }
 
 function normalizeText(element: Element): string {
@@ -355,19 +306,20 @@ describe("WorkflowTimeline", () => {
 
   afterEach(() => {
     cleanup();
-    navigateToWorkspace = () => undefined;
-    syncWorkflowTaskWorkspaces(new Map());
-    workspaceStoreSubscribers.clear();
+    // Tests drive the real store singleton (syncWorkspaces bumps the derived "workspaces"
+    // channel the timeline subscribes to), so reset it for the next test and file.
+    useWorkspaceStoreRaw().setNavigateToWorkspace(() => undefined);
+    useWorkspaceStoreRaw().syncWorkspaces(new Map());
     cleanupDom?.();
     cleanupDom = null;
   });
 
   test("opens an available child task workspace from a workflow step", () => {
     const navigatedTo: string[] = [];
-    navigateToWorkspace = (workspaceId) => {
+    useWorkspaceStoreRaw().setNavigateToWorkspace((workspaceId) => {
       navigatedTo.push(workspaceId);
-    };
-    syncWorkflowTaskWorkspaces(
+    });
+    useWorkspaceStoreRaw().syncWorkspaces(
       new Map([["task_live", createWorkflowTaskWorkspaceMetadata("task_live")]])
     );
 
@@ -392,7 +344,7 @@ describe("WorkflowTimeline", () => {
   });
 
   test("hides workspace action when a step only references another task id", () => {
-    syncWorkflowTaskWorkspaces(
+    useWorkspaceStoreRaw().syncWorkspaces(
       new Map([["task_source", createWorkflowTaskWorkspaceMetadata("task_source")]])
     );
     const workflowView = makeRunningStepView("task_source");
@@ -408,10 +360,10 @@ describe("WorkflowTimeline", () => {
 
   test("opens completed step details independently from workspace navigation", () => {
     const navigatedTo: string[] = [];
-    navigateToWorkspace = (workspaceId) => {
+    useWorkspaceStoreRaw().setNavigateToWorkspace((workspaceId) => {
       navigatedTo.push(workspaceId);
-    };
-    syncWorkflowTaskWorkspaces(
+    });
+    useWorkspaceStoreRaw().syncWorkspaces(
       new Map([["task_completed", createWorkflowTaskWorkspaceMetadata("task_completed")]])
     );
     const view = render(<WorkflowTimeline view={makeCompletedStepView("task_completed")} />);
@@ -576,7 +528,12 @@ describe("WorkflowTimeline", () => {
   });
 
   test("renders final report stat chips as bold key before value", () => {
-    const { container } = render(<WorkflowTimeline view={makeCompletedView()} />);
+    // The real WorkflowJsonBlock renders the final result through the themed code renderer.
+    const { container } = render(
+      <ThemeProvider forcedTheme="dark">
+        <WorkflowTimeline view={makeCompletedView()} />
+      </ThemeProvider>
+    );
 
     const statTexts = Array.from(container.querySelectorAll("span"), normalizeText);
     const boldTexts = Array.from(container.querySelectorAll("b"), normalizeText);
