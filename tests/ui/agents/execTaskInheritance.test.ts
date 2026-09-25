@@ -244,16 +244,21 @@ describeIntegration("Calling-chat Exec inheritance", () => {
                       );
                     } else if (text.startsWith("Follow up ") && !handled.has(text)) {
                       handled.add(text);
+                      // One parent step reawakens every listed child: a second manual parent
+                      // send would race the first child's report wake-up turn.
+                      const taskIds = text.slice("Follow up ".length).trim().split(/\s+/);
                       chunks.push(
-                        {
-                          type: "tool-call",
-                          toolCallId: `follow-up-${handled.size}`,
-                          toolName: "task_send_message",
-                          input: JSON.stringify({
-                            task_id: text.slice("Follow up ".length).trim(),
-                            message: "Take one more pass.",
-                          }),
-                        },
+                        ...taskIds.map(
+                          (taskId, index): LanguageModelV3StreamPart => ({
+                            type: "tool-call",
+                            toolCallId: `follow-up-${handled.size}-${index}`,
+                            toolName: "task_send_message",
+                            input: JSON.stringify({
+                              task_id: taskId,
+                              message: "Take one more pass.",
+                            }),
+                          })
+                        ),
                         finish("tool-calls")
                       );
                     } else {
@@ -304,14 +309,15 @@ describeIntegration("Calling-chat Exec inheritance", () => {
         },
       });
 
-      for (const childId of [unpinnedId, pinnedId]) {
-        const before = modelsFor(childId).length;
-        await sendMessage(app.view.container, `Follow up ${childId}`);
-        await waitFor(() => expect(modelsFor(childId).length).toBeGreaterThan(before), {
-          timeout: 30_000,
-        });
-        await app.chat.expectStreamComplete();
-      }
+      const before = [modelsFor(unpinnedId).length, modelsFor(pinnedId).length];
+      await sendMessage(app.view.container, `Follow up ${unpinnedId} ${pinnedId}`);
+      await waitFor(
+        () => {
+          expect(modelsFor(unpinnedId).length).toBeGreaterThan(before[0]);
+          expect(modelsFor(pinnedId).length).toBeGreaterThan(before[1]);
+        },
+        { timeout: 30_000 }
+      );
 
       expect(modelsFor(unpinnedId).at(-1)).toBe(MODEL_B);
       expect(modelsFor(pinnedId).at(-1)).toBe(MODEL_A);
