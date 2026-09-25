@@ -497,7 +497,7 @@ export async function preparePlanReviewFeedback(
  * The authentic feedback row `message` would put into review state: the row itself, or the
  * nested follow-up of an on-send compaction request, which dispatches as that row later.
  */
-function carriedPlanReviewFeedback(message: MuxMessage): MuxMessage | null {
+export function carriedPlanReviewFeedback(message: MuxMessage): MuxMessage | null {
   if (getAuthenticPlanReviewRecord(message)?.kind === "feedback") return message;
   const followUp = getCompactionFollowUpContent(message.metadata?.muxMetadata);
   if (followUp?.muxMetadata?.type !== PLAN_REVIEW_METADATA_TYPE) return null;

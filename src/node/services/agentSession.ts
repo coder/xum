@@ -14,7 +14,6 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
-import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
@@ -182,6 +181,7 @@ import {
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
 import {
+  carriedPlanReviewFeedback,
   carriesPlanReviewMetadata,
   createPlanReviewFeedbackPrecondition,
   ensurePlanSnapshot,
@@ -2204,8 +2204,10 @@ export class AgentSession {
   private async isPlanReviewFeedbackEditTarget(
     editMessageId: string
   ): Promise<Result<boolean, string>> {
+    // An on-send compaction request that deferred feedback carries it as its follow-up, which
+    // dispatches as the feedback row later; editing the request would drop it just the same.
     const isFeedback = (message: MuxMessage | undefined) =>
-      message !== undefined && getAuthenticPlanReviewRecord(message)?.kind === "feedback";
+      message !== undefined && carriedPlanReviewFeedback(message) !== null;
     // A failed latest-boundary read falls through to the full scan, which also covers it.
     const latest = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     const inLatest = latest.success

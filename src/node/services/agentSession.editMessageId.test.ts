@@ -1,6 +1,10 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
 import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import { createMuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  getCompactionFollowUpContent,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { HistoryService } from "./historyService";
 import { getPlanReviewState, hashPlanSnapshotContent } from "./planReviewService";
@@ -207,6 +211,97 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     await session.waitForIdle();
     expect(streamMessage).toHaveBeenCalledTimes(1);
     expect((await ids()).slice(0, 2)).toEqual(["plan-feedback", "assistant-reply"]);
+  });
+
+  it("refuses an edit of a compaction request whose follow-up carries plan-review feedback", async () => {
+    // On-send compaction defers feedback as the request's nested follow-up; that follow-up
+    // dispatches as the feedback row later. Editing the request would truncate it and drop the
+    // feedback (and its threads) exactly as editing the feedback row itself would.
+    const workspaceId = "ws-edit-compaction-feedback";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const feedbackRecord: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec-f",
+      feedbackId: "f1",
+      snapshotId: "s1",
+      contentHash: "a".repeat(64),
+      comments: [{ threadId: "t1", anchor: { startLine: 1, endLine: 1 }, quote: "#", body: "?" }],
+      replies: [],
+    };
+    const compactionRequest = (followUpText: string, followUpMetadata?: MuxMessageMetadata) =>
+      ({
+        type: "compaction-request",
+        rawCommand: "/compact",
+        source: "auto-compaction",
+        parsed: {
+          followUpContent: {
+            text: followUpText,
+            model: TEST_MODEL,
+            agentId: "plan",
+            ...(followUpMetadata ? { muxMetadata: followUpMetadata } : {}),
+          },
+        },
+      }) satisfies MuxMessageMetadata;
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-feedback", "user", "Summarize the conversation", {
+        historySequence: 0,
+        muxMetadata: compactionRequest(
+          formatPlanReviewEnvelope(feedbackRecord),
+          buildPlanReviewMetadata(feedbackRecord)
+        ),
+      })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-ordinary", "user", "Summarize the conversation", {
+        historySequence: 1,
+        muxMetadata: compactionRequest("Also cover rollback"),
+      })
+    );
+    const truncateAfterMessage = spyOn(historyService, "truncateAfterMessage");
+    const ids = async () => {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      return history.success ? history.data.map((message) => message.id) : [];
+    };
+
+    const refused = await session.sendMessage("edited", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "compaction-feedback",
+    });
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toMatchObject({
+        type: "unknown",
+        raw: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+      });
+    }
+    expect(truncateAfterMessage).not.toHaveBeenCalled();
+    expect(streamMessage).not.toHaveBeenCalled();
+    expect(await ids()).toEqual(["compaction-feedback", "compaction-ordinary"]);
+    // The deferred handoff still carries the feedback.
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    expect(
+      getCompactionFollowUpContent(history.data[0]?.metadata?.muxMetadata)?.muxMetadata
+    ).toEqual(buildPlanReviewMetadata(feedbackRecord));
+
+    // Control: a compaction request with an ordinary follow-up stays editable.
+    const edited = await session.sendMessage("Also cover retries", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "compaction-ordinary",
+    });
+    expect(edited.success).toBe(true);
+    await session.waitForIdle();
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    expect((await ids())[0]).toBe("compaction-feedback");
+    expect(await ids()).not.toContain("compaction-ordinary");
   });
 
   it("refuses an edit when the full-history read that classifies an archived target fails", async () => {
