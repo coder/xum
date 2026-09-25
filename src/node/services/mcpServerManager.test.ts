@@ -48,6 +48,8 @@ import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { jsonSchema, type Tool } from "ai";
 import {
+  MCP_IDLE_CHECK_INTERVAL_MS,
+  MCP_IDLE_TIMEOUT_MS,
   MCP_LAUNCH_INITIATION_FENCE_MS,
   MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
   MCP_STARTUP_CONCURRENCY,
@@ -229,7 +231,9 @@ describe("MCPServerManager", () => {
     let sweep: unknown;
     try {
       instance = create();
-      sweep = setIntervalSpy.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
+      sweep = setIntervalSpy.mock.calls.find(
+        ([, delay]) => delay === MCP_IDLE_CHECK_INTERVAL_MS
+      )?.[0];
     } finally {
       setIntervalSpy.mockRestore();
     }
@@ -585,7 +589,7 @@ describe("MCPServerManager", () => {
       fail = shouldFail;
       const attempts = removed.close.mock.calls.length;
       // The sweep reads the clock synchronously: make the workspace look idle.
-      setSystemTime(new Date(Date.now() + 11 * 60_000));
+      setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
       f.sweepIdle();
       setSystemTime();
       await waitFor(() => removed.close.mock.calls.length > attempts);
@@ -1403,7 +1407,7 @@ describe("MCPServerManager", () => {
         const attempts = failedClient!.close.mock.calls.length;
         if (mode === "retired-only") {
           // The sweep reads the clock synchronously: make the workspace look idle.
-          setSystemTime(new Date(Date.now() + 11 * 60_000));
+          setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
           f.sweepIdle();
           setSystemTime();
           await waitFor(() => failedClient!.close.mock.calls.length > attempts);
@@ -2233,7 +2237,7 @@ describe("MCPServerManager", () => {
     servers.serve("cmd", { close });
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    setSystemTime(new Date(Date.now() + 11 * 60_000));
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
     sweepIdleServers();
 
     expect(close).toHaveBeenCalledTimes(1);
@@ -2252,7 +2256,7 @@ describe("MCPServerManager", () => {
     manager.acquireLease(workspaceId);
 
     // The workspace looks idle even though acquireLease() updated activity.
-    setSystemTime(new Date(Date.now() + 11 * 60_000));
+    setSystemTime(new Date(Date.now() + MCP_IDLE_TIMEOUT_MS + 60_000));
     sweepIdleServers();
 
     expect(close).toHaveBeenCalledTimes(0);

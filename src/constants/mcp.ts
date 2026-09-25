@@ -1,6 +1,12 @@
 /** Per-server MCP startup deadline, kept generous so first-run npx package downloads can finish. */
 export const MCP_STARTUP_TIMEOUT_MS = 60_000;
 
+/** A workspace's MCP servers are stopped after this long without activity (unless leased). */
+export const MCP_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** How often the idle sweep checks workspaces against MCP_IDLE_TIMEOUT_MS. */
+export const MCP_IDLE_CHECK_INTERVAL_MS = 60 * 1000;
+
 /** Fail-safe wait for startup cleanup so a timeout error cannot hang forever. */
 export const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000;
 
