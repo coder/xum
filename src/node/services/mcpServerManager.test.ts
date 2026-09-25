@@ -3935,12 +3935,8 @@ describe("MCPServerManager", () => {
     );
 
     const close = mock(() => Promise.resolve(undefined));
-
-    const startServersMock = mock(() =>
-      Promise.resolve(startResult([["server", { tools: { tool: testTool() }, close }]]))
-    );
-
-    access.startServers = startServersMock;
+    servers.serve("cmd-1", { tools: { tool: testTool() }, close });
+    servers.serve("cmd-2", { tools: { tool: testTool() } });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
@@ -3949,21 +3945,21 @@ describe("MCPServerManager", () => {
     // Change signature while leased.
     command = "cmd-2";
 
-    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const leased = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount("cmd-2")).toBe(0);
+    expect(leased.stats.startedServerCount).toBe(1);
 
     manager.releaseLease(workspaceId);
 
     // No automatic restart on lease release (avoids closing clients out from under a
     // subsequent stream that already captured the tool objects).
-    expect(access.workspaceServers.has(workspaceId)).toBe(true);
     expect(close).toHaveBeenCalledTimes(0);
 
     // Next request (no lease) applies the pending restart.
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
 
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount("cmd-2")).toBe(1);
     expect(close).toHaveBeenCalledTimes(1);
   });
 
@@ -3980,14 +3976,9 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", { getPrompt });
+    servers.serve("cmd-2", { getPrompt });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     manager.acquireLease(workspaceId);
@@ -4002,6 +3993,9 @@ describe("MCPServerManager", () => {
       expect(await manager.getPrompt(workspaceId, "stable", "review", {})).toEqual({
         text: "hi",
       });
+      // The stale client was never invoked and no replacement started under the lease.
+      expect(getPrompt).toHaveBeenCalledTimes(1);
+      expect(servers.connectCount("cmd-2")).toBe(0);
     } finally {
       manager.releaseLease(workspaceId);
     }
@@ -4014,20 +4008,20 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    const refreshTools = mock(() => Promise.resolve(undefined));
-    access.startServers = mock(() =>
-      Promise.resolve(startResult([["server", { getPrompt, refreshTools }]]))
-    );
+    // Modern connections refresh tools/list in the background on cached serves.
+    const listTools = mock(() => Promise.resolve({}));
+    servers.serve("cmd-1", { era: "modern", getPrompt, listTools });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const startupListCount = listTools.mock.calls.length;
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    const toolPathRefreshCount = refreshTools.mock.calls.length;
-    expect(toolPathRefreshCount).toBeGreaterThan(0);
+    const toolPathRefreshCount = listTools.mock.calls.length;
+    expect(toolPathRefreshCount).toBeGreaterThan(startupListCount);
 
     // A hung tools/list on any server must not stall prompt listing or invocation.
     await manager.getPromptsForWorkspace(workspaceRequest(workspaceId));
     expect(await manager.getPrompt(workspaceId, "server", "review", {})).toEqual({ text: "hi" });
-    expect(refreshTools).toHaveBeenCalledTimes(toolPathRefreshCount);
+    expect(listTools).toHaveBeenCalledTimes(toolPathRefreshCount);
   });
 
   test("blocks prompt invocation when trust is revoked during secret resolution", async () => {
