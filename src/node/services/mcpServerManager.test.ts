@@ -55,23 +55,6 @@ import {
 } from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 
-interface MCPServerManagerTestAccess {
-  workspaceServers: Map<string, unknown>;
-  lastWorkspaceRequestOptions: Map<string, unknown>;
-  cleanupIdleServers: () => void;
-  ensureWorkspaceServers: (
-    ...args: unknown[]
-  ) => Promise<{ tools: Record<string, Tool>; stats: unknown; enablementDerivedFrom?: unknown }>;
-  startServers: (...args: unknown[]) => Promise<{
-    instances: Map<string, unknown>;
-    failedServerNames: string[];
-    timedOutServerNames?: string[];
-  }>;
-  startSingleServer: (...args: unknown[]) => Promise<unknown>;
-  runWithStablePluginEpoch: (operation: () => Promise<unknown>) => Promise<unknown>;
-  startSingleServerImpl: (...args: unknown[]) => Promise<unknown>;
-}
-
 const PROJECT_PATH = "/tmp/project";
 const WORKSPACE_PATH = "/tmp/workspace";
 
@@ -110,55 +93,6 @@ function testTool(result: unknown = { ok: true }): Tool {
   return { execute: mock(() => Promise.resolve(result)) } as unknown as Tool;
 }
 
-function testInstance(
-  name: string,
-  options: {
-    tools?: Record<string, Tool>;
-    prompts?: Array<{
-      name: string;
-      description?: string;
-      arguments?: Array<{ name: string; description?: string; required?: boolean }>;
-    }>;
-    getPrompt?: ReturnType<typeof mock>;
-    refreshTools?: ReturnType<typeof mock>;
-    refreshPrompts?: ReturnType<typeof mock>;
-    close?: ReturnType<typeof mock>;
-    isClosed?: boolean;
-  } = {}
-) {
-  return {
-    name,
-    resolvedTransport: "stdio" as const,
-    autoFallbackUsed: false,
-    tools: options.tools ?? {},
-    prompts: options.prompts ?? [],
-    getPrompt: options.getPrompt ?? mock(() => Promise.resolve({ messages: [], context: {} })),
-    ...(options.refreshTools !== undefined ? { refreshTools: options.refreshTools } : {}),
-    // Prompt fixtures need a refresher because production stores catalogs
-    // only through refreshInstancePrompts.
-    ...(options.refreshPrompts !== undefined
-      ? { refreshPrompts: options.refreshPrompts }
-      : options.prompts !== undefined
-        ? { refreshPrompts: mock(() => Promise.resolve(options.prompts)) }
-        : {}),
-    isClosed: options.isClosed ?? false,
-    close: options.close ?? mock(() => Promise.resolve(undefined)),
-  };
-}
-
-function startResult(
-  entries: Array<[string, Parameters<typeof testInstance>[1]?]>,
-  options: { failedServerNames?: string[]; timedOutServerNames?: string[] } = {}
-) {
-  return {
-    instances: new Map(
-      entries.map(([name, instanceOptions]) => [name, testInstance(name, instanceOptions)])
-    ),
-    failedServerNames: options.failedServerNames ?? [],
-    timedOutServerNames: options.timedOutServerNames ?? [],
-  };
-}
-
 /**
  * A timed-out server backs off one startup timeout before its first retry.
  * Bun freezes the clock under setSystemTime, so jump relative to the current
@@ -191,7 +125,6 @@ describe("MCPServerManager", () => {
   };
 
   let manager: MCPServerManager;
-  let access: MCPServerManagerTestAccess;
 
   beforeEach(() => {
     configService = {
@@ -201,7 +134,6 @@ describe("MCPServerManager", () => {
     };
 
     manager = new MCPServerManager(configService as unknown as MCPConfigService);
-    access = manager as unknown as MCPServerManagerTestAccess;
   });
 
   afterEach(() => {
@@ -283,6 +215,28 @@ describe("MCPServerManager", () => {
   const asyncMock = (impl: (...args: unknown[]) => Promise<unknown>) => mock(impl);
   type AsyncMock = ReturnType<typeof asyncMock>;
 
+  /**
+   * Construct a manager and capture its idle sweep, which production reaches
+   * only through a one-minute interval armed in the constructor, so tests can
+   * run it on demand.
+   */
+  function constructWithIdleSweep(create: () => MCPServerManager): {
+    instance: MCPServerManager;
+    sweepIdle: () => void;
+  } {
+    const setIntervalSpy = spyOn(globalThis, "setInterval");
+    let instance: MCPServerManager;
+    let sweep: unknown;
+    try {
+      instance = create();
+      sweep = setIntervalSpy.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+    if (typeof sweep !== "function") throw new Error("idle sweep interval was not armed");
+    return { instance, sweepIdle: sweep as () => void };
+  }
+
   async function componentFixture(home: string) {
     await fs.mkdir(path.join(home, "plugins"), { recursive: true });
     const registryPath = path.join(home, "plugins.json");
@@ -354,7 +308,7 @@ describe("MCPServerManager", () => {
     /** Connections to `command`'s server, oldest first. */
     const clients = (command: string) => connections.filter((c) => c.command === command);
     const makeManager = () => {
-      // WORKAROUND for pre-existing production behavior (reported separately):
+      // WORKAROUND for pre-existing production behavior (#4513):
       // the real component try-lock is the exclusive, timeout-0 plugin
       // mutation lock, exclusive even in-process and held through each launch,
       // so sibling managed launches in one process fail closed ("unavailable
@@ -385,15 +339,17 @@ describe("MCPServerManager", () => {
           }
         },
       };
-      const instance = new MCPServerManager(configService as unknown as MCPConfigService, {
-        pluginInvalidation: invalidation,
-      });
-      return { instance, invalidation };
+      const { instance, sweepIdle } = constructWithIdleSweep(
+        () =>
+          new MCPServerManager(configService as unknown as MCPConfigService, {
+            pluginInvalidation: invalidation,
+          })
+      );
+      return { instance, invalidation, sweepIdle };
     };
     manager.dispose();
     const local = makeManager();
     manager = local.instance;
-    access = local.instance as unknown as MCPServerManagerTestAccess;
     return {
       ...local,
       registryPath,
@@ -630,8 +586,7 @@ describe("MCPServerManager", () => {
       const attempts = removed.close.mock.calls.length;
       // The sweep reads the clock synchronously: make the workspace look idle.
       setSystemTime(new Date(Date.now() + 11 * 60_000));
-      // Private call: the idle sweep runs only from a one-minute interval timer.
-      (manager as unknown as { cleanupIdleServers: () => void }).cleanupIdleServers();
+      f.sweepIdle();
       setSystemTime();
       await waitFor(() => removed.close.mock.calls.length > attempts);
       expect(removed.close).toHaveBeenCalledTimes(attempts + 1);
@@ -1448,8 +1403,7 @@ describe("MCPServerManager", () => {
         if (mode === "retired-only") {
           // The sweep reads the clock synchronously: make the workspace look idle.
           setSystemTime(new Date(Date.now() + 11 * 60_000));
-          // Private call: the idle sweep runs only from a one-minute interval timer.
-          (manager as unknown as { cleanupIdleServers: () => void }).cleanupIdleServers();
+          f.sweepIdle();
           setSystemTime();
           await waitFor(() => failedClient!.close.mock.calls.length > attempts);
         } else if (mode === "additional" || mode === "restart") {
@@ -1515,7 +1469,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-cross-process";
     const pluginKey = "plugin:abc123:echo";
@@ -1553,7 +1506,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-startup-race";
     const pluginKey = "plugin:abc123:echo";
@@ -1591,7 +1543,7 @@ describe("MCPServerManager", () => {
     // for a disabled server, which this enabled-server race cannot also cover.
     expect(
       (
-        access as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
+        manager as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
       ).latestWorkspaceOverrides.get(workspaceId)
     ).toEqual({ enabledServers: [] });
   });
@@ -1605,7 +1557,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-sweep-order";
     const pluginKey = "plugin:abc123:echo";
@@ -1669,7 +1620,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-token-loop";
     const pluginKey = "plugin:abc123:echo";
@@ -1710,7 +1660,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-prompt-list-token-race";
     const pluginKey = "plugin:abc123:echo";
@@ -1746,7 +1695,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-prompt-get-token-race";
     const pluginKey = "plugin:abc123:echo";
@@ -1793,7 +1741,6 @@ describe("MCPServerManager", () => {
         readToken: () => Promise.resolve(token),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-unreadable-epoch";
     const pluginKey = "plugin:abc123:echo";
@@ -1851,7 +1798,6 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-disk-refresh";
     const pluginKey = "plugin:abc123:echo";
@@ -1920,7 +1866,6 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve({}), // pruned on disk
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const pluginKey = "plugin:abc123:echo";
     configService.listServers.mockImplementation(() =>
@@ -2280,17 +2225,12 @@ describe("MCPServerManager", () => {
    * a one-minute interval armed in the constructor — the test runs on demand.
    */
   function useManagerWithIdleSweep(): () => void {
-    const setIntervalSpy = spyOn(globalThis, "setInterval");
-    let sweep: unknown;
-    try {
-      manager.dispose();
-      manager = new MCPServerManager(configService as unknown as MCPConfigService);
-      sweep = setIntervalSpy.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
-    } finally {
-      setIntervalSpy.mockRestore();
-    }
-    if (typeof sweep !== "function") throw new Error("idle sweep interval was not armed");
-    return sweep as () => void;
+    manager.dispose();
+    const constructed = constructWithIdleSweep(
+      () => new MCPServerManager(configService as unknown as MCPConfigService)
+    );
+    manager = constructed.instance;
+    return constructed.sweepIdle;
   }
 
   test("cleanupIdleServers stops idle servers when workspace is not leased", async () => {
@@ -4039,14 +3979,8 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", { getPrompt });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
@@ -6537,6 +6471,7 @@ describe("MCPServerManager", () => {
   });
 
   test("an invalidated workspace whose overrides stay unreadable fails closed until disk answers", async () => {
+    using tmp = new DisposableTempDir("mcp-fail-closed-plugin");
     manager.dispose();
     let diskOverrides: Record<string, unknown> | undefined = { enabledServers: [PLUGIN_KEY] };
     const readWorkspaceOverrides = mock(() => Promise.resolve(diskOverrides));
@@ -6547,29 +6482,28 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     // A globally ENABLED ordinary server plus a default-disabled plugin server.
     configService.listServers = mock(() =>
-      Promise.resolve({ ordinary: stdioConfig("node ordinary.js"), ...pluginStdioConfig() })
+      Promise.resolve({
+        ordinary: stdioConfig("node ordinary.js"),
+        ...launchablePluginConfig(tmp.path),
+      })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
+    servers.serve(PLUGIN_COMMAND);
     const workspaceId = "ws-fail-closed";
-    // Recorded snapshot: the parent had enabled the plugin server; ordinary runs by default.
-    const recordedOptions = () =>
-      access.lastWorkspaceRequestOptions.get(workspaceId) as MCPWorkspaceRequestOptions;
+    // The caller's snapshot: the parent had enabled the plugin server; ordinary runs by default.
+    const callerSnapshot = workspaceRequest(workspaceId, {
+      overrides: { enabledServers: [PLUGIN_KEY] },
+    });
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    expect((await manager.getToolsForWorkspace(recordedOptions())).stats.enabledServerCount).toBe(
-      2
-    );
+    expect((await manager.getToolsForWorkspace(callerSnapshot)).stats.enabledServerCount).toBe(2);
 
     // Parent save (revoking the plugin enable) evicted us; disk is unreadable
     // during the re-read.
     manager.forgetWorkspaceOverrides(workspaceId);
     diskOverrides = undefined;
-    const during = await manager.getToolsForWorkspace(recordedOptions());
+    const during = await manager.getToolsForWorkspace(callerSnapshot);
     // Fail closed: neither the recorded plugin enable nor the globally enabled
     // ordinary server is served from a snapshot disk cannot vouch for.
     expect(during.stats.enabledServerCount).toBe(0);
@@ -6577,11 +6511,12 @@ describe("MCPServerManager", () => {
     // Disk recovers: the invalidation survived, the revocation is observed,
     // and ordinary enablement resumes from the authoritative read.
     diskOverrides = {};
-    const after = await manager.getToolsForWorkspace(recordedOptions());
+    const after = await manager.getToolsForWorkspace(callerSnapshot);
     expect(after.stats.enabledServerCount).toBe(1);
   });
 
   test("a plugin-epoch refresh that cannot read disk keeps an invalidated workspace failing closed", async () => {
+    using tmp = new DisposableTempDir("mcp-refresh-invalidated-plugin");
     manager.dispose();
     let token = "epoch-1";
     let diskOverrides: Record<string, unknown> | undefined = { enabledServers: [PLUGIN_KEY] };
@@ -6593,42 +6528,46 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
-      Promise.resolve({ ordinary: stdioConfig("node ordinary.js"), ...pluginStdioConfig() })
+      Promise.resolve({
+        ordinary: stdioConfig("node ordinary.js"),
+        ...launchablePluginConfig(tmp.path),
+      })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
+    servers.serve(PLUGIN_COMMAND);
     const workspaceId = "ws-refresh-invalidated";
-    const recordedOptions = () =>
-      access.lastWorkspaceRequestOptions.get(workspaceId) as MCPWorkspaceRequestOptions;
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    expect((await manager.getToolsForWorkspace(recordedOptions())).stats.enabledServerCount).toBe(
-      2
-    );
+    expect(
+      (
+        await manager.getToolsForWorkspace(
+          workspaceRequest(workspaceId, { overrides: { enabledServers: [PLUGIN_KEY] } })
+        )
+      ).stats.enabledServerCount
+    ).toBe(2);
 
     // Parent save evicted us while disk is unreadable; then a sibling
     // process's plugin mutation bumps the epoch. The refresh sweep's fallback
     // (scrubbed recorded snapshot) must not repopulate the overlay cache for
     // the invalidated workspace — that snapshot is what is being distrusted.
+    // A caller holding exactly that scrubbed document (read after the
+    // sibling's prune) would otherwise match the repopulated cache and be
+    // served on the fast path without the pending disk re-read.
     manager.forgetWorkspaceOverrides(workspaceId);
     diskOverrides = undefined;
     token = "epoch-2";
-    const during = await manager.getToolsForWorkspace(recordedOptions());
+    const prunedSnapshot = workspaceRequest(workspaceId, { overrides: { enabledServers: [] } });
+    const during = await manager.getToolsForWorkspace(prunedSnapshot);
     expect(during.stats.enabledServerCount).toBe(0);
-    expect(
-      (
-        access as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
-      ).latestWorkspaceOverrides.has(workspaceId)
-    ).toBe(false);
 
-    // Disk recovers: the invalidation survived the sweep and the revocation
-    // is observed from the authoritative read.
-    diskOverrides = {};
-    const after = await manager.getToolsForWorkspace(recordedOptions());
-    expect(after.stats.enabledServerCount).toBe(1);
+    // Disk recovers to a state the scrubbed snapshot does not match (the
+    // parent re-enabled the plugin): the invalidation survived the sweep, so
+    // this serve re-reads disk instead of matching a repopulated cache.
+    const readsBeforeRecovery = readWorkspaceOverrides.mock.calls.length;
+    diskOverrides = { enabledServers: [PLUGIN_KEY] };
+    const after = await manager.getToolsForWorkspace(prunedSnapshot);
+    expect(readWorkspaceOverrides.mock.calls.length).toBeGreaterThan(readsBeforeRecovery);
+    expect(after.stats.enabledServerCount).toBe(2);
   });
 
   test("an authoritative publication retires the invalidation and the fail-closed state", async () => {
@@ -6642,32 +6581,24 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-publication-wins";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    const recordedOptions = () =>
-      access.lastWorkspaceRequestOptions.get(workspaceId) as MCPWorkspaceRequestOptions;
+    // The caller's snapshot of what disk said at that serve.
+    const callerSnapshot = workspaceRequest(workspaceId, { overrides: {} });
 
     // Evicted, then disk unreadable: fails closed.
     manager.forgetWorkspaceOverrides(workspaceId);
     diskOverrides = undefined;
-    expect((await manager.getToolsForWorkspace(recordedOptions())).stats.enabledServerCount).toBe(
-      0
-    );
+    expect((await manager.getToolsForWorkspace(callerSnapshot)).stats.enabledServerCount).toBe(0);
     // A later parent save resolves the child authoritatively and publishes it:
     // MCP must come back without waiting for another disk read.
     await manager.applyWorkspaceOverrides(workspaceId, {});
     const reads = readWorkspaceOverrides.mock.calls.length;
-    expect((await manager.getToolsForWorkspace(recordedOptions())).stats.enabledServerCount).toBe(
-      1
-    );
+    expect((await manager.getToolsForWorkspace(callerSnapshot)).stats.enabledServerCount).toBe(1);
     expect(readWorkspaceOverrides.mock.calls.length).toBe(reads);
   });
 
@@ -6703,14 +6634,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const inFlight = manager.getToolsForWorkspace(workspaceRequest("ws-cold-global"));
     while (readWorkspaceOverrides.mock.calls.length < 1) {
       await new Promise((resolve) => setTimeout(resolve, 1));
@@ -6722,10 +6649,9 @@ describe("MCPServerManager", () => {
     expect((await inFlight).stats.enabledServerCount).toBe(0);
     // …and the recorded (stale) options must not satisfy the next serve either:
     // it re-reads disk.
-    const recorded = access.lastWorkspaceRequestOptions.get(
-      "ws-cold-global"
-    ) as MCPWorkspaceRequestOptions;
-    const next = manager.getToolsForWorkspace(recorded);
+    const next = manager.getToolsForWorkspace(
+      workspaceRequest("ws-cold-global", { overrides: {} })
+    );
     while (readWorkspaceOverrides.mock.calls.length < 2) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
@@ -6751,21 +6677,16 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-forget-race";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    const recordedOptions = () =>
-      access.lastWorkspaceRequestOptions.get(workspaceId) as MCPWorkspaceRequestOptions;
+    const callerSnapshot = workspaceRequest(workspaceId, { overrides: {} });
 
     manager.forgetWorkspaceOverrides(workspaceId);
-    const inFlight = manager.getToolsForWorkspace(recordedOptions());
+    const inFlight = manager.getToolsForWorkspace(callerSnapshot);
     while (reads < 2) await new Promise((resolve) => setTimeout(resolve, 1));
     // A newer parent save invalidates again while the (older) read is pending…
     manager.forgetWorkspaceOverrides(workspaceId);
@@ -6774,7 +6695,7 @@ describe("MCPServerManager", () => {
     expect((await inFlight).stats.enabledServerCount).toBe(0);
 
     // The newer invalidation must still force a disk read, which now sees the disable.
-    const next = await manager.getToolsForWorkspace(recordedOptions());
+    const next = await manager.getToolsForWorkspace(callerSnapshot);
     expect(reads).toBe(3);
     expect(next.stats.enabledServerCount).toBe(0);
   });
@@ -6795,42 +6716,31 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    let releaseStartup: () => void = () => undefined;
-    let startupGated = false;
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      const result = startResult(
-        Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }])
-      );
-      if (!startupGated) return Promise.resolve(result);
-      return new Promise((resolve) => {
-        releaseStartup = () => resolve(result);
-      });
+    // Startup (after the serve recorded its options) waits on this gate.
+    const startup = Promise.withResolvers<void>();
+    servers.serve("node ordinary.js", {
+      tools: { echo: testTool() },
+      prompts: [{ name: "status" }],
+      connect: () => startup.promise,
     });
     const workspaceId = "ws-forget-mid-startup";
-    startupGated = true;
     const inFlight = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    while (access.lastWorkspaceRequestOptions.get(workspaceId) === undefined) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
+    await waitFor(() => servers.connectCount("node ordinary.js") === 1);
     // Parent save revokes the server on disk and evicts us mid-startup.
     diskOverrides = { disabledServers: ["ordinary"] };
     manager.forgetWorkspaceOverrides(workspaceId);
-    releaseStartup();
+    startup.resolve();
     const served = await inFlight;
     expect(Object.keys(served.tools)).toHaveLength(0);
     expect(served.promptDescriptors).toHaveLength(0);
 
     // The marker survived: the next serve re-reads disk and observes the disable.
-    startupGated = false;
-    const recorded = access.lastWorkspaceRequestOptions.get(
-      workspaceId
-    ) as MCPWorkspaceRequestOptions;
-    const next = await manager.getToolsForWorkspace(recorded);
+    const next = await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, { overrides: {} })
+    );
     expect(readWorkspaceOverrides).toHaveBeenCalledTimes(2);
     expect(next.stats.enabledServerCount).toBe(0);
   });
@@ -6849,18 +6759,12 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
-    const servers = { ordinary: stdioConfig("node ordinary.js") };
-    configService.listServers = mock(() => Promise.resolve(servers));
+    const configured = { ordinary: stdioConfig("node ordinary.js") };
+    configService.listServers = mock(() => Promise.resolve(configured));
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { prompts: [{ name: "status" }], getPrompt }]))
-      );
-    });
+    servers.serve("node ordinary.js", { prompts: [{ name: "status" }], getPrompt });
     const workspaceId = "ws-prompt-forget-mid-serve";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     // Sanity: the prompt dispatches normally.
@@ -6874,10 +6778,10 @@ describe("MCPServerManager", () => {
     let releaseListServers: () => void = () => undefined;
     configService.listServers = mock(() => {
       listServersCalls += 1;
-      if (listServersCalls < 2) return Promise.resolve(servers);
+      if (listServersCalls < 2) return Promise.resolve(configured);
       gatedListServersCalls += 1;
-      return new Promise<typeof servers>((resolve) => {
-        releaseListServers = () => resolve(servers);
+      return new Promise<typeof configured>((resolve) => {
+        releaseListServers = () => resolve(configured);
       });
     });
     const prompt = manager.getPrompt(workspaceId, "ordinary", "status", {});
@@ -6912,24 +6816,20 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-refresh-vs-publication";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    const recordedOptions = () =>
-      access.lastWorkspaceRequestOptions.get(workspaceId) as MCPWorkspaceRequestOptions;
+    // The caller still holds the pre-save snapshot throughout.
+    const staleSnapshot = workspaceRequest(workspaceId, { overrides: {} });
 
     // Sibling plugin mutation: the epoch sweep re-reads this workspace's
     // overrides; the read is in flight…
     gateRead = true;
     token = "epoch-2";
-    const sweep = manager.getToolsForWorkspace(recordedOptions());
+    const sweep = manager.getToolsForWorkspace(staleSnapshot);
     while (readWorkspaceOverrides.mock.calls.length < 2) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
@@ -6940,9 +6840,10 @@ describe("MCPServerManager", () => {
     // stale `{}` snapshot then disagrees with the cache and is revalidated
     // against disk, which agrees with the publication.)
     release({});
-    await sweep;
-    expect(recordedOptions().overrides).toEqual({ disabledServers: ["ordinary"] });
-    const next = await manager.getToolsForWorkspace(recordedOptions());
+    expect((await sweep).stats.enabledServerCount).toBe(0);
+    // Had the sweep committed its read, the cache would hold `{}` again and
+    // the stale snapshot would match it on the fast path.
+    const next = await manager.getToolsForWorkspace(staleSnapshot);
     expect(next.stats.enabledServerCount).toBe(0);
   });
 
@@ -7181,32 +7082,33 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-retire-after-install";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
-    const recordedOptions = () =>
-      access.lastWorkspaceRequestOptions.get(workspaceId) as MCPWorkspaceRequestOptions;
 
-    const generations = (
-      access as unknown as { overridesInvalidationGenerations: Map<string, number> }
-    ).overridesInvalidationGenerations;
+    // Private read: retirement and recording share one synchronous block, so
+    // no public caller can interleave there; observe the marker map and the
+    // recorded options at the instant the marker goes away.
+    const internals = manager as unknown as {
+      overridesInvalidationGenerations: Map<string, number>;
+      lastWorkspaceRequestOptions: Map<string, MCPWorkspaceRequestOptions>;
+    };
+    const generations = internals.overridesInvalidationGenerations;
     const recordedAtRetirement: unknown[] = [];
     const realDelete = generations.delete.bind(generations);
     generations.delete = (key: string) => {
-      recordedAtRetirement.push(recordedOptions().overrides);
+      recordedAtRetirement.push(internals.lastWorkspaceRequestOptions.get(workspaceId)?.overrides);
       return realDelete(key);
     };
 
     manager.forgetWorkspaceOverrides(workspaceId);
     diskOverrides = { disabledServers: ["ordinary"] };
-    const served = await manager.getToolsForWorkspace(recordedOptions());
+    const served = await manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, { overrides: {} })
+    );
     expect(served.stats.enabledServerCount).toBe(0);
     // Whenever the marker went away, the recorded options already held the
     // fresh disk state — never the stale pre-read snapshot.
@@ -7229,14 +7131,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-stale-snapshot-after-recovery";
     const staleSnapshot = workspaceRequest(workspaceId); // pre-save: nothing disabled
     expect((await manager.getToolsForWorkspace(staleSnapshot)).stats.enabledServerCount).toBe(1);
@@ -7244,10 +7142,8 @@ describe("MCPServerManager", () => {
     // Parent save disables the server on disk and evicts us; recovery re-reads.
     manager.forgetWorkspaceOverrides(workspaceId);
     diskOverrides = { disabledServers: ["ordinary"] };
-    const recorded = access.lastWorkspaceRequestOptions.get(
-      workspaceId
-    ) as MCPWorkspaceRequestOptions;
-    expect((await manager.getToolsForWorkspace(recorded)).stats.enabledServerCount).toBe(0);
+    const recovery = workspaceRequest(workspaceId, { overrides: {} });
+    expect((await manager.getToolsForWorkspace(recovery)).stats.enabledServerCount).toBe(0);
 
     // A request that still holds the pre-save snapshot must not win.
     const late = await manager.getToolsForWorkspace(staleSnapshot);
@@ -7267,14 +7163,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-untrusted-snapshot";
     // Establish recorded options first (an authoritative serve).
     diskOverrides = {};
@@ -7316,24 +7208,18 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
     const workspaceId = "ws-prompts-fail-closed";
     const refreshPrompts = mock(() => Promise.resolve([{ name: "review" }]));
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
+    servers.serve("node ordinary.js", {
+      listPrompts: refreshPrompts,
       // A parent save's eviction lands mid-startup.
-      manager.forgetWorkspaceOverrides(workspaceId);
-      return Promise.resolve(
-        startResult(
-          Object.keys(servers).map((name) => [
-            name,
-            { prompts: [{ name: "review" }], refreshPrompts },
-          ])
-        )
-      );
+      connect: () => {
+        manager.forgetWorkspaceOverrides(workspaceId);
+        return Promise.resolve();
+      },
     });
 
     const descriptors = await manager.getPromptsForWorkspace(workspaceRequest(workspaceId));
@@ -7360,19 +7246,13 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(
-        startResult(Object.keys(servers).map((name) => [name, { getPrompt }]))
-      );
-    });
+    servers.serve("node ordinary.js", { getPrompt });
     const workspaceId = "ws-shared-read-budget";
 
     // Budget exhausted by the caller's read: no second attempt, fail closed.
@@ -7425,14 +7305,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-cache-vs-fresh-caller";
     await manager.applyWorkspaceOverrides(workspaceId, {}); // in-process publication: enabled
     // Caller agrees with the cache: served from it, no disk read.
@@ -7449,13 +7325,10 @@ describe("MCPServerManager", () => {
     );
     expect(afterEdit.stats.enabledServerCount).toBe(0);
     expect(readWorkspaceOverrides).toHaveBeenCalledTimes(1);
-    expect(
-      (
-        access as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
-      ).latestWorkspaceOverrides.get(workspaceId)
-    ).toEqual(diskOverrides);
 
-    // A stale caller snapshot from before the edit still loses to disk.
+    // A stale caller snapshot from before the edit still loses to disk: the
+    // cache now holds the edit, so the snapshot disagrees and is re-read
+    // (a cache left at `{}` would serve it on the fast path).
     const stale = await manager.getToolsForWorkspace(
       workspaceRequest(workspaceId, { overrides: {} })
     );
@@ -7485,16 +7358,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { prompts: [{ name: "status" }] }]))
-      );
-    });
+    servers.serve("node ordinary.js", { prompts: [{ name: "status" }] });
     const workspaceId = "ws-prompts-distrusted-caller";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
     expect(await manager.getPromptsForWorkspace(workspaceRequest(workspaceId))).toHaveLength(1);
@@ -7531,14 +7398,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-cached-distrusted-caller";
     await manager.applyWorkspaceOverrides(workspaceId, {}); // cached: nothing disabled
     // An authoritative caller is served from the cache without a disk read.
@@ -7561,20 +7424,19 @@ describe("MCPServerManager", () => {
       workspaceRequest(workspaceId, { overrides: {}, overridesAuthoritative: false })
     );
     expect(revoked.stats.enabledServerCount).toBe(0);
-    expect(
-      (
-        access as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
-      ).latestWorkspaceOverrides.get(workspaceId)
-    ).toEqual(diskOverrides);
-    // The successful reread is recorded as authoritative: prompt paths that
-    // replay the recorded options must not re-enter the disk read forever.
-    const recorded = access.lastWorkspaceRequestOptions.get(
-      workspaceId
-    ) as MCPWorkspaceRequestOptions;
-    expect(recorded.overridesAuthoritative).toBe(true);
+    // The successful reread is recorded as authoritative: prompt discovery
+    // replays the recorded options for an agreeing caller and must not
+    // re-enter the disk read forever.
     const readsBefore = readWorkspaceOverrides.mock.calls.length;
-    expect((await manager.getToolsForWorkspace(recorded)).stats.enabledServerCount).toBe(0);
+    expect(await manager.getPromptsForWorkspace(workspaceRequest(workspaceId))).toEqual([]);
     expect(readWorkspaceOverrides.mock.calls.length).toBe(readsBefore);
+    // The cache was revalidated with disk truth: a stale authoritative
+    // snapshot now disagrees with it, is re-read, and loses.
+    expect(
+      (await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { overrides: {} }))).stats
+        .enabledServerCount
+    ).toBe(0);
+    expect(readWorkspaceOverrides.mock.calls.length).toBe(readsBefore + 1);
     expect(
       (await manager.getToolsForWorkspace(workspaceRequest(workspaceId))).stats.enabledServerCount
     ).toBe(0);
@@ -7596,23 +7458,20 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const served = "ws-sibling-served";
     const coldCached = "ws-sibling-cold-cached";
     await manager.getToolsForWorkspace(workspaceRequest(served));
     // An earlier publication in THIS process cached an inheriting child that
     // was never served here.
     await manager.applyWorkspaceOverrides(coldCached, {});
-    // Both caches say "nothing disabled"; recorded options exist for `served`.
-    const recorded = access.lastWorkspaceRequestOptions.get(served) as MCPWorkspaceRequestOptions;
-    expect((await manager.getToolsForWorkspace(recorded)).stats.enabledServerCount).toBe(1);
+    // Both caches say "nothing disabled"; recorded options exist for `served`,
+    // whose caller keeps its pre-write snapshot.
+    const callerSnapshot = workspaceRequest(served, { overrides: {} });
+    expect((await manager.getToolsForWorkspace(callerSnapshot)).stats.enabledServerCount).toBe(1);
     const readsBefore = readWorkspaceOverrides.mock.calls.length;
 
     // Sibling backend disables the server on disk (for both workspaces) and
@@ -7621,7 +7480,7 @@ describe("MCPServerManager", () => {
     epoch = "epoch-2";
 
     // Served workspace: the preflight sweep re-read its overrides from disk.
-    const afterServed = await manager.getToolsForWorkspace(recorded);
+    const afterServed = await manager.getToolsForWorkspace(callerSnapshot);
     expect(afterServed.stats.enabledServerCount).toBe(0);
     expect(readWorkspaceOverrides.mock.calls.length).toBeGreaterThan(readsBefore);
     // Cold cached workspace: its overlay was evicted, so the serve re-reads disk
@@ -7646,14 +7505,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-cache-before-first-observation";
     await manager.applyWorkspaceOverrides(workspaceId, {}); // pre-revocation publication
     const served = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
@@ -7683,14 +7538,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-mid-serve-sibling-write";
     expect(
       (await manager.getToolsForWorkspace(workspaceRequest(workspaceId))).stats.enabledServerCount
@@ -7718,7 +7569,6 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
@@ -7732,12 +7582,7 @@ describe("MCPServerManager", () => {
             resolve({ messages: [{ role: "user", content: { type: "text", text: "Status" } }] });
         })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const names = Object.keys(args[0] as Record<string, unknown>);
-      return Promise.resolve(
-        startResult(names.map((name) => [name, { prompts: [{ name: "status" }], getPrompt }]))
-      );
-    });
+    servers.serve("node ordinary.js", { prompts: [{ name: "status" }], getPrompt });
     const workspaceId = "ws-prompt-baseline";
     const other = "ws-other-serve";
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
@@ -7763,14 +7608,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve({}),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const workspaceId = "ws-epoch-unreadable";
     // Every serve — including the first — sees "unreadable" as a change it
     // cannot bound, and gives up rather than trusting anything (the request
@@ -7784,7 +7625,8 @@ describe("MCPServerManager", () => {
     await expect(manager.getToolsForWorkspace(workspaceRequest(workspaceId))).rejects.toThrow(
       /about to start/
     );
-    expect(startServers).not.toHaveBeenCalled();
+    expect(servers.exec).not.toHaveBeenCalled();
+    expect(servers.connectCount("node ordinary.js")).toBe(0);
   });
 
   test("a cold off-host serve re-reads disk instead of trusting a snapshot older than the epoch baseline", async () => {
@@ -7803,14 +7645,10 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides,
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
     configService.listServers = mock(() =>
       Promise.resolve({ ordinary: stdioConfig("node ordinary.js") })
     );
-    spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(startResult(Object.keys(servers).map((name) => [name, undefined])));
-    });
+    servers.serve("node ordinary.js");
     const remote = Object.create(RemoteRuntime.prototype) as Runtime;
     const served = await manager.getToolsForWorkspace(
       workspaceRequest("ws-cold-remote", { runtime: remote, overrides: {} })
@@ -7829,7 +7667,6 @@ describe("MCPServerManager", () => {
 
   test("plugin servers are excluded on off-host runtimes (remote and devcontainer)", async () => {
     configService.listServers = mock(() => Promise.resolve(pluginStdioConfig()));
-    spyOn(access, "startServers").mockImplementation(() => Promise.resolve(startResult([])));
 
     // Runtime identity is all the gate needs; both classes exec off-host.
     // DevcontainerRuntime extends LocalBaseRuntime but execs inside the container.
@@ -7879,19 +7716,12 @@ describe("MCPServerManager", () => {
         })
       );
       const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
-        agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+        agentPluginsMcpProvider: () =>
+          Promise.resolve(launchablePluginConfig(path.join(tmp.path, "data"))),
       });
       manager.dispose();
       manager = new MCPServerManager(pluginConfigService);
-      access = manager as unknown as MCPServerManagerTestAccess;
-      const startServers = spyOn(access, "startServers").mockImplementation(
-        (...args: unknown[]) => {
-          const servers = args[0] as Record<string, unknown>;
-          return Promise.resolve(
-            startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
-          );
-        }
-      );
+      servers.serve(PLUGIN_COMMAND, { tools: { echo: testTool() } });
 
       // Establish the persisted default before testing workspace precedence.
       expect((await pluginConfigService.listServers())[PLUGIN_KEY]?.disabled).toBe(
@@ -7903,9 +7733,7 @@ describe("MCPServerManager", () => {
       expect(result.stats.enabledServerCount).toBe(scenario.expectedServers.length);
       expect(result.stats.startedServerCount).toBe(scenario.expectedServers.length);
       expect(Object.values(result.toolServerNames)).toEqual(scenario.expectedServers);
-      expect(Object.keys(startServers.mock.calls.at(-1)?.[0] as Record<string, unknown>)).toEqual(
-        scenario.expectedServers
-      );
+      expect(servers.connectCount(PLUGIN_COMMAND)).toBe(scenario.expectedServers.length);
     });
   }
 
@@ -8063,7 +7891,10 @@ describe("MCPServerManager", () => {
     tool = testTool(),
     options?: MCPServerManagerOptions
   ) {
-    const deps = { agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()) };
+    const deps = {
+      agentPluginsMcpProvider: () =>
+        Promise.resolve(launchablePluginConfig(path.join(rootDir, "data"))),
+    };
     const writer = new MCPConfigService(new Config(rootDir), deps);
     const reader = new MCPConfigService(new Config(rootDir), deps);
     expect(await writer.setServerEnabled(PLUGIN_KEY, true)).toEqual({
@@ -8072,17 +7903,14 @@ describe("MCPServerManager", () => {
     });
     manager.dispose();
     manager = new MCPServerManager(reader, options);
-    access = manager as unknown as MCPServerManagerTestAccess;
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "review" } }] })
     );
-    spyOn(access, "startServers").mockImplementation(() =>
-      Promise.resolve(
-        startResult([
-          [PLUGIN_KEY, { tools: { echo: tool }, prompts: [{ name: "review" }], getPrompt }],
-        ])
-      )
-    );
+    servers.serve(PLUGIN_COMMAND, {
+      tools: { echo: tool },
+      prompts: [{ name: "review" }],
+      getPrompt,
+    });
     const served = await manager.getToolsForWorkspace(
       workspaceRequest("ws-global-revocation", { overrides })
     );
@@ -8359,17 +8187,11 @@ describe("MCPServerManager", () => {
       JSON.stringify({ servers: {}, enabledPluginServers: [PLUGIN_KEY] })
     );
     const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
-      agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+      agentPluginsMcpProvider: () =>
+        Promise.resolve(launchablePluginConfig(path.join(tmp.path, "data"))),
     });
     manager.dispose();
     manager = new MCPServerManager(pluginConfigService);
-    access = manager as unknown as MCPServerManagerTestAccess;
-    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(
-        startResult(Object.keys(servers).map((name) => [name, { tools: { echo: testTool() } }]))
-      );
-    });
 
     expect((await pluginConfigService.listServers())[PLUGIN_KEY]?.disabled).toBe(false);
     const runtimes = [
@@ -8384,33 +8206,25 @@ describe("MCPServerManager", () => {
       expect(result.stats.enabledServerCount).toBe(0);
       expect(result.stats.startedServerCount).toBe(0);
       expect(result.tools).toEqual({});
-      expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
     }
   });
 
   test("global plugin toggles start and retire instances on the next warm-manager serve", async () => {
     using tmp = new DisposableTempDir("mcp-plugin-global-toggle");
     const pluginConfigService = new MCPConfigService(new Config(tmp.path), {
-      agentPluginsMcpProvider: () => Promise.resolve(pluginStdioConfig()),
+      agentPluginsMcpProvider: () =>
+        Promise.resolve(launchablePluginConfig(path.join(tmp.path, "data"))),
     });
     manager.dispose();
     manager = new MCPServerManager(pluginConfigService);
-    access = manager as unknown as MCPServerManagerTestAccess;
     const close = mock(() => Promise.resolve(undefined));
-    const startServers = spyOn(access, "startServers").mockImplementation((...args: unknown[]) => {
-      const servers = args[0] as Record<string, unknown>;
-      return Promise.resolve(
-        startResult(
-          Object.keys(servers).map((name) => [name, { tools: { echo: testTool() }, close }])
-        )
-      );
-    });
+    servers.serve(PLUGIN_COMMAND, { tools: { echo: testTool() }, close });
     const request = workspaceRequest("ws-plugin-global-toggle");
 
     const initiallyDisabled = await manager.getToolsForWorkspace(request);
     expect(initiallyDisabled.stats.enabledServerCount).toBe(0);
     expect(initiallyDisabled.tools).toEqual({});
-    expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+    expect(servers.connectCount(PLUGIN_COMMAND)).toBe(0);
 
     // Changing only the global default must invalidate a warmed startup signature;
     // no workspace overrides or explicit stop/refresh calls should be necessary.
@@ -8420,12 +8234,12 @@ describe("MCPServerManager", () => {
     expect(enabled.stats.startedServerCount).toBe(1);
     expect(Object.keys(enabled.tools)).toHaveLength(1);
     expect(Object.values(enabled.toolServerNames)).toEqual([PLUGIN_KEY]);
-    expect(startServers).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount(PLUGIN_COMMAND)).toBe(1);
     expect(close).not.toHaveBeenCalled();
 
     const cached = await manager.getToolsForWorkspace(request);
     expect(Object.keys(cached.tools)).toEqual(Object.keys(enabled.tools));
-    expect(startServers).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount(PLUGIN_COMMAND)).toBe(1);
     expect(close).not.toHaveBeenCalled();
 
     expect((await pluginConfigService.setServerEnabled(PLUGIN_KEY, false)).success).toBe(true);
@@ -8434,13 +8248,12 @@ describe("MCPServerManager", () => {
     expect(disabled.stats.startedServerCount).toBe(0);
     expect(disabled.tools).toEqual({});
     expect(disabled.toolServerNames).toEqual({});
-    expect(startServers.mock.calls.at(-1)?.[0]).toEqual({});
+    expect(servers.connectCount(PLUGIN_COMMAND)).toBe(1);
     expect(close).toHaveBeenCalledTimes(1);
   });
 
   test("threads the agentPlugins context through to config listing", async () => {
     configService.listServers = mock(() => Promise.resolve({}));
-    spyOn(access, "startServers").mockImplementation(() => Promise.resolve(startResult([])));
 
     const context = { projectRoot: "/worktrees/ws-1", projectKey: PROJECT_PATH };
     await manager.getToolsForWorkspace(
@@ -8457,25 +8270,28 @@ describe("MCPServerManager", () => {
   });
 
   test("stdio config signature includes args/env/cwd so plugin mcp.json edits recycle servers", async () => {
-    const startServersMock = spyOn(access, "startServers").mockImplementation(() =>
-      Promise.resolve(startResult([[PLUGIN_KEY, undefined]]))
-    );
+    using tmp = new DisposableTempDir("mcp-plugin-signature");
+    const env = { PLUGIN_ROOT: "/plugins/demo", PLUGIN_DATA: tmp.path };
+    const changedCommand = `${PLUGIN_COMMAND} '--changed'`;
+    servers.serve(PLUGIN_COMMAND);
+    servers.serve(changedCommand);
     const overrides = { enabledServers: [PLUGIN_KEY] };
 
-    configService.listServers = mock(() => Promise.resolve(pluginStdioConfig()));
+    configService.listServers = mock(() => Promise.resolve(pluginStdioConfig({ env })));
     await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
-    expect(startServersMock).toHaveBeenCalledTimes(1);
+    expect(servers.connectCount(PLUGIN_COMMAND)).toBe(1);
 
     // Same command, changed args: signature must change and servers restart.
     configService.listServers = mock(() =>
-      Promise.resolve(pluginStdioConfig({ args: ["-y", "some-server", "--changed"] }))
+      Promise.resolve(pluginStdioConfig({ env, args: ["-y", "some-server", "--changed"] }))
     );
     await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount(changedCommand)).toBe(1);
 
     // Unchanged config: cached instances are reused.
     await manager.getToolsForWorkspace(workspaceRequest("ws-plugin-sig", { overrides }));
-    expect(startServersMock).toHaveBeenCalledTimes(2);
+    expect(servers.connectCount(changedCommand)).toBe(1);
+    expect(servers.connectCount(PLUGIN_COMMAND)).toBe(1);
   });
 });
 
