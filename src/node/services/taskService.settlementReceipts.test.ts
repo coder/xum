@@ -8,11 +8,11 @@ import {
   spyOn,
   test,
 } from "bun:test";
-import { existsSync } from "fs";
+import { existsSync, writeFileSync } from "fs";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { SecretsStore } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -561,6 +561,69 @@ describe("TaskService settlement receipt producers (G2)", () => {
       }
     );
   });
+
+  test.each(["idle stop", "stop record"] as const)(
+    "%s: an unreadable config at the receipt decision fails closed — closing, no receipt, unproven",
+    async (producer) => {
+      const taskId = producer === "idle stop" ? "unreadableidle" : "unreadablerecord";
+      const { config } = await setupTree([
+        {
+          id: taskId,
+          overrides: {
+            taskStatus: "interrupted",
+            taskAttemptId: PREDECESSOR,
+            taskDesktopOwnerWorkspaceId: rootId,
+          },
+        },
+      ]);
+      const { taskService, svc } = createHarness(config);
+      const attemptId = await ownEligibleAttempt(config, taskService, taskId);
+      // config.json becomes unparseable exactly when the producer reaches its receipt decision
+      // (after its own status write): lenient reads then see an empty default config — no row,
+      // which must not be mistaken for a confirmed superseded row — and strict reads throw.
+      const configPath = configFilePath(config.rootDir);
+      const goodBytes = await fsPromises.readFile(configPath);
+      const decider = svc as unknown as {
+        decideSettlementReceipt: (...args: unknown[]) => unknown;
+      };
+      const decide = decider.decideSettlementReceipt;
+      const decideSpy = spyOn(decider, "decideSettlementReceipt").mockImplementation(
+        (...args: unknown[]) => {
+          writeFileSync(configPath, "{ not json", "utf-8");
+          return decide.apply(taskService, args);
+        }
+      );
+
+      if (producer === "idle stop") {
+        await svc.releaseSharedDesktopTaskOnUserStop(
+          taskId,
+          svc.resolveStreamAttemptAtEvent(taskId)
+        );
+      } else {
+        expect((await taskService.stopDescendantAgentTask(rootId, taskId)).success).toBe(true);
+        // The failed decision still releases the latch (nothing pinned until restart).
+        await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
+      }
+      expect(decideSpy).toHaveBeenCalledTimes(1);
+      decideSpy.mockRestore();
+      await fsPromises.writeFile(configPath, goodBytes);
+
+      expect(entryOf(config, taskId)?.taskAttemptId).toBe(attemptId);
+      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        attemptId,
+        phase: "closing",
+      });
+      expect(
+        await taskService.readAttemptOutcome(taskId, { requestingWorkspaceId: midId })
+      ).toEqual({ kind: "cleanup-pending" });
+      await expectNoReceipt(config, taskId, attemptId);
+      const otherConfig = await createTestConfig(rootDir);
+      const other = createHarness(otherConfig);
+      expect(
+        (await other.svc.evaluateAttemptLineage(taskId, entryOf(otherConfig, taskId)!)).proven
+      ).toBe(false);
+    }
+  );
 
   test("a successor another backend admitted never receives the predecessor's receipt", async () => {
     const taskId = "rotated";

@@ -1011,10 +1011,10 @@ interface WorkspaceStopRecord {
   /** Registered stream at capture; a later stop must not touch a replacement (expectedMessageId). */
   capturedStreamMessageId: string | undefined;
   /**
-   * The owned attempt's settlement receipt (writeSettlementReceiptBeforeSettling), written once
-   * the release conditions hold and BEFORE the latch releases run: `writing` while it is awaited
-   * (a recheck meanwhile schedules no second write), then `written` (or no receipt authority) or
-   * `failed`. Unset when no write was needed.
+   * The owned attempt's settlement receipt (decideSettlementReceipt), written once the release
+   * conditions hold and BEFORE the latch releases run: `writing` while it is awaited (a recheck
+   * meanwhile schedules no second write), then `written`, or `failed` (the write failed or the
+   * config was unreadable). Unset when no receipt applies (in-memory settlement only).
    */
   receipt?: "writing" | "written" | "failed";
 }
@@ -2483,31 +2483,31 @@ export class TaskService implements AgentTaskIntegration {
     // the latch holds back (a reawaken, a peer send, a queued launch) observes the stopped attempt
     // as released while its receipt could still be missing. The record stays registered (latched)
     // for the write; its completion rechecks, releasing the latch and recording the settlement in
-    // one step as before. A failed write still releases, with the attempt left `closing` (fail
-    // closed) instead of pinning the latch until restart.
+    // one step as before. A failed write (or an unreadable config) still releases, with the
+    // attempt left `closing` (fail closed) instead of pinning the latch until restart.
     if (record.receipt === "writing") return;
-    if (
-      record.receipt == null &&
-      this.attemptNeedsSettlementReceipt(workspaceId, record.ownedAttempt)
-    ) {
-      record.receipt = "writing";
-      void this.writeSettlementReceiptBeforeSettling(
+    if (record.receipt == null) {
+      const decision = this.decideSettlementReceipt(
         workspaceId,
         record.ownedAttempt,
-        "execution-settled",
         "stop-settled"
-      )
-        .then(
-          (settle) => {
-            record.receipt = settle ? "written" : "failed";
-          },
-          (error: unknown) => {
-            log.error("Stop release: settlement receipt write threw", { workspaceId, error });
-            record.receipt = "failed";
-          }
-        )
-        .finally(() => this.recheckWorkspaceStopRelease(workspaceId));
-      return;
+      );
+      if (decision.kind === "unreadable") record.receipt = "failed";
+      if (decision.kind === "write") {
+        record.receipt = "writing";
+        void this.writeSettlementReceipt(workspaceId, decision, "execution-settled")
+          .then(
+            (written) => {
+              record.receipt = written ? "written" : "failed";
+            },
+            (error: unknown) => {
+              log.error("Stop release: settlement receipt write threw", { workspaceId, error });
+              record.receipt = "failed";
+            }
+          )
+          .finally(() => this.recheckWorkspaceStopRelease(workspaceId));
+        return;
+      }
     }
     this.workspaceStopRecords.delete(workspaceId);
     for (const release of record.releases) {
@@ -2698,31 +2698,70 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Only this process's CURRENT owned attempt, admitted with proven lineage under a persisted id
-   * the row still names, may produce a cross-process receipt. Anything else (unowned or
-   * prior-process attempt, marked lineage, pre-identity entry, an owner a reawakening or a durable
-   * report already replaced, a row another writer rotated) settles in memory only, exactly as
-   * before receipts existed.
+   * Only this process's CURRENT owned attempt, admitted with proven lineage under a persisted id,
+   * may produce a cross-process receipt. Anything else (unowned or prior-process attempt, marked
+   * lineage, pre-identity entry, an owner a reawakening or a durable report already replaced)
+   * settles in memory only, exactly as before receipts existed. In-memory checks only: whether
+   * the row still names the attempt is decided by one strict read (readSettlementReceiptRow).
    */
-  private attemptNeedsSettlementReceipt(
+  private ownsReceiptEligibleAttempt(
     taskId: string,
     attempt: OwnedTaskAttempt | undefined
   ): attempt is OwnedTaskAttempt & { attemptId: string } {
-    // The row check also keeps the closure below from replacing a closure another producer
-    // recorded for the attempt the row does name.
     return (
       attempt?.attemptId != null &&
       attempt.receiptEligible &&
-      this.ownedAttemptByTaskId.get(taskId) === attempt &&
-      this.currentTaskAttemptId(taskId) === attempt.attemptId
+      this.ownedAttemptByTaskId.get(taskId) === attempt
     );
+  }
+
+  /**
+   * The one strict config read a receipt decision rests on. `ours`: the row names `attemptId`,
+   * with the owner dirs to write into (parent first). `elsewhere`: CONFIRMED gone, parentless or
+   * naming another attempt (rowSupersedes) — a successor another writer admitted must never be
+   * vouched for by its predecessor's settlement. `unreadable`: the config (or the parent chain)
+   * could not be read, which is no evidence either way and must never be taken for `elsewhere`.
+   */
+  private readSettlementReceiptRow(
+    taskId: string,
+    attemptId: string
+  ):
+    | { kind: "ours"; parentWorkspaceId: string; owners: string[] }
+    | { kind: "elsewhere" }
+    | { kind: "unreadable"; error: string } {
+    let parentWorkspaceId: string | undefined;
+    let owners: string[];
+    try {
+      const cfg = this.config.loadConfigOrDefault({ throwOnError: true });
+      const row = findWorkspaceEntry(cfg, taskId)?.workspace;
+      parentWorkspaceId = coerceNonEmptyString(row?.parentWorkspaceId);
+      if (row == null || parentWorkspaceId == null || rowSupersedes(row, attemptId)) {
+        log.info("[task-attempt] settlement receipt skipped: the row no longer names the attempt", {
+          taskId,
+          attemptId,
+          current: row?.taskAttemptId,
+        });
+        return { kind: "elsewhere" };
+      }
+      owners = this.listAncestorWorkspaceIdsUsingParentById(
+        this.buildAgentTaskIndex(cfg).parentById,
+        taskId
+      );
+    } catch (error: unknown) {
+      // An unreadable config, or a parent cycle in it.
+      return { kind: "unreadable", error: getErrorMessage(error) };
+    }
+    assert(
+      owners[0] === parentWorkspaceId,
+      "readSettlementReceiptRow: the first owner must be the row's parent"
+    );
+    return { kind: "ours", parentWorkspaceId, owners };
   }
 
   /**
    * Durable settlement for producers that established that no execution can still publish a
    * report for `attempt` (idle stop, idle terminal failure, reservation canceled/failed, launch
-   * failed before its send): the receipt first, then the in-memory settlement (see
-   * writeSettlementReceiptBeforeSettling).
+   * failed before its send): the receipt first, then the in-memory settlement.
    */
   private async persistOwnedAttemptSettlement(
     taskId: string,
@@ -2730,96 +2769,84 @@ export class TaskService implements AgentTaskIntegration {
     receiptSource: SubagentAttemptSettlementSource,
     settlementSource: string
   ): Promise<void> {
+    const decision = this.decideSettlementReceipt(taskId, attempt, settlementSource);
+    if (decision.kind === "unreadable") return;
     if (
-      await this.writeSettlementReceiptBeforeSettling(
-        taskId,
-        attempt,
-        receiptSource,
-        settlementSource
-      )
+      decision.kind === "write" &&
+      !(await this.writeSettlementReceipt(taskId, decision, receiptSource))
     ) {
-      this.settleOwnedTaskAttempt(taskId, attempt, settlementSource);
+      return;
     }
+    this.settleOwnedTaskAttempt(taskId, attempt, settlementSource);
   }
 
   /**
-   * The receipt half of a settlement: true when the caller may now record the in-memory
-   * settlement (receipt durable, or no receipt authority — see attemptNeedsSettlementReceipt —
-   * which keeps today's in-memory-only settlement). False when the write failed: the attempt
-   * stays `closing` — cleanup-pending in this process, indeterminate after a restart — and never
-   * becomes `settled`, so no successor can read it as settled without a durable receipt. The
-   * attempt is closed to sends first, so none can be admitted while the write is awaited.
+   * The synchronous half of a receipt-bearing settlement, from one strict read:
+   *  - `memory-only`: no receipt authority (ownsReceiptEligibleAttempt), or the read CONFIRMED the
+   *    row gone or naming another attempt — today's in-memory-only settlement follows;
+   *  - `write`: the row names the attempt, which is closed to sends here (before any await) and
+   *    must not be settled until writeSettlementReceipt succeeds;
+   *  - `unreadable`: no evidence either way, so fail closed — the attempt is closed but never
+   *    settled (cleanup-pending here, indeterminate after a restart) and gets no receipt. A
+   *    closure another producer recorded for a DIFFERENT attempt is kept rather than replaced:
+   *    with the row unknown it may name the row's current attempt, and replacing it would reopen
+   *    that attempt to sends.
+   * A failed write, like `unreadable`, leaves the attempt `closing`: never settled without its
+   * receipt, so no successor reads it as settled when a restart would not.
    */
-  private async writeSettlementReceiptBeforeSettling(
+  private decideSettlementReceipt(
     taskId: string,
     attempt: OwnedTaskAttempt | undefined,
-    receiptSource: SubagentAttemptSettlementSource,
     settlementSource: string
-  ): Promise<boolean> {
-    if (!this.attemptNeedsSettlementReceipt(taskId, attempt)) return true;
-    this.closeAttemptAdmission(taskId, attempt.attemptId, attempt, settlementSource);
-    const written = await this.writeOwnedAttemptSettlementReceipt(
-      taskId,
-      attempt.attemptId,
-      receiptSource
-    );
-    return written !== "failed";
+  ):
+    | { kind: "memory-only" }
+    | { kind: "unreadable" }
+    | { kind: "write"; attemptId: string; parentWorkspaceId: string; owners: string[] } {
+    if (!this.ownsReceiptEligibleAttempt(taskId, attempt)) return { kind: "memory-only" };
+    const attemptId = attempt.attemptId;
+    const row = this.readSettlementReceiptRow(taskId, attemptId);
+    if (row.kind === "elsewhere") return { kind: "memory-only" };
+    if (row.kind === "unreadable") {
+      log.warn("[task-attempt] settlement receipt not written: config unreadable", {
+        taskId,
+        attemptId,
+        error: row.error,
+      });
+      const existing = this.attemptSettlementByTaskId.get(taskId);
+      if (existing == null || existing.attemptId === attemptId) {
+        this.closeAttemptAdmission(taskId, attemptId, attempt, settlementSource);
+      }
+      return { kind: "unreadable" };
+    }
+    // Synchronous with the read: the row names this attempt, so any closure replaced here names
+    // an attempt the row no longer does.
+    this.closeAttemptAdmission(taskId, attemptId, attempt, settlementSource);
+    return {
+      kind: "write",
+      attemptId,
+      parentWorkspaceId: row.parentWorkspaceId,
+      owners: row.owners,
+    };
   }
 
   /**
-   * Write the receipt for exactly `attemptId` into every owner session dir (the task's parent and
-   * its ancestors, from a strict config read). `skipped` — no receipt, not a failure — when the
-   * row is gone, has no parent, or names another attempt: a successor admitted by another writer
-   * (rowSupersedes) must never be vouched for by its predecessor's settlement. Never throws.
+   * Write the receipt into every owner dir: outermost ancestor first, the parent LAST, stopping
+   * at the first failure, so the parent's copy (the one lineage proof reads) exists only once
+   * every other owner holds one too. True when all writes succeeded. Never throws.
    */
-  private async writeOwnedAttemptSettlementReceipt(
+  private async writeSettlementReceipt(
     taskId: string,
-    attemptId: string,
+    target: { attemptId: string; parentWorkspaceId: string; owners: string[] },
     source: SubagentAttemptSettlementSource
-  ): Promise<"written" | "skipped" | "failed"> {
-    let resolved: { parentWorkspaceId: string; owners: string[] } | undefined;
-    try {
-      const cfg = this.config.loadConfigOrDefault({ throwOnError: true });
-      const row = findWorkspaceEntry(cfg, taskId)?.workspace;
-      const parentWorkspaceId = coerceNonEmptyString(row?.parentWorkspaceId);
-      if (row == null || parentWorkspaceId == null || rowSupersedes(row, attemptId)) {
-        log.info("[task-attempt] settlement receipt skipped: the row no longer names the attempt", {
-          taskId,
-          attemptId,
-          current: row?.taskAttemptId,
-        });
-        return "skipped";
-      }
-      resolved = {
-        parentWorkspaceId,
-        owners: this.listAncestorWorkspaceIdsUsingParentById(
-          this.buildAgentTaskIndex(cfg).parentById,
-          taskId
-        ),
-      };
-    } catch (error: unknown) {
-      // Unreadable config (or a parent cycle): no owner dirs to vouch in; fail closed.
-      log.warn("[task-attempt] settlement receipt not written; attempt left closing", {
-        taskId,
-        attemptId,
-        error: getErrorMessage(error),
-      });
-      return "failed";
-    }
-    assert(
-      resolved.owners[0] === resolved.parentWorkspaceId,
-      "writeOwnedAttemptSettlementReceipt: the first owner must be the row's parent"
-    );
+  ): Promise<boolean> {
     const receipt = {
       taskId,
-      attemptId,
-      parentWorkspaceId: resolved.parentWorkspaceId,
+      attemptId: target.attemptId,
+      parentWorkspaceId: target.parentWorkspaceId,
       source,
       settledAt: new Date().toISOString(),
     };
-    // Outermost ancestor first, the parent LAST, stopping at the first failure: the parent's copy
-    // (the one lineage proof reads) then exists only once every other owner holds one too.
-    for (const ownerWorkspaceId of [...resolved.owners].reverse()) {
+    for (const ownerWorkspaceId of [...target.owners].reverse()) {
       const result = await writeSubagentAttemptSettlementReceipt({
         ownerWorkspaceSessionDirs: [path.join(this.config.sessionsDir, ownerWorkspaceId)],
         receipt,
@@ -2827,14 +2854,14 @@ export class TaskService implements AgentTaskIntegration {
       if (!result.success) {
         log.warn("[task-attempt] settlement receipt write failed; attempt left closing", {
           taskId,
-          attemptId,
+          attemptId: target.attemptId,
           ownerWorkspaceId,
           error: result.error,
         });
-        return "failed";
+        return false;
       }
     }
-    return "written";
+    return true;
   }
 
   /**
@@ -5908,7 +5935,7 @@ export class TaskService implements AgentTaskIntegration {
         }
       }
       // The pre-launch path failed before scheduling: nothing ran under the attempt. A row the
-      // failed commit never wrote gets no receipt (writeOwnedAttemptSettlementReceipt skips it).
+      // failed commit never wrote gets no receipt (readSettlementReceiptRow: elsewhere).
       await this.persistOwnedAttemptSettlement(
         plan.taskId,
         ownedAttempts.get(plan.taskId),
