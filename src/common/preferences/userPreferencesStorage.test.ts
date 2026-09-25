@@ -4,7 +4,6 @@ import {
   applyStoredUserPreference,
   entriesFromUserPreferences,
   getStoredUserPreferenceEntries,
-  hasUserPreferenceEntry,
   isUserPreferenceStorageKey,
   removeStoredUserPreference,
 } from "./userPreferencesStorage";
@@ -51,6 +50,10 @@ function collectForTest(storage: MemoryStorage) {
     (preferences, entry) => applyStoredUserPreference(preferences, entry.key, entry.value),
     undefined as Parameters<typeof applyStoredUserPreference>[0]
   );
+}
+
+function entryKeys(preferences: UserPreferences | undefined): string[] {
+  return entriesFromUserPreferences(preferences).map((entry) => entry.key);
 }
 
 describe("user preference localStorage registry", () => {
@@ -160,10 +163,8 @@ describe("user preference localStorage registry", () => {
     for (const entry of entries) {
       expect(isUserPreferenceStorageKey(entry.key)).toBe(true);
       const applied = applyStoredUserPreference(undefined, entry.key, entry.value);
-      expect(hasUserPreferenceEntry(applied, entry.key)).toBe(true);
-      expect(
-        hasUserPreferenceEntry(removeStoredUserPreference(applied, entry.key), entry.key)
-      ).toBe(false);
+      expect(entryKeys(applied)).toContain(entry.key);
+      expect(entryKeys(removeStoredUserPreference(applied, entry.key))).not.toContain(entry.key);
     }
   });
 
@@ -194,7 +195,7 @@ describe("user preference localStorage registry", () => {
     preferences = removeStoredUserPreference(preferences, UI_THEME_KEY);
 
     expect(preferences).toEqual({ appearance: { vimEnabled: true } });
-    expect(hasUserPreferenceEntry(preferences, UI_THEME_KEY)).toBe(false);
+    expect(entryKeys(preferences)).not.toContain(UI_THEME_KEY);
   });
 
   test("returns only valid entries for backfill", () => {

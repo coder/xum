@@ -38,7 +38,7 @@
  */
 import type { Cause, Context } from "effect";
 import { Effect, Queue, Stream } from "effect";
-import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/common/utils/withQueueHeartbeat";
+import { SUBSCRIPTION_HEARTBEAT_INTERVAL_MS } from "@/constants/orpcSubscriptions";
 
 /** Producer-facing handle. Safe to call from any non-Effect callsite. */
 export interface SubscriptionEmit<T> {
@@ -70,8 +70,7 @@ export interface SubscriptionStreamOptions<T> {
   /**
    * Buffering strategy. `"all"` (default) is an unbounded FIFO. `"latest"`
    * coalesces: an unconsumed value is replaced by the newest one, so a slow
-   * consumer never accumulates a backlog and never replays stale snapshots
-   * (mirrors `createLatestValueQueue`).
+   * consumer never accumulates a backlog and never replays stale snapshots.
    */
   buffer?: "all" | "latest";
   /**

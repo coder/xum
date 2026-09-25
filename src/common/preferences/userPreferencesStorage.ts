@@ -636,10 +636,3 @@ export function getStoredUserPreferenceKeys(storage: UserPreferenceStorageArea):
   }
   return keys;
 }
-
-export function hasUserPreferenceEntry(
-  preferences: UserPreferences | undefined,
-  key: string
-): boolean {
-  return entriesFromUserPreferences(preferences).some((entry) => entry.key === key);
-}
