@@ -2043,6 +2043,55 @@ describe("MCPServerManager", () => {
   test("invalidation landing between the final epoch scan and cache publication never publishes the stale instance", async () => {
     const workspaceId = "ws-publish-race";
     const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // Schedule the invalidation for the first microtask turn AFTER the
+    // caller's continuation resumes from the final (stable-clock) scan: two
+    // hops, because the caller's continuation is queued behind the first when
+    // the scan resolves. Publication is synchronous with the final clock
+    // check, so the stop must find the PUBLISHED entry and close it; any await
+    // inserted between check and publish lets the stop run first, miss the
+    // unpublished instance, and the stale instance is published.
+    // Private call: no public callback runs between the final scan and publish.
+    const scans = manager as unknown as {
+      closeInvalidatedInstances: (...args: unknown[]) => Promise<string[]>;
+    };
+    const scan = scans.closeInvalidatedInstances.bind(manager);
+    let stopPromise: Promise<void> | undefined;
+    let armed = true;
+    scans.closeInvalidatedInstances = async (...args: unknown[]) => {
+      const removed = await scan(...args);
+      if (armed) {
+        armed = false;
+        queueMicrotask(() =>
+          queueMicrotask(() => {
+            stopPromise = manager.stopServersWithKeyPrefix("plugin:abc123:");
+          })
+        );
+      }
+      return removed;
+    };
+    const close = mock(() => Promise.resolve(undefined));
+    servers.serve("node server.js", { tools: { echo: testTool() }, close });
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(stopPromise).toBeDefined();
+    await stopPromise;
+
+    // The stale-tree instance was closed and carries a retry marker, so the
+    // next call restarts it from the new tree.
+    expect(close).toHaveBeenCalledTimes(1);
+    servers.serve("node server.js", { tools: { echo: testTool() } });
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(servers.connectCount("node server.js")).toBe(1);
+    expect(Object.keys(second.tools)).toHaveLength(1);
+  });
+
+  test("invalidation landing during the epoch scan forces a rescan before publication", async () => {
+    const workspaceId = "ws-scan-race";
+    const pluginKey = "plugin:abc123:echo";
     const triggerKey = "plugin:zzz:trigger";
     configService.listServers.mockImplementation(() =>
       Promise.resolve({
@@ -3178,6 +3227,34 @@ describe("MCPServerManager", () => {
     expect(listPrompts).toHaveBeenCalledTimes(1);
     expect(result.tools).toEqual({});
     expect(result.toolServerNames).toEqual({});
+  });
+
+  test("a closed client observed by a background tools/list refresh is excluded from that response", async () => {
+    const workspaceId = "closed-during-background-refresh";
+    const url = "https://mcp.example.test/refresh";
+    configService.listServers = mock(() =>
+      Promise.resolve({ server: { transport: "http" as const, url, disabled: false } })
+    );
+    // tools/list call 1 is the startup fetch; call 2 is the cached serve's
+    // background refresh, whose request surfaces the transport as closed
+    // (the client's onUncaughtError) before the serve collects its tools.
+    const listTools = mock((): Promise<Record<string, Tool>> => {
+      if (listTools.mock.calls.length > 1) {
+        // Read at call time: the harness installs its createMCPClient spy on serve().
+        const connects = mcpSdk.createMCPClient as unknown as {
+          mock: { calls: Array<[mcpSdk.MCPClientConfig]> };
+        };
+        connects.mock.calls.at(-1)![0].onUncaughtError?.(new Error("Connection closed"));
+      }
+      return Promise.resolve({ work: testTool() });
+    });
+    servers.serve(url, { era: "modern", listTools });
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(first.tools)).toEqual(["server_work"]);
+    const next = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(listTools).toHaveBeenCalledTimes(2);
+    expect(next.tools).toEqual({});
+    expect(next.toolServerNames).toEqual({});
   });
 
   test("getToolsForWorkspace serves the cached tool catalog and refreshes it in the background", async () => {
