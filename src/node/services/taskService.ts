@@ -665,10 +665,6 @@ export const TASK_RESERVATION_INTERRUPTED_PREFIX = "Interrupted";
 /** taskLaunchError persisted for a reservation canceled before its launch was admitted. */
 export const TASK_RESERVATION_CANCELED_MESSAGE = "Reservation canceled";
 
-export function isTaskReservationInterruptedError(message: string): boolean {
-  return message.startsWith(TASK_RESERVATION_INTERRUPTED_PREFIX);
-}
-
 /**
  * Stage tracking for one createMany call: the last entered stage is included in cancellation
  * errors, and a single warning names it if the reservation is still waiting after
