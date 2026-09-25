@@ -57,6 +57,16 @@ jobs:
               - 'src/common/**'
               - 'tests/ipc/**'
               - 'tests/runtime/**'
+              # Shared Jest harness (setup.ts, testUtils.ts, __mocks__, fixtures), root-level
+              # suites (workerBudget.test.ts), tests/run, and Jest's own config: the
+              # integration job below runs Jest only when this filter (or browser) matches.
+              - 'tests/*'
+              - 'tests/__mocks__/**'
+              - 'tests/fixtures/**'
+              - 'tests/run/**'
+              - 'jest.config.js'
+              - 'babel.config.cjs'
+              - 'scripts/lib/worker_budget.js'
             browser:
               - 'src/browser/**'
               - 'tests/ui/**'
@@ -64,7 +74,8 @@ jobs:
               - '.github/**'
               - 'scripts/**'
               - 'packages/mux-compat/**'
-              - 'jest.config.cjs'
+              - 'jest.config.js'
+              - 'bunfig.toml'
               - 'babel.config.cjs'
               - 'package.json'
               - 'bun.lock'
