@@ -13,7 +13,6 @@ import { EventEmitter, once } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
-import type { SendMessageError } from "@/common/types/errors";
 import { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
@@ -21,7 +20,11 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import { streamText, tool } from "ai";
 import { z } from "zod";
 import { StreamManager } from "./streamManager";
-import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
+import {
+  BashMonitorRegistryStore,
+  type BashMonitorRegistryRecord,
+} from "./bashMonitorRegistryStore";
+import * as codeWorkspaceSync from "@/node/worktree/codeWorkspaceSync";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
@@ -29,13 +32,13 @@ import type { WorkspaceTurnHost } from "./taskWorkspaceSeam";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
-import type { WorkspaceGoalService } from "./workspaceGoalService";
+import { WorkspaceGoalService } from "./workspaceGoalService";
 import { waitForCondition } from "./testDispatchHelpers";
-import type {
-  BashMonitorProcessSnapshot,
+import {
   BashMonitorWakeReconciler,
-  BashMonitorWakeReconcilerProcessManager,
-  BashMonitorWakeDispatch,
+  type BashMonitorProcessSnapshot,
+  type BashMonitorWakeReconcilerProcessManager,
+  type BashMonitorWakeDispatch,
 } from "./bashMonitorWakeReconciler";
 import {
   createDeferred,
@@ -44,6 +47,18 @@ import {
 } from "./workspaceService.testHarness";
 
 describe("WorkspaceService bash monitor wake reconciler wiring", () => {
+  function registryRecord(ownerWorkspaceId: string, createdAt: string): BashMonitorRegistryRecord {
+    return {
+      processId: "proc",
+      taskId: "bash:proc",
+      ownerWorkspaceId,
+      filter: "READY",
+      filterExclude: false,
+      script: "run",
+      createdAt,
+    };
+  }
+
   // The durable auto-retry preference a restarted session reads for this workspace.
   function autoRetryPreferencePath(h: {
     config: { sessionsDir: string };
@@ -66,19 +81,21 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       setMessageQueued: mock(() => undefined),
     }) as unknown as BackgroundProcessManager;
     const aiService = createMockAIService({ isStreaming: mock(() => false) });
+    const extensionMetadata = new ExtensionMetadataService(
+      path.join(config.rootDir, "wake-wiring-extension-metadata.json")
+    );
     const service = createWorkspaceServiceForTest({
       config,
       historyService,
       aiService,
-      extensionMetadata: new ExtensionMetadataService(
-        path.join(config.rootDir, "wake-wiring-extension-metadata.json")
-      ),
+      extensionMetadata,
       backgroundProcessManager,
     });
     return {
       config,
       historyService,
       aiService,
+      extensionMetadata,
       backgroundProcessManager,
       service,
       events,
@@ -87,10 +104,15 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   }
 
   async function createActiveWakeHarness(options?: {
-    workspaceGoalService?: WorkspaceGoalService;
+    workspaceGoalService?: WorkspaceGoalService | "real";
   }) {
     const fixture = await createWakeWiringService();
     const { config, service, historyService, backgroundProcessManager } = fixture;
+    // "real": the session gets a real goal service over this fixture's stores.
+    const workspaceGoalService =
+      options?.workspaceGoalService === "real"
+        ? new WorkspaceGoalService(config, historyService, fixture.extensionMetadata)
+        : options?.workspaceGoalService;
     const workspaceId = "monitor-attention-owner";
     await config.addWorkspace("/tmp/monitor-attention-project", {
       id: workspaceId,
@@ -111,7 +133,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       historyService,
       backgroundProcessManager,
       aiEmitter,
-      workspaceGoalService: options?.workspaceGoalService,
+      workspaceGoalService,
       aiServiceOverrides: {
         isStreaming: () => streaming,
         streamMessage: mock((request: Parameters<AIService["streamMessage"]>[0]) => {
@@ -199,6 +221,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     return {
       ...fixture,
       ...harness,
+      workspaceGoalService,
       workspaceId,
       model,
       requests,
@@ -357,13 +380,12 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       restoreSnapshotAfterUnarchive.mockImplementation(() => Promise.resolve(Ok(undefined)));
       // Restoration succeeds but a follow-up step throws: unarchivedAt is already persisted and a
       // retried unarchive would not run the hooks again, so the held attention must still wake.
-      spyOn(
-        h.internal as unknown as { syncCodeWorkspaceFiles(): Promise<void> },
-        "syncCodeWorkspaceFiles"
-      ).mockImplementationOnce(() => {
-        throw new Error("sync failed");
-      });
+      const sync = spyOn(codeWorkspaceSync, "syncProjectCodeWorkspace").mockImplementationOnce(() =>
+        Promise.reject(new Error("sync failed"))
+      );
       expect((await h.service.unarchive(h.workspaceId)).success).toBe(false);
+      expect(sync).toHaveBeenCalledTimes(1);
+      sync.mockRestore();
       // Unarchive itself schedules the reconcile; no manual reconcile here.
       await waitForCondition(() => h.requests.length === 1);
     } finally {
@@ -899,7 +921,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   );
 
   test("a cancellation write failure still completes successful hard-Stop cleanup", async () => {
-    const h = await createActiveWakeHarness();
+    const h = await createActiveWakeHarness({ workspaceGoalService: "real" });
     const descendants = mock(() => Promise.resolve(["child"]));
     h.service.setAgentTaskIntegration(
       makeAgentTaskIntegrationFake({ terminateAllDescendantAgentTasks: descendants })
@@ -908,12 +930,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const queueRestored = spyOn(h.session, "restoreQueueToInput");
     const accountingEntered = Promise.withResolvers<void>();
     const releaseAccounting = Promise.withResolvers<void>();
-    const policy = h.session as unknown as {
-      recordGoalAccountingFromUsage(input: unknown): Promise<void>;
-    };
-    spyOn(policy, "recordGoalAccountingFromUsage").mockImplementation(async () => {
+    // Hold the abort's goal accounting where the session awaits its goal service.
+    spyOn(h.workspaceGoalService!, "recordStreamAccounting").mockImplementation(async () => {
       accountingEntered.resolve();
       await releaseAccounting.promise;
+      return null;
     });
     const stopSession = h.session.interruptStream.bind(h.session);
     let sessionResult: Awaited<ReturnType<AgentSession["interruptStream"]>> | undefined;
@@ -1510,10 +1531,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
           }
         );
       } else {
-        const internal = h.service as unknown as {
-          assertPricedModelForBudgetedGoal(): Promise<Result<void, SendMessageError>>;
-        };
-        spyOn(internal, "assertPricedModelForBudgetedGoal").mockImplementationOnce(async () => {
+        // The service's pricing gate asks its goal service; wire a real one and hold it there.
+        const goals = new WorkspaceGoalService(h.config, h.historyService, h.extensionMetadata);
+        h.service.setWorkspaceGoalService(goals);
+        spyOn(goals, "assertPricedModelForBudgetedGoal").mockImplementationOnce(async () => {
           entered.resolve();
           await release.promise;
           return Ok(undefined);
@@ -1611,28 +1632,21 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   );
 
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
-    const { service, events, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const discardProcess = mock(() => Promise.resolve());
-    const upsert = mock(() => Promise.resolve());
-    const remove = mock(() => Promise.resolve());
-    const recordTerminal = mock(() => Promise.resolve());
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: {
-        scheduleReconcile: typeof scheduleReconcile;
-        discardProcess: typeof discardProcess;
-      };
-      bashMonitorRegistryStore: {
-        upsert: typeof upsert;
-        remove: typeof remove;
-        recordTerminal: typeof recordTerminal;
-      };
-    };
+    const { events, cleanup } = await createWakeWiringService();
+    // The service owns one reconciler and one registry store; recording their public methods
+    // observes the wiring without running reconciliation or registry I/O.
+    const scheduleReconcile = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "scheduleReconcile"
+    ).mockImplementation(() => undefined);
+    const discardProcess = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "discardProcess"
+    ).mockResolvedValue(undefined);
+    const upsert = spyOn(BashMonitorRegistryStore.prototype, "upsert").mockResolvedValue(undefined);
+    const remove = spyOn(BashMonitorRegistryStore.prototype, "remove").mockResolvedValue(undefined);
+    spyOn(BashMonitorRegistryStore.prototype, "recordTerminal").mockResolvedValue(undefined);
     try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
-      internal.bashMonitorRegistryStore = { upsert, remove, recordTerminal };
       const armed = {
         processId: "proc",
         taskId: "bash:proc",
@@ -1659,6 +1673,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(remove).toHaveBeenCalledWith("owner", "proc", armed.createdAt);
       expect(scheduleReconcile).toHaveBeenCalledTimes(4);
     } finally {
+      mock.restore();
       await cleanup();
     }
   });
@@ -1738,17 +1753,19 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   });
 
   test("runtime failure recreates missing registry evidence from arm metadata", async () => {
-    const { config, service, events, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-    };
+    // Startup recovery sees an empty registry, so only the failure path can schedule the owner.
+    spyOn(BashMonitorRegistryStore.prototype, "listOwnerWorkspaceIds").mockResolvedValue({
+      ownerWorkspaceIds: [],
+      scanFailed: false,
+    });
+    const { config, events, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "scheduleReconcile"
+    ).mockImplementation(() => undefined);
     // Read the evidence back through a fresh store: it must be durable, not only in memory.
     const registry = new BashMonitorRegistryStore(config);
     try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
       const armMetadata = {
         processId: "failed-proc",
         taskId: "bash:failed-proc",
@@ -1790,38 +1807,29 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       });
       expect(scheduleReconcile).toHaveBeenCalledWith("owner");
     } finally {
+      mock.restore();
       await cleanup();
     }
   });
 
   test("runtime failure persistence retries before scheduling its wake", async () => {
-    const { service, events, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const upsert = mock(() => Promise.resolve());
+    const { events, cleanup } = await createWakeWiringService();
+    const scheduleReconcile = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "scheduleReconcile"
+    ).mockImplementation(() => undefined);
+    spyOn(BashMonitorRegistryStore.prototype, "upsert").mockResolvedValue(undefined);
+    spyOn(BashMonitorRegistryStore.prototype, "recordTerminal").mockResolvedValue(undefined);
     let lostAttempts = 0;
-    const recordLost = mock(() => {
-      lostAttempts++;
-      return lostAttempts === 1
-        ? Promise.reject(new Error("transient registry write failure"))
-        : Promise.resolve();
-    });
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-      bashMonitorRegistryStore: {
-        upsert: typeof upsert;
-        recordTerminal(): Promise<void>;
-        recordLost: typeof recordLost;
-      };
-    };
+    const recordLost = spyOn(BashMonitorRegistryStore.prototype, "recordLost").mockImplementation(
+      () => {
+        lostAttempts++;
+        return lostAttempts === 1
+          ? Promise.reject(new Error("transient registry write failure"))
+          : Promise.resolve();
+      }
+    );
     try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
-      internal.bashMonitorRegistryStore = {
-        upsert,
-        recordTerminal: () => Promise.resolve(),
-        recordLost,
-      };
       const armMetadata = {
         processId: "retry-failed-proc",
         taskId: "bash:retry-failed-proc",
@@ -1845,39 +1853,27 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(recordLost).toHaveBeenCalledTimes(2);
       expect(scheduleReconcile).toHaveBeenCalledWith("owner");
     } finally {
+      mock.restore();
       await cleanup();
     }
   });
 
   test("cancellation invalidates a scheduled runtime failure persistence retry", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const discardProcess = mock(() => Promise.resolve());
-    const upsert = mock(() => Promise.resolve());
-    const remove = mock(() => Promise.resolve());
-    const recordLost = mock(() => Promise.reject(new Error("transient registry write failure")));
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: {
-        scheduleReconcile: typeof scheduleReconcile;
-        discardProcess: typeof discardProcess;
-      };
-      bashMonitorRegistryStore: {
-        upsert: typeof upsert;
-        remove: typeof remove;
-        recordTerminal(): Promise<void>;
-        recordLost: typeof recordLost;
-      };
-    };
+    spyOn(BashMonitorWakeReconciler.prototype, "scheduleReconcile").mockImplementation(
+      () => undefined
+    );
+    const discardProcess = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "discardProcess"
+    ).mockResolvedValue(undefined);
+    const upsert = spyOn(BashMonitorRegistryStore.prototype, "upsert").mockResolvedValue(undefined);
+    const remove = spyOn(BashMonitorRegistryStore.prototype, "remove").mockResolvedValue(undefined);
+    spyOn(BashMonitorRegistryStore.prototype, "recordTerminal").mockResolvedValue(undefined);
+    const recordLost = spyOn(BashMonitorRegistryStore.prototype, "recordLost").mockImplementation(
+      () => Promise.reject(new Error("transient registry write failure"))
+    );
     try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = { scheduleReconcile, discardProcess };
-      internal.bashMonitorRegistryStore = {
-        upsert,
-        remove,
-        recordTerminal: () => Promise.resolve(),
-        recordLost,
-      };
       const armMetadata = {
         processId: "canceled-retry-proc",
         taskId: "bash:canceled-retry-proc",
@@ -1919,6 +1915,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ).activeBashMonitorFailurePersists;
       expect(tracking.size).toBe(0);
     } finally {
+      mock.restore();
       await cleanup();
     }
   });
@@ -1944,133 +1941,115 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
   });
 
   test("full clears preconsume and postconsume wakes while truncations leave them alone", async () => {
-    const { service, cleanup } = await createWakeWiringService();
+    const { service, historyService, cleanup } = await createWakeWiringService();
+    const workspaceId = "owner";
     const order: string[] = [];
-    const internal = service as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-      bashMonitorWakeReconciler: {
-        beginFullHistoryClear(workspaceId: string): Promise<{ ownerWorkspaceId: string }>;
-        finishFullHistoryClear(token: { ownerWorkspaceId: string }): Promise<void>;
-      };
-      clearHistoryWithRetiredBashMonitorWakes<T>(
-        workspaceId: string,
-        clear: () => Promise<Result<T>>,
-        options?: { discardUnacceptedOnSuccess?: boolean }
-      ): Promise<Result<T>>;
-    };
+    // Record the real reconciler's full-clear barrier and the history writes each public
+    // truncateHistory call makes, calling through so the real paths run.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+    const begin = BashMonitorWakeReconciler.prototype.beginFullHistoryClear;
+    spyOn(BashMonitorWakeReconciler.prototype, "beginFullHistoryClear").mockImplementation(
+      function (this: BashMonitorWakeReconciler, ...args) {
+        order.push("pre");
+        return begin.apply(this, args);
+      }
+    );
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+    const finish = BashMonitorWakeReconciler.prototype.finishFullHistoryClear;
+    spyOn(BashMonitorWakeReconciler.prototype, "finishFullHistoryClear").mockImplementation(
+      function (this: BashMonitorWakeReconciler, ...args) {
+        order.push("post");
+        return finish.apply(this, args);
+      }
+    );
+    const truncateRows = historyService.truncateHistory.bind(historyService);
+    spyOn(historyService, "truncateHistory").mockImplementation((...args) => {
+      order.push("truncate");
+      return truncateRows(...args);
+    });
+    const clearRows = historyService.clearCompactionHistoryUnderHistoryLock.bind(historyService);
+    spyOn(historyService, "clearCompactionHistoryUnderHistoryLock").mockImplementation(
+      (...args) => {
+        order.push("clear");
+        return clearRows(...args);
+      }
+    );
     try {
-      await internal.bashMonitorRecoveryPromise;
-      internal.bashMonitorWakeReconciler = {
-        beginFullHistoryClear: (workspaceId) => {
-          order.push("pre");
-          return Promise.resolve({ ownerWorkspaceId: workspaceId });
-        },
-        finishFullHistoryClear: () => {
-          order.push("post");
-          return Promise.resolve();
-        },
-      };
-      const truncate = await internal.clearHistoryWithRetiredBashMonitorWakes(
-        "owner",
-        () => {
-          order.push("truncate");
-          return Promise.resolve(Ok(undefined));
-        },
-        { discardUnacceptedOnSuccess: false }
-      );
+      for (const [id, text] of [
+        ["first", "a first row that is several times longer than the row that follows it"],
+        ["second", "short"],
+      ]) {
+        await historyService.appendToHistory(workspaceId, createMuxMessage(id, "user", text));
+      }
+      const truncate = await service.truncateHistory(workspaceId, 0.5);
       expect(truncate.success).toBe(true);
       expect(order).toEqual(["truncate"]);
 
-      const clear = await internal.clearHistoryWithRetiredBashMonitorWakes(
-        "owner",
-        () => {
-          order.push("clear");
-          return Promise.resolve(Ok(undefined));
-        },
-        { discardUnacceptedOnSuccess: true }
-      );
+      const clear = await service.truncateHistory(workspaceId);
       expect(clear.success).toBe(true);
       expect(order).toEqual(["truncate", "pre", "clear", "post"]);
     } finally {
+      mock.restore();
       await cleanup();
     }
   });
 
   test("startup schedules reconciliation only for pre-construction registry rows", async () => {
-    const { service, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
-    const internal = service as unknown as {
-      constructedAtMs: number;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-      bashMonitorRegistryStore: {
-        listOwnerWorkspaceIds(): Promise<{ ownerWorkspaceIds: string[]; scanFailed: boolean }>;
-        listAll(workspaceId: string): Promise<Array<{ createdAt: string }>>;
-      };
-      recoverBashMonitorStateAfterRestart(): Promise<void>;
+    // Installed before construction: the constructor starts recovery against the real clock.
+    const createdAtByOwner: Record<string, string> = {
+      old: "2020-01-01T00:00:00.000Z",
+      new: "2999-01-01T00:00:00.000Z",
+      invalid: "not-a-date",
     };
+    spyOn(BashMonitorRegistryStore.prototype, "listOwnerWorkspaceIds").mockResolvedValue({
+      ownerWorkspaceIds: ["old", "new", "invalid"],
+      scanFailed: false,
+    });
+    spyOn(BashMonitorRegistryStore.prototype, "listAll").mockImplementation((workspaceId) =>
+      Promise.resolve([registryRecord(workspaceId, createdAtByOwner[workspaceId])])
+    );
+    const scheduleReconcile = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "scheduleReconcile"
+    ).mockImplementation(() => undefined);
+    const { cleanup } = await createWakeWiringService();
     try {
-      internal.constructedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
-      internal.bashMonitorRegistryStore = {
-        listOwnerWorkspaceIds: () =>
-          Promise.resolve({
-            ownerWorkspaceIds: ["old", "new", "invalid"],
-            scanFailed: false,
-          }),
-        listAll: (workspaceId) =>
-          Promise.resolve([
-            {
-              createdAt:
-                workspaceId === "old"
-                  ? "2026-08-31T11:59:00.000Z"
-                  : workspaceId === "invalid"
-                    ? "not-a-date"
-                    : "2026-08-31T12:01:00.000Z",
-            },
-          ]),
-      };
-
-      await internal.recoverBashMonitorStateAfterRestart();
+      // Owners are scanned in order, so seeing the last one means "new" was already judged.
+      await waitForCondition(() =>
+        scheduleReconcile.mock.calls.some(([workspaceId]) => workspaceId === "invalid")
+      );
       expect(scheduleReconcile).toHaveBeenCalledTimes(2);
       expect(scheduleReconcile).toHaveBeenCalledWith("old");
       expect(scheduleReconcile).toHaveBeenCalledWith("invalid");
     } finally {
+      mock.restore();
       await cleanup();
     }
   });
 
   test("startup retries a partial registry scan before scheduling reconciliation", async () => {
-    const { service, cleanup } = await createWakeWiringService();
-    const scheduleReconcile = mock(() => undefined);
     let scans = 0;
-    const internal = service as unknown as {
-      constructedAtMs: number;
-      bashMonitorWakeReconciler: { scheduleReconcile: typeof scheduleReconcile };
-      bashMonitorRegistryStore: {
-        listOwnerWorkspaceIds(): Promise<{ ownerWorkspaceIds: string[]; scanFailed: boolean }>;
-        listAll(workspaceId: string): Promise<Array<{ createdAt: string }>>;
-      };
-      recoverBashMonitorStateAfterRestart(): Promise<void>;
-    };
+    spyOn(BashMonitorRegistryStore.prototype, "listOwnerWorkspaceIds").mockImplementation(() => {
+      scans++;
+      return Promise.resolve({ ownerWorkspaceIds: ["owner"], scanFailed: scans === 1 });
+    });
+    spyOn(BashMonitorRegistryStore.prototype, "listAll").mockImplementation(() =>
+      scans === 1
+        ? Promise.reject(new Error("transient owner scan failure"))
+        : Promise.resolve([registryRecord("owner", "2020-01-01T00:00:00.000Z")])
+    );
+    const scheduleReconcile = spyOn(
+      BashMonitorWakeReconciler.prototype,
+      "scheduleReconcile"
+    ).mockImplementation(() => undefined);
+    const { cleanup } = await createWakeWiringService();
     try {
-      internal.constructedAtMs = Date.parse("2026-08-31T12:00:00.000Z");
-      internal.bashMonitorWakeReconciler = { scheduleReconcile };
-      internal.bashMonitorRegistryStore = {
-        listOwnerWorkspaceIds: () => {
-          scans++;
-          return Promise.resolve({ ownerWorkspaceIds: ["owner"], scanFailed: scans === 1 });
-        },
-        listAll: () =>
-          scans === 1
-            ? Promise.reject(new Error("transient owner scan failure"))
-            : Promise.resolve([{ createdAt: "2026-08-31T11:59:00.000Z" }]),
-      };
-
-      await internal.recoverBashMonitorStateAfterRestart();
+      await waitForCondition(() => scheduleReconcile.mock.calls.length > 0);
 
       expect(scans).toBe(2);
       expect(scheduleReconcile).toHaveBeenCalledWith("owner");
     } finally {
+      mock.restore();
       await cleanup();
     }
   });

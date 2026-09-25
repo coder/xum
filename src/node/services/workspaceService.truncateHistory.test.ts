@@ -26,6 +26,7 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
 import type { BashMonitorWakeReconciler } from "./bashMonitorWakeReconciler";
+import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import {
   createCompactionAdmissionMocks,
   writePlanFile,
@@ -324,12 +325,10 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     // the LIVE preflight count so AgentSession's admission gates (re-evaluated
     // up to the last gate before the pre-turn batch becomes irrevocable) can
     // refuse the continuation.
-    const { config, workspaceService, cleanup } = await createServices();
+    const { config, workspaceService, goalService, cleanup } = await createServices();
     const workspaceId = "require-idle-admission-probe";
-    const internalAccess = workspaceService as unknown as {
-      sessions: Map<string, AgentSession>;
-      preflightSendCounts: Map<string, number>;
-    };
+    const continuationText = "Continue working on the goal.";
+    const sendOptions = { model: "openai:gpt-4o", agentId: "exec" };
     try {
       await config.addWorkspace("/tmp/require-idle-probe-project", {
         id: workspaceId,
@@ -339,39 +338,67 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         runtimeConfig: { type: "local" },
       });
       let capturedProbe: (() => boolean) | undefined;
+      const probeSamples: { idle?: boolean; withManual?: boolean } = {};
+      let manualSend: ReturnType<WorkspaceService["sendMessage"]> | undefined;
       const fakeSession = {
         ...createCompactionAdmissionMocks(),
         isBusy: mock(() => false),
         emitMetadata: mock(() => undefined),
         drainQueuedMessagesIfIdle: mock(() => undefined),
+        onChatEvent: mock(() => () => undefined),
+        onMetadataEvent: mock(() => () => undefined),
         sendMessage: mock(
-          (_msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
+          async (msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
+            // The manual send's own dispatch: nothing to probe.
+            if (msg !== continuationText) return Ok(undefined);
             capturedProbe = internal?.admissionStale;
-            return Promise.resolve(Ok(undefined));
+            // Sampled at the session's admission gate, while the continuation holds its slot.
+            probeSamples.idle = capturedProbe?.();
+            // A manual send enters preflight (held at its pricing gate) while the continuation
+            // is still in its admission awaits.
+            const manualEntered = createDeferred<void>();
+            const releaseManual = createDeferred<void>();
+            const pricing = goalService.assertPricedModelForBudgetedGoal.bind(goalService);
+            spyOn(goalService, "assertPricedModelForBudgetedGoal").mockImplementationOnce(
+              async (...args) => {
+                manualEntered.resolve();
+                await releaseManual.promise;
+                return pricing(...args);
+              }
+            );
+            manualSend = workspaceService.sendMessage(workspaceId, "manual input", sendOptions);
+            await manualEntered.promise;
+            probeSamples.withManual = capturedProbe?.();
+            releaseManual.resolve();
+            return Ok(undefined);
           }
         ),
       } as unknown as AgentSession;
-      internalAccess.sessions.set(workspaceId, fakeSession);
+      workspaceService.registerSession(workspaceId, fakeSession);
 
       const result = await workspaceService.sendMessage(
         workspaceId,
-        "Continue working on the goal.",
-        { model: "openai:gpt-4o", agentId: "exec" },
-        { synthetic: true, agentInitiated: true, requireIdle: true, goalContinuation: true }
+        continuationText,
+        sendOptions,
+        {
+          synthetic: true,
+          agentInitiated: true,
+          requireIdle: true,
+          goalContinuation: true,
+        }
       );
       expect(result.success).toBe(true);
       expect(typeof capturedProbe).toBe("function");
 
-      // Live sampling: idle (only the continuation itself would hold a slot).
-      expect(capturedProbe?.()).toBe(false);
+      // Live sampling: idle (only the continuation itself holds a slot).
+      expect(probeSamples.idle).toBe(false);
       // A manual send entering preflight while the continuation is still in
       // its admission awaits (continuation slot + manual slot) flips the
       // probe stale — even though the entry snapshot passed.
-      internalAccess.preflightSendCounts.set(workspaceId, 2);
-      expect(capturedProbe?.()).toBe(true);
-      internalAccess.preflightSendCounts.delete(workspaceId);
+      expect(probeSamples.withManual).toBe(true);
+      expect((await manualSend)?.success).toBe(true);
     } finally {
-      internalAccess.sessions.delete(workspaceId);
+      mock.restore();
       await cleanup();
     }
   });
@@ -463,16 +490,24 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
   });
 
   test("destructive clear waits for startup monitor recovery discovery", async () => {
+    // Hold the real startup recovery at its first registry scan; the service starts that
+    // scan in its constructor, so the hold must be installed before construction.
+    const recovery = createDeferred<void>();
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- called with the original receiver
+    const scan = BashMonitorRegistryStore.prototype.listOwnerWorkspaceIds;
+    const scanSpy = spyOn(
+      BashMonitorRegistryStore.prototype,
+      "listOwnerWorkspaceIds"
+    ).mockImplementationOnce(async function (this: BashMonitorRegistryStore) {
+      await recovery.promise;
+      return scan.call(this);
+    });
     const { historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "clear-waits-for-monitor-recovery";
-    const recovery = createDeferred<void>();
-    const internal = workspaceService as unknown as {
-      bashMonitorRecoveryPromise: Promise<void>;
-    };
-    internal.bashMonitorRecoveryPromise = recovery.promise;
     const truncateSpy = spyOn(historyService, "clearCompactionHistoryUnderHistoryLock");
 
     try {
+      expect(scanSpy).toHaveBeenCalledTimes(1);
       const clearPromise = workspaceService.truncateHistory(workspaceId, 1.0);
       await drainPendingDispatches();
       expect(truncateSpy).not.toHaveBeenCalled();
@@ -483,6 +518,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     } finally {
       recovery.resolve();
       truncateSpy.mockRestore();
+      scanSpy.mockRestore();
       await cleanup();
     }
   });

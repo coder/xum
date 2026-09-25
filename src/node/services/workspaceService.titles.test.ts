@@ -277,15 +277,16 @@ describe("WorkspaceService pending auto-title", () => {
       })
     );
 
+    const titled = waitForTitleEmission("Harden auth flow");
+
     try {
-      await (
-        workspaceService as unknown as {
-          maybeRunPendingAutoTitleFromMessage: (
-            workspaceId: string,
-            message: string
-          ) => Promise<void>;
-        }
-      ).maybeRunPendingAutoTitleFromMessage(workspaceId, "Continue with auth hardening");
+      const result = await workspaceService.sendMessage(
+        workspaceId,
+        "Continue with auth hardening",
+        { model: "openai:gpt-4o-mini", agentId: "exec" }
+      );
+      expect(result.success).toBe(true);
+      await titled;
 
       const metadata = (await config.getAllWorkspaceMetadata()).find(
         (entry) => entry.id === workspaceId
