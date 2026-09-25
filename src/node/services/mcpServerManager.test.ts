@@ -1619,9 +1619,10 @@ describe("MCPServerManager", () => {
 
     releaseClose();
     const [firstResult, secondResult] = await Promise.all([first, second]);
-    // Neither serve returned the stale instance. The first restarted the tree;
-    // the concurrent second serve may skip that in-flight restart, but any
-    // tool it returns must reach the restarted server.
+    // Neither serve returned the stale instance. The first restarted the tree.
+    // The concurrent second serve currently skips that in-flight restart and
+    // returns no tools (#4539; main's startServers stub hid this); any tool it
+    // returns must reach the restarted server. Require its tool once fixed.
     expect(Object.keys(firstResult.tools)).toHaveLength(1);
     for (const served of [firstResult, secondResult]) {
       for (const tool of Object.values(served.tools)) {

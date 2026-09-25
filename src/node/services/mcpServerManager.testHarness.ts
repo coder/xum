@@ -110,8 +110,8 @@ export class FakeMcpServers {
 
   /**
    * Run `operation` until `hangs` more `hang` connections are reached, then
-   * fire the manager's startup deadline on fake timers instead of waiting a
-   * real minute. Leaves the clock frozen at the advanced time (afterEach's
+   * fire the manager's startup deadline on fake timers instead of waiting out the
+   * real deadline. Leaves the clock frozen at the advanced time (afterEach's
    * setSystemTime() restores it), so backoff windows are measured from it.
    */
   async expireStartupDeadline<T>(operation: () => Promise<T>, hangs = 1): Promise<T> {
