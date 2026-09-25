@@ -680,12 +680,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        # A sibling counts only if it belongs to this PR (the same commit can head PRs
+        # against other bases) and publishes its own Required: still running, or
+        # completed with success/failure. startup_failure, action_required, stale and
+        # cancelled runs never report one.
         run: |
           set -euo pipefail
-          siblings=$(gh run list -R "$GITHUB_REPOSITORY" --commit "$HEAD_SHA" \
-            --workflow "$GITHUB_WORKFLOW" --event pull_request --json databaseId,conclusion \
-            --jq "[.[] | select(.databaseId != $GITHUB_RUN_ID and .conclusion != \"cancelled\")] | length")
-          echo "Other non-cancelled runs for $HEAD_SHA: $siblings"
+          siblings=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/pr.yml/runs?head_sha=$HEAD_SHA&event=pull_request&per_page=100" \
+            --jq "[.workflow_runs[] | select(.id != $GITHUB_RUN_ID)
+              | select(any(.pull_requests[]; .number == $PR_NUMBER))
+              | select(.status != \"completed\" or .conclusion == \"success\" or .conclusion == \"failure\")] | length")
+          echo "Other runs for PR #$PR_NUMBER at $HEAD_SHA that report Required: $siblings"
           if ((siblings > 0)); then
             echo "value=true" >>"$GITHUB_OUTPUT"
           fi
