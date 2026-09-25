@@ -124,10 +124,6 @@ export function createTestBackgroundProcessManager(): BackgroundProcessManager {
 
 export type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
 
-export type MockWorkspaceConfig = Partial<Config> & {
-  getEffectiveSecrets?: SecretsStore["getEffectiveSecrets"];
-};
-
 /**
  * AI-service fake with every member WorkspaceService and AgentSession call unconditionally:
  * no provider config, no experiments, and no workspace metadata (the real service's answer
