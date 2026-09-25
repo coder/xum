@@ -402,6 +402,7 @@ describe("TaskService", () => {
       getQueueCutCutter?: ReturnType<typeof mock>;
       hasPendingAutoRetry?: ReturnType<typeof mock>;
       waitForPendingStreamErrorRecoveryDecision?: ReturnType<typeof mock>;
+      waitForPendingCompactionCompletionDecision?: ReturnType<typeof mock>;
     } = {}
   ) {
     const config = await createTestConfig(rootDir);
@@ -29763,20 +29764,61 @@ describe("TaskService", () => {
 
   test("initialize contains task execution reconciliation scan failures", async () => {
     const config = await createTestConfig(rootDir);
-    await saveLocalParentWorkspace(config, rootDir);
-    const { taskService } = createTaskServiceHarness(config);
-    const taskHandleStore = (taskService as unknown as { taskHandleStore: TaskHandleStore })
-      .taskHandleStore;
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    // One child the reconciliation pass would adopt a handle for, and one stale `starting` child
+    // that only the recovery steps AFTER the reconciliation pass repair.
+    const reconcilableChildId = "child-reconcilable-execution";
+    const staleStartingChildId = "child-stale-starting";
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push(
+        projectWorkspace(projectPath, "child-reconcilable", reconcilableChildId, {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-08-10T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "child-stale-starting", staleStartingChildId, {
+          parentWorkspaceId: parentId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "starting",
+          taskPrompt: "Resume the investigation.",
+        })
+      );
+      return cfg;
+    });
+    const isStreaming = mock((workspaceId: string) => workspaceId === reconcilableChildId);
+    const { aiService } = createAIServiceMocks(config, { isStreaming });
+    const { taskService } = createTaskServiceHarness(config, { aiService });
+    await new TaskHandleStore(config).upsertWorkspaceTurn(
+      workspaceTurnRecord(parentId, reconcilableChildId, "wst_reconcilable", "running", {
+        turnId: "turn-reconcilable",
+        createdAt: "2026-08-10T00:00:01.000Z",
+        updatedAt: "2026-08-10T00:00:01.000Z",
+      })
+    );
     const listAllWorkspaceTurns = spyOn(
-      taskHandleStore,
+      TaskHandleStore.prototype,
       "listAllWorkspaceTurns"
     ).mockRejectedValueOnce(new Error("permission denied"));
 
+    let scanCalls: number;
     try {
       await taskService.initialize();
     } finally {
+      // mockRestore() also clears the recorded calls.
+      scanCalls = listAllWorkspaceTurns.mock.calls.length;
       listAllWorkspaceTurns.mockRestore();
     }
+
+    // The injected scan failure reached the reconciliation pass, which skipped its adoption...
+    expect(scanCalls).toBeGreaterThan(0);
+    expect(findWorkspaceInConfig(config, reconcilableChildId)?.taskExecutionId).toBeUndefined();
+    // ...and startup recovery still continued past it.
+    expect(findWorkspaceInConfig(config, staleStartingChildId)?.taskStatus).not.toBe("starting");
   });
 
   test("initialize recovers an unreferenced persistent child execution handle", async () => {
@@ -31184,8 +31226,12 @@ describe("TaskService", () => {
   test("uncorrelated compaction stream-end does not interrupt an active workspace turn", async () => {
     // On-send compaction can consume a monitor-wake continuation mid-turn; the
     // compact turn's own stream-end is uncorrelated and must not supersede the
-    // still-running delegated turn.
-    const { parentId, taskService, created } = await startWorkspaceTurnForTest();
+    // still-running delegated turn. The compaction must NOT have transferred completion to a
+    // durable follow-up: a transferred compaction returns before workspace-turn settlement, so
+    // the uncorrelated-stream guard would never run.
+    const { parentId, taskService, created } = await startWorkspaceTurnForTest({
+      waitForPendingCompactionCompletionDecision: mock(() => Promise.resolve(false)),
+    });
     const internal = taskService as unknown as {
       handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
     };
