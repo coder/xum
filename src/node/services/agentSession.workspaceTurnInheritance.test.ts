@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 
 import { inheritOpenWorkspaceTurnMetadata } from "./agentSession";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
@@ -161,7 +161,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId: "workspace-turn-inheritance",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     try {

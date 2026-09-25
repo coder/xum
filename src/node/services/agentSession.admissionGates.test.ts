@@ -1,9 +1,8 @@
 import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
-import type { AIService } from "@/node/services/aiService";
 import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage } from "@/common/types/message";
-import { Ok } from "@/common/types/result";
-import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
+import { Err } from "@/common/types/result";
+import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE, type AgentSessionAIService } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
@@ -19,11 +18,14 @@ describe("AgentSession.sendMessage (admission gates)", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
   async function createSessionHarness(workspaceId: string) {
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
+    // Every gate refuses before streaming; a stream attempt surfaces as a failed send.
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "streamMessage must not be reached" }))
+    );
     const harness = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     historyCleanup = harness.cleanup;

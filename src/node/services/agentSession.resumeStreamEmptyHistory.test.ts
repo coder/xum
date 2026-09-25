@@ -1,8 +1,8 @@
 import { describe, expect, test, mock, afterEach } from "bun:test";
 
 import { createAgentSessionHarness } from "./agentSession.testHarness";
-import type { AIService } from "./aiService";
-import { Ok } from "@/common/types/result";
+import type { AgentSessionAIService } from "./agentSession";
+import { Err } from "@/common/types/result";
 
 describe("AgentSession.resumeStream", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
@@ -11,12 +11,14 @@ describe("AgentSession.resumeStream", () => {
   });
 
   test("returns an error when history is empty", async () => {
-    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
+      Promise.resolve(Err({ type: "unknown", raw: "streamMessage must not be reached" }))
+    );
 
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "ws",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     historyCleanup = cleanup;

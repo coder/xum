@@ -812,7 +812,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       config,
       historyService,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     try {

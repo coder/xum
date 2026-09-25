@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
+import type { StreamMessageOptions } from "@/node/services/aiService";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { SendMessageError } from "@/common/types/errors";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -27,6 +27,7 @@ import {
   type MuxMessageMetadata,
 } from "@/common/types/message";
 import type { LiveTurnRouting } from "./thinkingOverride";
+import type { AgentSessionAIService } from "./agentSession";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
@@ -36,7 +37,6 @@ import {
   createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
   runSessionTerminalPolicy,
   seedAutoCompactionThreshold,
 } from "./agentSession.testHarness";
@@ -109,30 +109,18 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       (opts: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>> =>
         Promise.resolve(Ok(createStartedTurnHandle(opts.abortSignal!)))
     );
-    const aiService = Object.assign(new EventEmitter(), {
-      ...createStreamLifecycleMocks(),
-      isStreaming: mock((_workspaceId: string) => false),
-      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+    // Only what differs from the harness's typed default AI service.
+    const aiServiceOverrides = {
       getProvidersConfig: mock(() => ({})),
       // The workspace is not registered in this config, so the real service reports it missing.
       getWorkspaceMetadata: mock((workspaceId: string) =>
         Promise.resolve(Err(`Workspace ${workspaceId} not found`))
       ),
-      createModelWithPinnedOptions: mock(() =>
-        Promise.resolve(
-          Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-        )
-      ),
-      createModelWithPinnedMetadata: mock(() =>
-        Promise.resolve(
-          Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-        )
-      ),
       isExperimentEnabled: mock(
         (id: ExperimentId) => id === EXPERIMENT_IDS.AUTO_MODEL_ROUTING && options.experimentEnabled
       ),
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-    }) as unknown as AIService;
+      streamMessage,
+    } satisfies Partial<AgentSessionAIService>;
     const classify = mock<NonNullable<typeof options.classify>>(
       options.classify ?? (() => Promise.resolve(Ok(decision("hard"))))
     );
@@ -159,11 +147,11 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       }
     );
 
-    const { session } = await createAgentSessionHarness({
+    const harness = await createAgentSessionHarness({
       workspaceId: "ws-auto-routing",
       config,
       historyService,
-      aiService,
+      aiServiceOverrides,
       initStateManager: new EventEmitter() as unknown as InitStateManager,
       backgroundProcessManager: {
         cleanup: mock((_workspaceId: string) => Promise.resolve()),
@@ -179,10 +167,11 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       workspaceGoalService,
     });
     return {
-      session,
+      session: harness.session,
       config,
       historyService,
-      aiService,
+      // The harness's AI service is its emitter; merging only unifies the two typed views.
+      aiService: Object.assign(harness.aiEmitter, harness.aiService),
       streamMessage,
       classify,
       recordHeadlessUsage,
@@ -226,7 +215,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     usage: { inputTokens: number; outputTokens: number; totalTokens: number },
     text?: string
   ) {
-    return runSessionTerminalPolicy(harness.session, harness.aiService as unknown as EventEmitter, {
+    return runSessionTerminalPolicy(harness.session, harness.aiService, {
       type: "stream-end",
       workspaceId: "ws-auto-routing",
       messageId: "test-assistant",
@@ -957,7 +946,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
       });
       aiService.stopStream = mock((workspaceId: string) => {
-        void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+        void runSessionTerminalPolicy(session, aiService, {
           type: "stream-abort",
           workspaceId,
           messageId: "assistant-routed",
@@ -1167,7 +1156,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
         return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
       });
       aiService.stopStream = mock((workspaceId: string) => {
-        void runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+        void runSessionTerminalPolicy(session, aiService, {
           type: "stream-abort",
           workspaceId,
           messageId: "assistant-routed",
@@ -1455,7 +1444,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(recordStreamAccounting).not.toHaveBeenCalled();
 
     const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
-    await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+    await runSessionTerminalPolicy(session, aiService, {
       type: "stream-end",
       workspaceId: "ws-auto-routing",
       messageId: "assistant-routed",
@@ -1556,7 +1545,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     expect(await persistedCompactionFollowUp(historyService)).toBeDefined();
     // The user stops the compaction before the deferred send behind its boundary is
     // dispatched, and the queue holding that send is cleared.
-    await runSessionTerminalPolicy(session, aiService as unknown as EventEmitter, {
+    await runSessionTerminalPolicy(session, aiService, {
       type: "stream-abort",
       workspaceId: "ws-auto-routing",
       messageId: "assistant-compaction",

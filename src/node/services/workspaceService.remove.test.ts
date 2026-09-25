@@ -162,8 +162,8 @@ describe("WorkspaceService remove timing rollup", () => {
 
     const aiEmitter = new EventEmitter();
     const aiServiceOverrides: Partial<AIService> = {
-      on: aiEmitter.on.bind(aiEmitter) as unknown as AIService["on"],
-      off: aiEmitter.off.bind(aiEmitter) as unknown as AIService["off"],
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
       isStreaming: mock(() => true),
       stopStream: mock(async () => {
         stopEntered.resolve();

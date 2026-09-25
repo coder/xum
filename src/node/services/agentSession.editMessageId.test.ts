@@ -43,7 +43,7 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
     const harness = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     historyCleanup = harness.cleanup;

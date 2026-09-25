@@ -1,20 +1,19 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "events";
-import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 // Registers a no-op goal-continuation consumer so the in-AS pricing gate
 // path runs end-to-end (DEREM-52). Bridge registration alone is now
 // sufficient — goals graduated to GA, so there is no longer an experiment
 // flag to flip.
 import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
-import { Err, Ok } from "@/common/types/result";
+import { Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1 } from "@/common/types/goal";
 
@@ -42,43 +41,6 @@ async function setGoalOk(
     throw new Error(`Expected goal set to succeed, got ${JSON.stringify(result.error)}`);
   }
   return result.data;
-}
-
-function createAiService(workspaceId: string, getClosingSignal: () => AbortSignal): AIService {
-  const aiEmitter = new EventEmitter();
-  return Object.assign(aiEmitter, {
-    isStreaming: mock((_workspaceId: string) => false),
-    stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) =>
-      Promise.resolve(Ok(createStartedTurnHandle(getClosingSignal())))
-    ),
-    getStreamInfo: mock((_workspaceId: string) => null),
-    getProvidersConfig: mock(() => null),
-    // Goal/budget gating does not depend on experiments or model creation.
-    isExperimentEnabled: mock((_experimentId: string) => false),
-    createModelWithPinnedOptions: mock(() =>
-      Promise.resolve(
-        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-      )
-    ),
-    createModelWithPinnedMetadata: mock(() =>
-      Promise.resolve(
-        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
-      )
-    ),
-    getWorkspaceMetadata: mock((_workspaceId: string) =>
-      Promise.resolve(
-        Ok({
-          id: workspaceId,
-          name: workspaceId,
-          projectName: "project",
-          projectPath: PROJECT_PATH,
-          runtimeConfig: { type: "local" },
-        })
-      )
-    ),
-    replayStream: mock((_workspaceId: string) => Promise.resolve()),
-  }) as unknown as AIService;
 }
 
 async function createSessionHarness(workspaceId: string): Promise<SessionHarness> {
@@ -110,7 +72,19 @@ async function createSessionHarness(workspaceId: string): Promise<SessionHarness
     workspaceId,
     config,
     historyService,
-    aiService: createAiService(workspaceId, () => session.closingSignal),
+    aiServiceOverrides: {
+      getWorkspaceMetadata: mock((_workspaceId: string) =>
+        Promise.resolve(
+          Ok({
+            id: workspaceId,
+            name: workspaceId,
+            projectName: "project",
+            projectPath: PROJECT_PATH,
+            runtimeConfig: { type: "local" as const },
+          })
+        )
+      ),
+    },
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,

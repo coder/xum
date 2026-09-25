@@ -105,16 +105,28 @@ export function createStreamLifecycleMocks() {
   };
 }
 
-function createMockAiService(args: {
-  getClosingSignal: () => AbortSignal;
+export interface AgentSessionAIServiceFakeOptions {
+  /** Event source the session subscribes to; tests emit stream events on it. */
   emitter?: EventEmitter;
   overrides?: Partial<AgentSessionAIService>;
-}): {
-  aiEmitter: EventEmitter;
-  aiService: AgentSessionAIService;
-} {
-  const aiEmitter = args?.emitter ?? new EventEmitter();
-  const aiService: AgentSessionAIService = Object.assign(aiEmitter, {
+  /**
+   * Signal that ends the default stream's started-turn handle (usually the session's
+   * closingSignal). Without it the default stream reports a startup failure instead.
+   */
+  getClosingSignal?: () => AbortSignal;
+}
+
+/**
+ * Typed AgentSession AI fake with every required member implemented, so tests never need a
+ * cast (and production never needs a typeof guard for a member a partial fake left out).
+ * The returned object is the emitter itself.
+ */
+export function createAgentSessionAIServiceFake(
+  options: AgentSessionAIServiceFakeOptions = {}
+): AgentSessionAIService & EventEmitter {
+  const aiEmitter = options.emitter ?? new EventEmitter();
+  const getClosingSignal = options.getClosingSignal;
+  const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
     // Real implementations report failures as Err results, never rejections.
     createModelWithPinnedMetadata: mock(() =>
       Promise.resolve(
@@ -142,8 +154,8 @@ function createMockAiService(args: {
     prepareStreamMessage: mock(() =>
       Promise.resolve(
         Ok({
-          start: (options: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
-            aiService.streamMessage(options),
+          start: (streamOptions: Parameters<AgentSessionAIService["streamMessage"]>[0]) =>
+            aiService.streamMessage(streamOptions),
           [Symbol.asyncDispose]: () => Promise.resolve(),
         })
       )
@@ -152,14 +164,16 @@ function createMockAiService(args: {
       Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
     ),
     ...createStreamLifecycleMocks(),
-    streamMessage: mock(() =>
+    streamMessage: mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(
-        Ok(createStartedTurnHandle(args.getClosingSignal(), "test-assistant-message"))
+        getClosingSignal
+          ? Ok(createStartedTurnHandle(getClosingSignal(), "test-assistant-message"))
+          : Err({ type: "unknown" as const, raw: "Test AI service has no stream" })
       )
     ),
-    ...args?.overrides,
+    ...options.overrides,
   });
-  return { aiEmitter, aiService };
+  return aiService;
 }
 
 export interface AgentSessionHarnessOptions extends Pick<
@@ -248,13 +262,15 @@ export async function createAgentSessionHarness(
   const historyService = options.historyService ?? testHistory!.historyService;
   const config = options.config ?? testHistory!.config;
   const cleanup = testHistory?.cleanup ?? (() => Promise.resolve());
-  const { aiEmitter, aiService } = options.aiService
-    ? { aiEmitter: options.aiEmitter ?? new EventEmitter(), aiService: options.aiService }
-    : createMockAiService({
+  const fake = options.aiService
+    ? undefined
+    : createAgentSessionAIServiceFake({
         getClosingSignal: () => session.closingSignal,
         emitter: options.aiEmitter,
         overrides: options.aiServiceOverrides,
       });
+  const aiService = options.aiService ?? fake!;
+  const aiEmitter = fake ?? options.aiEmitter ?? new EventEmitter();
   const initStateManager =
     options.initStateManager ??
     createTestInitStateManager(config, options.initStateManagerOverrides);

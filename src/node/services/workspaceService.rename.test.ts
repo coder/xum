@@ -16,6 +16,7 @@ import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecor
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
 import {
   addToRenamingWorkspaces,
+  createMockAIService,
   createWorkspaceServiceForTest,
   createWorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
@@ -135,7 +136,7 @@ test.each([
     await saveWorkspaces(config, projectPath, [
       projectWorkspace(projectPath, "child", workspaceId),
     ]);
-    const { session, aiService } = await createAgentSessionHarness({
+    const { session, aiEmitter } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
@@ -143,7 +144,11 @@ test.each([
     const workspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      aiService: aiService as unknown as AIService,
+      // The service listens on the session's AI emitter, as the real shared AIService does.
+      aiService: createMockAIService({
+        on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+        off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
+      }),
     });
     (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
       workspaceId,
@@ -244,7 +249,7 @@ test("a committed question stays answerable after a hidden plan-review record is
   const workspaceId = "question-then-review-record";
   const projectPath = path.join(config.rootDir, "repo");
   await saveWorkspaces(config, projectPath, [projectWorkspace(projectPath, "child", workspaceId)]);
-  const { session, aiService } = await createAgentSessionHarness({
+  const { session, aiEmitter } = await createAgentSessionHarness({
     workspaceId,
     config,
     historyService,
@@ -252,7 +257,11 @@ test("a committed question stays answerable after a hidden plan-review record is
   const workspaceService = createWorkspaceServiceForTest({
     config,
     historyService,
-    aiService: aiService as unknown as AIService,
+    // The service listens on the session's AI emitter, as the real shared AIService does.
+    aiService: createMockAIService({
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
+    }),
   });
   (workspaceService as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
     workspaceId,

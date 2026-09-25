@@ -15,6 +15,7 @@ import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { TaskTurnAdmission, TurnAdmissionToken } from "./taskWorkspaceSeam";
 import { createTestHistoryService } from "./testHistoryService";
 import { WorkspaceService } from "./workspaceService";
+import { createMockAIService } from "./workspaceService.testHarness";
 
 /**
  * The task-attempt fence at WorkspaceService's session handoff: a send into a workspace the task
@@ -117,7 +118,12 @@ describe("WorkspaceService task-attempt admission fence", () => {
       waitForInit: mock(() => Promise.resolve()),
       clearInMemoryState: mock(() => undefined),
     } as unknown as InitStateManager;
-    const aiService = harness.aiService as unknown as AIService;
+    // The service listens on the session's AI emitter, as the real shared AIService does.
+    const aiService = createMockAIService({
+      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
+      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
+      isStreaming: () => streaming,
+    });
     const service = new WorkspaceService(
       config,
       historyService,
@@ -131,7 +137,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
       workspaceId,
       harness.session
     );
-    return { service, session: harness.session, aiService, historyService };
+    return { service, session: harness.session, aiService: harness.aiService, historyService };
   }
 
   function integration(

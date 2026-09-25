@@ -4,7 +4,6 @@ import * as fsPromises from "fs/promises";
 import * as path from "path";
 
 import { Err } from "@/common/types/result";
-import type { AIService } from "./aiService";
 
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -125,7 +124,7 @@ describe("AgentSession post-compaction context retry", () => {
       historyService,
       aiEmitter,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
         // No workspace metadata: the retry path must not depend on a runtime.
         getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
       },
@@ -240,7 +239,7 @@ describe("AgentSession post-compaction context retry", () => {
       historyService,
       aiEmitter,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
         // No workspace metadata: the retry path must not depend on a runtime.
         getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
       },
@@ -345,7 +344,7 @@ describe("AgentSession post-compaction context retry", () => {
       historyService,
       aiEmitter,
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
         // No workspace metadata: the retry path must not depend on a runtime.
         getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
       },
