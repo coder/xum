@@ -55,23 +55,6 @@ import {
 } from "@/constants/mcp";
 import { FakeMcpServers, MCP_STARTUP_TIMEOUT_MS } from "./mcpServerManager.testHarness";
 
-interface MCPServerManagerTestAccess {
-  workspaceServers: Map<string, unknown>;
-  lastWorkspaceRequestOptions: Map<string, unknown>;
-  cleanupIdleServers: () => void;
-  ensureWorkspaceServers: (
-    ...args: unknown[]
-  ) => Promise<{ tools: Record<string, Tool>; stats: unknown; enablementDerivedFrom?: unknown }>;
-  startServers: (...args: unknown[]) => Promise<{
-    instances: Map<string, unknown>;
-    failedServerNames: string[];
-    timedOutServerNames?: string[];
-  }>;
-  startSingleServer: (...args: unknown[]) => Promise<unknown>;
-  runWithStablePluginEpoch: (operation: () => Promise<unknown>) => Promise<unknown>;
-  startSingleServerImpl: (...args: unknown[]) => Promise<unknown>;
-}
-
 const PROJECT_PATH = "/tmp/project";
 const WORKSPACE_PATH = "/tmp/workspace";
 
@@ -110,55 +93,6 @@ function testTool(result: unknown = { ok: true }): Tool {
   return { execute: mock(() => Promise.resolve(result)) } as unknown as Tool;
 }
 
-function testInstance(
-  name: string,
-  options: {
-    tools?: Record<string, Tool>;
-    prompts?: Array<{
-      name: string;
-      description?: string;
-      arguments?: Array<{ name: string; description?: string; required?: boolean }>;
-    }>;
-    getPrompt?: ReturnType<typeof mock>;
-    refreshTools?: ReturnType<typeof mock>;
-    refreshPrompts?: ReturnType<typeof mock>;
-    close?: ReturnType<typeof mock>;
-    isClosed?: boolean;
-  } = {}
-) {
-  return {
-    name,
-    resolvedTransport: "stdio" as const,
-    autoFallbackUsed: false,
-    tools: options.tools ?? {},
-    prompts: options.prompts ?? [],
-    getPrompt: options.getPrompt ?? mock(() => Promise.resolve({ messages: [], context: {} })),
-    ...(options.refreshTools !== undefined ? { refreshTools: options.refreshTools } : {}),
-    // Prompt fixtures need a refresher because production stores catalogs
-    // only through refreshInstancePrompts.
-    ...(options.refreshPrompts !== undefined
-      ? { refreshPrompts: options.refreshPrompts }
-      : options.prompts !== undefined
-        ? { refreshPrompts: mock(() => Promise.resolve(options.prompts)) }
-        : {}),
-    isClosed: options.isClosed ?? false,
-    close: options.close ?? mock(() => Promise.resolve(undefined)),
-  };
-}
-
-function startResult(
-  entries: Array<[string, Parameters<typeof testInstance>[1]?]>,
-  options: { failedServerNames?: string[]; timedOutServerNames?: string[] } = {}
-) {
-  return {
-    instances: new Map(
-      entries.map(([name, instanceOptions]) => [name, testInstance(name, instanceOptions)])
-    ),
-    failedServerNames: options.failedServerNames ?? [],
-    timedOutServerNames: options.timedOutServerNames ?? [],
-  };
-}
-
 /**
  * A timed-out server backs off one startup timeout before its first retry.
  * Bun freezes the clock under setSystemTime, so jump relative to the current
@@ -191,7 +125,6 @@ describe("MCPServerManager", () => {
   };
 
   let manager: MCPServerManager;
-  let access: MCPServerManagerTestAccess;
 
   beforeEach(() => {
     configService = {
@@ -201,7 +134,6 @@ describe("MCPServerManager", () => {
     };
 
     manager = new MCPServerManager(configService as unknown as MCPConfigService);
-    access = manager as unknown as MCPServerManagerTestAccess;
   });
 
   afterEach(() => {
@@ -283,6 +215,28 @@ describe("MCPServerManager", () => {
   const asyncMock = (impl: (...args: unknown[]) => Promise<unknown>) => mock(impl);
   type AsyncMock = ReturnType<typeof asyncMock>;
 
+  /**
+   * Construct a manager and capture its idle sweep, which production reaches
+   * only through a one-minute interval armed in the constructor, so tests can
+   * run it on demand.
+   */
+  function constructWithIdleSweep(create: () => MCPServerManager): {
+    instance: MCPServerManager;
+    sweepIdle: () => void;
+  } {
+    const setIntervalSpy = spyOn(globalThis, "setInterval");
+    let instance: MCPServerManager;
+    let sweep: unknown;
+    try {
+      instance = create();
+      sweep = setIntervalSpy.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
+    if (typeof sweep !== "function") throw new Error("idle sweep interval was not armed");
+    return { instance, sweepIdle: sweep as () => void };
+  }
+
   async function componentFixture(home: string) {
     await fs.mkdir(path.join(home, "plugins"), { recursive: true });
     const registryPath = path.join(home, "plugins.json");
@@ -354,7 +308,7 @@ describe("MCPServerManager", () => {
     /** Connections to `command`'s server, oldest first. */
     const clients = (command: string) => connections.filter((c) => c.command === command);
     const makeManager = () => {
-      // WORKAROUND for pre-existing production behavior (reported separately):
+      // WORKAROUND for pre-existing production behavior (#4513):
       // the real component try-lock is the exclusive, timeout-0 plugin
       // mutation lock, exclusive even in-process and held through each launch,
       // so sibling managed launches in one process fail closed ("unavailable
@@ -385,15 +339,17 @@ describe("MCPServerManager", () => {
           }
         },
       };
-      const instance = new MCPServerManager(configService as unknown as MCPConfigService, {
-        pluginInvalidation: invalidation,
-      });
-      return { instance, invalidation };
+      const { instance, sweepIdle } = constructWithIdleSweep(
+        () =>
+          new MCPServerManager(configService as unknown as MCPConfigService, {
+            pluginInvalidation: invalidation,
+          })
+      );
+      return { instance, invalidation, sweepIdle };
     };
     manager.dispose();
     const local = makeManager();
     manager = local.instance;
-    access = local.instance as unknown as MCPServerManagerTestAccess;
     return {
       ...local,
       registryPath,
@@ -630,8 +586,7 @@ describe("MCPServerManager", () => {
       const attempts = removed.close.mock.calls.length;
       // The sweep reads the clock synchronously: make the workspace look idle.
       setSystemTime(new Date(Date.now() + 11 * 60_000));
-      // Private call: the idle sweep runs only from a one-minute interval timer.
-      (manager as unknown as { cleanupIdleServers: () => void }).cleanupIdleServers();
+      f.sweepIdle();
       setSystemTime();
       await waitFor(() => removed.close.mock.calls.length > attempts);
       expect(removed.close).toHaveBeenCalledTimes(attempts + 1);
@@ -1448,8 +1403,7 @@ describe("MCPServerManager", () => {
         if (mode === "retired-only") {
           // The sweep reads the clock synchronously: make the workspace look idle.
           setSystemTime(new Date(Date.now() + 11 * 60_000));
-          // Private call: the idle sweep runs only from a one-minute interval timer.
-          (manager as unknown as { cleanupIdleServers: () => void }).cleanupIdleServers();
+          f.sweepIdle();
           setSystemTime();
           await waitFor(() => failedClient!.close.mock.calls.length > attempts);
         } else if (mode === "additional" || mode === "restart") {
@@ -1515,7 +1469,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-cross-process";
     const pluginKey = "plugin:abc123:echo";
@@ -1553,7 +1506,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-startup-race";
     const pluginKey = "plugin:abc123:echo";
@@ -1591,7 +1543,7 @@ describe("MCPServerManager", () => {
     // for a disabled server, which this enabled-server race cannot also cover.
     expect(
       (
-        access as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
+        manager as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
       ).latestWorkspaceOverrides.get(workspaceId)
     ).toEqual({ enabledServers: [] });
   });
@@ -1605,7 +1557,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-sweep-order";
     const pluginKey = "plugin:abc123:echo";
@@ -1669,7 +1620,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-token-loop";
     const pluginKey = "plugin:abc123:echo";
@@ -1710,7 +1660,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-prompt-list-token-race";
     const pluginKey = "plugin:abc123:echo";
@@ -1746,7 +1695,6 @@ describe("MCPServerManager", () => {
     manager = new MCPServerManager(configService as unknown as MCPConfigService, {
       pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-prompt-get-token-race";
     const pluginKey = "plugin:abc123:echo";
@@ -1793,7 +1741,6 @@ describe("MCPServerManager", () => {
         readToken: () => Promise.resolve(token),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-unreadable-epoch";
     const pluginKey = "plugin:abc123:echo";
@@ -1851,7 +1798,6 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const workspaceId = "ws-disk-refresh";
     const pluginKey = "plugin:abc123:echo";
@@ -1920,7 +1866,6 @@ describe("MCPServerManager", () => {
         readWorkspaceOverrides: () => Promise.resolve({}), // pruned on disk
       },
     });
-    access = manager as unknown as MCPServerManagerTestAccess;
 
     const pluginKey = "plugin:abc123:echo";
     configService.listServers.mockImplementation(() =>
@@ -2280,17 +2225,12 @@ describe("MCPServerManager", () => {
    * a one-minute interval armed in the constructor — the test runs on demand.
    */
   function useManagerWithIdleSweep(): () => void {
-    const setIntervalSpy = spyOn(globalThis, "setInterval");
-    let sweep: unknown;
-    try {
-      manager.dispose();
-      manager = new MCPServerManager(configService as unknown as MCPConfigService);
-      sweep = setIntervalSpy.mock.calls.find(([, delay]) => delay === 60_000)?.[0];
-    } finally {
-      setIntervalSpy.mockRestore();
-    }
-    if (typeof sweep !== "function") throw new Error("idle sweep interval was not armed");
-    return sweep as () => void;
+    manager.dispose();
+    const constructed = constructWithIdleSweep(
+      () => new MCPServerManager(configService as unknown as MCPConfigService)
+    );
+    manager = constructed.instance;
+    return constructed.sweepIdle;
   }
 
   test("cleanupIdleServers stops idle servers when workspace is not leased", async () => {
@@ -4039,14 +3979,8 @@ describe("MCPServerManager", () => {
     const getPrompt = mock(() =>
       Promise.resolve({ messages: [{ role: "user", content: { type: "text", text: "hi" } }] })
     );
-    access.startServers = mock(() =>
-      Promise.resolve(
-        startResult([
-          ["server", { getPrompt }],
-          ["stable", { getPrompt }],
-        ])
-      )
-    );
+    servers.serve("cmd-1", { getPrompt });
+    servers.serve("cmd-stable", { getPrompt });
 
     await manager.getToolsForWorkspace(workspaceRequest(workspaceId, { trusted: true }));
 
