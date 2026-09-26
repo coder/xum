@@ -672,6 +672,9 @@ export async function runMemoryIntuition(args: {
             entries: selection.entries,
             readFile: readMemoryView,
           });
+    // Same contract as evaluation recall: verification reads turn an abort into failed
+    // reads (downgrading memories to leads), so a deadline hit here ends as a timeout.
+    if (signal.aborted) return { kind: "no_report", stats };
     if (classified) return { kind: "report", ...classified, stats };
     if (errors.length > 0 && !signal.aborted) return { kind: "error", message: errors[0], stats };
     return { kind: "no_report", stats };
