@@ -45,8 +45,9 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Has no non-test consumers." The claim must end there, so invariants such as
   // "No production callers pass null" stay quiet.
   /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:;,)]|$))/i,
-  // "overridable for tests only", "set by tests only".
-  /\b(?:for|by|in)\s+tests\s+only\b/i,
+  // "overridable for tests only", "set by tests only". The seam verb is required so behavior
+  // notes such as "runs in tests only when isolation is enabled" stay quiet.
+  /\b(?:overridable|overridden|settable|set|passed|injected|kept)\s+(?:for|by|in)\s+tests\s+only\b/i,
 ];
 
 export const ALLOWLIST_PATH = "scripts/check-test-seam-comments.allowlist.json";
@@ -423,8 +424,9 @@ function main(): number {
         "",
         "Production code should not grow exports or options that only tests use.",
         "Test through a public API, or move the helper into a test support file.",
-        `If the symbol has a production caller, is a clearly named ...ForTests reset hook, or is a`,
-        `deliberate clock/timer/transport or interleaving injection point, add it to "allowed" in`,
+        `If the symbol has a production caller, is a clearly named ...ForTests reset hook, is a`,
+        `deliberate clock/timer/transport or interleaving injection point, or is a read-only getter`,
+        `that is the only witness of a retention contract, add it to "allowed" in`,
         `${ALLOWLIST_PATH} and name that caller (or the test and the contract it witnesses) in the reason`,
         `("knownDebt" is a shrink-only baseline; do not add to it):`,
         ...unlisted.map(
