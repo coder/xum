@@ -6499,6 +6499,7 @@ export class TaskService implements AgentTaskIntegration {
    * and session dir are named after the task id, so no other task can reuse them once the row is
    * gone. Anything short of a confirmed unpublication — no or another owner, a moved row, a lost
    * or unverifiable write — retains everything; the failure is then recorded on the row.
+   * Returns whether the row was unpublished and the checkout reclaimed.
    */
   private async reclaimUnsanitizedTaskCheckout(
     runtime: Runtime,
@@ -6506,7 +6507,7 @@ export class TaskService implements AgentTaskIntegration {
     workspaceName: string,
     taskId: string,
     expectedAttemptId: string | undefined
-  ): Promise<void> {
+  ): Promise<boolean> {
     let unpublished = false;
     if (
       expectedAttemptId != null &&
@@ -6540,11 +6541,12 @@ export class TaskService implements AgentTaskIntegration {
       log.warn("Task launch: unsanitized checkout retained (its row is still published)", {
         taskId,
       });
-      return;
+      return false;
     }
     await this.rollbackFailedTaskCreate(runtime, projectPath, workspaceName, taskId, {
       rowUnpublished: true,
     });
+    return true;
   }
 
   private async getExistingMaterializedTaskLaunch(
@@ -7019,18 +7021,32 @@ export class TaskService implements AgentTaskIntegration {
         forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
-        initLogger.logComplete(-1);
         // Reclaim the just-materialized worktree/session before failing the
         // launch: the throw reaches scheduleReservedTaskLaunch, which only
         // marks the task interrupted — without this cleanup the physical
         // checkout would accumulate and collide with later same-name forks.
-        await this.reclaimUnsanitizedTaskCheckout(
-          runtimeForTaskWorkspace,
-          plan.parentMeta.projectPath,
-          plan.workspaceName,
-          plan.taskId,
-          plan.attemptId
-        );
+        let reclaimed = false;
+        try {
+          reclaimed = await this.reclaimUnsanitizedTaskCheckout(
+            runtimeForTaskWorkspace,
+            plan.parentMeta.projectPath,
+            plan.workspaceName,
+            plan.taskId,
+            plan.attemptId
+          );
+        } finally {
+          // SECURITY: init ends only after the reclaim attempt. Ending it releases every
+          // request parked in waitForInit (MCP prompt discovery among them); released while
+          // the row is still published, one would start MCP servers inside this unsanitized
+          // checkout. A reclaimed task is gone (row, checkout, session dir): drop its init state
+          // as workspace removal does, since completing it would recreate the session dir to
+          // persist init-status.json. A retained checkout completes init so waiters don't hang.
+          if (reclaimed) {
+            this.initStateManager.clearInMemoryState(plan.taskId);
+          } else {
+            initLogger.logComplete(-1);
+          }
+        }
         throw new Error(sanitizeError);
       }
     }
