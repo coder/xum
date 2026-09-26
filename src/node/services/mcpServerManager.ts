@@ -89,6 +89,8 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
 import {
+  MCP_IDLE_CHECK_INTERVAL_MS,
+  MCP_IDLE_TIMEOUT_MS,
   MCP_LAUNCH_INITIATION_FENCE_MS,
   MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
   MCP_STARTUP_CONCURRENCY,
@@ -97,7 +99,6 @@ import {
 } from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
-const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Freshness horizon for cached *legacy* era verdicts.
@@ -108,7 +109,6 @@ const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
  * are re-probed after this horizon to notice server upgrades.
  */
 const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
-const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
 /**
  * Timed-out servers are restarted from the cached same-signature path, and
  * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
@@ -1529,7 +1529,10 @@ export class MCPServerManager {
       options?.toolCallDisplayRegistry ?? new ToolCallDisplayRegistry();
     this.config = options?.config ?? null;
     this.telemetryService = options?.telemetryService ?? null;
-    this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
+    this.idleCheckInterval = setInterval(
+      () => this.cleanupIdleServers(),
+      MCP_IDLE_CHECK_INTERVAL_MS
+    );
     this.idleCheckInterval.unref?.();
     if (options?.inlineServers) {
       this.inlineServers = options.inlineServers;
@@ -2328,7 +2331,7 @@ export class MCPServerManager {
       }
 
       const idleMs = now - entry.lastActivity;
-      if (idleMs >= IDLE_TIMEOUT_MS) {
+      if (idleMs >= MCP_IDLE_TIMEOUT_MS) {
         // Do not evict retry ownership while retired clients still fail to close.
         // Once they close, a later idle sweep resumes normal workspace eviction.
         if (entry.retiredPluginInstances?.size) {
