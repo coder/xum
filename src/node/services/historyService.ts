@@ -4803,6 +4803,20 @@ export class HistoryService {
         messages.push(persistedCopy);
       }
 
+      // The only place that sees the boundary's final bytes (#4551): history scanners skip rows
+      // over the line limit, so say so when a large pending follow-up keeps the row oversized.
+      const boundaryRowBytes = Buffer.byteLength(
+        JSON.stringify({ ...persistedSummary, workspaceId }),
+        "utf8"
+      );
+      if (boundaryRowBytes > SESSION_HISTORY_MAX_LINE_BYTES) {
+        log.warn("Compaction boundary row exceeds the history line limit", {
+          workspaceId,
+          messageId: persistedSummary.id,
+          rowBytes: boundaryRowBytes,
+        });
+      }
+
       // Final admission or rename can fail: keep caller rows retryable until the boundary is
       // durable, then publish their sequence metadata before delivering its synchronous receipt.
       const onCommitted = () => {

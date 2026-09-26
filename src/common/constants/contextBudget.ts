@@ -53,6 +53,14 @@ export const SESSION_HISTORY_SCAN_DEADLINE_MS = 2_000;
 // 35 s request timeout for the equivalent tools.
 export const SESSION_HISTORY_TOOL_DEADLINE_MS = 30_000;
 export const SESSION_HISTORY_MAX_LINE_BYTES = 1024 * 1024;
+// Compaction boundary rows keep this much of SESSION_HISTORY_MAX_LINE_BYTES free for fields
+// added after the summary is bounded (publication id/generation, preserved replacement
+// metadata). The widest historySequence is already part of the measurement.
+export const COMPACTION_BOUNDARY_ROW_HEADROOM_BYTES = 16 * 1024;
+// Smallest summary worth truncating to so the boundary row still fits: about five times the
+// default 2000-word compaction target. When the pending follow-up leaves less room than this,
+// cutting the summary cannot make the row fit, so only the summary's own ceiling applies.
+export const MIN_FITTED_COMPACTION_SUMMARY_BYTES = 64 * 1024;
 export const SESSION_HISTORY_DEFAULT_LIMIT = 10;
 export const SESSION_HISTORY_MAX_SEARCH_LIMIT = 25;
 export const SESSION_HISTORY_MAX_WINDOW_LIMIT = 50;

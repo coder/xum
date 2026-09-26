@@ -37,6 +37,7 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import { MAX_EDITED_FILES } from "@/common/constants/attachments";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { log } from "@/node/services/log";
+import { fitCompactionSummaryToHistoryRow } from "./historyRowBudget";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
 import {
   extractEditedFileDiffs,
@@ -401,11 +402,8 @@ export class CompactionHandler {
       "heartbeat reset boundary must compute a positive compaction epoch"
     );
 
-    const summaryMessage = createMuxMessage(
-      createCompactionSummaryMessageId(),
-      "assistant",
-      boundaryText,
-      {
+    const summaryMessage = this.fitBoundarySummary(
+      createMuxMessage(createCompactionSummaryMessageId(), "assistant", boundaryText, {
         timestamp: Date.now(),
         synthetic: true,
         uiVisible: true,
@@ -416,7 +414,7 @@ export class CompactionHandler {
           type: "compaction-summary",
           pendingFollowUp,
         },
-      }
+      })
     );
 
     assert(
@@ -791,6 +789,26 @@ export class CompactionHandler {
     return null;
   }
 
+  /**
+   * Keep every boundary this handler writes within the history line limit when possible (#4551).
+   * Applied where the message is built, so the persisted row, the emitted chat event and the
+   * provider view all carry the same (possibly truncated) summary.
+   */
+  private fitBoundarySummary(message: MuxMessage): MuxMessage {
+    const fitted = fitCompactionSummaryToHistoryRow(message, this.workspaceId);
+    if (fitted.truncated || fitted.rowExceedsLimit) {
+      log.warn("Compaction boundary summary did not fit the history line budget", {
+        workspaceId: this.workspaceId,
+        messageId: message.id,
+        rowBytes: fitted.rowBytes,
+        summaryOriginalBytes: fitted.truncated?.originalBytes,
+        summaryKeptBytes: fitted.truncated?.keptBytes,
+        rowExceedsLimit: fitted.rowExceedsLimit,
+      });
+    }
+    return fitted.message;
+  }
+
   /** The rolling summarizer already paid for this text; applying it must not start another turn. */
   buildContinuousCompactionRows(params: {
     boundaryMessageId?: string;
@@ -846,9 +864,13 @@ export class CompactionHandler {
   ): Promise<boolean> {
     const shouldPersist = params.shouldPersist;
     const previousBoundaryHistorySequence = getLatestBoundaryHistorySequence(params.messages);
-    const { boundary, copies } = params.prepared
+    const built = params.prepared
       ? structuredClone(params.prepared)
       : this.buildContinuousCompactionRows(params);
+    // Bound here, not in the builder: a journaled boundary gets its pending follow-up only
+    // after it was built, and the follow-up counts toward the row size.
+    const boundary = this.fitBoundarySummary(built.boundary);
+    const copies = built.copies;
     const inputTokens =
       params.systemMessageTokens +
       params.attachmentTokens +
@@ -986,7 +1008,7 @@ export class CompactionHandler {
       metadata.contextProviderMetadata
     );
 
-    const summaryMessage = createMuxMessage(
+    const builtSummaryMessage = createMuxMessage(
       persistedStreamSummary?.id ?? createCompactionSummaryMessageId(),
       "assistant",
       summary,
@@ -1012,11 +1034,12 @@ export class CompactionHandler {
       }
     );
     if (persistedSummaryHistorySequence !== undefined) {
-      summaryMessage.metadata = {
-        ...(summaryMessage.metadata ?? {}),
+      builtSummaryMessage.metadata = {
+        ...(builtSummaryMessage.metadata ?? {}),
         historySequence: persistedSummaryHistorySequence,
       };
     }
+    const summaryMessage = this.fitBoundarySummary(builtSummaryMessage);
 
     assert(
       summaryMessage.metadata?.compactionBoundary === true,

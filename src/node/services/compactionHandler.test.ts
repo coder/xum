@@ -10,8 +10,16 @@ import * as path from "path";
 import type { EventEmitter } from "events";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MAX_EDITED_FILES } from "@/common/constants/attachments";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type MuxMessage,
+} from "@/common/types/message";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
+import assert from "@/common/utils/assert";
+import { formatCompactionSummaryTruncationMarker } from "./historyRowBudget";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { TelemetryService } from "./telemetryService";
 import type { TelemetryEventPayload } from "@/common/telemetry/payload";
@@ -2133,6 +2141,95 @@ describe("CompactionHandler", () => {
       });
       const pending = await reloaded.peekPendingState();
       expect(pending?.readFiles).toEqual(["/persisted.ts"]);
+    });
+  });
+
+  // #4551: history scanners skip rows over SESSION_HISTORY_MAX_LINE_BYTES, so an oversized
+  // boundary stops being a boundary and provider history falls back to the previous epoch.
+  describe("boundary row size", () => {
+    const olderBoundary = createMuxMessage("older-boundary", "assistant", "Older summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const requestWithFollowUp = (followUpContent: CompactionFollowUpRequest): MuxMessage =>
+      createMuxMessage("limit-request", "user", "Please summarize the conversation", {
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: { followUpContent },
+        },
+      });
+
+    async function persistedRowBytes(): Promise<number[]> {
+      const rows: number[] = [];
+      for (const file of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME]) {
+        const contents = await fsPromises
+          .readFile(path.join(path.dirname(historyPath), file))
+          .catch(() => Buffer.alloc(0));
+        for (const row of contents.toString("utf8").split("\n")) {
+          if (row.length > 0) rows.push(Buffer.byteLength(row, "utf8"));
+        }
+      }
+      return rows;
+    }
+
+    async function compactWith(summary: string, followUpContent: CompactionFollowUpRequest) {
+      await seedHistory(
+        olderBoundary,
+        createMuxMessage("before-compaction", "user", "earlier turn"),
+        requestWithFollowUp(followUpContent)
+      );
+      expect(await handler.handleCompletion(createStreamEndEvent(summary), "limit-request")).toBe(
+        true
+      );
+      for (const bytes of await persistedRowBytes()) {
+        expect(bytes).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES);
+      }
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!history.success) throw new Error(history.error);
+      // The new boundary alone starts the epoch: nothing from before it comes back.
+      expect(history.data).toHaveLength(1);
+      const boundary = history.data[0];
+      expect(boundary?.metadata?.compactionEpoch).toBe(2);
+      expect(boundary?.metadata?.muxMetadata).toEqual({
+        type: "compaction-summary",
+        pendingFollowUp: followUpContent,
+      });
+      const part = boundary?.parts[0];
+      assert(part?.type === "text", "boundary summary must be text");
+      return { boundary, text: part.text };
+    }
+
+    it("truncates a runaway summary with a marker so the boundary stays the epoch start", async () => {
+      const summary = "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 64 * 1024);
+      const followUp = { text: "Continue with step 2", model: "openai:gpt-4o", agentId: "exec" };
+
+      const { boundary, text } = await compactWith(summary, followUp);
+
+      const kept = text.lastIndexOf("\n\n[");
+      expect(summary.startsWith(text.slice(0, kept))).toBe(true);
+      expect(text.slice(kept)).toBe(formatCompactionSummaryTruncationMarker(kept, summary.length));
+      const emitted = emittedEvents
+        .map((event) => event.data.message)
+        .find(
+          (message): message is MuxMessage =>
+            typeof message === "object" &&
+            message !== null &&
+            (message as { type?: unknown }).type === "message" &&
+            (message as { id?: unknown }).id === boundary?.id
+        );
+      expect(emitted?.parts[0]).toMatchObject({ type: "text", text });
+    });
+
+    it("keeps a large follow-up byte-identical and shrinks only the summary", async () => {
+      const followUp = { text: "f".repeat(900 * 1024), model: "openai:gpt-4o", agentId: "exec" };
+      const summary = "s".repeat(300 * 1024);
+
+      const { text } = await compactWith(summary, followUp);
+
+      expect(text.length).toBeLessThan(summary.length);
+      expect(summary.startsWith(text.slice(0, text.lastIndexOf("\n\n[")))).toBe(true);
     });
   });
 });
