@@ -478,7 +478,7 @@ if (!result.success) throw new Error(result.error);
 
   test("post-append certification failure preserves success but expires the epoch", async () => {
     const cursor = await startCursor();
-    const stamps = HistoryAppendProvenance.prototype.stamps;
+    const stamps = HistoryAppendProvenance.prototype.stamps; // eslint-disable-line @typescript-eslint/unbound-method -- called with the original receiver
     // Target the post-append stat by call site, not by a global prototype call count:
     // stamps() calls from other instances (leftover async work from earlier tests) or
     // extra calls elsewhere would otherwise move the fault onto the pre-append stat.
