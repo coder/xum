@@ -68,11 +68,11 @@ const ToolsDisclosureButton: React.FC<{
     type="button"
     onClick={props.onToggle}
     aria-expanded={props.expanded}
-    className="text-muted hover:text-foreground flex items-center gap-1 text-xs"
+    className="text-content-secondary hover:text-foreground focus-visible:ring-accent flex items-center gap-1 rounded-sm text-xs focus-visible:ring-1"
   >
     {props.expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
     <span>{props.summary}</span>
-    <span className="text-muted/60 ml-1">({formatRelativeTime(props.testedAt)})</span>
+    <span className="ml-1">({formatRelativeTime(props.testedAt)})</span>
     {props.saving && <Loader2 className="ml-1 h-3 w-3 animate-spin" />}
   </button>
 );
@@ -223,7 +223,7 @@ const PluginToolListSection: React.FC<{ tools: string[]; testedAt: number }> = (
       />
       {expanded && (
         <div className="mt-2">
-          <p className="text-muted mb-2 text-xs">
+          <p className="text-content-secondary mb-2 text-xs">
             Discovered by the connection test. Tool permissions for plugin servers are chosen per
             workspace via Configure MCP servers.
           </p>
@@ -550,15 +550,15 @@ const MCPOAuthRequiredCalloutView: React.FC<{
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="font-medium">This server requires OAuth.</p>
-          {disabledReason && <p className="text-muted mt-0.5">{disabledReason}</p>}
+          {disabledReason && <p className="text-content-secondary mt-0.5">{disabledReason}</p>}
 
           {loginStatus === "waiting" && (
             <>
-              <p className="text-muted mt-0.5">
+              <p className="text-content-secondary mt-0.5">
                 Finish the login flow in your browser, then return here.
               </p>
               {!isDesktop && (
-                <p className="text-muted mt-0.5">
+                <p className="text-content-secondary mt-0.5">
                   If a new tab didn&apos;t open, your browser may have blocked the popup. Allow
                   popups and try again.
                 </p>
@@ -567,7 +567,7 @@ const MCPOAuthRequiredCalloutView: React.FC<{
           )}
 
           {(loginStatus === "completing" || loginStatus === "success") && (
-            <p className="text-muted mt-0.5">Logged in.</p>
+            <p className="text-content-secondary mt-0.5">Logged in.</p>
           )}
 
           {loginStatus === "error" && loginError && (
@@ -732,14 +732,14 @@ const RemoteMCPOAuthSection: React.FC<{
     <div className="mt-1 flex items-center justify-between gap-2">
       <div className="flex min-w-0 items-center gap-2 text-xs">
         <span className="text-foreground font-medium">OAuth</span>
-        <span className="text-muted truncate">
+        <span className="text-content-secondary truncate">
           {authStatusText}
           {updatedAtText}
         </span>
 
         {oauthDebugErrors.length > 0 && (
           <details className="group inline-block">
-            <summary className="text-muted hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
+            <summary className="text-content-secondary hover:text-foreground cursor-pointer list-none text-[11px] underline-offset-2 group-open:underline">
               Details
             </summary>
             <div className="border-border-medium bg-background-secondary mt-1 space-y-1 rounded-md border px-2 py-1 text-xs">
@@ -1290,7 +1290,7 @@ export const MCPSettingsSection: React.FC = () => {
     <div className="space-y-6">
       {/* Intro */}
       <div>
-        <p className="text-muted mb-4 text-xs">
+        <p className="text-content-secondary mb-4 text-xs">
           Configure global MCP servers. Global config lives in{" "}
           <code className="text-accent">~/.xum/mcp.jsonc</code>, with optional repo overrides in{" "}
           <code className="text-accent">./.xum/mcp.jsonc</code> and workspace overrides in{" "}
@@ -1315,7 +1315,7 @@ export const MCPSettingsSection: React.FC = () => {
         <h3 className="text-foreground mb-4 text-sm font-medium">MCP Servers</h3>
 
         {mcpDisabledByPolicy ? (
-          <p className="text-muted py-2 text-sm">MCP servers are disabled by policy.</p>
+          <p className="text-content-secondary py-2 text-sm">MCP servers are disabled by policy.</p>
         ) : (
           <>
             {error && (
@@ -1328,12 +1328,12 @@ export const MCPSettingsSection: React.FC = () => {
             {/* Server list */}
             <div className="space-y-2">
               {loading ? (
-                <div className="text-muted flex items-center gap-2 py-4 text-sm">
+                <div className="text-content-secondary flex items-center gap-2 py-4 text-sm">
                   <Loader2 className="h-4 w-4 animate-spin" />
                   Loading servers…
                 </div>
               ) : Object.keys(servers).length === 0 ? (
-                <p className="text-muted py-2 text-sm">No MCP servers configured yet.</p>
+                <p className="text-content-secondary py-2 text-sm">No MCP servers configured yet.</p>
               ) : (
                 Object.entries(servers).map(([name, entry]) => {
                   const isTesting = testingServer === name;
@@ -1387,7 +1387,7 @@ export const MCPSettingsSection: React.FC = () => {
                               {displayName}
                             </span>
                             {entry.plugin && (
-                              <span className="text-muted bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
+                              <span className="text-content-secondary bg-background min-w-0 rounded px-1.5 py-0.5 text-xs wrap-anywhere">
                                 {/* Include the install location: same-name plugins can
                                     exist in sibling containers (.mux vs .agents). */}
                                 plugin · {entry.plugin.sourceLocation}
@@ -1405,11 +1405,11 @@ export const MCPSettingsSection: React.FC = () => {
                                 </TooltipContent>
                               </Tooltip>
                             )}
-                            {!isEnabled && <span className="text-muted text-xs">disabled</span>}
+                            {!isEnabled && <span className="text-content-secondary text-xs">disabled</span>}
                           </div>
                           {isEditing ? (
                             <div className="mt-2 space-y-2">
-                              <p className="text-muted text-xs">transport: {editing.transport}</p>
+                              <p className="text-content-secondary text-xs">transport: {editing.transport}</p>
                               <input
                                 type="text"
                                 value={editing.value}
@@ -1424,7 +1424,7 @@ export const MCPSettingsSection: React.FC = () => {
                               />
                               {editing.transport !== "stdio" && (
                                 <div>
-                                  <div className="text-muted mb-1 text-[11px]">
+                                  <div className="text-content-secondary mb-1 text-[11px]">
                                     HTTP headers (optional)
                                   </div>
                                   <MCPHeadersEditor
@@ -1442,7 +1442,7 @@ export const MCPSettingsSection: React.FC = () => {
                               )}
                             </div>
                           ) : (
-                            <p className="text-muted mt-0.5 font-mono text-xs break-all">
+                            <p className="text-content-secondary mt-0.5 font-mono text-xs break-all">
                               {serverDisplayValue(entry)}
                             </p>
                           )}
@@ -1632,7 +1632,7 @@ export const MCPSettingsSection: React.FC = () => {
               </summary>
               <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
                 <div>
-                  <label htmlFor="server-name" className="text-muted mb-1 block text-xs">
+                  <label htmlFor="server-name" className="text-content-secondary mb-1 block text-xs">
                     Name
                   </label>
                   <input
@@ -1647,7 +1647,7 @@ export const MCPSettingsSection: React.FC = () => {
                 </div>
 
                 <div>
-                  <label className="text-muted mb-1 block text-xs">Transport</label>
+                  <label className="text-content-secondary mb-1 block text-xs">Transport</label>
                   <Select
                     value={newServer.transport}
                     disabled={newServerOauthPending}
@@ -1679,7 +1679,7 @@ export const MCPSettingsSection: React.FC = () => {
                 </div>
 
                 <div>
-                  <label htmlFor="server-value" className="text-muted mb-1 block text-xs">
+                  <label htmlFor="server-value" className="text-content-secondary mb-1 block text-xs">
                     {newServer.transport === "stdio" ? "Command" : "URL"}
                   </label>
                   <input
@@ -1700,7 +1700,7 @@ export const MCPSettingsSection: React.FC = () => {
 
                 {newServer.transport !== "stdio" && (
                   <div>
-                    <label className="text-muted mb-1 block text-xs">HTTP headers (optional)</label>
+                    <label className="text-content-secondary mb-1 block text-xs">HTTP headers (optional)</label>
                     <MCPHeadersEditor
                       rows={newServer.headersRows}
                       onChange={(rows) =>
