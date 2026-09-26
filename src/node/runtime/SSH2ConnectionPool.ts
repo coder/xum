@@ -45,15 +45,6 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
  */
 const IDLE_TIMEOUT_MS = 60 * 1000;
 
-export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOptions {
-  /**
-   * Test seam.
-   *
-   * If provided, this is used for sleeping between wait cycles.
-   */
-  sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
-}
-
 interface SSH2ConnectionEntry {
   client: Client;
   resolvedConfig: ResolvedSSHConfig;
@@ -309,11 +300,10 @@ export class SSH2ConnectionPool {
 
   async acquireConnection(
     config: SSHConnectionConfig,
-    options: AcquireConnectionOptions = {}
+    options: BaseSshAcquireConnectionOptions = {}
   ): Promise<SSH2ConnectionEntry> {
     const key = makeConnectionKey(config);
     const timeoutMs = options.timeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-    const sleep = options.sleep ?? sleepWithAbort;
     const maxWaitMs = options.maxWaitMs ?? DEFAULT_SSH_MAX_WAIT_MS;
     const shouldWait = maxWaitMs > 0;
     const startTime = Date.now();
@@ -353,7 +343,7 @@ export class SSH2ConnectionPool {
 
         const waitMs = Math.min(remainingMs, budgetMs);
         options.onWait?.(waitMs);
-        await sleep(waitMs, options.abortSignal);
+        await sleepWithAbort(waitMs, options.abortSignal);
         continue;
       }
 
@@ -418,7 +408,7 @@ export class SSH2ConnectionPool {
    * Clear all health state. Used in tests to reset between test cases
    * so backoff from one test doesn't affect subsequent tests.
    */
-  clearAllHealth(): void {
+  clearAllHealthForTests(): void {
     this.health.clear();
     this.inflight.clear();
   }

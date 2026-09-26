@@ -67,8 +67,8 @@ describeIntegration("SSH2 Transport integration tests", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   describe("exec() - Command execution via SSH2", () => {

@@ -1,6 +1,6 @@
 import * as os from "os";
 import * as path from "path";
-import { afterEach, describe, expect, test, spyOn } from "bun:test";
+import { afterEach, describe, expect, jest, test, spyOn } from "bun:test";
 import {
   appendOpenSSHHostKeyPolicyArgs,
   getControlPath,
@@ -8,6 +8,9 @@ import {
   SSHConnectionPool,
   type SSHRuntimeConfig,
 } from "./sshConnectionPool";
+
+// bun-types (^1.2.23) lags the pinned runtime (bun@1.3.5), which implements this.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("sshConnectionPool", () => {
   describe("getControlPath", () => {
@@ -281,36 +284,55 @@ describe("SSHConnectionPool", () => {
     });
 
     test("waits through backoff (bounded) instead of throwing", async () => {
-      const pool = new SSHConnectionPool();
-      const config: SSHRuntimeConfig = {
-        host: "test.example.com",
-        srcBaseDir: "/work",
-      };
+      // Fake timers also fake Date, so the backoff deadline and the real default
+      // sleep advance together without slowing the test down.
+      fakeTimers.useFakeTimers();
+      try {
+        const pool = new SSHConnectionPool();
+        const config: SSHRuntimeConfig = {
+          host: "test.example.com",
+          srcBaseDir: "/work",
+        };
 
-      // Put host into backoff without doing a real probe.
-      pool.reportFailure(config, "Connection refused");
-      expect(pool.getConnectionHealth(config)?.backoffUntil).toBeDefined();
+        // Put host into backoff without doing a real probe.
+        pool.reportFailure(config, "Connection refused");
+        expect(pool.getConnectionHealth(config)?.backoffUntil).toBeDefined();
 
-      const sleepCalls: number[] = [];
-      const onWaitCalls: number[] = [];
+        const onWaitCalls: number[] = [];
+        let settled = false;
+        const acquire = pool
+          .acquireConnection(config, {
+            onWait: (ms) => {
+              onWaitCalls.push(ms);
+            },
+          })
+          .then(() => {
+            settled = true;
+          });
 
-      await pool.acquireConnection(config, {
-        onWait: (ms) => {
-          onWaitCalls.push(ms);
-        },
-        sleep: (ms) => {
-          sleepCalls.push(ms);
-          // Simulate time passing / recovery.
-          pool.markHealthy(config);
-          return Promise.resolve();
-        },
-      });
+        expect(onWaitCalls.length).toBe(1);
+        const waitMs = onWaitCalls[0];
+        expect(waitMs).toBeGreaterThan(0);
 
-      expect(sleepCalls.length).toBe(1);
-      expect(onWaitCalls.length).toBe(1);
-      expect(sleepCalls[0]).toBeGreaterThan(0);
-      expect(onWaitCalls[0]).toBe(sleepCalls[0]);
-      expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+        // Simulate recovery while the caller is waiting.
+        pool.markHealthy(config);
+
+        // The caller keeps waiting for the whole reported backoff...
+        fakeTimers.advanceTimersByTime(waitMs - 1);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(settled).toBe(false);
+
+        // ...and resumes once it elapses.
+        fakeTimers.advanceTimersByTime(1);
+        await acquire;
+
+        expect(settled).toBe(true);
+        expect(onWaitCalls.length).toBe(1);
+        expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+      } finally {
+        fakeTimers.useRealTimers();
+      }
     });
     test("throws immediately when in backoff", async () => {
       const pool = new SSHConnectionPool();
@@ -602,45 +624,66 @@ describe("SSHConnectionPool", () => {
         host: "test.example.com",
         srcBaseDir: "/work",
       };
-
-      // Put connection in backoff
-      pool.reportFailure(config, "Initial failure");
-      expect(pool.getConnectionHealth(config)?.consecutiveFailures).toBe(1);
+      const privatePool = pool as unknown as {
+        probeConnection: (
+          config: SSHRuntimeConfig,
+          timeoutMs: number,
+          key: string,
+          controlPath: string
+        ) => Promise<void>;
+        markHealthyByKey: (key: string) => void;
+      };
 
       let probeCount = 0;
-      const sleepResolvers: Array<() => void> = [];
-
-      // Start 3 waiters - they'll all sleep through backoff
-      const waiters = [1, 2, 3].map(() =>
-        pool.acquireConnection(config, {
-          sleep: () =>
-            new Promise<void>((resolve) => {
-              sleepResolvers.push(() => {
-                // When sleep resolves, simulate recovery (mark healthy)
-                // This happens during the first probe - all waiters share it
-                if (probeCount === 0) {
-                  probeCount++;
-                  pool.markHealthy(config);
-                }
-                resolve();
-              });
-            }),
-        })
+      let releaseProbe!: () => void;
+      const probeReleased = new Promise<void>((resolve) => {
+        releaseProbe = resolve;
+      });
+      const probeSpy = spyOn(privatePool, "probeConnection").mockImplementation(
+        async (_config, _timeoutMs, key) => {
+          probeCount++;
+          // Hold the probe open until every woken caller has had a chance to run.
+          await probeReleased;
+          privatePool.markHealthyByKey(key);
+        }
       );
 
-      // Let all sleepers proceed
-      await Promise.resolve(); // Let all acquireConnection calls reach sleep
-      expect(sleepResolvers.length).toBe(3);
+      fakeTimers.useFakeTimers();
+      try {
+        // Put connection in backoff
+        pool.reportFailure(config, "Initial failure");
+        expect(pool.getConnectionHealth(config)?.consecutiveFailures).toBe(1);
 
-      // Wake them all up "simultaneously"
-      sleepResolvers.forEach((resolve) => resolve());
+        // Start 3 waiters - they'll all sleep through backoff
+        const waitMs: number[] = [];
+        const waiters = [1, 2, 3].map(() =>
+          pool.acquireConnection(config, {
+            onWait: (ms) => {
+              waitMs.push(ms);
+            },
+          })
+        );
+        expect(waitMs.length).toBe(3);
+        expect(probeCount).toBe(0);
 
-      // All should succeed
-      await Promise.all(waiters);
+        // Wake them all up simultaneously when the backoff expires.
+        fakeTimers.advanceTimersByTime(Math.max(...waitMs));
+        for (let i = 0; i < 20; i++) {
+          await Promise.resolve();
+        }
+        expect(probeCount).toBe(1);
 
-      // Only one "probe" (markHealthy) should have happened
-      expect(probeCount).toBe(1);
-      expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+        // Herd is only released once the shared probe succeeds.
+        releaseProbe();
+        await Promise.all(waiters);
+
+        // The woken herd shares one probe instead of each caller probing.
+        expect(probeCount).toBe(1);
+        expect(pool.getConnectionHealth(config)?.status).toBe("healthy");
+      } finally {
+        probeSpy.mockRestore();
+        fakeTimers.useRealTimers();
+      }
     });
   });
 });

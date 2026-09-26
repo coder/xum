@@ -80,8 +80,8 @@ describeIntegration("Runtime integration tests", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run all tests for local, SSH, and Docker runtimes
