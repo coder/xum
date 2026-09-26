@@ -4,6 +4,7 @@ import { execBuffered } from "@/node/utils/runtime/helpers";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { providerSecretEnvVarNames } from "@/node/utils/providerRequirements";
 import { execFileAsync } from "@/node/utils/disposableExec";
+import { getBashPath } from "@/node/utils/main/bashPath";
 
 /**
  * Environment variables that disable git hooks by pointing core.hooksPath
@@ -391,13 +392,131 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
   return appendDisabledRepoAutomationDrivers(baseEnv, result.stdout.split("\0"));
 }
 
-function isNoMatchingConfigError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: unknown }).code === 1
+const LOCAL_DISCOVERY_AUTOMATION_ERROR = "Failed to inspect repository automation drivers";
+const LOCAL_DISCOVERY_WORKTREE_ERROR = "Failed to inspect repository worktree config";
+const LOCAL_DISCOVERY_INCLUDES_ERROR = "Failed to inspect repository conditional includes";
+const LOCAL_DISCOVERY_HEADER = "xum-git-discovery 1\n";
+const LOCAL_DISCOVERY_RECORD_REGEX =
+  /^(?:(rev-parse|worktree-config|unrepresentable-failed|drivers) (\d{1,3})|unrepresentable (includeif|executable))\n$/;
+
+// Runs the git queries in sequence and prints each decisive exit status in-band. `command`
+// bypasses shell functions, and the cwd is inherited so PATH lookup matches spawning git
+// directly. rev-parse stdout is discarded, the worktree-config and unrepresentable-key queries
+// are captured and decided here, and only the driver query (last) streams repo-controlled bytes.
+// The unrepresentable-key query omits --null because its output lands in a shell variable; the
+// refusal decision is "exited 0", and the keys only choose the refusal message. The record after
+// the last NUL is written after the last git call exits, and the script exits 0 only after
+// writing it.
+const LOCAL_DISCOVERY_SCRIPT_BODY = String.raw`printf 'xum-git-discovery 1\n'
+command git -C "$repo" rev-parse --git-dir >/dev/null
+rc=$?
+if [ "$rc" -ne 0 ]; then printf '\000rev-parse %s\n' "$rc"; exit 0; fi
+worktree_config=$(LC_ALL=C command git -C "$repo" config --local --bool extensions.worktreeConfig)
+worktree_rc=$?
+case $worktree_rc in
+  0|1) ;;
+  *) printf '\000worktree-config %s\n' "$worktree_rc"; exit 0 ;;
+esac
+check_unrepresentable() {
+  keys=$(LC_ALL=C command git -C "$repo" config "$1" --includes --name-only --get-regexp "$unrepresentable_pattern")
+  rc=$?
+  case $rc in
+    1) return 0 ;;
+    0) case $keys in
+         *[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ii][Ff].*) printf '\000unrepresentable includeif\n' ;;
+         *) printf '\000unrepresentable executable\n' ;;
+       esac ;;
+    *) printf '\000unrepresentable-failed %s\n' "$rc" ;;
+  esac
+  exit 0
+}
+check_unrepresentable --local
+if [ "$worktree_rc" -eq 0 ] && [ "$worktree_config" = true ]; then
+  check_unrepresentable --worktree
+fi
+LC_ALL=C command git -C "$repo" config --null --includes --get-regexp "$automation_pattern"
+rc=$?
+printf '\000drivers %s\n' "$rc"
+`;
+
+function localDiscoveryShell(): string {
+  // Non-interactive POSIX sh reads no startup files. Windows has no /bin/sh outside Git Bash;
+  // getBashPath throws when Git Bash is missing, which the caller turns into a closed failure.
+  return process.platform === "win32" ? getBashPath() : "/bin/sh";
+}
+
+function malformedLocalDiscoveryOutput(): Error {
+  return new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+    cause: new Error("Malformed repository automation discovery output"),
+  });
+}
+
+/**
+ * Map the output of the local discovery script to an env, failing closed on anything else.
+ * Exported for protocol tests. stdout is HEADER + PAYLOAD + NUL + RECORD + LF; the payload
+ * (driver query output) may only accompany a `drivers` record.
+ */
+export function parseLocalRepoAutomationDiscovery(
+  output: { stdout: string; stderr: string },
+  allowNonRepository: boolean
+): Record<string, string> {
+  const baseEnv = gitNoRepoAutomationEnv();
+  if (!output.stdout.startsWith(LOCAL_DISCOVERY_HEADER)) throw malformedLocalDiscoveryOutput();
+  const body = output.stdout.slice(LOCAL_DISCOVERY_HEADER.length);
+  const recordStart = body.lastIndexOf("\0");
+  if (recordStart === -1) throw malformedLocalDiscoveryOutput();
+  const payload = body.slice(0, recordStart);
+  const record = LOCAL_DISCOVERY_RECORD_REGEX.exec(body.slice(recordStart + 1));
+  if (record == null) throw malformedLocalDiscoveryOutput();
+  const [, step, statusText, refusal] = record;
+  if (step !== "drivers" && payload.length > 0) throw malformedLocalDiscoveryOutput();
+
+  if (refusal != null) {
+    throw new Error(LOCAL_DISCOVERY_INCLUDES_ERROR, {
+      cause: new Error(
+        refusal === "includeif"
+          ? "Refusing git operation with conditional config includes"
+          : "Refusing git operation with unsupported executable config"
+      ),
+    });
+  }
+
+  const status = Number(statusText);
+  // Shaped like the execFileAsync error a direct git spawn would raise.
+  const gitFailure = Object.assign(
+    new Error(output.stderr.trim() || `Command failed with exit code ${status}`),
+    { code: status, stderr: output.stderr }
   );
+  switch (step) {
+    case "rev-parse":
+      if (status === 128 && allowNonRepository) return baseEnv;
+      throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, { cause: gitFailure });
+    case "worktree-config":
+      throw new Error(LOCAL_DISCOVERY_WORKTREE_ERROR, { cause: gitFailure });
+    case "unrepresentable-failed":
+      throw new Error(LOCAL_DISCOVERY_INCLUDES_ERROR, { cause: gitFailure });
+    case "drivers":
+      // git config --get-regexp exits 1 when no keys match. Output with exit 1 is not a real git
+      // result, so it fails closed instead of reading as "no drivers".
+      if (status === 1 && payload.length === 0) return baseEnv;
+      if (status !== 0) {
+        throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, { cause: gitFailure });
+      }
+      if (Buffer.byteLength(payload) > MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES) {
+        throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
+          cause: new Error("Repository automation driver config output exceeded the safety limit"),
+        });
+      }
+      try {
+        return appendDisabledRepoAutomationDrivers(baseEnv, payload.split("\0"));
+      } catch (error) {
+        // Fail closed: materialization must not proceed with an unknown set of
+        // repo-configured attribute drivers.
+        throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, { cause: error });
+      }
+    default:
+      throw malformedLocalDiscoveryOutput();
+  }
 }
 
 /**
@@ -406,122 +525,43 @@ function isNoMatchingConfigError(error: unknown): boolean {
  * $GIT_DIR/info/attributes higher precedence. Discovering every configured
  * attribute driver and overriding it at command scope neutralizes both sources
  * without mutating repository files (which would be racy and destructive).
+ *
+ * Discovery is one shell spawn that runs the git queries in sequence and reports each exit
+ * status in-band (see LOCAL_DISCOVERY_SCRIPT_BODY and parseLocalRepoAutomationDiscovery).
+ * It runs in the Electron main process before every untrusted bash command, and each spawn
+ * forks that large process and blocks its thread, so all queries share one spawn.
+ * Every call still takes its own fresh snapshot: nothing is cached or shared between callers.
+ * Any process failure (missing shell, non-zero script exit, signal, timeout, abort, output
+ * overflow) or malformed output fails closed.
  */
 export async function gitNoRepoAutomationEnvForLocalRepo(
   repoPath: string,
   signal?: AbortSignal,
   allowNonRepository = false
 ): Promise<Record<string, string>> {
-  const baseEnv = gitNoRepoAutomationEnv();
+  // Only these three values are interpolated, each shell-quoted.
+  const script = [
+    `repo=${shellQuote(repoPath)}`,
+    `unrepresentable_pattern=${shellQuote(GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN)}`,
+    `automation_pattern=${shellQuote(GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN)}`,
+    LOCAL_DISCOVERY_SCRIPT_BODY,
+  ].join("\n");
+  let output: { stdout: string; stderr: string };
   try {
-    using repoProc = execFileAsync("git", ["-C", repoPath, "rev-parse", "--git-dir"], {
-      env: baseEnv,
+    using proc = execFileAsync(localDiscoveryShell(), ["-c", script], {
+      // Git Bash would source BASH_ENV; /bin/sh ignores it.
+      env: { ...gitNoRepoAutomationEnv(), BASH_ENV: "" },
       signal,
       timeoutMs: 10_000,
-      maxOutputBytes: 1024,
+      // The slack covers header, record and stderr; the parser caps the payload itself.
+      maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 4096,
       killTreeOnTermination: true,
     });
-    await repoProc.result;
+    output = await proc.result;
   } catch (error) {
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      (error as { code?: unknown }).code === 128 &&
-      allowNonRepository
-    ) {
-      return baseEnv;
-    }
-    throw new Error("Failed to inspect repository automation drivers", { cause: error });
+    throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, { cause: error });
   }
-
-  const scopes: Array<"--local" | "--worktree"> = ["--local"];
-  try {
-    using worktreeConfigProc = execFileAsync(
-      "git",
-      ["-C", repoPath, "config", "--local", "--bool", "extensions.worktreeConfig"],
-      {
-        env: { ...baseEnv, LC_ALL: "C" },
-        signal,
-        timeoutMs: 10_000,
-        maxOutputBytes: 1024,
-        killTreeOnTermination: true,
-      }
-    );
-    const { stdout } = await worktreeConfigProc.result;
-    if (stdout.trim() === "true") scopes.push("--worktree");
-  } catch (error) {
-    if (!isNoMatchingConfigError(error)) {
-      throw new Error("Failed to inspect repository worktree config", { cause: error });
-    }
-  }
-
-  for (const scope of scopes) {
-    try {
-      using includeProc = execFileAsync(
-        "git",
-        [
-          "-C",
-          repoPath,
-          "config",
-          scope,
-          "--includes",
-          "--null",
-          "--name-only",
-          "--get-regexp",
-          GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN,
-        ],
-        {
-          env: { ...baseEnv, LC_ALL: "C" },
-          signal,
-          timeoutMs: 10_000,
-          maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
-          killTreeOnTermination: true,
-        }
-      );
-      const { stdout } = await includeProc.result;
-      if (stdout.toLowerCase().includes("includeif.")) {
-        throw new Error("Refusing git operation with conditional config includes");
-      }
-      throw new Error("Refusing git operation with unsupported executable config");
-    } catch (error) {
-      if (!isNoMatchingConfigError(error)) {
-        throw new Error("Failed to inspect repository conditional includes", { cause: error });
-      }
-    }
-  }
-
-  try {
-    using proc = execFileAsync(
-      "git",
-      [
-        "-C",
-        repoPath,
-        "config",
-        "--null",
-        "--includes",
-        "--get-regexp",
-        GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN,
-      ],
-      {
-        env: { ...baseEnv, LC_ALL: "C" },
-        signal,
-        timeoutMs: 10_000,
-        maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
-        killTreeOnTermination: true,
-      }
-    );
-    const { stdout } = await proc.result;
-    return appendDisabledRepoAutomationDrivers(baseEnv, stdout.split("\0"));
-  } catch (error) {
-    // git config --get-regexp exits 1 when no keys match.
-    if (isNoMatchingConfigError(error)) {
-      return baseEnv;
-    }
-    // Fail closed: materialization must not proceed with an unknown set of
-    // repo-configured attribute drivers.
-    throw new Error("Failed to inspect repository automation drivers", { cause: error });
-  }
+  return parseLocalRepoAutomationDiscovery(output, allowNonRepository);
 }
 
 /**
