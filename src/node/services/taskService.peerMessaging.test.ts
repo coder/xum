@@ -1795,7 +1795,8 @@ describe("TaskService", () => {
       await t.drainSenderLock();
       expect(t.wakeCalls()).toHaveLength(1);
       const [, content, , internal] = t.wakeCalls()[0];
-      expect(content).toContain("sib-b");
+      // Workspace IDs can be legacy, repository-derived names: keep them out of the prompt.
+      expect(content).not.toContain("sib-b");
       // Idle-only: never queued behind the sender's work with a stale tool-policy snapshot.
       expect(internal).toMatchObject({
         requireIdle: true,

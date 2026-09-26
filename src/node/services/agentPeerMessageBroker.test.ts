@@ -140,9 +140,21 @@ describe("AgentPeerMessageBroker", () => {
     });
     // While the cap is still full, a successful reawaken must not drain the waiters.
     expect(broker.takePeerWakeWaitersIfUncapped("target")).toEqual([]);
-    expect(broker.resetConsecutivePeerWakes("target")).toHaveLength(
-      MAX_PEER_WAKE_WAITERS_PER_TARGET
-    );
+    const taken = broker.resetConsecutivePeerWakes("target");
+    expect(taken).toHaveLength(MAX_PEER_WAKE_WAITERS_PER_TARGET);
+
+    // Newer refusals fill the list while the taken notices are in flight; putting a promised
+    // waiter back must still succeed, so it is not displaced by them.
+    for (let i = 0; i < MAX_CONSECUTIVE_PEER_WAKES; i++) {
+      broker.chargeConsecutivePeerWake("target");
+    }
+    for (let i = 0; i < MAX_PEER_WAKE_WAITERS_PER_TARGET; i++) {
+      broker.checkPeerAdmission(`newer-${i}`, "target", "message", grant);
+    }
+    broker.requeuePeerWakeWaiter("target", taken[0]);
+    expect(
+      broker.resetConsecutivePeerWakes("target").map((waiter) => waiter.senderWorkspaceId)
+    ).toContain(taken[0].senderWorkspaceId);
   });
 
   test.each([

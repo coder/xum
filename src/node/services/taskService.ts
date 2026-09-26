@@ -9681,7 +9681,7 @@ export class TaskService implements AgentTaskIntegration {
             error,
           });
           // Keep the promised wake: the next attention reruns every validity check.
-          this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+          this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
         });
     }
   }
@@ -9750,7 +9750,7 @@ export class TaskService implements AgentTaskIntegration {
     // reawakenInterruptedTask runs (and may fail). Keep waiting; a later reset or the successful
     // reawaken delivers the notice.
     if (targetUnavailable()) {
-      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+      this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
       return;
     }
     // Same rules as sending: a stopped, terminal, or archived sender must not be woken by this.
@@ -9775,7 +9775,7 @@ export class TaskService implements AgentTaskIntegration {
       this.workspaceService.hasPendingQueuedOrPreparingTurn(senderId);
     if (senderBusy()) {
       if (afterIdle) {
-        this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+        this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
         return;
       }
       this.workspaceService
@@ -9787,7 +9787,7 @@ export class TaskService implements AgentTaskIntegration {
             senderId,
             error,
           });
-          this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+          this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
         });
       return;
     }
@@ -9819,7 +9819,7 @@ export class TaskService implements AgentTaskIntegration {
         // unreachable (stopped, inactive, or capped again). Keep waiting for the target's next
         // attention instead of dispatching stale grants or a futile retry turn. Idempotent, so
         // repeated probe calls re-register the same waiter.
-        this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+        this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
         return true;
       }
       return false;
@@ -9834,15 +9834,17 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error: unknown) {
       // Fail closed without losing the waiter: the next attention retries the read.
       log.warn("Deferring peer-wake notice; sender tool policy unavailable", { senderId, error });
-      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+      this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
       return;
     }
     if (admissionStale()) return;
 
-    // Zero peer-controlled bytes: workspace IDs are server-generated and the title is omitted.
+    // Fixed text only: no title and no target ID, because legacy workspace IDs can derive from
+    // repository-controlled names (Config.generateLegacyId). The refused tool call in the
+    // sender's own history identifies the target.
     const content =
-      `Workspace ${targetId} received user or parent attention, so the consecutive peer-wake ` +
-      `limit that refused your task_send_message was reset. If that message still matters, ` +
+      `A workspace whose consecutive peer-wake limit refused your task_send_message received ` +
+      `user or parent attention, so that limit was reset. If the refused message still matters, ` +
       `resend it now; it can still be refused for other reasons, so follow that refusal's ` +
       `guidance. Otherwise continue.`;
     const result = await this.wakeParentWorkspaceWithSyntheticMessage({
@@ -9861,7 +9863,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!result.success) {
       // Usually user input won the race; keep waiting for the target's next attention.
       log.debug("Peer-wake notice was not admitted", { targetId, senderId, error: result.error });
-      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+      this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
     }
   }
 

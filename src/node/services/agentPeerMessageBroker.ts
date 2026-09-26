@@ -197,6 +197,20 @@ export class AgentPeerMessageBroker {
     return true;
   }
 
+  /**
+   * Puts back a waiter taken by a reset whose notice could not be delivered yet. Exempt from the
+   * bound: the sender was already promised a wake, and newer refusals must not displace it.
+   * Still bounded overall, since only previously registered waiters can be requeued.
+   */
+  requeuePeerWakeWaiter(targetId: string, waiter: PeerWakeWaiter): void {
+    const { senderWorkspaceId, ...grant } = waiter;
+    assert(senderWorkspaceId !== targetId, "requeuePeerWakeWaiter: sender cannot wait on itself");
+    const waiters =
+      this.peerWakeWaitersByTarget.get(targetId) ?? new Map<string, PeerWakeWaiterGrant>();
+    waiters.set(senderWorkspaceId, grant);
+    this.peerWakeWaitersByTarget.set(targetId, waiters);
+  }
+
   private takePeerWakeWaiters(targetId: string): PeerWakeWaiter[] {
     const waiters = this.peerWakeWaitersByTarget.get(targetId);
     this.peerWakeWaitersByTarget.delete(targetId);
