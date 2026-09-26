@@ -2235,9 +2235,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
-
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      // Await the policy itself: it decides the queued dispatch synchronously before resolving,
+      // and a detached run would keep holding the history write lock past cleanup (#4572).
+      await runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       expect(sendQueuedMessages).not.toHaveBeenCalled();
     } finally {
       sendQueuedMessages.mockRestore();
