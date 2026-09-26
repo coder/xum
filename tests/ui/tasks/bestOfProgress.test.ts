@@ -245,9 +245,7 @@ async function openTaskCard(view: RenderedApp): Promise<HTMLElement> {
     throw new Error("Task tool call not found in a chat message");
   }
 
-  const taskMessageBlock = taskToolName.closest(
-    '[data-testid="chat-message"]'
-  );
+  const taskMessageBlock = taskToolName.closest<HTMLElement>('[data-testid="chat-message"]');
   if (!taskMessageBlock) {
     throw new Error("Task chat message block not found");
   }

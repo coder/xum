@@ -15,7 +15,7 @@ import { createAppHarness } from "../harness";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 function getWorkspaceElement(container: HTMLElement, workspaceId: string): HTMLElement {
-  const el = container.querySelector(
+  const el = container.querySelector<HTMLElement>(
     `[role="button"][data-workspace-id="${workspaceId}"]`
   );
   if (!el) {

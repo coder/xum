@@ -97,9 +97,7 @@ describe("Chat bottom layout stability", () => {
 
       const idleRow = await waitFor(
         () => {
-          const row = app.view.container.querySelector(
-            `[data-workspace-id="${idleWorkspaceId}"]`
-          );
+          const row = app.view.container.querySelector(`[data-workspace-id="${idleWorkspaceId}"]`);
           if (!row) {
             throw new Error("Idle workspace row not rendered");
           }
@@ -118,9 +116,7 @@ describe("Chat bottom layout stability", () => {
 
       const sourceRow = await waitFor(
         () => {
-          const row = app.view.container.querySelector(
-            `[data-workspace-id="${app.workspaceId}"]`
-          );
+          const row = app.view.container.querySelector(`[data-workspace-id="${app.workspaceId}"]`);
           if (!row) {
             throw new Error("Source workspace row not rendered");
           }

@@ -2,6 +2,7 @@ import "./dom";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fireEvent, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
@@ -22,7 +23,7 @@ const LONG_TOOL = "fetch_page_property_item_with_pagination_and_rich_text_expans
 const PLUGIN_TOOLS = ["search_docs", LONG_TOOL, "read_doc"];
 const REGULAR_TOOLS = ["search", "read"];
 
-type Canvas = ReturnType<typeof within>;
+type Canvas = BoundFunctions<typeof queries>;
 
 /**
  * The Settings card for one configured server: the header grid (switch, name,

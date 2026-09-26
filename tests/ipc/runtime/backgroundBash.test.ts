@@ -293,7 +293,7 @@ describeIntegration("Background Bash Execution", () => {
           const startEvents = await sendMessageAndWait(
             env,
             workspaceId,
-            `Use the bash tool with args: { script: "echo \"${marker}\" && sleep 1", timeout_secs: 30, run_in_background: true, display_name: "bg-output" }. Do not spawn a sub-agent.`,
+            `Use the bash tool with args: { script: "echo "${marker}" && sleep 1", timeout_secs: 30, run_in_background: true, display_name: "bg-output" }. Do not spawn a sub-agent.`,
             HAIKU_MODEL,
             BASH_ONLY,
             30000

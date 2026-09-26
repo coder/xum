@@ -154,7 +154,7 @@ function unwrap<T>(result: Result<T, string>): T {
         .filter((server) => server.plugin)
         .map((server) => server.plugin?.serverName)
     ).toEqual(["selective-second"]);
-    expect(Object.values(serversAfter).filter((server) => server.plugin)[0].disabled).toBe(true);
+    expect(Object.values(serversAfter).find((server) => server.plugin)?.disabled).toBe(true);
     await expect(
       env.orpc.agentSkills.get({ projectPath: remote, skillName: "selective-first" })
     ).rejects.toThrow();

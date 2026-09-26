@@ -38,9 +38,7 @@ import { cleanupView, setupWorkspaceView } from "../helpers";
 import { renderApp, type RenderedApp } from "../renderReviewPanel";
 
 function getWorkspaceRow(container: HTMLElement, workspaceId: string): HTMLElement | null {
-  return container.querySelector(
-    `[data-workspace-id="${workspaceId}"][role="button"]`
-  );
+  return container.querySelector(`[data-workspace-id="${workspaceId}"][role="button"]`);
 }
 
 function getSubagentConnector(container: HTMLElement, workspaceId: string): HTMLElement | null {
@@ -63,7 +61,7 @@ async function findWorkspaceActionsButton(params: {
 }): Promise<HTMLButtonElement> {
   return waitFor(
     () => {
-      const button = params.container.querySelector(
+      const button = params.container.querySelector<HTMLButtonElement>(
         `button[aria-label="Workspace actions for ${params.title}"]`
       );
       if (!button) {

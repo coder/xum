@@ -50,9 +50,7 @@ function setUpdateStatus(updateService: MutableUpdateService, status: UpdateStat
 
 async function openAboutDialog(view: RenderedApp) {
   const trigger = await waitFor(() => {
-    const triggerButton = view.container.querySelector(
-      'button[aria-label="Open about dialog"]'
-    );
+    const triggerButton = view.container.querySelector('button[aria-label="Open about dialog"]');
     if (!triggerButton) {
       throw new Error("About dialog trigger was not found in the title bar");
     }
@@ -62,9 +60,8 @@ async function openAboutDialog(view: RenderedApp) {
   fireEvent.click(trigger);
 
   const dialog = await waitFor(() => {
-    const dialogElement = view.container.ownerDocument.body.querySelector(
-      '[role="dialog"]'
-    );
+    const dialogElement =
+      view.container.ownerDocument.body.querySelector<HTMLElement>('[role="dialog"]');
     if (!dialogElement) {
       throw new Error("About dialog did not open");
     }

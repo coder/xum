@@ -46,7 +46,7 @@ if (!Object.getOwnPropertyDescriptor(globalThis, "location")) {
         resolvingLocation = false;
       }
     },
-    set(value) {
+    set(value: { href: string } | undefined) {
       fallbackLocation = value;
     },
   });
@@ -56,7 +56,7 @@ assert.equal(typeof Symbol.asyncDispose, "symbol");
 // Polyfill File for undici in jest environment
 // undici expects File to be available globally but jest doesn't provide it
 if (typeof globalThis.File === "undefined") {
-  (globalThis as any).File = class File extends Blob {
+  (globalThis as { File?: unknown }).File = class File extends Blob {
     constructor(bits: BlobPart[], name: string, options?: FilePropertyBag) {
       super(bits, options);
       this.name = name;
@@ -70,14 +70,15 @@ if (typeof globalThis.File === "undefined") {
 // Preload tokenizer and AI SDK modules for integration tests
 // This eliminates ~10s initialization delay on first use
 if (process.env.TEST_INTEGRATION === "1") {
+  const preloadGlobal = globalThis as { __muxPreloadPromise?: Promise<void> };
   // Store promise globally to ensure it blocks subsequent test execution
-  (globalThis as any).__muxPreloadPromise = (async () => {
+  preloadGlobal.__muxPreloadPromise = (async () => {
     const { preloadTestModules } = await import("./ipc/setup");
     await preloadTestModules();
   })();
 
   // Add a global beforeAll to block until preload completes
   beforeAll(async () => {
-    await (globalThis as any).__muxPreloadPromise;
+    await preloadGlobal.__muxPreloadPromise;
   }, 30000); // 30s timeout for preload
 }

@@ -1,6 +1,5 @@
 import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
 import { sendMessageWithModel, createStreamCollector, modelString } from "../helpers";
-import type { StreamErrorMessage } from "@/common/orpc/types";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;

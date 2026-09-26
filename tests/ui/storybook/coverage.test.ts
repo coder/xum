@@ -37,7 +37,9 @@ const hasSmokeStoryWithDualThemeCoverage = (content: string): boolean => {
 };
 
 function getPlanTocViewports(content: string): string | null {
-  const matrixMatch = /PLAN_TOC_PIXEL_MATRIX\s*=\s*\{\s*viewports:\s*\[([^\]]*)\]\s*\}/.exec(content);
+  const matrixMatch = /PLAN_TOC_PIXEL_MATRIX\s*=\s*\{\s*viewports:\s*\[([^\]]*)\]\s*\}/.exec(
+    content
+  );
   return matrixMatch?.[1] ?? null;
 }
 

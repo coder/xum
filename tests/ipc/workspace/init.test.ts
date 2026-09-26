@@ -31,6 +31,7 @@ import {
 } from "../../runtime/test-fixtures/ssh-fixture";
 import type { RuntimeConfig } from "../../../src/common/types/runtime";
 import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
+import type { InitStatus } from "../../../src/node/services/initStateManager";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
 
 // Skip all tests if TEST_INTEGRATION is not set
@@ -343,7 +344,7 @@ describeIntegration("Workspace init hook", () => {
         // The checkout must be complete before the hook runs against it.
         const lines = initEvents.filter(isInitOutput).map((e) => e.line);
         const materializedAt = lines.indexOf("Worktree created successfully");
-        const hookAt = lines.findIndex((line) => line.includes('Running init hook:'));
+        const hookAt = lines.findIndex((line) => line.includes("Running init hook:"));
         expect(materializedAt).toBeGreaterThanOrEqual(0);
         expect(hookAt).toBeGreaterThan(materializedAt);
         expect(lines).toContain("hook ran");
@@ -429,9 +430,9 @@ describeIntegration("Workspace init hook", () => {
         expect(
           errorLines.filter((line) => line.includes("smudge filter fail failed"))
         ).toHaveLength(1);
-        expect(initEvents.filter(isInitOutput).some((e) => e.line.includes('Running init hook'))).toBe(
-          false
-        );
+        expect(
+          initEvents.filter(isInitOutput).some((e) => e.line.includes("Running init hook"))
+        ).toBe(false);
         // Like a remote sync failure, the workspace stays so the user can inspect and remove it.
         const client = resolveOrpcClient(env);
         const info = await client.workspace.getInfo({ workspaceId: createResult.metadata.id });
@@ -638,13 +639,13 @@ describeIntegration("Workspace init hook", () => {
 
         // Read and verify persisted state
         const statusContent = await fs.readFile(initStatusPath, "utf-8");
-        const status = JSON.parse(statusContent);
+        const status = JSON.parse(statusContent) as InitStatus;
         expect(status.status).toBe("success");
         expect(status.exitCode).toBe(0);
 
         // Should include workspace creation logs + hook output
         expect(status.lines).toEqual(
-          expect.arrayContaining([
+          expect.arrayContaining<Record<string, unknown>>([
             {
               line: "Creating git worktree...",
               isError: false,
@@ -657,7 +658,7 @@ describeIntegration("Workspace init hook", () => {
               step: true,
               timestamp: expect.any(Number),
             },
-            expect.objectContaining({
+            expect.objectContaining<Record<string, unknown>>({
               line: expect.stringMatching(/Running init hook:/),
               isError: false,
               step: true,

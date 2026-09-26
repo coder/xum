@@ -48,10 +48,7 @@ interface MockServer {
   close: () => Promise<void>;
 }
 
-function writeCompletion(
-  response: http.ServerResponse,
-  chunks: Record<string, unknown>[]
-): void {
+function writeCompletion(response: http.ServerResponse, chunks: Record<string, unknown>[]): void {
   response.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",

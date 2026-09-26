@@ -34,7 +34,7 @@ async function findQuickArchiveButton(params: {
 }): Promise<HTMLButtonElement> {
   return waitFor(
     () => {
-      const button = params.container.querySelector(
+      const button = params.container.querySelector<HTMLButtonElement>(
         `button[aria-label="Archive workspace ${params.title}"]`
       );
       if (!button) {
@@ -71,9 +71,7 @@ describeIntegration("Workspace Creation (UI)", () => {
         await setupWorkspaceView(view, metadata, workspaceId);
 
         // Click the workspace again to simulate navigation
-        const wsElement = view.container.querySelector(
-          `[data-workspace-id="${workspaceId}"]`
-        )!;
+        const wsElement = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`)!;
         fireEvent.click(wsElement);
 
         // Give React time to process the navigation
@@ -402,9 +400,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
       // since workspace views also have textareas and we might still be there briefly.
       const expandArchivedButton = await waitFor(
         () => {
-          const expand = view.container.querySelector(
-            '[aria-label="Expand archived workspaces"]'
-          );
+          const expand = view.container.querySelector('[aria-label="Expand archived workspaces"]');
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
           );
@@ -509,9 +505,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
       // ArchivedWorkspaces is collapsed by default; expand so archived rows are visible.
       const expandArchivedButton = await waitFor(
         () => {
-          const expand = view.container.querySelector(
-            '[aria-label="Expand archived workspaces"]'
-          );
+          const expand = view.container.querySelector('[aria-label="Expand archived workspaces"]');
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
           );
@@ -613,9 +607,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
       // ArchivedWorkspaces is collapsed by default; expand so archived rows are visible.
       const expandArchivedButton = await waitFor(
         () => {
-          const expand = view.container.querySelector(
-            '[aria-label="Expand archived workspaces"]'
-          );
+          const expand = view.container.querySelector('[aria-label="Expand archived workspaces"]');
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
           );

@@ -20,7 +20,7 @@ describeIntegration("MCP prompts", () => {
       expect(addResult.success).toBe(true);
 
       const prompts = await client.workspace.mcp.prompts.list({ workspaceId });
-      expect(prompts).toContainEqual({
+      expect(prompts).toContainEqual<Record<string, unknown>>({
         commandKey: "mcp__prompt_server__review",
         stableKey: expect.stringMatching(/^mcp__prompt_server__review_[0-9a-f]{8}$/),
         serverName: "prompt server",
@@ -33,7 +33,7 @@ describeIntegration("MCP prompts", () => {
       });
       // The fixture serves prompts/list one prompt per page; status lives on
       // page two, so its presence pins whole-catalog pagination.
-      expect(prompts).toContainEqual({
+      expect(prompts).toContainEqual<Record<string, unknown>>({
         commandKey: "mcp__prompt_server__status",
         stableKey: expect.stringMatching(/^mcp__prompt_server__status_[0-9a-f]{8}$/),
         serverName: "prompt server",

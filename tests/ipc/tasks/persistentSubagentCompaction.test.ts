@@ -493,7 +493,7 @@ describe("Persistent sub-agent compaction", () => {
         timeoutMs: 10_000,
       }
     );
-    expect(continuation).toMatchObject({
+    expect(continuation).toMatchObject<Record<string, unknown>>({
       taskId: executionTaskId,
       workspaceId: childWorkspaceId,
       reportMarkdown: expect.stringContaining(

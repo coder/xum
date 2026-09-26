@@ -440,13 +440,18 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         };
       }, workspaceId);
 
-      let actionError: unknown;
+      // Boxed so a caught value keeps its `unknown` type (a truthiness check would narrow it).
+      let actionFailure: { error: unknown } | undefined;
       try {
         await action();
         await page.waitForFunction(
           (id: string) => {
-            interface StreamCaptureEvent { type: string }
-            interface StreamCapture { events: StreamCaptureEvent[] }
+            interface StreamCaptureEvent {
+              type: string;
+            }
+            interface StreamCapture {
+              events: StreamCaptureEvent[];
+            }
             const win = window as unknown as {
               __muxStreamCapture?: Record<string, StreamCapture>;
             };
@@ -463,7 +468,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           { timeout: timeoutMs }
         );
       } catch (error) {
-        actionError = error;
+        actionFailure = { error };
       }
 
       const events = await page.evaluate((id: string) => {
@@ -497,8 +502,8 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         return capture.events.slice();
       }, workspaceId);
 
-      if (actionError) {
-        throw actionError;
+      if (actionFailure) {
+        throw actionFailure.error;
       }
 
       return { events };

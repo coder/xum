@@ -21,9 +21,7 @@ function clearDesktopApi() {
 }
 
 async function openAnalyticsAndGetHeader(container: HTMLElement) {
-  const analyticsButton = container.querySelector(
-    '[data-testid="analytics-button"]'
-  )!;
+  const analyticsButton = container.querySelector('[data-testid="analytics-button"]')!;
   expect(analyticsButton).not.toBeNull();
   fireEvent.click(analyticsButton);
 
@@ -75,9 +73,7 @@ describe("Analytics header titlebar contract", () => {
       fireEvent.click(collapseSidebarButton!);
 
       const openSidebarButton = await waitFor(() => {
-        const button = header.querySelector(
-          'button[aria-label="Open sidebar"]'
-        );
+        const button = header.querySelector('button[aria-label="Open sidebar"]');
         if (!button) {
           throw new Error("Analytics sidebar opener not found");
         }

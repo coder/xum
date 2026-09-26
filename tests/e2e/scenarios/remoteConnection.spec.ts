@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
-import type { BrowserWindow, Clipboard } from "electron";
+import type { BrowserWindow, Clipboard, WebPreferences } from "electron";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { electronTest, electronExpect as expect } from "../electronTest";
 import { REMOTE_CONNECTION_EDITOR_FRAME_NAME_PREFIX } from "../../../src/common/constants/remoteConnection";
+
+// getLastWebPreferences() is an internal WebContents method missing from Electron's typings.
+type BrowserWindowWithLastPreferences = BrowserWindow & {
+  webContents: { getLastWebPreferences(): WebPreferences };
+};
 
 const test = electronTest.extend<{ remoteServer: { url: string; requests: string[] } }>({
   remoteServer: async ({ workspace }, use) => {
@@ -313,7 +318,7 @@ test("remote app popups and blob attachments retain isolation and close on disco
     });
     const popupWindow = await app.browserWindow(popup);
     expect(
-      await popupWindow.evaluate((window) => {
+      await popupWindow.evaluate((window: BrowserWindowWithLastPreferences) => {
         const preferences = window.webContents.getLastWebPreferences();
         return {
           sandbox: preferences.sandbox,
@@ -322,7 +327,7 @@ test("remote app popups and blob attachments retain isolation and close on disco
         };
       })
     ).toMatchObject({ sandbox: true, nodeIntegration: false, preload: undefined });
-    await popupWindow.evaluate((window) => window.focus());
+    await popupWindow.evaluate((window: BrowserWindow) => window.focus());
     await popup.getByRole("button", { name: "Copy text" }).click();
     await expect(popup.locator("#copied")).toHaveText("Copied");
     popups.push(popup);

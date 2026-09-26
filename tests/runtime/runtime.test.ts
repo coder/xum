@@ -32,6 +32,7 @@ import {
 } from "./test-fixtures/test-helpers";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { CoderService } from "@/node/services/coderService";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import {
@@ -2638,7 +2639,7 @@ describeIntegration("Runtime integration tests", () => {
       return new Promise((resolve) => {
         const proc = spawn("bash", ["-c", cmd]);
         let stdout = "";
-        proc.stdout.on("data", (data) => (stdout += data.toString()));
+        proc.stdout.on("data", (data: Buffer) => (stdout += data.toString()));
         proc.on("close", (code) => resolve({ stdout, exitCode: code ?? 0 }));
       });
     };
@@ -2954,13 +2955,12 @@ describeIntegration("Runtime integration tests", () => {
     // Create a CoderSSHRuntime with mock CoderService
     const createCoderSSHRuntime = async () => {
       const { CoderSSHRuntime } = await import("@/node/runtime/CoderSSHRuntime");
-      const { CoderService } = await import("@/node/services/coderService");
 
       // Mock CoderService with methods that CoderSSHRuntime may call
       const mockCoderService = {
         getWorkspaceStatus: () =>
           Promise.resolve({ kind: "running" as const, status: "running" as const }),
-      } as unknown as InstanceType<typeof CoderService>;
+      } as unknown as CoderService;
 
       const config = {
         host: "testuser@localhost",
@@ -3037,7 +3037,6 @@ describeIntegration("Runtime integration tests", () => {
 
       test("postCreateSetup after fork does not call coder create", async () => {
         const { CoderSSHRuntime } = await import("@/node/runtime/CoderSSHRuntime");
-        const { CoderService } = await import("@/node/services/coderService");
 
         // Track whether createWorkspace was called
         let createWorkspaceCalled = false;
@@ -3054,7 +3053,7 @@ describeIntegration("Runtime integration tests", () => {
           waitForStartupScripts: async function* () {
             // Yield nothing - workspace is already running
           },
-        } as unknown as InstanceType<typeof CoderService>;
+        } as unknown as CoderService;
 
         const config = {
           host: "testuser@localhost",

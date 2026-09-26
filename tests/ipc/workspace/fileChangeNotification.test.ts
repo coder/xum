@@ -113,7 +113,7 @@ describeIntegration("File Change Notification Integration", () => {
 
       // 4. Record the file state (simulates what propose_plan does)
       const { mtimeMs: originalMtime } = await stat(planPath);
-      session.recordFileState(planPath, {
+      await session.recordFileState(planPath, {
         content: originalContent,
         timestamp: originalMtime,
       });
@@ -227,7 +227,7 @@ describeIntegration("File Change Notification Integration", () => {
 
       // 4. Record the file state
       const { mtimeMs: originalMtime } = await stat(planPath);
-      session.recordFileState(planPath, {
+      await session.recordFileState(planPath, {
         content: originalContent,
         timestamp: originalMtime,
       });

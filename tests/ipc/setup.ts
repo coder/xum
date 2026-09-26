@@ -204,6 +204,7 @@ export async function setupWorkspace(
   if (provider === "ollama") {
     await setupProviders(env, {
       [provider]: {
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty env var means unset
         baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434/api",
       },
     });
@@ -215,6 +216,7 @@ export async function setupWorkspace(
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the provider name
   const branchName = generateBranchName(branchPrefix || provider);
   const runtimeConfig = options?.runtimeConfig;
   const waitForInit = options?.waitForInit ?? false;
@@ -321,6 +323,7 @@ export async function setupWorkspaceWithoutProvider(branchPrefix?: string): Prom
 
   const env = await createTestEnvironment();
 
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the default
   const branchName = generateBranchName(branchPrefix || "noapi");
   const createResult = await createWorkspace(env, tempGitRepo, branchName);
 

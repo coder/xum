@@ -284,7 +284,7 @@ export async function createWorkspaceWithInit(
     collector.start();
     try {
       await collector.waitForEvent("init-end", initTimeout);
-    } catch (err) {
+    } catch {
       // Init hook might not exist or might have already completed before we started waiting
       // This is not necessarily an error - just log it
       console.log(
@@ -469,19 +469,24 @@ export async function waitForInitEnd(
   }
 }
 
+interface ChatHistoryEntry {
+  role: string;
+  parts: { type: string; [key: string]: unknown }[];
+}
+
 /**
  * Read and parse chat history from disk
  */
 export async function readChatHistory(
   tempDir: string,
   workspaceId: string
-): Promise<{ role: string; parts: { type: string; [key: string]: unknown }[] }[]> {
+): Promise<ChatHistoryEntry[]> {
   const historyPath = path.join(tempDir, "sessions", workspaceId, "chat.jsonl");
   const historyContent = await fs.readFile(historyPath, "utf-8");
   return historyContent
     .trim()
     .split("\n")
-    .map((line: string) => JSON.parse(line));
+    .map((line: string) => JSON.parse(line) as ChatHistoryEntry);
 }
 
 /**
@@ -516,8 +521,6 @@ export async function waitForFileNotExists(filePath: string, timeoutMs = 5000): 
  * Create a temporary git repository for testing
  */
 export async function createTempGitRepo(): Promise<string> {
-  // eslint-disable-next-line local/no-unsafe-child-process
-
   // Use mkdtemp to avoid race conditions and ensure unique directory
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-repo-"));
 

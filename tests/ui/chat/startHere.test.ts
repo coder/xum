@@ -31,7 +31,9 @@ describe("Start Here (mock AI router)", () => {
       const startHereButton = await waitFor(
         () => {
           const buttons = Array.from(
-            app.view.container.querySelectorAll('button[aria-label="Start Here"]')
+            app.view.container.querySelectorAll<HTMLButtonElement>(
+              'button[aria-label="Start Here"]'
+            )
           );
           const enabled = buttons.find((b) => !b.disabled);
           if (!enabled) {

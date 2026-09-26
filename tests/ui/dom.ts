@@ -23,7 +23,8 @@ function rebindRadixLayoutEffect(): void {
   radixLayoutEffectRebound = true;
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { mock } = require("bun:test") as typeof import("bun:test");
-  mock.module("@radix-ui/react-use-layout-effect", () => ({
+  // Not awaited, as before: the factory is synchronous.
+  void mock.module("@radix-ui/react-use-layout-effect", () => ({
     useLayoutEffect: React.useLayoutEffect,
   }));
 }

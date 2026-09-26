@@ -120,10 +120,7 @@ async function waitForButtonToDisappear(
   );
 }
 
-async function waitForNotLoading(
-  container: HTMLElement,
-  timeoutMs = 15_000
-): Promise<void> {
+async function waitForNotLoading(container: HTMLElement, timeoutMs = 15_000): Promise<void> {
   await waitFor(
     () => {
       const text = container.textContent ?? "";

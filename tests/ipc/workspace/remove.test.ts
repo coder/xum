@@ -285,7 +285,7 @@ describeIntegration("Workspace deletion integration tests", () => {
 
           const sleepSeconds = 5;
           const tempGitRepo = await createTempGitRepoWithInitHook(
-            `echo HOOK_STARTED\nsleep ${sleepSeconds}\necho done > \"${markerPath}\"`
+            `echo HOOK_STARTED\nsleep ${sleepSeconds}\necho done > "${markerPath}"`
           );
 
           try {

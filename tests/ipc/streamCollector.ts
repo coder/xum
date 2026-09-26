@@ -222,10 +222,7 @@ export class StreamCollector {
    * Wait for a specific event type.
    * Returns the event if found, or null on timeout.
    */
-  async waitForEvent(
-    eventType: string,
-    timeoutMs = 30000
-  ): Promise<WorkspaceChatMessage | null> {
+  async waitForEvent(eventType: string, timeoutMs = 30000): Promise<WorkspaceChatMessage | null> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
     }
@@ -381,7 +378,7 @@ export class StreamCollector {
    */
   getStreamContent(): string {
     return this.getDeltas()
-      .map((e) => ("delta" in e ? (e as { delta?: string }).delta || "" : ""))
+      .map((e) => ("delta" in e ? ((e as { delta?: string }).delta ?? "") : ""))
       .join("");
   }
 
@@ -399,8 +396,7 @@ export class StreamCollector {
 
     // Log all events with details
     this.events.forEach((event, idx) => {
-      const timestamp =
-        "timestamp" in event ? new Date(event.timestamp).toISOString() : "no-ts";
+      const timestamp = "timestamp" in event ? new Date(event.timestamp).toISOString() : "no-ts";
       const type = "type" in event ? (event as { type: string }).type : "no-type";
 
       console.error(`  [${idx}] ${timestamp} - ${type}`);
@@ -516,7 +512,7 @@ export async function resumeAndWaitForSuccess(
     });
 
     if (!resumeResult.success) {
-      throw new Error(`Resume failed: ${resumeResult.error}`);
+      throw new Error(`Resume failed: ${JSON.stringify(resumeResult.error)}`);
     }
 
     // Wait for stream-end event after resume
@@ -635,7 +631,7 @@ export function extractTextFromEvents(events: WorkspaceChatMessage[]): string {
     })
     .map((e: unknown) => {
       const typed = e as { delta?: string };
-      return typed.delta || "";
+      return typed.delta ?? "";
     })
     .join("");
 }

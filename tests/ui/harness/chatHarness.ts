@@ -16,7 +16,9 @@ export class ChatHarness {
         // There can be multiple ChatInput instances mounted (e.g., ProjectPage + Workspace view).
         // Use the last textarea in DOM order to target the active view.
         const textareas = Array.from(
-          this.container.querySelectorAll('textarea[aria-label="Message Claude"]')
+          this.container.querySelectorAll<HTMLTextAreaElement>(
+            'textarea[aria-label="Message Claude"]'
+          )
         );
 
         if (textareas.length === 0) {
@@ -62,7 +64,7 @@ export class ChatHarness {
 
     const sendButton = await waitFor(
       () => {
-        const el = chatInputSection.querySelector(
+        const el = chatInputSection.querySelector<HTMLButtonElement>(
           'button[aria-label="Send message"]'
         );
         if (!el) {
@@ -79,10 +81,7 @@ export class ChatHarness {
     fireEvent.click(sendButton);
   }
 
-  async expectTranscriptContains(
-    needle: string | RegExp,
-    timeoutMs = 30_000
-  ): Promise<void> {
+  async expectTranscriptContains(needle: string | RegExp, timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const text = this.container.textContent ?? "";

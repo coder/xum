@@ -61,9 +61,7 @@ describeIntegration("Workspace Fork (UI)", () => {
       // expanding an "Older than X days" tier.
       await waitFor(
         () => {
-          const el = app.view.container.querySelector(
-            `[data-workspace-id=\"${forkedWorkspaceId}\"]`
-          );
+          const el = app.view.container.querySelector(`[data-workspace-id="${forkedWorkspaceId}"]`);
           if (!el) {
             throw new Error("Forked workspace not found in sidebar");
           }
@@ -141,9 +139,7 @@ describeIntegration("Workspace Fork (UI)", () => {
 
       await waitFor(
         () => {
-          const el = app.view.container.querySelector(
-            `[data-workspace-id=\"${forkedWorkspaceId}\"]`
-          );
+          const el = app.view.container.querySelector(`[data-workspace-id="${forkedWorkspaceId}"]`);
           if (!el) {
             throw new Error("Forked workspace not found in sidebar");
           }

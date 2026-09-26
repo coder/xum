@@ -38,6 +38,7 @@ import {
 } from "../../runtime/test-fixtures/ssh-fixture";
 import type { RuntimeConfig } from "../../../src/common/types/runtime";
 import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
+import { isToolCallStart, type WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
 import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
 
@@ -46,6 +47,11 @@ const FILE_TOOLS_ONLY: ToolPolicy = [
   { regex_match: "file_.*", action: "enable" },
   { regex_match: "bash", action: "disable" },
 ];
+
+// The stream-end schema has no `error` field; read one defensively if a failed stream carries it.
+function streamEndError(event: WorkspaceChatMessage | undefined): unknown {
+  return event && "error" in event ? event.error : undefined;
+}
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -160,7 +166,7 @@ describeIntegration("Runtime File Editing Tools", () => {
                 (e) => "type" in e && e.type === "stream-end"
               );
               expect(createStreamEnd).toBeDefined();
-              expect((createStreamEnd as any).error).toBeUndefined();
+              expect(streamEndError(createStreamEnd)).toBeUndefined();
 
               // Now ask AI to read the file (explicitly request file_read tool)
               const readEvents = await sendMessageAndWait(
@@ -175,13 +181,11 @@ describeIntegration("Runtime File Editing Tools", () => {
               // Verify stream completed successfully
               const streamEnd = readEvents.find((e) => "type" in e && e.type === "stream-end");
               expect(streamEnd).toBeDefined();
-              expect((streamEnd as any).error).toBeUndefined();
+              expect(streamEndError(streamEnd)).toBeUndefined();
 
               // Verify file_read tool was called
-              const toolCalls = readEvents.filter(
-                (e) => "type" in e && e.type === "tool-call-start"
-              );
-              const fileReadCall = toolCalls.find((e: any) => e.toolName === "file_read");
+              const toolCalls = readEvents.filter(isToolCallStart);
+              const fileReadCall = toolCalls.find((e) => e.toolName === "file_read");
               expect(fileReadCall).toBeDefined();
 
               // Verify response mentions the content
@@ -243,7 +247,7 @@ describeIntegration("Runtime File Editing Tools", () => {
                 (e) => "type" in e && e.type === "stream-end"
               );
               expect(createStreamEnd).toBeDefined();
-              expect((createStreamEnd as any).error).toBeUndefined();
+              expect(streamEndError(createStreamEnd)).toBeUndefined();
 
               // Ask AI to replace text (explicitly request file_edit_replace_string tool)
               const replaceEvents = await sendMessageAndWait(
@@ -258,15 +262,11 @@ describeIntegration("Runtime File Editing Tools", () => {
               // Verify stream completed successfully
               const streamEnd = replaceEvents.find((e) => "type" in e && e.type === "stream-end");
               expect(streamEnd).toBeDefined();
-              expect((streamEnd as any).error).toBeUndefined();
+              expect(streamEndError(streamEnd)).toBeUndefined();
 
               // Verify file_edit_replace_string tool was called
-              const toolCalls = replaceEvents.filter(
-                (e) => "type" in e && e.type === "tool-call-start"
-              );
-              const replaceCall = toolCalls.find(
-                (e: any) => e.toolName === "file_edit_replace_string"
-              );
+              const toolCalls = replaceEvents.filter(isToolCallStart);
+              const replaceCall = toolCalls.find((e) => e.toolName === "file_edit_replace_string");
               expect(replaceCall).toBeDefined();
 
               // Verify the replacement was successful (check for diff or success message)
@@ -332,7 +332,7 @@ describeIntegration("Runtime File Editing Tools", () => {
                 (e) => "type" in e && e.type === "stream-end"
               );
               expect(createStreamEnd).toBeDefined();
-              expect((createStreamEnd as any).error).toBeUndefined();
+              expect(streamEndError(createStreamEnd)).toBeUndefined();
 
               // Ask AI to insert text (explicitly request file_edit tool usage)
               const insertEvents = await sendMessageAndWait(
@@ -347,14 +347,12 @@ describeIntegration("Runtime File Editing Tools", () => {
               // Verify stream completed successfully
               const streamEnd = insertEvents.find((e) => "type" in e && e.type === "stream-end");
               expect(streamEnd).toBeDefined();
-              expect((streamEnd as any).error).toBeUndefined();
+              expect(streamEndError(streamEnd)).toBeUndefined();
 
               // Verify file_edit_insert (or fallback file_edit_replace_string) tool was called
-              const toolCalls = insertEvents.filter(
-                (e) => "type" in e && e.type === "tool-call-start"
-              );
+              const toolCalls = insertEvents.filter(isToolCallStart);
               const editCall = toolCalls.find(
-                (e: any) =>
+                (e) =>
                   e.toolName === "file_edit_insert" || e.toolName === "file_edit_replace_string"
               );
               expect(editCall).toBeDefined();
@@ -423,7 +421,7 @@ describeIntegration("Runtime File Editing Tools", () => {
                 (e) => "type" in e && e.type === "stream-end"
               );
               expect(createStreamEnd).toBeDefined();
-              expect((createStreamEnd as any).error).toBeUndefined();
+              expect(streamEndError(createStreamEnd)).toBeUndefined();
 
               // Now edit the file using a relative path
               const editEvents = await sendMessageAndWait(
@@ -438,15 +436,11 @@ describeIntegration("Runtime File Editing Tools", () => {
               // Verify edit was successful
               const editStreamEnd = editEvents.find((e) => "type" in e && e.type === "stream-end");
               expect(editStreamEnd).toBeDefined();
-              expect((editStreamEnd as any).error).toBeUndefined();
+              expect(streamEndError(editStreamEnd)).toBeUndefined();
 
               // Verify file_edit_replace_string tool was called
-              const toolCalls = editEvents.filter(
-                (e) => "type" in e && e.type === "tool-call-start"
-              );
-              const editCall = toolCalls.find(
-                (e: any) => e.toolName === "file_edit_replace_string"
-              );
+              const toolCalls = editEvents.filter(isToolCallStart);
+              const editCall = toolCalls.find((e) => e.toolName === "file_edit_replace_string");
               expect(editCall).toBeDefined();
 
               // Read the file to verify the edit was applied

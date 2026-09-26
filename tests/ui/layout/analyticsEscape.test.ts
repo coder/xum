@@ -21,9 +21,7 @@ describe("Analytics Escape", () => {
 
     try {
       // Open analytics via the TitleBar button.
-      const analyticsButton = app.view.container.querySelector(
-        '[data-testid="analytics-button"]'
-      )!;
+      const analyticsButton = app.view.container.querySelector('[data-testid="analytics-button"]')!;
       expect(analyticsButton).not.toBeNull();
       fireEvent.click(analyticsButton);
 

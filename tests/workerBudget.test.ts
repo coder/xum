@@ -2,8 +2,37 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const workerBudget = require("../scripts/lib/worker_budget.js");
+interface MemoryConstraint {
+  dir: string;
+  limitBytes: number;
+}
+
+interface WorkerSizingInput {
+  cpuCount: number;
+  memoryPerWorkerGib: number;
+  maxWorkers: number;
+  limitBytes: number;
+  inUseBytes: number;
+}
+
+interface WorkerBudgetProfile {
+  memoryPerWorkerGib: number;
+  maxWorkers: number;
+}
+
+// Local shape for the untyped CommonJS helper; only the members these tests exercise.
+interface WorkerBudgetModule {
+  resolveMemoryConstraint(options?: {
+    cgroupRoot?: string;
+    procSelfCgroup?: string;
+  }): MemoryConstraint | null;
+  readCgroupUsageBytes(dir: string): number | null;
+  computeWorkers(input: WorkerSizingInput): number;
+  PROFILES: Record<"eslint" | "jest", WorkerBudgetProfile>;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- plain CommonJS script helper with no ESM entry
+const workerBudget = require("../scripts/lib/worker_budget.js") as WorkerBudgetModule;
 
 const GIB = 1024 ** 3;
 
@@ -57,8 +86,8 @@ describe("worker budget cgroup resolution", () => {
 
     const constraint = workerBudget.resolveMemoryConstraint(fake);
 
-    expect(constraint.limitBytes).toBe(32 * GIB);
-    expect(constraint.dir).toBe(fake.cgroupRoot);
+    expect(constraint?.limitBytes).toBe(32 * GIB);
+    expect(constraint?.dir).toBe(fake.cgroupRoot);
   });
 
   it("prefers the tightest cap when several ancestors impose one", () => {
@@ -68,7 +97,7 @@ describe("worker budget cgroup resolution", () => {
       "/parent/leaf": { "memory.max": `${16 * GIB}` },
     });
 
-    expect(workerBudget.resolveMemoryConstraint(fake).limitBytes).toBe(8 * GIB);
+    expect(workerBudget.resolveMemoryConstraint(fake)?.limitBytes).toBe(8 * GIB);
   });
 
   it("uses the broadest usage scope when equal caps constrain multiple levels", () => {
@@ -80,8 +109,8 @@ describe("worker budget cgroup resolution", () => {
 
     const constraint = workerBudget.resolveMemoryConstraint(fake);
 
-    expect(constraint.limitBytes).toBe(8 * GIB);
-    expect(constraint.dir).toBe(path.join(fake.cgroupRoot, "parent"));
+    expect(constraint?.limitBytes).toBe(8 * GIB);
+    expect(constraint?.dir).toBe(path.join(fake.cgroupRoot, "parent"));
   });
 
   it("ignores saturated integers that stand in for 'unlimited'", () => {
@@ -107,8 +136,8 @@ describe("worker budget cgroup resolution", () => {
 
     const constraint = workerBudget.resolveMemoryConstraint(fake);
 
-    expect(constraint.limitBytes).toBe(4 * GIB);
-    expect(constraint.dir).toBe(path.join(fake.cgroupRoot, "memory/docker/leaf"));
+    expect(constraint?.limitBytes).toBe(4 * GIB);
+    expect(constraint?.dir).toBe(path.join(fake.cgroupRoot, "memory/docker/leaf"));
   });
 
   it("reports no constraint when the host has no cgroup files", () => {

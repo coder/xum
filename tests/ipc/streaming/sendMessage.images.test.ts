@@ -108,7 +108,7 @@ describeIntegration("sendMessage image handling tests", () => {
 
           // Combine all text deltas
           const fullResponse = deltas
-            .map((d) => ("delta" in d ? (d as { delta?: string }).delta || "" : ""))
+            .map((d) => ("delta" in d ? ((d as { delta?: string }).delta ?? "") : ""))
             .join("")
             .toLowerCase();
 
@@ -149,7 +149,7 @@ describeIntegration("sendMessage image handling tests", () => {
 
           // Combine all text deltas
           const fullResponse = deltas
-            .map((d) => ("delta" in d ? (d as { delta?: string }).delta || "" : ""))
+            .map((d) => ("delta" in d ? ((d as { delta?: string }).delta ?? "") : ""))
             .join("")
             .toLowerCase();
 

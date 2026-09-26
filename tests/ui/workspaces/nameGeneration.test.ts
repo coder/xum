@@ -68,7 +68,7 @@ describeIntegration("Name generation UI flow", () => {
       // Name format: lowercase letters/numbers/hyphens with 4-char suffix (e.g., "sidebar-a1b2")
       await waitFor(
         () => {
-          const input = view.container.querySelector("#workspace-name")!;
+          const input = view.container.querySelector<HTMLInputElement>("#workspace-name")!;
           if (!input) throw new Error("Workspace name input not found");
 
           const name = input.value;
@@ -81,7 +81,7 @@ describeIntegration("Name generation UI flow", () => {
       );
 
       // Verify the generated name is valid
-      const nameInput = view.container.querySelector("#workspace-name")!;
+      const nameInput = view.container.querySelector<HTMLInputElement>("#workspace-name")!;
       const generatedName = nameInput.value;
       expect(generatedName).toMatch(/^[a-z0-9-]+-[a-z0-9]{4}$/);
       expect(generatedName.length).toBeLessThanOrEqual(30);

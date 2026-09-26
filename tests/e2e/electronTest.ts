@@ -54,7 +54,7 @@ async function waitForServerReady(url: string, timeoutMs = 20_000): Promise<void
       if (response.ok || response.status === 404) {
         return;
       }
-    } catch (error) {
+    } catch {
       // Server not ready yet
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -154,6 +154,7 @@ function buildTarget(target: string): void {
 }
 
 export const electronTest = base.extend<ElectronFixtures>({
+  // eslint-disable-next-line no-empty-pattern -- Playwright fixtures must destructure their first argument
   workspace: async ({}, use, testInfo) => {
     const originalXumRoot = process.env.XUM_ROOT;
     const originalMuxRoot = process.env.MUX_ROOT;
@@ -359,13 +360,13 @@ export const electronTest = base.extend<ElectronFixtures>({
                 const destination = path.join(videosDir, `${baseName}${suffix}${ext}`);
                 await fsPromises.rm(destination, { force: true });
                 await fsPromises.rename(path.join(recordVideoDir, file), destination);
-                console.log(`[video] saved to ${destination}`);  
+                console.log(`[video] saved to ${destination}`);
               }
             } else if (electronApp) {
-              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`);  
+              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`);
             }
           } catch (error) {
-            console.error(`[video] failed to process video for "${displayName}":`, error);  
+            console.error(`[video] failed to process video for "${displayName}":`, error);
           } finally {
             await fsPromises.rm(recordVideoDir, { recursive: true, force: true });
           }
@@ -397,7 +398,6 @@ export const electronTest = base.extend<ElectronFixtures>({
     await window.waitForLoadState("domcontentloaded");
 
     window.on("console", (msg) => {
-       
       console.log(`[renderer:${msg.type()}]`, msg.text());
     });
     window.on("pageerror", (error) => {

@@ -51,16 +51,12 @@ function getWorkspaceUnreadIndicator(
   container: HTMLElement,
   workspaceId: string
 ): { element: HTMLElement; hasUnreadBar: boolean } | null {
-  const workspaceEl = container.querySelector(
-    `[data-workspace-id="${workspaceId}"]`
-  );
+  const workspaceEl = container.querySelector<HTMLElement>(`[data-workspace-id="${workspaceId}"]`);
 
   if (!workspaceEl) return null;
 
   // The unread indicator is a StatusDot span with the idle/unread styling
-  const statusDot = workspaceEl.querySelector(
-    'span[class*="bg-surface-invert-secondary"]'
-  );
+  const statusDot = workspaceEl.querySelector('span[class*="bg-surface-invert-secondary"]');
 
   return {
     element: workspaceEl,
@@ -246,9 +242,7 @@ describe("Unread indicator (mock AI router)", () => {
       const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
 
       // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector(
-        '[data-testid="settings-button"]'
-      )!;
+      const settingsButton = app.view.container.querySelector('[data-testid="settings-button"]')!;
       expect(settingsButton).not.toBeNull();
       fireEvent.click(settingsButton);
 
@@ -285,9 +279,7 @@ describe("Unread indicator (mock AI router)", () => {
       const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
 
       // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector(
-        '[data-testid="settings-button"]'
-      )!;
+      const settingsButton = app.view.container.querySelector('[data-testid="settings-button"]')!;
       expect(settingsButton).not.toBeNull();
       fireEvent.click(settingsButton);
 
@@ -470,9 +462,7 @@ describe("Unread indicator (mock AI router)", () => {
       workspaceId: string,
       displayTitle: string
     ): HTMLSpanElement | null {
-      const workspaceRow = app.view.container.querySelector(
-        `[data-workspace-id="${workspaceId}"]`
-      );
+      const workspaceRow = app.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!workspaceRow) {
         return null;
       }

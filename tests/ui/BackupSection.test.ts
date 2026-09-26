@@ -1,6 +1,7 @@
 import "./dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import { APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
@@ -69,7 +70,7 @@ function renderBackupSection(
 
   return { client, view };
 }
-async function confirmRestore(canvas: ReturnType<typeof within>): Promise<void> {
+async function confirmRestore(canvas: BoundFunctions<typeof queries>): Promise<void> {
   fireEvent.click(canvas.getByRole("button", { name: /^Restore$/ }));
   const dialog = await within(document.body).findByRole("dialog");
   fireEvent.click(within(dialog).getByRole("button", { name: /Restore settings/i }));

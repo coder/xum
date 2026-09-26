@@ -11,7 +11,7 @@ import { createTempGitRepo, generateBranchName, trustProject } from "./helpers";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
-import { isCaughtUpMessage, isMuxMessage, type WorkspaceChatMessage } from "@/common/orpc/types";
+import { isCaughtUpMessage, isMuxMessage } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";

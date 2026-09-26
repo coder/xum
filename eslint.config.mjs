@@ -2013,6 +2013,19 @@ export default defineConfig([
       // (`async () => {}` stubs for services, windows, and IPC handlers).
       "@typescript-eslint/require-await": "off",
       "@typescript-eslint/no-empty-function": "off",
+      // Same options as src/: a leading underscore marks an intentionally unused binding
+      // (mock signatures, destructured tuple slots). The base default flags those too.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
     },
   },
   {

@@ -68,7 +68,10 @@ const STREAM_TIMEOUT_MS = 30_000;
 const PLAN_A = "# Plan A\n\n## Step 1\n\nRead the config loader.\n\n## Step 2\n\nAdd the flag.\n";
 const PLAN_B = `${PLAN_A}\n## Step 3\n\nWrite tests.\n`;
 
-interface ChatMessage { role?: unknown; content?: unknown }
+interface ChatMessage {
+  role?: unknown;
+  content?: unknown;
+}
 type RequestBody = { messages?: ChatMessage[] } & Record<string, unknown>;
 
 interface CapturedRequest {
@@ -166,36 +169,39 @@ async function createFixtureServer(): Promise<{
   const server = http.createServer((request, response) => {
     const bodyChunks: Buffer[] = [];
     request.on("data", (part: Buffer) => bodyChunks.push(part));
-    request.on("end", async () => {
-      const body = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as RequestBody;
-      const captured = { path: request.url ?? "", body };
-      requests.push(captured);
-      const messages = body.messages ?? [];
-      const lastUser = [...messages].reverse().find((m) => m.role === "user");
-      const lastUserText = contentText(lastUser);
-      // A held turn answers only after releaseHeld(), so sends issued meanwhile are queued.
-      if (lastUserText.includes(HOLD_MARKER)) await held.promise;
-      // Propose once per turn: a failed propose_plan is not terminal, so without the tool-role
-      // guard the fixture would re-issue it every step and the turn would never end.
-      const chunks =
-        lastUserText.includes(PROPOSE_MARKER) && messages.at(-1)?.role !== "tool"
-          ? toolCallChunks(`call_plan_${requests.length}`, "propose_plan", {})
-          : lastUserText.includes(READ_MARKER) && messages.at(-1)?.role !== "tool"
-            ? toolCallChunks(`call_read_${requests.length}`, "file_read", {
-                path: fixture.readPath,
-              })
-            : lastUserText.includes(ATTACH_MARKER) && messages.at(-1)?.role !== "tool"
-              ? toolCallChunks(`call_attach_${requests.length}`, "attach_file", {
-                  path: fixture.attachPath,
+    // Fire-and-forget: the async handler owns the response, and Node ignores listener results.
+    request.on("end", () => {
+      void (async () => {
+        const body = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as RequestBody;
+        const captured = { path: request.url ?? "", body };
+        requests.push(captured);
+        const messages = body.messages ?? [];
+        const lastUser = [...messages].reverse().find((m) => m.role === "user");
+        const lastUserText = contentText(lastUser);
+        // A held turn answers only after releaseHeld(), so sends issued meanwhile are queued.
+        if (lastUserText.includes(HOLD_MARKER)) await held.promise;
+        // Propose once per turn: a failed propose_plan is not terminal, so without the tool-role
+        // guard the fixture would re-issue it every step and the turn would never end.
+        const chunks =
+          lastUserText.includes(PROPOSE_MARKER) && messages.at(-1)?.role !== "tool"
+            ? toolCallChunks(`call_plan_${requests.length}`, "propose_plan", {})
+            : lastUserText.includes(READ_MARKER) && messages.at(-1)?.role !== "tool"
+              ? toolCallChunks(`call_read_${requests.length}`, "file_read", {
+                  path: fixture.readPath,
                 })
-              : [chunk({ role: "assistant", content: "Fixture reply." }), chunk({}, "stop")];
-      response.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-      for (const part of chunks) response.write(`data: ${JSON.stringify(part)}\n\n`);
-      response.end("data: [DONE]\n\n");
+              : lastUserText.includes(ATTACH_MARKER) && messages.at(-1)?.role !== "tool"
+                ? toolCallChunks(`call_attach_${requests.length}`, "attach_file", {
+                    path: fixture.attachPath,
+                  })
+                : [chunk({ role: "assistant", content: "Fixture reply." }), chunk({}, "stop")];
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        });
+        for (const part of chunks) response.write(`data: ${JSON.stringify(part)}\n\n`);
+        response.end("data: [DONE]\n\n");
+      })();
     });
   });
   await new Promise<void>((resolve, reject) => {
