@@ -69,11 +69,14 @@ describe("calculateTokenStats", () => {
       createMuxMessage(`m${i}`, "user", `message ${i}`)
     );
 
-    await expect(
-      calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
-        enableAgentReport: false,
-      })
-    ).rejects.toThrow("worker died");
+    const failure = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    }).then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("worker died");
     expect(calls).toBe(messages.length);
   });
 });
