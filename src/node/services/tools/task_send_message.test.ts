@@ -95,7 +95,7 @@ describe("task_send_message tool", () => {
       )
     ).toEqual({ status: "accepted", taskId: "ws-root-b", targetRelation: "unrelated" });
 
-    // The service owns the turn-end default for unrelated targets; the tool only echoes it.
+    // The service resolves the mode (here a recipient that holds messages); the tool echoes it.
     expect(
       await Promise.resolve(
         tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)

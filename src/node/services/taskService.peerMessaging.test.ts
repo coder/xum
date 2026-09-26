@@ -530,7 +530,7 @@ describe("TaskService", () => {
     expect(internal.queueDedupeKey).toStartWith("agent-msg:sib-a:");
   });
 
-  test("sendAgentTreeMessage delivers ancestor messages with a turn-end default and descendant relationship", async () => {
+  test("sendAgentTreeMessage delivers ancestor messages with a tool-end default and descendant relationship", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -554,7 +554,7 @@ describe("TaskService", () => {
 
     // No onAccepted call from the default mock ⇒ the send queued behind the (busy) ancestor.
     expect(result).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
     );
     const [targetId, , options, internal] = sendMessage.mock.calls[0] as [
       string,
@@ -569,7 +569,7 @@ describe("TaskService", () => {
         ? internal.preTurnMessages[0].parts[0].text
         : "";
     expect(parseAgentMessageEnvelope(payloadText)?.relationship).toBe("descendant");
-    expect(options.queueDispatchMode).toBe("turn-end");
+    expect(options.queueDispatchMode).toBe("tool-end");
     expect(options.muxMetadata?.relationship).toBe("descendant");
     expect(internal.skipAutoResumeReset).toBe(true);
   });
@@ -664,13 +664,13 @@ describe("TaskService", () => {
       expect(await taskService.sendAgentTreeMessage("child-a", "other-root", payload)).toEqual(
         accepted
           ? Ok({ delivery: "accepted", relation: "target_unrelated" })
-          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
       );
       const [targetId, trigger, options, internal] = sendMessage.mock.calls[0] as Parameters<
         WorkspaceHost["sendMessage"]
       >;
       expect(targetId).toBe("other-root");
-      expect(options?.queueDispatchMode).toBe("turn-end");
+      expect(options?.queueDispatchMode).toBe("tool-end");
       expect(internal?.synthetic).toBe(true);
       expect(internal?.skipAutoResumeReset).toBe(true);
       const row = internal?.preTurnMessages?.[0];
@@ -689,7 +689,7 @@ describe("TaskService", () => {
       expect(await taskService.sendAgentTreeMessage("other-root", envelope.from, "Reply")).toEqual(
         accepted
           ? Ok({ delivery: "accepted", relation: "target_unrelated" })
-          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+          : Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
       );
       expect(
         await taskService.sendAgentTreeMessage("child-a", "other-child", "hi", "tool-end")
@@ -702,6 +702,45 @@ describe("TaskService", () => {
         (sendMessage.mock.calls[2] as Parameters<WorkspaceHost["sendMessage"]>)[2]
           ?.queueDispatchMode
       ).toBe("tool-end");
+    }
+  );
+
+  test.each([
+    // [recipient preference, sender request, effective mode]
+    [undefined, undefined, "tool-end"],
+    [undefined, "turn-end", "turn-end"],
+    ["tool-end", "turn-end", "turn-end"],
+    ["turn-end", undefined, "turn-end"],
+    ["turn-end", "tool-end", "turn-end"],
+  ] as const)(
+    "sendAgentTreeMessage lets the recipient choose busy-time delivery (recipient=%s, sender=%s)",
+    async (recipientMode, senderMode, expected) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "root", "tree-root", {
+            ...(recipientMode != null ? { agentMessageDispatchMode: recipientMode } : {}),
+          }),
+          projectWorkspace(projectPath, "child", "child-a", {
+            parentWorkspaceId: "tree-root",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      expect(
+        await taskService.sendAgentTreeMessage("child-a", "tree-root", "Blocked on CI.", senderMode)
+      ).toEqual(
+        Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: expected })
+      );
+      const [, , options] = sendMessage.mock.calls[0] as Parameters<WorkspaceHost["sendMessage"]>;
+      expect(options?.queueDispatchMode).toBe(expected);
     }
   );
 
@@ -1059,7 +1098,7 @@ describe("TaskService", () => {
                 ? "anthropic:claude-sonnet-4-5"
                 : "openai:gpt-5.2",
             thinkingLevel: !hasSettings ? "off" : entry.expected === "plan" ? "high" : "medium",
-            queueDispatchMode: "turn-end",
+            queueDispatchMode: "tool-end",
             muxMetadata: { type: "agent-peer-message", relationship: "unrelated" },
           });
           expect(internal?.synthetic).toBe(true);
@@ -1147,7 +1186,7 @@ describe("TaskService", () => {
           expect(
             await taskService.sendAgentTreeMessage("sender", "target", "New synthetic input")
           ).toEqual(
-            Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+            Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
           );
           const [, , options] = sendMessage.mock.calls[0] as Parameters<
             WorkspaceHost["sendMessage"]
@@ -1213,7 +1252,7 @@ describe("TaskService", () => {
               Ok({
                 delivery: "queued",
                 relation: "target_unrelated",
-                queueDispatchMode: "turn-end",
+                queueDispatchMode: "tool-end",
               })
             );
             await registerLiveWorkspaceTurnHandle(
@@ -1473,7 +1512,7 @@ describe("TaskService", () => {
       expect(
         await taskService.sendAgentTreeMessage("sender", "target", "Reply to live execution")
       ).toEqual(
-        Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "turn-end" })
+        Ok({ delivery: "queued", relation: "target_unrelated", queueDispatchMode: "tool-end" })
       );
       const [, , options, internal] = sendMessage.mock.calls[0] as Parameters<
         WorkspaceHost["sendMessage"]

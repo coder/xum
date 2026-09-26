@@ -1816,6 +1816,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
         ),
+      setAgentMessageDispatchMode: t
+        .input(schemas.workspace.setAgentMessageDispatchMode.input)
+        .output(schemas.workspace.setAgentMessageDispatchMode.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setAgentMessageDispatchMode(input.workspaceId, input.mode)
+        ),
       interruptStream: t
         .input(schemas.workspace.interruptStream.input)
         .output(schemas.workspace.interruptStream.output)

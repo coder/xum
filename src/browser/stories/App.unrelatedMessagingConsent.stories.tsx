@@ -14,6 +14,8 @@ import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
 
+const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
+
 const WORKSPACE_ID = "ws-unrelated-messaging-consent";
 
 function setupConsentStory() {
@@ -68,7 +70,7 @@ export const Desktop: AppStory = {
   },
   play: async ({ canvasElement }) => {
     const dialog = await openConsentDialog(canvasElement);
-    const toggle = within(dialog).getByRole("switch");
+    const toggle = within(dialog).getByRole("switch", { name: CONSENT_SWITCH_NAME });
     // A workspace without a generation (created before the on-by-default change, or turned off)
     // starts off.
     if (toggle.getAttribute("aria-checked") !== "false") {
@@ -79,11 +81,17 @@ export const Desktop: AppStory = {
     // The mock acks like the backend does — by publishing metadata — and only then may the
     // switch report "on". Asserting through waitFor keeps the contract: no optimistic flip.
     await waitFor(() => {
-      if (within(dialog).getByRole("switch").getAttribute("aria-checked") !== "true") {
+      if (
+        within(dialog)
+          .getByRole("switch", { name: CONSENT_SWITCH_NAME })
+          .getAttribute("aria-checked") !== "true"
+      ) {
         throw new Error("switch did not follow the published consent metadata");
       }
     });
-    if (within(dialog).getByRole("switch").hasAttribute("disabled")) {
+    if (
+      within(dialog).getByRole("switch", { name: CONSENT_SWITCH_NAME }).hasAttribute("disabled")
+    ) {
       throw new Error("switch stayed locked after the backend acknowledged");
     }
     // Leave the dialog open (switch on) for the visual baseline.

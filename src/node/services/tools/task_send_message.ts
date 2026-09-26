@@ -22,7 +22,7 @@ function targetRelationLabel(
       return "sibling";
     case "target_unrelated":
       // Cross-tree target (another root, or a live sub-agent of another tree); the untrusted
-      // envelope path applies, exactly like a sibling, with a turn-end default.
+      // envelope path applies, exactly like a sibling.
       return "unrelated";
   }
 }

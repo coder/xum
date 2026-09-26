@@ -350,7 +350,11 @@ function getLastTimelineDialogProps() {
 function getLastUnrelatedMessagingModalProps() {
   const spy =
     WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal as unknown as {
-      mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+      mock: {
+        calls: Array<
+          [{ open: boolean; consentSupported: boolean; onOpenChange: (open: boolean) => void }]
+        >;
+      };
     };
   return spy.mock.calls.at(-1)?.[0];
 }
@@ -397,6 +401,8 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   leftSidebarCollapsed: false,
   onToggleLeftSidebarCollapsed: () => undefined,
 };
+
+const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
 
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
@@ -710,21 +716,25 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
     });
     // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
-    fireEvent.click(view.getByRole("switch"));
+    fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(1);
     expect(requests[0].input).toEqual({ workspaceId, enabled: true });
     await waitFor(() => {
-      expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(true);
+      expect(
+        (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+      ).toBe(true);
     });
     expect(view.queryByRole("status")).not.toBeNull();
 
     // Workspace B: the dialog opened here must be B's own, not A's still-saving instance.
     view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
-    expect(view.queryByRole("switch")).toBeNull();
+    expect(view.queryByRole("switch", { name: CONSENT_SWITCH_NAME })).toBeNull();
     act(() => {
       getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
     });
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect(view.queryByRole("status")).toBeNull();
 
     // A's request settling (here: refused) belongs to A's dialog and must not surface in B.
@@ -733,17 +743,21 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       await Promise.resolve();
     });
     expect(view.queryByRole("alert")).toBeNull();
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
 
     // B is fully usable and its request targets B.
-    fireEvent.click(view.getByRole("switch"));
+    fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(2);
     expect(requests[1].input).toEqual({ workspaceId: "workspace-2", enabled: true });
     await act(async () => {
       requests[1].settle(Ok(undefined));
       await Promise.resolve();
     });
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect(view.queryByRole("alert")).toBeNull();
   });
 
@@ -770,8 +784,9 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
-  // refuses otherwise), so remote/container workspaces get neither consent entry point: a
-  // grant there could never be honoured. An unset config means the canonical default.
+  // refuses otherwise), so remote/container workspaces get no consent switch: a grant there
+  // could never be honoured. The dialog still opens there for the same-tree hold preference.
+  // An unset config means the canonical default.
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig | undefined }>([
     { runtime: "worktree", runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" } },
     { runtime: "project-dir local", runtimeConfig: { type: "local" } },
@@ -785,6 +800,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
   });
 
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig }>([
@@ -798,19 +814,16 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       runtime: "devcontainer",
       runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
     },
-  ])(
-    "hides the consent action and ignores its shortcut for $runtime workspaces",
-    ({ runtimeConfig }) => {
-      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])("opens the dialog without the consent switch for $runtime workspaces", ({ runtimeConfig }) => {
+    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-      expect(getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBeNull();
-      act(() => {
-        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-      });
-      // Not rendered at all, or rendered closed: either way nothing can open here.
-      expect(getLastUnrelatedMessagingModalProps()?.open ?? false).toBe(false);
-    }
-  );
+    expect(typeof getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBe("function");
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
+  });
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
     mockTimelineExperimentEnabled = true;

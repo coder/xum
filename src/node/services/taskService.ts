@@ -1,6 +1,9 @@
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
-import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
+import {
+  getValidAgentMessageDispatchMode,
+  getValidUnrelatedWorkspaceConsent,
+} from "@/common/orpc/schemas/workspace";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import assert from "node:assert/strict";
 import * as path from "node:path";
@@ -8959,7 +8962,10 @@ export class TaskService implements AgentTaskIntegration {
           parentWorkspaceId: targetWorkspaceId,
           parentEntry,
           content: prepared.triggerContent,
-          queueDispatchMode: spec.queueDispatchMode,
+          queueDispatchMode: this.resolveRecipientDispatchMode(
+            targetWorkspaceId,
+            spec.queueDispatchMode
+          ),
           preTurnMessages: [payloadRow],
           onPreTurnRowsPersisted: () => reservation.markPersisted(),
         });
@@ -8976,7 +8982,7 @@ export class TaskService implements AgentTaskIntegration {
         authorizingParentId,
         spec.targetId,
         prepared.triggerContent,
-        spec.queueDispatchMode,
+        this.resolveRecipientDispatchMode(spec.targetId, spec.queueDispatchMode),
         "sibling",
         {
           messageLabel: triggerLabel,
@@ -8988,6 +8994,24 @@ export class TaskService implements AgentTaskIntegration {
       return sendResult;
     });
   }
+
+  /**
+   * Busy-time delivery for agent messages is the recipient's choice. Tool-end is the default
+   * because fast delivery is what lets agents coordinate; a recipient that must not be cut into
+   * mid-turn opts into turn-end, which also overrides a sender's explicit tool-end. Senders may
+   * always ask for the less intrusive turn-end. Reads config fresh so a preference acknowledged
+   * before admission applies.
+   */
+  private resolveRecipientDispatchMode(
+    targetWorkspaceId: string,
+    requested: TaskMessageQueueDispatchMode | undefined
+  ): TaskMessageQueueDispatchMode {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetWorkspaceId);
+    const recipient =
+      getValidAgentMessageDispatchMode(entry?.workspace.agentMessageDispatchMode) ?? "tool-end";
+    return recipient === "turn-end" ? "turn-end" : (requested ?? recipient);
+  }
+
   private reserveTreeMessageBudget(
     senderWorkspaceId: string,
     targetWorkspaceId: string,
@@ -9356,15 +9380,6 @@ export class TaskService implements AgentTaskIntegration {
       // the catch below, or transient failures would consume the pair/target budgets without
       // delivering anything — eventually refusing valid peer messages until restart.
       try {
-        // Ancestor and unrelated targets can be human-driven. Do not cut into their turns
-        // unless explicitly requested; sibling sends retain their existing boundary.
-        const defaultDispatchModes: Record<typeof relation, TaskMessageQueueDispatchMode> = {
-          target_ancestor: "turn-end",
-          target_unrelated: "turn-end",
-          peer: "tool-end",
-        };
-        const effectiveDispatchMode = spec.queueDispatchMode ?? defaultDispatchModes[relation];
-
         // Delegated-turn correlation: if the target is currently executing a delegated workspace
         // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
         // Message) — otherwise the queued peer wake dispatches as an unrelated turn and the next
@@ -9398,7 +9413,6 @@ export class TaskService implements AgentTaskIntegration {
             thinkingLevel: resumeOptions.thinkingLevel,
             reasoningMode: resumeOptions.reasoningMode,
             muxMetadata: triggerMuxMetadata,
-            queueDispatchMode: effectiveDispatchMode,
           };
         } else if (unrelatedRoot) {
           assert(!targetIsAgentTask);
@@ -9414,7 +9428,6 @@ export class TaskService implements AgentTaskIntegration {
           sendOptions = {
             ...resumeOptions,
             muxMetadata: triggerMuxMetadata,
-            queueDispatchMode: effectiveDispatchMode,
           };
         } else {
           const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
@@ -9433,7 +9446,6 @@ export class TaskService implements AgentTaskIntegration {
             reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
             experiments: targetEntry.workspace.taskExperiments,
             muxMetadata: triggerMuxMetadata,
-            queueDispatchMode: effectiveDispatchMode,
           };
         }
 
@@ -9557,6 +9569,12 @@ export class TaskService implements AgentTaskIntegration {
           reservation.refundIfUnpersisted();
           return Err(admissionRefusal ?? interruptedRefusal);
         }
+        // Resolved after the awaits above so a preference change acknowledged meanwhile applies.
+        const effectiveDispatchMode = this.resolveRecipientDispatchMode(
+          targetId,
+          spec.queueDispatchMode
+        );
+        sendOptions = { ...sendOptions, queueDispatchMode: effectiveDispatchMode };
 
         let accepted = false;
         // Admission classification: parent guidance into a live child continues its attempt (no
