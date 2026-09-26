@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import React, { useContext, useEffect, useState } from "react";
+import React, { useContext, useEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
 import { Mermaid } from "./Mermaid";
 import { useOptionalMessageListContext } from "./MessageListContext";
@@ -163,9 +163,10 @@ export function getCurrentHighlightedCodeBlockLines(
 // backfill ends mid-stream. A remounted CodeBlock loses its Shiki state and would repaint as plain
 // text until the async highlighter answers again, so results from streaming rows (the only rows
 // that switch modes) are kept here to seed it. Completed rows never write, so an older row
-// mounting during the backfill cannot evict the in-flight reply's blocks. A growing block replaces
-// its own earlier, shorter states, so each streamed block holds one entry. Bounded because the
-// highlighted HTML of a large block can be hundreds of KB.
+// mounting during the backfill cannot evict the in-flight reply's blocks. Each CodeBlock instance
+// replaces the entry it wrote last, so a growing block holds one entry and never removes another
+// block's (content alone can't tell them apart: a later fence may start with an earlier one's text).
+// Bounded because the highlighted HTML of a large block can be hundreds of KB.
 const HIGHLIGHT_CACHE_MAX_ENTRIES = 32;
 const highlightCache = new Map<string, HighlightedCodeBlockLines>();
 
@@ -182,16 +183,13 @@ function readHighlightCache(key: string): HighlightedCodeBlockLines | null {
   return cached;
 }
 
-function writeHighlightCache(key: string, highlighted: HighlightedCodeBlockLines): void {
-  for (const [existingKey, existing] of highlightCache) {
-    if (
-      existing.theme === highlighted.theme &&
-      existing.shikiLanguage === highlighted.shikiLanguage &&
-      highlighted.code.startsWith(existing.code)
-    ) {
-      highlightCache.delete(existingKey);
-    }
-  }
+function writeHighlightCache(
+  key: string,
+  highlighted: HighlightedCodeBlockLines,
+  replacesKey: string | null
+): void {
+  if (replacesKey !== null) highlightCache.delete(replacesKey);
+  highlightCache.delete(key);
   highlightCache.set(key, highlighted);
   while (highlightCache.size > HIGHLIGHT_CACHE_MAX_ENTRIES) {
     const oldestKey = highlightCache.keys().next().value;
@@ -210,6 +208,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
   const theme = isLightThemeMode(themeMode) ? "light" : "dark";
   const cacheKey = highlightCacheKey(code, shikiLanguage, theme);
   const { isStreaming } = useContext(StreamingContext);
+  const lastWrittenCacheKeyRef = useRef<string | null>(null);
 
   const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(() =>
     readHighlightCache(cacheKey)
@@ -246,7 +245,10 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
               theme,
               lines: filteredLines,
             };
-            if (isStreaming) writeHighlightCache(cacheKey, result);
+            if (isStreaming) {
+              writeHighlightCache(cacheKey, result, lastWrittenCacheKeyRef.current);
+              lastWrittenCacheKeyRef.current = cacheKey;
+            }
             setHighlighted(result);
           } else {
             setHighlighted(null);
