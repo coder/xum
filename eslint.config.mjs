@@ -814,21 +814,32 @@ const localPlugin = {
       },
       create(context) {
         // Whether a type name refers to APIClient, including an aliased import
-        // (`import type { APIClient as Client }`).
-        const isApiClientName = (identifier) => {
+        // (`import type { APIClient as Client }`) or a local alias (`type Client = APIClient`).
+        const isApiClientName = (identifier, depth = 0) => {
           if (identifier.name === "APIClient") {
             return true;
           }
+          if (depth > 5) {
+            return false;
+          }
           for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
             const variable = scope.set.get(identifier.name);
-            if (variable) {
-              const def = variable.defs[0];
+            if (!variable) {
+              continue;
+            }
+            const def = variable.defs[0];
+            if (def?.type === "ImportBinding") {
               return (
-                def?.type === "ImportBinding" &&
                 def.node.type === "ImportSpecifier" &&
                 (def.node.imported.name ?? def.node.imported.value) === "APIClient"
               );
             }
+            const aliased = def?.type === "Type" ? def.node.typeAnnotation : null;
+            return (
+              aliased?.type === "TSTypeReference" &&
+              aliased.typeName.type === "Identifier" &&
+              isApiClientName(aliased.typeName, depth + 1)
+            );
           }
           return false;
         };
