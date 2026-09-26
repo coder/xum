@@ -154,12 +154,11 @@ const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   "gpt-5.6-sol": 372_000,
   "gpt-5.6-terra": 372_000,
   "gpt-5.6-luna": 372_000,
-  // Astra keeps its pre-existing GPT-5.6-family cap. Reconciling it with the Codex
-  // catalog is tracked in #4347; it is not tied to the Sol/Luna entries below.
-  "gpt-6-astra": 372_000,
-  // Sol/Luna are published at 272K (context_window) in the pinned Codex catalog:
+  // GPT-6 Astra/Sol/Luna are each published at 272K (default context_window; the
+  // configurable max_context_window is 872K) in the pinned Codex catalog:
   // https://github.com/openai/codex/blob/04fc75adbe67a612a1cb0fc469533f24b24fa499/codex-rs/models-manager/models.json
-  // Do not copy Astra's cap here; the two entries are sourced independently.
+  // Each entry is sourced from its own catalog row; do not copy one model's cap to another.
+  "gpt-6-astra": 272_000,
   "gpt-6-sol": 272_000,
   "gpt-6-luna": 272_000,
 };

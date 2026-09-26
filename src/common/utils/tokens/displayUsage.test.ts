@@ -278,11 +278,17 @@ describe("createDisplayUsage", () => {
     test.each([
       ["openai:gpt-6-sol", 2, 0.2, 10],
       ["openai:gpt-6-luna", 0.1, 0.01, 0.5],
+      // GPT-5.6 Sol promotional base rates (OpenAI pricing page, verified 2026-09-26);
+      // the bare alias routes to Sol and must price identically.
+      ["openai:gpt-5.6-sol", 4, 0.4, 20],
+      ["openai:gpt-5.6", 4, 0.4, 20],
     ] as const)(
       "applies %s pricing only above the 272K boundary",
       (model, input, cached, output) => {
         for (const tokens of [272000, 272001]) {
           const longContext = tokens > 272000;
+          // inputTokens is inclusive of cache reads and writes; the tier is chosen from
+          // the whole prompt, so the boundary also moves cache-read and cache-write rates.
           const result = createDisplayUsage(
             {
               inputTokens: tokens,
@@ -290,13 +296,19 @@ describe("createDisplayUsage", () => {
               outputTokens: 1000,
               totalTokens: tokens + 1000,
             },
-            model
+            model,
+            { anthropic: { cacheCreationInputTokens: 5000 } }
           );
           expect(result?.input.cost_usd).toBeCloseTo(
-            (((tokens - 100000) * input) / 1e6) * (longContext ? 2 : 1),
+            (((tokens - 105000) * input) / 1e6) * (longContext ? 2 : 1),
             12
           );
           expect(result?.cached.cost_usd).toBeCloseTo(0.1 * cached * (longContext ? 2 : 1), 12);
+          // Cache writes bill at 1.25x the active input rate.
+          expect(result?.cacheCreate.cost_usd).toBeCloseTo(
+            0.005 * input * 1.25 * (longContext ? 2 : 1),
+            12
+          );
           expect(result?.output.cost_usd).toBeCloseTo(0.001 * output * (longContext ? 1.5 : 1), 12);
         }
       }

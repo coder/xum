@@ -129,7 +129,7 @@ describe("getEffectiveContextLimit", () => {
       false,
       providersWithOpenAI({ codexOauthSet: true })
     );
-    expect(oauthOnlyLimit).toBe(372_000);
+    expect(oauthOnlyLimit).toBe(272_000);
 
     const apiKeyLimit = getEffectiveContextLimit(
       "openai:gpt-6-astra",

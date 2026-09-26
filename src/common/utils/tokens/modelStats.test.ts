@@ -70,7 +70,7 @@ describe("getModelStats", () => {
 
   test.each([
     // [model, input, output, cacheRead, cacheCreation]
-    ["openai:gpt-5.6-sol", 0.000005, 0.00003, 0.0000005, 0.00000625],
+    ["openai:gpt-5.6-sol", 0.000004, 0.00002, 0.0000004, 0.000005], // promotional rates
     ["openai:gpt-5.6-terra", 0.000002, 0.000012, 0.0000002, 0.0000025],
     ["openai:gpt-5.6-luna", 0.0000002, 0.0000012, 0.00000002, 0.00000025],
     ["openai:gpt-6-astra", 0.00001, 0.00005, 0.000001, 0.0000125],

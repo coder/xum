@@ -40,8 +40,8 @@ describe("codexOAuth model gating", () => {
   });
 
   it.each([
-    ["gpt-6-astra", 372_000],
-    // Sol/Luna must not inherit Astra's cap: the Codex catalog publishes 272K for them.
+    // The pinned Codex catalog publishes a 272K default context_window for all three.
+    ["gpt-6-astra", 272_000],
     ["gpt-6-sol", 272_000],
     ["gpt-6-luna", 272_000],
   ])("allows %s through Codex OAuth with a %d context cap", (model, contextLimit) => {
