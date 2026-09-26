@@ -140,6 +140,8 @@ describe("gitNoRepoAutomationEnv", () => {
     await fs.chmod(driver, 0o755);
     await Bun.$`git config filter.evil.smudge ${driver}`.cwd(repo).quiet();
     await Bun.$`git config filter.evil.required true`.cwd(repo).quiet();
+    // Newer git templates no longer create .git/info.
+    await fs.mkdir(path.join(repo, ".git", "info"), { recursive: true });
     await fs.writeFile(
       path.join(repo, ".git", "info", "attributes"),
       "*.txt filter=evil\n",
@@ -186,6 +188,7 @@ describe("gitNoRepoAutomationEnv", () => {
     await fs.writeFile(driver, `#!/bin/sh\ntouch "${marker}"\n`, "utf-8");
     await fs.chmod(driver, 0o755);
     await Bun.$`git config diff.evil.command ${driver}`.cwd(repo).quiet();
+    await fs.mkdir(path.join(repo, ".git", "info"), { recursive: true });
     await fs.writeFile(path.join(repo, ".git", "info", "attributes"), "*.txt diff=evil\n", "utf-8");
     await fs.writeFile(path.join(repo, "data.txt"), "after\n", "utf-8");
 
@@ -396,6 +399,7 @@ describe("gitNoRepoAutomationEnv", () => {
         Buffer.from('"]\n\tsmudge = ' + driver + "\n\trequired = true\n"),
       ])
     );
+    await fs.mkdir(path.join(repo, ".git", "info"), { recursive: true });
     await fs.writeFile(
       path.join(repo, ".git", "info", "attributes"),
       Buffer.concat([Buffer.from("*.txt filter="), driverName, Buffer.from("\n")])
