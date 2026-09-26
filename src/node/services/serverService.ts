@@ -549,8 +549,9 @@ export async function setServerSshHost(
   context: ServerSettingsContext,
   sshHost: string | null | undefined
 ): Promise<void> {
-  context.serverService.setSshHost(sshHost ?? undefined);
+  // Write first (#4444): a rejected write must not leave the in-memory host ahead of disk.
   await context.config.editConfig((config) => ({ ...config, serverSshHost: sshHost ?? undefined }));
+  context.serverService.setSshHost(sshHost ?? undefined);
 }
 
 export function getApiServerStatus(context: ServerSettingsContext) {
@@ -571,13 +572,15 @@ export async function setApiServerSettings(
     input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
   const port = input.port === null || input.port === 0 ? undefined : input.port;
 
-  if (wasRunning) await context.serverService.stopServer();
+  // Write before stopping (#4444): a rejected write then leaves the running server, with its
+  // live address and mode, untouched instead of stopped while disk keeps the old settings.
   await context.config.editConfig((config) => {
     config.apiServerServeWebUi = serveWebUi;
     config.apiServerBindHost = bindHost;
     config.apiServerPort = port;
     return config;
   });
+  if (wasRunning) await context.serverService.stopServer();
 
   if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
     const authToken = context.serverService.getApiAuthToken();

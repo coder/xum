@@ -4074,21 +4074,30 @@ export class Config {
     // path match with a different id is a replacement workspace that must not inherit
     // the removed workspace's migrated settings.
     if (pendingWorkspaceMigrations.length > 0 && options?.persistMigrations !== false) {
-      await this.editConfig((freshConfig) => {
-        for (const migration of pendingWorkspaceMigrations) {
-          const project = freshConfig.projects.get(migration.projectPath);
-          const entry = migration.persistedWorkspaceId
-            ? project?.workspaces.find(
-                (candidate) => candidate.id === migration.persistedWorkspaceId
-              )
-            : project?.workspaces.find(
-                (candidate) => candidate.path === migration.workspacePath && !candidate.id
-              );
-          if (!entry) continue; // workspace removed concurrently — do not resurrect
-          migration.apply(entry);
-        }
-        return freshConfig;
-      });
+      // Best-effort (#4444): startup and every workspace list read land here, so a failed
+      // write must not turn the read into a rejection. Migrations re-apply on every load,
+      // and the next successful write persists them.
+      try {
+        await this.editConfig((freshConfig) => {
+          for (const migration of pendingWorkspaceMigrations) {
+            const project = freshConfig.projects.get(migration.projectPath);
+            const entry = migration.persistedWorkspaceId
+              ? project?.workspaces.find(
+                  (candidate) => candidate.id === migration.persistedWorkspaceId
+                )
+              : project?.workspaces.find(
+                  (candidate) => candidate.path === migration.workspacePath && !candidate.id
+                );
+            if (!entry) continue; // workspace removed concurrently — do not resurrect
+            migration.apply(entry);
+          }
+          return freshConfig;
+        });
+      } catch (error) {
+        log.warn("Failed to persist workspace migrations; they re-apply on the next load", {
+          error,
+        });
+      }
     }
 
     // Filtered rows still inherit family identity from archived ancestors in the registry.

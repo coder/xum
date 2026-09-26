@@ -1126,15 +1126,24 @@ export class ProjectService {
       }
 
       const projectConfig: ProjectConfig = { workspaces: [] };
-      await this.config.editConfig((freshConfig) => {
-        if (freshConfig.projects.has(normalizedPath)) {
-          return freshConfig;
-        }
-        const updatedProjects = new Map(freshConfig.projects);
-        updatedProjects.set(normalizedPath, projectConfig);
-        return { ...freshConfig, projects: updatedProjects };
-      });
+      // A rejected write takes the same rollback as an unpersisted one (#4444): jumping to the
+      // outer catch would orphan the clone at the user's chosen path.
+      let persistError: unknown;
+      await this.config
+        .editConfig((freshConfig) => {
+          if (freshConfig.projects.has(normalizedPath)) {
+            return freshConfig;
+          }
+          const updatedProjects = new Map(freshConfig.projects);
+          updatedProjects.set(normalizedPath, projectConfig);
+          return { ...freshConfig, projects: updatedProjects };
+        })
+        .catch((error: unknown) => {
+          persistError = error;
+        });
 
+      // Decide from the fresh config, not the rejection: another backend may have registered
+      // this path meanwhile, and its checkout must not be deleted.
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
         // Config persistence (editConfig → private saveConfig) logs-and-continues on write
         // failures, so verify persistence explicitly before reporting success.
@@ -1146,7 +1155,10 @@ export class ProjectService {
         yield {
           type: "error",
           code: "clone_failed",
-          error: "Failed to persist cloned project configuration",
+          error:
+            persistError === undefined
+              ? "Failed to persist cloned project configuration"
+              : `Failed to persist cloned project configuration: ${getErrorMessage(persistError)}`,
         };
         return;
       }
