@@ -1142,10 +1142,9 @@ export class ProjectService {
           persistError = error;
         });
 
-      if (
-        persistError !== undefined ||
-        !this.config.loadConfigOrDefault().projects.has(normalizedPath)
-      ) {
+      // Decide from the fresh config, not the rejection: another backend may have registered
+      // this path meanwhile, and its checkout must not be deleted.
+      if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
         // Config persistence (editConfig → private saveConfig) logs-and-continues on write
         // failures, so verify persistence explicitly before reporting success.
         try {

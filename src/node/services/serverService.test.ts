@@ -451,12 +451,9 @@ describe("server settings writes (#4444)", () => {
     expect(serverService.getSshHost()).toBe("old-host");
   });
 
-  test("a failed settings write brings a running server back on its previous settings", async () => {
-    await config.editConfig((value) => ({
-      ...value,
-      apiServerBindHost: "127.0.0.1",
-      apiServerPort: 4321,
-    }));
+  test("a failed settings write brings a running server back on its live address", async () => {
+    // No configured port: the running server picked one, and it must come back on it.
+    await config.editConfig((value) => ({ ...value, apiServerBindHost: "127.0.0.1" }));
     let running = true;
     const starts: Array<{ host: string; port: number; serveStatic: boolean }> = [];
     const serverService = {
@@ -471,6 +468,7 @@ describe("server settings writes (#4444)", () => {
         return Promise.resolve();
       },
       getApiAuthToken: () => "token",
+      getServerInfo: () => (running ? { bindHost: "127.0.0.1", port: 51234 } : null),
     };
     spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
     const context = { config, serverService } as unknown as ORPCContext;
@@ -484,7 +482,7 @@ describe("server settings writes (#4444)", () => {
     expect(String(error)).toContain("EACCES");
 
     expect(running).toBe(true);
-    expect(starts).toEqual([{ host: "127.0.0.1", port: 4321, serveStatic: false }]);
+    expect(starts).toEqual([{ host: "127.0.0.1", port: 51234, serveStatic: false }]);
     expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
   });
 });

@@ -573,6 +573,9 @@ export async function setApiServerSettings(
   const port = input.port === null || input.port === 0 ? undefined : input.port;
   const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
   const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
+  // Restore from the live listening address, not config: a corrupt config reads as defaults,
+  // and an auto-selected port would otherwise come back as a different one.
+  const liveInfo = context.serverService.getServerInfo();
   // Best effort, so callers see the original settings error.
   const restartWithPreviousSettings = async (): Promise<void> => {
     const authToken = context.serverService.getApiAuthToken();
@@ -583,8 +586,8 @@ export async function setApiServerSettings(
         context,
         serveStatic: prevServeWebUi === true,
         authToken,
-        host: prevBindHost ?? "127.0.0.1",
-        port: envPort ?? prevPort ?? 0,
+        host: liveInfo?.bindHost ?? prevBindHost ?? "127.0.0.1",
+        port: liveInfo?.port ?? envPort ?? prevPort ?? 0,
       });
     } catch {
       // Best effort: preserve the original settings error.
