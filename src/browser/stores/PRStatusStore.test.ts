@@ -211,6 +211,59 @@ describe("passive refresh runtime gating", () => {
   });
 });
 
+// #4662: opening a workspace must not spawn gh pr/stack probes while its chat replay runs.
+describe("chat replay gating", () => {
+  it.each([false, true])(
+    "defers PR and stack probes until the chat replay settles (last subscriber leaves first: %s)",
+    async (unsubscribeFirst) => {
+      const metadata = createWorkspaceMetadata("replay-pending", DEFAULT_RUNTIME_CONFIG);
+      const executeBash = mock(() =>
+        Promise.resolve({ success: false as const, error: "gh unavailable" })
+      );
+      let pending = true;
+      const gateListeners = new Set<() => void>();
+      const store = new PRStatusStore({ getStatus: () => null });
+
+      try {
+        store.setChatReplayGate({
+          isReplayPending: () => pending,
+          subscribeKey: (_workspaceId, listener) => {
+            gateListeners.add(listener);
+            return () => gateListeners.delete(listener);
+          },
+        });
+        store.setClient({
+          workspace: { executeBash },
+        } as unknown as Parameters<PRStatusStore["setClient"]>[0]);
+        store.syncWorkspaces(new Map([[metadata.id, metadata]]));
+        const unsubscribe = store.subscribeWorkspace(metadata.id, () => undefined);
+
+        await waitUntil(() => gateListeners.size === 1);
+        expect(executeBash.mock.calls.length).toBe(0);
+
+        if (unsubscribeFirst) {
+          // The last subscriber leaving must release the watcher on WorkspaceStore.
+          unsubscribe();
+          expect(gateListeners.size).toBe(0);
+          return;
+        }
+        pending = false;
+        for (const listener of Array.from(gateListeners)) listener();
+
+        await waitUntil(() => executeBash.mock.calls.length === 2);
+        const scripts = executeBash.mock.calls.map(
+          (call) => ((call as unknown[])[0] as { script: string }).script
+        );
+        expect(scripts.some((script) => script.includes("gh stack view"))).toBe(true);
+        expect(gateListeners.size).toBe(0);
+        unsubscribe();
+      } finally {
+        store.dispose();
+      }
+    }
+  );
+});
+
 describe("parseMergeQueueEntry", () => {
   it("returns null for null and undefined", () => {
     expect(parseMergeQueueEntry(null)).toBeNull();

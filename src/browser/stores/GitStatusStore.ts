@@ -5,6 +5,7 @@ import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/worksp
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
+import { onChatReplaySettled, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -97,6 +98,8 @@ export class GitStatusStore {
   private fetchCache = new Map<string, FetchState>();
   private runtimeStatusRetryUnsubscribers = new Map<string, () => void>();
   private runtimeFetchRetryUnsubscribers = new Map<string, () => void>();
+  private chatReplayGate: ChatReplayGate | null = null;
+  private chatReplayRetryUnsubscribers = new Map<string, () => void>();
   private client: RouterClient<AppRouter> | null = null;
   private immediateUpdateQueued = false;
   private workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
@@ -139,6 +142,11 @@ export class GitStatusStore {
     if (this.workspaceMetadata.size > 0) {
       this.refreshController.requestImmediate();
     }
+  }
+
+  /** Defer refreshes of a workspace while its chat replay is pending; null disables gating. */
+  setChatReplayGate(gate: ChatReplayGate | null): void {
+    this.chatReplayGate = gate;
   }
 
   /**
@@ -338,6 +346,7 @@ export class GitStatusStore {
 
     this.cleanupRuntimeRetryMap(this.runtimeStatusRetryUnsubscribers, metadata);
     this.cleanupRuntimeRetryMap(this.runtimeFetchRetryUnsubscribers, metadata);
+    this.cleanupRuntimeRetryMap(this.chatReplayRetryUnsubscribers, metadata);
 
     // Remove statuses for deleted workspaces
     // Iterate plain map (statusCache) for membership, not reactive store
@@ -364,6 +373,29 @@ export class GitStatusStore {
   }
 
   /**
+   * #4662: skip a workspace (status script AND git fetch) while its chat replay is pending.
+   * Each executeBash spawn blocks the Electron main process ~8-16 ms and the results render
+   * during the transcript paint. Deferring to caught-up costs roughly the replay duration
+   * (~0.1-0.2 s on cold open) while the cached status stays visible.
+   */
+  private deferForChatReplay(workspaceId: string): boolean {
+    const gate = this.chatReplayGate;
+    if (!gate?.isReplayPending(workspaceId)) {
+      return false;
+    }
+    if (!this.chatReplayRetryUnsubscribers.has(workspaceId)) {
+      this.chatReplayRetryUnsubscribers.set(
+        workspaceId,
+        onChatReplaySettled(gate, workspaceId, () => {
+          this.chatReplayRetryUnsubscribers.delete(workspaceId);
+          this.refreshController.requestImmediate();
+        })
+      );
+    }
+    return true;
+  }
+
+  /**
    * Update git status for all workspaces.
    */
   private async updateGitStatus(): Promise<void> {
@@ -372,8 +404,8 @@ export class GitStatusStore {
     }
 
     // Only poll workspaces that have active subscribers.
-    const workspaces = Array.from(this.workspaceMetadata.values()).filter((ws) =>
-      this.hasWorkspaceSubscribers(ws.id)
+    const workspaces = Array.from(this.workspaceMetadata.values()).filter(
+      (ws) => this.hasWorkspaceSubscribers(ws.id) && !this.deferForChatReplay(ws.id)
     );
 
     if (workspaces.length === 0) {
@@ -1085,6 +1117,10 @@ export class GitStatusStore {
       unsub();
     }
     this.runtimeFetchRetryUnsubscribers.clear();
+    for (const unsub of this.chatReplayRetryUnsubscribers.values()) {
+      unsub();
+    }
+    this.chatReplayRetryUnsubscribers.clear();
     this.refreshController.dispose();
   }
 

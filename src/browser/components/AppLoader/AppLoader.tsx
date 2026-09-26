@@ -179,6 +179,17 @@ function AppLoaderInner() {
 
   // Sync stores when metadata finishes loading
   useEffect(() => {
+    // #4662: git/PR probes for a workspace wait for its chat replay to settle. Wire the gate
+    // before setClient/syncWorkspaces below, which can refresh synchronously.
+    const chatReplayGate = {
+      isReplayPending: (workspaceId: string) =>
+        workspaceStore.isWorkspaceChatReplayPending(workspaceId),
+      subscribeKey: (workspaceId: string, listener: () => void) =>
+        workspaceStore.subscribeKey(workspaceId, listener),
+    };
+    gitStatusStore.setChatReplayGate(chatReplayGate);
+    getPRStatusStoreInstance().setChatReplayGate(chatReplayGate);
+
     // Keep store clients in sync even during backend restarts (api can be null while reconnecting).
     workspaceStoreInstance.setClient(api ?? null);
     gitStatusStore.setClient(api ?? null);

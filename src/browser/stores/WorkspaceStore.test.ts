@@ -1476,6 +1476,41 @@ describe("WorkspaceStore", () => {
         expect.anything()
       );
     });
+    // #4662: workspace-open git/PR probes wait on this gate, so it must open on every way
+    // the first replay can settle, or the probes would never run for the workspace.
+    it.each(["caught-up", "attempt end", "switch away"] as const)(
+      "reports the chat replay pending until %s",
+      async (settle) => {
+        const workspaceId = `workspace-replay-gate-${settle.replace(" ", "-")}`;
+        const firstAttempt = createControllableAsyncIterable<WorkspaceChatMessage>();
+        let subscriptions = 0;
+        mockOnChat.mockImplementation(async function* (input, options) {
+          if (input?.workspaceId !== workspaceId || subscriptions++ > 0) {
+            await waitForAbortSignal(options?.signal);
+            return;
+          }
+          options?.signal?.addEventListener("abort", () => firstAttempt.close(), { once: true });
+          yield* firstAttempt.iterable;
+        });
+        createAndAddWorkspace(store, workspaceId);
+        expect(store.isWorkspaceChatReplayPending(workspaceId)).toBe(true);
+        expect(await waitUntil(() => subscriptions === 1)).toBe(true);
+
+        let notified = false;
+        const unsubscribe = store.subscribeKey(workspaceId, () => {
+          notified ||= !store.isWorkspaceChatReplayPending(workspaceId);
+        });
+        if (settle === "caught-up") firstAttempt.push(caughtUpEvent());
+        else if (settle === "attempt end") firstAttempt.close();
+        else createAndAddWorkspace(store, `${workspaceId}-other`);
+
+        expect(await waitUntil(() => notified)).toBe(true);
+        expect(store.isWorkspaceChatReplayPending(workspaceId)).toBe(false);
+        unsubscribe();
+        mockChatScript([], { keepOpen: true });
+      }
+    );
+
     it("keeps transcript hydration active across full replay resets", async () => {
       const workspaceId = "workspace-full-replay-hydration";
 

@@ -29,6 +29,7 @@ import {
   onPassiveRuntimeEligible,
   type PassiveRuntimeDeps,
 } from "@/browser/utils/runtimeExecutionPolicy";
+import { onChatReplaySettled, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -331,6 +332,8 @@ export class PRStatusStore {
   private workspacePRCache = new Map<string, WorkspacePRCacheEntry>();
   private workspaceStackCache = new Map<string, WorkspaceStackCacheEntry>();
   private runtimeRetryUnsubscribers = new Map<string, () => void>();
+  private chatReplayGate: ChatReplayGate | null = null;
+  private chatReplayRetryUnsubscribers = new Map<string, () => void>();
 
   // Track active subscriptions per workspace so we only refresh workspaces that are actually visible.
   private workspaceSubscriptionCounts = new Map<string, number>();
@@ -384,6 +387,11 @@ export class PRStatusStore {
     }
   }
 
+  /** Defer refreshes of a workspace while its chat replay is pending; null disables gating. */
+  setChatReplayGate(gate: ChatReplayGate | null): void {
+    this.chatReplayGate = gate;
+  }
+
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
     if (!this.isActive && metadata.size > 0) {
       this.isActive = true;
@@ -394,6 +402,12 @@ export class PRStatusStore {
       if (!metadata.has(id)) {
         unsubscribe();
         this.runtimeRetryUnsubscribers.delete(id);
+      }
+    }
+    for (const [id, unsubscribe] of this.chatReplayRetryUnsubscribers) {
+      if (!metadata.has(id)) {
+        unsubscribe();
+        this.chatReplayRetryUnsubscribers.delete(id);
       }
     }
     this.refreshController.bindListeners();
@@ -428,6 +442,8 @@ export class PRStatusStore {
         this.workspaceSubscriptionCounts.delete(workspaceId);
         this.runtimeRetryUnsubscribers.get(workspaceId)?.();
         this.runtimeRetryUnsubscribers.delete(workspaceId);
+        this.chatReplayRetryUnsubscribers.get(workspaceId)?.();
+        this.chatReplayRetryUnsubscribers.delete(workspaceId);
       } else {
         this.workspaceSubscriptionCounts.set(workspaceId, next);
       }
@@ -909,6 +925,23 @@ export class PRStatusStore {
     const refreshes: Array<Promise<void>> = [];
 
     for (const workspaceId of workspaceIds) {
+      // #4662: defer gh pr/stack probes while the workspace's chat replay is pending. Each
+      // executeBash spawn blocks the Electron main process ~8-16 ms and the results render
+      // during the transcript paint; the persisted PR status stays visible meanwhile.
+      const chatReplayGate = this.chatReplayGate;
+      if (chatReplayGate?.isReplayPending(workspaceId)) {
+        if (!this.chatReplayRetryUnsubscribers.has(workspaceId)) {
+          this.chatReplayRetryUnsubscribers.set(
+            workspaceId,
+            onChatReplaySettled(chatReplayGate, workspaceId, () => {
+              this.chatReplayRetryUnsubscribers.delete(workspaceId);
+              this.refreshController.requestImmediate();
+            })
+          );
+        }
+        continue;
+      }
+
       const shouldFetchPR = this.shouldFetchWorkspace(this.workspacePRCache.get(workspaceId), now);
       const shouldFetchStack = this.shouldFetchStack(
         this.workspaceStackCache.get(workspaceId),
@@ -976,6 +1009,10 @@ export class PRStatusStore {
       unsubscribe();
     }
     this.runtimeRetryUnsubscribers.clear();
+    for (const unsubscribe of this.chatReplayRetryUnsubscribers.values()) {
+      unsubscribe();
+    }
+    this.chatReplayRetryUnsubscribers.clear();
     this.refreshController.dispose();
   }
 }
