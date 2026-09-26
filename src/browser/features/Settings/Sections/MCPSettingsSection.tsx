@@ -68,7 +68,9 @@ const ToolsDisclosureButton: React.FC<{
     type="button"
     onClick={props.onToggle}
     aria-expanded={props.expanded}
-    className="text-content-secondary hover:text-foreground focus-visible:ring-accent flex items-center gap-1 rounded-sm text-xs focus-visible:ring-1"
+    // Forced-colors mode drops box-shadow rings, and globals.css removes
+    // outlines with an unlayered rule, so the fallback outline needs `!`.
+    className="text-content-secondary hover:text-foreground focus-visible:ring-accent flex items-center gap-1 rounded-sm text-xs focus-visible:ring-1 forced-colors:focus-visible:outline!"
   >
     {props.expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
     <span>{props.summary}</span>

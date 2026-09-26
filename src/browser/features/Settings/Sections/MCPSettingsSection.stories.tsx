@@ -491,14 +491,18 @@ const helpTextAccessibilityPlay: Story["play"] = async ({ canvasElement }) => {
 export const HelpTextAccessibilityLight: Story = {
   ...ProjectSettingsWithToolAllowlist,
   globals: { theme: "light" },
-  parameters: { pixel: { matrix: { themes: ["light"] } } },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
   play: helpTextAccessibilityPlay,
 };
 
 export const HelpTextAccessibilityDark: Story = {
   ...ProjectSettingsWithToolAllowlist,
   globals: { theme: "dark" },
-  parameters: { pixel: { matrix: { themes: ["dark"] } } },
+  // Behavioral contract only: ProjectSettingsWithToolAllowlist already snapshots
+  // this layout, and the Pixel budget has no headroom for duplicate captures.
+  parameters: { pixel: { exclude: true } },
   play: helpTextAccessibilityPlay,
 };
 
