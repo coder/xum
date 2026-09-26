@@ -163,12 +163,19 @@ export function getCurrentHighlightedCodeBlockLines(
 // backfill ends mid-stream. A remounted CodeBlock loses its Shiki state and would repaint as plain
 // text until the async highlighter answers again, so results from streaming rows (the only rows
 // that switch modes) are kept here to seed it. Completed rows never write, so an older row
-// mounting during the backfill cannot evict the in-flight reply's blocks. Each CodeBlock instance
-// replaces the entry it wrote last, so a growing block holds one entry and never removes another
-// block's (content alone can't tell them apart: a later fence may start with an earlier one's text).
-// Bounded because the highlighted HTML of a large block can be hundreds of KB.
+// mounting during the backfill cannot evict the in-flight reply's blocks. A growing block replaces
+// the entry it wrote last, so it holds one entry; an entry other blocks also wrote (identical code)
+// stays until its last writer moves on. Bounded because the highlighted HTML of a large block can
+// be hundreds of KB; a reply with more fences than the bound falls back to re-highlighting.
 const HIGHLIGHT_CACHE_MAX_ENTRIES = 32;
-const highlightCache = new Map<string, HighlightedCodeBlockLines>();
+
+interface HighlightCacheEntry {
+  highlighted: HighlightedCodeBlockLines;
+  /** CodeBlock instances whose latest highlight is this entry. */
+  writers: Set<symbol>;
+}
+
+const highlightCache = new Map<string, HighlightCacheEntry>();
 
 function highlightCacheKey(code: string, shikiLanguage: string, theme: "light" | "dark"): string {
   return `${theme}\0${shikiLanguage}\0${code}`;
@@ -180,17 +187,24 @@ function readHighlightCache(key: string): HighlightedCodeBlockLines | null {
   // Refresh recency: Map iteration order is insertion order, so the first key is the oldest.
   highlightCache.delete(key);
   highlightCache.set(key, cached);
-  return cached;
+  return cached.highlighted;
 }
 
 function writeHighlightCache(
   key: string,
   highlighted: HighlightedCodeBlockLines,
+  writer: symbol,
   replacesKey: string | null
 ): void {
-  if (replacesKey !== null) highlightCache.delete(replacesKey);
+  if (replacesKey !== null && replacesKey !== key) {
+    const replaced = highlightCache.get(replacesKey);
+    replaced?.writers.delete(writer);
+    if (replaced?.writers.size === 0) highlightCache.delete(replacesKey);
+  }
+  const writers = highlightCache.get(key)?.writers ?? new Set<symbol>();
+  writers.add(writer);
   highlightCache.delete(key);
-  highlightCache.set(key, highlighted);
+  highlightCache.set(key, { highlighted, writers });
   while (highlightCache.size > HIGHLIGHT_CACHE_MAX_ENTRIES) {
     const oldestKey = highlightCache.keys().next().value;
     if (oldestKey === undefined) break;
@@ -208,6 +222,8 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
   const theme = isLightThemeMode(themeMode) ? "light" : "dark";
   const cacheKey = highlightCacheKey(code, shikiLanguage, theme);
   const { isStreaming } = useContext(StreamingContext);
+  // Stable identity of this instance as a cache writer.
+  const cacheWriterRef = useRef(Symbol("CodeBlock"));
   const lastWrittenCacheKeyRef = useRef<string | null>(null);
 
   const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(() =>
@@ -246,7 +262,12 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
               lines: filteredLines,
             };
             if (isStreaming) {
-              writeHighlightCache(cacheKey, result, lastWrittenCacheKeyRef.current);
+              writeHighlightCache(
+                cacheKey,
+                result,
+                cacheWriterRef.current,
+                lastWrittenCacheKeyRef.current
+              );
               lastWrittenCacheKeyRef.current = cacheKey;
             }
             setHighlighted(result);

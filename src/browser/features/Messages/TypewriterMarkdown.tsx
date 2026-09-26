@@ -76,7 +76,10 @@ export const TypewriterMarkdown: React.FC<TypewriterMarkdownProps> = ({
   // mode) so it paints without a transition (see TranscriptBackfillContext). It still gets
   // incomplete-markdown repair, so the row looks the same before and after the flag flips back.
   // The static render keeps Streamdown's block state current, so switching back never blanks.
+  // Completed rows render statically either way; gating on isStreaming keeps the flag flip from
+  // changing their props, which would re-render every mounted markdown row.
   const isTranscriptBackfilling = useContext(TranscriptBackfillContext);
+  const renderSynchronously = isStreaming && isTranscriptBackfilling;
 
   return (
     <StreamingContext.Provider value={streamingContextValue}>
@@ -84,7 +87,7 @@ export const TypewriterMarkdown: React.FC<TypewriterMarkdownProps> = ({
         <MarkdownCore
           content={visibleText}
           parseIncompleteMarkdown={isStreaming}
-          renderSynchronously={isTranscriptBackfilling}
+          renderSynchronously={renderSynchronously}
           preserveLineBreaks={preserveLineBreaks}
         />
       </div>

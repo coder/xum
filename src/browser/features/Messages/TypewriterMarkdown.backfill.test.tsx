@@ -144,9 +144,9 @@ describe("TypewriterMarkdown during a transcript backfill", () => {
       expect(allHighlighted()).toBe(true);
     };
 
-    // The growing block starts with the finished block's text, so it can't be told apart from a
-    // later state of that block by its content.
-    let content = "```ts\nconst finished = 1;\n```\n\n```ts\nconst finished = 1;\nlet growing = 0;";
+    // The growing block starts out identical to the finished block, so the two can't be told apart
+    // by content until it grows.
+    let content = "```ts\nconst finished = 1;\n```\n\n```ts\nconst finished = 1;";
     renderScene(content, true);
     await waitForHighlights();
     for (let chunk = 0; chunk < 16; chunk++) {
