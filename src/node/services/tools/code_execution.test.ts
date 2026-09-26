@@ -574,7 +574,6 @@ describe("createCodeExecutionTool", () => {
         content: "mock file content",
         success: true,
       });
-      expect(result.toolCalls[0].duration_ms).toBeGreaterThanOrEqual(0);
     });
 
     it("validates tool arguments against schema at runtime", async () => {

@@ -3609,8 +3609,24 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
     description:
       "Execute JavaScript code in a sandboxed environment with access to Xum tools. " +
       "Available for multi-tool workflows when PTC experiment is enabled.",
+    // The live tool (src/node/services/tools/code_execution.ts) uses this schema as its input
+    // schema, so hook env vars, token counting and the nullish audit see the real inputs.
     schema: z.object({
-      code: z.string().min(1).describe("JavaScript code to execute in the PTC sandbox"),
+      code: z
+        .string()
+        .min(1)
+        .describe(
+          "JavaScript code to execute. xum.* calls are synchronous—do not use await. mux.* is a compatibility alias. Use 'return' for final result."
+        ),
+      timeout_secs: z
+        .number()
+        .int()
+        .positive()
+        .nullish()
+        .describe(
+          "Execution timeout in seconds (default: 300, max: 3600). " +
+            "Increase when spawning subagents that may take 5-15+ minutes."
+        ),
     }),
   },
   refinement_rollback: {

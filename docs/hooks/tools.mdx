@@ -370,11 +370,12 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
-<summary>code_execution (1)</summary>
+<summary>code_execution (2)</summary>
 
-| Env var               | JSON path | Type   | Description                                   |
-| --------------------- | --------- | ------ | --------------------------------------------- |
-| `XUM_TOOL_INPUT_CODE` | `code`    | string | JavaScript code to execute in the PTC sandbox |
+| Env var                       | JSON path      | Type   | Description                                                                                                                                |
+| ----------------------------- | -------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `XUM_TOOL_INPUT_CODE`         | `code`         | string | JavaScript code to execute. xum.\* calls are synchronous—do not use await. mux.\* is a compatibility alias. Use 'return' for final result. |
+| `XUM_TOOL_INPUT_TIMEOUT_SECS` | `timeout_secs` | number | Execution timeout in seconds (default: 300, max: 3600). Increase when spawning subagents that may take 5-15+ minutes.                      |
 
 </details>
 
