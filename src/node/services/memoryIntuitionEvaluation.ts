@@ -146,8 +146,15 @@ export async function runEvaluationRecall(args: {
       }),
       { runtimeAbortSignal: args.signal, deadlineAt: args.deadlineAt }
     );
-    if (outcome.status === "completed") {
-      const { usage, usageProviderMetadata: metadata } = outcome.result;
+    // A rejected answer to a received response was billed too (#4728).
+    const billed =
+      outcome.status === "completed"
+        ? outcome.result
+        : outcome.status === "failed"
+          ? outcome.billedUsage
+          : undefined;
+    if (billed !== undefined) {
+      const { usage, usageProviderMetadata: metadata } = billed;
       // Unknown counts are skipped: recording them as zero would under-count spend.
       if (usage.inputTokens !== null && usage.outputTokens !== null) {
         args.onUsage(

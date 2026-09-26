@@ -659,7 +659,7 @@ describe("WorkflowRunner evaluate()", () => {
       });
 
       await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(/attempt 1\)/);
-      expect(canRetryWorkflowFromCheckpoint(await store.getRun(RUN_ID)).canRetry).toBe(true);
+      expect(canRetryWorkflowFromCheckpoint(await store.getRun(RUN_ID))).toBe(true);
       fail = false;
       await createRunner(store, fake.adapter).run(RUN_ID, { allowRetryFromFailedCheckpoint: true });
 
@@ -687,7 +687,7 @@ describe("WorkflowRunner evaluate()", () => {
         );
 
         const run = await store.getRun(RUN_ID);
-        expect(canRetryWorkflowFromCheckpoint(run).canRetry).toBe(true);
+        expect(canRetryWorkflowFromCheckpoint(run)).toBe(true);
         const ledgerWarnings = warn.mock.calls.filter(
           ([, fields]) =>
             (fields as { code?: string } | undefined)?.code === "evaluation-failed-usage-failed"

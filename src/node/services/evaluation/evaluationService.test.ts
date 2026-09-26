@@ -343,8 +343,11 @@ describe("EvaluationService.evaluate", () => {
  * A Responses API fake for `createOpenAI().evaluationModel()`: the real
  * provider-utils evaluation adapter parses `text` as its JSON answer object.
  */
-function fakeResponsesFetch(text: string, usage = { input_tokens: 120, output_tokens: 30 }) {
-  return () =>
+function fakeResponsesFetch(
+  text: string,
+  usage = { input_tokens: 120, output_tokens: 30 }
+): typeof fetch {
+  const fake = () =>
     Promise.resolve(
       new Response(
         JSON.stringify({
@@ -364,6 +367,7 @@ function fakeResponsesFetch(text: string, usage = { input_tokens: 120, output_to
         { headers: { "Content-Type": "application/json" } }
       )
     );
+  return fake as unknown as typeof fetch;
 }
 
 describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", () => {
@@ -428,7 +432,10 @@ describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", 
   it("carries no billed usage when the provider call itself failed", async () => {
     const model = createOpenAI({
       apiKey: "test",
-      fetch: () => Promise.resolve(new Response(`{"error":"${SENTINEL}"}`, { status: 500 })),
+      fetch: (() =>
+        Promise.resolve(
+          new Response(`{"error":"${SENTINEL}"}`, { status: 500 })
+        )) as unknown as typeof fetch,
     }).evaluationModel("gpt-6-sol");
     const error = expectFailure(
       await runExit(service.evaluate({ model, state: { title: "hello" }, questions: QUESTIONS }))
