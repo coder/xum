@@ -3230,6 +3230,10 @@ export class WorkspaceTurnManager {
           ? { deferredMessageIds: options.deferredMessageIds }
           : {}),
       };
+      // The settlement released the live-owner lock; the revived turn is this backend's again.
+      // Take it before any durable mutation: a live backend that holds it owns the handle.
+      const lockHeldBefore = this.turnOwnerLocks.has(record.handleId);
+      if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return current;
       // Re-admission can fail if another child now controls this desktop. Do not revive the
       // handle, erase terminal attention, or register it live until its durable mirror reserves it.
       const taskEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
@@ -3237,7 +3241,10 @@ export class WorkspaceTurnManager {
         const claimed = await this.desktopInputCoordinator.withAdmission(record.workspaceId, () =>
           this.persistAgentTaskExecutionState(record.workspaceId, record.handleId, "running", true)
         );
-        if (!claimed) return current;
+        if (!claimed) {
+          if (!lockHeldBefore) await this.releaseTurnOwnerLock(record.handleId);
+          return current;
+        }
       }
       delete next.error;
       // The revived turn's next terminal transition is a new outcome; re-arm its wake-up.
@@ -3248,8 +3255,6 @@ export class WorkspaceTurnManager {
       delete next.terminalAttentionNotifiedAt;
       await this.deleteWorkspaceTurnTerminalAttention(record);
       await this.deletePersistentChildWorkspaceTurnAttention(current);
-      // The settlement released the live-owner lock; the revived turn is this backend's again.
-      if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return current;
       await this.taskHandleStore.upsertWorkspaceTurn(next);
       // Re-register so stream-end/abort/error settlement paths own the handle again. The
       // revived turn is a retry of an already-admitted turn, so the registration is accepted.
@@ -5435,6 +5440,7 @@ export class WorkspaceTurnManager {
           // "The restart killed any live stream" holds only when no live backend owns the turn
           // (#4446). Two new backends may both adopt a dead owner's handle; the second settlement
           // then finds a terminal record and does nothing.
+          const lockHeldBefore = this.turnOwnerLocks.has(normalized.handleId);
           if ((await this.acquireTurnOwnerLock(normalized.handleId)) !== "held") {
             log.info("Skipping a persistent sub-agent execution owned by a live backend", {
               taskId,
@@ -5465,7 +5471,12 @@ export class WorkspaceTurnManager {
             });
             continue;
           }
-          if (!claimed) continue;
+          if (!claimed) {
+            // Another backend published a newer execution: this manager neither adopted nor
+            // settled the handle, so it must not keep that handle's lock.
+            if (!lockHeldBefore) await this.releaseTurnOwnerLock(normalized.handleId);
+            continue;
+          }
         } else {
           await this.taskHost.editWorkspaceEntry(
             task.id,

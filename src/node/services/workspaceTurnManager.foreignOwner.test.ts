@@ -1,8 +1,11 @@
 import * as path from "path";
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
-import { TaskHandleStore } from "@/node/services/taskHandleStore";
+import {
+  TaskHandleStore,
+  type WorkspaceTurnTaskHandleRecord,
+} from "@/node/services/taskHandleStore";
 import {
   createWorkspaceTurnManagerHarness,
   startWorkspaceTurnForTest,
@@ -13,14 +16,17 @@ import {
 } from "@/node/services/workspaceTurnManager";
 import { registerLiveWorkspaceTurnHandle } from "@/node/services/taskService.shared.testHarness";
 import {
+  createAIServiceMocks,
   createTaskServiceStack,
   createTestConfig,
   projectWorkspace,
   saveWorkspaces,
   testTaskSettings,
   workspaceTurnManagerFor,
+  workspaceTurnRecord,
   workspaceTurnSnapshot,
 } from "@/node/services/taskService.testHarness";
+import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 
 /**
  * #4446: a workspace-turn handle's liveness lives in the memory of the backend that runs it. With
@@ -146,5 +152,93 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       workspaceTurnManagerFor(stackA.taskService).getLiveWorkspaceTurnRegistration("task-child")
         ?.handleId
     ).toBe("wst_live_elsewhere");
+  });
+
+  test("revival leaves a terminal handle's durable state alone while a live backend holds its lock", async () => {
+    // A still holds the lock (live); the durable record reads terminal (e.g. a torn settlement).
+    const { config, parentId } = await startWorkspaceTurnForTest(rootDir);
+    const store = new TaskHandleStore(config);
+    const running = await store.getWorkspaceTurn(parentId, "wst_handle");
+    expect(running).not.toBeNull();
+    const settled: WorkspaceTurnTaskHandleRecord = {
+      ...running!,
+      status: "interrupted",
+      updatedAt: new Date(Date.parse(running!.updatedAt) + 1000).toISOString(),
+      error: "interrupted",
+    };
+    await store.upsertWorkspaceTurn(settled);
+    const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+      await createTestConfig(rootDir)
+    );
+    const b = backendB as unknown as {
+      terminalAttentionStore: TerminalAttentionStore;
+      reviveRetryingWorkspaceTurn: (
+        record: WorkspaceTurnTaskHandleRecord
+      ) => Promise<WorkspaceTurnTaskHandleRecord | null>;
+    };
+    const attentionDeletes = spyOn(b.terminalAttentionStore, "delete");
+    const writesB = spyOn(internals(backendB).taskHandleStore, "upsertWorkspaceTurn");
+
+    expect(await b.reviveRetryingWorkspaceTurn(settled)).toMatchObject({ status: "interrupted" });
+
+    // B must not erase A's terminal attention or revive the handle it does not own.
+    expect(attentionDeletes).not.toHaveBeenCalled();
+    expect(writesB).not.toHaveBeenCalled();
+  });
+
+  test("startup adoption that loses to a newer execution gives the dead owner's lock back", async () => {
+    const configA = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspaces(
+      configA,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child", "task-child", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+          taskExecutionId: "wst_dead_owner",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+    // The handle's owner died: the record reads running and nobody holds its lock.
+    await new TaskHandleStore(configA).upsertWorkspaceTurn(
+      workspaceTurnRecord("tree-root", "task-child", "wst_dead_owner", "running", {
+        turnId: "wst_dead_owner-turn",
+      })
+    );
+    // B's child is streaming, so B's startup keeps the handle active and adopts it.
+    const configB = await createTestConfig(rootDir);
+    const managerB = workspaceTurnManagerFor(
+      createTaskServiceStack(configB, {
+        aiService: createAIServiceMocks(configB, { isStreaming: mock(() => true) }).aiService,
+      }).taskService
+    );
+    const coordinator = (
+      managerB as unknown as {
+        desktopInputCoordinator: {
+          withAdmission: <T>(id: string, fn: () => Promise<T>) => Promise<T>;
+        };
+      }
+    ).desktopInputCoordinator;
+    const realAdmission = coordinator.withAdmission.bind(coordinator);
+    // Another backend publishes a newer execution between B's snapshot and its claim.
+    spyOn(coordinator, "withAdmission").mockImplementationOnce(async (id, fn) => {
+      await configA.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === "task-child");
+          if (ws) ws.taskExecutionId = "wst_newer";
+        }
+        return cfg;
+      });
+      return realAdmission(id, fn);
+    });
+
+    await managerB.reconcileAgentTaskExecutionIds();
+
+    expect(managerB.getLiveWorkspaceTurnRegistration("task-child")).toBeUndefined();
+    expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_dead_owner"))).toBe(false);
   });
 });
