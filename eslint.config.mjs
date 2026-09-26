@@ -1988,6 +1988,11 @@ export default defineConfig([
     // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
     // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
     files: ["tests/**/*.{ts,tsx}"],
+    // Registered so repo-wide test rules (e.g. local/no-unknown-cast-to-api-client on
+    // **/*.test.ts) resolve here too.
+    plugins: {
+      local: localPlugin,
+    },
     languageOptions: {
       parserOptions: {
         projectService: true,
