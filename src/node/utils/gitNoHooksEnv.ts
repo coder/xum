@@ -138,9 +138,15 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
   return env;
 }
 
+// git lowercases only the first and last dot-separated segments of a --get-regexp pattern
+// before matching canonical (lowercase) key names, so alternatives in the middle segment must
+// be written in lowercase.
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd)|submodule[.].*[.]update|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command)$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](cccmd|headercmd|tocmd)|submodule[.].*[.]update|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command)$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
+// Checked in the repo-controlled scopes only (--local, plus --worktree when enabled), with
+// --includes: a scope flag alone turns include-following off, so keys in files reached through
+// include.path would otherwise go unchecked.
 const GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN =
   "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$";
 
@@ -324,13 +330,13 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
 
   const includeResult = await execBuffered(
     runtime,
-    `${prefix}git config --local --null --name-only --get-regexp ${shellQuote(
+    `${prefix}git config --local --includes --null --name-only --get-regexp ${shellQuote(
       GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN
     )} || [ "$?" -eq 1 ]; ` +
       `worktree_config=$(${prefix}git config --local --bool extensions.worktreeConfig); ` +
       `worktree_status=$?; ` +
       `if [ "$worktree_status" -eq 0 ] && [ "$worktree_config" = true ]; then ` +
-      `${prefix}git config --worktree --null --name-only --get-regexp ${shellQuote(
+      `${prefix}git config --worktree --includes --null --name-only --get-regexp ${shellQuote(
         GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN
       )} || [ "$?" -eq 1 ]; ` +
       `elif [ "$worktree_status" -ne 1 ]; then exit "$worktree_status"; fi`,
@@ -459,6 +465,7 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
           repoPath,
           "config",
           scope,
+          "--includes",
           "--null",
           "--name-only",
           "--get-regexp",

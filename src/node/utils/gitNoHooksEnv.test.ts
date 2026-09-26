@@ -3,12 +3,14 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { generateGitStatusScript } from "@/common/utils/git/gitStatus";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   gitHooksAllowed,
   gitNoHooksPrefix,
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForConfigKeys,
   gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
 } from "./gitNoHooksEnv";
 
 describe("gitNoHooksPrefix", () => {
@@ -756,6 +758,77 @@ describe("gitNoRepoAutomationEnv", () => {
     );
     expect(markerExists).toBe(false);
   });
+});
+
+describe("unsupported keys reached through include.path", () => {
+  const variants = [
+    { name: "local", discover: (repo: string) => gitNoRepoAutomationEnvForLocalRepo(repo) },
+    {
+      name: "runtime",
+      discover: (repo: string) =>
+        gitNoRepoAutomationEnvForRuntimeRepo(new LocalRuntime(repo), repo),
+    },
+  ];
+  const nestedKeys = [
+    {
+      name: "conditional include",
+      config: '[includeIf "onbranch:other"]\n\tpath = other.cfg\n',
+      refusal: "conditional config includes",
+    },
+    {
+      name: "gc.recentObjectsHook",
+      config: "[gc]\n\trecentObjectsHook = helper\n",
+      refusal: "unsupported executable config",
+    },
+  ];
+  for (const variant of variants) {
+    for (const scope of ["--local", "--worktree"] as const) {
+      for (const nested of nestedKeys) {
+        test(`${variant.name} discovery refuses a ${nested.name} included from ${scope} config`, async () => {
+          using tmp = new DisposableTempDir("git-nested-include");
+          const repo = path.join(tmp.path, "repo");
+          const included = path.join(tmp.path, "included.gitconfig");
+          await fs.mkdir(repo, { recursive: true });
+          await Bun.$`git init`.cwd(repo).quiet();
+          if (scope === "--worktree") {
+            await Bun.$`git config extensions.worktreeConfig true`.cwd(repo).quiet();
+          }
+          await fs.writeFile(included, nested.config, "utf-8");
+          await Bun.$`git config ${scope} include.path ${included}`.cwd(repo).quiet();
+
+          const rejection = await variant.discover(repo).then(
+            () => null,
+            (error: unknown) => error
+          );
+          expect(rejection).toBeInstanceOf(Error);
+          const error = rejection as Error;
+          const messages = [error.message, error.cause instanceof Error ? error.cause.message : ""];
+          expect(messages.join("\n")).toContain(nested.refusal);
+        });
+      }
+    }
+  }
+});
+
+test("blanks identity-specific sendemail commands", async () => {
+  using tmp = new DisposableTempDir("git-sendemail-identity");
+  const repo = path.join(tmp.path, "repo");
+  await fs.mkdir(repo, { recursive: true });
+  await Bun.$`git init`.cwd(repo).quiet();
+  await Bun.$`git config sendemail.work.ccCmd helper`.cwd(repo).quiet();
+  await Bun.$`git config sendemail.work.toCmd helper`.cwd(repo).quiet();
+  await Bun.$`git config sendemail.work.headerCmd helper`.cwd(repo).quiet();
+
+  const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+  for (const key of ["sendemail.work.cccmd", "sendemail.work.tocmd", "sendemail.work.headercmd"]) {
+    // Command-scope config wins, so git itself now resolves the command to empty.
+    const value = await Bun.$`git config --get ${key}`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .text();
+    expect(value.trim()).toBe("");
+  }
 });
 
 describe("gitHooksAllowed", () => {
