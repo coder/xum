@@ -1637,7 +1637,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       test("a rollback whose write fails reopens the attempt it closed", async () => {
         const { config, taskService, svc, attemptId, token } = await reawakenAndBindSend();
         token.onDisposed("refused");
-        // The updater runs (and closes the attempt), but the config write never persists.
+        // The updater runs, but the config write never persists.
         spyOn(taskService, "editWorkspaceEntry").mockImplementationOnce((_id, updater) => {
           updater(structuredClone(entryOf(config, taskId)!), config.loadConfigOrDefault());
           return Promise.reject(new Error("disk full"));

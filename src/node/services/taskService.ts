@@ -15228,61 +15228,46 @@ export class TaskService implements AgentTaskIntegration {
     // and only while this process owns it, is ended here.
     const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
     let revertedToInterrupted = false;
-    let closedAttempt: (OwnedTaskAttempt & { attemptId: string }) | undefined;
+    let revertedOwnedAttempt = false;
     let parentWorkspaceId: string | undefined;
-    try {
-      await this.editWorkspaceEntry(
-        workspaceId,
-        (ws) => {
-          if (!ws.parentWorkspaceId) {
-            return;
-          }
-          if (ws.taskStatus !== "running") {
-            return;
-          }
-          // A stale resume's rollback never flips a successor another writer admitted since.
-          if (rowSupersedes(ws, expectedAttemptId)) {
-            return;
-          }
+    await this.editWorkspaceEntry(
+      workspaceId,
+      (ws) => {
+        if (!ws.parentWorkspaceId) {
+          return;
+        }
+        if (ws.taskStatus !== "running") {
+          return;
+        }
+        // A stale resume's rollback never flips a successor another writer admitted since.
+        if (rowSupersedes(ws, expectedAttemptId)) {
+          return;
+        }
 
-          parentWorkspaceId = ws.parentWorkspaceId;
-          ws.taskStatus = previousStatus === "reported" ? "reported" : "interrupted";
-          if (previousStatus !== "reported") ws.reportedAt = undefined;
-          revertedToInterrupted = true;
-          // Idle-producer linearization (closeAttemptAdmission): synchronously with the decision,
-          // before the write is awaited, so no further send is admitted under this attempt.
-          if (
-            expectedAttemptId != null &&
-            ws.taskAttemptId === expectedAttemptId &&
-            ownedAttempt?.attemptId === expectedAttemptId &&
-            this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt
-          ) {
-            this.closeAttemptAdmission(
-              workspaceId,
-              expectedAttemptId,
-              ownedAttempt,
-              "resume-failed"
-            );
-            // Identity is what later checks compare; its attemptId was just checked to be a string.
-            closedAttempt = ownedAttempt as OwnedTaskAttempt & { attemptId: string };
-          }
-        },
-        { allowMissing: true }
-      );
-    } catch (error) {
-      // The revert never became durable (the row still runs under this attempt): reopen what the
-      // updater closed, or every send stays refused with nothing left to settle the closure.
-      const closure = this.attemptSettlementByTaskId.get(workspaceId);
-      if (
-        closedAttempt != null &&
-        closure?.attempt === closedAttempt &&
-        closure.phase === "closing" &&
-        closure.source === "resume-failed"
-      ) {
-        this.attemptSettlementByTaskId.delete(workspaceId);
-        this.notifyAttemptSettlementListeners(workspaceId);
-      }
-      throw error;
+        parentWorkspaceId = ws.parentWorkspaceId;
+        ws.taskStatus = previousStatus === "reported" ? "reported" : "interrupted";
+        if (previousStatus !== "reported") ws.reportedAt = undefined;
+        revertedToInterrupted = true;
+        revertedOwnedAttempt =
+          expectedAttemptId != null &&
+          ws.taskAttemptId === expectedAttemptId &&
+          ownedAttempt?.attemptId === expectedAttemptId;
+      },
+      { allowMissing: true }
+    );
+    // Closed only once the revert is durable: a write that rejects leaves the attempt running
+    // and open, exactly as before. A send admitted between the write and this closure stays an
+    // obligation of the attempt, which the settlement boundary below waits for.
+    let closedAttempt: (OwnedTaskAttempt & { attemptId: string }) | undefined;
+    if (
+      revertedOwnedAttempt &&
+      expectedAttemptId != null &&
+      ownedAttempt != null &&
+      this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt
+    ) {
+      this.closeAttemptAdmission(workspaceId, expectedAttemptId, ownedAttempt, "resume-failed");
+      // Identity is what later checks compare; its attemptId was checked to be a string.
+      closedAttempt = ownedAttempt as OwnedTaskAttempt & { attemptId: string };
     }
 
     if (!revertedToInterrupted) {
