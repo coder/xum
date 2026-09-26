@@ -198,6 +198,31 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       expect(await read(otherProcess(config), "absent")).toEqual(noRecord);
     });
 
+    test("the row's terminal-failure marker counts only for the attempt it names", async () => {
+      const config = await setupChild("marked", {
+        taskLaunchError: "refused by the model",
+        taskTerminalFailure: { attemptId: ATTEMPT, errorType: "model_refusal" },
+      });
+      await writeReceipt(config, midId, "marked");
+      // No failure artifact (its write failed): the marker still makes it a failure.
+      expect(await read(otherProcess(config), "marked")).toEqual({
+        kind: "terminal-no-report",
+        attemptId: ATTEMPT,
+        failure: { errorMessage: "refused by the model" },
+      });
+
+      // A marker left by an earlier attempt: the current attempt's no-report stays replaceable.
+      const stale = await setupChild("stalemarker", {
+        taskLaunchError: "refused by the model",
+        taskTerminalFailure: { attemptId: "att_00000000000000c0", errorType: "model_refusal" },
+      });
+      await writeReceipt(stale, midId, "stalemarker");
+      expect(await read(otherProcess(stale), "stalemarker")).toEqual({
+        kind: "terminal-no-report",
+        attemptId: ATTEMPT,
+      });
+    });
+
     test.each([
       ["only an ancestor holds the receipt", {}, rootId, ATTEMPT],
       ["the receipt names an older attempt", {}, midId, "att_00000000000000c0"],

@@ -301,6 +301,10 @@ export const WorkspaceConfigSchema = z.object({
       description:
         "Monotonic workflow claim that retired this attempt for replacement. Never cleared; every later admission of the task refuses while it is set.",
     }),
+  taskTerminalFailure: z.object({ attemptId: z.string(), errorType: z.string() }).optional().meta({
+    description:
+      "The attempt a terminal stream failure (e.g. model_refusal) ended, written with its interrupted status. Applies only while taskAttemptId still names that attempt.",
+  }),
   taskAttentionPolicy: BackgroundWorkAttentionPolicySchema.optional().meta({
     description:
       "How the owner workspace's stream-end treats this child task while it is active. " +

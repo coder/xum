@@ -3893,6 +3893,17 @@ export class TaskService implements AgentTaskIntegration {
       entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     }
 
+    // The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
+    // artifact write that failed still fails the step, and a later attempt's no-report is not.
+    const failureFields = (attemptId: string | undefined) => {
+      const marker = entry?.workspace.taskTerminalFailure;
+      if (failure != null) return { failure };
+      if (attemptId == null || marker?.attemptId !== attemptId) return {};
+      const errorMessage =
+        coerceNonEmptyString(entry?.workspace.taskLaunchError) ??
+        `Task failed terminally (${marker.errorType})`;
+      return { failure: { errorMessage } };
+    };
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
     if (this.isWorkspaceStopInProgress(taskId)) {
       return { kind: "cleanup-pending" };
@@ -3928,7 +3939,7 @@ export class TaskService implements AgentTaskIntegration {
           return {
             kind: "terminal-no-report",
             attemptId: proof.attemptId,
-            ...(failure != null ? { failure } : {}),
+            ...failureFields(proof.attemptId),
           };
         }
         return indeterminate(
@@ -3961,7 +3972,7 @@ export class TaskService implements AgentTaskIntegration {
       return {
         kind: "terminal-no-report",
         ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
-        ...(failure != null ? { failure } : {}),
+        ...failureFields(owned.attemptId),
         // Ended before (or without) a published row, e.g. a canceled reservation.
         ...(entry == null && this.taskRowPositivelyAbsent(taskId)
           ? { code: "no-record" as const }
@@ -16513,6 +16524,11 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
         ws.taskLaunchError = failure.errorMessage;
+        // #4579: binds the failure to the attempt this CAS matched. The artifacts below are
+        // log-only on I/O errors, and taskLaunchError is not attempt-bound or failure-only.
+        if (ws.taskAttemptId != null) {
+          ws.taskTerminalFailure = { attemptId: ws.taskAttemptId, errorType: failure.errorType };
+        }
         if (stopRecord == null) {
           this.closeAttemptAdmission(
             workspaceId,

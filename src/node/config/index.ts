@@ -4209,6 +4209,7 @@ export class Config {
           taskAttemptId: existing.taskAttemptId,
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
+          taskTerminalFailure: existing.taskTerminalFailure,
         };
       } else {
         // Add new workspace

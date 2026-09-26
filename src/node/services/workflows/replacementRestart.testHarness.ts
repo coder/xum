@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { spyOn } from "bun:test";
 import { Config, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
+import { getSubagentFailureArtifactsFilePath } from "@/node/services/subagentFailureArtifacts";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { TaskService } from "@/node/services/taskService";
 import {
@@ -67,7 +68,13 @@ interface TerminalFailureInternals {
 
 async function end(
   root: string,
-  outcome: "reported" | "no-report" | "refused" | "failed-checkpoint" | "refused-failed-checkpoint"
+  outcome:
+    | "reported"
+    | "no-report"
+    | "refused"
+    | "failed-checkpoint"
+    | "refused-failed-checkpoint"
+    | "refused-artifact-lost"
 ) {
   const config = new Config(root);
   await fs.mkdir(config.srcDir, { recursive: true });
@@ -142,16 +149,25 @@ async function end(
         completedAt: new Date().toISOString(),
       });
     }
-  } else if (outcome === "refused" || outcome === "refused-failed-checkpoint") {
+  } else if (
+    outcome === "refused" ||
+    outcome === "refused-failed-checkpoint" ||
+    outcome === "refused-artifact-lost"
+  ) {
     // The real terminal-failure path: interrupted row, settlement receipt, failure artifact.
     const row = findWorkspaceInConfig(config, childId);
     if (row == null) throw new Error("reserved child row missing");
+    // "refused-artifact-lost": the parent's failure-artifact write fails (a directory squats on
+    // its path; the writer only logs), and the squatter is gone before the next process reads.
+    const artifactPath = getSubagentFailureArtifactsFilePath(sessionDir(config));
+    if (outcome === "refused-artifact-lost") await fs.mkdir(artifactPath, { recursive: true });
     await (taskService as unknown as TerminalFailureInternals).failAgentTaskTerminally(
       childId,
       { projectPath, workspace: row },
       FIXTURE_REFUSAL,
       { expectedAttemptId: row.taskAttemptId ?? null }
     );
+    if (outcome === "refused-artifact-lost") await fs.rmdir(artifactPath);
     if (outcome === "refused-failed-checkpoint") {
       // What the child's own runner records: the step failed with the refusal, the run failed.
       await store.recordStepFailed(FIXTURE_RUN_ID, {
@@ -174,7 +190,13 @@ async function end(
       reportMarkdown: "the prior child's report",
     });
   }
-  return { childId, row: findWorkspaceInConfig(config, childId) };
+  const artifactPresent = await fs
+    .access(getSubagentFailureArtifactsFilePath(sessionDir(config)))
+    .then(
+      () => true,
+      () => false
+    );
+  return { childId, row: findWorkspaceInConfig(config, childId), artifactPresent };
 }
 
 async function resume(root: string, retryFromFailedCheckpoint: boolean) {
@@ -241,7 +263,8 @@ try {
           outcome === "reported" ||
             outcome === "refused" ||
             outcome === "failed-checkpoint" ||
-            outcome === "refused-failed-checkpoint"
+            outcome === "refused-failed-checkpoint" ||
+            outcome === "refused-artifact-lost"
             ? outcome
             : "no-report"
         )
