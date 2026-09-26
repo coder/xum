@@ -4,6 +4,8 @@ import {
   DEVTOOLS_STEP_ID_HEADER,
   captureAndStripDevToolsHeader,
   consumeCapturedRequestHeaders,
+  consumeRedactedRequestBody,
+  discardCapturedRequestBody,
   redactHeaders,
 } from "../devToolsHeaderCapture";
 
@@ -117,6 +119,38 @@ describe("devToolsHeaderCapture", () => {
 
     consumeCapturedRequestHeaders("step-1"); // first read
     expect(consumeCapturedRequestHeaders("step-1")).toBeNull(); // second read → null
+  });
+
+  it("never persists a request body it cannot parse and redact", () => {
+    captureAndStripDevToolsHeader(
+      new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-text" }),
+      "api_key=sk-plain-text-secret"
+    );
+    expect(consumeRedactedRequestBody("step-text")).toBeNull();
+  });
+
+  it("redacts Anthropic redacted_thinking payloads but keeps unrelated data fields", () => {
+    captureAndStripDevToolsHeader(
+      new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-anthropic" }),
+      JSON.stringify({
+        messages: [
+          { type: "redacted_thinking", data: "opaque-blob" },
+          { type: "document", data: "visible" },
+        ],
+      })
+    );
+    expect(consumeRedactedRequestBody("step-anthropic")).toEqual({
+      messages: [
+        { type: "redacted_thinking", data: "[REDACTED 11 chars]" },
+        { type: "document", data: "visible" },
+      ],
+    });
+  });
+
+  it("drops a discarded body so a later read finds nothing", () => {
+    captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-ok" }), "{}");
+    discardCapturedRequestBody("step-ok");
+    expect(consumeRedactedRequestBody("step-ok")).toBeNull();
   });
 
   it("strips run metadata header even without step header", () => {

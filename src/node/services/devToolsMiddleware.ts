@@ -21,6 +21,8 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  consumeRedactedRequestBody,
+  discardCapturedRequestBody,
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
@@ -392,6 +394,7 @@ export function createDevToolsMiddleware(
 
       const abortHandler = (): void => {
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
         void finalizeStep({
           output: null,
           usage: null,
@@ -415,6 +418,7 @@ export function createDevToolsMiddleware(
       try {
         const result = await doGenerate();
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
 
         await finalizeStep({
           output: extractGenerateOutput(result),
@@ -440,7 +444,8 @@ export function createDevToolsMiddleware(
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // No result means no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,
@@ -566,13 +571,15 @@ export function createDevToolsMiddleware(
       try {
         streamResult = await doStream();
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
       } catch (error) {
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
         await finalizeStep({
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // A pre-stream rejection has no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,

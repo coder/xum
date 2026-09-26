@@ -220,7 +220,7 @@ const defaultFetchWithUnlimitedTimeout = (async (
   // Capture final request headers for DevTools if a synthetic step ID is present.
   // This runs after buildAIProviderRequestHeaders so the Xum user-agent is included.
   // The synthetic header is stripped before the request is sent.
-  captureAndStripDevToolsHeader(headers);
+  captureAndStripDevToolsHeader(headers, init?.body);
 
   // dispatcher is a Node.js undici-specific property for custom HTTP agents
   const requestInit: RequestInitWithDispatcher = {
@@ -732,7 +732,7 @@ function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
       }
     }
 
-    captureAndStripDevToolsHeader(merged);
+    captureAndStripDevToolsHeader(merged, init?.body);
     return customFetch(input, { ...init, headers: merged });
   };
 
