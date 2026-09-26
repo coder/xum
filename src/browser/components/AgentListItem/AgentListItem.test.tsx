@@ -20,6 +20,14 @@ import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as WorkspaceStatusIndicatorModule from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
 import * as RealWorkspaceHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal";
+import * as RealReactDndModule from "react-dnd";
+import * as RealReactDndHtml5BackendModule from "react-dnd-html5-backend";
+import * as RealWorkspaceTitleEditContextModule from "@/browser/contexts/WorkspaceTitleEditContext";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import * as RealWorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
+import * as RealRuntimeStatusStoreModule from "@/browser/stores/RuntimeStatusStore";
+import * as RealWorkspaceFallbackModelModule from "@/browser/hooks/useWorkspaceFallbackModel";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 // The heartbeat modal stub below replaces the modal's index module for the whole process.
@@ -46,6 +54,17 @@ import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
 restoreModulesAfterSuite([
   ["@/browser/contexts/ProjectContext", { ...RealProjectContextModule }],
   ["@/browser/hooks/useExperiments", { ...RealExperimentsHookModule }],
+  // installAgentListItemTestDoubles() re-registers these from beforeEach with overridden
+  // exports, and `mock.restore()` does not undo mock.module, so the overrides otherwise leak
+  // into every later test file (#4639).
+  ["react-dnd", { ...RealReactDndModule }],
+  ["react-dnd-html5-backend", { ...RealReactDndHtml5BackendModule }],
+  ["@/browser/contexts/WorkspaceTitleEditContext", { ...RealWorkspaceTitleEditContextModule }],
+  ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
+  ["@/browser/hooks/useWorkspaceUnread", { ...RealWorkspaceUnreadModule }],
+  ["@/browser/stores/RuntimeStatusStore", { ...RealRuntimeStatusStoreModule }],
+  ["@/browser/hooks/useWorkspaceFallbackModel", { ...RealWorkspaceFallbackModelModule }],
+  ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
 ]);
 
 let AgentListItem!: typeof AgentListItemComponent;

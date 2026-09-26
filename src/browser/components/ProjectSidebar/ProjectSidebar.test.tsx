@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 
 import React, { type ComponentProps, type PropsWithChildren } from "react";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
@@ -44,7 +44,11 @@ import * as WorkspaceSectionDropZoneModule from "../WorkspaceSectionDropZone/Wor
 import * as WorkspaceDragLayerModule from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type ProjectSidebarComponent from "./ProjectSidebar";
+import type * as AgentListItemModuleExports from "@/browser/components/AgentListItem/AgentListItem";
 import type * as WorkspaceStatusIndicatorModuleExports from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealPositionedMenuModule from "@/browser/components/PositionedMenu/PositionedMenu";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const agentItemTestId = (workspaceId: string) => `agent-item-${workspaceId}`;
 const toggleButtonLabel = (workspaceId: string) => `toggle-completed-${workspaceId}`;
@@ -56,6 +60,33 @@ function TestWrapper(props: PropsWithChildren) {
 const ProviderIconSvgStub = (props: React.SVGProps<SVGSVGElement>) => (
   <svg data-testid="provider-icon-mock" {...props} />
 );
+
+// installProjectSidebarTestDoubles() registers module mocks from setup hooks, and `mock.restore()`
+// in cleanup does not undo mock.module, so restore the real modules once the suite ends; they
+// otherwise leak into every later test file in the bun process (#4639).
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
+  ["@/browser/components/PositionedMenu/PositionedMenu", { ...RealPositionedMenuModule }],
+]);
+// AgentListItem and the logos are restored lazily instead: loading them (or AgentListItem's SVG
+// icons) while this file's module graph is being evaluated makes bun's warm transpiler cache
+// parse the SVG assets as JSX ("Legacy HTML comments not implemented"). The query-suffixed
+// AgentListItem is the same real instance the real-row tests render. Without svgr, bun test's
+// real `?react` SVG module is the file loader's `{ default: <asset path> }`.
+function realAgentListItemModule(): typeof AgentListItemModuleExports {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  return require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as typeof AgentListItemModuleExports;
+  /* eslint-enable @typescript-eslint/no-require-imports */
+}
+afterAll(() => {
+  for (const logoFile of ["xum-logo-dark.svg", "xum-logo-light.svg"]) {
+    void mock.module(`@/browser/assets/logos/${logoFile}?react`, () => ({
+      default: Bun.resolveSync(`@/browser/assets/logos/${logoFile}`, import.meta.dir),
+    }));
+  }
+  const realAgentListItem = { ...realAgentListItemModule() };
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => realAgentListItem);
+});
 
 function installProviderIconSvgMocks() {
   const providerIconSvgPaths = [
@@ -301,7 +332,7 @@ function installProjectSidebarTestDoubles() {
     __esModule: true,
     default: () => <svg data-testid="xum-logo-light" />,
   }));
-  void mock.module("../AgentListItem/AgentListItem", () => ({
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => ({
     AgentListItem: (props: MockAgentListItemProps) => {
       if (props.draft) {
         return (
@@ -318,13 +349,8 @@ function installProjectSidebarTestDoubles() {
       const metadata = props.metadata;
 
       if (renderRealAgentListItems) {
-        /* eslint-disable @typescript-eslint/no-require-imports */
-        const ActualAgentListItem = (
-          require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as {
-            AgentListItem: React.ComponentType<Record<string, unknown>>;
-          }
-        ).AgentListItem;
-        /* eslint-enable @typescript-eslint/no-require-imports */
+        const ActualAgentListItem = realAgentListItemModule()
+          .AgentListItem as unknown as React.ComponentType<Record<string, unknown>>;
         return <ActualAgentListItem {...(props as unknown as Record<string, unknown>)} />;
       }
 
@@ -670,7 +696,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceDragLayerModule, "WorkspaceDragLayer").mockImplementation(
     (() => null) as unknown as typeof WorkspaceDragLayerModule.WorkspaceDragLayer
   );
-  void mock.module("../PositionedMenu/PositionedMenu", () => ({
+  void mock.module("@/browser/components/PositionedMenu/PositionedMenu", () => ({
     PositionedMenu: (props: { open: boolean; children: React.ReactNode }) =>
       props.open ? <div data-testid="project-actions-menu">{props.children}</div> : null,
     PositionedMenuItem: (props: {
