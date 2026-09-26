@@ -882,7 +882,8 @@ describe("createDevToolsMiddleware", () => {
 
       const result = await wrapStream({
         doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
-        doStream: () => Promise.resolve({ stream: new ReadableStream<LanguageModelV4StreamPart>() }),
+        doStream: () =>
+          Promise.resolve({ stream: new ReadableStream<LanguageModelV4StreamPart>() }),
         params,
         model: createMockModel(),
       });
