@@ -95,23 +95,30 @@ describe("workflow step replacement across a backend restart (G2)", () => {
     expect(resumed.priorRetiredBy).toBeUndefined();
   }, 60_000);
 
-  test("a terminal failure whose artifact write failed still fails the step, never replaced", async () => {
-    const ended = await runFixture(["end", root.path, "refused-artifact-lost"]);
-    expect(ended).toMatchObject({
-      artifactPresent: false,
-      row: { taskStatus: "interrupted", taskTerminalFailure: { errorType: "model_refusal" } },
-    });
+  test.each([
+    ["was lost", "refused-artifact-lost", false],
+    ["stays unreadable", "refused-artifact-unreadable", true],
+  ] as const)(
+    "a terminal failure whose artifact %s still fails the step, never replaced",
+    async (_label, variant, artifactPresent) => {
+      const ended = await runFixture(["end", root.path, variant]);
+      expect(ended).toMatchObject({
+        artifactPresent,
+        row: { taskStatus: "interrupted", taskTerminalFailure: { errorType: "model_refusal" } },
+      });
 
-    const resumed = await runFixture(["resume", root.path]);
-    expect(String(resumed.error)).toContain("fixture: the model refused");
-    expect(resumed).toMatchObject({
-      runStatus: "failed",
-      children: ["priorchild01"],
-      journal: "priorchild01",
-      journalStatus: "failed",
-    });
-    expect(resumed.priorRetiredBy).toBeUndefined();
-  }, 60_000);
+      const resumed = await runFixture(["resume", root.path]);
+      expect(String(resumed.error)).toContain("fixture: the model refused");
+      expect(resumed).toMatchObject({
+        runStatus: "failed",
+        children: ["priorchild01"],
+        journal: "priorchild01",
+        journalStatus: "failed",
+      });
+      expect(resumed.priorRetiredBy).toBeUndefined();
+    },
+    60_000
+  );
 
   test("a child that reported is never replaced: the next process uses its report", async () => {
     await runFixture(["end", root.path, "reported"]);

@@ -75,6 +75,7 @@ async function end(
     | "failed-checkpoint"
     | "refused-failed-checkpoint"
     | "refused-artifact-lost"
+    | "refused-artifact-unreadable"
 ) {
   const config = new Config(root);
   await fs.mkdir(config.srcDir, { recursive: true });
@@ -152,7 +153,8 @@ async function end(
   } else if (
     outcome === "refused" ||
     outcome === "refused-failed-checkpoint" ||
-    outcome === "refused-artifact-lost"
+    outcome === "refused-artifact-lost" ||
+    outcome === "refused-artifact-unreadable"
   ) {
     // The real terminal-failure path: interrupted row, settlement receipt, failure artifact.
     const row = findWorkspaceInConfig(config, childId);
@@ -160,7 +162,9 @@ async function end(
     // "refused-artifact-lost": the parent's failure-artifact write fails (a directory squats on
     // its path; the writer only logs), and the squatter is gone before the next process reads.
     const artifactPath = getSubagentFailureArtifactsFilePath(sessionDir(config));
-    if (outcome === "refused-artifact-lost") await fs.mkdir(artifactPath, { recursive: true });
+    // "refused-artifact-unreadable": the squatter stays, so the next process cannot read it.
+    const squat = outcome === "refused-artifact-lost" || outcome === "refused-artifact-unreadable";
+    if (squat) await fs.mkdir(artifactPath, { recursive: true });
     await (taskService as unknown as TerminalFailureInternals).failAgentTaskTerminally(
       childId,
       { projectPath, workspace: row },
@@ -264,7 +268,8 @@ try {
             outcome === "refused" ||
             outcome === "failed-checkpoint" ||
             outcome === "refused-failed-checkpoint" ||
-            outcome === "refused-artifact-lost"
+            outcome === "refused-artifact-lost" ||
+            outcome === "refused-artifact-unreadable"
             ? outcome
             : "no-report"
         )

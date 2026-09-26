@@ -1061,6 +1061,22 @@ function rowSupersedes(
 }
 
 /**
+ * The terminal failure the row's marker (#4579) records for `attemptId`, or undefined when the
+ * marker is absent or names another attempt (a later attempt ignores an earlier failure).
+ */
+function markedTerminalFailure(
+  row: WorkspaceConfigEntry | undefined,
+  attemptId: string | undefined
+): { errorMessage: string } | undefined {
+  const marker = row?.taskTerminalFailure;
+  if (attemptId == null || marker?.attemptId !== attemptId) return undefined;
+  return {
+    errorMessage:
+      coerceNonEmptyString(row?.taskLaunchError) ?? `Task failed terminally (${marker.errorType})`,
+  };
+}
+
+/**
  * Why a workflow claim on `attemptId` must be refused (see TaskService.claimRetiredAttempt), or
  * undefined when it may be granted (or re-stamped, for the same run/step before any replacement).
  */
@@ -3881,6 +3897,23 @@ export class TaskService implements AgentTaskIntegration {
         taskId
       );
       if (failureRead.kind === "unreadable") {
+        // The row's marker (#4579) still proves a terminal failure for the attempt it names;
+        // without one, a damaged artifact proves nothing (fail closed).
+        let row: WorkspaceConfigEntry | undefined;
+        try {
+          row = findWorkspaceEntry(
+            this.config.loadConfigOrDefault({ throwOnError: true }),
+            taskId
+          )?.workspace;
+        } catch {
+          row = undefined;
+        }
+        const owned = this.ownedAttemptByTaskId.get(taskId);
+        const attemptId = row?.taskAttemptId;
+        const marked = markedTerminalFailure(row, attemptId);
+        if (marked != null && (owned?.attemptId == null || owned.attemptId === attemptId)) {
+          return { kind: "terminal-no-report", attemptId, failure: marked };
+        }
         return indeterminate(
           `failure artifact unreadable in ${reportOwnerWorkspaceId}: ${failureRead.error}`
         );
@@ -3896,13 +3929,8 @@ export class TaskService implements AgentTaskIntegration {
     // The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
     // artifact write that failed still fails the step, and a later attempt's no-report is not.
     const failureFields = (attemptId: string | undefined) => {
-      const marker = entry?.workspace.taskTerminalFailure;
-      if (failure != null) return { failure };
-      if (attemptId == null || marker?.attemptId !== attemptId) return {};
-      const errorMessage =
-        coerceNonEmptyString(entry?.workspace.taskLaunchError) ??
-        `Task failed terminally (${marker.errorType})`;
-      return { failure: { errorMessage } };
+      const marked = failure ?? markedTerminalFailure(entry?.workspace, attemptId);
+      return marked != null ? { failure: marked } : {};
     };
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
     if (this.isWorkspaceStopInProgress(taskId)) {

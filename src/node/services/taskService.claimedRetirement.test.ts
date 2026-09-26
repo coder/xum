@@ -224,6 +224,46 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
     });
 
     test.each([
+      ["malformed", "file"],
+      ["a directory", "dir"],
+    ] as const)(
+      "an unreadable failure artifact (%s) defers to the row's marker for the attempt it names",
+      async (_label, damage) => {
+        const marker = (attemptId: string) => ({
+          taskLaunchError: "refused by the model",
+          taskTerminalFailure: { attemptId, errorType: "model_refusal" },
+        });
+        const cases = [
+          ["matching", marker(ATTEMPT)],
+          ["stale", marker("att_00000000000000c0")],
+          ["absent", {}],
+        ] as const;
+        for (const [name, overrides] of cases) {
+          const taskId = `unread${name}`;
+          const config = await setupChild(taskId, overrides);
+          await writeReceipt(config, midId, taskId);
+          const failures = getSubagentFailureArtifactsFilePath(
+            path.join(config.sessionsDir, midId)
+          );
+          await fsPromises.rm(failures, { recursive: true, force: true });
+          if (damage === "dir") await fsPromises.mkdir(failures, { recursive: true });
+          else await fsPromises.writeFile(failures, "{ not json", "utf-8");
+          const outcome = await read(otherProcess(config), taskId);
+          if (name === "matching") {
+            expect(outcome).toEqual({
+              kind: "terminal-no-report",
+              attemptId: ATTEMPT,
+              failure: { errorMessage: "refused by the model" },
+            });
+          } else {
+            // Fail closed: nothing proves this attempt failed, or that it merely ended.
+            expect(outcome.kind).toBe("indeterminate");
+          }
+        }
+      }
+    );
+
+    test.each([
       ["only an ancestor holds the receipt", {}, rootId, ATTEMPT],
       ["the receipt names an older attempt", {}, midId, "att_00000000000000c0"],
       ["the lineage is marked unproven", { taskAttemptUnproven: true as const }, midId, ATTEMPT],
