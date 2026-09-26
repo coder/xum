@@ -303,6 +303,9 @@ export function subscribeWorkspaceChat(
   return runtimeSubscription<WorkspaceChatMessage>(context, {
     signal,
     heartbeat: { value: { type: "heartbeat" as const } },
+    // Replay can take seconds on large epochs: stream rows as they are produced and keep the
+    // client's stall watchdog fed with heartbeats meanwhile (#4506).
+    progressiveInitialize: true,
     subscribe: (emit) => {
       replayRelay = createReplayBufferedStreamMessageRelay(emit.push);
       return session.onChatEvent(({ message }) => replayRelay.handleSessionMessage(message));

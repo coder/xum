@@ -2,6 +2,7 @@ import type { CompactionHistoryDeletion } from "./compactionCancellation";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
 import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -3022,8 +3023,8 @@ export class AgentSession {
     // caught-up is emitted from `finally` so the client never hangs; this flag makes it say
     // whether the history it closes is trustworthy (see CaughtUpMessageSchema).
     let historyReplayFailed = false;
-    // Phase timing for the one replay log line (#4504). The subscription delivers nothing until
-    // this method returns, so totalMs is the server's share of the switch-back skeleton window.
+    // Phase timing for the one replay log line (#4504). caught-up goes out only when this method
+    // returns, so totalMs is the server's share of the switch-back skeleton window.
     const replayTimer = createOnChatReplayTimer();
     let historyBytesRead = 0;
     let streamReplayed = false;
@@ -3275,7 +3276,11 @@ export class AgentSession {
         }
 
         const stopEmitRows = replayTimer.start("emitRows");
+        // Yield on large epochs so heartbeats keep firing and pushed rows reach the client
+        // while the rest are still being validated (#4506).
+        const emitYielder = new EventLoopYielder();
         for (const message of history) {
+          if (emitYielder.isDue()) await emitYielder.yield();
           // Skip the placeholder message if we have a partial with the same historySequence.
           // The placeholder has empty parts; the partial has the actual content.
           // Without this, both get loaded and the empty placeholder may be shown as "last message".
