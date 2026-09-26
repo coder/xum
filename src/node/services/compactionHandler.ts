@@ -1088,7 +1088,8 @@ export class CompactionHandler {
         .join("");
       let keptSummaryTokens: number | undefined;
       try {
-        keptSummaryTokens = await countTokens(metadata.model, keptText);
+        // Count with the request-pinned identity, as StreamManager does for custom providers.
+        keptSummaryTokens = await countTokens(metadata.metadataModel ?? metadata.model, keptText);
       } catch (error) {
         log.warn("Failed to count truncated compaction summary tokens", {
           workspaceId: this.workspaceId,
