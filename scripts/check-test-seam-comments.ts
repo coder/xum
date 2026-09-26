@@ -44,7 +44,7 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // Honest phrasings that say the same thing without "test": "No production caller: ...",
   // "Has no non-test consumers." The claim must end there, so invariants such as
   // "No production callers pass null" stay quiet.
-  /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:;,)]|$))/i,
+  /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:)]|$))/i,
   // "overridable for tests only", "set by tests only". The seam verb is required so behavior
   // notes such as "runs in tests only when isolation is enabled" stay quiet.
   /\b(?:overridable|overridden|settable|set|passed|injected|kept)\s+(?:for|by|in)\s+tests\s+only\b/i,

@@ -72,6 +72,9 @@ test("matches honest phrasings without the word test in the seam claim", () => {
   // Descriptive uses stay quiet.
   expect(seams("// No production data leaves this process.\nexport const c = 1;")).toEqual([]);
   expect(seams("// No production callers pass null here.\nexport const e = 1;")).toEqual([]);
+  expect(
+    seams("// When there are no production consumers, close it.\nexport const g = 1;")
+  ).toEqual([]);
   expect(seams("// This runs in tests only when isolation is on.\nexport const f = 1;")).toEqual(
     []
   );
