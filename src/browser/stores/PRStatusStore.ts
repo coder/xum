@@ -29,7 +29,7 @@ import {
   onPassiveRuntimeEligible,
   type PassiveRuntimeDeps,
 } from "@/browser/utils/runtimeExecutionPolicy";
-import { onChatReplaySettled, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
 /**
  * Parse a GitHub PR URL to extract owner, repo, and number.
  * Returns null if the URL is not a valid GitHub PR URL.
@@ -925,20 +925,15 @@ export class PRStatusStore {
     const refreshes: Array<Promise<void>> = [];
 
     for (const workspaceId of workspaceIds) {
-      // #4662: defer gh pr/stack probes while the workspace's chat replay is pending. Each
-      // executeBash spawn blocks the Electron main process ~8-16 ms and the results render
-      // during the transcript paint; the persisted PR status stays visible meanwhile.
-      const chatReplayGate = this.chatReplayGate;
-      if (chatReplayGate?.isReplayPending(workspaceId)) {
-        if (!this.chatReplayRetryUnsubscribers.has(workspaceId)) {
-          this.chatReplayRetryUnsubscribers.set(
-            workspaceId,
-            onChatReplaySettled(chatReplayGate, workspaceId, () => {
-              this.chatReplayRetryUnsubscribers.delete(workspaceId);
-              this.refreshController.requestImmediate();
-            })
-          );
-        }
+      // #4662: defer gh pr/stack probes while the workspace's chat replay is pending.
+      if (
+        deferWhileChatReplayPending(
+          this.chatReplayGate,
+          this.chatReplayRetryUnsubscribers,
+          workspaceId,
+          () => this.refreshController.requestImmediate()
+        )
+      ) {
         continue;
       }
 

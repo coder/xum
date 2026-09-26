@@ -182,10 +182,8 @@ function AppLoaderInner() {
     // #4662: git/PR probes for a workspace wait for its chat replay to settle. Wire the gate
     // before setClient/syncWorkspaces below, which can refresh synchronously.
     const chatReplayGate = {
-      isReplayPending: (workspaceId: string) =>
-        workspaceStore.isWorkspaceChatReplayPending(workspaceId),
-      subscribeKey: (workspaceId: string, listener: () => void) =>
-        workspaceStore.subscribeKey(workspaceId, listener),
+      isReplayPending: workspaceStore.isWorkspaceChatReplayPending,
+      subscribeKey: workspaceStore.subscribeKey,
     };
     gitStatusStore.setChatReplayGate(chatReplayGate);
     getPRStatusStoreInstance().setChatReplayGate(chatReplayGate);

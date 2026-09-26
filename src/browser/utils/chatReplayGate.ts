@@ -1,5 +1,3 @@
-import assert from "@/common/utils/assert";
-
 /**
  * Read-only view of WorkspaceStore's chat-replay state used to defer passive
  * git/PR probes while a workspace's onChat history replay is still pending (#4662).
@@ -10,21 +8,26 @@ export interface ChatReplayGate {
 }
 
 /**
- * Arms a one-shot listener that fires `onSettled()` once the workspace's chat replay is
- * no longer pending. Callers arm it only after `isReplayPending` returned true, so it
- * never fires synchronously (callers store the returned cancel function afterwards).
+ * #4662: returns true while the workspace's chat replay is pending, so the caller skips its
+ * git/PR probes for now. Each executeBash spawn blocks the Electron main process ~8-16 ms and
+ * the results render during the transcript paint; the cached status stays visible meanwhile,
+ * and deferring costs roughly the replay duration (~0.1-0.2 s on cold open).
  *
- * Returns a cancel function; the listener auto-unsubscribes after firing once.
+ * Arms at most one retry per workspace in `retries` (workspace ID -> cancel function). The
+ * retry removes its entry and calls `onSettled()` once the replay is no longer pending.
  */
-export function onChatReplaySettled(
-  gate: ChatReplayGate,
+export function deferWhileChatReplayPending(
+  gate: ChatReplayGate | null,
+  retries: Map<string, () => void>,
   workspaceId: string,
   onSettled: () => void
-): () => void {
-  assert(
-    gate.isReplayPending(workspaceId),
-    `onChatReplaySettled requires a pending chat replay for ${workspaceId}`
-  );
+): boolean {
+  if (!gate?.isReplayPending(workspaceId)) {
+    return false;
+  }
+  if (retries.has(workspaceId)) {
+    return true;
+  }
 
   let done = false;
   const unsubscribe = gate.subscribeKey(workspaceId, () => {
@@ -33,11 +36,12 @@ export function onChatReplaySettled(
     }
     done = true;
     unsubscribe();
+    retries.delete(workspaceId);
     onSettled();
   });
-
-  return () => {
+  retries.set(workspaceId, () => {
     done = true;
     unsubscribe();
-  };
+  });
+  return true;
 }

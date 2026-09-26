@@ -5,7 +5,7 @@ import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/worksp
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
-import { onChatReplaySettled, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
+import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -373,29 +373,6 @@ export class GitStatusStore {
   }
 
   /**
-   * #4662: skip a workspace (status script AND git fetch) while its chat replay is pending.
-   * Each executeBash spawn blocks the Electron main process ~8-16 ms and the results render
-   * during the transcript paint. Deferring to caught-up costs roughly the replay duration
-   * (~0.1-0.2 s on cold open) while the cached status stays visible.
-   */
-  private deferForChatReplay(workspaceId: string): boolean {
-    const gate = this.chatReplayGate;
-    if (!gate?.isReplayPending(workspaceId)) {
-      return false;
-    }
-    if (!this.chatReplayRetryUnsubscribers.has(workspaceId)) {
-      this.chatReplayRetryUnsubscribers.set(
-        workspaceId,
-        onChatReplaySettled(gate, workspaceId, () => {
-          this.chatReplayRetryUnsubscribers.delete(workspaceId);
-          this.refreshController.requestImmediate();
-        })
-      );
-    }
-    return true;
-  }
-
-  /**
    * Update git status for all workspaces.
    */
   private async updateGitStatus(): Promise<void> {
@@ -403,9 +380,17 @@ export class GitStatusStore {
       return;
     }
 
-    // Only poll workspaces that have active subscribers.
+    // Only poll workspaces that have active subscribers and whose chat replay has settled
+    // (#4662: a deferred workspace skips both the status script and git fetch).
     const workspaces = Array.from(this.workspaceMetadata.values()).filter(
-      (ws) => this.hasWorkspaceSubscribers(ws.id) && !this.deferForChatReplay(ws.id)
+      (ws) =>
+        this.hasWorkspaceSubscribers(ws.id) &&
+        !deferWhileChatReplayPending(
+          this.chatReplayGate,
+          this.chatReplayRetryUnsubscribers,
+          ws.id,
+          () => this.refreshController.requestImmediate()
+        )
     );
 
     if (workspaces.length === 0) {
