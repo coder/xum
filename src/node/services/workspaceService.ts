@@ -4580,6 +4580,10 @@ export class WorkspaceService
     return null;
   }
 
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
   beginShutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
