@@ -1138,6 +1138,33 @@ exit 1
       }
     });
 
+    it("yields error and rolls back when the config write rejects", async () => {
+      const sourceRepoPath = await createLocalGitRepository(tempDir, "source-repo-write-reject");
+      const cloneParentDir = path.join(tempDir, "write-reject-clones");
+      const rejectingConfig = new Config(tempDir);
+      rejectingConfig.editConfig = () => Promise.reject(new Error("EACCES: permission denied"));
+      const rejectingService = new ProjectService(rejectingConfig);
+
+      const events: CloneEvent[] = [];
+      for await (const event of rejectingService.cloneWithProgress({
+        repoUrl: sourceRepoPath,
+        cloneParentDir,
+      })) {
+        events.push(event);
+      }
+
+      const terminalEvent = events[events.length - 1];
+      expect(terminalEvent?.type).toBe("error");
+      if (terminalEvent?.type !== "error") throw new Error("Expected error event");
+      expect(terminalEvent.error).toContain("EACCES");
+      // A rejected registration must not orphan the clone at the user's chosen path (#4444).
+      const expectedProjectPath = path.resolve(cloneParentDir, "source-repo-write-reject");
+      const stat = await fs
+        .stat(expectedProjectPath)
+        .catch((error: NodeJS.ErrnoException) => error);
+      expect(stat).toMatchObject({ code: "ENOENT" });
+    });
+
     it("cleans up partial clone and yields cancellation event when aborted", async () => {
       if (process.platform === "win32") {
         // This test relies on a POSIX shell shim named "git" in PATH.

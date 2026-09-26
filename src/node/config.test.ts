@@ -836,6 +836,45 @@ describe("Config", () => {
         readOnly?.runtimeConfig
       );
     });
+
+    it("a failed migration persist does not fail the metadata read (#4444)", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      fs.mkdirSync(projectPath, { recursive: true });
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              {
+                workspaces: [
+                  { id: "ws-legacy", name: "legacy", path: path.join(projectPath, "legacy") },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      await flushConfigEdits();
+      const before = fs.readFileSync(configFile, "utf-8");
+      const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+      const editSpy = spyOn(config, "editConfig").mockRejectedValueOnce(
+        new Error("ENOSPC: no space left on device")
+      );
+      try {
+        // Startup and every workspace list read go through here: a write failure must not
+        // turn a read into a rejection.
+        const all = await config.getAllWorkspaceMetadata();
+        expect(all.find((meta) => meta.id === "ws-legacy")?.runtimeConfig).toBeDefined();
+        expect(editSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalled();
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
+      } finally {
+        editSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   describe("editConfig", () => {
