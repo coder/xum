@@ -23,10 +23,10 @@ describe("codexOAuth model gating", () => {
   it("allows the GPT-5.6 family through Codex OAuth without requiring it", () => {
     // Includes the bare alias: it is a servable model id (OpenAI routes it to Sol).
     const contextLimits = {
-      "gpt-5.6": 372_000,
-      "gpt-5.6-sol": 372_000,
-      "gpt-5.6-terra": 372_000,
-      "gpt-5.6-luna": 372_000,
+      "gpt-5.6": 272_000,
+      "gpt-5.6-sol": 272_000,
+      "gpt-5.6-terra": 272_000,
+      "gpt-5.6-luna": 272_000,
     } as const;
 
     for (const [model, contextLimit] of Object.entries(contextLimits)) {
