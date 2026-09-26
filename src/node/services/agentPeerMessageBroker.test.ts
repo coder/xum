@@ -16,7 +16,10 @@ import {
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
 } from "@/constants/taskMessages";
-import { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
+import {
+  AgentPeerMessageBroker,
+  PEER_WAKE_LIMIT_REFUSAL_REASON,
+} from "@/node/services/agentPeerMessageBroker";
 
 function createHarness(initialNow = 1_000) {
   let now = initialNow;
@@ -101,10 +104,12 @@ describe("AgentPeerMessageBroker", () => {
     }
     expect(broker.checkPeerAdmission("sender", "target", "message")).toEqual({
       code: "refused",
-      reason: "Target reached its consecutive peer-wake limit and needs user or parent attention.",
+      reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
     });
-    broker.resetConsecutivePeerWakes("target");
+    // The refused sender is returned once so the caller can wake it; a later reset has no waiters.
+    expect(broker.resetConsecutivePeerWakes("target")).toEqual(["sender"]);
     expect(broker.checkPeerAdmission("sender", "target", "message")).toBeNull();
+    expect(broker.resetConsecutivePeerWakes("target")).toEqual([]);
   });
 
   test.each([

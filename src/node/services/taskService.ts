@@ -88,6 +88,7 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import {
   AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
   AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  PEER_WAKE_AVAILABLE_DEDUPE_PREFIX,
   INSTANCE_DISCOVERY_DEFAULT_LIMIT,
   INSTANCE_DISCOVERY_MAX_LIMIT,
   agentReportProgressDedupePrefix,
@@ -9124,30 +9125,9 @@ export class TaskService implements AgentTaskIntegration {
       const hasLiveRunningExecution = (
         workspace: WorkspaceConfigEntry,
         workspaceId: string
-      ): boolean => {
-        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
-        return (
-          workspace.taskExecutionStatus === "running" &&
-          workspace.taskExecutionId != null &&
-          live != null &&
-          live.handleId === workspace.taskExecutionId &&
-          live.accepted
-        );
-      };
-      const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
-        // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
-        if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
-        if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
-          // Root workspaces have no task lifecycle to go terminal.
-          return false;
-        }
-        const status = workspace.taskStatus ?? "running";
-        return (
-          !hasLiveRunningExecution(workspace, senderWorkspaceId) &&
-          status !== "running" &&
-          status !== "awaiting_report"
-        );
-      };
+      ): boolean => this.hasLiveRunningTaskExecution(workspace, workspaceId);
+      const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean =>
+        this.isInactivePeerSenderWorkspace(workspace, senderWorkspaceId);
       if (isInactivePeerSender(senderEntry.workspace)) {
         return Err(senderInactiveRefusal);
       }
@@ -9625,6 +9605,118 @@ export class TaskService implements AgentTaskIntegration {
         throw error;
       }
     });
+  }
+
+  private hasLiveRunningTaskExecution(
+    workspace: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
+    return (
+      workspace.taskExecutionStatus === "running" &&
+      workspace.taskExecutionId != null &&
+      live != null &&
+      live.handleId === workspace.taskExecutionId &&
+      live.accepted
+    );
+  }
+
+  private isInactivePeerSenderWorkspace(
+    workspace: WorkspaceConfigEntry,
+    workspaceId: string
+  ): boolean {
+    // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
+    if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
+    if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
+      // Root workspaces have no task lifecycle to go terminal.
+      return false;
+    }
+    const status = workspace.taskStatus ?? "running";
+    return (
+      !this.hasLiveRunningTaskExecution(workspace, workspaceId) &&
+      status !== "running" &&
+      status !== "awaiting_report"
+    );
+  }
+
+  /**
+   * Wake senders that the target's consecutive-wake cap refused, now that user or parent attention
+   * reset it. A refused sender cannot tell when the target becomes reachable again; without this it
+   * either polls or abandons the message (observed: it fell back to posting on a GitHub issue).
+   * Each notice runs under the sender's event lock and never blocks the attention reset itself.
+   */
+  private schedulePeerWakeAvailableNotices(targetId: string, senderIds: readonly string[]): void {
+    for (const senderId of senderIds) {
+      this.workspaceEventLocks
+        .withLock(senderId, () => this.deliverPeerWakeAvailableNotice(targetId, senderId))
+        .catch((error: unknown) => {
+          log.error("Failed to wake a sender refused by a peer-wake limit", {
+            targetId,
+            senderId,
+            error,
+          });
+        });
+    }
+  }
+
+  private async deliverPeerWakeAvailableNotice(targetId: string, senderId: string): Promise<void> {
+    const cfg = this.config.loadConfigOrDefault();
+    const targetEntry = findWorkspaceEntry(cfg, targetId);
+    const senderEntry = findWorkspaceEntry(cfg, senderId);
+    if (targetEntry == null || senderEntry == null) return;
+    if (isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt)) {
+      return;
+    }
+    const index = this.buildAgentTaskIndex(cfg);
+    const chainInterrupted = (workspaceId: string): boolean =>
+      [
+        workspaceId,
+        ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, workspaceId),
+      ].some((id) => this.interruptedParentWorkspaceIds.has(id));
+    // A user Stop also resets the cap (interruptStream resets before marking the interrupt), but
+    // the stopped target still refuses peer messages. Keep waiting for the resume instead.
+    if (chainInterrupted(targetId)) {
+      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, senderId);
+      return;
+    }
+    // Same rules as sending: a stopped, terminal, or archived sender must not be woken by this.
+    if (
+      chainInterrupted(senderId) ||
+      this.isInactivePeerSenderWorkspace(senderEntry.workspace, senderId)
+    ) {
+      return;
+    }
+
+    let sendRestrictions: Awaited<
+      ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
+    >;
+    try {
+      // Security: a fresh synthetic turn must keep the sender's tool policy (see terminal wakes).
+      sendRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(senderId);
+    } catch (error: unknown) {
+      log.warn("Skipping peer-wake notice; sender tool policy unavailable", { senderId, error });
+      return;
+    }
+
+    // Zero peer-controlled bytes: workspace IDs are server-generated and the title is omitted.
+    const content =
+      `Workspace ${targetId} accepts agent messages again: it received user or parent attention ` +
+      `after task_send_message refused your message for its consecutive peer-wake limit. ` +
+      `If that message still matters, resend it with task_send_message now; otherwise continue.`;
+    const result = await this.wakeParentWorkspaceWithSyntheticMessage({
+      parentWorkspaceId: senderId,
+      parentEntry: senderEntry,
+      content,
+      queueDedupeKey: `${PEER_WAKE_AVAILABLE_DEDUPE_PREFIX}${targetId}`,
+      // Never cut into the sender's current work; an idle sender starts a new turn right away.
+      queueDispatchMode: "turn-end",
+      // An opportunistic notice must not fail the sender's own delegated workspace turn.
+      settleContinuationOnSendRefusal: false,
+      sendRestrictions,
+    });
+    if (!result.success) {
+      log.warn("Peer-wake notice was not delivered", { targetId, senderId, error: result.error });
+    }
   }
 
   async stopDescendantAgentTask(
@@ -15003,7 +15095,10 @@ export class TaskService implements AgentTaskIntegration {
     this.interruptedParentWorkspaceIds.delete(workspaceId);
     // User-authored sends (and parent guidance, which does not skip this reset) count as fresh
     // attention: peer messages may wake this workspace again.
-    this.agentPeerMessageBroker.resetConsecutivePeerWakes(workspaceId);
+    const refusedSenderIds = this.agentPeerMessageBroker.resetConsecutivePeerWakes(workspaceId);
+    if (refusedSenderIds.length > 0) {
+      this.schedulePeerWakeAvailableNotices(workspaceId, refusedSenderIds);
+    }
   }
 
   /** Mark a parent workspace as hard-interrupted by the user. */
