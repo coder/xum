@@ -21,16 +21,14 @@ function clearDesktopApi() {
 }
 
 async function openAnalyticsAndGetHeader(container: HTMLElement) {
-  const analyticsButton = container.querySelector(
-    '[data-testid="analytics-button"]'
-  ) as HTMLButtonElement;
+  const analyticsButton = container.querySelector('[data-testid="analytics-button"]')!;
   expect(analyticsButton).not.toBeNull();
   fireEvent.click(analyticsButton);
 
   let header: HTMLElement | null = null;
   await waitFor(
     () => {
-      header = container.querySelector('[data-testid="analytics-header"]') as HTMLElement;
+      header = container.querySelector('[data-testid="analytics-header"]')!;
       if (!header) {
         throw new Error("Analytics header not found");
       }
@@ -70,14 +68,12 @@ describe("Analytics header titlebar contract", () => {
       const header = await openAnalyticsAndGetHeader(app.view.container);
       const collapseSidebarButton = app.view.container.querySelector(
         'button[aria-label="Collapse sidebar"]'
-      ) as HTMLButtonElement | null;
+      );
       expect(collapseSidebarButton).not.toBeNull();
       fireEvent.click(collapseSidebarButton!);
 
       const openSidebarButton = await waitFor(() => {
-        const button = header.querySelector(
-          'button[aria-label="Open sidebar"]'
-        ) as HTMLButtonElement | null;
+        const button = header.querySelector('button[aria-label="Open sidebar"]');
         if (!button) {
           throw new Error("Analytics sidebar opener not found");
         }

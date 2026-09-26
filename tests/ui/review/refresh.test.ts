@@ -578,6 +578,7 @@ describeIntegration("ReviewPanel auto refresh (UI + ORPC)", () => {
         textarea.focus();
         fireEvent.focus(textarea);
 
+        // eslint-disable-next-line @typescript-eslint/unbound-method -- native setter is invoked with .call(textarea) below
         const valueSetter = Object.getOwnPropertyDescriptor(
           Object.getPrototypeOf(textarea),
           "value"

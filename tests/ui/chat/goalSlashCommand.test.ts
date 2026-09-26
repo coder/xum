@@ -43,9 +43,7 @@ describe("Goal slash command", () => {
       });
 
       await app.chat.typeWithoutSending("/goal this is your new goal,");
-      const textarea = app.view.container.querySelector(
-        'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      const textarea = app.view.container.querySelector('textarea[aria-label="Message Claude"]');
       expect(textarea).not.toBeNull();
       fireEvent.keyDown(textarea!, { key: "Enter" });
 
@@ -135,9 +133,9 @@ describe("Goal slash command", () => {
 
     try {
       const getTextarea = () =>
-        app.view.container.querySelector(
+        app.view.container.querySelector<HTMLTextAreaElement>(
           'textarea[aria-label="Message Claude"]'
-        ) as HTMLTextAreaElement | null;
+        );
 
       await waitFor(() => {
         const textarea = getTextarea();

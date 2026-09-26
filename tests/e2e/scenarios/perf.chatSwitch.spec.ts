@@ -351,7 +351,7 @@ test.describe("chat switch performance profiling", () => {
       chatSwitch: { switches, medians: summarizeChatSwitches(switches) },
     });
     testInfo.annotations.push({ type: "perf-artifact", description: artifactDirectory });
-    // eslint-disable-next-line no-console
+
     console.log(`[chat-switch] medians\n${renderChatSwitchMarkdownTable(switches)}`);
 
     const switchBacks = switches.filter((record) => record.targetMidStream);

@@ -88,13 +88,13 @@ describe("Queued messages during stream completion", () => {
 
     // Create a deterministic COMPLETING window by gating the async stream-end handler
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
-    type SessionInternals = {
+    interface SessionInternals {
       contextController: {
         compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
-    };
+    }
     const compactionHandler = (session as unknown as SessionInternals).contextController
       .compactionHandler;
 
@@ -162,13 +162,13 @@ describe("Queued messages during stream completion", () => {
 
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
-    type SessionInternals = {
+    interface SessionInternals {
       contextController: {
         compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
-    };
+    }
     const compactionHandler = (session as unknown as SessionInternals).contextController
       .compactionHandler;
 
@@ -239,13 +239,13 @@ describe("Queued messages during stream completion", () => {
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
     const aiService = env.services.aiService;
 
-    type SessionInternals = {
+    interface SessionInternals {
       contextController: {
         compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
-    };
+    }
     const compactionHandler = (session as unknown as SessionInternals).contextController
       .compactionHandler;
 
@@ -376,13 +376,13 @@ describe("Queued messages during stream completion", () => {
 
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
-    type SessionInternals = {
+    interface SessionInternals {
       contextController: {
         compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
-    };
+    }
     const compactionHandler = (session as unknown as SessionInternals).contextController
       .compactionHandler;
 
@@ -398,9 +398,9 @@ describe("Queued messages during stream completion", () => {
         return originalHandleCompletion(event);
       });
 
-    type WorkspaceServiceInternals = {
+    interface WorkspaceServiceInternals {
       historyService: HistoryService;
-    };
+    }
     const historyService = (env.services.workspaceService as unknown as WorkspaceServiceInternals)
       .historyService;
     const truncateSpy = jest.spyOn(historyService, "truncateAfterMessage");
@@ -490,13 +490,13 @@ describe("Queued messages during stream completion", () => {
 
     const session = env.services.workspaceService.getOrCreateSession(workspaceId);
 
-    type SessionInternals = {
+    interface SessionInternals {
       contextController: {
         compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
-    };
+    }
     const compactionHandler = (session as unknown as SessionInternals).contextController
       .compactionHandler;
 
@@ -575,13 +575,13 @@ describe("Queued messages during stream completion", () => {
 
     // Create a deterministic COMPLETING window by gating the async stream-end handler
     // (AgentSession awaits CompactionHandler.handleCompletion before it can go idle).
-    type SessionInternals = {
+    interface SessionInternals {
       contextController: {
         compactionHandler: {
           handleCompletion: (event: unknown) => Promise<boolean>;
         };
       };
-    };
+    }
     const compactionHandler = (session as unknown as SessionInternals).contextController
       .compactionHandler;
 
@@ -597,9 +597,9 @@ describe("Queued messages during stream completion", () => {
         return originalHandleCompletion(event);
       });
 
-    type WorkspaceServiceInternals = {
+    interface WorkspaceServiceInternals {
       historyService: HistoryService;
-    };
+    }
     const historyService = (env.services.workspaceService as unknown as WorkspaceServiceInternals)
       .historyService;
 

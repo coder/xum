@@ -61,9 +61,7 @@ describeIntegration("LeftSidebar (UI)", () => {
           { timeout: 10_000 }
         );
 
-        const handle = sidebar.querySelector(
-          '[data-testid="left-sidebar-resize-handle"]'
-        ) as HTMLElement | null;
+        const handle = sidebar.querySelector('[data-testid="left-sidebar-resize-handle"]');
         if (!handle) {
           throw new Error("LeftSidebar resize handle not found");
         }

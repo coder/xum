@@ -1,6 +1,7 @@
 import "./dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import { APIProvider } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
@@ -69,7 +70,7 @@ function renderBackupSection(
 
   return { client, view };
 }
-async function confirmRestore(canvas: ReturnType<typeof within>): Promise<void> {
+async function confirmRestore(canvas: BoundFunctions<typeof queries>): Promise<void> {
   fireEvent.click(canvas.getByRole("button", { name: /^Restore$/ }));
   const dialog = await within(document.body).findByRole("dialog");
   fireEvent.click(within(dialog).getByRole("button", { name: /Restore settings/i }));
@@ -763,7 +764,7 @@ describe("BackupSection", () => {
     const restore = jest.spyOn(client.backup, "restore");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
     const targetInputs = canvas.getAllByLabelText("Local project directory");
-    fireEvent.change(targetInputs[0]!, { target: { value: "/home/other/rocket" } });
+    fireEvent.change(targetInputs[0], { target: { value: "/home/other/rocket" } });
     await confirmRestore(canvas);
 
     await waitFor(() =>
@@ -823,7 +824,7 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);
@@ -908,7 +909,7 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);
@@ -919,7 +920,7 @@ describe("BackupSection", () => {
     ).toBeTruthy();
 
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);

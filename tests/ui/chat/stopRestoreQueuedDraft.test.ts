@@ -37,7 +37,7 @@ const providerAttachment = (filename: string) => ({
 });
 
 const composerAttachmentNames = (app: AppHarness) =>
-  readPersistedState<Array<{ filename?: string }>>(getInputAttachmentsKey(app.workspaceId), []).map(
+  readPersistedState<{ filename?: string }[]>(getInputAttachmentsKey(app.workspaceId), []).map(
     (attachment) => attachment.filename
   );
 /** Notes still attached in the workspace's review store (a send checks its notes off). */

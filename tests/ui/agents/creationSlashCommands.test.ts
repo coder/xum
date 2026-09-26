@@ -29,13 +29,13 @@ import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-type CreationView = {
+interface CreationView {
   env: ReturnType<typeof getSharedEnv>;
   projectPath: string;
   view: ReturnType<typeof renderApp>;
   cleanupDom: () => void;
   chat: ChatHarness;
-};
+}
 
 async function setupCreationView(): Promise<CreationView> {
   const env = getSharedEnv();

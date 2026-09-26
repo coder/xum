@@ -89,7 +89,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected /compact command to parse");
     }
 
@@ -105,7 +105,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected /compact command with explicit gateway prefix to parse");
     }
 
@@ -119,7 +119,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected /compact command with mux-gateway prefix to parse");
     }
 
@@ -142,7 +142,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected one-line /compact command to parse");
     }
 
@@ -157,7 +157,7 @@ describe("ACP slash command support", () => {
     );
 
     expect(parsed?.kind).toBe("compact");
-    if (parsed == null || parsed.kind !== "compact") {
+    if (parsed?.kind !== "compact") {
       throw new Error("Expected numeric one-line /compact command to parse");
     }
 
@@ -195,7 +195,7 @@ describe("ACP slash command support", () => {
 
     const parsed = parseAcpSlashCommand("/react-effects reduce useEffect churn", skillsByName);
     expect(parsed?.kind).toBe("skill");
-    if (parsed == null || parsed.kind !== "skill") {
+    if (parsed?.kind !== "skill") {
       throw new Error("Expected skill command to parse");
     }
 
@@ -205,7 +205,7 @@ describe("ACP slash command support", () => {
 
     const noArgs = parseAcpSlashCommand("/react-effects", skillsByName);
     expect(noArgs?.kind).toBe("skill");
-    if (noArgs == null || noArgs.kind !== "skill") {
+    if (noArgs?.kind !== "skill") {
       throw new Error("Expected skill command without args to parse");
     }
 

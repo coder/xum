@@ -309,7 +309,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       const timeoutMs = options?.timeoutMs ?? 30_000;
       const workspaceId = context.workspaceId;
       await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -319,11 +319,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
 
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
@@ -440,13 +440,18 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         };
       }, workspaceId);
 
-      let actionError: unknown;
+      // Boxed so a caught value keeps its `unknown` type (a truthiness check would narrow it).
+      let actionFailure: { error: unknown } | undefined;
       try {
         await action();
         await page.waitForFunction(
           (id: string) => {
-            type StreamCaptureEvent = { type: string };
-            type StreamCapture = { events: StreamCaptureEvent[] };
+            interface StreamCaptureEvent {
+              type: string;
+            }
+            interface StreamCapture {
+              events: StreamCaptureEvent[];
+            }
             const win = window as unknown as {
               __muxStreamCapture?: Record<string, StreamCapture>;
             };
@@ -463,11 +468,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           { timeout: timeoutMs }
         );
       } catch (error) {
-        actionError = error;
+        actionFailure = { error };
       }
 
       const events = await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -477,11 +482,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
         };
@@ -497,8 +502,8 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         return capture.events.slice();
       }, workspaceId);
 
-      if (actionError) {
-        throw actionError;
+      if (actionFailure) {
+        throw actionFailure.error;
       }
 
       return { events };

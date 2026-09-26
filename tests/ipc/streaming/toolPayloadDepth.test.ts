@@ -43,7 +43,11 @@ const usage = {
 };
 
 type SpecVersion = "v2" | "v3" | "v4";
-type MockToolCall = { toolCallId: string; toolName: string; input: string };
+interface MockToolCall {
+  toolCallId: string;
+  toolName: string;
+  input: string;
+}
 
 /**
  * The same two-step stream in each provider spec shape. v2/v3 models reach the
@@ -249,7 +253,7 @@ describe("tool payload depth guard (live stream)", () => {
       expect(run.executeInputs).toEqual([JSON.parse(deepToolInputText(depth))]);
       expect(run.toolPart).toMatchObject({
         state: "output-available",
-        input: JSON.parse(deepToolInputText(depth)),
+        input: JSON.parse(deepToolInputText(depth)) as unknown,
         output: { ok: true },
       });
     }

@@ -36,7 +36,7 @@ const ANTHROPIC_1M_BETA = "context-1m-2025-08-07";
 /** What the fixture returns for a request that carries the 1M beta header. */
 type RetryResponse = "success" | "refusal" | "overflow";
 
-function sse(events: Array<[string, unknown]>): string {
+function sse(events: [string, unknown][]): string {
   return events
     .map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     .join("");
@@ -101,7 +101,7 @@ const OVERFLOW_BODY = JSON.stringify({
  * request order: without the header every request overflows.
  */
 async function startAnthropicFixture(retryResponse: RetryResponse) {
-  const requests: Array<{ has1MHeader: boolean }> = [];
+  const requests: { has1MHeader: boolean }[] = [];
   const server = http.createServer((req, res) => {
     req.resume();
     req.on("end", () => {

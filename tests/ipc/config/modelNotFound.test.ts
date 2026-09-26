@@ -1,6 +1,5 @@
 import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
 import { sendMessageWithModel, createStreamCollector, modelString } from "../helpers";
-import type { StreamErrorMessage } from "@/common/orpc/types";
 
 // Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -32,9 +31,7 @@ describeIntegration("model_not_found error handling", () => {
         await collector.waitForEvent("stream-error", 10000);
 
         const events = collector.getEvents();
-        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error") as
-          | StreamErrorMessage
-          | undefined;
+        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error");
 
         expect(errorEvent).toBeDefined();
 
@@ -70,9 +67,7 @@ describeIntegration("model_not_found error handling", () => {
         await collector.waitForEvent("stream-error", 10000);
 
         const events = collector.getEvents();
-        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error") as
-          | StreamErrorMessage
-          | undefined;
+        const errorEvent = events.find((e) => "type" in e && e.type === "stream-error");
 
         expect(errorEvent).toBeDefined();
 

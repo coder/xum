@@ -18,7 +18,7 @@ import { setImmediate as yieldToEventLoop } from "node:timers/promises";
  */
 export async function drainFifoReaders(
   fifoPath: string,
-  attempts: ReadonlyArray<Promise<unknown>>,
+  attempts: readonly Promise<unknown>[],
   deadlineMs = 30_000
 ): Promise<{ settled: boolean; writerOpens: number }> {
   let settled = false;

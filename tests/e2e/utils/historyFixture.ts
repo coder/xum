@@ -7,14 +7,14 @@ import { HistoryService } from "../../../src/node/services/historyService";
 
 const BASE_TIMESTAMP_MS = 1_700_000_000_000;
 
-type HistoryProfileDefinition = {
+interface HistoryProfileDefinition {
   messagePairs: number;
   userChars: number;
   assistantChars: number;
   reasoningChars: number;
   toolOutputChars: number;
   largeDiffLinePairs?: number;
-};
+}
 
 const HISTORY_PROFILE_NAMES = [
   "small",

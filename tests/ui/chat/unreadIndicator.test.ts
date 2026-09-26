@@ -51,16 +51,12 @@ function getWorkspaceUnreadIndicator(
   container: HTMLElement,
   workspaceId: string
 ): { element: HTMLElement; hasUnreadBar: boolean } | null {
-  const workspaceEl = container.querySelector(
-    `[data-workspace-id="${workspaceId}"]`
-  ) as HTMLElement | null;
+  const workspaceEl = container.querySelector<HTMLElement>(`[data-workspace-id="${workspaceId}"]`);
 
   if (!workspaceEl) return null;
 
   // The unread indicator is a StatusDot span with the idle/unread styling
-  const statusDot = workspaceEl.querySelector(
-    'span[class*="bg-surface-invert-secondary"]'
-  ) as HTMLElement | null;
+  const statusDot = workspaceEl.querySelector('span[class*="bg-surface-invert-secondary"]');
 
   return {
     element: workspaceEl,
@@ -246,9 +242,7 @@ describe("Unread indicator (mock AI router)", () => {
       const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
 
       // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector(
-        '[data-testid="settings-button"]'
-      ) as HTMLButtonElement;
+      const settingsButton = app.view.container.querySelector('[data-testid="settings-button"]')!;
       expect(settingsButton).not.toBeNull();
       fireEvent.click(settingsButton);
 
@@ -285,9 +279,7 @@ describe("Unread indicator (mock AI router)", () => {
       const lastReadAfterSend = getLastReadTimestamp(app.workspaceId);
 
       // Navigate to settings — this replaces AIView with SettingsPage.
-      const settingsButton = app.view.container.querySelector(
-        '[data-testid="settings-button"]'
-      ) as HTMLButtonElement;
+      const settingsButton = app.view.container.querySelector('[data-testid="settings-button"]')!;
       expect(settingsButton).not.toBeNull();
       fireEvent.click(settingsButton);
 
@@ -389,7 +381,7 @@ describe("Unread indicator (mock AI router)", () => {
     let createdWorkspaceIds: string[];
 
     function queryMenuItem(label: string): HTMLButtonElement | null {
-      const menuButtons = Array.from(document.querySelectorAll("button")) as HTMLButtonElement[];
+      const menuButtons = Array.from(document.querySelectorAll("button"));
       return menuButtons.find((button) => button.textContent?.includes(label)) ?? null;
     }
 
@@ -398,7 +390,7 @@ describe("Unread indicator (mock AI router)", () => {
         () => {
           const button = app.view.container.querySelector(
             `button[aria-label="Workspace actions for ${displayTitle}"]`
-          ) as HTMLButtonElement | null;
+          );
           if (!button) {
             throw new Error(`Workspace actions button not found for ${displayTitle}`);
           }
@@ -442,7 +434,7 @@ describe("Unread indicator (mock AI router)", () => {
         () => {
           const workspaceRow = app.view.container.querySelector(
             `[data-workspace-id="${createdWorkspace.id}"]`
-          ) as HTMLElement | null;
+          );
           if (!workspaceRow) {
             throw new Error("Created workspace row not visible yet");
           }
@@ -470,14 +462,12 @@ describe("Unread indicator (mock AI router)", () => {
       workspaceId: string,
       displayTitle: string
     ): HTMLSpanElement | null {
-      const workspaceRow = app.view.container.querySelector(
-        `[data-workspace-id="${workspaceId}"]`
-      ) as HTMLElement | null;
+      const workspaceRow = app.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!workspaceRow) {
         return null;
       }
 
-      const textSpans = Array.from(workspaceRow.querySelectorAll("span")) as HTMLSpanElement[];
+      const textSpans = Array.from(workspaceRow.querySelectorAll("span"));
       return textSpans.find((span) => span.textContent?.trim() === displayTitle) ?? null;
     }
 
@@ -608,7 +598,7 @@ describe("Unread indicator (mock AI router)", () => {
       await waitFor(() => {
         const selectedRow = app.view.container.querySelector(
           `[data-workspace-id="${app.workspaceId}"]`
-        ) as HTMLElement | null;
+        );
         if (!selectedRow) {
           throw new Error("Selected workspace row not found");
         }

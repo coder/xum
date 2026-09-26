@@ -46,7 +46,9 @@ export function prepareDemoProject(
   rootDir: string,
   options: DemoProjectOptions = {}
 ): DemoProjectConfig {
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- blank name must use the default
   const projectName = options.projectName?.trim() || DEFAULT_PROJECT_NAME;
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- blank branch must use the default
   const workspaceBranch = options.workspaceBranch?.trim() || DEFAULT_WORKSPACE_BRANCH;
   assertHistoryLines(options.historyLines);
 
@@ -131,7 +133,7 @@ export function addDemoWorkspace(
 
   const workspaceId = new Config(rootDir).generateLegacyId(demoProject.projectPath, workspacePath);
   const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
-    projects: Array<[string, { workspaces: Array<{ path: string }> }]>;
+    projects: [string, { workspaces: { path: string }[] }][];
   };
   const projectEntry = configPayload.projects.find(
     ([projectPath]) => projectPath === demoProject.projectPath

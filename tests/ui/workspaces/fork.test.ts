@@ -61,9 +61,7 @@ describeIntegration("Workspace Fork (UI)", () => {
       // expanding an "Older than X days" tier.
       await waitFor(
         () => {
-          const el = app.view.container.querySelector(
-            `[data-workspace-id=\"${forkedWorkspaceId}\"]`
-          ) as HTMLElement | null;
+          const el = app.view.container.querySelector(`[data-workspace-id="${forkedWorkspaceId}"]`);
           if (!el) {
             throw new Error("Forked workspace not found in sidebar");
           }
@@ -98,7 +96,7 @@ describeIntegration("Workspace Fork (UI)", () => {
         () => {
           const btn = app.view.container.querySelector(
             `[aria-label="Workspace actions for ${sourceDisplayTitle}"]`
-          ) as HTMLElement | null;
+          );
           if (!btn) throw new Error("Workspace actions menu button not found");
           return btn;
         },
@@ -141,9 +139,7 @@ describeIntegration("Workspace Fork (UI)", () => {
 
       await waitFor(
         () => {
-          const el = app.view.container.querySelector(
-            `[data-workspace-id=\"${forkedWorkspaceId}\"]`
-          ) as HTMLElement | null;
+          const el = app.view.container.querySelector(`[data-workspace-id="${forkedWorkspaceId}"]`);
           if (!el) {
             throw new Error("Forked workspace not found in sidebar");
           }

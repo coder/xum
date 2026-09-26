@@ -50,7 +50,7 @@ async function findRequiredElement<T extends HTMLElement = HTMLElement>(
 ): Promise<T> {
   return waitFor(
     () => {
-      const element = root.querySelector(selector) as T | null;
+      const element = root.querySelector<T>(selector);
       if (!element) throw new Error(errorMessage);
       return element;
     },
@@ -60,7 +60,7 @@ async function findRequiredElement<T extends HTMLElement = HTMLElement>(
 
 function getSidebarWidth(sidebar: HTMLElement): number {
   const styleWidth = sidebar.style.width;
-  if (styleWidth && styleWidth.endsWith("px")) {
+  if (styleWidth.endsWith("px")) {
     return parseInt(styleWidth, 10);
   }
   return sidebar.getBoundingClientRect().width;
@@ -225,7 +225,7 @@ describeIntegration("RightSidebar (UI)", () => {
       await waitFor(() => {
         const instructionsTab = sidebar.querySelector(
           '[role="tab"][aria-controls*="instructions"]'
-        ) as HTMLElement | null;
+        );
         if (!instructionsTab) {
           throw new Error("Instructions tab should be present by default");
         }
@@ -266,9 +266,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // always visible on top-level workspaces so it can surface the
       // in-tab create form for new workspaces.
       await waitFor(() => {
-        const goalTab = sidebar.querySelector(
-          '[role="tab"][aria-controls*="goal"]'
-        ) as HTMLElement | null;
+        const goalTab = sidebar.querySelector('[role="tab"][aria-controls*="goal"]');
         if (!goalTab) {
           throw new Error("Goal tab should always be present on top-level workspaces");
         }
@@ -287,9 +285,7 @@ describeIntegration("RightSidebar (UI)", () => {
 
     try {
       await waitFor(() => {
-        const browserTab = sidebar.querySelector(
-          '[role="tab"][aria-controls*="browser"]'
-        ) as HTMLElement | null;
+        const browserTab = sidebar.querySelector('[role="tab"][aria-controls*="browser"]');
         if (!browserTab) {
           throw new Error("Browser tab not found");
         }
@@ -314,9 +310,7 @@ describeIntegration("RightSidebar (UI)", () => {
       expect(costsTab.getAttribute("aria-selected")).toBe("true");
 
       // Click Review tab
-      const reviewTab = sidebar.querySelector(
-        '[role="tab"][aria-controls*="review"]'
-      ) as HTMLElement;
+      const reviewTab = sidebar.querySelector('[role="tab"][aria-controls*="review"]')!;
       expect(reviewTab).toBeTruthy();
       fireEvent.click(reviewTab);
 
@@ -355,17 +349,13 @@ describeIntegration("RightSidebar (UI)", () => {
     try {
       // Verify the costs/stats tab is selected by default (no standalone "stats" tab exists).
       await waitFor(() => {
-        const costsTab = sidebar.querySelector(
-          '[role="tab"][aria-controls*="costs"]'
-        ) as HTMLElement | null;
+        const costsTab = sidebar.querySelector('[role="tab"][aria-controls*="costs"]');
         if (!costsTab) throw new Error("Stats tab (costs) not found");
 
         expect(costsTab.getAttribute("aria-selected")).toBe("true");
 
         // Standalone "stats" tab should not exist
-        const statsTab = sidebar.querySelector(
-          '[role="tab"][aria-controls*="-stats"]'
-        ) as HTMLElement | null;
+        const statsTab = sidebar.querySelector('[role="tab"][aria-controls*="-stats"]');
         expect(statsTab).toBeNull();
       });
     } finally {
@@ -402,11 +392,9 @@ describeIntegration("RightSidebar (UI)", () => {
       // Re-query sidebar and find expand button (sidebar reference may be stale after collapse)
       const collapsedSidebar = view.container.querySelector(
         '[role="complementary"][aria-label="Workspace insights"]'
-      ) as HTMLElement;
+      )!;
       expect(collapsedSidebar).toBeTruthy();
-      const expandButton = collapsedSidebar.querySelector(
-        'button[aria-label="Expand sidebar"]'
-      ) as HTMLElement;
+      const expandButton = collapsedSidebar.querySelector('button[aria-label="Expand sidebar"]')!;
       expect(expandButton).toBeTruthy();
       fireEvent.click(expandButton);
 
@@ -440,9 +428,7 @@ describeIntegration("RightSidebar (UI)", () => {
     try {
       // Verify Review tab is selected (from persisted state)
       await waitFor(() => {
-        const reviewTab = sidebar.querySelector(
-          '[role="tab"][aria-controls*="review"]'
-        ) as HTMLElement;
+        const reviewTab = sidebar.querySelector('[role="tab"][aria-controls*="review"]')!;
         if (!reviewTab) throw new Error("Review tab not found");
         if (reviewTab.getAttribute("aria-selected") !== "true") {
           throw new Error("Review tab should be selected from persisted state");
@@ -452,7 +438,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Navigate away by clicking project row (goes to home)
       const projectRow = view.container.querySelector(
         `[data-project-path="${metadata.projectPath}"]`
-      ) as HTMLElement;
+      )!;
       if (projectRow) {
         fireEvent.click(projectRow);
       }
@@ -477,9 +463,7 @@ describeIntegration("RightSidebar (UI)", () => {
           '[role="complementary"][aria-label="Workspace insights"]'
         );
         if (!sidebar2) throw new Error("Sidebar not found after navigation");
-        const reviewTab = sidebar2.querySelector(
-          '[role="tab"][aria-controls*="review"]'
-        ) as HTMLElement;
+        const reviewTab = sidebar2.querySelector('[role="tab"][aria-controls*="review"]')!;
         if (!reviewTab) throw new Error("Review tab not found after navigation");
         if (reviewTab.getAttribute("aria-selected") !== "true") {
           throw new Error("Review tab selection should persist across navigation");
@@ -527,7 +511,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Find the resize handle (left edge of sidebar)
       const resizeHandle = await waitFor(
         () => {
-          const handle = sidebar.querySelector('[class*="cursor-col-resize"]') as HTMLElement;
+          const handle = sidebar.querySelector('[class*="cursor-col-resize"]')!;
           if (!handle) throw new Error("Resize handle not found");
           return handle;
         },
@@ -538,9 +522,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Start on Costs tab (default)
       const costsTab = await waitFor(
         () => {
-          const tab = sidebar.querySelector(
-            '[role="tab"][aria-controls*="costs"]'
-          ) as HTMLElement | null;
+          const tab = sidebar.querySelector('[role="tab"][aria-controls*="costs"]');
           if (!tab) throw new Error("Costs tab not found");
           return tab;
         },
@@ -570,9 +552,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Switch to Review tab
       const reviewTab = await waitFor(
         () => {
-          const tab = sidebar.querySelector(
-            '[role="tab"][aria-controls*="review"]'
-          ) as HTMLElement | null;
+          const tab = sidebar.querySelector('[role="tab"][aria-controls*="review"]');
           if (!tab) throw new Error("Review tab not found");
           return tab;
         },
@@ -601,9 +581,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Switch to Review tab first
       const reviewTab = await waitFor(
         () => {
-          const tab = sidebar.querySelector(
-            '[role="tab"][aria-controls*="review"]'
-          ) as HTMLElement | null;
+          const tab = sidebar.querySelector('[role="tab"][aria-controls*="review"]');
           if (!tab) throw new Error("Review tab not found");
           return tab;
         },
@@ -618,7 +596,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Find and use resize handle
       const resizeHandle = await waitFor(
         () => {
-          const handle = sidebar.querySelector('[class*="cursor-col-resize"]') as HTMLElement;
+          const handle = sidebar.querySelector('[class*="cursor-col-resize"]')!;
           if (!handle) throw new Error("Resize handle not found");
           return handle;
         },
@@ -647,9 +625,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Switch to Costs tab
       const costsTab = await waitFor(
         () => {
-          const tab = sidebar.querySelector(
-            '[role="tab"][aria-controls*="costs"]'
-          ) as HTMLElement | null;
+          const tab = sidebar.querySelector('[role="tab"][aria-controls*="costs"]');
           if (!tab) throw new Error("Costs tab not found");
           return tab;
         },
@@ -700,7 +676,7 @@ describeIntegration("RightSidebar (UI)", () => {
     try {
       const resizeHandle = await waitFor(
         () => {
-          const handle = sidebar.querySelector('[class*="cursor-col-resize"]') as HTMLElement;
+          const handle = sidebar.querySelector('[class*="cursor-col-resize"]')!;
           if (!handle) throw new Error("Resize handle not found");
           return handle;
         },
@@ -764,13 +740,13 @@ describeIntegration("RightSidebar (UI)", () => {
 
       // Verify top pane has Costs tab selected
       const topTablist = tablists[0] as HTMLElement;
-      const costsTab = topTablist.querySelector('[role="tab"]') as HTMLElement;
+      const costsTab = topTablist.querySelector('[role="tab"]')!;
       expect(costsTab).toBeTruthy();
       expect(costsTab.getAttribute("aria-selected")).toBe("true");
 
       // Verify bottom pane has Review tab selected
       const bottomTablist = tablists[1] as HTMLElement;
-      const reviewTab = bottomTablist.querySelector('[role="tab"]') as HTMLElement;
+      const reviewTab = bottomTablist.querySelector('[role="tab"]')!;
       expect(reviewTab).toBeTruthy();
       expect(reviewTab.getAttribute("aria-selected")).toBe("true");
 
@@ -802,9 +778,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Wait for the terminal tab to appear and become selected
       const terminalTab = await waitFor(
         () => {
-          const tab = sidebar.querySelector(
-            '[role="tab"][aria-controls*="terminal:"]'
-          ) as HTMLElement | null;
+          const tab = sidebar.querySelector('[role="tab"][aria-controls*="terminal:"]');
           if (!tab) throw new Error("Terminal tab not found after Cmd+T");
           return tab;
         },
@@ -818,9 +792,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Verify terminal panel is visible (not hidden)
       const terminalPanel = await waitFor(
         () => {
-          const panel = sidebar.querySelector(
-            '[role="tabpanel"][id*="terminal"]:not([hidden])'
-          ) as HTMLElement | null;
+          const panel = sidebar.querySelector('[role="tabpanel"][id*="terminal"]:not([hidden])');
           if (!panel) throw new Error("Terminal panel not visible");
           return panel;
         },
@@ -830,7 +802,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Verify the terminal view is rendered inside the panel
       await waitFor(
         () => {
-          const terminalView = terminalPanel.querySelector(".terminal-view") as HTMLElement | null;
+          const terminalView = terminalPanel.querySelector(".terminal-view");
           if (!terminalView) throw new Error("Terminal view not found");
         },
         { timeout: 5_000 }

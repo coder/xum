@@ -1,5 +1,6 @@
 import "./dom";
 import { fireEvent, waitFor, within } from "@testing-library/react";
+import type { BoundFunctions, queries } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { shouldRunIntegrationTests } from "../testUtils";
 import { preloadTestModules } from "../ipc/setup";
@@ -27,7 +28,7 @@ const BRANDED: MCPTestResult = {
   },
 };
 
-type Canvas = ReturnType<typeof within>;
+type Canvas = BoundFunctions<typeof queries>;
 
 /** The Settings row card for one configured server (contains its switch and actions). */
 function serverRow(canvas: Canvas, name: string): HTMLElement {

@@ -396,7 +396,7 @@ describeIntegration("Runtime Bash Execution", () => {
               const events = await sendMessageAndWait(
                 env,
                 workspaceId,
-                'Use the bash tool with args: { script: "for i in {1..1000}; do echo \"terminal bench line $i\" >> testfile.txt; done && grep -n \"terminal bench\" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
+                'Use the bash tool with args: { script: "for i in {1..1000}; do echo "terminal bench line $i" >> testfile.txt; done && grep -n "terminal bench" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
                 HAIKU_MODEL,
                 BASH_ONLY,
                 streamTimeoutMs

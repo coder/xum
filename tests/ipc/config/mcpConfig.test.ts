@@ -37,8 +37,15 @@ if (shouldRunIntegrationTests()) {
 }
 
 // Shared types for MCP content parsing
-type MediaItem = { type: "media"; data: string; mediaType: string };
-type TextItem = { type: "text"; text: string };
+interface MediaItem {
+  type: "media";
+  data: string;
+  mediaType: string;
+}
+interface TextItem {
+  type: "text";
+  text: string;
+}
 
 function isMediaItem(item: unknown): item is MediaItem {
   return (

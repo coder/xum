@@ -114,8 +114,7 @@ describeIntegration("web_fetch integration tests", () => {
         expect(["web_fetch_result", "web_fetch_tool_result_error"]).toContain(toolResult?.type);
 
         // Assert the model produced a substantive text response about CNN content
-        const deltas = collector.getDeltas();
-        const responseText = deltas.join("");
+        const responseText = collector.getStreamContent();
         expect(responseText.length).toBeGreaterThan(20);
       });
     },

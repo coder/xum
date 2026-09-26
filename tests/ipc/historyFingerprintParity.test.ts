@@ -11,7 +11,7 @@ import { createTempGitRepo, generateBranchName, trustProject } from "./helpers";
 import { detectDefaultTrunkBranch } from "@/node/git";
 import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import { applyWorkspaceChatEventToAggregator } from "@/browser/utils/messages/applyWorkspaceChatEventToAggregator";
-import { isCaughtUpMessage, isMuxMessage, type WorkspaceChatMessage } from "@/common/orpc/types";
+import { isCaughtUpMessage, isMuxMessage } from "@/common/orpc/types";
 import type { MuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
@@ -77,10 +77,10 @@ describe("history edit precondition parity over real IPC", () => {
       await collector.waitForSubscription(10_000);
 
       // Live turns covering text, tool calls, reasoning and an image attachment on the user row.
-      const prompts: Array<{
+      const prompts: {
         text: string;
-        fileParts?: Array<{ url: string; mediaType: string; filename?: string }>;
-      }> = [
+        fileParts?: { url: string; mediaType: string; filename?: string }[];
+      }[] = [
         { text: "Plain text turn" },
         { text: "[mock:tool:file-read] what's in readme.md?" },
         { text: "[mock:reasoning:quicksort] explain quicksort algorithm step by step" },
@@ -108,7 +108,7 @@ describe("history edit precondition parity over real IPC", () => {
 
       // The live client view: every event applied in order, as WorkspaceStore does.
       const live = new StreamingMessageAggregator("2024-01-01T00:00:00.000Z");
-      for (const event of collector.getEvents() as WorkspaceChatMessage[]) {
+      for (const event of collector.getEvents()) {
         if (isMuxMessage(event)) {
           live.loadHistoricalMessages([event], false, { mode: "append" });
         } else {

@@ -26,8 +26,10 @@ describe("dom harness file-boundary isolation", () => {
     try {
       // Guards the eager preload in dom.ts: without it, this require would be
       // @react-dnd/asap's first evaluation and would crash on document access.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      expect(() => require("react-dnd")).not.toThrow();
+      expect(() => {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports -- must evaluate lazily, after document is removed
+        require("react-dnd");
+      }).not.toThrow();
     } finally {
       globalThis.document = savedDocument;
     }

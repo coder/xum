@@ -168,11 +168,12 @@ export async function withChromeProfiles(
   const startedAt = new Date().toISOString();
   const startTime = Date.now();
 
-  let actionError: unknown;
+  // Boxed so a caught value keeps its `unknown` type (a truthiness check would narrow it).
+  let actionFailure: { error: unknown } | undefined;
   try {
     await action();
   } catch (error) {
-    actionError = error;
+    actionFailure = { error };
   }
 
   const endedAt = new Date().toISOString();
@@ -213,8 +214,8 @@ export async function withChromeProfiles(
     ]);
   }
 
-  if (actionError) {
-    throw actionError;
+  if (actionFailure) {
+    throw actionFailure.error;
   }
 
   return {

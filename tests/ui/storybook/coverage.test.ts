@@ -37,8 +37,8 @@ const hasSmokeStoryWithDualThemeCoverage = (content: string): boolean => {
 };
 
 function getPlanTocViewports(content: string): string | null {
-  const matrixMatch = content.match(
-    /PLAN_TOC_PIXEL_MATRIX\s*=\s*\{\s*viewports:\s*\[([^\]]*)\]\s*\}/
+  const matrixMatch = /PLAN_TOC_PIXEL_MATRIX\s*=\s*\{\s*viewports:\s*\[([^\]]*)\]\s*\}/.exec(
+    content
   );
   return matrixMatch?.[1] ?? null;
 }
@@ -79,7 +79,7 @@ describe("Storybook coverage contract", () => {
       expect(/matrix:\s*PLAN_TOC_PIXEL_MATRIX/.test(content)).toBe(true);
 
       // The play() width guard must stay in sync with the pinned viewport.
-      const widthMatch = content.match(/PLAN_TOC_MIN_WIDTH\s*=\s*(\d+)/);
+      const widthMatch = /PLAN_TOC_MIN_WIDTH\s*=\s*(\d+)/.exec(content);
       expect(Number(widthMatch?.[1])).toBeGreaterThanOrEqual(PLAN_TOC_MIN_WIDTH);
     });
   });

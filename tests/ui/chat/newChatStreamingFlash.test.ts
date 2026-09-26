@@ -131,7 +131,6 @@ function overrideWorkspaceCreate(env: TestEnvironment, override: WorkspaceCreate
   };
 }
 
-// eslint-disable-next-line local/no-unsafe-child-process
 const execAsync = promisify(exec);
 
 function gate(): { release: () => void; wait: Promise<void> } {
@@ -174,9 +173,7 @@ describe("New chat streaming flash regression", () => {
     let restoreSendMessage: () => void = () => {};
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
+        const originalSendMessage = env.orpc.workspace.sendMessage.bind(env.orpc.workspace);
         restoreSendMessage = overrideWorkspaceSendMessage(env, (async (input) => {
           await sendGate;
           return originalSendMessage(input);
@@ -264,21 +261,17 @@ describe("New chat streaming flash regression", () => {
     const typed = "Show my first message before the workspace exists";
     const createGate = gate();
     const sendGate = gate();
-    const restores: Array<() => void> = [];
+    const restores: (() => void)[] = [];
     const app = await createCreationHarness({
       beforeRender: (env) => {
-        const originalCreate = env.orpc.workspace.create.bind(
-          env.orpc.workspace
-        ) as WorkspaceCreateFn;
+        const originalCreate = env.orpc.workspace.create.bind(env.orpc.workspace);
         restores.push(
           overrideWorkspaceCreate(env, (async (input) => {
             await createGate.wait;
             return originalCreate(input);
           }) as WorkspaceCreateFn)
         );
-        const originalSendMessage = env.orpc.workspace.sendMessage.bind(
-          env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
+        const originalSendMessage = env.orpc.workspace.sendMessage.bind(env.orpc.workspace);
         restores.push(
           overrideWorkspaceSendMessage(env, (async (input) => {
             await sendGate.wait;

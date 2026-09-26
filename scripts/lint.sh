@@ -27,6 +27,7 @@ fi
 # non-type-aware config blocks).
 ESLINT_PATTERNS=(
   'src/**/*.{ts,tsx}'
+  'tests/**/*.{ts,tsx}'
   'src/node/builtinSkills/**/*.js'
   'src/node/workflowRuntime/*.js'
   'scripts/lib/*.js'

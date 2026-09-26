@@ -27,7 +27,7 @@ interface HarnessOptions {
   beforeCreateResolves?: Promise<void>;
   disconnectCleanupMaxWaitMs?: number;
   requireTrustedProjectForCreate?: boolean;
-  projectEntries?: Array<[string, ProjectConfig]>;
+  projectEntries?: [string, ProjectConfig][];
 }
 
 interface Harness {
@@ -36,7 +36,7 @@ interface Harness {
   createCalls: WorkspaceCreateInput[];
   removeCalls: string[];
   replayChecks: string[];
-  setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
+  setTrustCalls: { projectPath: string; trusted: boolean }[];
   closeConnection: () => void;
   connectionClosed: Promise<void>;
 }
@@ -140,7 +140,7 @@ function createHarness(options?: HarnessOptions): Harness {
   const createCalls: WorkspaceCreateInput[] = [];
   const removeCalls: string[] = [];
   const replayChecks: string[] = [];
-  const setTrustCalls: Array<{ projectPath: string; trusted: boolean }> = [];
+  const setTrustCalls: { projectPath: string; trusted: boolean }[] = [];
   const projectsByPath = new Map<string, ProjectConfig>(options?.projectEntries ?? []);
 
   const client = {
