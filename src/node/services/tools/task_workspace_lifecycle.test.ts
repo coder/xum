@@ -2,7 +2,7 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { Ok, type Result } from "@/common/types/result";
-import { TaskWorkspaceLifecycleToolInputSchema } from "@/common/utils/tools/toolDefinitions";
+import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { WorkspaceLifecycleResult } from "@/node/services/taskWorkspaceSeam";
 import { createTaskWorkspaceLifecycleTool } from "./task_workspace_lifecycle";
 import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
@@ -39,11 +39,7 @@ describe("task_workspace_lifecycle tool", () => {
     expect(archiveOwnedWorkspaceTurnWorkspace).toHaveBeenCalledWith(
       "root-workspace",
       { workspaceId: "child-a" },
-      {
-        interruptActive: true,
-        acknowledgedUntrackedPaths: undefined,
-        acknowledgedUntrackedPathsByWorkspaceId: undefined,
-      }
+      { interruptActive: true }
     );
     expect(result).toEqual({
       results: [{ status: "archived", action: "archive", workspaceId: "child-a" }],
@@ -124,69 +120,18 @@ describe("task_workspace_lifecycle tool", () => {
     });
   });
 
-  it("forwards the full acknowledged paths map when the target is addressed by taskId", async () => {
-    using tempDir = new TestTempDir("test-task-workspace-lifecycle-ack-paths");
-    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
-
-    const archiveOwnedWorkspaceTurnWorkspace = mock(
-      (): Promise<Result<WorkspaceLifecycleResult, string>> =>
-        Promise.resolve(
-          Ok({
-            status: "archived" as const,
-            action: "archive" as const,
-            taskId: "wst_child",
-            workspaceId: "child-a",
-          })
-        )
-    );
-    const workspaceTurnManager = createFakeWorkspaceTurnManager({
-      archiveOwnedWorkspaceTurnWorkspace,
-    });
-    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, workspaceTurnManager });
-
-    await Promise.resolve(
-      tool.execute!(
-        {
-          action: "archive",
-          targets: [{ taskId: "wst_child" }],
-          acknowledged_untracked_paths: { "child-a": ["scratch.txt"] },
-        },
-        mockToolCallOptions
-      )
-    );
-
-    // The tool cannot resolve wst_ handles to workspace IDs, so the backend needs the
-    // full by-workspaceId map to apply confirmations after handle resolution.
-    expect(archiveOwnedWorkspaceTurnWorkspace).toHaveBeenCalledWith(
-      "root-workspace",
-      { taskId: "wst_child" },
-      {
-        interruptActive: false,
-        acknowledgedUntrackedPaths: undefined,
-        acknowledgedUntrackedPathsByWorkspaceId: { "child-a": ["scratch.txt"] },
-      }
-    );
-  });
-
-  it("rejects blank acknowledged paths at the input schema boundary", () => {
-    // The archive sink asserts trimmed non-empty paths when normalizing acknowledgements; a
-    // blank entry must fail this call's validation instead of throwing inside the service.
-    const base = {
+  it("rejects model-supplied untracked-file acknowledgements at the input schema boundary", () => {
+    // #3950: any path list returned to the model can be echoed back by the model, so a
+    // model-side acknowledgement is not user consent. The live schema must not accept one;
+    // lossy archives are refused and the user archives through the UI confirmation instead.
+    const echoedAcknowledgement = {
       action: "archive" as const,
       targets: [{ workspaceId: "child-a" }],
+      acknowledged_untracked_paths: { "child-a": ["scratch.txt"] },
     };
     expect(
-      TaskWorkspaceLifecycleToolInputSchema.safeParse({
-        ...base,
-        acknowledged_untracked_paths: { "child-a": ["  "] },
-      }).success
+      TOOL_DEFINITIONS.task_workspace_lifecycle.schema.safeParse(echoedAcknowledgement).success
     ).toBe(false);
-    expect(
-      TaskWorkspaceLifecycleToolInputSchema.safeParse({
-        ...base,
-        acknowledged_untracked_paths: { "child-a": ["scratch.txt"] },
-      }).success
-    ).toBe(true);
   });
 
   it("isolates one target's unexpected throw as a per-target error result", async () => {

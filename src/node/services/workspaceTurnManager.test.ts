@@ -22,6 +22,17 @@ import {
   workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
 
+/** Lossy snapshot archives refuse with the blocking paths and an explanation (#3950). */
+function expectLossyArchiveRefusal(
+  result: Awaited<ReturnType<WorkspaceTurnManager["archiveOwnedWorkspaceTurnWorkspace"]>>,
+  expected: { taskId?: string; workspaceId: string; displayName: string; paths: string[] }
+): void {
+  assert(result.success, "archive must return a lifecycle result");
+  const { error, ...fields } = result.data;
+  expect(fields).toEqual({ status: "error", action: "archive", ...expected });
+  expect(typeof error).toBe("string");
+}
+
 describe("WorkspaceTurnManager", () => {
   let rootDir: string;
 
@@ -511,7 +522,7 @@ describe("WorkspaceTurnManager", () => {
     expect(archive).toHaveBeenCalledTimes(1);
   });
 
-  test("workspace lifecycle returns archive confirmation and treats already archived as idempotent", async () => {
+  test("workspace lifecycle refuses lossy snapshot archives and treats already archived as idempotent", async () => {
     const confirmationArchive = mock(
       (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
         Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
@@ -519,22 +530,19 @@ describe("WorkspaceTurnManager", () => {
     const { config, parentId, projectPath, taskService, taskHandleStore } =
       await createWorkspaceLifecycleHarness({ archive: confirmationArchive });
 
-    const confirmation = await taskService.archiveOwnedWorkspaceTurnWorkspace(
-      parentId,
-      { workspaceId: "childworkspace" },
-      { acknowledgedUntrackedPaths: ["scratch.txt"] }
-    );
+    // Only the user can approve losing untracked files (#3950): the model-driven archive never
+    // hands the sink an acknowledgement, and a lossy result is a refusal that lists the paths
+    // instead of a confirmation round trip the model could answer itself.
+    const refusal = await taskService.archiveOwnedWorkspaceTurnWorkspace(parentId, {
+      workspaceId: "childworkspace",
+    });
 
-    expect(confirmation).toEqual(
-      Ok({
-        status: "requires_confirmation",
-        action: "archive",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-        paths: ["scratch.txt"],
-      })
-    );
-    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"], {
+    expectLossyArchiveRefusal(refusal, {
+      workspaceId: "childworkspace",
+      displayName: "Child workspace",
+      paths: ["scratch.txt"],
+    });
+    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", undefined, {
       forbidWorktreeCheckoutDeletion: true,
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
@@ -542,23 +550,17 @@ describe("WorkspaceTurnManager", () => {
       coderWorkspaceArchiveBehaviorOverride: "stop",
     });
 
-    const confirmationByTaskId = await taskService.archiveOwnedWorkspaceTurnWorkspace(
-      parentId,
-      { taskId: "wst_created" },
-      { acknowledgedUntrackedPathsByWorkspaceId: { childworkspace: ["task-scratch.txt"] } }
-    );
+    const refusalByTaskId = await taskService.archiveOwnedWorkspaceTurnWorkspace(parentId, {
+      taskId: "wst_created",
+    });
 
-    expect(confirmationByTaskId).toEqual(
-      Ok({
-        status: "requires_confirmation",
-        action: "archive",
-        taskId: "wst_created",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-        paths: ["scratch.txt"],
-      })
-    );
-    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["task-scratch.txt"], {
+    expectLossyArchiveRefusal(refusalByTaskId, {
+      taskId: "wst_created",
+      workspaceId: "childworkspace",
+      displayName: "Child workspace",
+      paths: ["scratch.txt"],
+    });
+    expect(confirmationArchive).toHaveBeenLastCalledWith("childworkspace", undefined, {
       forbidWorktreeCheckoutDeletion: true,
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
@@ -940,10 +942,11 @@ describe("WorkspaceTurnManager", () => {
     expect(nested?.status).toBe("running");
   });
 
-  test("workspace lifecycle preflights lossy confirmation before interrupting active turns", async () => {
+  test("workspace lifecycle refuses lossy archives before interrupting active turns", async () => {
     const preflightArchive = mock(
-      (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
-        Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
+      (): Promise<
+        Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] } | { kind: "ready" }>
+      > => Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
     );
     const archive = mock(
       (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))
@@ -958,23 +961,18 @@ describe("WorkspaceTurnManager", () => {
     );
     markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
 
-    // Unacknowledged lossy confirmation must surface BEFORE any interruption so a refused
-    // confirmation leaves the in-flight work running.
-    const confirmation = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+    // The lossy refusal must surface BEFORE any interruption so the in-flight work keeps running.
+    const refusal = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
     );
 
-    expect(confirmation).toEqual(
-      Ok({
-        status: "requires_confirmation",
-        action: "archive",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-        paths: ["scratch.txt"],
-      })
-    );
+    expectLossyArchiveRefusal(refusal, {
+      workspaceId: "childworkspace",
+      displayName: "Child workspace",
+      paths: ["scratch.txt"],
+    });
     expect(archive).not.toHaveBeenCalled();
     const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
       harness.parentId,
@@ -982,12 +980,12 @@ describe("WorkspaceTurnManager", () => {
     );
     expect(stillRunning?.status).toBe("running");
 
-    // With acknowledged paths the preflight is skipped (archive re-validates at capture time)
-    // and interruption proceeds.
+    // Once nothing would be lost (e.g. the files were committed), interruption proceeds.
+    preflightArchive.mockImplementation(() => Promise.resolve(Ok({ kind: "ready" as const })));
     const archived = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
-      { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt"] }
+      { interruptActive: true }
     );
 
     expect(archived).toEqual(
@@ -998,10 +996,10 @@ describe("WorkspaceTurnManager", () => {
         displayName: "Child workspace",
       })
     );
-    // Preflight runs before interruption on BOTH calls; the acknowledged set covering the
-    // reported paths is what lets the second call proceed.
+    // Preflight runs before interruption on BOTH calls, and the sink never receives an
+    // acknowledgement from the model-driven path.
     expect(preflightArchive).toHaveBeenCalledTimes(2);
-    expect(archive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"], {
+    expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
       forbidWorktreeCheckoutDeletion: true,
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
@@ -1227,96 +1225,6 @@ describe("WorkspaceTurnManager", () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
-  test("workspace lifecycle re-confirms when acknowledged paths no longer cover the preflight", async () => {
-    const preflightArchive = mock(
-      (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
-        Promise.resolve(
-          Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt", "new-file.txt"] })
-        )
-    );
-    const archive = mock(
-      (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))
-    );
-    const harness = await createWorkspaceLifecycleHarness({ archive, preflightArchive });
-    await harness.taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(harness.parentId, "childworkspace", "wst_running", "running", {
-        turnId: "turn-running",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      })
-    );
-    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
-
-    // The acknowledged set predates a new untracked file: surface a fresh confirmation
-    // BEFORE interrupting instead of destroying the turn and then failing the archive.
-    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
-      harness.parentId,
-      { workspaceId: "childworkspace" },
-      { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt"] }
-    );
-
-    expect(result).toEqual(
-      Ok({
-        status: "requires_confirmation",
-        action: "archive",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-        paths: ["scratch.txt", "new-file.txt"],
-      })
-    );
-    expect(archive).not.toHaveBeenCalled();
-    const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
-      harness.parentId,
-      "wst_running"
-    );
-    expect(stillRunning?.status).toBe("running");
-  });
-
-  test("workspace lifecycle re-confirms when acknowledged paths include entries the preflight no longer reports", async () => {
-    const preflightArchive = mock(
-      (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
-        Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
-    );
-    const archive = mock(
-      (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))
-    );
-    const harness = await createWorkspaceLifecycleHarness({ archive, preflightArchive });
-    await harness.taskHandleStore.upsertWorkspaceTurn(
-      workspaceTurnRecord(harness.parentId, "childworkspace", "wst_running", "running", {
-        turnId: "turn-running",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      })
-    );
-    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
-
-    // The acknowledged set is a stale SUPERSET (one acknowledged file was removed). The archive
-    // sink requires exact list equality, so a subset check here would interrupt the turn and
-    // then still bounce with requires_confirmation — the acknowledgement must be re-confirmed
-    // BEFORE anything is interrupted.
-    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
-      harness.parentId,
-      { workspaceId: "childworkspace" },
-      { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt", "stale.txt"] }
-    );
-
-    expect(result).toEqual(
-      Ok({
-        status: "requires_confirmation",
-        action: "archive",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-        paths: ["scratch.txt"],
-      })
-    );
-    expect(archive).not.toHaveBeenCalled();
-    const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
-      harness.parentId,
-      "wst_running"
-    );
-    expect(stillRunning?.status).toBe("running");
-  });
-
   test("workspace lifecycle refuses interrupt_active when snapshot eligibility is mutation-sensitive", async () => {
     const isSnapshotArchiveEligibilityMutationSensitive = mock(() => true);
     const harness = await createWorkspaceLifecycleHarness({
@@ -1331,9 +1239,9 @@ describe("WorkspaceTurnManager", () => {
     );
     markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
 
-    // Snapshot archives require an exact untracked-file acknowledgement that running turns can
-    // invalidate mid-interruption, so honoring interrupt_active could destroy in-flight work and
-    // still bounce with requires_confirmation. Refuse instead and leave the turn running.
+    // Running turns can create untracked files mid-interruption, so honoring interrupt_active
+    // could destroy in-flight work and still end in a lossy-archive refusal. Refuse instead and
+    // leave the turn running.
     const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
       harness.parentId,
       { workspaceId: "childworkspace" },
