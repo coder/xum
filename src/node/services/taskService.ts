@@ -103,6 +103,7 @@ import {
   TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
   TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
+  pendingRemovalAdmissionMessage,
   retiredAttemptMessage,
 } from "@/constants/agentMessaging";
 import {
@@ -3264,7 +3265,7 @@ export class TaskService implements AgentTaskIntegration {
     if (this.currentTaskAttemptId(taskId, entry) !== attemptId) return false;
     if (this.isAttemptClosed(taskId, attemptId)) return false;
     if (this.isWorkspaceStopInProgress(taskId)) return false;
-    return entry?.taskAttemptRetiredBy == null;
+    return entry?.taskAttemptRetiredBy == null && entry?.pendingRemoval == null;
   }
 
   /**
@@ -3485,6 +3486,9 @@ export class TaskService implements AgentTaskIntegration {
     if (entry.taskAttemptRetiredBy != null) {
       return { kind: "refused", message: retiredAttemptMessage(entry.taskAttemptRetiredBy) };
     }
+    if (entry.pendingRemoval != null) {
+      return { kind: "refused", message: pendingRemovalAdmissionMessage(entry.pendingRemoval) };
+    }
     const attemptId = this.currentTaskAttemptId(workspaceId, entry);
     if (attemptId == null) {
       log.debug("[task-attempt] send into a pre-identity task entry carries no obligation", {
@@ -3624,7 +3628,7 @@ export class TaskService implements AgentTaskIntegration {
       await this.editWorkspaceEntry(
         taskId,
         (ws) => {
-          if (ws.taskAttemptRetiredBy != null) return;
+          if (ws.taskAttemptRetiredBy != null || ws.pendingRemoval != null) return;
           if (
             ws.taskAttemptId !== snapshot.taskAttemptId ||
             ws.taskStatus !== snapshot.taskStatus
@@ -3650,7 +3654,9 @@ export class TaskService implements AgentTaskIntegration {
       return undefined;
     }
     if (!committed) {
-      log.info("[startup] task skipped: its attempt was retired by a workflow claim", { taskId });
+      log.info("[startup] task skipped: a workflow claim retired its attempt, or it is being removed", {
+        taskId,
+      });
       return undefined;
     }
     this.publishAttemptRotation(taskId, attemptId);
@@ -8303,6 +8309,12 @@ export class TaskService implements AgentTaskIntegration {
         message: retiredAttemptMessage(refreshedEntry.workspace.taskAttemptRetiredBy),
       });
     }
+    if (refreshedEntry.workspace.pendingRemoval != null) {
+      return Err({
+        code: "send_failed" as const,
+        message: pendingRemovalAdmissionMessage(refreshedEntry.workspace.pendingRemoval),
+      });
+    }
     // Admission classification: reactivation = new OWNED attempt. The CAS publishes the fresh id
     // before any turn exists; once committed the new identity is kept in config and memory
     // whatever createWorkspaceTurn returns or throws (P3: never roll an id back) — a refused
@@ -8329,7 +8341,13 @@ export class TaskService implements AgentTaskIntegration {
       await this.editWorkspaceEntry(
         taskId,
         (ws) => {
-          if (ws.taskAttemptRetiredBy != null || ws.taskAttemptId !== previousAttemptId) return;
+          if (
+            ws.taskAttemptRetiredBy != null ||
+            ws.pendingRemoval != null ||
+            ws.taskAttemptId !== previousAttemptId
+          ) {
+            return;
+          }
           ws.taskAttemptId = reactivationAttemptId;
           committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
           if (!committedProven) ws.taskAttemptUnproven = true;
@@ -8345,7 +8363,9 @@ export class TaskService implements AgentTaskIntegration {
           message:
             latest?.taskAttemptRetiredBy != null
               ? retiredAttemptMessage(latest.taskAttemptRetiredBy)
-              : "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
+              : latest?.pendingRemoval != null
+                ? pendingRemovalAdmissionMessage(latest.pendingRemoval)
+                : "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
         });
       }
       // A writer outside this mutex (another backend) may have rotated the row again during the
@@ -15009,7 +15029,13 @@ export class TaskService implements AgentTaskIntegration {
               shuttingDown = true;
               return;
             }
-            if (workspace.taskStatus !== "queued" || workspace.taskAttemptRetiredBy != null) return;
+            if (
+              workspace.taskStatus !== "queued" ||
+              workspace.taskAttemptRetiredBy != null ||
+              workspace.pendingRemoval != null
+            ) {
+              return;
+            }
             const owned = this.ownedAttemptByTaskId.get(taskId);
             const attemptId =
               owned?.attemptId != null && owned.attemptId === workspace.taskAttemptId
@@ -15255,6 +15281,12 @@ export class TaskService implements AgentTaskIntegration {
       });
       return notApplicable;
     }
+    if (entryAtStart.workspace.pendingRemoval != null) {
+      return {
+        kind: "refused",
+        message: pendingRemovalAdmissionMessage(entryAtStart.workspace.pendingRemoval),
+      };
+    }
     // From here on this call has decided to reawaken: losing any race below refuses the caller's
     // send instead of letting it bind to whatever attempt the winner published.
     const lost = (message: string): TaskReawakenOutcome => ({ kind: "refused", message });
@@ -15314,7 +15346,11 @@ export class TaskService implements AgentTaskIntegration {
           ) {
             return;
           }
-          if (ws.taskAttemptRetiredBy != null || ws.taskAttemptId !== previousAttemptId) {
+          if (
+            ws.taskAttemptRetiredBy != null ||
+            ws.pendingRemoval != null ||
+            ws.taskAttemptId !== previousAttemptId
+          ) {
             return;
           }
 
@@ -19311,7 +19347,10 @@ export class TaskService implements AgentTaskIntegration {
   private async canCleanupReportedTask(
     workspaceId: string,
     config: ProjectsConfig = this.config.loadConfigOrDefault()
-  ): Promise<{ ok: true; parentWorkspaceId: string } | { ok: false; reason: string }> {
+  ): Promise<
+    | { ok: true; parentWorkspaceId: string; attemptId: string | undefined }
+    | { ok: false; reason: string }
+  > {
     assert(workspaceId.length > 0, "canCleanupReportedTask: workspaceId must be non-empty");
 
     const entry = findWorkspaceEntry(config, workspaceId);
@@ -19392,7 +19431,7 @@ export class TaskService implements AgentTaskIntegration {
       return { ok: false, reason: "patch_pending" };
     }
 
-    return { ok: true, parentWorkspaceId };
+    return { ok: true, parentWorkspaceId, attemptId: entry.workspace.taskAttemptId };
   }
 
   /**
@@ -19443,7 +19482,9 @@ export class TaskService implements AgentTaskIntegration {
         beforeRemove: async () => {
           const live = await this.canCleanupReportedTask(targetWorkspaceId);
           confirmed = live.ok ? live : undefined;
-          return live.ok;
+          // Bound to the attempt confirmed here (#4478): another backend can reawaken the task
+          // after this in-process check, and the removal must then refuse, not delete its checkout.
+          return live.ok ? { expectedAttemptId: live.attemptId } : false;
         },
       });
       if (!removeResult.success) {

@@ -258,6 +258,14 @@ export function getIsoNow(): string {
   return new Date().toISOString();
 }
 
+/**
+ * A removal bound to the task attempt its caller confirmed (#4478): WorkspaceService.remove
+ * refuses when the row names another attempt by the time it closes admission.
+ */
+export interface RemovalAttemptBinding {
+  expectedAttemptId: string | undefined;
+}
+
 export interface ArchiveWorkspaceOptions {
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
@@ -676,7 +684,7 @@ export interface WorkspaceLifecycleHost {
   remove(
     workspaceId: string,
     force?: boolean,
-    options?: { beforeRemove?: () => Promise<boolean> }
+    options?: { beforeRemove?: () => Promise<boolean | RemovalAttemptBinding> }
   ): Promise<Result<void>>;
   removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */

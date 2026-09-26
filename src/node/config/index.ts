@@ -4239,6 +4239,7 @@ export class Config {
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          pendingRemoval: existing.pendingRemoval,
         };
       } else {
         // Add new workspace
@@ -4253,9 +4254,20 @@ export class Config {
    * Remove a workspace from config.json
    *
    * @param workspaceId ID of the workspace to remove
+   * @param options.removalId - the removal's pendingRemoval marker: the row is removed only while
+   *   it still carries that marker (throws otherwise), so a removal whose marker another backend
+   *   took over cannot deregister the workspace under it.
    */
-  async removeWorkspace(workspaceId: string): Promise<void> {
+  async removeWorkspace(workspaceId: string, options?: { removalId?: string }): Promise<void> {
     await this.editConfig((config) => {
+      if (options?.removalId != null) {
+        const row = [...config.projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === workspaceId);
+        if (row != null && row.pendingRemoval?.removalId !== options.removalId) {
+          throw new Error(`Workspace ${workspaceId} is no longer held by this removal`);
+        }
+      }
       let workspaceFound = false;
 
       for (const [_projectPath, project] of config.projects) {
