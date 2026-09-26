@@ -38,6 +38,7 @@
     { "file": "src/cli/debug/refinements.ts", "symbol": "RefinementsCommandOptions.sessionDir", "reason": "option set only by tests (cli/debug/index.ts passes rollback/force only)" },
     { "file": "src/common/orpc/schemas/api.ts", "symbol": "debug", "reason": "debug.triggerStreamError endpoint used only by integration tests" },
     { "file": "src/common/orpc/schemas/api.ts", "symbol": "debug.triggerStreamError", "reason": "debug endpoint used only by integration tests" },
+    { "file": "src/desktop/keepAwake.ts", "symbol": "KeepAwakeController.isHoldingBlocker", "reason": "getter read only by keepAwake.test.ts" },
     { "file": "src/node/runtime/SSH2ConnectionPool.ts", "symbol": "AcquireConnectionOptions.sleep", "reason": "option set only by tests (SSHRuntime passes abortSignal/onWait)" },
     { "file": "src/node/runtime/SSH2ConnectionPool.ts", "symbol": "SSH2ConnectionPool.clearAllHealth", "reason": "no callers at all, production or test (dead)" },
     { "file": "src/node/runtime/sshConnectionPool.ts", "symbol": "AcquireConnectionOptions.sleep", "reason": "option set only by tests" },

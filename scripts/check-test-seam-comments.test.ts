@@ -61,6 +61,25 @@ test("matches unit/integration qualifiers after used in/by/for", () => {
   expect(seams("// used in integration tests\nexport const b = 1;")).toEqual(["1:b"]);
 });
 
+test("keys comments on star re-exports by module or namespace", () => {
+  expect(seams('// Exported for tests.\nexport * from "./a";')).toEqual(["1:* from ./a"]);
+  expect(seams('// Exported for tests.\nexport * as ns from "./a";')).toEqual(["1:ns"]);
+});
+
+test("matches slash-qualified test visibility wording", () => {
+  expect(
+    seams("class A {\n  /** Test/debug visibility only. */\n  get b() { return 1; }\n}")
+  ).toEqual(["2:A.b"]);
+  expect(seams("// Grants hook visibility only.\nexport const c = 1;")).toEqual([]);
+});
+
+test("ignores comment-like text inside regex literals and JSX text", () => {
+  expect(seams("const marker = /\\/\\/ Exported for tests/;\nexport const a = marker;")).toEqual(
+    []
+  );
+  expect(seams("export const B = () => <p>// Exported for tests</p>;", "src/x.tsx")).toEqual([]);
+});
+
 test("ignores non-comment text and descriptive uses of the words", () => {
   const text = [
     'const label = "Exported for tests";',

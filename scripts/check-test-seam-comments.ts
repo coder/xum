@@ -36,6 +36,8 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Test seam", "test seams", "@VisibleForTesting".
   /\btest[- ]?seams?\b/i,
   /\bvisibleForTesting\b/i,
+  // "Test/debug visibility only.", "Test visibility only".
+  /\btests?(?:\/debug)?\s+visibility\s+only\b/i,
   // "Test-only: reset ...", "(test-only, not for production use)", "Test-only seams".
   /\btest[- ]only(?:\s*[:,)]|\s+seams?\b)/i,
 ];
@@ -54,6 +56,7 @@ export const FROZEN_KNOWN_DEBT: readonly string[] = [
   "src/cli/debug/refinements.ts#RefinementsCommandOptions.sessionDir",
   "src/common/orpc/schemas/api.ts#debug",
   "src/common/orpc/schemas/api.ts#debug.triggerStreamError",
+  "src/desktop/keepAwake.ts#KeepAwakeController.isHoldingBlocker",
   "src/node/runtime/SSH2ConnectionPool.ts#AcquireConnectionOptions.sleep",
   "src/node/runtime/SSH2ConnectionPool.ts#SSH2ConnectionPool.clearAllHealth",
   "src/node/runtime/sshConnectionPool.ts#AcquireConnectionOptions.sleep",
@@ -141,6 +144,19 @@ function declarationName(node: ts.Node): string | undefined {
     const names = node.exportClause.elements.map((element) => element.name.text);
     return names.length > 0 ? names.join(",") : undefined;
   }
+  // `export * from "./a"` re-exports a module; `export * as ns from "./a"` names it.
+  if (ts.isExportDeclaration(node) && node.exportClause === undefined && node.moduleSpecifier) {
+    return ts.isStringLiteral(node.moduleSpecifier)
+      ? `* from ${node.moduleSpecifier.text}`
+      : undefined;
+  }
+  if (
+    ts.isExportDeclaration(node) &&
+    node.exportClause &&
+    ts.isNamespaceExport(node.exportClause)
+  ) {
+    return node.exportClause.name.text;
+  }
   if (ts.isExportAssignment(node)) return "default";
   if (ts.isVariableDeclarationList(node)) {
     const first = node.declarations[0];
@@ -221,12 +237,37 @@ export function findSeamComments(file: string, text: string): SeamComment[] {
   const record = (ranges: ts.CommentRange[] | undefined, owner: ts.Node) => {
     for (const range of ranges ?? []) owners.set(range.pos, { range, owner });
   };
+  // Trivia scans can wander into token text that looks like a comment (JSX text such as
+  // `<p>// note</p>`), so keep only ranges that start outside every token.
+  const tokenSpans: Array<[start: number, end: number]> = [];
   const visit = (node: ts.Node) => {
+    // JSDoc nodes are parsed comment contents, not tokens; their owner records the comment.
+    if (ts.isJSDoc(node)) return;
     record(ts.getLeadingCommentRanges(text, node.pos), node);
     record(ts.getTrailingCommentRanges(text, node.end), node);
-    for (const child of node.getChildren(sourceFile)) visit(child);
+    const children = node.getChildren(sourceFile);
+    if (children.length === 0 && node.end > node.pos) {
+      tokenSpans.push([node.getStart(sourceFile), node.end]);
+    }
+    for (const child of children) visit(child);
   };
   visit(sourceFile);
+  const insideToken = (pos: number) => {
+    // Leaves are visited in source order, so spans are sorted by start.
+    let low = 0;
+    let high = tokenSpans.length - 1;
+    while (low <= high) {
+      const mid = (low + high) >> 1;
+      const [start, end] = tokenSpans[mid];
+      if (pos < start) high = mid - 1;
+      else if (pos >= end) low = mid + 1;
+      else return true;
+    }
+    return false;
+  };
+  for (const pos of [...owners.keys()]) {
+    if (insideToken(pos)) owners.delete(pos);
+  }
 
   const found: SeamComment[] = [];
   for (const { range, owner } of coalesceLineComments(text, [...owners.values()])) {
