@@ -292,8 +292,10 @@ function blockedHint(
   switch (status) {
     case "requires_archive":
       return `Archive this workspace before ${action === "remove" ? "removing it" : "deleting its worktree"}.`;
+    // Historical rows only (#3950): the tool no longer accepts acknowledged paths, so point
+    // at the user-driven archive, which lists the files and asks for confirmation.
     case "requires_confirmation":
-      return "Re-run with these paths listed in acknowledged_untracked_paths to confirm.";
+      return "Archive this workspace from the sidebar to review and confirm these files.";
     case "active":
       return "Pass interrupt_active: true to act on a running turn.";
     default:
@@ -364,7 +366,8 @@ const WorkspaceRow: React.FC<{
         {row.paths && row.paths.length > 0 && (
           <DetailList
             label={
-              row.status === "requires_confirmation"
+              // Since #3950 the lossy-snapshot refusal is the only "error" row with paths.
+              row.status === "requires_confirmation" || row.status === "error"
                 ? "Untracked files that would be lost"
                 : "Paths"
             }

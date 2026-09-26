@@ -1494,6 +1494,9 @@ export const TaskWorkspaceLifecycleToolArgsSchema = z
 // TaskWorkspaceLifecycleToolArgsSchema (which is kept intact so historical transcripts
 // with delete_worktree/remove/force calls still parse and render): only the reversible
 // archive/unarchive verbs are model-invocable; task_remove stays the only irreversible verb.
+// It also has no untracked-file acknowledgement (#3950): paths returned to the model can be
+// echoed back, so only the user may approve a lossy snapshot archive (through the UI). The
+// strict schema rejects a model-supplied acknowledged_untracked_paths outright.
 export const TaskWorkspaceLifecycleToolInputSchema = z
   .object({
     action: z
@@ -1512,22 +1515,6 @@ export const TaskWorkspaceLifecycleToolInputSchema = z
       .nullish()
       .describe(
         "Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false."
-      ),
-    acknowledged_untracked_paths: z
-      .record(
-        z.string(),
-        z.array(
-          // The archive sink asserts trimmed non-empty paths when normalizing acknowledgements;
-          // reject blank entries at the boundary so a malformed acknowledgement fails this one
-          // call's validation instead of throwing inside the lifecycle service.
-          z
-            .string()
-            .refine((path) => path.trim().length > 0, "acknowledged paths must be non-empty")
-        )
-      )
-      .nullish()
-      .describe(
-        "Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result."
       ),
   })
   .strict();
@@ -1558,6 +1545,8 @@ export const TaskWorkspaceLifecycleToolTargetResultSchema = z.discriminatedUnion
   TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("removed") }).strict(),
   TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("already_removed") }).strict(),
   TaskWorkspaceLifecycleBaseResultSchema.extend({ status: z.literal("requires_archive") }).strict(),
+  // Historical only: lossy snapshot archives return "error" with paths since #3950, but
+  // older transcripts still carry this status and must keep rendering.
   TaskWorkspaceLifecycleBaseResultSchema.extend({
     status: z.literal("requires_confirmation"),
   }).strict(),
@@ -3208,7 +3197,7 @@ export const TOOL_DEFINITIONS = {
       'Use action="archive" when a peer workspace\'s work is complete; archived targets refuse task(kind="workspace", mode="existing") follow-ups until unarchived. ' +
       "Active workspace turns involving the target (delegated to it, or owned by it for nested delegation) are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
       "Live user activity in the target (a manual stream, terminal, or an attached desktop viewer/popout) also refuses archive and is never interrupted by this tool; an idle desktop process with nobody attached is closed by the archive. " +
-      "Archive may return requires_confirmation with untracked paths when a snapshot would be lossy — the confirmation is checked before any interruption; re-call with acknowledged_untracked_paths to confirm. " +
+      "Archive is refused (status error, with the untracked paths) when a snapshot archive would permanently delete untracked files; this check runs before any interruption, and only the user can approve that loss by archiving the workspace manually. " +
       'Archive of a managed-worktree target is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation; targets the worktree policy cannot delete (SSH/Coder, Docker, project-dir local, or shared isolation-none checkouts) stay archivable. ' +
       "For irreversible removal of inactive sub-agent children, use task_remove instead.",
     schema: TaskWorkspaceLifecycleToolInputSchema,

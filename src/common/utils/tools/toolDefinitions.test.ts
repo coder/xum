@@ -218,7 +218,6 @@ describe("TOOL_DEFINITIONS", () => {
         action: "archive",
         targets: [{ taskId: "wst_child" }],
         interrupt_active: null,
-        acknowledged_untracked_paths: null,
       }).success
     ).toBe(true);
 

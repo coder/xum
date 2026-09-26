@@ -100,17 +100,7 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
                 const result = await workspaceTurnManager.archiveOwnedWorkspaceTurnWorkspace(
                   ownerWorkspaceId,
                   target,
-                  {
-                    interruptActive,
-                    acknowledgedUntrackedPaths:
-                      target.workspaceId != null
-                        ? (args.acknowledged_untracked_paths?.[target.workspaceId] ?? undefined)
-                        : undefined,
-                    // Targets addressed by taskId resolve to a workspaceId in the backend, so
-                    // forward the full by-workspaceId map for post-resolution lookup.
-                    acknowledgedUntrackedPathsByWorkspaceId:
-                      args.acknowledged_untracked_paths ?? undefined,
-                  }
+                  { interruptActive }
                 );
                 return result.success
                   ? result.data
