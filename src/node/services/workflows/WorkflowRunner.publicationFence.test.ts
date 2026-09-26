@@ -35,6 +35,7 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { WorkflowRunStore } from "./WorkflowRunStore";
+import { createDeferred, pauseNextOwnerCheckedWrite } from "./workflowRunStore.testHarness";
 import {
   isWorkflowRunAlreadyActiveError,
   WorkflowPriorAttemptUnresolvedError,
@@ -67,14 +68,6 @@ const definition = {
   executable: true,
 };
 
-function createDeferred<T = void>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((promiseResolve) => {
-    resolve = promiseResolve;
-  });
-  return { promise, resolve };
-}
-
 async function settle(promise: Promise<unknown>) {
   try {
     return { kind: "resolved" as const, value: await promise };
@@ -104,27 +97,6 @@ class StallableRenewalStore extends WorkflowRunStore {
     }
     return await super.renewLease(runId, ownerId, nowMs);
   }
-}
-
-/**
- * One-shot pause on the store's next `getRunUnlocked`, which in appendStepRecord runs after
- * withWorkflowMutationLock + withExpectedLeaseOwner took their locks and checked the owner.
- */
-function pauseNextOwnerCheckedWrite(store: WorkflowRunStore) {
-  const entered = createDeferred();
-  const release = createDeferred();
-  // Private seam, reached the same way other store/service tests reach internals.
-  const internals = store as unknown as {
-    getRunUnlocked: (runId: string) => Promise<WorkflowRunRecord>;
-  };
-  const original = internals.getRunUnlocked.bind(store);
-  internals.getRunUnlocked = async (runId: string): Promise<WorkflowRunRecord> => {
-    internals.getRunUnlocked = original;
-    entered.resolve();
-    await release.promise;
-    return await original(runId);
-  };
-  return { entered: entered.promise, release: () => release.resolve() };
 }
 
 interface Backend {

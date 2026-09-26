@@ -26,6 +26,7 @@ import {
   CrossProcessLockTimeoutError,
 } from "@/node/utils/main/crossProcessLock";
 import { WorkflowRunStore } from "./WorkflowRunStore";
+import { pauseNextOwnerCheckedWrite } from "./workflowRunStore.testHarness";
 
 const RUN_ID = "wfr_4452_gap1";
 const STALE_LEASE_MS = 50;
@@ -41,14 +42,6 @@ const definition = {
   scope: "built-in" as const,
   executable: true,
 };
-
-function createDeferred<T = void>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((promiseResolve) => {
-    resolve = promiseResolve;
-  });
-  return { promise, resolve };
-}
 
 /** Two stores on the same session dir: two backends sharing one Xum root. */
 async function createBackends(sessionDir: string) {
@@ -69,28 +62,6 @@ async function createBackends(sessionDir: string) {
     eventsLock: path.join(runDir, "events.jsonl.xlock"),
     leaseLock: path.join(runDir, "lease.json.xlock"),
   };
-}
-
-/**
- * One-shot pause on the store's first `getRunUnlocked` call. In appendNextEvent that call is the
- * first thing appendNextEventUnlocked does, i.e. after withWorkflowMutationLock took the events
- * lock and withExpectedLeaseOwner took the lease lock and checked the owner.
- */
-function pauseInsideOwnerCheckedSection(store: WorkflowRunStore) {
-  const entered = createDeferred();
-  const release = createDeferred();
-  // Private seam, reached the same way other store/service tests reach internals.
-  const internals = store as unknown as {
-    getRunUnlocked: (runId: string) => Promise<WorkflowRunRecord>;
-  };
-  const original = internals.getRunUnlocked.bind(store);
-  internals.getRunUnlocked = async (runId: string): Promise<WorkflowRunRecord> => {
-    internals.getRunUnlocked = original;
-    entered.resolve();
-    await release.promise;
-    return await original(runId);
-  };
-  return { entered: entered.promise, release: () => release.resolve() };
 }
 
 /**
@@ -147,7 +118,7 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
     const { storeA, eventsLock, leaseLock } = await createBackends(tmp.path);
     await expect(storeA.acquireLease(RUN_ID, OWNER_A, LEASE_ACQUIRED_AT_MS)).resolves.toBe(true);
 
-    const pause = pauseInsideOwnerCheckedSection(storeA);
+    const pause = pauseNextOwnerCheckedWrite(storeA);
     const writeA = storeA.appendNextEvent(RUN_ID, logEvent("A write"), {
       expectedLeaseOwnerId: OWNER_A,
     });
@@ -168,7 +139,7 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
     const { storeA, storeB, eventsLock, leaseLock } = await createBackends(tmp.path);
     await expect(storeA.acquireLease(RUN_ID, OWNER_A, LEASE_ACQUIRED_AT_MS)).resolves.toBe(true);
 
-    const pause = pauseInsideOwnerCheckedSection(storeA);
+    const pause = pauseNextOwnerCheckedWrite(storeA);
     const writeA = storeA.appendNextEvent(RUN_ID, logEvent("A write"), {
       expectedLeaseOwnerId: OWNER_A,
     });
@@ -200,7 +171,7 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
     const { storeA, storeB, eventsLock, leaseLock } = await createBackends(tmp.path);
     await expect(storeA.acquireLease(RUN_ID, OWNER_A, LEASE_ACQUIRED_AT_MS)).resolves.toBe(true);
 
-    const pause = pauseInsideOwnerCheckedSection(storeA);
+    const pause = pauseNextOwnerCheckedWrite(storeA);
     const writeA = storeA.appendNextEvent(RUN_ID, logEvent("A write"), {
       expectedLeaseOwnerId: OWNER_A,
     });
@@ -234,14 +205,14 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
     const { storeA, storeB, eventsLock } = await createBackends(tmp.path);
     await expect(storeA.acquireLease(RUN_ID, OWNER_A, LEASE_ACQUIRED_AT_MS)).resolves.toBe(true);
 
-    const pauseA = pauseInsideOwnerCheckedSection(storeA);
+    const pauseA = pauseNextOwnerCheckedWrite(storeA);
     const writeA = storeA.appendNextEvent(RUN_ID, logEvent("A write"), {
       expectedLeaseOwnerId: OWNER_A,
     });
     await pauseA.entered;
     // An unfenced journal write from the other store (e.g. a Stop's status) queues on the events
     // lock; it must not enter while A holds it.
-    const pauseB = pauseInsideOwnerCheckedSection(storeB);
+    const pauseB = pauseNextOwnerCheckedWrite(storeB);
     let bEntered = false;
     const bEnteredSignal = pauseB.entered.then(() => {
       bEntered = true;
@@ -282,7 +253,7 @@ describe("WorkflowRunStore lease takeover under a stalled lock holder (#4452 gap
     });
     await expect(storeA.acquireLease(RUN_ID, OWNER_A, LEASE_ACQUIRED_AT_MS)).resolves.toBe(true);
 
-    const pause = pauseInsideOwnerCheckedSection(storeA);
+    const pause = pauseNextOwnerCheckedWrite(storeA);
     const writeA = storeA.appendNextEvent(RUN_ID, logEvent("A write"), {
       expectedLeaseOwnerId: OWNER_A,
     });
