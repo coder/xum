@@ -213,9 +213,9 @@ describe("passive refresh runtime gating", () => {
 
 // #4662: opening a workspace must not spawn gh pr/stack probes while its chat replay runs.
 describe("chat replay gating", () => {
-  it.each([false, true])(
-    "defers PR and stack probes until the chat replay settles (last subscriber leaves first: %s)",
-    async (unsubscribeFirst) => {
+  it.each(["the chat replay settles", "the last subscriber leaves"] as const)(
+    "defers PR and stack probes until %s",
+    async (release) => {
       const metadata = createWorkspaceMetadata("replay-pending", DEFAULT_RUNTIME_CONFIG);
       const executeBash = mock(() =>
         Promise.resolve({ success: false as const, error: "gh unavailable" })
@@ -241,7 +241,7 @@ describe("chat replay gating", () => {
         await waitUntil(() => gateListeners.size === 1);
         expect(executeBash.mock.calls.length).toBe(0);
 
-        if (unsubscribeFirst) {
+        if (release === "the last subscriber leaves") {
           // The last subscriber leaving must release the watcher on WorkspaceStore.
           unsubscribe();
           expect(gateListeners.size).toBe(0);
@@ -254,6 +254,7 @@ describe("chat replay gating", () => {
         const scripts = executeBash.mock.calls.map(
           (call) => ((call as unknown[])[0] as { script: string }).script
         );
+        expect(scripts.some((script) => script.includes("gh pr view"))).toBe(true);
         expect(scripts.some((script) => script.includes("gh stack view"))).toBe(true);
         expect(gateListeners.size).toBe(0);
         unsubscribe();
