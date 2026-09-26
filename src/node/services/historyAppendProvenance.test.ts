@@ -478,12 +478,24 @@ if (!result.success) throw new Error(result.error);
 
   test("post-append certification failure preserves success but expires the epoch", async () => {
     const cursor = await startCursor();
-    const stamps = HistoryAppendProvenance.prototype.stamps.bind(store);
-    let calls = 0;
+    const stamps = HistoryAppendProvenance.prototype.stamps; // eslint-disable-line @typescript-eslint/unbound-method -- called with the original receiver
+    // Target the post-append stat by call site, not by a global prototype call count:
+    // stamps() calls from other instances (leftover async work from earlier tests) or
+    // extra calls elsewhere would otherwise move the fault onto the pre-append stat.
+    // The post-append stat is the first stamps() on this chat once the row is on disk.
+    let rejected = false;
     const failed = spyOn(HistoryAppendProvenance.prototype, "stamps").mockImplementation(function (
       this: HistoryAppendProvenance
     ) {
-      return ++calls === 3 ? Promise.reject(new Error("post-append stat failure")) : stamps();
+      if (
+        !rejected &&
+        this.chatPath === store.chatPath &&
+        nodeFs.readFileSync(this.chatPath, "utf8").includes("accepted-without-certificate")
+      ) {
+        rejected = true;
+        return Promise.reject(new Error("post-append stat failure"));
+      }
+      return stamps.call(this);
     });
     try {
       expect(
@@ -497,6 +509,7 @@ if (!result.success) throw new Error(result.error);
     } finally {
       failed.mockRestore();
     }
+    expect(rejected).toBe(true);
     await assertStale(cursor);
     expect(await fs.readFile(store.chatPath, "utf8")).toContain("accepted-without-certificate");
   });
