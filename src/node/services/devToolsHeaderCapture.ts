@@ -109,7 +109,11 @@ const CREDENTIAL_BODY_KEYS = new Set([
  * Anthropic thinking `signature`, Gemini `thoughtSignature`. Only the length is kept, which
  * is enough to spot an empty or truncated blob without persisting its contents.
  */
-const ENCRYPTED_REASONING_BODY_KEYS = new Set(["encryptedcontent", "signature", "thoughtsignature"]);
+const ENCRYPTED_REASONING_BODY_KEYS = new Set([
+  "encryptedcontent",
+  "signature",
+  "thoughtsignature",
+]);
 
 function normalizeBodyKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
