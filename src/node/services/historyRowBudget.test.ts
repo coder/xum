@@ -70,6 +70,14 @@ describe("fitCompactionSummaryToHistoryRow", () => {
     expect(fitted.message.metadata).toBe(message.metadata);
   });
 
+  it("leaves an oversized boundary without exactly one text part untouched", () => {
+    const message = boundary("s".repeat(SESSION_HISTORY_MAX_LINE_BYTES), "continue");
+    message.parts.push({ type: "text", text: "second part" });
+    const fitted = fitCompactionSummaryToHistoryRow(message, workspaceId);
+    expect(fitted.message).toBe(message);
+    expect(fitted.rowExceedsLimit).toBe(true);
+  });
+
   it("shrinks the summary to the room a large follow-up leaves", () => {
     const followUpText = "f".repeat(limit - MIN_FITTED_COMPACTION_SUMMARY_BYTES - 4096);
     const summary = "s".repeat(256 * 1024);

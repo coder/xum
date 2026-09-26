@@ -65,15 +65,20 @@ export function fitCompactionSummaryToHistoryRow(
   message: MuxMessage,
   workspaceId: string
 ): FittedCompactionSummary {
-  const textIndex = message.parts.findIndex((part) => part.type === "text");
-  const textParts = message.parts.filter((part) => part.type === "text");
-  assert(textParts.length === 1, "Compaction boundary summaries carry exactly one text part");
-  const summaryPart = message.parts[textIndex];
-  assert(summaryPart?.type === "text", "Compaction boundary summary part must be text");
-
   const limit = SESSION_HISTORY_MAX_LINE_BYTES - COMPACTION_BOUNDARY_ROW_HEADROOM_BYTES;
   const rowBytes = measurePersistedHistoryRowBytes(message, workspaceId);
   if (rowBytes <= limit) return { message, rowExceedsLimit: false, rowBytes };
+
+  // Builders emit one text part, but a replayed continuous-compaction journal is persisted
+  // input: leave any other shape untouched rather than failing its recovery.
+  const textIndex = message.parts.findIndex((part) => part.type === "text");
+  const summaryPart = message.parts[textIndex];
+  if (
+    summaryPart?.type !== "text" ||
+    message.parts.filter((part) => part.type === "text").length !== 1
+  ) {
+    return { message, rowExceedsLimit: rowBytes > SESSION_HISTORY_MAX_LINE_BYTES, rowBytes };
+  }
 
   const withSummary = (text: string): MuxMessage => ({
     ...message,

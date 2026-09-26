@@ -2220,6 +2220,11 @@ describe("CompactionHandler", () => {
             (message as { id?: unknown }).id === boundary?.id
         );
       expect(emitted?.parts[0]).toMatchObject({ type: "text", text });
+      // A renderer that missed stream-start rebuilds the message from the terminal event.
+      const streamEnd = getEmittedStreamEndEvent(emittedEvents);
+      expect(streamEnd?.parts.filter((part) => part.type === "text")).toEqual([
+        expect.objectContaining({ text }),
+      ]);
     });
 
     it("keeps a large follow-up byte-identical and shrinks only the summary", async () => {

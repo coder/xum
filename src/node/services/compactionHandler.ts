@@ -652,7 +652,7 @@ export class CompactionHandler {
     });
 
     // Notify that compaction completed (clears idle compaction pending state)
-    this.onCompactionComplete?.(result.data);
+    this.onCompactionComplete?.(result.data.completion);
 
     // Report the idle-compaction success only after the summary is actually persisted,
     // so the idle loop's failure streak is reset on real success (not just stream end).
@@ -660,7 +660,20 @@ export class CompactionHandler {
 
     // Emit a sanitized stream-end so UI can close streaming state without
     // re-introducing stale provider metadata from the pre-compaction row.
-    this.emitChatEvent(this.sanitizeCompactionStreamEndEvent(event));
+    // When the boundary truncated the summary, carry the persisted text: a renderer that missed
+    // stream-start rebuilds the message from these parts and must not restore it (#4551).
+    const persistedTextParts = result.data.summaryParts.filter((part) => part.type === "text");
+    const truncated = persistedTextParts.map((part) => part.text).join("") !== summary;
+    this.emitChatEvent(
+      this.sanitizeCompactionStreamEndEvent(
+        truncated
+          ? {
+              ...event,
+              parts: [...event.parts.filter((part) => part.type !== "text"), ...persistedTextParts],
+            }
+          : event
+      )
+    );
     return true;
   }
 
@@ -947,7 +960,9 @@ export class CompactionHandler {
     compactionRequestMessageId: string,
     isIdleCompaction = false,
     pendingFollowUp?: CompactionFollowUpRequest
-  ): Promise<Result<CompactionCompletionMetadata, string>> {
+  ): Promise<
+    Result<{ completion: CompactionCompletionMetadata; summaryParts: MuxMessage["parts"] }, string>
+  > {
     assert(summary.trim().length > 0, "performCompaction requires a non-empty summary");
     assert(metadata.model.trim().length > 0, "Compaction summary requires a model");
     assert(
@@ -1117,13 +1132,16 @@ export class CompactionHandler {
     }
 
     return Ok({
-      workspaceId: this.workspaceId,
-      summaryMessageId: summaryMessage.id,
-      summaryHistorySequence: persistedSequence,
-      compactionEpoch: nextCompactionEpoch,
-      previousBoundaryHistorySequence,
-      compactionRequestMessageId,
-      preservedTailMessageCount: preservedTailCopies.length,
+      completion: {
+        workspaceId: this.workspaceId,
+        summaryMessageId: summaryMessage.id,
+        summaryHistorySequence: persistedSequence,
+        compactionEpoch: nextCompactionEpoch,
+        previousBoundaryHistorySequence,
+        compactionRequestMessageId,
+        preservedTailMessageCount: preservedTailCopies.length,
+      },
+      summaryParts: persisted.parts,
     });
   }
 
