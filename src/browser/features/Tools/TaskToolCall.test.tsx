@@ -747,6 +747,56 @@ describe("TaskListToolCall", () => {
     expect(view.getByText("sibling")).toBeDefined();
     expect(view.getByText("depth: 1")).toBeDefined();
   });
+
+  test("untitled instance rows fall back to the workspace name; titled and tree rows do not", () => {
+    const instanceArgs = { scope: "instance" as const };
+    const InstanceTaskListToolCall = getToolComponent("task_list", instanceArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <InstanceTaskListToolCall
+          args={instanceArgs}
+          status="completed"
+          result={{
+            tasks: [
+              {
+                taskId: "ws-untitled",
+                status: "workspace",
+                workspaceName: "feature-login",
+                relationship: "unrelated",
+                projectPath: "/home/alice/projects/app",
+                activity: "idle",
+                depth: 0,
+              },
+              {
+                taskId: "ws-titled",
+                status: "workspace",
+                workspaceName: "release-branch",
+                title: "Release cut",
+                relationship: "unrelated",
+                projectPath: "/home/alice/projects/app",
+                activity: "busy",
+                depth: 0,
+              },
+              // Not an instance row (no projectPath): the fallback must not apply.
+              {
+                taskId: "task-child",
+                status: "running",
+                workspaceName: "explore_child",
+                relationship: "descendant",
+                depth: 1,
+              },
+            ],
+          }}
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task_list"));
+    expect(view.getByText("feature-login")).toBeDefined();
+    expect(view.getByText("Release cut")).toBeDefined();
+    expect(view.queryByText("release-branch")).toBeNull();
+    expect(view.queryByText("explore_child")).toBeNull();
+  });
 });
 
 const taskRetitleArgs = { task_id: "child-task", title: "Simplicity Auditor" };

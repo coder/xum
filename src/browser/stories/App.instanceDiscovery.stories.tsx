@@ -1,7 +1,8 @@
 /**
  * Instance-wide discovery: `task_list scope:"instance"` rendered inside the full App transcript.
  * Rows are root workspaces across projects with a busy/idle snapshot, the caller's own row, a long
- * project path, and a truncated page that advertises `nextOffset`.
+ * project path, an untitled row labeled by its workspace name, and a truncated page that advertises
+ * `nextOffset`.
  */
 
 import type { ComponentType } from "react";
@@ -136,6 +137,10 @@ export const Desktop: AppStory = {
     }
     if (canvas.queryByText("self") == null || canvas.queryAllByText("unrelated").length !== 2) {
       throw new Error("instance rows did not render their relationships");
+    }
+    // Untitled instance rows fall back to their workspace name; titled rows keep only the title.
+    if (canvas.queryByText("docs-sweep") == null || canvas.queryByText("release-cut") != null) {
+      throw new Error("untitled instance row did not fall back to its workspace name");
     }
   },
 };
