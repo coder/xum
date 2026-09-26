@@ -1241,15 +1241,18 @@ export class AgentSession {
   private preparingQueuedInput?: {
     attempt: PreparationAttempt;
     read: () => QueuedInput | undefined;
+    /** The send behind `read`, kept as held input when Stop restores it (#4448). */
+    readSend: () => RefusedManualSend | undefined;
   };
 
   /**
    * Held input: the user's manual queued sends that the dequeue gate refused (the task reported
-   * before they ran), oldest first. The session keeps the full original send, so it is never
-   * handed to the renderer to own: the user explicitly re-sends it (sendHeldInput, an ordinary
-   * new manual send) or discards it. Held inputs are NOT queue entries — never batched with new
-   * sends, drained, force-sent or counted as dispatchable work, and untouched by Stop and
-   * clearQueue. Published as `held-inputs-changed` on every change and every onChat replay (the
+   * before they ran), or that a restore returned to the composer (`interrupted`: held until a
+   * composer takes the restore and discards them, #4448), oldest first. The session keeps the full
+   * original send, so it is never handed to the renderer to own: the user explicitly re-sends it
+   * (sendHeldInput, an ordinary new manual send) or discards it. Held inputs are NOT queue
+   * entries — never batched with new sends, drained, force-sent or counted as dispatchable work,
+   * and never removed by Stop or clearQueue. Published as `held-inputs-changed` on every change and every onChat replay (the
    * renderer only subscribes to the workspace it shows). In memory only: like a queued message, a
    * held input does not survive a backend restart.
    */
@@ -10166,16 +10169,20 @@ export class AgentSession {
   restoreQueueToInput(): void {
     this.assertNotDisposed("restoreQueueToInput");
     const preparing = this.preparingQueuedInput;
-    const interrupted =
+    const restoresPreparing =
       preparing?.attempt.durability === "rollback-eligible" &&
       // Complete bytes may survive a failed flush without granting a durable acceptance receipt.
       preparing.attempt.inputPublication?.metadata?.historySequence === undefined &&
-      (preparing.attempt.compactionAdmissionStale() || preparing.attempt.failure != null)
-        ? preparing.read()
-        : undefined;
+      (preparing.attempt.compactionAdmissionStale() || preparing.attempt.failure != null);
+    const interrupted = restoresPreparing ? preparing.read() : undefined;
+    // Under the same condition as `interrupted`: a published send held here would be sent twice.
+    const interruptedSend = restoresPreparing ? preparing.readSend() : undefined;
     if (interrupted) this.preparingQueuedInput = undefined;
     const inputs = [interrupted, this.messageQueue.getInputForRestore()].filter(
       (input) => input != null
+    );
+    const restoredSends = [interruptedSend, ...this.messageQueue.getRestorableManualSends()].filter(
+      (send) => send != null
     );
     if (this.messageQueue.isEmpty() && inputs.length === 0) return;
 
@@ -10188,6 +10195,19 @@ export class AgentSession {
     for (const { send, refusal } of this.messageQueue.getTaskStaleManualSends()) {
       this.holdRefusedSend(send, refusal);
     }
+
+    // The restore below is a one-shot event: a composer in edit mode drops it, and nobody receives
+    // it while this workspace's composer is not mounted or not subscribed (#4448). So the restored
+    // input is also held until a composer takes it and releases these entries
+    // (discardHeldInput). Held before the clear is published, so no observer sees the input in
+    // neither; announced after the restore, so a composer that takes it can hide the entries
+    // before the renderer would show them.
+    const restoredHeld = restoredSends.map((send) => ({
+      id: randomUUID(),
+      send,
+      reason: "interrupted" as const,
+    }));
+    if (restoredHeld.length > 0) this.heldInputs = [...this.heldInputs, ...restoredHeld];
 
     // Clear everything: synthetic wake callbacks need cancellation so their durable
     // records do not retry after the user explicitly interrupted the workspace.
@@ -10204,8 +10224,10 @@ export class AgentSession {
           .join("\n"),
         fileParts: inputs.flatMap((input) => input.fileParts ?? []),
         reviews: reviews.length > 0 ? reviews : undefined,
+        ...(restoredHeld.length > 0 ? { heldInputIds: restoredHeld.map(({ id }) => id) } : {}),
       });
     }
+    if (restoredHeld.length > 0) this.emitChatEvent(this.heldInputsChangedEvent());
   }
 
   private heldInputsChangedEvent(): Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }> {
@@ -10421,7 +10443,11 @@ export class AgentSession {
         receipt.successor = { kind: "admitted", turnGeneration: preparedTurn };
         attempt.queueCutEntryId = entryId;
       }
-      this.preparingQueuedInput = { attempt, read: candidate.inputForRestore };
+      this.preparingQueuedInput = {
+        attempt,
+        read: candidate.inputForRestore,
+        readSend: candidate.sendForRestore,
+      };
       attempt.acceptanceOrigin = internal?.acceptanceOrigin ?? "manual";
       attempt.onFailure = internal?.onAcceptedPreStreamFailure;
       this.dispatchingQueuedEntry = true;

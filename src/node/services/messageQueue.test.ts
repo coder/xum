@@ -2023,4 +2023,96 @@ describe("MessageQueue", () => {
       expect(second.internal?.preTurnMessages).toBeUndefined();
     });
   });
+
+  // #4448: Stop keeps each restored manual entry as held input; its Send must reproduce the send
+  // the drain would have made.
+  describe("getRestorableManualSends", () => {
+    const reviews = [
+      { filePath: "src/file.ts", lineRange: "1", selectedCode: "call()", userNote: "check" },
+    ];
+    const filePart = { url: "data:text/plain;base64,cXVldWVk", mediaType: "text/plain" };
+    const fill = (target: MessageQueue) => {
+      target.add(
+        "first provider text",
+        {
+          model: "openai:gpt-5.2",
+          agentId: "exec",
+          fileParts: [filePart],
+          muxMetadata: { type: "normal", reviews },
+          authoredText: "first authored",
+          queueDispatchMode: "turn-end",
+        },
+        { acceptanceOrigin: "manual" }
+      );
+      // Batched into the same entry: the drain sends both texts with the latest options.
+      target.add(
+        "second",
+        { model: "openai:gpt-5.2", agentId: "plan" },
+        { acceptanceOrigin: "manual" }
+      );
+      target.add(
+        "background wake",
+        { model: "openai:gpt-5.2", agentId: "exec" },
+        { synthetic: true }
+      );
+      target.add(
+        "/init",
+        {
+          model: "openai:gpt-5.2",
+          agentId: "exec",
+          muxMetadata: {
+            type: "agent-skill",
+            rawCommand: "/init",
+            skillName: "init",
+            scope: "built-in",
+          },
+        },
+        { acceptanceOrigin: "manual" }
+      );
+    };
+
+    it("holds one send per restorable manual entry, equal to what the drain would send", () => {
+      fill(queue);
+      const drained = new MessageQueue();
+      fill(drained);
+      const drainSends = [drained.dequeueNext(), drained.dequeueNext(), drained.dequeueNext()];
+
+      const sends = queue.getRestorableManualSends();
+
+      // The synthetic wake is never the user's input.
+      expect(sends.map((send) => send.displayText)).toEqual(["first authored\nsecond", "/init"]);
+      const expected = [drainSends[0], drainSends[2]];
+      sends.forEach((send, index) => {
+        const { authoredText, ...options } = send.options;
+        expect(send.message).toBe(expected[index].message);
+        // The drain passes `fileParts: undefined` when there are none; the held send omits it.
+        const drain = expected[index].options;
+        if (drain === undefined) throw new Error("the drain sends options for a manual entry");
+        const { fileParts, ...drainOptions } = drain;
+        expect(options).toEqual({ ...drainOptions, ...(fileParts ? { fileParts } : {}) });
+        expect(authoredText).toBe(index === 0 ? "first authored\nsecond" : undefined);
+      });
+      expect(sends[0].attachmentCount).toBe(1);
+      expect(sends[0].reviewCount).toBe(1);
+    });
+
+    it("skips canceled and stale entries, like the composer restore", () => {
+      const controller = new AbortController();
+      queue.add(
+        "canceled",
+        { model: "openai:gpt-5.2", agentId: "exec" },
+        { cancelSignal: controller.signal }
+      );
+      queue.add(
+        "stale",
+        { model: "openai:gpt-5.2", agentId: "exec" },
+        { admissionStale: () => true }
+      );
+      queue.add("kept", { model: "openai:gpt-5.2", agentId: "exec" });
+      controller.abort();
+
+      expect(queue.getRestorableManualSends().map((send) => send.displayText)).toEqual(["kept"]);
+      expect(queue.getInputForRestore()?.text).toBe("kept");
+    });
+  });
 });

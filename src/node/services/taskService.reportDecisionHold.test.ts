@@ -1059,7 +1059,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         workspaceId: childId,
         text: "follow-up text",
       });
-      expect(stack.heldInputs()).toHaveLength(0);
+      // Kept as held input until a composer takes the restore (#4448); never held twice.
+      expect(stack.heldInputs().map((held) => [held.reason, held.send.displayText])).toEqual([
+        ["interrupted", "follow-up text"],
+      ]);
+      expect(stack.restoreEvents()[0]).toMatchObject({ heldInputIds: [stack.heldInputs()[0].id] });
       expect(onCanceled).toHaveBeenCalledTimes(1);
       expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
       // The obligation is discharged by the clear; the decision still belongs to the handler.

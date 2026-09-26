@@ -22,6 +22,7 @@ const SHORTCUT_HINT_CLASS =
 const HELD_INPUT_REASON_LABELS: Record<HeldInputData["reason"], string> = {
   reported: "Not sent — the task reported before this ran",
   indeterminate: "Not sent — the task's outcome was not confirmed before this ran",
+  interrupted: "Not sent — interrupted before this ran",
 };
 
 function pluralize(count: number, noun: string): string {
@@ -80,7 +81,8 @@ function runHeldInputAction(
 
 /**
  * A manual queued message the backend refused to dispatch because the task reported before it
- * ran. The backend keeps the full send; this banner only offers the two explicit outcomes. There
+ * ran, or that Stop returned while no composer could take it (edit mode, not mounted). The
+ * backend keeps the full send; this banner only offers the two explicit outcomes. There
  * is deliberately no "edit"/move-to-composer action: that would hand the only copy to renderer
  * draft storage, which can fail to persist it.
  */

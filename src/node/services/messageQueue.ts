@@ -976,8 +976,18 @@ export class MessageQueue {
     return this.inputForRestore(this.entries);
   }
 
-  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
-    const restorable = entries.filter(
+  /**
+   * Each restorable entry's send (see {@link manualSend}), for the same entries and at the same
+   * moment as {@link getInputForRestore}: Stop keeps them as held input until a composer takes
+   * the restored input (AgentSession.restoreQueueToInput, #4448).
+   */
+  getRestorableManualSends(): RefusedManualSend[] {
+    return this.restorableEntries(this.entries).flatMap((entry) => this.manualSend(entry) ?? []);
+  }
+
+  /** The user's own manual input that Stop may restore. */
+  private restorableEntries(entries: readonly QueueEntry[]): QueueEntry[] {
+    return entries.filter(
       (entry) =>
         entry.userAuthored &&
         this.getAcceptanceOrigin(entry) === "manual" &&
@@ -986,6 +996,10 @@ export class MessageQueue {
         // A task-stale entry is kept as held input instead (getTaskStaleManualSends): never both.
         entry.turnAdmission?.admissionStale() !== true
     );
+  }
+
+  private inputForRestore(entries: readonly QueueEntry[]): QueuedInput | undefined {
+    const restorable = this.restorableEntries(entries);
     for (const entry of restorable) {
       assert(
         entry.authoredMessages.length === entry.messages.length,
@@ -1134,6 +1148,8 @@ export class MessageQueue {
         muxMetadata: unknown;
         acceptanceOrigin: TurnAcceptanceOrigin;
         inputForRestore: () => QueuedInput | undefined;
+        /** The send behind {@link inputForRestore}, when it has one (Stop holds it, #4448). */
+        sendForRestore: () => RefusedManualSend | undefined;
         /** The entry's original send when it is the user's manual input (the dequeue gate holds it). */
         refusedManualSend: () => RefusedManualSend | undefined;
         /** The entry's task-attempt obligation, checked by the dequeue gate before admission. */
@@ -1147,6 +1163,8 @@ export class MessageQueue {
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),
           inputForRestore: () => this.inputForRestore([entry]),
+          sendForRestore: () =>
+            this.restorableEntries([entry]).length > 0 ? this.manualSend(entry) : undefined,
           refusedManualSend: () => this.refusedManualSend(entry),
           turnAdmission: entry.turnAdmission,
         }
@@ -1185,6 +1203,16 @@ export class MessageQueue {
     assert(entry.turnAdmission != null, "only task-attempt entries are refused at dispatch");
     assert(entry.addCount === 1, "a refused task-attempt entry holds exactly one send");
     assert(entry.latestOptions != null, "a manual queued send keeps its send options");
+    return this.manualSend(entry);
+  }
+
+  /**
+   * The send an entry holds, as {@link dequeueNext} would send it (joined texts with the latest
+   * options, first metadata, all file parts), plus its display data. Undefined when it has nothing
+   * to send or no send options to re-send with.
+   */
+  private manualSend(entry: QueueEntry): RefusedManualSend | undefined {
+    if (entry.latestOptions == null) return undefined;
     const reviewCount = this.getReviewsForEntries([entry])?.length ?? 0;
     if (entry.messages.length === 0 && entry.fileParts.length === 0 && reviewCount === 0) {
       return undefined;
