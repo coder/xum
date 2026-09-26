@@ -1544,9 +1544,16 @@ export class WorkspaceMcpOverridesService {
     // container swapped in between the guard and the unlink (#4696). The
     // container-side child is bounded instead (#4481); the host's timeout
     // below also kills the local `devcontainer exec` process tree.
+    // The bound can kill `rm` between operands, so there the canonical
+    // document goes last (lowest read precedence first), as on the host path.
     const command =
       runtimeConfig !== undefined && isDevcontainerRuntime(runtimeConfig)
-        ? boundContainerMutation(rm)
+        ? boundContainerMutation(
+            `rm -f ${[...MCP_OVERRIDES_GITIGNORE_PATTERNS]
+              .reverse()
+              .map((filePath) => `"${filePath}"`)
+              .join(" ")}`
+          )
         : rm;
     const result = await execBuffered(runtime, command, {
       cwd: workspacePath,

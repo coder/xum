@@ -2859,7 +2859,9 @@ describe("WorkspaceMcpOverridesService", () => {
       type: "devcontainer",
       configPath: ".devcontainer/devcontainer.json",
     });
-    const rm = `rm -f ${[".xum/mcp.local.jsonc", ".xum/mcp.local.json", ".mux/mcp.local.jsonc", ".mux/mcp.local.json"].map((relative) => `"${relative}"`).join(" ")}`;
+    // Lowest read precedence first, canonical last: a kill at the bound
+    // between operands must never leave a stale fallback authoritative.
+    const rm = `rm -f ${[".mux/mcp.local.json", ".mux/mcp.local.jsonc", ".xum/mcp.local.json", ".xum/mcp.local.jsonc"].map((relative) => `"${relative}"`).join(" ")}`;
     expect(commands).toEqual([boundContainerMutation(rm)]);
     expect(await pathExists(filePath)).toBe(false);
   });
