@@ -61,6 +61,21 @@ const ProviderIconSvgStub = (props: React.SVGProps<SVGSVGElement>) => (
   <svg data-testid="provider-icon-mock" {...props} />
 );
 
+const PROVIDER_ICON_SVG_PATHS = [
+  "@/browser/assets/icons/anthropic.svg?react",
+  "@/browser/assets/icons/openai.svg?react",
+  "@/browser/assets/icons/google.svg?react",
+  "@/browser/assets/icons/xai.svg?react",
+  "@/browser/assets/icons/openrouter.svg?react",
+  "@/browser/assets/icons/ollama.svg?react",
+  "@/browser/assets/icons/deepseek.svg?react",
+  "@/browser/assets/icons/moonshotai.svg?react",
+  "@/browser/assets/icons/zai.svg?react",
+  "@/browser/assets/icons/aws.svg?react",
+  "@/browser/assets/icons/github.svg?react",
+  "@/browser/assets/icons/coder.svg?react",
+] as const;
+
 // installProjectSidebarTestDoubles() registers module mocks from setup hooks, and `mock.restore()`
 // in cleanup does not undo mock.module, so restore the real modules once the suite ends; they
 // otherwise leak into every later test file in the bun process (#4639).
@@ -68,20 +83,24 @@ restoreModulesAfterSuite([
   ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
   ["@/browser/components/PositionedMenu/PositionedMenu", { ...RealPositionedMenuModule }],
 ]);
-// AgentListItem and the logos are restored lazily instead: loading them (or AgentListItem's SVG
-// icons) while this file's module graph is being evaluated makes bun's warm transpiler cache
-// parse the SVG assets as JSX ("Legacy HTML comments not implemented"). The query-suffixed
-// AgentListItem is the same real instance the real-row tests render. Without svgr, bun test's
-// real `?react` SVG module is the file loader's `{ default: <asset path> }`.
+// AgentListItem and the SVGs (logos, provider icons) are restored lazily instead: loading them
+// (or AgentListItem's SVG icons) while this file's module graph is being evaluated makes bun's
+// warm transpiler cache parse the SVG assets as JSX ("Legacy HTML comments not implemented").
+// The query-suffixed AgentListItem is the same real instance the real-row tests render. Without
+// svgr, bun test's real `?react` SVG module is the file loader's `{ default: <asset path> }`.
 function realAgentListItemModule(): typeof AgentListItemModuleExports {
   /* eslint-disable @typescript-eslint/no-require-imports */
   return require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as typeof AgentListItemModuleExports;
   /* eslint-enable @typescript-eslint/no-require-imports */
 }
 afterAll(() => {
-  for (const logoFile of ["xum-logo-dark.svg", "xum-logo-light.svg"]) {
-    void mock.module(`@/browser/assets/logos/${logoFile}?react`, () => ({
-      default: Bun.resolveSync(`@/browser/assets/logos/${logoFile}`, import.meta.dir),
+  for (const svgPath of [
+    "@/browser/assets/logos/xum-logo-dark.svg?react",
+    "@/browser/assets/logos/xum-logo-light.svg?react",
+    ...PROVIDER_ICON_SVG_PATHS,
+  ]) {
+    void mock.module(svgPath, () => ({
+      default: Bun.resolveSync(svgPath.replace(/\?react$/, ""), import.meta.dir),
     }));
   }
   const realAgentListItem = { ...realAgentListItemModule() };
@@ -89,22 +108,7 @@ afterAll(() => {
 });
 
 function installProviderIconSvgMocks() {
-  const providerIconSvgPaths = [
-    "@/browser/assets/icons/anthropic.svg?react",
-    "@/browser/assets/icons/openai.svg?react",
-    "@/browser/assets/icons/google.svg?react",
-    "@/browser/assets/icons/xai.svg?react",
-    "@/browser/assets/icons/openrouter.svg?react",
-    "@/browser/assets/icons/ollama.svg?react",
-    "@/browser/assets/icons/deepseek.svg?react",
-    "@/browser/assets/icons/moonshotai.svg?react",
-    "@/browser/assets/icons/zai.svg?react",
-    "@/browser/assets/icons/aws.svg?react",
-    "@/browser/assets/icons/github.svg?react",
-    "@/browser/assets/icons/coder.svg?react",
-  ] as const;
-
-  for (const svgPath of providerIconSvgPaths) {
+  for (const svgPath of PROVIDER_ICON_SVG_PATHS) {
     void mock.module(svgPath, () => ({
       __esModule: true,
       default: ProviderIconSvgStub,
