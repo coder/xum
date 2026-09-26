@@ -28,6 +28,14 @@ export const MAX_QUEUED_PEER_MESSAGES_PER_TARGET = 10;
 export const AGENT_PEER_MESSAGE_DEDUPE_PREFIX = "agent-msg:";
 
 /**
+ * Queue dedupe-key prefix for the notice that wakes a sender refused by a target's
+ * consecutive-wake cap (`peer-wake-available:<target>`). Repeated resets coalesce onto one queued
+ * notice; deliberately distinct from AGENT_PEER_MESSAGE_DEDUPE_PREFIX so it is not counted as a
+ * peer message against the sender's own queue cap.
+ */
+export const PEER_WAKE_AVAILABLE_DEDUPE_PREFIX = "peer-wake-available:";
+
+/**
  * Queue dedupe-key prefix for incremental `agent_report` updates queued behind a busy parent.
  * Full key: `agent-report:<child>:<toolCallId>` for a child's original run, or
  * `agent-report:<child>:<executionId>:<toolCallId>` while a reawakened child runs as a
@@ -79,6 +87,12 @@ export function taskRecoveryPromptDedupeKey(taskId: string, kind: TaskRecoveryPr
  * admitted (queued or delivered), so dispatch timing cannot exceed the advertised turn count.
  */
 export const MAX_CONSECUTIVE_PEER_WAKES = 3;
+
+/**
+ * Max senders remembered per target for the "target is reachable again" wake after a
+ * consecutive-wake refusal. Bounds the wake turns one attention reset can start.
+ */
+export const MAX_PEER_WAKE_WAITERS_PER_TARGET = 5;
 
 /**
  * Single retryable refusal for every admission path (direct/automatic sends, queued dispatch,

@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   MAX_CONSECUTIVE_PEER_WAKES,
+  MAX_PEER_WAKE_WAITERS_PER_TARGET,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
   PEER_MESSAGE_RATE_LIMIT_MAX,
@@ -16,7 +17,11 @@ import {
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_CHARS,
   TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
 } from "@/constants/taskMessages";
-import { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
+import {
+  AgentPeerMessageBroker,
+  PEER_WAKE_LIMIT_FULL_REFUSAL_REASON,
+  PEER_WAKE_LIMIT_REFUSAL_REASON,
+} from "@/node/services/agentPeerMessageBroker";
 
 function createHarness(initialNow = 1_000) {
   let now = initialNow;
@@ -99,12 +104,45 @@ describe("AgentPeerMessageBroker", () => {
     for (let i = 0; i < MAX_CONSECUTIVE_PEER_WAKES; i++) {
       broker.chargeConsecutivePeerWake("target");
     }
-    expect(broker.checkPeerAdmission("sender", "target", "message")).toEqual({
+    const grant = { relation: "peer" as const };
+    expect(broker.checkPeerAdmission("sender", "target", "message", grant)).toEqual({
       code: "refused",
-      reason: "Target reached its consecutive peer-wake limit and needs user or parent attention.",
+      reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
     });
-    broker.resetConsecutivePeerWakes("target");
-    expect(broker.checkPeerAdmission("sender", "target", "message")).toBeNull();
+    // The refused sender is returned once so the caller can wake it; a later reset has no waiters.
+    expect(broker.resetConsecutivePeerWakes("target")).toEqual([
+      { senderWorkspaceId: "sender", relation: "peer" },
+    ]);
+    expect(broker.checkPeerAdmission("sender", "target", "message", grant)).toBeNull();
+    expect(broker.resetConsecutivePeerWakes("target")).toEqual([]);
+  });
+
+  test("bounds remembered waiters and only promises a wake to registered senders", () => {
+    const { broker } = createHarness();
+    for (let i = 0; i < MAX_CONSECUTIVE_PEER_WAKES; i++) {
+      broker.chargeConsecutivePeerWake("target");
+    }
+    const grant = { relation: "peer" as const };
+    for (let i = 0; i < MAX_PEER_WAKE_WAITERS_PER_TARGET; i++) {
+      expect(broker.checkPeerAdmission(`sender-${i}`, "target", "message", grant)).toEqual({
+        code: "refused",
+        reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
+      });
+    }
+    // A known waiter refreshes its entry; a new sender beyond the bound is not promised a wake.
+    expect(broker.checkPeerAdmission("sender-0", "target", "again", grant)).toEqual({
+      code: "refused",
+      reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
+    });
+    expect(broker.checkPeerAdmission("overflow", "target", "message", grant)).toEqual({
+      code: "refused",
+      reason: PEER_WAKE_LIMIT_FULL_REFUSAL_REASON,
+    });
+    // While the cap is still full, a successful reawaken must not drain the waiters.
+    expect(broker.takePeerWakeWaitersIfUncapped("target")).toEqual([]);
+    expect(broker.resetConsecutivePeerWakes("target")).toHaveLength(
+      MAX_PEER_WAKE_WAITERS_PER_TARGET
+    );
   });
 
   test.each([
