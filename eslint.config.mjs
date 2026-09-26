@@ -562,7 +562,7 @@ const localPlugin = {
         ],
         messages: {
           unrestored:
-            'mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`/`afterEach`, or inject the dependency instead of mocking the module. Restores behind a condition or early exit, in helpers passed around as values, in an `afterEach` of a suite without a running test, or read from a restore list that is mutated or passed elsewhere do not count.',
+            'mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`/`afterEach`, or inject the dependency instead of mocking the module. Restores that may not run (conditional, in helpers passed as values, in `afterEach` of an all-skipped suite) or come from a mutated list do not count.',
           dynamicSpecifier:
             "mock.module needs a statically known specifier (a string literal, a `const` string, or a loop over a `const` array of them) so its restore can be verified.",
         },
@@ -582,12 +582,8 @@ const localPlugin = {
         // restore that runs covers them. Skipped suites and never-called helpers do not run.
         // This is a flow-insensitive lint heuristic for the repo's idioms, not a proof, so it
         // errs in one direction (#4660): installs over-approximate and restores
-        // under-approximate. A restore behind a condition or early exit, in an `afterEach`
-        // of a suite without a running test (bun skips it), in a helper passed around as a
-        // value, or read from a const array that is mutated or escapes restores nothing. A
-        // filtered install installs every candidate; a helper passed around as a value must
-        // be restored at file scope; a helper called both at load and from hooks needs
-        // coverage in each context.
+        // under-approximate (a restore that may not run, or may not cover a specifier, counts
+        // as none).
         const allowed = new Set(
           context.options[0]?.allow?.[
             path.relative(context.cwd, context.filename).split(path.sep).join("/")
@@ -597,7 +593,7 @@ const localPlugin = {
         const { sourceCode } = context;
         const mockCalls = [];
         const restoreListCalls = [];
-        const testCalls = [];
+        const allCalls = [];
         const exitStatements = [];
 
         const isFunctionNode = (node) =>
@@ -636,6 +632,25 @@ const localPlugin = {
             String(def.parent.source.value).endsWith("/moduleMocks")
           );
         };
+        // A loop leaves the elements alone when it destructures each one
+        // (`for (const [p, real] of entries)`) or never reaches into or hands off its variable
+        // except to mock.module; `for (const entry of entries) entry[0] = "b"` rewrites the list.
+        const loopKeepsElements = (loop) => {
+          const declarator =
+            loop.left.type === "VariableDeclaration" ? loop.left.declarations[0] : null;
+          if (declarator?.id.type === "ArrayPattern") {
+            return declarator.id.elements.every((e) => e == null || e.type === "Identifier");
+          }
+          return (
+            declarator?.id.type === "Identifier" &&
+            sourceCode.getDeclaredVariables(declarator)[0].references.every(({ identifier }) => {
+              const parent = identifier.parent;
+              return parent.type === "CallExpression" || parent.type === "NewExpression"
+                ? isMockModuleCall(parent) && parent.arguments[0] === identifier
+                : !(parent.type === "MemberExpression" && parent.object === identifier);
+            })
+          );
+        };
         // A `const` array still holds its literal elements only when every use reads it
         // whole: looping over it, spreading it into a copy, or handing it to
         // restoreModulesAfterSuite. Any other use (`entries.length = 0`, `.push`, passing it
@@ -656,7 +671,9 @@ const localPlugin = {
             }
             const parent = node.parent;
             return (
-              (parent.type === "ForOfStatement" && parent.right === node) ||
+              (parent.type === "ForOfStatement" &&
+                parent.right === node &&
+                loopKeepsElements(parent)) ||
               (parent.type === "SpreadElement" && parent.parent.type === "ArrayExpression") ||
               (parent.type === "CallExpression" &&
                 parent.arguments[0] === node &&
@@ -847,6 +864,43 @@ const localPlugin = {
           );
         };
 
+        // Whether bun surely skips every test of `suite` (a describe callback, or null for the
+        // file), so its `afterEach` hooks never run: its body registers at least one test and
+        // every test it registers is skip/todo (or `.each([])`), counting inline nested suites.
+        // Anything the rule cannot see (other calls that may register tests, describe callbacks
+        // passed by name, aliased test functions) means tests may run.
+        const isEmptyEach = (call) =>
+          (call.callee.type === "MemberExpression" &&
+            !call.callee.computed &&
+            call.callee.property.name === "each" &&
+            call.arguments[0]?.type === "ArrayExpression" &&
+            call.arguments[0].elements.length === 0) ||
+          (call.callee.type === "CallExpression" && isEmptyEach(call.callee));
+        const allTestsSkipped = (suite) => {
+          const body = suite ?? sourceCode.ast;
+          let sawTest = false;
+          for (const call of allCalls) {
+            if (enclosingContext(call) !== body) {
+              continue;
+            }
+            const root = getCalleeRootName(call.callee);
+            if (TEST_CALLS.has(root)) {
+              if (!isSkippedCall(call) && !isEmptyEach(call)) {
+                return false;
+              }
+              sawTest = true;
+            } else if (SUITE_CALLS.has(root)) {
+              const callback = call.arguments.find((argument) => isFunctionNode(argument));
+              if (!isSkippedCall(call) && (callback == null || !allTestsSkipped(callback))) {
+                return false;
+              }
+            } else if (!HOOK_CALLS.has(root) && root !== "mock") {
+              return false;
+            }
+          }
+          return sawTest;
+        };
+
         // Where a function (or the Program) runs:
         // - suites: the `describe` callbacks (null = the whole file) whose tests execute it; empty
         //   when it never runs (skipped suites, dead helpers). Hooks registered here join them;
@@ -854,21 +908,18 @@ const localPlugin = {
         // - scoped: the suites whose hooks or tests run it (installs there need a restore in
         //   that suite or an enclosing one);
         // - teardown: it runs only from `afterAll`/`afterEach`;
-        // - uncertain: it may not run (conditional call site, passed around as a value), so its
-        //   restores do not count;
-        // - eachOnly: it runs from an `afterEach`, which bun skips in suites without a running
-        //   test.
+        // - sure: the suites it surely runs in, so restores there count. Conditional call
+        //   sites, values passed around, and `afterEach` of an all-skipped suite add none.
         // Named helpers take the union over their call sites, resolved by binding, so a helper
         // that setup code also calls is not teardown and its installs belong to every suite and
-        // context that calls it.
+        // context that calls it. Restoring once suffices, so any sure site makes it sure.
         const contextInfo = new Map();
         const NEVER = {
           suites: new Set(),
           atLoad: false,
           scoped: new Set(),
           teardown: false,
-          uncertain: false,
-          eachOnly: false,
+          sure: new Set(),
         };
         const infoOf = (fn) => {
           const known = contextInfo.get(fn);
@@ -880,6 +931,7 @@ const localPlugin = {
           contextInfo.set(fn, info);
           return info;
         };
+        const sureAt = (node, info) => (runsConditionally(node) ? new Set() : info.sure);
         // `fn` registered as the callback of a describe/hook/test `call`.
         const callbackInfo = (call, fn) => {
           const owner = getCalleeRootName(call.callee);
@@ -887,18 +939,23 @@ const localPlugin = {
           if (isSkippedCall(call) || outer.suites.size === 0) {
             return NEVER;
           }
-          const uncertain =
-            outer.uncertain || runsConditionally(call) || calleeUses(call, CONDITIONAL_MODIFIERS);
+          const sure = calleeUses(call, CONDITIONAL_MODIFIERS) ? new Set() : sureAt(call, outer);
           if (SUITE_CALLS.has(owner)) {
-            return { ...NEVER, suites: new Set([fn]), atLoad: true, uncertain };
+            return {
+              ...NEVER,
+              suites: new Set([fn]),
+              atLoad: true,
+              sure: new Set(sure.size ? [fn] : []),
+            };
           }
           return {
             ...NEVER,
             suites: outer.suites,
             scoped: outer.suites,
             teardown: RESTORE_HOOKS.has(owner),
-            uncertain,
-            eachOnly: outer.eachOnly || owner === "afterEach",
+            sure: new Set(
+              [...sure].filter((suite) => owner !== "afterEach" || !allTestsSkipped(suite))
+            ),
           };
         };
         const isCallbackOf = (call, node) =>
@@ -909,7 +966,7 @@ const localPlugin = {
           );
         const computeInfo = (fn) => {
           if (fn.type === "Program") {
-            return { ...NEVER, suites: new Set([null]), atLoad: true };
+            return { ...NEVER, suites: new Set([null]), atLoad: true, sure: new Set([null]) };
           }
           if (isCallbackOf(fn.parent, fn)) {
             return callbackInfo(fn.parent, fn);
@@ -923,16 +980,22 @@ const localPlugin = {
               return NEVER;
             }
             const enclosing = infoOf(enclosingContext(fn));
-            return { ...enclosing, uncertain: enclosing.uncertain || runsConditionally(fn) };
+            return { ...enclosing, sure: sureAt(fn, enclosing) };
           }
-          const info = { ...NEVER, suites: new Set(), scoped: new Set(), teardown: true };
+          const info = {
+            ...NEVER,
+            suites: new Set(),
+            scoped: new Set(),
+            teardown: true,
+            sure: new Set(),
+          };
           for (const reference of reads) {
             const identifier = reference.identifier;
             const parent = identifier.parent;
             let site;
             if (parent.type === "CallExpression" && parent.callee === identifier) {
               const caller = infoOf(enclosingContext(parent));
-              site = { ...caller, uncertain: caller.uncertain || runsConditionally(parent) };
+              site = { ...caller, sure: sureAt(parent, caller) };
             } else if (isCallbackOf(parent, identifier)) {
               // `beforeEach(install)` / `afterEach(restore)` / `describe("x", suiteBody)`.
               site = callbackInfo(parent, fn);
@@ -941,25 +1004,20 @@ const localPlugin = {
             } else {
               // Stored or passed to another API: it may run anywhere, even after a suite's
               // restore, so only a file-scope restore covers its installs.
-              site = {
-                ...NEVER,
-                suites: new Set([null]),
-                scoped: new Set([null]),
-                uncertain: true,
-              };
+              site = { ...NEVER, suites: new Set([null]), scoped: new Set([null]) };
             }
             site.suites.forEach((suite) => info.suites.add(suite));
             site.scoped.forEach((suite) => info.scoped.add(suite));
+            site.sure.forEach((suite) => info.sure.add(suite));
             info.atLoad ||= site.atLoad;
             info.teardown &&= site.teardown;
-            info.uncertain ||= site.uncertain;
-            info.eachOnly ||= site.eachOnly;
           }
           return info;
         };
 
         return {
           CallExpression(node) {
+            allCalls.push(node);
             if (
               node.callee.type === "Identifier" &&
               node.callee.name === "restoreModulesAfterSuite"
@@ -971,41 +1029,12 @@ const localPlugin = {
             }
             if (isMockModuleCall(node)) {
               mockCalls.push(node);
-            } else if (
-              TEST_CALLS.has(getCalleeRootName(node.callee)) &&
-              node.arguments.length >= 2
-            ) {
-              testCalls.push(node);
             }
           },
           "ReturnStatement, ThrowStatement, BreakStatement, ContinueStatement"(node) {
             exitStatements.push(node);
           },
           "Program:exit"() {
-            // Suites with a test that surely runs; only their `afterEach` hooks execute.
-            const testedSuites = [];
-            for (const call of testCalls) {
-              const info = infoOf(enclosingContext(call));
-              if (
-                !info.uncertain &&
-                !isSkippedCall(call) &&
-                !calleeUses(call, CONDITIONAL_MODIFIERS) &&
-                !runsConditionally(call)
-              ) {
-                testedSuites.push(...info.suites);
-              }
-            }
-            // The suites a restore from this context surely runs in.
-            const restoringSuites = (info, node) =>
-              info.uncertain || runsConditionally(node)
-                ? new Set()
-                : new Set(
-                    [...info.suites].filter(
-                      (suite) =>
-                        !info.eachOnly ||
-                        testedSuites.some((tested) => suiteIsWithin(tested, suite))
-                    )
-                  );
             const restores = [];
             for (const node of restoreListCalls) {
               const specifiers = new Set();
@@ -1014,11 +1043,8 @@ const localPlugin = {
                   (resolveSpecifiers(entry.elements[0]) ?? []).forEach((s) => specifiers.add(s));
                 }
               }
-              // It registers an `afterAll` in each suite its call runs in.
-              restores.push({
-                specifiers,
-                suites: restoringSuites(infoOf(enclosingContext(node)), node),
-              });
+              // It registers an `afterAll` in each suite its call surely runs in.
+              restores.push({ specifiers, suites: sureAt(node, infoOf(enclosingContext(node))) });
             }
             const installs = [];
             for (const node of mockCalls) {
@@ -1027,7 +1053,7 @@ const localPlugin = {
               if (info.teardown) {
                 restores.push({
                   specifiers: new Set(specifiers ?? []),
-                  suites: restoringSuites(info, node),
+                  suites: sureAt(node, info),
                 });
               } else if (info.suites.size === 0) {
                 // Never runs (skipped suite, uncalled helper): nothing to restore or resolve.

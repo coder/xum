@@ -63,7 +63,6 @@ test("restores from afterAll/afterEach, restoreModulesAfterSuite and teardown he
       function restore() { mock.module("a", () => real); }
       beforeEach(install);
       afterEach(restore);
-      test("t", () => {});
     `)
   ).toEqual([]);
   expect(
@@ -71,7 +70,6 @@ test("restores from afterAll/afterEach, restoreModulesAfterSuite and teardown he
       const restore = async () => { await mock.module("a", () => real); };
       beforeEach(() => { mock.module("a", () => ({})); });
       afterEach(async () => { await restore(); });
-      test("t", () => {});
     `)
   ).toEqual([]);
 });
@@ -89,7 +87,6 @@ test("looped specifiers resolve through const arrays", () => {
       const realModules = [["a", {}], ["b", {}]];
       beforeEach(() => { mock.module("a", () => ({})); mock.module("b", () => ({})); });
       afterEach(() => { for (const [p, exports] of realModules) mock.module(p, () => exports); });
-      test("t", () => {});
     `)
   ).toEqual([]);
   expect(reported(`beforeEach(() => { mock.module(pathFromSomewhere(), () => ({})); });`)).toEqual([
@@ -126,7 +123,6 @@ test("a restore hook covers only installs inside its describe block", () => {
       describe("restores", () => {
         beforeEach(() => { mock.module("a", () => ({})); });
         afterEach(() => { mock.module("a", () => real); });
-        test("t", () => {});
       });
       describe("leaks", () => {
         beforeEach(() => { mock.module("a", () => ({})); });
@@ -149,7 +145,6 @@ test("helper installs belong to the suites that call them", () => {
       describe("restores", () => {
         beforeEach(install);
         afterEach(() => { mock.module("a", () => real); });
-        test("t", () => {});
       });
     `)
   ).toEqual([]);
@@ -230,6 +225,14 @@ test("a restore list that is mutated or escapes proves nothing", () => {
       mock.module("a", () => ({}));
     `)
   ).toEqual(["a"]);
+  expect(
+    reported(`${importLine}
+      const entries = [["a", real]];
+      restoreModulesAfterSuite(entries);
+      for (const entry of entries) entry[0] = "b";
+      mock.module("a", () => ({}));
+    `)
+  ).toEqual(["a"]);
   // Passing the list only to the restore helper (or copying it) keeps it trustworthy.
   expect(
     reported(`${importLine}
@@ -262,6 +265,16 @@ test("a restore behind a filter restores nothing; a filtered install installs ev
       afterEach(() => { if (flag) restore(); });
     `)
   ).toEqual(["a"]);
+  // Restoring once suffices: one sure call site makes a helper's restore count.
+  expect(
+    reported(`
+      function restore() { mock.module("a", () => real); }
+      mock.module("a", () => ({}));
+      afterAll(restore);
+      if (flag) afterAll(restore);
+      describe("skipped", () => { afterEach(restore); test.skip("x", () => {}); });
+    `)
+  ).toEqual([]);
 });
 
 test("afterEach restores in a suite whose tests are all skipped never run", () => {
@@ -274,6 +287,27 @@ test("afterEach restores in a suite whose tests are all skipped never run", () =
       });
     `)
   ).toEqual(["a"]);
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      afterEach(() => { mock.module("a", () => real); });
+      test.each([])("x %p", () => {});
+    `)
+  ).toEqual(["a"]);
+  // Tests the rule cannot see may run, so their afterEach restores count.
+  expect(
+    reported(`
+      import { test as t } from "bun:test";
+      mock.module("a", () => ({}));
+      function nested() { test("x", () => {}); }
+      describe("outer", () => {
+        afterEach(() => { mock.module("a", () => real); });
+        describe("inner", nested);
+      });
+      describe("one-arg", () => { afterEach(() => { mock.module("a", () => real); }); test(() => {}); });
+      describe("aliased", () => { afterEach(() => { mock.module("a", () => real); }); t("x", () => {}); });
+    `)
+  ).toEqual([]);
   // bun still runs afterAll for such a suite.
   expect(
     reported(`
@@ -291,8 +325,8 @@ test("a helper called at load and from a scoped hook needs coverage in both cont
     reported(`
       function install() { mock.module("a", () => ({})); }
       install();
-      describe("earlier", () => { afterEach(() => { mock.module("a", () => real); }); test("t", () => {}); });
-      describe("later", () => { beforeEach(install); test("t", () => {}); });
+      describe("earlier", () => { afterEach(() => { mock.module("a", () => real); }); });
+      describe("later", () => { beforeEach(install); });
     `)
   ).toEqual(["a"]);
 });
