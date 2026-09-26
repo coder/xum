@@ -1,6 +1,9 @@
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { randomUUID } from "node:crypto";
-import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
+import {
+  getValidAgentMessageDispatchMode,
+  getValidUnrelatedWorkspaceConsent,
+} from "@/common/orpc/schemas/workspace";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import assert from "node:assert/strict";
 import * as path from "node:path";
@@ -9356,14 +9359,17 @@ export class TaskService implements AgentTaskIntegration {
       // the catch below, or transient failures would consume the pair/target budgets without
       // delivering anything — eventually refusing valid peer messages until restart.
       try {
-        // Ancestor and unrelated targets can be human-driven. Do not cut into their turns
-        // unless explicitly requested; sibling sends retain their existing boundary.
-        const defaultDispatchModes: Record<typeof relation, TaskMessageQueueDispatchMode> = {
-          target_ancestor: "turn-end",
-          target_unrelated: "turn-end",
-          peer: "tool-end",
-        };
-        const effectiveDispatchMode = spec.queueDispatchMode ?? defaultDispatchModes[relation];
+        // The recipient owns this choice. Tool-end is the default for every relation because
+        // fast delivery is what lets agents coordinate; a recipient that must not be cut into
+        // mid-turn opts into turn-end, which also overrides a sender's explicit tool-end.
+        // Senders may always ask for the less intrusive turn-end.
+        const recipientDispatchMode: TaskMessageQueueDispatchMode =
+          getValidAgentMessageDispatchMode(targetEntry.workspace.agentMessageDispatchMode) ??
+          "tool-end";
+        const effectiveDispatchMode: TaskMessageQueueDispatchMode =
+          recipientDispatchMode === "turn-end"
+            ? "turn-end"
+            : (spec.queueDispatchMode ?? recipientDispatchMode);
 
         // Delegated-turn correlation: if the target is currently executing a delegated workspace
         // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-

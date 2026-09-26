@@ -897,6 +897,15 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               ? api.workspace.setUnrelatedWorkspaceConsent({ workspaceId, enabled })
               : Promise.resolve({ success: false as const, error: "Not connected to server" })
           }
+          holdUntilTurnEnd={workspaceEntry?.agentMessageDispatchMode === "turn-end"}
+          onSetHoldUntilTurnEnd={(hold) =>
+            api
+              ? api.workspace.setAgentMessageDispatchMode({
+                  workspaceId,
+                  mode: hold ? "turn-end" : "tool-end",
+                })
+              : Promise.resolve({ success: false as const, error: "Not connected to server" })
+          }
         />
       )}
       <WorkspaceMCPModal

@@ -324,7 +324,10 @@ import type {
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
-import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
+import {
+  type AgentMessageDispatchMode,
+  getValidUnrelatedWorkspaceConsent,
+} from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -7375,6 +7378,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setAgentMessageDispatchMode"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
     const normalizedWorkspaceId = workspaceId.trim();
     assert(normalizedWorkspaceId.length > 0, `${methodName} requires a non-empty workspaceId`);
@@ -7571,6 +7575,59 @@ export class WorkspaceService
       return Ok(undefined);
     } catch (error) {
       return Err(`Failed to update unrelated workspace consent: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * Recipient-side delivery preference for agent messages that arrive while this workspace is
+   * busy (TaskService.sendAgentTreeMessage reads it at admission). "tool-end" is the default and
+   * is stored as an absent field; only "turn-end" is persisted. Like the consent switch, Ok means
+   * committed AND republished, so the UI only moves after the ack; recency is not bumped.
+   */
+  async setAgentMessageDispatchMode(
+    workspaceId: string,
+    mode: AgentMessageDispatchMode
+  ): Promise<Result<void, string>> {
+    try {
+      assert(
+        mode === "tool-end" || mode === "turn-end",
+        "setAgentMessageDispatchMode requires a known mode"
+      );
+      const resolved = this.resolveHeartbeatWorkspaceEntry(
+        workspaceId,
+        "setAgentMessageDispatchMode"
+      );
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+
+      const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
+      let outcome: Result<void, string> = Err("Workspace not found");
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        if (mode === "tool-end") {
+          delete entry.agentMessageDispatchMode;
+        } else {
+          entry.agentMessageDispatchMode = mode;
+        }
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above).
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update agent message delivery: ${getErrorMessage(error)}`);
     }
   }
 

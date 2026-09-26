@@ -75,7 +75,10 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
-import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
+import {
+  getValidAgentMessageDispatchMode,
+  getValidUnrelatedWorkspaceConsent,
+} from "@/common/orpc/schemas/workspace";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_DEFAULT_INTERVAL_MS,
@@ -3650,6 +3653,9 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+                workspace.agentMessageDispatchMode
+              ),
               // Display defaults stay ephemeral: no raw Exec bucket means no saved Exec choice.
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
@@ -3952,6 +3958,9 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+                workspace.agentMessageDispatchMode
+              ),
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
                 (workspace.aiSettings
@@ -4030,6 +4039,9 @@ export class Config {
             goalDefaults: workspace.goalDefaults,
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
+            ),
+            agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+              workspace.agentMessageDispatchMode
             ),
             aiSettingsByAgent:
               workspace.aiSettingsByAgent ??
@@ -4172,6 +4184,9 @@ export class Config {
         // re-add of an existing consented entry does not silently revoke it.
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
+        ),
+        agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+          metadata.agentMessageDispatchMode
         ),
         parentWorkspaceId: metadata.parentWorkspaceId,
         agentType: metadata.agentType,

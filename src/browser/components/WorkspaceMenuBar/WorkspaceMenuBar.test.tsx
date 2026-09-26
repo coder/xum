@@ -398,6 +398,8 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
   onToggleLeftSidebarCollapsed: () => undefined,
 };
 
+const CONSENT_SWITCH_NAME = /allow messages from unrelated workspaces/i;
+
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
     workspaceMetadata = new Map();
@@ -710,21 +712,25 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
     });
     // Workspace A: start a request and leave it in flight (switch locked, "Saving" shown).
-    fireEvent.click(view.getByRole("switch"));
+    fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(1);
     expect(requests[0].input).toEqual({ workspaceId, enabled: true });
     await waitFor(() => {
-      expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(true);
+      expect(
+        (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+      ).toBe(true);
     });
     expect(view.queryByRole("status")).not.toBeNull();
 
     // Workspace B: the dialog opened here must be B's own, not A's still-saving instance.
     view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
-    expect(view.queryByRole("switch")).toBeNull();
+    expect(view.queryByRole("switch", { name: CONSENT_SWITCH_NAME })).toBeNull();
     act(() => {
       getLastMenuContentProps()?.onConfigureUnrelatedMessaging?.();
     });
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect(view.queryByRole("status")).toBeNull();
 
     // A's request settling (here: refused) belongs to A's dialog and must not surface in B.
@@ -733,17 +739,21 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       await Promise.resolve();
     });
     expect(view.queryByRole("alert")).toBeNull();
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
 
     // B is fully usable and its request targets B.
-    fireEvent.click(view.getByRole("switch"));
+    fireEvent.click(view.getByRole("switch", { name: CONSENT_SWITCH_NAME }));
     expect(requests).toHaveLength(2);
     expect(requests[1].input).toEqual({ workspaceId: "workspace-2", enabled: true });
     await act(async () => {
       requests[1].settle(Ok(undefined));
       await Promise.resolve();
     });
-    expect((view.getByRole("switch") as HTMLButtonElement).disabled).toBe(false);
+    expect(
+      (view.getByRole("switch", { name: CONSENT_SWITCH_NAME }) as HTMLButtonElement).disabled
+    ).toBe(false);
     expect(view.queryByRole("alert")).toBeNull();
   });
 

@@ -1,6 +1,8 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
+  AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
+  AgentMessageDispatchModeSchema,
   BestOfGroupSchema,
   ProjectRefSchema,
   UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
@@ -104,6 +106,9 @@ export const WorkspaceConfigSchema = z.object({
   }),
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:
