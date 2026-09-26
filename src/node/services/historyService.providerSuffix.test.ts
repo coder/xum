@@ -9,7 +9,6 @@ import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
-import { readProviderHistorySuffix } from "./historyScanner";
 import { createTestHistoryService } from "./testHistoryService";
 
 // The sidebar status (#4720) keeps `filter(pred).slice(-N)` of this suffix, so its window equals
@@ -257,9 +256,13 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
       return stat(...args);
     }) as typeof fs.stat);
     try {
-      expect(
-        await readProviderHistorySuffix(paths, 1, statusRow).catch((error: unknown) => error)
-      ).toMatchObject({ message: "History changed during provider read" });
+      const result = await h.historyService.getHistorySuffixFromLatestBoundary(
+        workspaceId,
+        1,
+        statusRow
+      );
+      expect(result.success).toBe(false);
+      expect(result.success ? "" : result.error).toContain("History changed during provider read");
     } finally {
       spy.mockRestore();
     }

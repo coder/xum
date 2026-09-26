@@ -264,7 +264,7 @@ type ProviderHistoryStart =
 const COMPACTION_BOUNDARY_NEEDLE = Buffer.from(SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE);
 
 /** One non-empty row delivered by the provider locator, newest first. */
-export interface ScannedHistoryRow {
+interface ScannedHistoryRow {
   start: number;
   /** Row bytes, excluding the newline. */
   size: number;
