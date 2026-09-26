@@ -203,6 +203,9 @@ describe("Tail-first transcript reveal (mock AI router)", () => {
           },
           { timeout: 4_000 }
         );
+        // Guards against a vacuous pass if Streamdown ever stops reading useTransition through
+        // the React module object this spy patches.
+        expect(useTransitionSpy).toHaveBeenCalled();
         expect(workspaceStore.getWorkspaceSidebarState(app.workspaceId).canInterrupt).toBe(true);
         expect(inFlightRow()!.textContent).not.toContain(slowMarker);
         const interrupted = await app.env.orpc.workspace.interruptStream({
