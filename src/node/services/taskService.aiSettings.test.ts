@@ -1806,6 +1806,12 @@ describe("TaskService", () => {
     async function restartFromCrashCut(parentId: string, childId: string) {
       const crashRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-taskService-cut-"));
       await fsPromises.cp(rootDir, crashRoot, { recursive: true });
+      // The crashed instance is dead, but its copied workspace-turn live-owner locks name tokens
+      // this still-running test process holds: drop them, as a dead owner's would be reclaimed.
+      await fsPromises.rm(path.join(crashRoot, "locks", "workspace-turns"), {
+        recursive: true,
+        force: true,
+      });
       const restartedConfig = new Config(crashRoot);
       const cutChild = findWorkspaceInConfig(restartedConfig, childId);
       const recoverySend = createAcceptingSendMessage();

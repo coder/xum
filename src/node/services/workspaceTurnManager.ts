@@ -1,4 +1,9 @@
+import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
+import {
+  acquireCrossProcessLock,
+  CrossProcessLockTimeoutError,
+} from "@/node/utils/main/crossProcessLock";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -391,6 +396,35 @@ const WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS: ReadonlySet<StreamErrorType> = n
 const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after restart";
 
 /**
+ * Live-owner lock of one workspace turn (#4446). A handle's liveness lives in the memory of the
+ * backend that runs it, so with several backends on one Xum root (desktop beside `xum server`,
+ * XUM_ALLOW_MULTIPLE_INSTANCES=1) no other backend may judge it stale from its own memory. The
+ * running backend holds this lock while the handle is active and releases it when the handle
+ * settles; the lock kit never reclaims it from a live holder (#4461), so another backend can take
+ * it only once the owner has died (restart recovery) or never took it (records from older builds).
+ */
+export function workspaceTurnOwnerLockPath(rootDir: string, handleId: string): string {
+  return path.join(rootDir, "locks", "workspace-turns", `${handleId}.lock`);
+}
+/** Renewal cadence for the lock kit only (a new lock: no older build reclaims it by age). */
+const WORKSPACE_TURN_OWNER_LOCK_STALE_MS = 5 * 60 * 1000;
+
+/** Handle store whose writes release the live-owner lock once a handle is no longer active. */
+class OwnedWorkspaceTurnHandleStore extends TaskHandleStore {
+  constructor(
+    config: Config,
+    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>
+  ) {
+    super(config);
+  }
+
+  override async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+    await super.upsertWorkspaceTurn(record);
+    await this.afterUpsert(record);
+  }
+}
+
+/**
  * Reason persisted when other queued input (a manual user message, /compact)
  * cut a delegated turn at a tool boundary and superseded it. The target
  * workspace continues under the new input, so the owner sees an interruption
@@ -608,7 +642,58 @@ export class WorkspaceTurnManager {
     private readonly streamManager?: StreamManager,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
-    this.taskHandleStore = new TaskHandleStore(config);
+    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(config, (record) =>
+      this.releaseTurnOwnerLockIfSettled(record)
+    );
+  }
+
+  /** Live-owner locks this manager holds, by handle id (see workspaceTurnOwnerLockPath). */
+  private readonly turnOwnerLocks = new Map<string, () => Promise<void>>();
+
+  /**
+   * Hold the handle's live-owner lock: "held" when this manager holds it now (already, or taken
+   * just now because nobody live held it), "foreign-live" when a live holder (another backend)
+   * owns the turn, or its state cannot be read (fail closed: never act on another's handle).
+   */
+  private async acquireTurnOwnerLock(handleId: string): Promise<"held" | "foreign-live"> {
+    if (this.turnOwnerLocks.has(handleId)) return "held";
+    try {
+      const release = await acquireCrossProcessLock({
+        lockPath: workspaceTurnOwnerLockPath(this.config.rootDir, handleId),
+        acquireTimeoutMs: 0,
+        staleMs: WORKSPACE_TURN_OWNER_LOCK_STALE_MS,
+        timeoutMessage: `Workspace turn ${handleId} is owned by another live Xum backend.`,
+      });
+      if (this.turnOwnerLocks.has(handleId)) {
+        await release(); // A concurrent caller in this manager took it first.
+      } else {
+        this.turnOwnerLocks.set(handleId, release);
+      }
+      return "held";
+    } catch (error: unknown) {
+      if (!(error instanceof CrossProcessLockTimeoutError)) {
+        log.warn("Workspace turn live-owner lock unreadable; leaving the handle alone", {
+          handleId,
+          error: getErrorMessage(error),
+        });
+      }
+      return "foreign-live";
+    }
+  }
+
+  private async releaseTurnOwnerLock(handleId: string): Promise<void> {
+    const release = this.turnOwnerLocks.get(handleId);
+    if (release == null) return;
+    this.turnOwnerLocks.delete(handleId);
+    await release();
+  }
+
+  private async releaseTurnOwnerLockIfSettled(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<void> {
+    if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
+      await this.releaseTurnOwnerLock(record.handleId);
+    }
   }
 
   /**
@@ -1467,6 +1552,10 @@ export class WorkspaceTurnManager {
         if (isArchivedInConfig(targetWorkspaceId)) return "target_archived";
         if (isArchivedInConfig(ownerWorkspaceId)) return "owner_archived";
         return await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, async () => {
+          // The handle id is fresh, so only an unreadable lock state can refuse this.
+          if ((await this.acquireTurnOwnerLock(handleId)) !== "held") {
+            throw new Error("could not take the workspace turn's live-owner lock");
+          }
           await this.taskHandleStore.upsertWorkspaceTurn(record);
           persistedHandle = true;
           if (record.status !== "queued") {
@@ -1499,6 +1588,8 @@ export class WorkspaceTurnManager {
           next: { ...record, status: "error", updatedAt: getIsoNow(), error: persisted.error },
           waiterSettlement: { status: "error", error: new Error(persisted.error) },
         });
+      } else {
+        await this.releaseTurnOwnerLock(handleId);
       }
       return Err(persisted.error);
     }
@@ -3157,6 +3248,8 @@ export class WorkspaceTurnManager {
       delete next.terminalAttentionNotifiedAt;
       await this.deleteWorkspaceTurnTerminalAttention(record);
       await this.deletePersistentChildWorkspaceTurnAttention(current);
+      // The settlement released the live-owner lock; the revived turn is this backend's again.
+      if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return current;
       await this.taskHandleStore.upsertWorkspaceTurn(next);
       // Re-register so stream-end/abort/error settlement paths own the handle again. The
       // revived turn is a retry of an already-admitted turn, so the registration is accepted.
@@ -4183,6 +4276,9 @@ export class WorkspaceTurnManager {
       (await this.isLiveWorkspaceTurn(record))
     )
       return;
+    // Not live in THIS backend's memory proves nothing about another backend that runs the turn
+    // (#4446): settle only a handle whose live-owner lock this manager holds or can take now.
+    if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return;
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
@@ -5336,6 +5432,16 @@ export class WorkspaceTurnManager {
 
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           const taskId = task.id;
+          // "The restart killed any live stream" holds only when no live backend owns the turn
+          // (#4446). Two new backends may both adopt a dead owner's handle; the second settlement
+          // then finds a terminal record and does nothing.
+          if ((await this.acquireTurnOwnerLock(normalized.handleId)) !== "held") {
+            log.info("Skipping a persistent sub-agent execution owned by a live backend", {
+              taskId,
+              handleId: normalized.handleId,
+            });
+            continue;
+          }
           let claimed: boolean;
           try {
             claimed = await this.desktopInputCoordinator.withAdmission(taskId, () =>
