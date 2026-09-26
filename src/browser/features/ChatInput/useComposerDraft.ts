@@ -48,41 +48,51 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() =>
     readPersistedChatAttachments(attachmentsKey)
   );
+  // The latest attachments, including updates React has not rendered yet. Persisting from here,
+  // outside a state updater, makes a write durable when setAttachments returns: an updater may
+  // only run at the next render, which never comes if the composer unmounts first. A Stop
+  // restore acknowledges the backend's copy right after this call (#4448).
+  const latestAttachmentsRef = useRef(attachments);
   const setAttachments = (
     value: ChatAttachment[] | ((previous: ChatAttachment[]) => ChatAttachment[])
-  ) =>
-    setAttachmentsState((previous) => {
-      const next = value instanceof Function ? value(previous) : value;
-      const persists =
-        next.length > 0 &&
-        estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
-      selfWriteRef.current = true;
-      try {
-        updatePersistedState<ChatAttachment[] | undefined>(
-          attachmentsKey,
-          persists ? next : undefined
-        );
-      } finally {
-        selfWriteRef.current = false;
-      }
-      if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
-      else if (tooLargeToastKeyRef.current !== attachmentsKey) {
-        tooLargeToastKeyRef.current = attachmentsKey;
-        pushToast({
-          type: "error",
-          message:
-            "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-          duration: 5000,
-        });
-      }
-      return next;
-    });
+  ) => {
+    const next = value instanceof Function ? value(latestAttachmentsRef.current) : value;
+    latestAttachmentsRef.current = next;
+    const persists =
+      next.length > 0 &&
+      estimatePersistedChatAttachmentsChars(next) <= MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS;
+    selfWriteRef.current = true;
+    try {
+      updatePersistedState<ChatAttachment[] | undefined>(
+        attachmentsKey,
+        persists ? next : undefined
+      );
+    } finally {
+      selfWriteRef.current = false;
+    }
+    if (persists || next.length === 0) tooLargeToastKeyRef.current = null;
+    else if (tooLargeToastKeyRef.current !== attachmentsKey) {
+      tooLargeToastKeyRef.current = attachmentsKey;
+      pushToast({
+        type: "error",
+        message:
+          "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
+        duration: 5000,
+      });
+    }
+    setAttachmentsState(next);
+  };
   useEffect(() => {
     tooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+    const syncFromStorage = () => {
+      const stored = readPersistedChatAttachments(attachmentsKey);
+      latestAttachmentsRef.current = stored;
+      setAttachmentsState(stored);
+    };
+    syncFromStorage();
     return subscribePersistedStateWrites((event) => {
       if (event.key === attachmentsKey && !selfWriteRef.current) {
-        setAttachmentsState(readPersistedChatAttachments(attachmentsKey));
+        syncFromStorage();
       }
     });
   }, [attachmentsKey]);

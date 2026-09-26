@@ -955,6 +955,23 @@ export class WorkspaceStore {
   // Per-workspace ephemeral chat state (buffering, queued message, live bash output, etc.)
   private chatTransientState = new Map<string, WorkspaceChatTransientState>();
 
+  /**
+   * Held inputs a composer took from a restore (#4448), per workspace, until the backend's held
+   * list drops them. Hidden from the banner list meanwhile, so input already in the composer never
+   * also shows as "Not sent". Kept outside chatTransientState: a replay reset before the backend's
+   * removal must not resurface them. Each change replaces the Set (visibleHeldInputs caches on
+   * its identity).
+   */
+  private readonly acceptedRestoreHeldInputs = new Map<string, ReadonlySet<string>>();
+  private readonly visibleHeldInputsCache = new Map<
+    string,
+    {
+      raw: readonly HeldInput[];
+      accepted: ReadonlySet<string>;
+      visible: readonly HeldInput[];
+    }
+  >();
+
   // Per-workspace transcript pagination state for loading prior compaction epochs.
   private historyPagination = new Map<string, WorkspaceHistoryPaginationState>();
 
@@ -1322,6 +1339,16 @@ export class WorkspaceStore {
       if (!isHeldInputsChanged(data)) return;
       this.assertChatTransientState(workspaceId).heldInputs =
         data.heldInputs.length > 0 ? data.heldInputs : NO_HELD_INPUTS;
+      // The backend no longer holds these: they need no hiding any more.
+      const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+      if (accepted) {
+        const stillHeld = new Set(data.heldInputs.map((input) => input.id));
+        const kept = [...accepted].filter((id) => stillHeld.has(id));
+        if (kept.length === 0) this.acceptedRestoreHeldInputs.delete(workspaceId);
+        else if (kept.length !== accepted.size) {
+          this.acceptedRestoreHeldInputs.set(workspaceId, new Set(kept));
+        }
+      }
       this.states.bump(workspaceId);
     },
     "restore-to-input": (_workspaceId, _aggregator, data) => {
@@ -1338,6 +1365,8 @@ export class WorkspaceStore {
           // Restore events can arrive for a background workspace; never let them
           // overwrite the composer currently mounted for another workspace.
           workspaceId: data.workspaceId,
+          // The composer that applies the restore acknowledges these (acceptRestoredHeldInputs).
+          heldInputIds: data.heldInputIds,
         })
       );
     },
@@ -2569,7 +2598,7 @@ export class WorkspaceStore {
         name: metadata?.name ?? workspaceId, // Fall back to ID if metadata missing
         messages: displayedMessages,
         queuedMessage: transient.queuedMessage,
-        heldInputs: transient.heldInputs,
+        heldInputs: this.visibleHeldInputs(workspaceId, transient.heldInputs),
         canInterrupt,
         isCompacting: aggregator.isCompacting(),
         isStreamStarting,
@@ -2735,6 +2764,63 @@ export class WorkspaceStore {
     this.sidebarStateCache.set(workspaceId, newState);
     this.sidebarStateSourceState.set(workspaceId, fullState);
     return newState;
+  }
+
+  /**
+   * A composer applied a restore naming these held inputs (#4448): hide them now and ask the
+   * backend to drop its copy. If the backend refuses, show them again: a visible duplicate of
+   * what the composer holds is recoverable, a hidden held copy is not.
+   */
+  acceptRestoredHeldInputs(workspaceId: string, heldInputIds: readonly string[]): void {
+    assert(workspaceId.length > 0, "acceptRestoredHeldInputs requires a workspaceId");
+    assert(heldInputIds.length > 0, "acceptRestoredHeldInputs requires held input ids");
+    this.acceptedRestoreHeldInputs.set(
+      workspaceId,
+      new Set([...(this.acceptedRestoreHeldInputs.get(workspaceId) ?? []), ...heldInputIds])
+    );
+    this.states.bump(workspaceId);
+
+    const client = this.client;
+    for (const heldInputId of heldInputIds) {
+      if (!client) {
+        this.showRestoredHeldInputAgain(workspaceId, heldInputId, "no ORPC client");
+        continue;
+      }
+      client.workspace.discardHeldInput({ workspaceId, heldInputId }).then(
+        (result) => {
+          if (!result.success) {
+            this.showRestoredHeldInputAgain(workspaceId, heldInputId, result.error);
+          }
+        },
+        (error: unknown) => this.showRestoredHeldInputAgain(workspaceId, heldInputId, error)
+      );
+    }
+  }
+
+  private showRestoredHeldInputAgain(workspaceId: string, heldInputId: string, reason: unknown) {
+    console.warn(
+      `[WorkspaceStore] Could not release held input ${heldInputId} for ${workspaceId}:`,
+      reason
+    );
+    const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+    if (!accepted?.has(heldInputId)) return;
+    const remaining = [...accepted].filter((id) => id !== heldInputId);
+    if (remaining.length === 0) this.acceptedRestoreHeldInputs.delete(workspaceId);
+    else this.acceptedRestoreHeldInputs.set(workspaceId, new Set(remaining));
+    this.states.bump(workspaceId);
+  }
+
+  /** The backend's held inputs minus those a composer took (stable array per input). */
+  private visibleHeldInputs(workspaceId: string, raw: readonly HeldInput[]): readonly HeldInput[] {
+    const accepted = this.acceptedRestoreHeldInputs.get(workspaceId);
+    if (accepted === undefined || raw.length === 0) return raw;
+    const cached = this.visibleHeldInputsCache.get(workspaceId);
+    if (cached?.raw === raw && cached.accepted === accepted) return cached.visible;
+    const filtered = raw.filter((input) => !accepted.has(input.id));
+    const visible =
+      filtered.length === raw.length ? raw : filtered.length > 0 ? filtered : NO_HELD_INPUTS;
+    this.visibleHeldInputsCache.set(workspaceId, { raw, accepted, visible });
+    return visible;
   }
 
   /**
@@ -4620,6 +4706,8 @@ export class WorkspaceStore {
     this.aggregators.delete(workspaceId);
     this.resetStaleSkeletonDeadline(workspaceId);
     this.chatTransientState.delete(workspaceId);
+    this.acceptedRestoreHeldInputs.delete(workspaceId);
+    this.visibleHeldInputsCache.delete(workspaceId);
     this.workspaceMetadata.delete(workspaceId);
     this.derived.bump("workspaces");
     this.workspaceActivity.delete(workspaceId);

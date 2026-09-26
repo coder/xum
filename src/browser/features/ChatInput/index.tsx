@@ -498,6 +498,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const onDetachAllReviewsForComposerClear =
     variant === "workspace" ? props.onDetachAllReviews : undefined;
   const onAddReviewForRestore = variant === "workspace" ? props.onAddReview : undefined;
+  const onAcceptRestoredHeldInputs =
+    variant === "workspace" ? props.onAcceptRestoredHeldInputs : undefined;
 
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
@@ -1414,6 +1416,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         fileParts?: FilePart[];
         reviews?: ReviewNoteDataForDisplay[];
         workspaceId?: string;
+        heldInputIds?: string[];
       }>;
 
       if (
@@ -1465,6 +1468,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
           }
         }
+        // The backend keeps this input as held input until a composer takes it (#4448). The
+        // setters above persist synchronously, so the draft is durable before the backend's copy
+        // is released. The edit-mode return above takes nothing, so it stays a "Not sent" banner.
+        const heldInputIds = customEvent.detail.heldInputIds ?? [];
+        if (heldInputIds.length > 0) onAcceptRestoredHeldInputs?.(heldInputIds);
         focusMessageInput();
       } else if (mode === "replace") {
         if (editingMessageForUi) {
@@ -1505,6 +1513,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     draftReviews,
     setDraftReviews,
     onAddReviewForRestore,
+    onAcceptRestoredHeldInputs,
     focusMessageInput,
   ]);
 

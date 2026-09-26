@@ -156,6 +156,8 @@ export interface CustomEventPayloads {
     reviews?: ReviewNoteDataForDisplay[];
     /** When set, only the matching workspace composer may apply this update. */
     workspaceId?: string;
+    /** "restore" only: backend held inputs to acknowledge once the composer applied it (#4448). */
+    heldInputIds?: string[];
   };
   [CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER]: {
     workspaceId: string;

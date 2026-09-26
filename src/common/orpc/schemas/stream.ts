@@ -709,6 +709,13 @@ export const RestoreToInputEventSchema = z.object({
   text: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Held inputs (see HeldInputsChangedEventSchema) that keep this restored input until a composer
+   * takes it (#4448). A composer that applies the restore acknowledges them with
+   * workspace.discardHeldInput; one that cannot (edit mode, not mounted, not subscribed) leaves
+   * them held, so the input is never lost with this one-shot event.
+   */
+  heldInputIds: z.array(z.string()).optional(),
 });
 
 /**

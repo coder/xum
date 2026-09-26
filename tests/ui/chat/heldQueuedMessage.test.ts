@@ -7,6 +7,7 @@ import { act, fireEvent, waitFor } from "@testing-library/react";
 
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { getInputAttachmentsKey, getInputKey, getReviewsKey } from "@/common/constants/storage";
 import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
@@ -477,4 +478,128 @@ describe("Held (refused) queued messages", () => {
       await app.dispose();
     }
   }, 60_000);
+
+  // #4448: the backend keeps a restored message as held input until a composer takes it. The
+  // composer acknowledges what it took, so the backend drops its copy; whatever no composer took
+  // stays a banner.
+  test("a restore naming held inputs is taken by the mounted composer: it acknowledges them, so the backend drops its copy and no banner remains", async () => {
+    const app = await createAppHarness({ branchPrefix: "restore-ack" });
+    try {
+      await app.chat.typeWithoutSending("newer draft");
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      const heldInputId = await holdOneRefusedMessage(app, "held until taken");
+
+      await emitRestoreAndWaitForDispatch(app, "held until taken", [heldInputId]);
+
+      await app.chat.expectInputValue("held until taken\n\nnewer draft");
+      expect(heldBanners(app)).toHaveLength(0);
+      await waitFor(() => expect(session.getHeldInputs()).toHaveLength(0), LOAD_TOLERANT_WAIT);
+      expect(heldBanners(app)).toHaveLength(0);
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("a restore naming held inputs that arrives in edit mode is not taken: the edit buffer is untouched and the banner and backend copy remain", async () => {
+    const app = await createAppHarness({ branchPrefix: "restore-ack-edit" });
+    try {
+      await app.chat.send("message to edit");
+      await app.chat.expectStreamComplete();
+      const editButton = await waitFor(() => {
+        const button = app.view.container.querySelector('button[aria-label="Edit"]');
+        if (!button) throw new Error("Edit button not found");
+        return button as HTMLElement;
+      }, LOAD_TOLERANT_WAIT);
+      fireEvent.click(editButton);
+      const editTextarea = await waitFor(() => {
+        const textarea = app.view.container.querySelector<HTMLTextAreaElement>(
+          'textarea[aria-label="Edit your last message"]'
+        );
+        if (!textarea) throw new Error("Edit textarea not found");
+        return textarea;
+      }, LOAD_TOLERANT_WAIT);
+      await waitFor(() => expect(editTextarea.value).toBe("message to edit"));
+      const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+      const heldInputId = await holdOneRefusedMessage(app, "held while editing");
+
+      await emitRestoreAndWaitForDispatch(app, "held while editing", [heldInputId]);
+
+      expect(editTextarea.value).toBe("message to edit");
+      expect(heldBanners(app)).toHaveLength(1);
+      expect(heldBanners(app)[0].textContent).toContain("held while editing");
+      expect(session.getHeldInputs().map((held) => held.id)).toEqual([heldInputId]);
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  test("when the acknowledgement fails, the taken input's banner shows again: a visible duplicate, never a hidden copy", async () => {
+    const app = await createAppHarness({ branchPrefix: "restore-ack-fail" });
+    try {
+      const workspaceService = app.env.services.workspaceService;
+      const session = workspaceService.getOrCreateSession(app.workspaceId);
+      const heldInputId = await holdOneRefusedMessage(app, "held after a failed ack");
+      const discard = jest
+        .spyOn(workspaceService, "discardHeldInput")
+        .mockReturnValueOnce(Err("backend refused the discard"));
+
+      await emitRestoreAndWaitForDispatch(app, "held after a failed ack", [heldInputId]);
+
+      await app.chat.expectInputValue("held after a failed ack");
+      await waitFor(() => expect(discard).toHaveBeenCalledTimes(1), LOAD_TOLERANT_WAIT);
+      await waitFor(() => expect(heldBanners(app)).toHaveLength(1), LOAD_TOLERANT_WAIT);
+      expect(session.getHeldInputs().map((held) => held.id)).toEqual([heldInputId]);
+      discard.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
 });
+
+/** One refused queued message the idle backend keeps as held input; returns its id. */
+async function holdOneRefusedMessage(app: AppHarness, text: string): Promise<string> {
+  const session = app.env.services.workspaceService.getOrCreateSession(app.workspaceId);
+  session.queueMessage(
+    text,
+    { model: "openai:gpt-5.2", agentId: "exec", authoredText: text },
+    { acceptanceOrigin: "manual", turnAdmission: refusingAdmission }
+  );
+  // A turn that just completed may still own the next dispatch for a moment; the drain is a no-op
+  // until the session is idle, and a no-op again once the refusal has been held.
+  await waitFor(() => {
+    session.drainQueuedMessagesIfIdle();
+    expect(session.getHeldInputs()).toHaveLength(1);
+  }, LOAD_TOLERANT_WAIT);
+  const held = session.getHeldInputs();
+  expect(held.map((input) => input.send.displayText)).toEqual([text]);
+  await waitFor(() => expect(heldBanners(app)).toHaveLength(1), LOAD_TOLERANT_WAIT);
+  return held[0].id;
+}
+
+/**
+ * Emit a backend restore naming held inputs and wait until the store has dispatched it to the
+ * composer. The test's listener is registered after the composer's, so the composer has handled
+ * the restore by the time it fires.
+ */
+async function emitRestoreAndWaitForDispatch(
+  app: AppHarness,
+  text: string,
+  heldInputIds: string[]
+): Promise<void> {
+  const dispatched = new Promise<void>((resolve) => {
+    const listener = () => {
+      window.removeEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, listener);
+      resolve();
+    };
+    window.addEventListener(CUSTOM_EVENTS.UPDATE_CHAT_INPUT, listener);
+  });
+  app.env.services.workspaceService.emitChatEvent(app.workspaceId, {
+    type: "restore-to-input",
+    workspaceId: app.workspaceId,
+    text,
+    heldInputIds,
+  });
+  await act(async () => {
+    await dispatched;
+  });
+}
