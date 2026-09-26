@@ -7899,7 +7899,9 @@ export class WorkspaceService
           workspacePath,
         });
         // Only while the registration's pending mark survives: an explicit toggle cleared it.
+        // Report that choice as it stands (an opt-in from another backend stays on).
         if (entry?.unrelatedWorkspaceConsentPending !== true) {
+          granted = getValidUnrelatedWorkspaceConsent(entry?.unrelatedWorkspaceConsent);
           return freshConfig;
         }
         delete entry.unrelatedWorkspaceConsentPending;

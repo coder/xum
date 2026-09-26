@@ -664,30 +664,39 @@ describe("default consent pending across backends (#4446)", () => {
     expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
   });
 
-  test("immediate checkout: B opts out between registration and A's grant, and stays out", async () => {
-    const workspacePath = path.join(projectPath, "immediate");
-    await fs.mkdir(workspacePath, { recursive: true });
-    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
-      createWorkspace: mock(() => Promise.resolve({ success: true as const, workspacePath })),
-    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
-    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
-    // The row is registered; A sanitizes before granting. B toggles in that window.
-    spyOn(internals(), "sanitizeStalePluginOverridesForNewWorkspace").mockImplementation(
-      async () => {
-        expect((await backendB().setUnrelatedWorkspaceConsent(CREATED_ID, false)).success).toBe(
-          true
-        );
-        return undefined;
-      }
-    );
+  test.each([
+    { choice: false, label: "opts out" },
+    { choice: true, label: "opts in" },
+  ])(
+    "immediate checkout: B $label between registration and A's grant, and B's choice wins",
+    async (row) => {
+      const workspacePath = path.join(projectPath, "immediate");
+      await fs.mkdir(workspacePath, { recursive: true });
+      spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+        createWorkspace: mock(() => Promise.resolve({ success: true as const, workspacePath })),
+      } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+      spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+      // The row is registered; A sanitizes before granting. B toggles in that window.
+      let chosen: string | undefined;
+      spyOn(internals(), "sanitizeStalePluginOverridesForNewWorkspace").mockImplementation(
+        async () => {
+          const toggled = await backendB().setUnrelatedWorkspaceConsent(CREATED_ID, row.choice);
+          expect(toggled.success).toBe(true);
+          chosen = readEntry()?.unrelatedWorkspaceConsent;
+          return undefined;
+        }
+      );
 
-    const result = await harness.service.create(projectPath, "immediate", undefined, undefined, {
-      type: "local",
-    });
+      const result = await harness.service.create(projectPath, "immediate", undefined, undefined, {
+        type: "local",
+      });
 
-    expect(result.success).toBe(true);
-    expect(readEntry()?.unrelatedWorkspaceConsent).toBeUndefined();
-    expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
-    expect(result.success && result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
-  });
+      expect(result.success).toBe(true);
+      expect(chosen === undefined).toBe(!row.choice);
+      expect(readEntry()?.unrelatedWorkspaceConsent).toBe(chosen);
+      expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
+      // A announces B's choice as it stands, not a stale "off".
+      expect(result.success && result.data.metadata.unrelatedWorkspaceConsent).toBe(chosen);
+    }
+  );
 });

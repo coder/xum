@@ -742,12 +742,18 @@ function normalizePersistedWorkspace(
   const hasMalformedPendingRemoval =
     persisted.pendingRemoval !== undefined &&
     !PendingRemovalSchema.safeParse(persisted.pendingRemoval).success;
+  // Only `true` is meaningful; any other value (hand edit, corruption) reads as absent, so one
+  // bad row cannot fail output validation of the whole project list.
+  const hasMalformedConsentPending =
+    Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
+    persisted.unrelatedWorkspaceConsentPending !== true;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
     !hasMalformedTaskAttemptId &&
-    !hasMalformedPendingRemoval
+    !hasMalformedPendingRemoval &&
+    !hasMalformedConsentPending
   ) {
     return workspace;
   }
@@ -756,6 +762,7 @@ function normalizePersistedWorkspace(
   delete nextWorkspace.workflowSchedule;
   if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
+  if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —

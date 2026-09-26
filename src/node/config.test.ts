@@ -763,6 +763,53 @@ describe("Config", () => {
     });
   });
 
+  describe("pending default consent marker", () => {
+    it("keeps only `true` and drops malformed values while loading", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/a",
+                    id: "ws-true",
+                    name: "a",
+                    unrelatedWorkspaceConsentPending: true,
+                  },
+                  {
+                    path: "/repo/b",
+                    id: "ws-false",
+                    name: "b",
+                    unrelatedWorkspaceConsentPending: false,
+                  },
+                  {
+                    path: "/repo/c",
+                    id: "ws-str",
+                    name: "c",
+                    unrelatedWorkspaceConsentPending: "yes",
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      const pending = (config.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map(
+        (workspace) => [workspace.id, Object.hasOwn(workspace, "unrelatedWorkspaceConsentPending")]
+      );
+
+      expect(pending).toEqual([
+        ["ws-true", true],
+        ["ws-false", false],
+        ["ws-str", false],
+      ]);
+    });
+  });
+
   describe("legacy PTC exclusive taskExperiments alias", () => {
     it("aliases programmaticToolCallingExclusive onto programmaticToolCalling at load time", () => {
       // Tasks stamped by pre-merge builds may carry only the exclusive flag;
