@@ -117,6 +117,7 @@ describe("WorkspaceService task-attempt admission fence", () => {
       getInitState: mock(() => undefined),
       waitForInit: mock(() => Promise.resolve()),
       clearInMemoryState: mock(() => undefined),
+      getUnsanitizedCheckoutError: mock(() => undefined),
     } as unknown as InitStateManager;
     // The service listens on the session's AI emitter, as the real shared AIService does.
     const aiService = createMockAIService({

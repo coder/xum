@@ -71,6 +71,7 @@ import {
 } from "./compactionCancellation";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
@@ -4668,7 +4669,11 @@ export class AgentSession {
           cancelSignal
         );
       } catch (error) {
-        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+        return Err(
+          error instanceof UnsanitizedTaskCheckoutError
+            ? { type: error.code, message: error.message }
+            : createUnknownSendMessageError(getErrorMessage(error))
+        );
       }
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
@@ -11478,6 +11483,13 @@ export class AgentSession {
     if (!mcpServerManager) return [];
 
     const refs = dedupeMcpPromptRefs(sanitizeMcpPromptRefs(muxMetadata?.mcpPromptRefs));
+    // Runs before the turn's init wait: a send admitted before a failed launch recorded this
+    // checkout must not start MCP in it here (#4674).
+    const unsanitized =
+      refs.length > 0
+        ? this.initStateManager.getUnsanitizedCheckoutError(this.workspaceId)
+        : undefined;
+    if (unsanitized) throw unsanitized;
     const snapshots = await Promise.all(
       refs.map(async (ref): Promise<MuxMessage | null> => {
         try {

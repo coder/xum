@@ -1,3 +1,4 @@
+import { ORPCError } from "@orpc/server";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { isMultiProject } from "@/common/utils/multiProject";
@@ -91,6 +92,15 @@ export async function listWorkspaceMcpPrompts(
   using admission = context.workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
   if (admission === undefined) return [];
   await context.initStateManager.waitForInit(workspaceId, signal);
+  // A checkout whose launch sanitize failed (recorded before its init completed, #4674): refuse
+  // with a typed error, unlike the archive degrade above, and never start MCP in it.
+  const unsanitized = context.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+  if (unsanitized) {
+    throw new ORPCError("PRECONDITION_FAILED", {
+      message: unsanitized.message,
+      data: { code: unsanitized.code },
+    });
+  }
   const metadataResult = await context.aiService.getWorkspaceMetadata(workspaceId);
   if (!metadataResult.success) throw new Error(metadataResult.error);
   const metadata = metadataResult.data;

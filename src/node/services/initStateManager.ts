@@ -6,6 +6,7 @@ import { log } from "@/node/services/log";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { clamp } from "@/common/utils/clamp";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
 
 /**
  * Output line with timestamp for replay timing.
@@ -89,6 +90,13 @@ export class InitStateManager extends EventEmitter {
       resolveHookPhase: () => void;
     }
   >();
+
+  /**
+   * Task checkouts whose launch sanitize failed (#4674). Terminal for the task id: removal may
+   * leave the checkout behind, so clearInMemoryState keeps it. MCP discovery and turns check it after waitForInit,
+   * which itself never throws (tools and inspection proceed).
+   */
+  private readonly unsanitizedCheckouts = new Set<string>();
 
   constructor(config: Config) {
     super();
@@ -453,6 +461,17 @@ export class InitStateManager extends EventEmitter {
       promiseEntry.resolveHookPhase();
       this.initPromises.delete(workspaceId);
     }
+  }
+
+  /** Record a task checkout whose launch sanitize failed, before its init completes (#4674). */
+  markCheckoutUnsanitized(workspaceId: string): void {
+    this.unsanitizedCheckouts.add(workspaceId);
+  }
+
+  getUnsanitizedCheckoutError(workspaceId: string): UnsanitizedTaskCheckoutError | undefined {
+    return this.unsanitizedCheckouts.has(workspaceId)
+      ? new UnsanitizedTaskCheckoutError(workspaceId)
+      : undefined;
   }
 
   /**

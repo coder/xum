@@ -1357,6 +1357,15 @@ export class TurnRequestBuilder {
     const waitForInitStartedAt = Date.now();
     await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
     recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
+    // Metadata was read before the wait: a checkout whose launch sanitize failed meanwhile
+    // must not reach MCP startup below (#4674).
+    const unsanitized = this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+    if (unsanitized) {
+      return {
+        type: "finished",
+        result: Err({ type: unsanitized.code, message: unsanitized.message }),
+      };
+    }
     if (combinedAbortSignal.aborted) {
       return {
         type: "finished",

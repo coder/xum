@@ -21,7 +21,10 @@ import {
   createWorkspace,
   generateBranchName,
   resolveOrpcClient,
+  sendMessage,
 } from "../../../tests/ipc/helpers";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { UNSANITIZED_TASK_CHECKOUT_CODE } from "@/node/services/unsanitizedTaskCheckout";
 
 // Runs under `bun test` with the real ServiceContainer (TaskService, WorkspaceService,
 // AIService, MCPServerManager) and a real stdio MCP process; only the language model is
@@ -386,6 +389,214 @@ describe("workflow replacement launch: MCP after sanitize", () => {
       expect(
         await fs.stat(path.join(env.config.sessionsDir, replacementId)).catch(() => null)
       ).toBeNull();
+    } finally {
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(repoPath);
+    }
+  }, 120_000);
+});
+
+/** The typed refusal a quarantined checkout returns through the prompt-catalog RPC. */
+function expectTypedPromptRefusal(outcome: object) {
+  expect("error" in outcome ? outcome.error : undefined).toMatchObject({
+    code: "PRECONDITION_FAILED",
+    data: { code: UNSANITIZED_TASK_CHECKOUT_CODE },
+  });
+}
+
+const listPrompts = (env: TestEnvironment, workspaceId: string) =>
+  resolveOrpcClient(env)
+    .workspace.mcp.prompts.list({ workspaceId })
+    .then(
+      (prompts) => ({ prompts }),
+      (error: unknown) => ({ error })
+    );
+
+/**
+ * #4674: a launch whose sanitize failed and whose reclaim could not remove the row or the
+ * checkout leaves an unsanitized checkout behind. MCP discovery and sends for it must refuse
+ * with a typed error; no MCP process may start in it.
+ */
+describe("unsanitized task checkout whose reclaim failed", () => {
+  test("a failed unpublish keeps prompt discovery and sends refused and starts nothing in the checkout", async () => {
+    const env = await createTestEnvironment();
+    const repoPath = await createTempGitRepo();
+    const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
+    try {
+      const { parentId, launchReplacement } = await setUpReplacement(env, repoPath, recordFile);
+      // The reclaim's unpublish (the first config edit after the failed sanitize) is held,
+      // then fails: the row and the unsanitized checkout both stay.
+      const reclaimHeld = Promise.withResolvers<void>();
+      const failReclaim = Promise.withResolvers<void>();
+      let failNextEdit = false;
+      const realEditConfig = env.config.editConfig.bind(env.config);
+      spyOn(env.config, "editConfig").mockImplementation((async (...args: unknown[]) => {
+        if (failNextEdit) {
+          failNextEdit = false;
+          reclaimHeld.resolve();
+          await failReclaim.promise;
+          throw new Error("fixture: unpublish failed");
+        }
+        return (realEditConfig as (...a: unknown[]) => Promise<unknown>)(...args);
+      }) as never);
+      let checkout: string | undefined;
+      spyOn(env.services.workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+        async (id: string, workspacePath: string) => {
+          if (id === parentId) return undefined;
+          checkout = await fs.realpath(workspacePath);
+          failNextEdit = true;
+          return "fixture: sanitize failed";
+        }
+      );
+      const initWaits = observeInit(env);
+
+      const replacementId = await launchReplacement();
+      await reclaimHeld.promise;
+      assert(checkout, "the replacement's sanitize must have run");
+      initWaits.target.workspaceId = replacementId;
+      const parked = listPrompts(env, replacementId);
+      await initWaits.parked;
+      expect(initWaits.completed).not.toContain(replacementId);
+      failReclaim.resolve();
+
+      // The parked request is released by the failed launch and refuses with the typed error.
+      expectTypedPromptRefusal(await parked);
+      expectTypedPromptRefusal(await listPrompts(env, replacementId));
+      const sent = await sendMessage(env, replacementId, "continue", { model: HAIKU_MODEL });
+      expect(sent).toMatchObject({
+        success: false,
+        error: { type: UNSANITIZED_TASK_CHECKOUT_CODE },
+      });
+      // Positive control: the sentinel records the (sanitized) parent's discovery in this run.
+      expect("prompts" in (await listPrompts(env, parentId))).toBe(true);
+      const events = await readRecord(recordFile);
+      expect(events.some((e) => e.cwd !== checkout)).toBe(true);
+      expect(events.filter((e) => e.cwd === checkout)).toEqual([]);
+      // The scenario: the row is still published and the unsanitized checkout still exists.
+      expect(
+        env.config
+          .loadConfigOrDefault()
+          .projects.get(repoPath)
+          ?.workspaces.some((w) => w.id === replacementId)
+      ).toBe(true);
+      expect(await fs.stat(checkout).catch(() => null)).not.toBeNull();
+      // Inspection and removal stay available.
+      expect(
+        (await resolveOrpcClient(env).workspace.getInfo({ workspaceId: replacementId }))?.id
+      ).toBe(replacementId);
+      const removed = await env.services.workspaceService.remove(replacementId, true);
+      expect(removed.success).toBe(true);
+      expect(await fs.stat(checkout).catch(() => null)).toBeNull();
+    } finally {
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(repoPath);
+    }
+  }, 120_000);
+
+  test("a failed checkout delete refuses the parked request and reports the checkout retained", async () => {
+    const env = await createTestEnvironment();
+    const repoPath = await createTempGitRepo();
+    const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
+    let deleteSpy: { mockRestore: () => void } | undefined;
+    try {
+      const { parentId, launchReplacement } = await setUpReplacement(env, repoPath, recordFile);
+      const reclaimHeld = Promise.withResolvers<void>();
+      const releaseReclaim = Promise.withResolvers<void>();
+      let holdNextEdit = false;
+      const realEditConfig = env.config.editConfig.bind(env.config);
+      spyOn(env.config, "editConfig").mockImplementation((async (...args: unknown[]) => {
+        if (holdNextEdit) {
+          holdNextEdit = false;
+          reclaimHeld.resolve();
+          await releaseReclaim.promise;
+        }
+        return (realEditConfig as (...a: unknown[]) => Promise<unknown>)(...args);
+      }) as never);
+      let checkout: string | undefined;
+      spyOn(env.services.workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+        async (id: string, workspacePath: string) => {
+          if (id === parentId) return undefined;
+          checkout = await fs.realpath(workspacePath);
+          holdNextEdit = true;
+          return "fixture: sanitize failed";
+        }
+      );
+      // The row is unpublished, but the checkout cannot be deleted. (A prototype spy:
+      // restored in finally so later tests delete checkouts for real.)
+      deleteSpy = spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockResolvedValue({
+        success: false,
+        error: "fixture: delete failed",
+      });
+      const taskService = env.services.taskService as unknown as {
+        reclaimUnsanitizedTaskCheckout: (...args: unknown[]) => Promise<unknown>;
+      };
+      const reclaim = taskService.reclaimUnsanitizedTaskCheckout.bind(taskService);
+      const reclaimResults: unknown[] = [];
+      spyOn(taskService, "reclaimUnsanitizedTaskCheckout").mockImplementation(async (...args) => {
+        const result = await reclaim(...args);
+        reclaimResults.push(result);
+        return result;
+      });
+      const initWaits = observeInit(env);
+
+      const replacementId = await launchReplacement();
+      await reclaimHeld.promise;
+      assert(checkout, "the replacement's sanitize must have run");
+      initWaits.target.workspaceId = replacementId;
+      const parked = listPrompts(env, replacementId);
+      await initWaits.parked;
+      releaseReclaim.resolve();
+
+      expectTypedPromptRefusal(await parked);
+      expect(reclaimResults).toEqual([{ rowUnpublished: true, checkoutRemoved: false }]);
+      expect((await readRecord(recordFile)).filter((e) => e.cwd === checkout)).toEqual([]);
+      expect(await fs.stat(checkout).catch(() => null)).not.toBeNull();
+      expect(
+        await fs.stat(path.join(env.config.sessionsDir, replacementId)).catch(() => null)
+      ).toBeNull();
+    } finally {
+      deleteSpy?.mockRestore();
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(repoPath);
+    }
+  }, 120_000);
+
+  test("a direct create whose sanitize fails leaves a retained row that refuses sends and discovery", async () => {
+    const env = await createTestEnvironment();
+    const repoPath = await createTempGitRepo();
+    const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
+    try {
+      const { parentId } = await setUpReplacement(env, repoPath, recordFile);
+      let checkout: string | undefined;
+      spyOn(env.services.workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+        async (id: string, workspacePath: string) => {
+          if (id === parentId) return undefined;
+          checkout = await fs.realpath(workspacePath);
+          return "fixture: sanitize failed";
+        }
+      );
+      const created = await env.services.taskService.create({
+        parentWorkspaceId: parentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "Summarize durable workflows",
+        title: "Direct",
+      });
+      expect(created.success).toBe(false);
+      assert(checkout, "the direct task's sanitize must have run");
+      const taskRow = env.config
+        .loadConfigOrDefault()
+        .projects.get(repoPath)
+        ?.workspaces.find((w) => w.parentWorkspaceId === parentId && w.id !== "retiredmcp");
+      assert(taskRow?.id, "the direct create retains its interrupted row");
+
+      const sent = await sendMessage(env, taskRow.id, "continue", { model: HAIKU_MODEL });
+      expect(sent).toMatchObject({
+        success: false,
+        error: { type: UNSANITIZED_TASK_CHECKOUT_CODE },
+      });
+      expectTypedPromptRefusal(await listPrompts(env, taskRow.id));
+      expect((await readRecord(recordFile)).filter((e) => e.cwd === checkout)).toEqual([]);
     } finally {
       await cleanupTestEnvironment(env);
       await cleanupTempGitRepo(repoPath);

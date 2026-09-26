@@ -3669,6 +3669,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           getInitState: mock(() => undefined),
           waitForInit: mock(() => Promise.resolve()),
           clearInMemoryState: mock(() => undefined),
+          getUnsanitizedCheckoutError: mock(() => undefined),
         } as unknown as InitStateManager;
         const aiService = sessionHarness.aiService as unknown as AIService;
         const workspaceService = new WorkspaceService(

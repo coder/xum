@@ -64,6 +64,8 @@ export function createMockInitStateManager(): InitStateManager {
     clearInMemoryState: mock(() => undefined),
     getInitState: mock(() => undefined),
     readInitStatus: mock(() => Promise.resolve(null)),
+    markCheckoutUnsanitized: mock(() => undefined),
+    getUnsanitizedCheckoutError: mock(() => undefined),
   } as unknown as InitStateManager;
 }
 

@@ -23,7 +23,7 @@ function createContext(options: {
     workspaceService: {
       acquireMcpPromptDiscoveryAdmission: mock(() => options.admission),
     },
-    initStateManager: { waitForInit },
+    initStateManager: { waitForInit, getUnsanitizedCheckoutError: () => undefined },
     aiService: {
       getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
       createWorkspaceRuntimeContext: mock(() =>
