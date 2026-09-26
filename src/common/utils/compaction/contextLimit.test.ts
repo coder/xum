@@ -107,10 +107,10 @@ describe("getEffectiveContextLimit", () => {
 
   test("caps the GPT-5.6 family at each tier's Codex OAuth context window", () => {
     const contextLimits = {
-      "gpt-5.6": 372_000,
-      "gpt-5.6-sol": 372_000,
-      "gpt-5.6-terra": 372_000,
-      "gpt-5.6-luna": 372_000,
+      "gpt-5.6": 272_000,
+      "gpt-5.6-sol": 272_000,
+      "gpt-5.6-terra": 272_000,
+      "gpt-5.6-luna": 272_000,
     } as const;
 
     for (const [model, contextLimit] of Object.entries(contextLimits)) {
