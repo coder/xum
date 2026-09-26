@@ -3991,13 +3991,23 @@ export class TaskService implements AgentTaskIntegration {
         `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
       );
     }
-    // The row names another writer's attempt (a second backend sharing this Xum root re-admitted
-    // it): this process's ownership is stale, so its settlement says nothing about the task's
-    // current attempt — never report it as ended (#4414).
-    const rowAttemptId = entry?.workspace.taskAttemptId;
-    if (rowAttemptId != null && owned.attemptId != null && rowAttemptId !== owned.attemptId) {
+    // In-process authority covers exactly the attempt the persisted row names now (#4311, #4414):
+    // once the row names another writer's attempt, lost its id, or cannot be read, this process's
+    // ownership says nothing about the task — never report it as ended. Strict, and after the last
+    // await. A positively absent row keeps the owned verdict below (e.g. a reservation canceled
+    // before publication): with no row, nothing can be admitted for the task.
+    let currentRow: WorkspaceConfigEntry | undefined;
+    try {
+      currentRow = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        taskId
+      )?.workspace;
+    } catch (error: unknown) {
+      return indeterminate(`config unreadable: ${getErrorMessage(error)}`);
+    }
+    if (currentRow != null && currentRow.taskAttemptId !== owned.attemptId) {
       return indeterminate(
-        `row moved to attempt ${rowAttemptId}; this process owns ${owned.attemptId}`
+        `row names attempt ${currentRow.taskAttemptId ?? "none"}; this process owns ${owned.attemptId ?? "none"}`
       );
     }
     const settlement = this.attemptSettlementByTaskId.get(taskId);

@@ -14,7 +14,7 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
-import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { configFilePath, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
@@ -4225,6 +4225,36 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       } finally {
         readSpy.mockRestore();
       }
+    });
+
+    // #4311: A's owned settlement speaks only for the attempt the persisted row names right now.
+    test("an owned settlement never reads as terminal-no-report through an unreadable config", async () => {
+      const result = await runStopSettlement({ successorAdmitted: false });
+      expect(result.read).toMatchObject({ kind: "terminal-no-report" });
+      const file = configFilePath(result.config.rootDir);
+      const intact = await fsPromises.readFile(file, "utf-8");
+      await fsPromises.writeFile(file, "{ damaged");
+      try {
+        const read = await result.taskService.readAttemptOutcome(result.taskId, requesting);
+        expect(read.kind).toBe("indeterminate");
+      } finally {
+        await fsPromises.writeFile(file, intact);
+      }
+    });
+
+    test("an owned settlement is not the outcome of a row that lost its attempt id", async () => {
+      const result = await runStopSettlement({ successorAdmitted: false });
+      expect(result.read).toMatchObject({ kind: "terminal-no-report" });
+      // Another writer (e.g. a backend that dropped the field) leaves the row without an id.
+      await result.otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === result.taskId);
+          if (ws) delete ws.taskAttemptId;
+        }
+        return cfg;
+      });
+      const read = await result.taskService.readAttemptOutcome(result.taskId, requesting);
+      expect(read.kind).toBe("indeterminate");
     });
 
     test.each([false, true])(
