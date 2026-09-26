@@ -20,10 +20,13 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
  * deleted. Concurrent writers of DIFFERENT attempts never touch the same file; the process-local
  * workspaceFileLocks used by the read-modify-write failure artifacts are therefore not needed.
  *
- * Scope: a receipt is evidence that ONE backend settled the attempt, never proof that no report
- * exists. With two backends on one root, another backend can run a turn under the same attempt id
- * without rotating it and still publish a report after this receipt (#4545). Consumers must read
- * the report artifact first: a receipt followed by a report is "reported".
+ * Scope: a receipt is evidence that ONE backend settled its own execution of the attempt, never
+ * proof that no report exists. With two backends on one root, another backend can run a turn
+ * under the same attempt id without rotating it and still publish a report after this receipt
+ * (#4545; driving one task from two backends is unsupported, and a Stop in one backend does not
+ * stop the other's turn). Consumers must read the report artifact first: a receipt followed by a
+ * report is "reported". Once a workflow claim retires the attempt, a late report is refused, so a
+ * step accepts either that report or the replacement, never both.
  *
  * Producers are TaskService's settlement paths (persistOwnedAttemptSettlement and the stop-record
  * release). The only reader so far is the lineage proof at reawaken/reactivation; the classifier
