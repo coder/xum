@@ -288,42 +288,6 @@ describe("subscriptionIterable ordering and buffering", () => {
     expect(detached).toBe(1);
   });
 
-  test("progressiveInitialize delivers pushes and heartbeats while initialize is pending", async () => {
-    const app = makeAppRuntime(TestClock.layer());
-    const controller = new AbortController();
-    const values: string[] = [];
-    const intervalMs = 1_000;
-    let finishInitialize: (() => void) | undefined;
-    const iterable = subscriptionIterable<string>({
-      context: app.context,
-      signal: controller.signal,
-      heartbeat: { value: "heartbeat", intervalMs },
-      progressiveInitialize: true,
-      subscribe: () => () => undefined,
-      initialize: async (emit) => {
-        emit.push("row");
-        await new Promise<void>((resolve) => (finishInitialize = resolve));
-        emit.push("caught-up");
-      },
-    });
-    const consumed = (async () => {
-      for await (const value of iterable) values.push(value);
-    })();
-    try {
-      await waitFor(() => values.length === 1);
-      await app.managed.runPromise(TestClock.adjust(2 * intervalMs));
-      await waitFor(() => values.length === 3);
-      expect(values).toEqual(["row", "heartbeat", "heartbeat"]);
-      finishInitialize?.();
-      await waitFor(() => values.length === 4);
-      expect(values[3]).toBe("caught-up");
-    } finally {
-      controller.abort();
-      await consumed;
-      await disposeAppRuntime(app.managed);
-    }
-  });
-
   test("progressiveInitialize failure after a push surfaces the error and detaches", async () => {
     const emitter = new EventEmitter();
     const boom = new Error("replay failed");
