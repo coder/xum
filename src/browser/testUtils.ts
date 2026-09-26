@@ -184,7 +184,13 @@ export function createTestBashResult(options: {
   if (exitCode === 0) {
     return {
       success: true,
-      data: { success: true, output: options.output, exitCode: 0, wall_duration_ms: 0, ...truncated },
+      data: {
+        success: true,
+        output: options.output,
+        exitCode: 0,
+        wall_duration_ms: 0,
+        ...truncated,
+      },
     };
   }
   return {
