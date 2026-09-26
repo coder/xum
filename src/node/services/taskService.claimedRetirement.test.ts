@@ -198,6 +198,71 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       expect(await read(otherProcess(config), "absent")).toEqual(noRecord);
     });
 
+    test("the row's terminal-failure marker counts only for the attempt it names", async () => {
+      const config = await setupChild("marked", {
+        taskLaunchError: "refused by the model",
+        taskTerminalFailure: { attemptId: ATTEMPT, errorType: "model_refusal" },
+      });
+      await writeReceipt(config, midId, "marked");
+      // No failure artifact (its write failed): the marker still makes it a failure.
+      expect(await read(otherProcess(config), "marked")).toEqual({
+        kind: "terminal-no-report",
+        attemptId: ATTEMPT,
+        failure: { errorMessage: "refused by the model" },
+      });
+
+      // A marker left by an earlier attempt: the current attempt's no-report stays replaceable.
+      const stale = await setupChild("stalemarker", {
+        taskLaunchError: "refused by the model",
+        taskTerminalFailure: { attemptId: "att_00000000000000c0", errorType: "model_refusal" },
+      });
+      await writeReceipt(stale, midId, "stalemarker");
+      expect(await read(otherProcess(stale), "stalemarker")).toEqual({
+        kind: "terminal-no-report",
+        attemptId: ATTEMPT,
+      });
+    });
+
+    test.each([
+      ["malformed", "file"],
+      ["a directory", "dir"],
+    ] as const)(
+      "an unreadable failure artifact (%s) defers to the row's marker for the attempt it names",
+      async (_label, damage) => {
+        const marker = (attemptId: string) => ({
+          taskLaunchError: "refused by the model",
+          taskTerminalFailure: { attemptId, errorType: "model_refusal" },
+        });
+        const cases = [
+          ["matching", marker(ATTEMPT)],
+          ["stale", marker("att_00000000000000c0")],
+          ["absent", {}],
+        ] as const;
+        for (const [name, overrides] of cases) {
+          const taskId = `unread${name}`;
+          const config = await setupChild(taskId, overrides);
+          await writeReceipt(config, midId, taskId);
+          const failures = getSubagentFailureArtifactsFilePath(
+            path.join(config.sessionsDir, midId)
+          );
+          await fsPromises.rm(failures, { recursive: true, force: true });
+          if (damage === "dir") await fsPromises.mkdir(failures, { recursive: true });
+          else await fsPromises.writeFile(failures, "{ not json", "utf-8");
+          const outcome = await read(otherProcess(config), taskId);
+          if (name === "matching") {
+            expect(outcome).toEqual({
+              kind: "terminal-no-report",
+              attemptId: ATTEMPT,
+              failure: { errorMessage: "refused by the model" },
+            });
+          } else {
+            // Fail closed: nothing proves this attempt failed, or that it merely ended.
+            expect(outcome.kind).toBe("indeterminate");
+          }
+        }
+      }
+    );
+
     test.each([
       ["only an ancestor holds the receipt", {}, rootId, ATTEMPT],
       ["the receipt names an older attempt", {}, midId, "att_00000000000000c0"],

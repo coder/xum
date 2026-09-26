@@ -3317,6 +3317,37 @@ describe("Config", () => {
       }
     );
 
+    it("keeps a task's terminal-failure marker through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      const marker = { attemptId: "att_00000000000000a1", errorType: "model_refusal" };
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "child",
+              name: "child",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              parentWorkspaceId: "owner",
+              taskStatus: "interrupted",
+              taskAttemptId: marker.attemptId,
+              taskTerminalFailure: marker,
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskTerminalFailure).toEqual(marker);
+      // Server-owned like the attempt identity: absent from metadata, kept by a metadata write.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
+    });
+
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
       const projectPath = "/fake/project";
       const workspacePath = path.join(config.srcDir, "project", "heartbeat-sparse");

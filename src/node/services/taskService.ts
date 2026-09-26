@@ -1061,6 +1061,22 @@ function rowSupersedes(
 }
 
 /**
+ * The terminal failure the row's marker (#4579) records for `attemptId`, or undefined when the
+ * marker is absent or names another attempt (a later attempt ignores an earlier failure).
+ */
+function markedTerminalFailure(
+  row: WorkspaceConfigEntry | undefined,
+  attemptId: string | undefined
+): { errorMessage: string } | undefined {
+  const marker = row?.taskTerminalFailure;
+  if (attemptId == null || marker?.attemptId !== attemptId) return undefined;
+  return {
+    errorMessage:
+      coerceNonEmptyString(row?.taskLaunchError) ?? `Task failed terminally (${marker.errorType})`,
+  };
+}
+
+/**
  * Why a workflow claim on `attemptId` must be refused (see TaskService.claimRetiredAttempt), or
  * undefined when it may be granted (or re-stamped, for the same run/step before any replacement).
  */
@@ -3881,6 +3897,23 @@ export class TaskService implements AgentTaskIntegration {
         taskId
       );
       if (failureRead.kind === "unreadable") {
+        // The row's marker (#4579) still proves a terminal failure for the attempt it names;
+        // without one, a damaged artifact proves nothing (fail closed).
+        let row: WorkspaceConfigEntry | undefined;
+        try {
+          row = findWorkspaceEntry(
+            this.config.loadConfigOrDefault({ throwOnError: true }),
+            taskId
+          )?.workspace;
+        } catch {
+          row = undefined;
+        }
+        const owned = this.ownedAttemptByTaskId.get(taskId);
+        const attemptId = row?.taskAttemptId;
+        const marked = markedTerminalFailure(row, attemptId);
+        if (marked != null && (owned?.attemptId == null || owned.attemptId === attemptId)) {
+          return { kind: "terminal-no-report", attemptId, failure: marked };
+        }
         return indeterminate(
           `failure artifact unreadable in ${reportOwnerWorkspaceId}: ${failureRead.error}`
         );
@@ -3893,6 +3926,12 @@ export class TaskService implements AgentTaskIntegration {
       entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     }
 
+    // The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
+    // artifact write that failed still fails the step, and a later attempt's no-report is not.
+    const failureFields = (attemptId: string | undefined) => {
+      const marked = failure ?? markedTerminalFailure(entry?.workspace, attemptId);
+      return marked != null ? { failure: marked } : {};
+    };
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
     if (this.isWorkspaceStopInProgress(taskId)) {
       return { kind: "cleanup-pending" };
@@ -3928,7 +3967,7 @@ export class TaskService implements AgentTaskIntegration {
           return {
             kind: "terminal-no-report",
             attemptId: proof.attemptId,
-            ...(failure != null ? { failure } : {}),
+            ...failureFields(proof.attemptId),
           };
         }
         return indeterminate(
@@ -3961,7 +4000,7 @@ export class TaskService implements AgentTaskIntegration {
       return {
         kind: "terminal-no-report",
         ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
-        ...(failure != null ? { failure } : {}),
+        ...failureFields(owned.attemptId),
         // Ended before (or without) a published row, e.g. a canceled reservation.
         ...(entry == null && this.taskRowPositivelyAbsent(taskId)
           ? { code: "no-record" as const }
@@ -16513,6 +16552,11 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
         ws.taskLaunchError = failure.errorMessage;
+        // #4579: binds the failure to the attempt this CAS matched. The artifacts below are
+        // log-only on I/O errors, and taskLaunchError is not attempt-bound or failure-only.
+        if (ws.taskAttemptId != null) {
+          ws.taskTerminalFailure = { attemptId: ws.taskAttemptId, errorType: failure.errorType };
+        }
         if (stopRecord == null) {
           this.closeAttemptAdmission(
             workspaceId,
