@@ -1,20 +1,31 @@
 import { describe, expect, it } from "bun:test";
-import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
+import type {
+  HistoryEditPrecondition,
+  ProvidersConfigMap,
+  SendMessageOptions,
+} from "@/common/orpc/types";
 import type { MuxMessageMetadata } from "@/common/types/message";
-import { prepareMessagePayload } from "./prepareMessagePayload";
+import { getModelOneShotOverrides, prepareMessagePayload } from "./prepareMessagePayload";
 
 const model = "anthropic:claude-sonnet-4";
 const options = { model, thinkingLevel: "off", agentId: "exec" } satisfies SendMessageOptions;
-const prepare = (input = {}) =>
+// Cases carry the parsed one-shot command; resolve it the way ChatInput does before preparing.
+const prepare = ({
+  messageText = "hello",
+  modelOneShot,
+  ...input
+}: Partial<Parameters<typeof prepareMessagePayload>[0]> & {
+  messageText?: string;
+  modelOneShot?: Parameters<typeof getModelOneShotOverrides>[0];
+} = {}) =>
   prepareMessagePayload({
-    messageText: "hello",
     messageTextForSend: "hello",
     attachments: [],
     reviewIds: [],
     agentSkillRefs: [],
     mcpPromptRefs: [],
     sendMessageOptions: options,
-    policyModel: model,
+    oneShot: modelOneShot && getModelOneShotOverrides(modelOneShot, messageText, [], model, null),
     transferredDraftProjectDiscovery: false,
     additionalSystemContextHydrated: false,
     additionalSystemContext: { enabled: false, content: "" },
@@ -54,7 +65,7 @@ describe("prepareMessagePayload", () => {
       "a thinking-only one-shot command",
       {
         messageText: "/+2 hello",
-        modelOneShot: { type: "model-oneshot", thinkingLevel: "2", message: "hello" } as const,
+        modelOneShot: { type: "model-oneshot", thinkingLevel: 2, message: "hello" } as const,
       },
       true,
     ],
@@ -84,7 +95,7 @@ describe("prepareMessagePayload", () => {
       "a thinking-only one-shot command",
       {
         messageText: "/+2 hello",
-        modelOneShot: { type: "model-oneshot", thinkingLevel: "2", message: "hello" } as const,
+        modelOneShot: { type: "model-oneshot", thinkingLevel: 2, message: "hello" } as const,
       },
       false,
     ],
@@ -115,6 +126,27 @@ describe("prepareMessagePayload", () => {
     expect(result.options.muxMetadata?.agentSkillRefs?.map((ref) => ref.skillName)).toEqual(
       expectedSkills
     );
+  });
+
+  it("resolves numeric one-shot levels through mapped model aliases", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      },
+    };
+    const resolve = (config: ProvidersConfigMap | null) =>
+      getModelOneShotOverrides(
+        { type: "model-oneshot", thinkingLevel: 3, message: "hello" },
+        "/+3 hello",
+        [],
+        "openai:team-astra",
+        config
+      ).options.thinkingLevel;
+    // Without the mapping the alias falls back to the default ladder and picks a lower level.
+    expect([resolve(providersConfig), resolve(null)]).toEqual(["xhigh", "high"]);
   });
 
   it("applies compaction, context, and dispatch overrides", () => {

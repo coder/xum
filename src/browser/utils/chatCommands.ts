@@ -437,16 +437,6 @@ export async function processSlashCommand(
     }
   }
 
-  if (parsed.type === "model-oneshot") {
-    return complete("restore", [
-      showToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: "Model one-shot is handled in the chat input.",
-      }),
-    ]);
-  }
-
   if (parsed.type === "workflow-run") {
     const workflowsEnabled =
       env.dynamicWorkflowsEnabled ?? isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS) === true;
