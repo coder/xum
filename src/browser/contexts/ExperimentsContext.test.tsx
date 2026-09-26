@@ -9,13 +9,13 @@ import {
   getExperimentKey,
   getLegacyPtcExclusiveExperimentKey,
 } from "@/common/constants/experiments";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { APIProvider, type APIClient } from "./API";
 import { ExperimentsProvider, useExperiment, useExperimentValue } from "./ExperimentsContext";
 
 // Keep the API client local to each render so this suite does not leak a process-global
 // mock.module override into ProjectContext and other later context tests.
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
@@ -113,7 +113,7 @@ describe("ExperimentsProvider", () => {
         return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
       }
       const view = render(
-        <APIProvider client={currentClientMock as APIClient}>
+        <APIProvider client={createTestApiClient(currentClientMock)}>
           <ExperimentsProvider>
             <Toggle />
           </ExperimentsProvider>
@@ -167,7 +167,7 @@ describe("ExperimentsProvider", () => {
       return <button onClick={() => setEnabled(false)}>{String(enabled)}</button>;
     }
     const view = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Toggle />
         </ExperimentsProvider>
@@ -204,7 +204,7 @@ describe("ExperimentsProvider", () => {
       return <div>{String(useExperimentValue(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP))}</div>;
     }
     const view = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Observer />
         </ExperimentsProvider>
@@ -275,7 +275,7 @@ describe("ExperimentsProvider", () => {
         );
       }
       const tree = (showSettings: boolean) => (
-        <APIProvider client={currentClientMock as APIClient}>
+        <APIProvider client={createTestApiClient(currentClientMock)}>
           <ExperimentsProvider>{showSettings && <Settings />}</ExperimentsProvider>
         </APIProvider>
       );
@@ -339,7 +339,7 @@ describe("ExperimentsProvider", () => {
     };
 
     render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <div />
         </ExperimentsProvider>
@@ -371,7 +371,7 @@ describe("ExperimentsProvider", () => {
     }
 
     const { getByTestId } = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Observer />
         </ExperimentsProvider>
@@ -399,7 +399,7 @@ describe("ExperimentsProvider", () => {
     }
 
     const { getByTestId } = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Observer />
         </ExperimentsProvider>
@@ -428,7 +428,7 @@ describe("ExperimentsProvider", () => {
     }
 
     const { getByTestId } = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Toggle />
         </ExperimentsProvider>
@@ -474,7 +474,7 @@ describe("ExperimentsProvider", () => {
     }
 
     const { getByTestId } = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Probe />
         </ExperimentsProvider>
@@ -514,7 +514,7 @@ describe("ExperimentsProvider", () => {
     }
 
     const { getByTestId } = render(
-      <APIProvider client={currentClientMock as APIClient}>
+      <APIProvider client={createTestApiClient(currentClientMock)}>
         <ExperimentsProvider>
           <Toggle />
         </ExperimentsProvider>

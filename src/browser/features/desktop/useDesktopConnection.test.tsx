@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test, type Mock } from "
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { APIContext, type APIClient } from "@/browser/contexts/API";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient } from "@/browser/testUtils";
 import {
   useDesktopConnection,
   type UseDesktopConnectionOptions,
@@ -105,14 +105,14 @@ describe("useDesktopConnection control ownership", () => {
       desktop = useDesktopConnection("workspace-1", options);
       return <div ref={desktop.containerRef} />;
     }
-    const client: RecursivePartial<APIClient> = {
+    const client = createTestApiClient({
       desktop: { getBootstrap, watchViewer, acknowledgeViewerRelease, detachViewer },
-    };
+    });
     const view = render(
       <APIContext.Provider
         value={{
           status: "connected",
-          api: client as APIClient,
+          api: client,
           error: null,
           authenticate: () => undefined,
           retry: () => undefined,

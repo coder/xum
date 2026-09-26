@@ -5,7 +5,8 @@ import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 import { ExperimentsProvider, useExperiment } from "@/browser/contexts/ExperimentsContext";
 import * as RealSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as RealTelemetryModule from "@/browser/hooks/useTelemetry";
@@ -26,20 +27,14 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 
-interface MockConfig {
-  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior;
-  worktreeArchiveBehavior: WorktreeArchiveBehavior;
-  chatTranscriptFullWidth: boolean;
-  llmDebugLogs: boolean;
-  keepScreenAwake: boolean;
-}
+type MockConfig = TestClientConfig;
 
 type ExperimentOverrides = Partial<Record<ExperimentId, boolean>>;
 
 interface MockAPIClient {
   experiments: {
     getOverrides: () => Promise<ExperimentOverrides>;
-    setOverride: (input: { experimentId: ExperimentId; enabled: boolean }) => Promise<void>;
+    setOverride: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => Promise<void>;
   };
   config: {
     getConfig: () => Promise<MockConfig>;
@@ -51,9 +46,9 @@ interface MockAPIClient {
     updateLlmDebugLogs: (input: { enabled: boolean }) => Promise<void>;
     updateKeepScreenAwake: (input: { enabled: boolean }) => Promise<void>;
     onConfigChanged: (
-      input: undefined,
+      input?: unknown,
       options?: { signal?: AbortSignal }
-    ) => Promise<AsyncIterator<void>>;
+    ) => Promise<AsyncIterableIterator<void>>;
   };
   server: {
     getSshHost: () => Promise<string | null>;
@@ -194,7 +189,7 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
 
 function TestProviders(props: { children: React.ReactNode }) {
   return (
-    <APIProvider client={mockApi as APIClient}>
+    <APIProvider client={createTestApiClient(mockApi)}>
       <ExperimentsProvider>
         <ThemeProvider forcedTheme="dark">{props.children}</ThemeProvider>
       </ExperimentsProvider>
@@ -245,19 +240,17 @@ function createMockAPI(
   const backendOverrides = { ...experimentOverrides };
   const getOverridesMock = mock(() => Promise.resolve({ ...backendOverrides }));
   const setOverrideMock = mock(
-    ({ experimentId, enabled }: { experimentId: ExperimentId; enabled: boolean }) => {
-      backendOverrides[experimentId] = enabled;
+    ({ experimentId, enabled }: { experimentId: ExperimentId; enabled?: boolean | null }) => {
+      // Like the backend, a null/omitted value clears the override.
+      if (enabled == null) {
+        delete backendOverrides[experimentId];
+      } else {
+        backendOverrides[experimentId] = enabled;
+      }
       return Promise.resolve();
     }
   );
-  const config: MockConfig = {
-    coderWorkspaceArchiveBehavior: DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-    worktreeArchiveBehavior: DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-    chatTranscriptFullWidth: false,
-    llmDebugLogs: false,
-    keepScreenAwake: false,
-    ...configOverrides,
-  };
+  const config: MockConfig = createTestConfig(configOverrides);
 
   const getConfigMock = mock(() => Promise.resolve({ ...config }));
   const updateCoderPrefsMock = mock(
@@ -290,7 +283,7 @@ function createMockAPI(
   const emitConfigChanged = () => {
     for (const notify of Array.from(configChangeNotifiers)) notify();
   };
-  const onConfigChanged = (_input: undefined, options?: { signal?: AbortSignal }) => {
+  const onConfigChanged = (_input?: unknown, options?: { signal?: AbortSignal }) => {
     let pending = 0;
     let wake: (() => void) | null = null;
     const notify = () => {
@@ -303,7 +296,9 @@ function createMockAPI(
       wake?.();
     };
     options?.signal?.addEventListener("abort", done, { once: true });
-    const iterator: AsyncIterator<void> = {
+    // The real procedure resolves to an async-iterable iterator; GeneralSection drives it with next().
+    const iterator: AsyncIterableIterator<void> = {
+      [Symbol.asyncIterator]: () => iterator,
       next: async () => {
         while (pending === 0 && !options?.signal?.aborted) {
           await new Promise<void>((resolve) => (wake = resolve));

@@ -800,19 +800,24 @@ const localPlugin = {
         };
       },
     },
-    // `x as unknown as APIClient` in tests hides typos and wrong return types in API doubles.
-    // createTestApiClient (src/browser/testUtils.ts) type-checks the partial double instead.
+    // Casting an API double to APIClient in tests hides typos and wrong return types: the
+    // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
+    // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
+    // type-checks the partial double instead. The name predates the single-cast ban; it is
+    // kept so existing eslint-disable comments stay valid.
     "no-unknown-cast-to-api-client": {
       meta: {
         type: "problem",
-        docs: { description: "Disallow `as unknown as APIClient` in tests" },
+        docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
         messages: {
-          cast: "Use createTestApiClient() from @/browser/testUtils instead of `as unknown as APIClient`: it type-checks the double against the real procedure types.",
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient: it type-checks the double against the real procedure types.",
         },
       },
       create(context) {
         return {
-          "TSAsExpression[expression.type='TSAsExpression'][expression.typeAnnotation.type='TSUnknownKeyword'][typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name='APIClient']"(
+          // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
+          // (one report per chain, since the inner `as unknown` does not target APIClient).
+          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name='APIClient']"(
             node
           ) {
             context.report({ node, messageId: "cast" });

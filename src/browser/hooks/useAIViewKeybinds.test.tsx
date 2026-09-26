@@ -4,16 +4,16 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { ChatInputAPI } from "@/browser/features/ChatInput";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { useAIViewKeybinds } from "./useAIViewKeybinds";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 let originalWindow: typeof globalThis.window;
 let originalDocument: typeof globalThis.document;
 let originalHTMLElement: unknown;
 function renderUseAIViewKeybinds(props: Parameters<typeof useAIViewKeybinds>[0]) {
   const wrapper = ({ children }: { children: ReactNode }) => (
-    <APIProvider client={currentClientMock as APIClient}>{children}</APIProvider>
+    <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
   );
 
   return renderHook(() => useAIViewKeybinds(props), { wrapper });

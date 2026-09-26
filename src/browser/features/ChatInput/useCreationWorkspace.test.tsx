@@ -1,4 +1,5 @@
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
@@ -2208,7 +2209,7 @@ function renderUseCreationWorkspace(options: HookOptions) {
     throw new Error("Tests must call setupWindow() before rendering the hook");
   }
   render(
-    <APIProvider client={currentORPCClient as APIClient}>
+    <APIProvider client={createTestApiClient(currentORPCClient)}>
       <Harness {...options} />
     </APIProvider>
   );

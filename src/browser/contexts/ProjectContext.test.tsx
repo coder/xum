@@ -2,14 +2,14 @@ import type { ProjectConfig } from "@/node/config";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider, useProjectContext, type ProjectContext } from "./ProjectContext";
 
 // Keep the client local to each test instead of using bun's process-global
 // mock.module registry for API, which leaks across context suites.
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 describe("ProjectContext", () => {
   let originalWindow: typeof globalThis.window;
@@ -461,7 +461,7 @@ describe("ProjectContext", () => {
       const oldRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
       const newRequest = Promise.withResolvers<Array<[string, ProjectConfig]>>();
       const oldApi = createMockAPI({ list: () => oldRequest.promise });
-      const oldClient = currentClientMock as APIClient;
+      const oldClient = createTestApiClient(currentClientMock);
       const newList = mock(() => newRequest.promise);
       const newClient = { ...oldClient, projects: { ...oldClient.projects, list: newList } };
       let context: ProjectContext | null = null;
@@ -705,7 +705,7 @@ async function setup() {
     return null;
   }
   render(
-    <APIProvider client={currentClientMock as APIClient}>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
       <ProjectProvider>
         <ContextCapture />
       </ProjectProvider>
@@ -715,7 +715,7 @@ async function setup() {
   return () => contextRef.current!;
 }
 
-function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
+function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
   const projects = {
     create: mock(
       overrides.create ??
@@ -754,8 +754,8 @@ function createMockAPI(overrides: RecursivePartial<APIClient["projects"]>) {
 
   // Update the global mock
   currentClientMock = {
-    projects: projects as unknown as RecursivePartial<APIClient["projects"]>,
-    secrets: projects.secrets as unknown as RecursivePartial<APIClient["secrets"]>,
+    projects: projects as unknown as TestApiOverrides<APIClient["projects"]>,
+    secrets: projects.secrets as unknown as TestApiOverrides<APIClient["secrets"]>,
   };
 
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
