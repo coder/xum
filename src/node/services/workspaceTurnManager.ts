@@ -6,7 +6,6 @@ import { type Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamManager } from "@/node/services/streamManager";
 import {
-  areArchiveUntrackedPathListsEqual,
   formatSubagentFailureUserMessage,
   formatSubagentReportUserMessage,
   getIsoNow,
@@ -179,11 +178,17 @@ interface WorkspaceLifecycleTarget {
   workspaceId?: string;
 }
 
+// Deliberately no untracked-file acknowledgement option (#3950): any path list returned to the
+// model can be echoed straight back, so a model-side "confirmation" is not user consent. Lossy
+// snapshot archives are refused here; the user archives through the UI confirmation dialog.
 interface WorkspaceLifecycleOptions {
   interruptActive?: boolean;
-  acknowledgedUntrackedPaths?: string[];
-  acknowledgedUntrackedPathsByWorkspaceId?: Record<string, string[]>;
 }
+
+const LOSSY_SNAPSHOT_ARCHIVE_REFUSAL =
+  "Archiving would permanently delete the untracked files listed in paths, because the snapshot archive behavior cannot preserve them. " +
+  "This tool cannot approve that loss, and you must not delete the files to get around it. " +
+  "Ask the user to archive this workspace manually; the archive dialog lists the files and asks for confirmation.";
 
 interface ResolvedWorkspaceLifecycleTarget {
   action: WorkspaceLifecycleAction;
@@ -3458,10 +3463,6 @@ export class WorkspaceTurnManager {
             });
           }
 
-          const acknowledgedUntrackedPaths =
-            options.acknowledgedUntrackedPaths ??
-            options.acknowledgedUntrackedPathsByWorkspaceId?.[resolved.workspaceId];
-
           const activeTurns = await this.collectActiveWorkspaceLifecycleTurns(
             ownerWorkspaceId,
             resolved
@@ -3609,13 +3610,12 @@ export class WorkspaceTurnManager {
                 });
               }
               // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
-              // being interrupted can create/remove untracked files between any preflight scan and
-              // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
-              // work and STILL bounce with requires_confirmation, stranding the workspace
-              // interrupted-but-unarchived. No worktree-freeze mechanism exists, so refuse to
-              // interrupt here: the caller stops the listed turns explicitly (task_stop / await),
-              // after which the untracked set is stable and any confirmation round-trip is
-              // deterministic.
+              // being interrupted can create untracked files between any preflight scan and the
+              // sink's recheck, so interruption could destroy in-flight work and STILL end in the
+              // lossy-archive refusal, stranding the workspace interrupted-but-unarchived. No
+              // worktree-freeze mechanism exists, so refuse to interrupt here: the caller stops the
+              // listed turns explicitly (task_stop / await), after which the untracked set is
+              // stable and the archive outcome is deterministic.
               if (
                 this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
                   resolved.workspaceId,
@@ -3629,7 +3629,7 @@ export class WorkspaceTurnManager {
                   ...this.lifecycleTargetFields(resolved),
                   activeTaskIds: activeTurns.map((turn) => turn.handleId),
                   note:
-                    "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
+                    "interrupt_active was not honored: under the snapshot archive behavior, an interrupted turn can leave untracked files that would make the archive refuse after the interruption. " +
                     "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
                 });
               }
@@ -3651,9 +3651,8 @@ export class WorkspaceTurnManager {
                 });
               }
               // Interruption destroys in-flight work, so surface every archive blocker BEFORE
-              // stopping anything: a refused lossy-untracked-files confirmation, changed paths since
-              // a prior acknowledgement, or archive-blocking errors (e.g. active descendant
-              // sub-agents) must all leave the active turns running.
+              // stopping anything: a lossy-untracked-files refusal or archive-blocking errors
+              // (e.g. active descendant sub-agents) must leave the active turns running.
               const preflight = await this.workspaceService.preflightArchive(resolved.workspaceId, {
                 worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
               });
@@ -3666,25 +3665,7 @@ export class WorkspaceTurnManager {
                 });
               }
               if (preflight.data.kind === "confirm-lossy-untracked-files") {
-                // The archive sink requires exact normalized equality between the acknowledged and
-                // current path lists (a subset check would accept a stale acknowledgement whose extra
-                // paths no longer exist, interrupt the turns, and then still bounce with
-                // requires_confirmation). Mirror the sink's check so interruption only happens when
-                // the acknowledgement would actually be accepted.
-                if (
-                  acknowledgedUntrackedPaths == null ||
-                  !areArchiveUntrackedPathListsEqual(
-                    acknowledgedUntrackedPaths,
-                    preflight.data.paths
-                  )
-                ) {
-                  return Ok({
-                    status: "requires_confirmation",
-                    action: "archive",
-                    ...this.lifecycleTargetFields(resolved),
-                    paths: preflight.data.paths,
-                  });
-                }
+                return Ok(this.lossySnapshotArchiveRefusal(resolved, preflight.data.paths));
               }
               // Arm the sink's admission gate BEFORE destroying anything: in-flight user
               // activity the earlier snapshot cannot see (admission counters, workflow
@@ -3755,7 +3736,9 @@ export class WorkspaceTurnManager {
             // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
             const result = await this.workspaceService.archiveWhileTaskTreeLocked(
               resolved.workspaceId,
-              acknowledgedUntrackedPaths,
+              // Never an acknowledgement (#3950): with none, the sink's own rechecks refuse any
+              // lossy untracked files, including ones that appeared after the preflight above.
+              undefined,
               // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
               // close the settings-flip races the early behavior checks above cannot cover,
               // refuseLiveUserActivity fails closed (and holds turn admission) if user activity was
@@ -3778,12 +3761,7 @@ export class WorkspaceTurnManager {
               });
             }
             if (result.data.kind === "confirm-lossy-untracked-files") {
-              return Ok({
-                status: "requires_confirmation",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                paths: result.data.paths,
-              });
+              return Ok(this.lossySnapshotArchiveRefusal(resolved, result.data.paths));
             }
             return Ok({
               status: "archived",
@@ -3960,6 +3938,22 @@ export class WorkspaceTurnManager {
    *   orphan those results, because terminal attention draining supersedes handles whose
    *   owner is archived.
    */
+  // Same "error" shape as the other refusals that need a human (e.g. the Delete checkout policy),
+  // plus the lossy paths so the model can tell the user which files block the archive.
+  private lossySnapshotArchiveRefusal(
+    resolved: ResolvedWorkspaceLifecycleTarget,
+    paths: string[]
+  ): WorkspaceLifecycleResult {
+    assert(paths.length > 0, "a lossy snapshot archive refusal must list the untracked paths");
+    return {
+      status: "error",
+      action: "archive",
+      ...this.lifecycleTargetFields(resolved),
+      paths,
+      error: LOSSY_SNAPSHOT_ARCHIVE_REFUSAL,
+    };
+  }
+
   private lifecycleTargetFields(resolved: ResolvedWorkspaceLifecycleTarget): {
     taskId?: string;
     workspaceId: string;
