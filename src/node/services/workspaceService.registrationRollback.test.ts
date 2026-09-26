@@ -167,17 +167,20 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     }
   );
 
-  // The deferred rollback force-removes the unpopulated checkout; that must never reach a
-  // branch the creation did not make (a forced delete runs `git branch -D`).
-  test("deferred create on an existing branch never deletes that branch", async () => {
-    git(projectPath, "checkout", "-q", "-b", "existing");
-    git(projectPath, "commit", "-q", "--allow-empty", "-m", "unmerged work");
-    const tip = git(projectPath, "rev-parse", "existing");
-    git(projectPath, "checkout", "-q", "main");
+  // A merged branch is the one a rollback could lose: a plain delete runs `git branch -d`.
+  test.each([
+    { label: "materialized", awaitMaterialization: true },
+    { label: "deferred", awaitMaterialization: false },
+  ])(
+    "create ($label) on an existing branch keeps that branch",
+    async ({ awaitMaterialization }) => {
+      git(projectPath, "branch", "existing");
+      const tip = git(projectPath, "rev-parse", "existing");
 
-    await expectFailsWithSaveError(() => createWorktree("existing", false));
-    expect(git(projectPath, "rev-parse", "existing")).toBe(tip);
-  });
+      await expectFailsWithSaveError(() => createWorktree("existing", awaitMaterialization));
+      expect(git(projectPath, "rev-parse", "existing")).toBe(tip);
+    }
+  );
 
   test("createMultiProject removes its worktrees, container, session and init state", async () => {
     const workspaceId = "bbbbbbbbb1";
@@ -198,6 +201,20 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(retry.success).toBe(true);
   });
 
+  test("createMultiProject keeps an existing branch and removes the ones it made", async () => {
+    git(projectPath, "branch", "multi-x");
+
+    await expectFailsWithSaveError(() =>
+      service.createMultiProject(projects(), "multi-x", "main", undefined, {
+        type: "worktree",
+        srcBaseDir,
+      })
+    );
+    expect(git(projectPath, "branch", "--list", "multi-x")).not.toBe("");
+    expect(git(otherProjectPath, "branch", "--list", "multi-x")).toBe("");
+    expect(worktreePaths(otherProjectPath)).toHaveLength(1);
+  });
+
   test("fork removes its worktree and copied session, leaving the source intact", async () => {
     const source = await createWorktree("source");
     if (!source.success) throw new Error(source.error);
@@ -214,44 +231,5 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       success: true,
       data: { metadata: { name: "fork-a" } },
     });
-  });
-
-  test("rename moves the checkout back and keeps the save error", async () => {
-    const created = await createWorktree("before");
-    if (!created.success) throw new Error(created.error);
-    const { id, namedWorkspacePath: oldPath } = created.data.metadata;
-
-    await expectFailsWithSaveError(() => service.rename(id, "after"));
-    // Disk agrees with the unchanged config again: old checkout and branch, nothing new.
-    expect(worktreePaths(projectPath)).toEqual(
-      [await fs.realpath(projectPath), await fs.realpath(oldPath)].sort()
-    );
-    expect(git(oldPath, "branch", "--show-current")).toBe("before");
-    expect(git(projectPath, "branch", "--list", "after")).toBe("");
-    expect((await harness.config.getWorkspaceMetadataById(id))?.name).toBe("before");
-
-    const retry = await service.rename(id, "after");
-    expect(retry.success).toBe(true);
-    expect((await harness.config.getWorkspaceMetadataById(id))?.name).toBe("after");
-  });
-
-  test("multi-project rename moves every checkout and the container back", async () => {
-    const created = await service.createMultiProject(
-      projects(),
-      "multi-before",
-      "main",
-      undefined,
-      { type: "worktree", srcBaseDir }
-    );
-    if (!created.success) throw new Error(created.error);
-    const { id, namedWorkspacePath: oldContainer } = created.data;
-    const checkoutsBefore = [worktreePaths(projectPath), worktreePaths(otherProjectPath)];
-
-    await expectFailsWithSaveError(() => service.rename(id, "multi-after"));
-    expect([worktreePaths(projectPath), worktreePaths(otherProjectPath)]).toEqual(checkoutsBefore);
-    expect(await exists(path.join(oldContainer, "project", "README.md"))).toBe(true);
-    expect(await exists(path.join(path.dirname(oldContainer), "multi-after"))).toBe(false);
-
-    expect((await service.rename(id, "multi-after")).success).toBe(true);
   });
 });

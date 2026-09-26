@@ -227,7 +227,7 @@ describe("WorktreeManager.createWorkspace", () => {
           trusted: false,
           initLogger,
         });
-        expect(result).toEqual({ success: true, workspacePath });
+        expect(result).toEqual({ success: true, workspacePath, createdBranch: !existing });
         expect(checkoutStarted).toBe(true);
         expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
           expectedContent
@@ -462,7 +462,8 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result).toEqual({
         success: true,
         workspacePath,
-        pendingMaterialization: { fastForwardFromOrigin: false, createdBranch: false },
+        pendingMaterialization: { fastForwardFromOrigin: false },
+        createdBranch: false,
       });
       // Reserved but empty: registered with git, no files, no checkout activity yet.
       expect(
@@ -1299,6 +1300,7 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result).toEqual({
         success: true,
         workspacePath: fixture.manager.getWorkspacePath(fixture.projectPath, "feature-submodules"),
+        createdBranch: true,
       });
     } finally {
       await fixture.cleanup();

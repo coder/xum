@@ -3285,11 +3285,15 @@ export class WorkspaceService
     workspaceName: string;
     trusted: boolean;
     initAbortController: AbortController;
-    /** Set when the checkout was never populated (a deferred create whose write rejected). */
-    pendingMaterialization?: PendingMaterialization;
+    /**
+     * What to do with a worktree checkout; default "delete" (`branch -d` keeps unmerged branches).
+     * "force-delete" is for an unpopulated checkout, which git will not remove otherwise, and
+     * "keep" for a branch this creation did not make, which a delete could remove (#4745).
+     */
+    checkout?: "delete" | "force-delete" | "keep";
   }): Promise<boolean> {
     const { workspaceId } = args;
-    const pending = args.pendingMaterialization;
+    const checkout = args.checkout ?? "delete";
     const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
     // WORKTREE runtimes created a fresh checkout; without deleting it,
     // retrying the same branch collides with the orphaned worktree and leaks
@@ -3298,12 +3302,10 @@ export class WorkspaceService
     // no-op by design, but we never call it here to keep that contract
     // explicit). Only after a successful config rollback: while the entry
     // persists, the checkout is still referenced.
-    if (rolledBack && isWorktreeRuntime(args.runtimeConfig) && pending?.createdBranch === false) {
-      // Git refuses a plain remove of an unpopulated worktree, and a forced one would
-      // `branch -D` this pre-existing, possibly unmerged, user branch.
-      log.warn("Kept the unpopulated worktree of an aborted creation on an existing branch", {
+    if (rolledBack && isWorktreeRuntime(args.runtimeConfig) && checkout === "keep") {
+      log.warn("Kept the worktree of an aborted creation on a branch it did not create", {
         workspaceId,
-        branch: args.workspaceName,
+        workspaceName: args.workspaceName,
       });
     } else if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
       const deleteResult = await args.runtime
@@ -3312,10 +3314,7 @@ export class WorkspaceService
           // Worktree directories are named after the sanitized workspace
           // name (branch names may contain "/").
           args.workspaceName,
-          // Force only an unpopulated checkout on a branch this creation made: its `branch -D`
-          // hits only that fresh branch. Populated checkouts keep `branch -d`, which refuses
-          // unmerged branches.
-          pending !== undefined,
+          checkout === "force-delete",
           undefined,
           args.trusted
         )
@@ -5771,7 +5770,14 @@ export class WorkspaceService
             workspaceName: finalWorkspaceName,
             trusted: projectConfig.trusted ?? false,
             initAbortController,
-            pendingMaterialization,
+            // Force only an unpopulated checkout on a branch this creation made: `branch -D`
+            // then hits only that fresh branch.
+            checkout:
+              createResult!.createdBranch !== true
+                ? "keep"
+                : pendingMaterialization
+                  ? "force-delete"
+                  : "delete",
           }).catch((rollbackError: unknown) =>
             logRegistrationRollbackFailure(workspaceId, rollbackError)
           );
@@ -6074,10 +6080,14 @@ export class WorkspaceService
         runtime: ReturnType<typeof createRuntime>;
         workspacePath: string;
         trunkBranch: string;
+        createdBranch: boolean;
       }> = [];
 
-      const rollbackCreatedWorkspaces = async (): Promise<void> => {
+      // onlyCreatedBranches keeps checkouts on branches this creation did not make: `branch -d`
+      // would delete such a branch when it is merged (#4745).
+      const rollbackCreatedWorkspaces = async (onlyCreatedBranches = false): Promise<void> => {
         for (const createdWorkspace of [...createdWorkspaces].reverse()) {
+          if (onlyCreatedBranches && !createdWorkspace.createdBranch) continue;
           const trusted =
             configSnapshot.projects.get(stripTrailingSlashes(createdWorkspace.project.projectPath))
               ?.trusted ?? false;
@@ -6156,6 +6166,7 @@ export class WorkspaceService
           runtime: projectRuntimeEntry.runtime,
           workspacePath: createResult.workspacePath,
           trunkBranch: projectTrunkBranch,
+          createdBranch: createResult.createdBranch === true,
         });
       }
 
@@ -6225,7 +6236,7 @@ export class WorkspaceService
               .catch((cleanupError: unknown) =>
                 logRegistrationRollbackFailure(workspaceId, cleanupError)
               );
-            await rollbackCreatedWorkspaces();
+            await rollbackCreatedWorkspaces(true);
           }
           await this.discardCreationState(workspaceId, initAbortController, entryGone);
         } catch (rollbackError: unknown) {
@@ -8255,8 +8266,6 @@ export class WorkspaceService
       let oldPath: string;
       let newPath: string;
       let runtimeForPlanFile: ReturnType<typeof createRuntime>;
-      // Moves the checkout back when the config rewrite below rejects (#4745).
-      let revertMove: () => Promise<void>;
 
       if (isMultiProject(oldMetadata)) {
         const projects = getProjects(oldMetadata);
@@ -8364,7 +8373,16 @@ export class WorkspaceService
           newContainerExistedBeforeRename = false;
         }
 
-        const revertMultiProjectMove = async (): Promise<void> => {
+        try {
+          await containerManager.removeContainer(oldName);
+          await containerManager.createContainer(
+            newName,
+            renamedProjectWorkspaces.map((workspaceEntry) => ({
+              projectName: workspaceEntry.projectName,
+              workspacePath: workspaceEntry.newWorkspacePath,
+            }))
+          );
+        } catch (containerError: unknown) {
           await rollbackRenamedProjects();
 
           if (!newContainerExistedBeforeRename) {
@@ -8405,22 +8423,9 @@ export class WorkspaceService
           } catch (recreateErr: unknown) {
             log.error("Failed to recreate old container after rename failure", recreateErr);
           }
-        };
 
-        try {
-          await containerManager.removeContainer(oldName);
-          await containerManager.createContainer(
-            newName,
-            renamedProjectWorkspaces.map((workspaceEntry) => ({
-              projectName: workspaceEntry.projectName,
-              workspacePath: workspaceEntry.newWorkspacePath,
-            }))
-          );
-        } catch (containerError: unknown) {
-          await revertMultiProjectMove();
           return Err(`Failed to recreate container: ${getErrorMessage(containerError)}`);
         }
-        revertMove = revertMultiProjectMove;
 
         // Multi-project tasks/forks stored under a real project must keep their git-root path in
         // config so downstream artifact collection can resolve the owning repo after rename.
@@ -8468,21 +8473,9 @@ export class WorkspaceService
         oldPath = renameResult.oldPath;
         newPath = renameResult.newPath;
         runtimeForPlanFile = runtime;
-        revertMove = async () => {
-          const revert = await runtime.renameWorkspace(
-            configProjectPath,
-            newName,
-            oldName,
-            undefined,
-            trusted
-          );
-          if (!revert.success) {
-            logRegistrationRollbackFailure(workspaceId, revert.error);
-          }
-        };
       }
 
-      const registration = this.config.editConfig((config) => {
+      await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(configProjectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -8494,19 +8487,6 @@ export class WorkspaceService
           }
         }
         return config;
-      });
-      await registration.catch(async (error: unknown) => {
-        // #4745: unless the write landed anyway, move the checkout back so disk and config
-        // agree, then fail with the write's own error.
-        try {
-          const landed = [...this.config.loadConfigOrDefault().projects.values()].some((project) =>
-            project.workspaces.some((entry) => entry.path === newPath)
-          );
-          if (!landed) await revertMove();
-        } catch (rollbackError: unknown) {
-          logRegistrationRollbackFailure(workspaceId, rollbackError);
-        }
-        throw error;
       });
       // Checkout and config agree again: let MCP-settings writers proceed
       // instead of queueing behind plan-file moves and .code-workspace sync.
