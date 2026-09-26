@@ -2487,6 +2487,8 @@ export class WorkspaceTurnManager {
           ) {
             this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
           }
+          // Another backend's settlement won and could not release this backend's lock (#4446).
+          await this.releaseTurnOwnerLock(current.handleId);
           this.settleWorkspaceTurnWaiters(
             current.handleId,
             current.status === "completed"

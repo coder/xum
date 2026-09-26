@@ -8,6 +8,7 @@ import {
 } from "@/node/services/taskHandleStore";
 import {
   createWorkspaceTurnManagerHarness,
+  finalizeWorkspaceTurnStreamEndForTest,
   startWorkspaceTurnForTest,
 } from "@/node/services/workspaceTurnManager.testHarness";
 import {
@@ -25,6 +26,7 @@ import {
   workspaceTurnManagerFor,
   workspaceTurnRecord,
   workspaceTurnSnapshot,
+  workspaceTurnStreamEndEvent,
 } from "@/node/services/taskService.testHarness";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 
@@ -240,5 +242,32 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
 
     expect(managerB.getLiveWorkspaceTurnRegistration("task-child")).toBeUndefined();
     expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_dead_owner"))).toBe(false);
+  });
+
+  test("the owner gives its lock back when another backend's settlement already won", async () => {
+    const { config, parentId, taskService: backendA } = await startWorkspaceTurnForTest(rootDir);
+    const lockPath = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
+    const store = new TaskHandleStore(config);
+    const running = await store.getWorkspaceTurn(parentId, "wst_handle");
+    expect(running).not.toBeNull();
+    // Backend B interrupted A's turn: B's terminal record lands, but B cannot release A's lock.
+    await store.upsertWorkspaceTurn({
+      ...running!,
+      status: "interrupted",
+      updatedAt: new Date(Date.parse(running!.updatedAt) + 1000).toISOString(),
+      error: "Workspace turn interrupted",
+    });
+    expect(await exists(lockPath)).toBe(true);
+
+    // A's stream then ends; its settlement finds B's terminal winner.
+    await finalizeWorkspaceTurnStreamEndForTest(
+      backendA,
+      workspaceTurnStreamEndEvent(parentId, "msg_final", "done")
+    );
+
+    expect(await workspaceTurnSnapshot(backendA, parentId)).toMatchObject({
+      status: "interrupted",
+    });
+    expect(await exists(lockPath)).toBe(false);
   });
 });
