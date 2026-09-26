@@ -9,6 +9,7 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
+  boundContainerMutation,
   isPositivelyAbsent,
   MCP_OVERRIDES_REVISION_UNAVAILABLE,
   readHostOverrideDocumentNoFollow,
@@ -2834,10 +2835,11 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   });
 
-  it("clearing a devcontainer workspace keeps the exec path", async () => {
+  it("clearing a devcontainer workspace keeps the exec path, bounded in the container", async () => {
     // A devcontainer's name-derived workspacePath may not be its persisted
-    // host checkout: an in-process unlink there would hit ENOENT and report a
-    // clear that left the real document behind.
+    // host checkout, and a host unlink would follow a symlink the container
+    // swapped in (#4696). The container-side `rm` must still not outlive this
+    // process indefinitely (#4481): it runs under boundContainerMutation.
     const service = new WorkspaceMcpOverridesService(config);
     const checkout = path.join(config.srcDir, "devcontainer-clear");
     const filePath = path.join(checkout, ".xum", "mcp.local.jsonc");
@@ -2857,8 +2859,71 @@ describe("WorkspaceMcpOverridesService", () => {
       type: "devcontainer",
       configPath: ".devcontainer/devcontainer.json",
     });
-    expect(commands.filter((command) => command.startsWith("rm -f "))).toHaveLength(1);
+    const rm = `rm -f ${[".xum/mcp.local.jsonc", ".xum/mcp.local.json", ".mux/mcp.local.jsonc", ".mux/mcp.local.json"].map((relative) => `"${relative}"`).join(" ")}`;
+    expect(commands).toEqual([boundContainerMutation(rm)]);
     expect(await pathExists(filePath)).toBe(false);
+  });
+
+  describe("boundContainerMutation", () => {
+    // Run exactly as DevcontainerRuntime.exec composes it: `cd <cwd> && <command>`.
+    const runInShell = async (dir: string, command: string) => {
+      const runtime = createRuntime({ type: "local" }, { projectPath: dir });
+      const started = Date.now();
+      const result = await execBuffered(runtime, `cd "${dir}" && ${command}`, {
+        cwd: dir,
+        timeout: 30,
+      });
+      return { ...result, elapsedMs: Date.now() - started };
+    };
+
+    it("preserves the mutation's exit code and working directory", async () => {
+      const dir = path.join(config.srcDir, "bounded-ok");
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "doc"), "x");
+      expect((await runInShell(dir, boundContainerMutation('rm -f "doc"'))).exitCode).toBe(0);
+      expect(await pathExists(path.join(dir, "doc"))).toBe(false);
+      expect((await runInShell(dir, boundContainerMutation("exit 3"))).exitCode).toBe(3);
+    });
+
+    it("never runs the mutation when the cd prefix fails", async () => {
+      const dir = path.join(config.srcDir, "bounded-cd");
+      await fs.mkdir(dir, { recursive: true });
+      const runtime = createRuntime({ type: "local" }, { projectPath: dir });
+      const result = await execBuffered(
+        runtime,
+        `cd "${path.join(dir, "missing")}" && ${boundContainerMutation('touch "marker"')}`,
+        { cwd: dir, timeout: 30 }
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(await pathExists(path.join(dir, "marker"))).toBe(false);
+    });
+
+    it("kills a stuck mutation and its children at the bound", async () => {
+      const dir = path.join(config.srcDir, "bounded-stuck");
+      await fs.mkdir(dir, { recursive: true });
+      // A compound mutation whose first step hangs: the kill must reach the
+      // whole group, so the second step can never run later.
+      const result = await runInShell(
+        dir,
+        boundContainerMutation('echo $BASHPID > "pid"; sleep 30; touch "marker"', 1)
+      );
+      expect(result.exitCode).not.toBe(0);
+      expect(result.elapsedMs).toBeLessThan(15_000);
+      const pid = Number((await fs.readFile(path.join(dir, "pid"), "utf8")).trim());
+      expect(Number.isInteger(pid) && pid > 0).toBe(true);
+      const alive = () => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      // The killed process may linger briefly as an unreaped zombie.
+      for (let i = 0; i < 100 && alive(); i++) await new Promise((r) => setTimeout(r, 20));
+      expect(alive()).toBe(false);
+      expect(await pathExists(path.join(dir, "marker"))).toBe(false);
+    });
   });
 
   describe("migration rollback (removeExactDocument)", () => {
@@ -2867,7 +2932,7 @@ describe("WorkspaceMcpOverridesService", () => {
       workspacePath: string,
       filePath: string,
       expectedContent: string,
-      hostFilesystem: boolean
+      runtimeConfig: unknown
     ) => Promise<void>;
     const setup = async (name: string) => {
       const service = new WorkspaceMcpOverridesService(config);
@@ -2888,11 +2953,11 @@ describe("WorkspaceMcpOverridesService", () => {
       const replaced = JSON.stringify({ enabledServers: ["replaced"] });
       const { commands, restore } = recordHostExecCommands();
       try {
-        await removeExactDocument(runtime, workspacePath, filePath, ours, true);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, { type: "local" });
         expect(await fs.readdir(path.dirname(filePath))).toEqual([]);
 
         await fs.writeFile(filePath, replaced);
-        await removeExactDocument(runtime, workspacePath, filePath, ours, true);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, { type: "local" });
       } finally {
         restore();
       }
@@ -2914,7 +2979,7 @@ describe("WorkspaceMcpOverridesService", () => {
         }
       );
       try {
-        await removeExactDocument(runtime, workspacePath, filePath, ours, true);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, { type: "local" });
       } finally {
         linkSpy.mockRestore();
       }
@@ -2932,7 +2997,11 @@ describe("WorkspaceMcpOverridesService", () => {
         return runtime.exec(command, options);
       };
       await fs.writeFile(filePath, ours);
-      await removeExactDocument(recording, workspacePath, filePath, ours, false);
+      await removeExactDocument(recording, workspacePath, filePath, ours, {
+        type: "ssh",
+        host: "remote",
+        srcBaseDir: "/remote",
+      });
       expect(await pathExists(filePath)).toBe(false);
       expect(commands.some((command) => command.startsWith("mv "))).toBe(true);
 
@@ -2951,6 +3020,32 @@ describe("WorkspaceMcpOverridesService", () => {
       );
       expect(await pathExists(filePath)).toBe(false);
       expect(commands.some((command) => command.startsWith("rm -f "))).toBe(true);
+    });
+
+    it("bounds every container-side mv/rm of a devcontainer rollback (#4481)", async () => {
+      const { workspacePath, filePath, runtime, removeExactDocument } = await setup("rb-container");
+      const commands: string[] = [];
+      const recording = Object.create(runtime) as typeof runtime;
+      recording.exec = (command, options) => {
+        commands.push(command);
+        return runtime.exec(command, options);
+      };
+      const devcontainer = { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" };
+      await fs.writeFile(filePath, ours);
+      await removeExactDocument(recording, workspacePath, filePath, ours, devcontainer);
+      expect(await pathExists(filePath)).toBe(false);
+      const replaced = JSON.stringify({ enabledServers: ["replaced"] });
+      await fs.writeFile(filePath, replaced);
+      await removeExactDocument(recording, workspacePath, filePath, ours, devcontainer);
+      expect(await fs.readFile(filePath, "utf8")).toBe(replaced);
+      expect(await fs.readdir(path.dirname(filePath))).toEqual(["mcp.local.jsonc"]);
+      // mv + rm (ours), then mv + mv -n/rm (replaced): all four bounded.
+      expect(commands).toHaveLength(4);
+      for (const command of commands) {
+        const inner = /^\{ set -m; \( (.*) \) & w=/.exec(command)?.[1];
+        expect(inner).toBeDefined();
+        expect(command).toBe(boundContainerMutation(inner!));
+      }
     });
   });
 
