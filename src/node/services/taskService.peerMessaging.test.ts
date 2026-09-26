@@ -1770,6 +1770,7 @@ describe("TaskService", () => {
       };
       return {
         taskService,
+        historyService,
         holdNoticeInPolicyLookup,
         setStatus,
         wakeCalls,
@@ -1878,6 +1879,22 @@ describe("TaskService", () => {
       expect(t.wakeCalls()).toHaveLength(1);
     });
 
+    test("an unreadable sender policy defers the notice to the next attention", async () => {
+      const t = await setup();
+      await t.fillAndRefuseSibA("sib-c");
+      const spy = spyOn(t.historyService, "iterateFullHistory").mockRejectedValueOnce(
+        new Error("transient read failure")
+      );
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(0);
+      spy.mockRestore();
+
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
     test("a busy sender is notified only after it goes idle", async () => {
       let senderBusy = true;
       let becomeIdle!: () => void;
@@ -1901,28 +1918,87 @@ describe("TaskService", () => {
       expect(t.wakeCalls()).toHaveLength(1);
     });
 
-    test("a turn admitted while the notice reads the sender's policy invalidates it", async () => {
-      let generation = Symbol("before");
-      const t = await setup({
-        getActiveTurnGeneration: mock((workspaceId: string) =>
-          workspaceId === "sib-a" ? generation : undefined
-        ),
-      });
-      await t.fillAndRefuseSibA("sib-c");
-      const held = t.holdNoticeInPolicyLookup();
-      t.taskService.resetAutoResumeCount("sib-b");
-      await held.reachedLookup;
-      // Manual input was admitted meanwhile: its tool policy may be stricter than the snapshot.
-      generation = Symbol("manual input");
-      held.release();
-      await t.drainSenderLock();
-      expect(t.wakeCalls()).toHaveLength(0);
+    test.each(["still active", "already settled"] as const)(
+      "a turn admitted while the notice reads the sender's policy invalidates it (%s)",
+      async (phase) => {
+        let generation: symbol | undefined;
+        let settled: ((workspaceId: string, turn: symbol) => void) | undefined;
+        const t = await setup({
+          getActiveTurnGeneration: mock((workspaceId: string) =>
+            workspaceId === "sib-a" ? generation : undefined
+          ),
+          onWorkspaceTurnSettled: mock((listener: (workspaceId: string, turn: symbol) => void) => {
+            settled = listener;
+            return () => undefined;
+          }),
+        });
+        await t.fillAndRefuseSibA("sib-c");
+        const held = t.holdNoticeInPolicyLookup();
+        t.taskService.resetAutoResumeCount("sib-b");
+        await held.reachedLookup;
+        // Manual input was admitted meanwhile: its tool policy may be stricter than the snapshot.
+        // Once that turn settles the sender reads idle again, like before (idle→turn→idle).
+        const manualTurn = Symbol("manual input");
+        if (phase === "still active") {
+          generation = manualTurn;
+        } else {
+          assert(settled);
+          settled("sib-a", manualTurn);
+        }
+        held.release();
+        await t.drainSenderLock();
+        expect(t.wakeCalls()).toHaveLength(0);
 
-      // The waiter was requeued: the next attention resolves a fresh snapshot and wakes it.
-      t.taskService.resetAutoResumeCount("sib-b");
-      await t.drainSenderLock();
-      expect(t.wakeCalls()).toHaveLength(1);
-    });
+        // The waiter was requeued: the next attention resolves a fresh snapshot and wakes it.
+        generation = undefined;
+        t.taskService.resetAutoResumeCount("sib-b");
+        await t.drainSenderLock();
+        expect(t.wakeCalls()).toHaveLength(1);
+      }
+    );
+
+    test.each([false, true])(
+      "an unrelated root target in a delegated turn keeps the sender waiting (delegated=%s)",
+      async (delegated) => {
+        const config = await createTestConfig(rootDir);
+        const projectPath = path.join(rootDir, "repo");
+        const target = projectWorkspace(projectPath, "target", "target");
+        const sender = projectWorkspace(projectPath, "sender", "sender");
+        Object.assign(target, { unrelatedWorkspaceConsent: "gen-1" });
+        Object.assign(sender, { unrelatedWorkspaceConsent: "sender-consent" });
+        await saveWorkspaces(
+          config,
+          projectPath,
+          [sender, target, projectWorkspace(projectPath, "f1", "f1")],
+          testTaskSettings()
+        );
+        const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+        const { taskService } = createTaskServiceHarness(config, { workspaceService });
+        for (let i = 1; i <= 3; i++) {
+          expect((await taskService.sendAgentTreeMessage("f1", "target", `f1 ${i}`)).success).toBe(
+            true
+          );
+        }
+        expect(await taskService.sendAgentTreeMessage("sender", "target", "need you")).toEqual(
+          Err({ code: "refused", reason: PEER_WAKE_LIMIT_REFUSAL_REASON })
+        );
+        if (delegated) {
+          // sendAgentTreeMessage refuses unrelated roots while a delegated turn is live.
+          await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_delegated", "sender");
+        }
+        taskService.resetAutoResumeCount("target");
+        // Barrier on the sender's event lock (see drainSenderLock above).
+        await taskService.sendAgentTreeMessage("target", "sender", "barrier");
+        const wakes = (
+          sendMessage.mock.calls as Array<Parameters<WorkspaceHost["sendMessage"]>>
+        ).filter(
+          (call) =>
+            call[0] === "sender" &&
+            call[3]?.queueDedupeKey?.startsWith(PEER_WAKE_AVAILABLE_DEDUPE_PREFIX) === true
+        );
+        expect(wakes).toHaveLength(delegated ? 0 : 1);
+      }
+    );
 
     test("an unrelated target's consent re-grant drops waiters from the old grant", async () => {
       const config = await createTestConfig(rootDir);

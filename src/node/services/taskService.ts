@@ -2660,6 +2660,10 @@ export class TaskService implements AgentTaskIntegration {
    * fail-closed shape (cleanup-pending), never a silent discharge.
    */
   private recordWorkspaceTurnSettled(workspaceId: string, turnGeneration: symbol): void {
+    this.settledTurnCountByWorkspace.set(
+      workspaceId,
+      (this.settledTurnCountByWorkspace.get(workspaceId) ?? 0) + 1
+    );
     for (const send of this.admittedSendsByTaskId.get(workspaceId) ?? []) {
       if (send.state === "admitted" && send.turnId === turnGeneration) {
         this.dischargeAdmittedSend(send);
@@ -4277,6 +4281,12 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   private readonly agentPeerMessageBroker: AgentPeerMessageBroker;
+  /**
+   * Monotonic count of settled turns per workspace. With the active generation it detects any
+   * turn admitted after a snapshot, including one that started and finished in between (an
+   * idle→turn→idle ABA the generation alone cannot see).
+   */
+  private readonly settledTurnCountByWorkspace = new Map<string, number>();
   private workspaceTurnManager: WorkspaceTurnManager | undefined;
 
   constructor(
@@ -9670,6 +9680,8 @@ export class TaskService implements AgentTaskIntegration {
             senderId,
             error,
           });
+          // Keep the promised wake: the next attention reruns every validity check.
+          this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
         });
     }
   }
@@ -9713,14 +9725,31 @@ export class TaskService implements AgentTaskIntegration {
     ];
     const chainInterrupted = (workspaceId: string): boolean =>
       chainIds(workspaceId).some((id) => this.interruptedParentWorkspaceIds.has(id));
+    const targetChainIds = chainIds(targetId);
+    // Best-effort: these checks only avoid obviously futile turns. Rate limits, queue caps,
+    // session budgets and runtime mismatches are not pre-checked on purpose; the resend's own
+    // refusal is authoritative and carries its guidance (the notice does not promise delivery).
+    // Level-based on purpose: a target stopped and then resumed during this notice is reachable
+    // again, and its resume's reset may already have passed this waiter.
+    const targetUnavailable = (): boolean => {
+      const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
+      return (
+        fresh == null ||
+        targetChainIds.some((id) => this.isWorkspaceStopInProgress(id)) ||
+        chainInterrupted(targetId) ||
+        this.isInactivePeerEndpointWorkspace(fresh.workspace, targetId) ||
+        this.agentPeerMessageBroker.isConsecutivePeerWakeCapped(targetId) ||
+        // sendAgentTreeMessage refuses unrelated roots during a delegated workspace turn.
+        (waiter.relation === "target_unrelated" &&
+          coerceNonEmptyString(fresh.workspace.parentWorkspaceId) == null &&
+          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null)
+      );
+    };
     // The cap reset can precede the target becoming reachable: interruptStream resets before
     // marking a user Stop, and a user message to an interrupted task resets before
     // reawakenInterruptedTask runs (and may fail). Keep waiting; a later reset or the successful
     // reawaken delivers the notice.
-    if (
-      chainInterrupted(targetId) ||
-      this.isInactivePeerEndpointWorkspace(targetEntry.workspace, targetId)
-    ) {
+    if (targetUnavailable()) {
       this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
       return;
     }
@@ -9765,11 +9794,11 @@ export class TaskService implements AgentTaskIntegration {
     // Any turn admitted after this point (e.g. manual input racing the policy read below) makes
     // the captured restrictions stale.
     const senderTurnGeneration = this.workspaceService.getActiveTurnGeneration(senderId);
+    const senderSettledTurns = this.settledTurnCountByWorkspace.get(senderId) ?? 0;
 
     // Sender stops latched from here on stay authoritative through every admission gate of the
     // send, even if the user resumes before the probe runs (same latch as peer delivery).
     const senderChainIds = chainIds(senderId);
-    const targetChainIds = chainIds(targetId);
     const capturedStopEpochs = new Map(
       senderChainIds.map((id) => [id, this.getWorkspaceStopEpoch(id)])
     );
@@ -9779,22 +9808,11 @@ export class TaskService implements AgentTaskIntegration {
           this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id) ||
           this.isWorkspaceStopInProgress(id)
       );
-    // Target checks are level-based on purpose: a target stopped and then resumed during this
-    // notice is reachable again, and its resume's reset may already have passed this waiter.
-    const targetUnavailable = (): boolean => {
-      const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
-      return (
-        fresh == null ||
-        targetChainIds.some((id) => this.isWorkspaceStopInProgress(id)) ||
-        chainInterrupted(targetId) ||
-        this.isInactivePeerEndpointWorkspace(fresh.workspace, targetId) ||
-        this.agentPeerMessageBroker.isConsecutivePeerWakeCapped(targetId)
-      );
-    };
     const admissionStale = (): boolean => {
       if (senderChainStopped() || senderInactive() || !grantStillValid()) return true;
       if (
         this.workspaceService.getActiveTurnGeneration(senderId) !== senderTurnGeneration ||
+        (this.settledTurnCountByWorkspace.get(senderId) ?? 0) !== senderSettledTurns ||
         targetUnavailable()
       ) {
         // Either the sender admitted a turn after the policy snapshot, or the target became
@@ -9814,16 +9832,19 @@ export class TaskService implements AgentTaskIntegration {
       // Security: a fresh synthetic turn must keep the sender's tool policy (see terminal wakes).
       sendRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(senderId);
     } catch (error: unknown) {
-      log.warn("Skipping peer-wake notice; sender tool policy unavailable", { senderId, error });
+      // Fail closed without losing the waiter: the next attention retries the read.
+      log.warn("Deferring peer-wake notice; sender tool policy unavailable", { senderId, error });
+      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
       return;
     }
     if (admissionStale()) return;
 
     // Zero peer-controlled bytes: workspace IDs are server-generated and the title is omitted.
     const content =
-      `Workspace ${targetId} accepts agent messages again: it received user or parent attention ` +
-      `after task_send_message refused your message for its consecutive peer-wake limit. ` +
-      `If that message still matters, resend it with task_send_message now; otherwise continue.`;
+      `Workspace ${targetId} received user or parent attention, so the consecutive peer-wake ` +
+      `limit that refused your task_send_message was reset. If that message still matters, ` +
+      `resend it now; it can still be refused for other reasons, so follow that refusal's ` +
+      `guidance. Otherwise continue.`;
     const result = await this.wakeParentWorkspaceWithSyntheticMessage({
       parentWorkspaceId: senderId,
       parentEntry: senderEntry,

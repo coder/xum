@@ -32,7 +32,7 @@ export const PEER_WAKE_LIMIT_FULL_REFUSAL_REASON =
 // Tells the refused sender it will be woken, so it waits instead of polling or working around it.
 export const PEER_WAKE_LIMIT_REFUSAL_REASON =
   PEER_WAKE_LIMIT_FULL_REFUSAL_REASON +
-  " You will get a new turn once it accepts agent messages again; resend then instead of polling.";
+  " You will get a new turn when that attention resets the limit; resend then instead of polling.";
 
 /**
  * What authorized a cap-refused send. The wake notice is dropped if the sender's relation to the
