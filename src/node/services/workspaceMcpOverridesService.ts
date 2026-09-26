@@ -156,6 +156,30 @@ function overridesOnHostFilesystem(config: RuntimeConfig | undefined): boolean {
 }
 
 /**
+ * Host directory of this checkout's override files when they are host files,
+ * else undefined (exec-backed SSH/Docker). Devcontainer checkouts are host
+ * worktrees at their PERSISTED path: Docker labels devcontainers by the exact
+ * host path from startup, so a migrated/non-canonical entry's name-derived
+ * `workspacePath` can differ (see resolveWorkspace). In-place workspaces
+ * (projectPath === name) store the checkout path directly.
+ */
+function hostOverridesCheckoutPath(
+  metadata: Pick<
+    FrontendWorkspaceMetadata,
+    "runtimeConfig" | "projectPath" | "name" | "namedWorkspacePath"
+  >,
+  workspacePath: string
+): string | undefined {
+  const config = metadata.runtimeConfig;
+  if (config === undefined) return undefined;
+  if (isHostLocalRuntimeConfig(config)) return workspacePath;
+  if (!isDevcontainerRuntime(config)) return undefined;
+  return metadata.projectPath === metadata.name
+    ? workspacePath
+    : (metadata.namedWorkspacePath ?? workspacePath);
+}
+
+/**
  * Filesystem identity of a runtime config: two workspaces can share a checkout
  * only when this matches AND their paths match. Ignores non-identity fields
  * (e.g. Coder's `existingWorkspace` flag, which forkWorkspace flips on the
@@ -561,6 +585,8 @@ interface LegacyMigrationTarget {
   canonicalPath: string;
   filePaths: readonly string[];
   runtimeConfig: RuntimeConfig | undefined;
+  /** See hostOverridesCheckoutPath; undefined for exec-backed checkouts. */
+  hostCheckoutPath: string | undefined;
 }
 /** Bound for each override resolution a settings save performs while holding the write locks. */
 const SAVE_RESOLUTION_TIMEOUT_MS = 30_000;
@@ -1167,8 +1193,12 @@ export class WorkspaceMcpOverridesService {
     // non-canonical entry can differ from the name-derived path). Decided from
     // the runtime CONFIG, not the runtime class: a multi-project workspace
     // wraps its devcontainers in a MultiProjectRuntime.
-    if (snapshot?.hostFilesystemView && isDevcontainerRuntime(metadata.runtimeConfig)) {
-      const hostPath = isInPlace ? workspacePath : (metadata.namedWorkspacePath ?? workspacePath);
+    const hostPath = hostOverridesCheckoutPath(metadata, workspacePath);
+    if (
+      snapshot?.hostFilesystemView &&
+      isDevcontainerRuntime(metadata.runtimeConfig) &&
+      hostPath !== undefined
+    ) {
       return {
         metadata,
         runtime: createRuntime({ type: "local" }, { projectPath: hostPath }),
@@ -1467,7 +1497,7 @@ export class WorkspaceMcpOverridesService {
   private async removeOverridesFile(
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string,
-    runtimeConfig: RuntimeConfig | undefined
+    metadata: Parameters<typeof hostOverridesCheckoutPath>[0]
   ): Promise<void> {
     // Remove canonical and legacy file names so no conflicting source remains.
     // The exit code MUST be checked: callers (e.g. the Agent Plugin
@@ -1478,24 +1508,27 @@ export class WorkspaceMcpOverridesService {
     // SECURITY: `rm -f` follows a symlinked parent directory; a repo-tracked
     // `.xum`/`.mux` symlink would make clearing this workspace delete a
     // sibling checkout's document.
+    const hostCheckoutPath = hostOverridesCheckoutPath(metadata, workspacePath);
+    // Host files (local/worktree, and devcontainers at their persisted host
+    // checkout): the guard probes exactly the directory the unlinks target.
     await assertOverrideSegmentsNotSymlinked(
       runtime,
-      workspacePath,
-      overridesOnHostFilesystem(runtimeConfig)
+      hostCheckoutPath ?? workspacePath,
+      hostCheckoutPath !== undefined
     );
-    // Host-local only: a devcontainer's (name-derived) workspacePath may not
-    // be its persisted host checkout, so it stays on the exec path below.
-    if (runtimeConfig !== undefined && isHostLocalRuntimeConfig(runtimeConfig)) {
+    if (hostCheckoutPath !== undefined) {
       // In-process, not `rm -f`: this runs under the override write locks,
       // and a host runtime's exec child is a DETACHED shell that can outlive
       // this process — after a crash it could still delete a document a
-      // successor saved under the lock it took over (#4415). fs calls end
+      // successor saved under the lock it took over (#4415). A devcontainer's
+      // `devcontainer exec` child runs in the container, is not owned by this
+      // process either, and needs a running container (#4481). fs calls end
       // with the process. ENOENT/ENOTDIR are the "nothing there" cases
       // `rm -f` ignores too. Lowest read precedence first, canonical last: a
       // crash between unlinks must never leave a stale fallback authoritative.
       for (const relative of [...MCP_OVERRIDES_GITIGNORE_PATTERNS].reverse()) {
         try {
-          await fsPromises.unlink(path.join(workspacePath, relative));
+          await fsPromises.unlink(path.join(hostCheckoutPath, relative));
         } catch (error) {
           if (hasFsCode(error, "ENOENT") || hasFsCode(error, "ENOTDIR")) continue;
           throw new Error(
@@ -1524,16 +1557,16 @@ export class WorkspaceMcpOverridesService {
    * replacement lands as a new file that is never touched), then inspected;
    * ours is deleted, anyone else's is moved back without clobbering a newer
    * one. The symlink guard ran before the write; paths are relative to the
-   * checkout for the shell like removeOverridesFile. Host-local checkouts
-   * use in-process fs calls instead (see removeOverridesFile for why and why
-   * devcontainers stay on exec).
+   * checkout for the shell like removeOverridesFile. Checkouts with host
+   * override files (`hostCheckoutPath`, see hostOverridesCheckoutPath) use
+   * in-process fs calls at that host path instead (see removeOverridesFile).
    */
   private async removeExactDocument(
     runtime: ReturnType<typeof createRuntime>,
     workspacePath: string,
     filePath: string,
     expectedContent: string,
-    hostLocal: boolean
+    hostCheckoutPath: string | undefined
   ): Promise<void> {
     // Host paths are joined with the platform separator (backslashes on
     // Windows) while the candidates are spelled with `/`.
@@ -1544,11 +1577,16 @@ export class WorkspaceMcpOverridesService {
     assert(relative !== undefined, "migrated document must be a known override path");
     const suffix = `${process.pid}-${Date.now()}`;
     const aside = `${relative}.rollback-${suffix}`;
-    const asidePath = `${filePath}.rollback-${suffix}`;
-    if (hostLocal) {
+    if (hostCheckoutPath !== undefined) {
       // In-process like removeOverridesFile: a detached `mv`/`rm` child could
       // outlive this process and move aside or delete a document a successor
-      // saved after taking over the lock (#4415).
+      // saved after taking over the lock (#4415, #4481). A migrated
+      // devcontainer's `filePath` is name-derived; its document lives under
+      // the persisted host checkout, which the caller's guard may not have
+      // probed, so guard it here.
+      await assertOverrideSegmentsNotSymlinked(runtime, hostCheckoutPath, true);
+      const hostFilePath = path.join(hostCheckoutPath, relative);
+      const asidePath = `${hostFilePath}.rollback-${suffix}`;
       const fail = (error: unknown): never => {
         throw new Error(
           `Failed to roll back the migrated override document: ${getErrorMessage(error)}`
@@ -1558,8 +1596,8 @@ export class WorkspaceMcpOverridesService {
         fsPromises.unlink(asidePath).catch((error: unknown) => {
           if (!hasFsCode(error, "ENOENT")) fail(error);
         });
-      await fsPromises.rename(filePath, asidePath).catch(fail);
-      if ((await readFileString(runtime, asidePath)) === expectedContent) {
+      await fsPromises.rename(hostFilePath, asidePath).catch(fail);
+      if ((await fsPromises.readFile(asidePath, "utf8")) === expectedContent) {
         await dropAside();
         return;
       }
@@ -1569,7 +1607,7 @@ export class WorkspaceMcpOverridesService {
       // `mv -n` equivalent: link() never replaces an existing target, so a
       // newer document that appeared meanwhile wins (EEXIST) and the older
       // one we hold is dropped, exactly like the shell branch below.
-      await fsPromises.link(asidePath, filePath).catch((error: unknown) => {
+      await fsPromises.link(asidePath, hostFilePath).catch((error: unknown) => {
         if (!hasFsCode(error, "EEXIST")) fail(error);
       });
       await dropAside();
@@ -1584,7 +1622,7 @@ export class WorkspaceMcpOverridesService {
       }
     };
     await run(`mv "${relative}" "${aside}"`);
-    const current = await readFileString(runtime, asidePath);
+    const current = await readFileString(runtime, `${filePath}.rollback-${suffix}`);
     if (current === expectedContent) {
       await run(`rm -f "${aside}"`);
       return;
@@ -1897,6 +1935,7 @@ export class WorkspaceMcpOverridesService {
       canonicalPath,
       filePaths,
       runtimeConfig: metadata.runtimeConfig,
+      hostCheckoutPath: hostOverridesCheckoutPath(metadata, workspacePath),
     };
     const migrated = snapshot.writerLocksHeld
       ? await this.migrateLegacyOverrides(target, snapshot)
@@ -2056,7 +2095,7 @@ export class WorkspaceMcpOverridesService {
               workspacePath,
               canonicalPath,
               content,
-              target.runtimeConfig !== undefined && isHostLocalRuntimeConfig(target.runtimeConfig)
+              target.hostCheckoutPath
             ).catch((rollbackError: unknown) =>
               log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
                 workspaceId,
@@ -4065,7 +4104,7 @@ export class WorkspaceMcpOverridesService {
       // reason: there the WRITE is the step that may fail.)
       await this.clearLegacyOverridesInConfig(workspaceId);
       await retireSharersLegacy();
-      await this.removeOverridesFile(runtime, workspacePath, metadata.runtimeConfig);
+      await this.removeOverridesFile(runtime, workspacePath, metadata);
       // The epoch moves as soon as the durable state has changed — never
       // after the (bounded, possibly slow) publication: a sibling process
       // about to launch a server this clear revoked must observe it (see

@@ -2834,31 +2834,79 @@ describe("WorkspaceMcpOverridesService", () => {
     });
   });
 
-  it("clearing a devcontainer workspace keeps the exec path", async () => {
-    // A devcontainer's name-derived workspacePath may not be its persisted
-    // host checkout: an in-process unlink there would hit ENOENT and report a
-    // clear that left the real document behind.
-    const service = new WorkspaceMcpOverridesService(config);
-    const checkout = path.join(config.srcDir, "devcontainer-clear");
-    const filePath = path.join(checkout, ".xum", "mcp.local.jsonc");
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(filePath, JSON.stringify({ disabledServers: ["shots"] }));
-    const runtime = createRuntime({ type: "local" }, { projectPath: checkout });
+  /** Test access to the private removeOverridesFile. */
+  const removeOverridesFileOf = (
+    service: WorkspaceMcpOverridesService
+  ): ((...args: unknown[]) => Promise<void>) =>
+    (
+      service as unknown as { removeOverridesFile: (...args: unknown[]) => Promise<void> }
+    ).removeOverridesFile.bind(service);
+  /** A migrated devcontainer: its persisted checkout differs from the name-derived path. */
+  const migratedDevcontainer = (persisted: string) => ({
+    derived: path.join(config.srcDir, "devcontainer-project", "branch"),
+    metadata: {
+      projectPath: "/fake/devcontainer-project",
+      name: "branch",
+      namedWorkspacePath: persisted,
+      runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    },
+  });
+  /** Wraps `runtime` so every exec'd command is recorded (the real exec still runs). */
+  const recordingRuntime = (runtime: ReturnType<typeof createRuntime>) => {
     const commands: string[] = [];
     const recording = Object.create(runtime) as typeof runtime;
     recording.exec = (command, options) => {
       commands.push(command);
       return runtime.exec(command, options);
     };
-    const removeOverridesFile = (
-      service as unknown as { removeOverridesFile: (...args: unknown[]) => Promise<void> }
-    ).removeOverridesFile.bind(service);
-    await removeOverridesFile(recording, checkout, {
-      type: "devcontainer",
-      configPath: ".devcontainer/devcontainer.json",
-    });
-    expect(commands.filter((command) => command.startsWith("rm -f "))).toHaveLength(1);
-    expect(await pathExists(filePath)).toBe(false);
+    return { recording, commands };
+  };
+
+  it("clearing a migrated devcontainer removes its persisted host documents without a shell", async () => {
+    // Container-side `rm` children are not owned by this process and can
+    // outlive it (#4481). Devcontainer checkouts are host worktrees at their
+    // PERSISTED path; the name-derived workspacePath of a migrated entry does
+    // not exist, so an unlink there would "succeed" and leave the document.
+    const persisted = path.join(config.srcDir, "elsewhere", "devcontainer-clear");
+    const { derived, metadata } = migratedDevcontainer(persisted);
+    const documents = [
+      ".xum/mcp.local.jsonc",
+      ".xum/mcp.local.json",
+      ".mux/mcp.local.jsonc",
+      ".mux/mcp.local.json",
+    ].map((relative) => path.join(persisted, relative));
+    for (const filePath of documents) {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify({ disabledServers: ["shots"] }));
+    }
+    const { recording, commands } = recordingRuntime(
+      createRuntime({ type: "local" }, { projectPath: persisted })
+    );
+    await removeOverridesFileOf(new WorkspaceMcpOverridesService(config))(
+      recording,
+      derived,
+      metadata
+    );
+    for (const filePath of documents) {
+      expect(await pathExists(filePath)).toBe(false);
+    }
+    expect(commands).toEqual([]);
+  });
+
+  it("clearing a migrated devcontainer refuses a symlinked segment of its persisted checkout", async () => {
+    const persisted = path.join(config.srcDir, "elsewhere", "devcontainer-clear-link");
+    const { derived, metadata } = migratedDevcontainer(persisted);
+    const outsideDir = path.join(config.srcDir, "outside-devcontainer-clear");
+    await fs.mkdir(outsideDir, { recursive: true });
+    await fs.writeFile(path.join(outsideDir, "mcp.local.jsonc"), "{}");
+    await fs.mkdir(persisted, { recursive: true });
+    await fs.symlink(outsideDir, path.join(persisted, ".xum"));
+    const runtime = createRuntime({ type: "local" }, { projectPath: persisted });
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+    await expect(
+      removeOverridesFileOf(new WorkspaceMcpOverridesService(config))(runtime, derived, metadata)
+    ).rejects.toThrow(/symbolic link/);
+    expect(await pathExists(path.join(outsideDir, "mcp.local.jsonc"))).toBe(true);
   });
 
   describe("migration rollback (removeExactDocument)", () => {
@@ -2867,7 +2915,7 @@ describe("WorkspaceMcpOverridesService", () => {
       workspacePath: string,
       filePath: string,
       expectedContent: string,
-      hostFilesystem: boolean
+      hostCheckoutPath: string | undefined
     ) => Promise<void>;
     const setup = async (name: string) => {
       const service = new WorkspaceMcpOverridesService(config);
@@ -2888,11 +2936,11 @@ describe("WorkspaceMcpOverridesService", () => {
       const replaced = JSON.stringify({ enabledServers: ["replaced"] });
       const { commands, restore } = recordHostExecCommands();
       try {
-        await removeExactDocument(runtime, workspacePath, filePath, ours, true);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, workspacePath);
         expect(await fs.readdir(path.dirname(filePath))).toEqual([]);
 
         await fs.writeFile(filePath, replaced);
-        await removeExactDocument(runtime, workspacePath, filePath, ours, true);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, workspacePath);
       } finally {
         restore();
       }
@@ -2914,13 +2962,32 @@ describe("WorkspaceMcpOverridesService", () => {
         }
       );
       try {
-        await removeExactDocument(runtime, workspacePath, filePath, ours, true);
+        await removeExactDocument(runtime, workspacePath, filePath, ours, workspacePath);
       } finally {
         linkSpy.mockRestore();
       }
       expect(await fs.readFile(filePath, "utf8")).toBe(newer);
       // The obsolete aside copy is dropped (same as `mv -n … && rm -f`).
       expect(await fs.readdir(path.dirname(filePath))).toEqual(["mcp.local.jsonc"]);
+    });
+
+    it("rolls back a migrated devcontainer's document at its persisted host path, without a shell", async () => {
+      // The migration names the document by the name-derived path; the
+      // checkout (and document) really lives at the persisted host path.
+      const { filePath: persistedFile, runtime, removeExactDocument } = await setup("rb-migrated");
+      const persisted = path.dirname(path.dirname(persistedFile));
+      const { derived } = migratedDevcontainer(persisted);
+      const derivedFile = path.join(derived, ".xum", "mcp.local.jsonc");
+      const { recording, commands } = recordingRuntime(runtime);
+      await fs.writeFile(persistedFile, ours);
+      await removeExactDocument(recording, derived, derivedFile, ours, persisted);
+      expect(await fs.readdir(path.dirname(persistedFile))).toEqual([]);
+      const replaced = JSON.stringify({ enabledServers: ["replaced"] });
+      await fs.writeFile(persistedFile, replaced);
+      await removeExactDocument(recording, derived, derivedFile, ours, persisted);
+      expect(await fs.readFile(persistedFile, "utf8")).toBe(replaced);
+      expect(await fs.readdir(path.dirname(persistedFile))).toEqual(["mcp.local.jsonc"]);
+      expect(commands).toEqual([]);
     });
 
     it("keeps the shell path for exec-backed runtimes", async () => {
@@ -2932,22 +2999,20 @@ describe("WorkspaceMcpOverridesService", () => {
         return runtime.exec(command, options);
       };
       await fs.writeFile(filePath, ours);
-      await removeExactDocument(recording, workspacePath, filePath, ours, false);
+      await removeExactDocument(recording, workspacePath, filePath, ours, undefined);
       expect(await pathExists(filePath)).toBe(false);
       expect(commands.some((command) => command.startsWith("mv "))).toBe(true);
 
       commands.length = 0;
       await fs.writeFile(filePath, ours);
-      const removeOverridesFile = (
-        service: WorkspaceMcpOverridesService
-      ): ((...args: unknown[]) => Promise<void>) =>
-        (
-          service as unknown as { removeOverridesFile: (...args: unknown[]) => Promise<void> }
-        ).removeOverridesFile.bind(service);
-      await removeOverridesFile(new WorkspaceMcpOverridesService(config))(
+      await removeOverridesFileOf(new WorkspaceMcpOverridesService(config))(
         recording,
         workspacePath,
-        { type: "ssh", host: "remote", srcBaseDir: "/remote" }
+        {
+          projectPath: "/fake/remote-project",
+          name: "branch",
+          runtimeConfig: { type: "ssh", host: "remote", srcBaseDir: "/remote" },
+        }
       );
       expect(await pathExists(filePath)).toBe(false);
       expect(commands.some((command) => command.startsWith("rm -f "))).toBe(true);
@@ -4394,6 +4459,33 @@ describe("WorkspaceMcpOverridesService", () => {
       service.setOverridesForWorkspace(workspaceId, { disabledServers: ["other"] })
     ).rejects.toThrow(/symbolic link/);
     expect(await pathExists(path.join(outsideDir, "mcp.local.jsonc"))).toBe(false);
+  });
+
+  it("clears a devcontainer workspace's settings on the host without a running container", async () => {
+    // Clearing used `devcontainer exec rm` (#4481): it needed a running
+    // container, and a container-side child can outlive this process.
+    const service = new WorkspaceMcpOverridesService(config);
+    // In-place registration: see the save test above.
+    const checkout = path.join(config.srcDir, "devcontainer-clear-api");
+    await fs.mkdir(checkout, { recursive: true });
+    const workspaceId = "ws-devcontainer-clear-api";
+    await config.editConfig((cfg) => {
+      cfg.projects.set(checkout, {
+        workspaces: [
+          {
+            path: checkout,
+            id: workspaceId,
+            name: checkout,
+            runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+          },
+        ],
+      });
+      return cfg;
+    });
+    await service.setOverridesForWorkspace(workspaceId, { disabledServers: ["shots"] });
+    await service.setOverridesForWorkspace(workspaceId, {});
+    expect(await pathExists(path.join(checkout, ".xum", "mcp.local.jsonc"))).toBe(false);
+    expect((await service.getOverridesForWorkspace(workspaceId)).overrides).toEqual({});
   });
 
   it("CAS saves from two service instances are serialized by the cross-process lock", async () => {
