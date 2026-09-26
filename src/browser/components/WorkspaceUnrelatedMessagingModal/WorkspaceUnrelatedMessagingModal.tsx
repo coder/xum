@@ -15,6 +15,12 @@ interface WorkspaceUnrelatedMessagingModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   /**
+   * False on runtimes that cannot take part in unrelated messaging (remote/container). The
+   * consent switch and its disclosure are hidden there; the hold preference still applies to
+   * same-tree senders.
+   */
+  consentSupported: boolean;
+  /**
    * Current persisted consent, derived from workspace metadata (`unrelatedWorkspaceConsent`
    * present). The modal never keeps its own copy: the switch only moves when the backend has
    * committed the change and republished metadata.
@@ -80,38 +86,40 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
         </DialogHeader>
 
         <div className="min-h-0 space-y-4 overflow-y-auto px-6 py-5">
-          <div className="border-border rounded-lg border p-4">
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0 flex-1">
-                <div
-                  id="unrelated-messaging-consent-label"
-                  className="text-foreground text-sm font-medium"
-                >
-                  Allow messages from unrelated workspaces
+          {props.consentSupported && (
+            <div className="border-border rounded-lg border p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <div
+                    id="unrelated-messaging-consent-label"
+                    className="text-foreground text-sm font-medium"
+                  >
+                    Allow messages from unrelated workspaces
+                  </div>
+                  <DialogDescription className="text-muted mt-1 text-xs">
+                    Applies to agents in other local chats in this Xum instance, outside this
+                    chat&apos;s task tree. On by default for new chats you create; same-tree
+                    sub-agents are unaffected.
+                  </DialogDescription>
                 </div>
-                <DialogDescription className="text-muted mt-1 text-xs">
-                  Applies to agents in other local chats in this Xum instance, outside this
-                  chat&apos;s task tree. On by default for new chats you create; same-tree
-                  sub-agents are unaffected.
-                </DialogDescription>
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {isSaving && (
-                  <span role="status" className="text-muted text-xs">
-                    Saving
-                  </span>
-                )}
-                <Switch
-                  checked={props.enabled}
-                  onCheckedChange={(checked) =>
-                    void handleToggle(() => props.onSetEnabled(checked))
-                  }
-                  disabled={isSaving}
-                  aria-labelledby="unrelated-messaging-consent-label"
-                />
+                <div className="flex shrink-0 items-center gap-2">
+                  {isSaving && (
+                    <span role="status" className="text-muted text-xs">
+                      Saving
+                    </span>
+                  )}
+                  <Switch
+                    checked={props.enabled}
+                    onCheckedChange={(checked) =>
+                      void handleToggle(() => props.onSetEnabled(checked))
+                    }
+                    disabled={isSaving}
+                    aria-labelledby="unrelated-messaging-consent-label"
+                  />
+                </div>
               </div>
             </div>
-          </div>
+          )}
 
           <div className="border-border rounded-lg border p-4">
             <div className="flex items-center justify-between gap-4">
@@ -137,23 +145,25 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
             </div>
           </div>
 
-          <ul className="text-muted list-disc space-y-1.5 pl-5 text-xs">
-            <li>
-              While on, other local agents can send this chat messages. Where cross-workspace
-              discovery is available, they can also list this chat&apos;s title, branch name,
-              project path, and busy/idle state.
-            </li>
-            <li>
-              Incoming messages arrive as untrusted agent text. If this chat is idle, they wake it
-              and spend provider tokens under this chat&apos;s own model and agent settings; if it
-              is busy, they arrive after its next step unless you hold them until the turn ends.
-            </li>
-            <li>
-              Turning this off stops new deliveries and removes this chat from any such listing.
-              Messages already received stay in the transcript, and a reply that is already running
-              finishes. After an app restart, resume these turns yourself.
-            </li>
-          </ul>
+          {props.consentSupported && (
+            <ul className="text-muted list-disc space-y-1.5 pl-5 text-xs">
+              <li>
+                While on, other local agents can send this chat messages. Where cross-workspace
+                discovery is available, they can also list this chat&apos;s title, branch name,
+                project path, and busy/idle state.
+              </li>
+              <li>
+                Incoming messages arrive as untrusted agent text. If this chat is idle, they wake it
+                and spend provider tokens under this chat&apos;s own model and agent settings; if it
+                is busy, they arrive after its next step unless you hold them until the turn ends.
+              </li>
+              <li>
+                Turning this off stops new deliveries and removes this chat from any such listing.
+                Messages already received stay in the transcript, and a reply that is already
+                running finishes. After an app restart, resume these turns yourself.
+              </li>
+            </ul>
+          )}
 
           {error != null && (
             <div role="alert" className="bg-danger-soft/10 text-danger-soft rounded-md p-3 text-sm">

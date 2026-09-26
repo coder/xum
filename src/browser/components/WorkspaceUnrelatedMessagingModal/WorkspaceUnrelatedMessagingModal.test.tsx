@@ -67,6 +67,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
       <WorkspaceUnrelatedMessagingModal
         open={true}
         onOpenChange={() => undefined}
+        consentSupported={true}
         enabled={false}
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
@@ -99,6 +100,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
       <WorkspaceUnrelatedMessagingModal
         open={true}
         onOpenChange={() => undefined}
+        consentSupported={true}
         enabled={true}
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
@@ -123,6 +125,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
       <WorkspaceUnrelatedMessagingModal
         open={true}
         onOpenChange={() => undefined}
+        consentSupported={true}
         enabled={false}
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
@@ -153,6 +156,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
       <WorkspaceUnrelatedMessagingModal
         open={true}
         onOpenChange={() => undefined}
+        consentSupported={true}
         enabled={false}
         onSetEnabled={onSetEnabled}
         holdUntilTurnEnd={false}
@@ -184,6 +188,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
       <WorkspaceUnrelatedMessagingModal
         open={false}
         onOpenChange={() => undefined}
+        consentSupported={true}
         enabled={true}
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
         holdUntilTurnEnd={false}
@@ -201,6 +206,7 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
       <WorkspaceUnrelatedMessagingModal
         open={true}
         onOpenChange={() => undefined}
+        consentSupported={true}
         // Consent off must not block the delivery preference: it also covers same-tree senders.
         enabled={false}
         onSetEnabled={() => Promise.resolve(Ok(undefined))}
@@ -225,5 +231,21 @@ describe("WorkspaceUnrelatedMessagingModal", () => {
     await waitFor(() => {
       expect((hold() as HTMLButtonElement).disabled).toBe(false);
     });
+  });
+
+  test("remote runtimes get only the hold switch, since consent could never be honoured there", () => {
+    const view = render(
+      <WorkspaceUnrelatedMessagingModal
+        open={true}
+        onOpenChange={() => undefined}
+        consentSupported={false}
+        enabled={false}
+        onSetEnabled={() => Promise.resolve(Ok(undefined))}
+        holdUntilTurnEnd={false}
+        onSetHoldUntilTurnEnd={() => Promise.resolve(Ok(undefined))}
+      />
+    );
+    expect(view.queryByRole("switch", { name: CONSENT_NAME })).toBeNull();
+    expect(view.getByRole("switch", { name: HOLD_NAME })).not.toBeNull();
   });
 });

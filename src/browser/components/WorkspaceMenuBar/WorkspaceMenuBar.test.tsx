@@ -350,7 +350,11 @@ function getLastTimelineDialogProps() {
 function getLastUnrelatedMessagingModalProps() {
   const spy =
     WorkspaceUnrelatedMessagingModalModule.WorkspaceUnrelatedMessagingModal as unknown as {
-      mock: { calls: Array<[{ open: boolean; onOpenChange: (open: boolean) => void }]> };
+      mock: {
+        calls: Array<
+          [{ open: boolean; consentSupported: boolean; onOpenChange: (open: boolean) => void }]
+        >;
+      };
     };
   return spy.mock.calls.at(-1)?.[0];
 }
@@ -780,8 +784,9 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   // Unrelated delivery requires local or worktree runtimes on BOTH endpoints (TaskService
-  // refuses otherwise), so remote/container workspaces get neither consent entry point: a
-  // grant there could never be honoured. An unset config means the canonical default.
+  // refuses otherwise), so remote/container workspaces get no consent switch: a grant there
+  // could never be honoured. The dialog still opens there for the same-tree hold preference.
+  // An unset config means the canonical default.
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig | undefined }>([
     { runtime: "worktree", runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" } },
     { runtime: "project-dir local", runtimeConfig: { type: "local" } },
@@ -795,6 +800,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(true);
   });
 
   it.each<{ runtime: string; runtimeConfig: RuntimeConfig }>([
@@ -808,19 +814,16 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       runtime: "devcontainer",
       runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
     },
-  ])(
-    "hides the consent action and ignores its shortcut for $runtime workspaces",
-    ({ runtimeConfig }) => {
-      render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
+  ])("opens the dialog without the consent switch for $runtime workspaces", ({ runtimeConfig }) => {
+    render(<WorkspaceMenuBar {...defaultProps} runtimeConfig={runtimeConfig} />);
 
-      expect(getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBeNull();
-      act(() => {
-        fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
-      });
-      // Not rendered at all, or rendered closed: either way nothing can open here.
-      expect(getLastUnrelatedMessagingModalProps()?.open ?? false).toBe(false);
-    }
-  );
+    expect(typeof getLastMenuContentProps()?.onConfigureUnrelatedMessaging).toBe("function");
+    act(() => {
+      fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
+    });
+    expect(getLastUnrelatedMessagingModalProps()?.open).toBe(true);
+    expect(getLastUnrelatedMessagingModalProps()?.consentSupported).toBe(false);
+  });
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
     mockTimelineExperimentEnabled = true;
