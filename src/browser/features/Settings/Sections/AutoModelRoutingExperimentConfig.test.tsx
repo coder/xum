@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import * as ActualModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -13,7 +14,9 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as ActualModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
 import {
   getDefaultAutoModelRoutingConfig,
+  normalizeAutoModelRoutingConfig,
   type AutoModelRoutingConfig,
+  type AutoModelRoutingConfigInput,
   type AutoModelRoutingEvaluationStatus,
 } from "@/common/types/autoModelRouting";
 import { DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL } from "@/constants/autoModelRouting";
@@ -92,9 +95,9 @@ import { AutoModelRoutingExperimentConfig } from "./AutoModelRoutingExperimentCo
 
 function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
   let stored: AutoModelRoutingConfig = initial ?? getDefaultAutoModelRoutingConfig();
-  return {
+  const api = {
     config: {
-      getConfig: mock(() => Promise.resolve({ autoModelRouting: stored })),
+      getConfig: mock(() => Promise.resolve(createTestConfig({ autoModelRouting: stored }))),
       // Never yields: the hook only needs a subscribable iterator to start fetching.
       onConfigChanged: mock(() =>
         Promise.resolve({
@@ -105,8 +108,9 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
           },
         })
       ),
-      updateAutoModelRouting: mock((input: { autoModelRouting: AutoModelRoutingConfig }) => {
-        stored = input.autoModelRouting;
+      updateAutoModelRouting: mock((input: { autoModelRouting: AutoModelRoutingConfigInput }) => {
+        // The real input leaves the evaluator optional; the backend stores it normalized.
+        stored = normalizeAutoModelRoutingConfig(input.autoModelRouting);
         return Promise.resolve();
       }),
       getAutoModelRoutingEvaluationStatus: mock(
@@ -130,13 +134,13 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
         })
       ),
     },
-  };
+  } satisfies TestApiOverrides<APIClient>;
+  return api;
 }
 
 // Inject the per-test client through the real provider; mocking the API module leaks across files.
 function ApiWrapper(props: { children: ReactNode }) {
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 function renderConfig() {
@@ -297,12 +301,14 @@ describe("AutoModelRoutingExperimentConfig", () => {
 
     // Another window switches the evaluator while this label is still being edited.
     mockApi.config.getConfig = mock(() =>
-      Promise.resolve({
-        autoModelRouting: {
-          ...getDefaultAutoModelRoutingConfig(),
-          evaluationModel: "openai:gpt-5.5",
-        },
-      })
+      Promise.resolve(
+        createTestConfig({
+          autoModelRouting: {
+            ...getDefaultAutoModelRoutingConfig(),
+            evaluationModel: "openai:gpt-5.5",
+          },
+        })
+      )
     );
     configChange.signal?.();
     const field = getByLabelText("Evaluation model") as HTMLInputElement;
@@ -320,12 +326,14 @@ describe("AutoModelRoutingExperimentConfig", () => {
     const subscribe = mockApi.config.onConfigChanged as () => Promise<unknown>;
     mockApi.config.onConfigChanged = mock(() => {
       mockApi.config.getConfig = mock(() =>
-        Promise.resolve({
-          autoModelRouting: {
-            ...getDefaultAutoModelRoutingConfig(),
-            evaluationModel: "openai:gpt-5.5",
-          },
-        })
+        Promise.resolve(
+          createTestConfig({
+            autoModelRouting: {
+              ...getDefaultAutoModelRoutingConfig(),
+              evaluationModel: "openai:gpt-5.5",
+            },
+          })
+        )
       );
       return subscribe();
     });

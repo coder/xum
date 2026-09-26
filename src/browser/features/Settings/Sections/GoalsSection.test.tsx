@@ -2,38 +2,39 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { DEFAULT_GOAL_DEFAULTS, type GoalDefaults } from "@/constants/goals";
+import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 
-interface MockAPIClient {
-  config: {
-    getConfig: () => Promise<{ goalDefaults?: GoalDefaults }>;
-    updateGoalDefaults: (input: { goalDefaults: GoalDefaults }) => Promise<void>;
-  };
-}
+type GoalDefaultsUpdate = Parameters<APIClient["config"]["updateGoalDefaults"]>[0];
 
 import { GoalsSection } from "./GoalsSection";
 
 function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
-  const current = { ...config };
-  const updateGoalDefaults = mock(({ goalDefaults }: { goalDefaults: GoalDefaults }) => {
-    current.goalDefaults = goalDefaults;
+  const current: Partial<TestClientConfig> = { ...config };
+  const updateGoalDefaults = mock(({ goalDefaults }: GoalDefaultsUpdate) => {
+    // The real input is partial; the backend stores it normalized, as getConfig returns it.
+    current.goalDefaults = normalizeGoalDefaults(goalDefaults);
     return Promise.resolve();
   });
 
-  const mockApi: MockAPIClient = {
+  const mockApi = {
     config: {
-      getConfig: mock(() => Promise.resolve({ ...current })),
+      getConfig: mock(() => Promise.resolve(createTestConfig({ ...current }))),
       updateGoalDefaults,
     },
-  };
+  } satisfies TestApiOverrides<APIClient>;
 
   // Inject the config-only client through the real provider; mocking the API module leaks
   // into later files.
   const view = render(
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    <APIProvider client={mockApi as unknown as APIClient}>
+    <APIProvider client={createTestApiClient(mockApi)}>
       <ThemeProvider forcedTheme="dark">
         <GoalsSection />
       </ThemeProvider>

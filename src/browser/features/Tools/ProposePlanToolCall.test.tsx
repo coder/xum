@@ -11,7 +11,6 @@ import * as UseReviewsModule from "@/browser/hooks/useReviews";
 import * as UseStartHereModule from "@/browser/hooks/useStartHere";
 import * as DiffRendererModule from "@/browser/features/Shared/DiffRenderer";
 import * as ReviewTypesModule from "@/common/types/review";
-import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -26,14 +25,12 @@ import {
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 
 import { ProposePlanToolCall } from "./ProposePlanToolCall";
 
-interface SendMessageArgs {
-  workspaceId: string;
-  message: string;
-  options: SendMessageOptions;
-}
+type SendMessageArgs = Parameters<APIClient["workspace"]["sendMessage"]>[0];
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
@@ -41,14 +38,7 @@ type GetPlanContentResult =
 
 type ResultVoid = { success: true; data: undefined } | { success: false; error: string };
 
-interface GetConfigResult {
-  taskSettings: {
-    maxParallelAgentTasks: number;
-    maxTaskNestingDepth: number;
-    proposePlanImplementReplacesChatHistory?: boolean;
-  };
-  agentAiDefaults: Record<string, unknown>;
-}
+type GetConfigResult = TestClientConfig;
 
 interface MockApi {
   config: {
@@ -62,7 +52,7 @@ interface MockApi {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
     }) => Promise<ResultVoid>;
-    sendMessage: (args: SendMessageArgs) => Promise<{ success: true; data: undefined }>;
+    sendMessage: (args: SendMessageArgs) => Promise<{ success: true; data: Record<string, never> }>;
   };
 }
 
@@ -182,10 +172,9 @@ const WORKSPACE_ID = "ws-123";
 const PLAN_PATH = "~/.mux/plans/demo/ws-123.md";
 const PLAN_CONTENT = "# My Plan\n\nDo the thing.";
 
-const DEFAULT_CONFIG: GetConfigResult = {
-  taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-  agentAiDefaults: {},
-};
+const DEFAULT_CONFIG: GetConfigResult = createTestConfig({
+  taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+});
 
 function createTestAgent(
   id: string,
@@ -252,8 +241,7 @@ function ApiWrapper(props: { children: ReactNode }) {
       </APIContext.Provider>
     );
   }
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 function renderToolCall(content: JSX.Element, agentId = "plan") {
@@ -282,8 +270,7 @@ function createMockApi(
           })),
       replaceChatHistory:
         overrides.replaceChatHistory ?? (() => Promise.resolve({ success: true, data: undefined })),
-      sendMessage:
-        overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: undefined })),
+      sendMessage: overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: {} })),
     },
   };
 }
@@ -313,7 +300,7 @@ function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLev
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
   return (args) => {
     calls.push(args);
-    return Promise.resolve({ success: true, data: undefined });
+    return Promise.resolve({ success: true, data: {} });
   };
 }
 
@@ -627,7 +614,7 @@ describe("ProposePlanToolCall", () => {
       sendMessage: (args) => {
         calls.push("sendMessage");
         sendMessageCalls.push(args);
-        return Promise.resolve({ success: true, data: undefined });
+        return Promise.resolve({ success: true, data: {} });
       },
     });
 
