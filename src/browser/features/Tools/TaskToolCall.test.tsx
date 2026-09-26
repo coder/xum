@@ -10,6 +10,8 @@ import { NestedToolsContainer } from "./Shared/NestedToolsContainer";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
+import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
+import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 let workspaceContextMock: {
@@ -17,21 +19,23 @@ let workspaceContextMock: {
   setSelectedWorkspace?: (selection: unknown) => void;
 } | null = null;
 
-// Restore the real WorkspaceContext after this suite so the partial stub cannot leak into
-// later suites that render the real provider (e.g. AgentContext.test).
+// Restore the real modules after this suite so the partial stubs cannot leak into later
+// suites that render the real components (e.g. AgentContext.test uses the real provider).
 restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...RealWorkspaceContextModule }],
+  ["@/browser/features/Tools/SubagentTranscriptDialog", { ...RealSubagentTranscriptDialogModule }],
+  ["@/browser/features/Tools/Shared/ElapsedTimeDisplay", { ...RealElapsedTimeDisplayModule }],
 ]);
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useOptionalWorkspaceContext: () => workspaceContextMock,
   toWorkspaceSelection: (workspace: FrontendWorkspaceMetadata) => workspace,
 }));
 
-void mock.module("./SubagentTranscriptDialog", () => ({
+void mock.module("@/browser/features/Tools/SubagentTranscriptDialog", () => ({
   SubagentTranscriptDialog: () => null,
 }));
 
-void mock.module("./Shared/ElapsedTimeDisplay", () => ({
+void mock.module("@/browser/features/Tools/Shared/ElapsedTimeDisplay", () => ({
   ElapsedTimeDisplay: ({
     startedAt,
     isActive,

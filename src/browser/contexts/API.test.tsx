@@ -3,6 +3,11 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import type { RecursivePartial } from "@/browser/testUtils";
+import * as RealOrpcClientModule from "@/common/orpc/client";
+import * as RealWebSocketLinkModule from "@orpc/client/websocket";
+import * as RealMessagePortLinkModule from "@orpc/client/message-port";
+import * as RealAuthTokenModalModule from "@/browser/components/AuthTokenModal/AuthTokenModal";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 
 // Mock WebSocket that we can control
 class MockWebSocket {
@@ -71,6 +76,14 @@ const clearStoredAuthTokenMock = mock(() => {
   storedAuthToken = null;
 });
 
+// Restore the real modules after this suite so the transport and auth stubs below cannot
+// leak into later files.
+restoreModulesAfterSuite([
+  ["@/common/orpc/client", { ...RealOrpcClientModule }],
+  ["@orpc/client/websocket", { ...RealWebSocketLinkModule }],
+  ["@orpc/client/message-port", { ...RealMessagePortLinkModule }],
+  ["@/browser/components/AuthTokenModal/AuthTokenModal", { ...RealAuthTokenModalModule }],
+]);
 void mock.module("@/common/orpc/client", () => ({
   createClient: () => ({
     general: {

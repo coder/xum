@@ -1,14 +1,9 @@
-import type * as React from "react";
 import { cleanup, fireEvent, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import type { DisplayedMessage } from "@/common/types/message";
 import { computeOperationalBundleInfos } from "@/browser/utils/messages/transcriptRenderProjection";
 import { OperationalBundleMessage } from "./OperationalBundleMessage";
-
-void mock.module("lucide-react", () => ({
-  ChevronRight: (props: React.SVGProps<SVGSVGElement>) => <svg {...props} />,
-}));
 
 function tool(id: string): DisplayedMessage & { type: "tool" } {
   return {

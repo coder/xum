@@ -7,6 +7,8 @@ import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/trans
 import MarkdownIt from "markdown-it";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import * as RealMermaidModule from "mermaid";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const DEFAULT_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" /></svg>';
@@ -15,6 +17,8 @@ const mermaidInitialize = mock(() => undefined);
 const mermaidParse = mock((_chart: string) => Promise.resolve());
 const mermaidRender = mock((_id: string, _chart: string) => Promise.resolve({ svg: DEFAULT_SVG }));
 
+// Restore the real mermaid module after this suite so the renderer stub cannot leak into later files.
+restoreModulesAfterSuite([["mermaid", { ...RealMermaidModule }]]);
 void mock.module("mermaid", () => ({
   default: {
     initialize: mermaidInitialize,
