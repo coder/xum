@@ -399,13 +399,14 @@ const LOCAL_DISCOVERY_HEADER = "xum-git-discovery 1\n";
 const LOCAL_DISCOVERY_RECORD_REGEX =
   /^(?:(rev-parse|worktree-config|unrepresentable-failed|drivers) (\d{1,3})|unrepresentable (includeif|executable))\n$/;
 
-// Runs the same git queries as one sequential discovery, each with its old argv and LC_ALL, and
-// prints each decisive exit status in-band. `command` bypasses shell functions, and the cwd is
-// inherited so PATH lookup matches spawning git directly. S1 stdout is discarded, S2/S3 are
-// captured and decided here, and only the driver query (last) streams repo-controlled bytes.
-// S3 drops --null because its output lands in a shell variable; the refusal decision is "exited
-// 0", and the keys only choose the refusal message. The record after the last NUL is written
-// after the last git call exits, and the script exits 0 only after writing it.
+// Runs the git queries in sequence and prints each decisive exit status in-band. `command`
+// bypasses shell functions, and the cwd is inherited so PATH lookup matches spawning git
+// directly. rev-parse stdout is discarded, the worktree-config and unrepresentable-key queries
+// are captured and decided here, and only the driver query (last) streams repo-controlled bytes.
+// The unrepresentable-key query omits --null because its output lands in a shell variable; the
+// refusal decision is "exited 0", and the keys only choose the refusal message. The record after
+// the last NUL is written after the last git call exits, and the script exits 0 only after
+// writing it.
 const LOCAL_DISCOVERY_SCRIPT_BODY = String.raw`printf 'xum-git-discovery 1\n'
 command git -C "$repo" rev-parse --git-dir >/dev/null
 rc=$?
@@ -481,7 +482,7 @@ export function parseLocalRepoAutomationDiscovery(
   }
 
   const status = Number(statusText);
-  // Mirrors the error execFileAsync raised when each query was its own process.
+  // Shaped like the execFileAsync error a direct git spawn would raise.
   const gitFailure = Object.assign(
     new Error(output.stderr.trim() || `Command failed with exit code ${status}`),
     { code: status, stderr: output.stderr }
@@ -528,7 +529,7 @@ export function parseLocalRepoAutomationDiscovery(
  * Discovery is one shell spawn that runs the git queries in sequence and reports each exit
  * status in-band (see LOCAL_DISCOVERY_SCRIPT_BODY and parseLocalRepoAutomationDiscovery).
  * It runs in the Electron main process before every untrusted bash command, and each spawn
- * forks that large process and blocks its thread, so one spawn replaces four or five (#4661).
+ * forks that large process and blocks its thread, so all queries share one spawn.
  * Every call still takes its own fresh snapshot: nothing is cached or shared between callers.
  * Any process failure (missing shell, non-zero script exit, signal, timeout, abort, output
  * overflow) or malformed output fails closed.
