@@ -8,7 +8,6 @@ import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { getProjectDisplayName } from "@/common/utils/subProjects";
 import { isSystemProjectEntry } from "@/common/utils/systemProjects";
 import {
-  BACKUP_CONTENT_FLAGS,
   MAX_BACKUP_PROJECT_PATH_CHARS,
   resolveBackupContents,
   type BackupContents,
@@ -1408,26 +1407,8 @@ export class BackupService {
     if (saved == null) {
       throw new BackupServiceError("IO_ERROR", "Settings backup configuration was not saved");
     }
-    const persisted = saved;
-    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
-    // write another writer replaced, so this method never reports saved settings, a recorded push,
-    // or a recorded restore that config.json does not hold. loadConfigOrDefault reads the file
-    // fresh, so a lost write reads back as the old value.
-    const stored = this.config.loadConfigOrDefault().settingsBackup;
-    if (
-      stored?.repoUrl !== persisted.repoUrl ||
-      stored.branch !== persisted.branch ||
-      stored.path !== persisted.path ||
-      BACKUP_CONTENT_FLAGS.some((flag) => stored[flag] !== persisted[flag]) ||
-      stored.lastPushedCommit !== persisted.lastPushedCommit ||
-      stored.lastRestoredCommit !== persisted.lastRestoredCommit
-    ) {
-      throw new BackupServiceError(
-        "IO_ERROR",
-        "The backup settings could not be written to config.json"
-      );
-    }
-    return persisted;
+    // editConfig rejects when the save fails (#4444), so a resolved edit means it landed.
+    return saved;
   }
 
   /**

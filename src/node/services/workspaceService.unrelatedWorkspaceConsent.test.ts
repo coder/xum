@@ -461,22 +461,6 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     expect(harness.persistedConsent()).toBeUndefined();
   });
 
-  test("does not report consent that is not on disk after the edit", async () => {
-    // A write another writer replaced: editConfig resolved, but the file lacks the grant.
-    spyOn(harness.config as unknown as ServiceInternals, "saveConfig").mockResolvedValue(undefined);
-
-    // create() and fork() announce exactly what this returns, so it must be the persisted
-    // value (none), not the one the transform wrote in memory.
-    const reported = await internals().grantCreationUnrelatedWorkspaceConsent(
-      harness.projectPath,
-      WORKSPACE_ID,
-      harness.workspacePath
-    );
-
-    expect(reported).toBeUndefined();
-    expect(harness.persistedConsent()).toBeUndefined();
-  });
-
   test("a failing metadata publication does not throw out of the grant", async () => {
     markPending();
     harness.service.on("metadata", () => {
@@ -542,17 +526,5 @@ describe("WorkspaceService.setAgentMessageDispatchMode", () => {
     );
     expect(persistedMode()).toBeUndefined();
     expect(published.at(-1)?.agentMessageDispatchMode).toBeUndefined();
-  });
-
-  test("does not acknowledge a mode that is not on disk after the edit", async () => {
-    // A write another writer replaced: editConfig resolved, but the file lacks the mode.
-    spyOn(
-      harness.config as unknown as { saveConfig: (config: unknown) => Promise<void> },
-      "saveConfig"
-    ).mockResolvedValue(undefined);
-
-    const result = await harness.service.setAgentMessageDispatchMode(WORKSPACE_ID, "turn-end");
-
-    expect(result.success).toBe(false);
   });
 });

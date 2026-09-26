@@ -326,7 +326,6 @@ import type {
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import {
   type AgentMessageDispatchMode,
-  getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import type {
@@ -6444,8 +6443,8 @@ export class WorkspaceService
 
       // Shared workspace memory (sub-agents write into their task-tree
       // owner's store): pin the owner on surviving descendants FIRST — their
-      // parent chain is about to lose this node — verified by reading the
-      // config back (belt and braces; a failed save rejects, #4444). A topology-only
+      // parent chain is about to lose this node (a failed save rejects, #4444,
+      // so a resolved edit means the pins persisted). A topology-only
       // edit from the persisted config, so it runs whether or not this
       // workspace's metadata can still be built (the phantom-cleanup path
       // below removes the config entry all the same, and a child left with a
@@ -6466,18 +6465,10 @@ export class WorkspaceService
         );
         verifiedSharedMemoryOwnerId = sharedMemoryOwnerId;
         if (sharedMemoryOwnerId !== workspaceId) {
-          let pinnedOwners = new Map<string, string>();
           await this.config.editConfig((cfg) => {
-            pinnedOwners = pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
+            pinDescendantWorkspaceMemoryOwners(cfg, workspaceId);
             return cfg;
           });
-          const persisted = this.config.loadConfigOrDefault();
-          for (const [id, owner] of pinnedOwners) {
-            const entry = findWorkspaceEntry(persisted, id);
-            if (entry?.workspace.memoryOwnerWorkspaceId !== owner) {
-              throw new Error(`memory owner pin for descendant ${id} did not persist`);
-            }
-          }
         }
       } catch (error) {
         if (!force) {
@@ -7636,19 +7627,6 @@ export class WorkspaceService
       if (!outcome.success) {
         return Err(outcome.error);
       }
-      // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
-      // write another writer replaced. editConfig leaves no cached snapshot, so it reads the file.
-      const persisted = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-        projectPath,
-        workspaceId: normalizedWorkspaceId,
-        workspacePath,
-      });
-      if (
-        (getValidAgentMessageDispatchMode(persisted?.agentMessageDispatchMode) ?? "tool-end") !==
-        mode
-      ) {
-        return Err("Failed to save agent message delivery: the config write did not persist.");
-      }
       // Publish after every successful write, including no-ops (same reason as consent above).
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
       return Ok(undefined);
@@ -7697,22 +7675,9 @@ export class WorkspaceService
       });
       return undefined;
     }
-    if (granted == null) {
-      return undefined;
-    }
-    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
-    // write another writer replaced. Report only what discovery and admission will actually read.
-    const persisted = getValidUnrelatedWorkspaceConsent(
-      findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
-        .unrelatedWorkspaceConsent
-    );
-    if (persisted !== granted) {
-      log.warn("Default unrelated-workspace consent did not persist; leaving it off", {
-        workspaceId,
-      });
-      return undefined;
-    }
-    return persisted;
+    // editConfig rejects when the save fails (#4444), so a resolved edit means the grant is
+    // what discovery and admission will read.
+    return granted;
   }
 
   /**

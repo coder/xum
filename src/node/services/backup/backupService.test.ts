@@ -735,25 +735,6 @@ describe("BackupService", () => {
     });
   }
 
-  test("reports a config write that never landed instead of claiming success", async () => {
-    const config = new TestBackupConfig(tempDir);
-    const service = createService(tempDir, {
-      config,
-    });
-    // A write that did not land (another writer replaced it): the edit callback runs,
-    // editConfig resolves, and the stored config never changes.
-    spyOn(config, "editConfig").mockImplementation((edit) => {
-      edit(config.loadConfigOrDefault());
-      return Promise.resolve();
-    });
-
-    const result = await service.saveSettings(SETTINGS);
-
-    expect(result.success).toBe(false);
-    if (result.success) throw new Error("Expected the lost write to be reported");
-    expect(result.error.code).toBe("IO_ERROR");
-  });
-
   test("rejects and does not persist a repository URL that embeds a credential", async () => {
     const config = new TestBackupConfig(tempDir);
     const service = createService(tempDir, {

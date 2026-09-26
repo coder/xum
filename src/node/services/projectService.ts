@@ -819,16 +819,6 @@ export class ProjectService {
           // unregistered outer repository that changes git discovery.
           await removeInitializedGitDir();
         }
-        if (
-          createResult.success &&
-          !this.config.loadConfigOrDefault().projects.has(normalizedPath)
-        ) {
-          // editConfig rejects when the save fails (#4444); this check is belt and braces against a
-          // write another writer replaced. Without it a git-initialized project could report
-          // success, vanish after restart, and block retries on the leftover .git.
-          await cleanupCreatedDirectory();
-          return Err("Failed to save project configuration");
-        }
         return createResult;
       };
       // A lock failure (a wait on another process timing out, an unwritable locks

@@ -707,15 +707,16 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       }),
     ]);
     if (!options.persistPins) {
-      // A pin write that does not land must be
-      // caught by the removal's verified read-back, so the no-persist variant
-      // drops every memory-owner pin from the edits it writes.
+      // A pin write that fails must abort the removal, so the no-persist variant rejects every
+      // edit that would write a memory-owner pin (editConfig rejects a failed save, #4444).
       const editConfig = config.editConfig.bind(config);
       spyOn(config, "editConfig").mockImplementation((edit, editOptions) =>
         editConfig((cfg) => {
           const next = edit(cfg);
           for (const project of next.projects.values()) {
-            for (const workspace of project.workspaces) delete workspace.memoryOwnerWorkspaceId;
+            if (project.workspaces.some((workspace) => workspace.memoryOwnerWorkspaceId != null)) {
+              throw new Error("EACCES: memory owner pin write failed");
+            }
           }
           return next;
         }, editOptions)
@@ -760,7 +761,7 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
     }
   });
 
-  test("aborts a non-forced removal (workspace intact) when the descendant pin does not persist", async () => {
+  test("aborts a non-forced removal (workspace intact) when the descendant pin write fails", async () => {
     const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
     try {
       await using harness = await createPinHarness({ persistPins: false });
@@ -834,7 +835,7 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
     expect(findEntry(harness.config, "ws-mid")).toBeUndefined();
     expect(findEntry(harness.config, "ws-grand")?.memoryOwnerWorkspaceId).toBe("ws-owner");
 
-    // ...and a pin that does not persist still aborts the non-forced removal
+    // ...and a pin write that fails still aborts the non-forced removal
     // on that path, before the config entry is dropped.
     await using unpersisted = await createPinHarness({ persistPins: false });
     spyOn(unpersisted.aiService, "getWorkspaceMetadata").mockResolvedValue(

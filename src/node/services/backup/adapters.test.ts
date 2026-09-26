@@ -1165,41 +1165,6 @@ describe("backup adapters", () => {
     );
   });
 
-  it("reports a lost preferences write instead of restoring silently", async () => {
-    config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
-    await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");
-    const gitRepo = createBackupGitRepo({ cacheRoot });
-    const payload = createBackupPayloadStore({ config });
-    const repository = await gitRepo.prepare(settings);
-    await payload.exportTo({
-      repositoryRoot: repository.rootDir,
-      managedPath: settings.path,
-      contents: CORE_CONTENTS,
-    });
-
-    config.state = { projects: new Map(), userPreferences: { appearance: { theme: "light" } } };
-    // A write that did not land: the edit callback runs, editConfig resolves, and the
-    // stored config never changes.
-    spyOn(config, "editConfig").mockImplementation((edit) => {
-      edit(config.state);
-      return Promise.resolve();
-    });
-
-    try {
-      await payload.restore({
-        repositoryRoot: repository.rootDir,
-        managedPath: settings.path,
-        contents: CORE_CONTENTS,
-        snapshotPath: path.join(tempDir, "restore-snapshot"),
-        matchedProjects: [],
-      });
-      throw new Error("Expected the lost preferences write to be reported");
-    } catch (error) {
-      if (!(error instanceof Error)) throw error;
-      expect(error.message).toContain("could not be written");
-    }
-  });
-
   it("keeps preferences another window saved while the restore ran", async () => {
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
     await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");

@@ -709,13 +709,12 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
         if (result.backupPreferences !== undefined) {
-          let merged: ReturnType<typeof normalizeUserPreferences> | undefined;
           await options.config.editConfig(
             (current) => {
               // Merged against the config this edit reads, not a snapshot taken before the
               // restore: a whole-object write would otherwise discard preferences another
               // window saved meanwhile, including the machine-local keys no backup carries.
-              merged = normalizeUserPreferences(
+              const merged = normalizeUserPreferences(
                 mergeBackupPreferences(current.userPreferences, result.backupPreferences)
               );
               return { ...current, userPreferences: merged };
@@ -724,20 +723,6 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // window's hold: taking its own would wait on itself.
             registration === null ? {} : { withinRegistrationLock: registration }
           );
-          // editConfig rejects when the save fails (#4444); re-reading is belt and braces against a
-          // write another writer replaced. Compared through the backup projection because every key
-          // a restore can change is portable, so a lost write is visible there, while machine-local
-          // keys the load path normalizes differently stay out of the check.
-          const stored = options.config.loadConfigOrDefault().userPreferences;
-          if (
-            merged !== undefined &&
-            !serializeBackupPreferences(stored ?? {}).equals(serializeBackupPreferences(merged))
-          ) {
-            throw new BackupServiceError(
-              "IO_ERROR",
-              "The restored preferences could not be written to config.json"
-            );
-          }
         }
         return { localOnlyFiles: result.localOnlyFiles };
       };

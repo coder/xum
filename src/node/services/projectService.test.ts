@@ -300,18 +300,14 @@ describe("ProjectService", () => {
     it("fails initGit create without leaving .git when config persistence fails", async () => {
       const projectPath = path.join(tempDir, "persist-fail-project");
       const nonPersistingConfig = new Config(tempDir);
-      // Run the transform (so create() reaches its success path) but drop the save,
-      // modeling a write that did not land.
-      nonPersistingConfig.editConfig = (transform) => {
-        transform(nonPersistingConfig.loadConfigOrDefault());
-        return Promise.resolve();
-      };
+      // A failed save rejects the edit (#4444).
+      nonPersistingConfig.editConfig = () => Promise.reject(new Error("EACCES: permission denied"));
       const nonPersistingService = new ProjectService(nonPersistingConfig);
 
       const result = await nonPersistingService.create(projectPath, { initGit: true });
 
       expect(result.success).toBe(false);
-      expect(!result.success && result.error).toContain("save project configuration");
+      expect(!result.success && result.error).toContain("EACCES");
       // Roll back the created directory so a retry is not blocked by leftover .git.
       expect(fs.stat(projectPath)).rejects.toThrow();
     });
