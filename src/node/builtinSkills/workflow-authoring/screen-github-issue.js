@@ -11,7 +11,8 @@
 // The evaluator needs an OpenAI API-key route (with stored Codex OAuth, set
 // codexOauthDefaultAuth: "apiKey" on the openai provider).
 //   REPO="owner/repo"; N=123
-//   gh label create needs-human-review -R "$REPO" --force   # once per repository
+//   gh label list -R "$REPO" --search needs-human-review --json name --jq '.[].name' \
+//     | grep -qx needs-human-review || gh label create needs-human-review -R "$REPO"
 //   gh issue view "$N" -R "$REPO" --json title,body \
 //     | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
 //     | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \
