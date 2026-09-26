@@ -1708,7 +1708,9 @@ const TaskListItem: React.FC<{
     taskId={task.taskId}
     status={task.status}
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
-    title={task.title}
+    // Untitled instance rows (the only rows carrying projectPath) would otherwise show just an
+    // opaque ID; their workspace name is the recognizable label. Other rows keep the title only.
+    title={task.title ?? (task.projectPath != null ? task.workspaceName : undefined)}
     depth={task.depth}
     // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
     // self) — the key context for interpreting the tree view and addressing peer messages.
