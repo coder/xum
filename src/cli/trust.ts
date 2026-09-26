@@ -209,7 +209,7 @@ export async function materializeResolvedTrust(
     project.trusted = true;
     return config;
   });
-  // Config.saveConfig swallows write errors, so verify the exact-path entry before continuing.
+  // editConfig rejects when the save fails (#4444); verifying the exact-path entry is belt and braces against another writer.
   if (targetConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted !== true) {
     throw new Error(`Failed to persist resolved trust for ${projectDir}`);
   }
@@ -269,11 +269,10 @@ async function runTrust(options: TrustCLIOptions): Promise<number> {
       }
       return config;
     });
-    // Config.saveConfig swallows write failures (self-healing keeps the desktop app
-    // alive on bad disks), so editConfig resolves even when nothing was persisted.
-    // A headless trust command must not report success in that case: re-read from
-    // disk and fail loudly instead of letting automation proceed with a wrong
-    // assumption about the project's trust state.
+    // editConfig rejects when the save fails (#4444). A headless trust command must never report success for a
+    // trust state that is not on disk, so this re-read is belt and braces against a write
+    // another writer replaced: fail loudly instead of letting automation proceed with a
+    // wrong assumption about the project's trust state.
     if ((await resolveProjectTrusted(realConfig, projectDir)) !== trusted) {
       throw new Error(
         `Failed to persist trust change for ${trustDir}. Check that ${realConfig.rootDir} is a writable directory.`

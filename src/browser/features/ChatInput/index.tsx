@@ -2445,8 +2445,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // preferences when the stream starts, and the slider write reaches config.json
         // asynchronously. Wait for the backend to accept that write so a send right after a
         // slider change is not ordered ahead of it; a rejected save refuses the send visibly
-        // and leaves the draft untouched. (Config swallows disk-write failures for every
-        // preference today, so acceptance is ordering, not durability.)
+        // and leaves the draft untouched. (Since #4444 a failed disk write rejects too, so
+        // acceptance also means the preference landed.)
         const preferencePersisted = await runWithCatch(
           async () => {
             await waitForPreferencePersisted(

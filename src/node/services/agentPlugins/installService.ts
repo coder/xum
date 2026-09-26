@@ -677,8 +677,8 @@ export class AgentPluginInstallService {
   }
 
   /**
-   * Atomic write that THROWS on failure (unlike Config.saveConfig's
-   * log-and-swallow) so callers can roll back filesystem changes instead of
+   * Atomic write that THROWS on failure (like Config.saveConfig since #4444)
+   * so callers can roll back filesystem changes instead of
    * reporting success with an unpersisted registry. Takes the RAW envelope
    * and entry list so unrecognized top-level fields and entries are written
    * back verbatim (only `plugins` is replaced).

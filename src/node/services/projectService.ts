@@ -823,9 +823,9 @@ export class ProjectService {
           createResult.success &&
           !this.config.loadConfigOrDefault().projects.has(normalizedPath)
         ) {
-          // Config persistence (editConfig → private saveConfig) logs-and-continues on
-          // write failures. Without this check a git-initialized project would report
-          // success, vanish after restart, and block retries on the leftover .git.
+          // editConfig rejects when the save fails (#4444); this check is belt and braces against a write another writer
+          // replaced. Without it a git-initialized project could report success, vanish
+          // after restart, and block retries on the leftover .git.
           await cleanupCreatedDirectory();
           return Err("Failed to save project configuration");
         }
@@ -1143,10 +1143,9 @@ export class ProjectService {
         });
 
       // Decide from the fresh config, not the rejection: another backend may have registered
-      // this path meanwhile, and its checkout must not be deleted.
+      // this path meanwhile, and its checkout must not be deleted. The re-read is also belt and
+      // braces against a write another writer replaced.
       if (!this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
-        // Config persistence (editConfig → private saveConfig) logs-and-continues on write
-        // failures, so verify persistence explicitly before reporting success.
         try {
           await fsPromises.rm(normalizedPath, { recursive: true, force: true });
         } catch {

@@ -1409,9 +1409,9 @@ export class BackupService {
       throw new BackupServiceError("IO_ERROR", "Settings backup configuration was not saved");
     }
     const persisted = saved;
-    // saveConfig logs and swallows write failures by design, so a resolved editConfig does
-    // not prove the write landed; on a full disk this method would otherwise report saved
-    // settings, a recorded push, or a recorded restore that config.json never received.
+    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a write another
+    // writer replaced, so this method never reports saved settings, a recorded push, or a
+    // recorded restore that config.json does not hold.
     // loadConfigOrDefault reads the file fresh, so a lost write reads back as the old value.
     const stored = this.config.loadConfigOrDefault().settingsBackup;
     if (

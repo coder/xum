@@ -5539,8 +5539,8 @@ export class WorkspaceTurnManager {
       // its latch must stay.
       //
       // Remove the matching live registration BEFORE releasing (synchronously, in the same
-      // tick): Config.saveConfig swallows write failures, so `updated` does not prove the
-      // terminal mirror reached disk — a peer admission probe reading a stale running mirror
+      // tick): `updated` alone does not prove the terminal mirror is what disk holds (another
+      // writer may replace it; a failed save rejects, #4444) — a peer admission probe reading a stale running mirror
       // between this release and the caller's own guarded registration delete would otherwise
       // still find an accepted live handle and escape the stop. Without the registration,
       // hasLiveRunningExecution refuses regardless of what the on-disk mirror claims. Callers'

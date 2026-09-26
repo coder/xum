@@ -2142,7 +2142,8 @@ export class Config {
   }
 
   /**
-   * Write the full config snapshot to disk (atomic write, log-and-swallow errors).
+   * Write the full config snapshot to disk (atomic write). Rejects when the file was not
+   * replaced, so editConfig never reports an unsaved edit as durable (#4444).
    *
    * PRIVATE on purpose: this is editConfig's write primitive only. Direct external
    * callers used to write stale full snapshots outside the editConfig queue, which
@@ -2151,18 +2152,19 @@ export class Config {
    * as a permanent sidebar ghost. All mutations must go through editConfig so each
    * write is derived from a fresh serialized read.
    *
-   * Kept as a Promise facade (tests spy on it with Promise mocks to simulate
-   * swallowed writes); saveConfigEffect below holds the actual pipeline.
+   * Kept as a Promise facade (tests spy on it with Promise mocks to simulate a write
+   * that did not land); saveConfigEffect below holds the actual pipeline.
    */
   private saveConfig(config: ProjectsConfig): Promise<void> {
     return Effect.runPromise(this.saveConfigEffect(config));
   }
 
   /**
-   * Never fails: the whole pipeline folds every failure and defect into the same
-   * log-and-swallow the old try/catch applied (total catch discipline).
+   * Fails when config.json was not replaced (#4444). Every failure (serialization or the
+   * atomic write) happens before the rename, so a failure means the previous bytes are
+   * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void> {
+  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2486,11 +2488,15 @@ export class Config {
         }
       }
     }).pipe(
-      // Mirror the old whole-pipeline try/catch: fold both the typed write failure and
-      // any defect thrown by the synchronous serialization above into the same
-      // log-and-swallow, so this pipeline never fails.
-      Effect.catch((error) => Effect.sync(() => log.error("Error saving config:", error))),
-      Effect.catchDefect((error) => Effect.sync(() => log.error("Error saving config:", error)))
+      // A defect thrown by the synchronous serialization above is a failed save too.
+      Effect.catchDefect((defect) => Effect.fail(defect)),
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          // Readers must see the unchanged file, however this edit obtained its input.
+          self.configSnapshot = undefined;
+          log.error("Error saving config:", error);
+        })
+      )
     );
   }
 
@@ -2996,8 +3002,9 @@ export class Config {
       // process registered meanwhile, whether or not this edit touched the project set.
       yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
-      // spies on saveConfig keep intercepting the serialized write.
-      yield* Effect.promise(async () => self.saveConfig(newConfig));
+      // spies on saveConfig keep intercepting the serialized write. A failed save rejects
+      // the edit and skips the change notification below (#4444).
+      yield* Effect.tryPromise({ try: () => self.saveConfig(newConfig), catch: (error) => error });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       self.notifyConfigChanged();
@@ -3057,9 +3064,8 @@ export class Config {
    * writing would replace the corrupt file with defaults. Only proceed when the bytes on
    * disk right now are the ones with a confirmed sidecar: no confirmed backup, a concurrent
    * replacement since the load, or an unreadable file all reject the edit so callers do not
-   * treat the mutation as durable (unlike saveConfig's log-and-swallow of unexpected I/O
-   * errors, this skip is deliberate). A missing file is safe to overwrite. This cannot fully
-   * close the cross-process race (that needs file locking, which editConfig has never had);
+   * treat the mutation as durable (a failed save rejects the same way). A missing file is
+   * safe to overwrite. This cannot fully close the cross-process race (that needs file locking, which editConfig has never had);
    * it binds the approval to the current bytes and shrinks the window to the atomic write
    * itself.
    */

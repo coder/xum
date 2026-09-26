@@ -301,7 +301,7 @@ describe("ProjectService", () => {
       const projectPath = path.join(tempDir, "persist-fail-project");
       const nonPersistingConfig = new Config(tempDir);
       // Run the transform (so create() reaches its success path) but drop the save,
-      // modeling saveConfig's log-and-continue behavior on write failures.
+      // modeling a write that did not land.
       nonPersistingConfig.editConfig = (transform) => {
         transform(nonPersistingConfig.loadConfigOrDefault());
         return Promise.resolve();

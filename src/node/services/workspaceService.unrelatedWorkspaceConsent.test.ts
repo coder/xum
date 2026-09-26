@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import cjsFs from "fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -40,6 +41,25 @@ async function createHarness() {
   return { config, service, projectPath, workspacePath, persistedConsent, cleanup };
 }
 
+/**
+ * Fails only the rename that publishes config.json, so the save really fails inside the real
+ * editConfig pipeline (#4444) while every other file write stays real.
+ */
+function failConfigPublish() {
+  const realRename = cjsFs.rename.bind(cjsFs);
+  return spyOn(cjsFs, "rename").mockImplementation(((
+    from: cjsFs.PathLike,
+    to: cjsFs.PathLike,
+    callback: cjsFs.NoParamCallback
+  ) => {
+    if (path.basename(String(to)) === "config.json") {
+      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      return;
+    }
+    realRename(from, to, callback);
+  }) as typeof cjsFs.rename);
+}
+
 describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
   let harness: Awaited<ReturnType<typeof createHarness>>;
   let config: Config;
@@ -54,6 +74,39 @@ describe("WorkspaceService.setUnrelatedWorkspaceConsent", () => {
   afterEach(async () => {
     mock.restore();
     await harness.cleanup();
+  });
+
+  test("enabling fails loudly and publishes nothing when the save fails (#4444)", async () => {
+    const metadataEvents: Array<{ metadata: { unrelatedWorkspaceConsent?: string } | null }> = [];
+    service.on("metadata", (event: { metadata: { unrelatedWorkspaceConsent?: string } | null }) =>
+      metadataEvents.push(event)
+    );
+    const publish = failConfigPublish();
+
+    const result = await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true);
+    publish.mockRestore();
+
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("expected Err");
+    expect(result.error).toContain("EACCES");
+    expect(harness.persistedConsent()).toBeUndefined();
+    expect(metadataEvents.some((event) => event.metadata?.unrelatedWorkspaceConsent != null)).toBe(
+      false
+    );
+  });
+
+  test("revoking fails loudly and keeps the persisted grant when the save fails (#4444)", async () => {
+    expect((await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(true);
+    const generation = harness.persistedConsent();
+    expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
+    const publish = failConfigPublish();
+
+    const result = await service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false);
+    publish.mockRestore();
+
+    // Never report a revocation that discovery and admission will not see.
+    expect(result.success).toBe(false);
+    expect(harness.persistedConsent()).toBe(generation);
   });
 
   test("consent is off by default and revoking an already-off workspace is a committed no-op", async () => {
@@ -394,8 +447,22 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     expect(harness.persistedConsent()).toBeUndefined();
   });
 
-  test("does not report consent whose save was swallowed", async () => {
-    // Config.saveConfig logs and swallows write failures; model one reaching the real edit path.
+  test("does not report consent whose save failed (#4444)", async () => {
+    const publish = failConfigPublish();
+
+    const reported = await internals().grantCreationUnrelatedWorkspaceConsent(
+      harness.projectPath,
+      WORKSPACE_ID,
+      harness.workspacePath
+    );
+    publish.mockRestore();
+
+    expect(reported).toBeUndefined();
+    expect(harness.persistedConsent()).toBeUndefined();
+  });
+
+  test("does not report consent that is not on disk after the edit", async () => {
+    // A write another writer replaced: editConfig resolved, but the file lacks the grant.
     spyOn(harness.config as unknown as ServiceInternals, "saveConfig").mockResolvedValue(undefined);
 
     // create() and fork() announce exactly what this returns, so it must be the persisted

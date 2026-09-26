@@ -648,7 +648,7 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       }),
     ]);
     if (!options.persistPins) {
-      // Config swallows write failures: a pin that does not land must be
+      // A pin write that does not land must be
       // caught by the removal's verified read-back, so the no-persist variant
       // drops every memory-owner pin from the edits it writes.
       const editConfig = config.editConfig.bind(config);

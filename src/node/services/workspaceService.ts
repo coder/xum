@@ -3214,9 +3214,8 @@ export class WorkspaceService
 
   /**
    * Roll back a just-persisted workspace registration and VERIFY it left the
-   * on-disk config. Config.saveConfig logs and swallows write failures, so
-   * removeWorkspace can resolve while the entry is still persisted — after a
-   * restart that entry would resurrect with the unsanitized overrides file
+   * on-disk config. A removeWorkspace that rejects or whose write another writer
+   * replaced can leave the entry persisted — after a restart that entry would resurrect with the unsanitized overrides file
    * this rollback exists to keep unreachable. Returns whether the entry is
    * provably gone from disk.
    */
@@ -6444,7 +6443,7 @@ export class WorkspaceService
       // Shared workspace memory (sub-agents write into their task-tree
       // owner's store): pin the owner on surviving descendants FIRST — their
       // parent chain is about to lose this node — verified by reading the
-      // config back because Config swallows write failures. A topology-only
+      // config back (belt and braces; a failed save rejects, #4444). A topology-only
       // edit from the persisted config, so it runs whether or not this
       // workspace's metadata can still be built (the phantom-cleanup path
       // below removes the config entry all the same, and a child left with a
@@ -7688,9 +7687,8 @@ export class WorkspaceService
     if (granted == null) {
       return undefined;
     }
-    // Config.saveConfig logs and swallows write failures, and editConfig's transform ran on an
-    // uncached read, so a failed save leaves loadConfigOrDefault() re-reading the unchanged
-    // file. Report only what discovery and admission will actually read (see #4444).
+    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a write another writer
+    // replaced. Report only what discovery and admission will actually read.
     const persisted = getValidUnrelatedWorkspaceConsent(
       findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
         .unrelatedWorkspaceConsent
@@ -15044,8 +15042,8 @@ export class WorkspaceService
     try {
       // Deleting also write-tombstones the id for the rest of this process,
       // so verify deregistration actually landed before publishing it:
-      // saveConfig swallows write failures, meaning config.removeWorkspace
-      // can resolve while the workspace is still persisted in config.json —
+      // config.removeWorkspace can resolve while another writer has put the
+      // workspace back in config.json —
       // tombstoning a still-live id would suppress all of its future
       // activity writes. A failed verification (unreadable config) skips the
       // delete too; like a missed delete, the entry is reclaimed by a later

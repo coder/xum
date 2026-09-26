@@ -7,7 +7,10 @@ import cjsFs from "fs";
 import * as os from "os";
 import { log } from "@/node/services/log";
 import { Config } from "./config";
-import { projectRegistrationLockFilePath } from "./config/projectRegistrationLock";
+import {
+  projectRegistrationLockFilePath,
+  withProjectRegistrationLock,
+} from "./config/projectRegistrationLock";
 import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
@@ -408,18 +411,29 @@ describe("Config", () => {
         error.code = "ENOSPC";
         args[5](error, 0, args[1]);
       });
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      let saveError: unknown;
       try {
-        await config.setUpdateChannel("nightly");
+        saveError = await config.setUpdateChannel("nightly").catch((error: unknown) => error);
       } finally {
         fsWrite.restore();
+        unsubscribe();
       }
 
       expect(fsWrite.callCount()).toBeGreaterThan(0);
+      // The caller learns the edit is not durable (#4444) instead of a silent drop.
+      expect(saveError).toMatchObject({ code: "ENOSPC" });
       expect(errorSpy).toHaveBeenCalledWith(
         "Error saving config:",
         expect.objectContaining({ code: "ENOSPC" })
       );
-      // The good config survives byte for byte and the failed edit is simply dropped.
+      expect(notifications).toBe(0);
+      // The same instance reads what is on disk, not the failed edit.
+      expect(config.getUpdateChannel()).not.toBe("nightly");
+      // The good config survives byte for byte.
       expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
       const reloaded = new Config(tempDir);
       expect(reloaded.loadConfigOrDefault().projects.has("/repo")).toBe(true);
@@ -459,18 +473,78 @@ describe("Config", () => {
           callback(error, length, buffer)
         );
       });
+      let saveError: unknown;
       try {
-        await config.setUpdateChannel("nightly");
+        saveError = await config.setUpdateChannel("nightly").catch((error: unknown) => error);
       } finally {
         fsWrite.restore();
       }
 
       expect(fsWrite.callCount()).toBeGreaterThan(0);
-      const saveError = errorSpy.mock.calls.find((call) => call[0] === "Error saving config:")?.[1];
       expect(saveError).toBeInstanceOf(Error);
       expect((saveError as Error).message).toContain("Incomplete write");
       expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
       expect(new Config(tempDir).loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("a failed save does not wedge later edits or the registration lock (#4444)", async () => {
+      const failOnce = mockFsWrite((call, original, args) => {
+        if (call === 1) {
+          const error: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device");
+          error.code = "ENOSPC";
+          args[5](error, 0, args[1]);
+          return;
+        }
+        original(...args);
+      });
+      try {
+        const gatedError = await config
+          .setUpdateChannel("nightly")
+          .catch((error: unknown) => error);
+        expect(gatedError).toMatchObject({ code: "ENOSPC" });
+      } finally {
+        failOnce.restore();
+      }
+      // The failed edit released its queue slot and the file lock: the next one lands.
+      await config.setUpdateChannel("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+
+      // Same inside a registration window: the held edit rejects, and the window's lock is
+      // still released for the edit that follows it.
+      const failHeld = mockFsWrite((_call, _original, args) => {
+        const error: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device");
+        error.code = "ENOSPC";
+        args[5](error, 0, args[1]);
+      });
+      try {
+        const heldError = await withProjectRegistrationLock(tempDir, (lock) =>
+          config.editConfig((value) => ({ ...value, updateChannel: "stable" }), {
+            withinRegistrationLock: lock,
+          })
+        ).catch((error: unknown) => error);
+        expect(heldError).toMatchObject({ code: "ENOSPC" });
+      } finally {
+        failHeld.restore();
+      }
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+      await config.setUpdateChannel("stable");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("stable");
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("a config that cannot be serialized rejects the edit (#4444)", async () => {
+      const cyclic: Record<string, unknown> = {};
+      cyclic.self = cyclic;
+      const saveError = await config
+        .editConfig((value) => ({
+          ...value,
+          settingsBackup: cyclic as unknown as NonNullable<typeof value.settingsBackup>,
+        }))
+        .catch((error: unknown) => error);
+
+      expect(saveError).toBeInstanceOf(TypeError);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
       expect(configFiles()).toEqual(["config.json"]);
     });
   });
@@ -859,19 +933,31 @@ describe("Config", () => {
       await flushConfigEdits();
       const before = fs.readFileSync(configFile, "utf-8");
       const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
-      const editSpy = spyOn(config, "editConfig").mockRejectedValueOnce(
-        new Error("ENOSPC: no space left on device")
-      );
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      // Fail only the rename that publishes config.json: a real failed save.
+      const realRename = cjsFs.rename.bind(cjsFs);
+      const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+        from: cjsFs.PathLike,
+        to: cjsFs.PathLike,
+        callback: cjsFs.NoParamCallback
+      ) => {
+        if (path.basename(String(to)) === "config.json") {
+          callback(Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }));
+          return;
+        }
+        realRename(from, to, callback);
+      }) as typeof cjsFs.rename);
       try {
         // Startup and every workspace list read go through here: a write failure must not
         // turn a read into a rejection.
         const all = await config.getAllWorkspaceMetadata();
         expect(all.find((meta) => meta.id === "ws-legacy")?.runtimeConfig).toBeDefined();
-        expect(editSpy).toHaveBeenCalledTimes(1);
+        expect(renameSpy).toHaveBeenCalled();
         expect(warnSpy).toHaveBeenCalled();
         expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
       } finally {
-        editSpy.mockRestore();
+        renameSpy.mockRestore();
+        errorSpy.mockRestore();
         warnSpy.mockRestore();
       }
     });

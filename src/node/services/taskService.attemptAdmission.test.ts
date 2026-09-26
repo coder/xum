@@ -1208,8 +1208,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         );
         spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
           if (failure === "sanitize failed, unpublish write lost") {
-            // The next config save (the unpublication) is swallowed, as saveConfigEffect does
-            // with a failed write: editConfig resolves, the bytes on disk still hold the row.
+            // The next config save (the unpublication) does not land (another writer replaced
+            // it): editConfig resolves, the bytes on disk still hold the row.
             spyOn(
               config as unknown as { saveConfig: (config: unknown) => Promise<void> },
               "saveConfig"
