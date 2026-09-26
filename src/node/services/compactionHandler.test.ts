@@ -2180,9 +2180,10 @@ describe("CompactionHandler", () => {
         createMuxMessage("before-compaction", "user", "earlier turn"),
         requestWithFollowUp(followUpContent)
       );
-      expect(await handler.handleCompletion(createStreamEndEvent(summary), "limit-request")).toBe(
-        true
-      );
+      const usage = { inputTokens: 100, outputTokens: 400_000, totalTokens: undefined };
+      expect(
+        await handler.handleCompletion(createStreamEndEvent(summary, { usage }), "limit-request")
+      ).toBe(true);
       for (const bytes of await persistedRowBytes()) {
         expect(bytes).toBeLessThanOrEqual(SESSION_HISTORY_MAX_LINE_BYTES);
       }
@@ -2225,6 +2226,10 @@ describe("CompactionHandler", () => {
       expect(streamEnd?.parts.filter((part) => part.type === "text")).toEqual([
         expect.objectContaining({ text }),
       ]);
+      // Truncated tokens are not in the next request: the meter counts only the kept share.
+      const keptTokens = Math.ceil((400_000 * kept) / summary.length);
+      expect(boundary?.metadata?.contextUsage?.inputTokens).toBe(keptTokens);
+      expect(streamEnd?.metadata.contextUsage?.inputTokens).toBe(keptTokens);
     });
 
     it("keeps a large follow-up byte-identical and shrinks only the summary", async () => {
