@@ -152,7 +152,7 @@ export class MCPConfigService {
     workspaceId?: string | null;
   }): Promise<Record<string, MCPServerInfo>> {
     const projectPath = input.projectPath ?? undefined;
-    const servers = await this.listServers(
+    const layers = await this.listServerLayers(
       projectPath,
       isProjectTrusted(this.config, projectPath),
       {
@@ -161,6 +161,18 @@ export class MCPConfigService {
           projectPath
         ),
       }
+    );
+    // Tag the owning user layer (#4297) so the UI can attribute `disabled`
+    // without re-deriving precedence. Plugin and managed entries stay untagged.
+    const servers = Object.fromEntries(
+      Object.entries(await this.mergeServerLayers(layers)).map(([name, info]) => {
+        const configLayer = Object.hasOwn(layers.project, name)
+          ? "project"
+          : Object.hasOwn(layers.global, name)
+            ? "global"
+            : undefined;
+        return [name, configLayer ? { ...info, configLayer } : info];
+      })
     );
     if (this.policyService?.isEnforced() !== true) {
       return servers;
@@ -675,7 +687,12 @@ export class MCPConfigService {
     trusted = false,
     options?: { agentPlugins?: AgentPluginsMcpContext | null }
   ): Promise<Record<string, MCPServerInfo>> {
-    const layers = await this.listServerLayers(projectPath, trusted, options);
+    return this.mergeServerLayers(await this.listServerLayers(projectPath, trusted, options));
+  }
+
+  private async mergeServerLayers(
+    layers: Awaited<ReturnType<MCPConfigService["listServerLayers"]>>
+  ): Promise<Record<string, MCPServerInfo>> {
     // Repo overrides win by server name over global config, which wins over plugin servers.
     const servers = { ...layers.plugin, ...layers.global, ...layers.project };
     const design = await this.claudeDesign.serverInfo();

@@ -225,12 +225,39 @@ export const WorkspaceMCPNoOverrides: Story = {
   },
 };
 
+// #4297: a server disabled only in the global MCP settings must not be
+// attributed to the project layer.
+export const WorkspaceMCPGlobalDisabledServer: Story = {
+  render: () =>
+    renderWorkspaceMCPModal({
+      servers: {
+        posthog: {
+          transport: "stdio",
+          command: "npx -y posthog-mcp-server",
+          disabled: true,
+          configLayer: "global",
+        },
+      },
+    }),
+  play: async ({ canvasElement }) => {
+    const modal = within(await findWorkspaceMCPDialog(canvasElement));
+
+    await expect(modal.findByText("(disabled globally)")).resolves.toBeInTheDocument();
+    await expect(modal.queryByText(/disabled at project level/i)).not.toBeInTheDocument();
+  },
+};
+
 export const WorkspaceMCPProjectDisabledServer: Story = {
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
         mux: { transport: "stdio", command: "npx -y @anthropics/mux-server", disabled: false },
-        posthog: { transport: "stdio", command: "npx -y posthog-mcp-server", disabled: true },
+        posthog: {
+          transport: "stdio",
+          command: "npx -y posthog-mcp-server",
+          disabled: true,
+          configLayer: "project",
+        },
       },
       testResults: {
         mux: MOCK_TOOLS,
@@ -251,7 +278,12 @@ export const WorkspaceMCPEnabledOverride: Story = {
     renderWorkspaceMCPModal({
       servers: {
         mux: { transport: "stdio", command: "npx -y @anthropics/mux-server", disabled: false },
-        posthog: { transport: "stdio", command: "npx -y posthog-mcp-server", disabled: true },
+        posthog: {
+          transport: "stdio",
+          command: "npx -y posthog-mcp-server",
+          disabled: true,
+          configLayer: "project",
+        },
       },
       workspaceOverrides: {
         enabledServers: ["posthog"],

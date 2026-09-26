@@ -407,8 +407,15 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                               )
                             </div>
                           ) : (
-                            projectDisabled && (
-                              <div className="text-muted text-xs">(disabled at project level)</div>
+                            // Attribute only a layer the backend reported (#4297);
+                            // untagged entries (e.g. managed servers) make no claim.
+                            projectDisabled &&
+                            info.configLayer && (
+                              <div className="text-muted text-xs">
+                                {info.configLayer === "project"
+                                  ? "(disabled at project level)"
+                                  : "(disabled globally)"}
+                              </div>
                             )
                           )}
                         </div>
