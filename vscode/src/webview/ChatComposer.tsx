@@ -9,9 +9,6 @@ import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/ke
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
-import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
-import { useMinThinkingLevels } from "xum/browser/hooks/useMinThinkingLevels";
-import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
 import { usePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { normalizeToCanonical } from "xum/common/utils/ai/models";
@@ -29,7 +26,6 @@ import type { AgentId } from "xum/common/types/agentDefinition";
 import { calculateTokenMeterData } from "xum/common/utils/tokens/tokenMeterUtils";
 import { createDisplayUsage } from "xum/common/utils/tokens/displayUsage";
 import type { ChatUsageDisplay } from "xum/common/utils/tokens/usageAggregator";
-import { enforceThinkingPolicy } from "xum/common/utils/thinking/policy";
 import { cn } from "xum/common/lib/utils";
 import { VIM_ENABLED_KEY, getInputKey, getModelKey } from "xum/common/constants/storage";
 
@@ -108,9 +104,6 @@ function ChatComposerInner(props: {
   const api = apiState.api;
 
   const { agentId, setAgentId } = useAgent();
-  const [thinkingLevel] = useThinkingLevel();
-  const { getMinimum } = useMinThinkingLevels();
-  const { config: providersConfig } = useProvidersConfig();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -253,19 +246,12 @@ function ChatComposerInner(props: {
     }, SEND_MESSAGE_TIMEOUT_MS);
 
     try {
-      const storedOptions = getSendOptionsFromStorage(props.workspaceId);
       const options = {
-        ...storedOptions,
-        // Send the level the thinking selector displays (raised to the model's minimum), not the
-        // raw stored value, so the sent level matches what the user sees.
-        thinkingLevel: enforceThinkingPolicy(
-          storedOptions.model,
-          thinkingLevel,
-          getMinimum(storedOptions.model),
-          providersConfig
-        ),
+        ...getSendOptionsFromStorage(props.workspaceId),
         // #4755: these options come from webview-local storage, never loaded from the workspace.
         // Skip persistence so a webview send cannot overwrite the workspace's agent/model/thinking.
+        // The thinking level is sent as selected: the webview does not load the user's configured
+        // per-model minimums, so only the backend can apply the authoritative floor.
         skipAiSettingsPersistence: true,
       };
 

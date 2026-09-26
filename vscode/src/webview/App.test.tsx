@@ -333,11 +333,12 @@ describe("vscode webview AI settings persistence", () => {
     expect(options.skipAiSettingsPersistence).toBe(true);
   });
 
-  test("sends the thinking level the selector displays, not the raw stored default", async () => {
+  test("sends the selected thinking level without raising it to a client-side floor", async () => {
+    // The webview only knows built-in minimum levels, not the user's configured ones, so it must
+    // not clamp; the backend applies the authoritative floor to the turn.
+    window.localStorage.setItem(`thinkingLevel:${WORKSPACE.id}`, JSON.stringify("off"));
     const { bridge, view } = await renderSelected();
-    // With nothing stored, the default model's minimum floor makes the selector show MED.
-    expect(view.container.textContent).toContain("MED");
     const options = await sendMessage(bridge, view);
-    expect(options.thinkingLevel).toBe("medium");
+    expect(options.thinkingLevel).toBe("off");
   });
 });
