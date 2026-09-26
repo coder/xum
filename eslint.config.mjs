@@ -680,6 +680,26 @@ const localPlugin = {
         };
       },
     },
+    // `x as unknown as APIClient` in tests hides typos and wrong return types in API doubles.
+    // createTestApiClient (src/browser/testUtils.ts) type-checks the partial double instead.
+    "no-unknown-cast-to-api-client": {
+      meta: {
+        type: "problem",
+        docs: { description: "Disallow `as unknown as APIClient` in tests" },
+        messages: {
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of `as unknown as APIClient`: it type-checks the double against the real procedure types.",
+        },
+      },
+      create(context) {
+        return {
+          "TSAsExpression[expression.type='TSAsExpression'][expression.typeAnnotation.type='TSUnknownKeyword'][typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name='APIClient']"(
+            node
+          ) {
+            context.report({ node, messageId: "cast" });
+          },
+        };
+      },
+    },
     // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
     // Chained assertions like `x as unknown as T` fabricate type evidence:
     // the detour through `unknown` bypasses TypeScript's assertion overlap
@@ -1847,6 +1867,9 @@ export default defineConfig([
   {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
+    rules: {
+      "local/no-unknown-cast-to-api-client": "error",
+    },
     languageOptions: {
       globals: {
         describe: "readonly",

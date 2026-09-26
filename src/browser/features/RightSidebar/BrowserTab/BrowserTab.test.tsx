@@ -1,7 +1,9 @@
 import "../../../../../tests/ui/dom";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { GlobalWindow } from "happy-dom";
 import type { ReactElement, ReactNode } from "react";
 
@@ -33,7 +35,7 @@ const sendInputMock = mock(() => undefined);
 const setPendingUrlMock = mock(() => undefined);
 let mockSession: BrowserSession | null = null;
 
-const apiMock = {
+const apiMock: TestApiOverrides<APIClient> = {
   browser: {
     listTabs: listTabsMock,
     selectTab: selectTabMock,
@@ -43,7 +45,7 @@ const apiMock = {
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
 function ApiWrapper(props: { children: ReactNode }) {
-  return <APIProvider client={apiMock as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(apiMock)}>{props.children}</APIProvider>;
 }
 
 function renderWithApi(ui: ReactElement) {

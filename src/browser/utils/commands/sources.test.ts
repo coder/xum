@@ -82,6 +82,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onOpenWorkspaceInTerminal: () => undefined,
     onToggleTheme: () => undefined,
     onSetTheme: () => undefined,
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: {
       workspace: {
         resetContext: () => Promise.resolve({ success: true, data: "reset" }),
@@ -159,6 +160,7 @@ describe("Auto routing palette actions", () => {
 });
 
 const workspaceApi = (workspace: Record<string, unknown>) =>
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
   ({
     workspace: {
       resetContext: () => Promise.resolve({ success: true as const, data: "reset" as const }),
@@ -649,6 +651,7 @@ test.each(["stable", "nightly", "npm"] as const)(
     );
     const actions = getActions({
       onOpenAbout,
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       api: { update: { install, setChannel } } as unknown as APIClient,
       supportedUpdateChannels: ["stable", "nightly", "npm"],
     });
@@ -711,6 +714,7 @@ test("Disconnect Coder command revokes via RPC and is gated on a stored credenti
   // must stay revocable.
   const disconnect = mock(() => Promise.resolve({ success: true as const, data: undefined }));
   const actions = getActions({
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: { coderOauth: { disconnect } } as unknown as APIClient,
     providersConfig: {
       coder: { coderOauthSet: false, coderOauthCredentialStored: true },
@@ -961,6 +965,7 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
       lifecycle: "active",
       goal: null,
     } as unknown as WorkspaceState,
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: {
       config: {
         // Even with default budget settings, blank palette budget means no budget.
@@ -1021,6 +1026,7 @@ test("goal set objective prompt treats blank budget as explicit no-budget", asyn
 test("goal set objective prompt allows zero budget on unpriced model", async () => {
   const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
   const actions = getVisibleGoalActions({
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: {
       config: { getConfig: mock(() => Promise.resolve({})) },
       providers: { getConfig: mock(() => Promise.resolve({})) },
@@ -1050,6 +1056,7 @@ test("goal set objective prompt submits objective and parsed budget", async () =
   const getGoal = mock(() => Promise.resolve({ goal: null }));
   const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("active") }));
   const actions = getVisibleGoalActions({
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: {
       workspace: { getGoal, setGoal },
     } as unknown as APIClient,
@@ -1089,6 +1096,7 @@ test("goal set objective prompt blocks budgeted goals on unpriced selected model
     const state = makeWorkspaceState(null);
     state.currentModel = "openai:gpt-4o";
     const actions = getVisibleGoalActions({
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       api: {
         workspace: { getGoal, setGoal },
       } as unknown as APIClient,
@@ -1114,6 +1122,7 @@ test("goal mark complete prompt submits completion summary", async () => {
   const getGoal = mock(() => Promise.resolve({ goal: makeGoalRecord("active") }));
   const setGoal = mock(() => Promise.resolve({ success: true, data: makeGoalRecord("complete") }));
   const actions = getVisibleGoalActions({
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: {
       workspace: { getGoal, setGoal },
     } as unknown as APIClient,
@@ -1152,6 +1161,7 @@ test("goal palette surfaces invalid transition messages without throwing", async
       })
     );
     const actions = getVisibleGoalActions({
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       api: {
         workspace: {
           getGoal: mock(() => Promise.resolve({ goal: makeGoalRecord("active") })),
@@ -1225,6 +1235,7 @@ test("toggle keep screen awake command inverts the persisted config flag", async
     return Promise.resolve();
   });
   const actions = getActions({
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     api: {
       config: {
         getConfig: () => Promise.resolve({ keepScreenAwake }),
@@ -1274,6 +1285,7 @@ test("analytics rebuild command calls route and dispatches toast feedback", asyn
 
   try {
     const actions = getActions({
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       api: {
         workspace: {
           truncateHistory: () => Promise.resolve({ success: true, data: undefined }),
@@ -1319,6 +1331,7 @@ test("analytics rebuild command falls back to alert when chat input toast host i
 
   try {
     const actions = getActions({
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       api: {
         workspace: {
           truncateHistory: () => Promise.resolve({ success: true, data: undefined }),

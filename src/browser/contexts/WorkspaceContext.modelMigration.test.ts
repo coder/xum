@@ -1,21 +1,21 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
-import type { APIClient } from "@/browser/contexts/API";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { migrateLocalModelPrefsToBackend } from "./WorkspaceContext";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function createApiMock() {
   const updateModelPreferences = mock(() => Promise.resolve(undefined));
 
   return {
-    api: {
+    api: createTestApiClient({
       config: {
         updateModelPreferences,
       },
-    } as unknown as APIClient,
+    }),
     updateModelPreferences,
   };
 }

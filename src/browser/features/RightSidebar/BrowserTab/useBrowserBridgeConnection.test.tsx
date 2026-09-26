@@ -1,5 +1,5 @@
 import "../../../../../tests/ui/dom";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -15,11 +15,11 @@ const getBootstrapMock = mock(() =>
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
-const apiClient = {
+const apiClient = createTestApiClient({
   browser: {
     getBootstrap: getBootstrapMock,
   },
-} as unknown as APIClient;
+});
 
 function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={apiClient}>{props.children}</APIProvider>;
@@ -27,6 +27,7 @@ function ApiWrapper(props: { children: ReactNode }) {
 
 import type { useBrowserBridgeConnection as UseBrowserBridgeConnection } from "./useBrowserBridgeConnection";
 import { useBrowserBridgeConnection as untypedUseBrowserBridgeConnection } from "./useBrowserBridgeConnection.ts?test-isolation=static";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const useBrowserBridgeConnection =
   untypedUseBrowserBridgeConnection as unknown as typeof UseBrowserBridgeConnection;

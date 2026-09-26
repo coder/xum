@@ -23,6 +23,7 @@ async function* emptyStream() {
 function createStubApiClient(): APIClient {
   // Avoid mock.module (global) by injecting a minimal client through providers.
   // Keep this stub local unless other tests need the same wiring.
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
   return {
     providers: {
       getConfig: () => Promise.resolve(null),
@@ -60,6 +61,7 @@ const createPolicyChurnClient = () => {
     }
   }
 
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
   const client = {
     providers: {
       getConfig: () => Promise.resolve(null),

@@ -13,7 +13,6 @@ import {
 import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { RecursivePartial } from "@/browser/testUtils";
 import {
   getAutoThinkingLevelKey,
   getModelKey,
@@ -27,8 +26,9 @@ import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 let metadataMap = new Map<string, FrontendWorkspaceMetadata>();
 const METADATA_WAIT_OPTIONS = { timeout: 5000, interval: 50 };
 
@@ -114,7 +114,9 @@ const ReasoningModeComponent: React.FC = () => {
 };
 
 function renderWithAPI(children: React.ReactNode) {
-  return render(<APIProvider client={currentClientMock as APIClient}>{children}</APIProvider>);
+  return render(
+    <APIProvider client={createTestApiClient(currentClientMock)}>{children}</APIProvider>
+  );
 }
 
 function createWorkspaceMetadata(
@@ -222,7 +224,7 @@ function createWorkspaceClient(): APIClient {
   const projectOverrides = currentClientMock.projects ?? {};
   const serverOverrides = currentClientMock.server ?? {};
 
-  return {
+  return createTestApiClient({
     ...currentClientMock,
     workspace: {
       list: () => Promise.resolve(Array.from(metadataMap.values())),
@@ -254,7 +256,7 @@ function createWorkspaceClient(): APIClient {
       getLaunchProject: () => Promise.resolve(null),
       ...serverOverrides,
     },
-  } as unknown as APIClient;
+  });
 }
 
 function renderWithWorkspaceMetadata(props: {

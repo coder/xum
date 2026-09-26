@@ -12,6 +12,7 @@ import {
 import type { MuxMessage } from "@/common/types/message";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { useResumeStream } from "./useResumeStream";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const DEFAULT_WORKSPACE_ID = "ws-1";
 
@@ -25,9 +26,9 @@ const setAutoRetryEnabled = mock((_input: unknown) =>
 );
 
 function createApiClient(): APIClient {
-  return {
+  return createTestApiClient({
     workspace: { resumeStream, setAutoRetryEnabled },
-  } as unknown as APIClient;
+  });
 }
 
 function createWorkspaceMetadata(workspaceId: string): FrontendWorkspaceMetadata {

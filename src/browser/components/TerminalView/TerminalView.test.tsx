@@ -1,10 +1,11 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { ReactNode } from "react";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;
@@ -132,11 +133,11 @@ function createRouter(): MockRouter {
 
 // Inject the client through the real provider; mocking the API module leaks process-wide
 // into later suites.
-const apiClient = {
+const apiClient = createTestApiClient({
   terminal: {
     onExit: terminalOnExitMock,
   },
-} as unknown as APIClient;
+});
 
 function APIWrapper(props: { children: ReactNode }) {
   return <APIProvider client={apiClient}>{props.children}</APIProvider>;

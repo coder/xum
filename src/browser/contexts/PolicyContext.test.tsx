@@ -5,6 +5,7 @@ import React from "react";
 import type { PolicyGetResponse } from "@/common/orpc/types";
 import { APIProvider, type APIClient } from "./API";
 import { PolicyProvider, usePolicy } from "./PolicyContext";
+import { createTestApiClient } from "@/browser/testUtils";
 
 async function* emptyStream() {
   // no-op
@@ -15,12 +16,12 @@ let mockGet: () => Promise<PolicyGetResponse>;
 // Keep the API client local to each render so this suite does not leak a process-global
 // mock.module override into later context tests.
 function createApiClient(): APIClient {
-  return {
+  return createTestApiClient({
     policy: {
       get: () => mockGet(),
       onChanged: () => Promise.resolve(emptyStream()),
     },
-  } as unknown as APIClient;
+  });
 }
 
 const buildBlockedResponse = (reason: string): PolicyGetResponse => ({

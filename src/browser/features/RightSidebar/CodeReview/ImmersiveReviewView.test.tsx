@@ -52,6 +52,7 @@ function ApiWrapper(props: { children: ReactNode }) {
       </APIContext.Provider>
     );
   }
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs bash result builder)
   return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
 }
 

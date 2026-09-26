@@ -1,11 +1,12 @@
 import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 interface MockWorkspaceState {
@@ -74,7 +75,9 @@ function createDeferred<T>() {
 let resumeStreamResult: ResumeStreamResult = { success: true, data: { started: true } };
 let previousAutoRetryEnabled = false;
 const resumeStream = mock((_input: unknown) => Promise.resolve(resumeStreamResult));
-const interruptStream = mock((_input: unknown) => Promise.resolve({ success: true as const }));
+const interruptStream = mock((_input: unknown) =>
+  Promise.resolve({ success: true as const, data: undefined })
+);
 const setAutoRetryEnabled = mock((input: unknown) => {
   if (
     typeof input === "object" &&
@@ -99,13 +102,13 @@ const setAutoRetryEnabled = mock((input: unknown) => {
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
-const apiClient = {
+const apiClient = createTestApiClient({
   workspace: {
     resumeStream,
     interruptStream,
     setAutoRetryEnabled,
   },
-} as unknown as APIClient;
+});
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const actualWorkspaceStore =

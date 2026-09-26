@@ -32,6 +32,7 @@ function renderGoalsSection(config: { goalDefaults?: GoalDefaults } = {}) {
   // Inject the config-only client through the real provider; mocking the API module leaks
   // into later files.
   const view = render(
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     <APIProvider client={mockApi as unknown as APIClient}>
       <ThemeProvider forcedTheme="dark">
         <GoalsSection />

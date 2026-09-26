@@ -5,7 +5,7 @@ import { GlobalWindow } from "happy-dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { MAX_LOG_ENTRIES } from "@/common/constants/ui";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 
 type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -21,16 +21,11 @@ type LogStreamEvent =
   | { type: "append"; epoch: number; entries: LogEntry[] }
   | { type: "reset"; epoch: number };
 
-interface MockAPI {
-  general: {
-    subscribeLogs: () => Promise<AsyncGenerator<LogStreamEvent, void, unknown>>;
-    clearLogs: () => Promise<{ success: boolean; error?: string | null }>;
-  };
-}
-
-let mockApi: MockAPI | null = null;
+let mockApi: TestApiOverrides<APIClient> | null = null;
 
 import { OutputTab } from "../OutputTab/OutputTab";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 // Inject the per-test client through the real provider; mocking the API module leaks
 // process-wide into later suites.
@@ -39,7 +34,7 @@ function renderOutputTab() {
     throw new Error("Tests must assign mockApi before rendering OutputTab");
   }
   return render(
-    <APIProvider client={mockApi as unknown as APIClient}>
+    <APIProvider client={createTestApiClient(mockApi)}>
       <OutputTab workspaceId="workspace-1" />
     </APIProvider>
   );

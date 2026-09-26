@@ -81,6 +81,7 @@ describe("openInEditor", () => {
   // Editor opens must be recorded on the backend before any launch (archive safety), so
   // every launch-path test needs an api stub whose recording succeeds.
   function createApiStub(extra?: Record<string, unknown>): APIClient {
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     return {
       general: {
         recordEditorOpen: () => Promise.resolve({ success: true }),
@@ -185,6 +186,7 @@ describe("openInEditor", () => {
   test("does not record the open when a deterministic compatibility check refuses", async () => {
     const calls: OpenCall[] = [];
     const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     // Zed + Docker is refused deterministically with no launch; recording first would leave
@@ -236,6 +238,7 @@ describe("openInEditor", () => {
 
     const recordEditorOpen = mock(() => Promise.reject(new Error("connection lost")));
     const rollbackEditorOpen = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = {
       general: { recordEditorOpen, rollbackEditorOpen },
     } as unknown as APIClient;
@@ -269,6 +272,7 @@ describe("openInEditor", () => {
     // Resolving this recording RPC yields the microtask queue, exactly the await that would
     // outlast the click's transient user activation if window.open ran after it.
     const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>
@@ -316,6 +320,7 @@ describe("openInEditor", () => {
   test("browser mode: closes the placeholder when the open is refused", async () => {
     const calls: OpenCall[] = [];
     const { windowValue, placeholder } = createBrowserModeWindow(calls);
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = {
       general: {
         recordEditorOpen: () => Promise.resolve({ success: false, error: "being archived" }),
@@ -348,6 +353,7 @@ describe("openInEditor", () => {
       return Promise.resolve({ success: true });
     });
     const rollbackEditorOpen = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = { general: { recordEditorOpen, rollbackEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>
@@ -378,6 +384,7 @@ describe("openInEditor", () => {
     const { windowValue, placeholder } = createBrowserModeWindow(calls);
     const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
     // The devcontainer-info await runs before admission; the user closes the tab during it.
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = {
       general: { recordEditorOpen },
       workspace: {
@@ -415,6 +422,7 @@ describe("openInEditor", () => {
       denyEditorPlaceholders: true,
     });
     const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>
@@ -436,6 +444,7 @@ describe("openInEditor", () => {
     const calls: OpenCall[] = [];
     const { windowValue, placeholder } = createBrowserModeWindow(calls, { popupBlocked: true });
     const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>

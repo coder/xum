@@ -135,6 +135,7 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
 
 // Inject the per-test client through the real provider; mocking the API module leaks across files.
 function ApiWrapper(props: { children: ReactNode }) {
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
   return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
 }
 

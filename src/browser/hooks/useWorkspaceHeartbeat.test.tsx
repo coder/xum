@@ -52,6 +52,7 @@ function createWrapper(api: HeartbeatApi): React.FC<{ children: React.ReactNode 
     } as unknown as WorkspaceContextValue;
 
     return (
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       <APIProvider client={api as unknown as APIClient}>
         <WorkspaceContext.Provider value={workspaceContext}>
           {props.children}

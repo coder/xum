@@ -21,6 +21,7 @@ describe("cancelCompaction", () => {
       return Promise.resolve({ success: true });
     });
 
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const client = {
       workspace: {
         interruptStream,
@@ -69,6 +70,7 @@ describe("cancelCompaction", () => {
 
   test("strips generated staged notices from raw compaction commands", async () => {
     const interruptStream = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const client = {
       workspace: {
         interruptStream,
@@ -124,6 +126,7 @@ describe("cancelCompaction", () => {
       return Promise.resolve({ success: true });
     });
 
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const client = {
       workspace: {
         interruptStream,
@@ -182,6 +185,7 @@ describe("cancelCompaction", () => {
 
   test("restores staged follow-up attachments without exposing the hidden notice", async () => {
     const interruptStream = mock(() => Promise.resolve({ success: true }));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     const client = {
       workspace: {
         interruptStream,

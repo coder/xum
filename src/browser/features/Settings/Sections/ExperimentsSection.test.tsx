@@ -61,6 +61,7 @@ let experimentValues: Record<string, boolean> = {};
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
 function ApiWrapper(props: { children: ReactNode }) {
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
   return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
 }
 

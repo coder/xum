@@ -1,5 +1,5 @@
 import "../../../../../tests/ui/dom";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -16,13 +16,14 @@ const controlMock = mock<() => Promise<BrowserControlResponse>>(() =>
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
-const apiClient = {
+const apiClient = createTestApiClient({
   browser: {
     control: controlMock,
   },
-} as unknown as APIClient;
+});
 
 import { BrowserToolbar } from "./BrowserToolbar";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function renderToolbar(overrides: Partial<ComponentProps<typeof BrowserToolbar>> = {}) {
   const onSetPendingUrl = mock(() => undefined);

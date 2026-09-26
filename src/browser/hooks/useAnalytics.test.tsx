@@ -8,7 +8,7 @@ import type { AppRouter } from "@/node/orpc/router";
 // eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 import type { ORPCContext } from "@/node/orpc/context";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import type { SavedQuery } from "@/common/types/savedQueries";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import {
@@ -79,7 +79,7 @@ function renderAnalyticsHook<TResult>(callback: () => TResult) {
 
   return renderHook(callback, {
     wrapper: (props: { children: React.ReactNode }) => (
-      <APIProvider client={apiClient as unknown as APIClient}>{props.children}</APIProvider>
+      <APIProvider client={apiClient}>{props.children}</APIProvider>
     ),
   });
 }
