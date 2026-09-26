@@ -146,7 +146,7 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
   const preEditDraftRef = useRef<ReturnType<typeof getDraft>>({ text: "", attachments: [] });
   const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   return {
-    storageKeys: { inputKey },
+    storageKeys: { inputKey, attachmentsKey },
     input,
     setInput,
     latestInputValueRef,

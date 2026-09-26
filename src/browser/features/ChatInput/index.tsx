@@ -217,6 +217,7 @@ import {
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
 import { useComposerSuggestions } from "./useComposerSuggestions";
+import { readPersistedChatAttachments } from "./draftAttachmentsStorage";
 import {
   commandBypassesTranscriptBarrier,
   isTranscriptMutationAllowed,
@@ -1456,6 +1457,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         if (restoredAttachments.length > 0) {
           setAttachments((current) => [...restoredAttachments, ...current]);
         }
+        let reviewsInStore = true;
         if (restoredPending.reviews.length > 0) {
           if (draftReviews === null && onAddReviewForRestore) {
             // The draft's notes live in the review store: add the restored ones there too, as
@@ -1466,13 +1468,28 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           } else {
             // An active override (e.g. a queued-message edit) owns the composer's notes.
             setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
+            reviewsInStore = false;
           }
         }
-        // The backend keeps this input as held input until a composer takes it (#4448). The
-        // setters above persist synchronously, so the draft is durable before the backend's copy
-        // is released. The edit-mode return above takes nothing, so it stays a "Not sent" banner.
+        // The backend keeps this input as held input until a composer takes it (#4448). Release
+        // that copy only once every restored part is durable: the setters above write storage
+        // synchronously, but a write can be skipped (attachments too large to save) or fail, and
+        // override notes live in memory only. Otherwise the "Not sent" banner stays next to the
+        // composer's copy: a visible duplicate beats a loss. Edit mode (above) takes nothing.
         const heldInputIds = customEvent.detail.heldInputIds ?? [];
-        if (heldInputIds.length > 0) onAcceptRestoredHeldInputs?.(heldInputIds);
+        if (heldInputIds.length > 0) {
+          const persistedAttachmentIds = new Set(
+            readPersistedChatAttachments(storageKeys.attachmentsKey).map(({ id }) => id)
+          );
+          const durable =
+            (restoredPending.content.trim().length === 0 ||
+              readPersistedState<string>(storageKeys.inputKey, "").startsWith(
+                restoredPending.content
+              )) &&
+            restoredAttachments.every(({ id }) => persistedAttachmentIds.has(id)) &&
+            reviewsInStore;
+          if (durable) onAcceptRestoredHeldInputs?.(heldInputIds);
+        }
         focusMessageInput();
       } else if (mode === "replace") {
         if (editingMessageForUi) {
@@ -1514,6 +1531,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setDraftReviews,
     onAddReviewForRestore,
     onAcceptRestoredHeldInputs,
+    storageKeys.inputKey,
+    storageKeys.attachmentsKey,
     focusMessageInput,
   ]);
 

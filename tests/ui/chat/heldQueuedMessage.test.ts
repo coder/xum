@@ -8,6 +8,7 @@ import { act, fireEvent, waitFor } from "@testing-library/react";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
+import type { FilePart } from "@/common/orpc/types";
 import { getInputAttachmentsKey, getInputKey, getReviewsKey } from "@/common/constants/storage";
 import { prepareUserMessageForSend } from "@/common/types/message";
 import { formatReviewForModel, type ReviewNoteData } from "@/common/types/review";
@@ -533,6 +534,40 @@ describe("Held (refused) queued messages", () => {
     }
   }, 60_000);
 
+  test("a restore whose attachment is too large to save keeps its held copy: the banner stays and nothing is released", async () => {
+    // Codex PRRT_kwDOPxxmWM6mTpjx: the draft keeps such attachments in memory only, so releasing
+    // the backend's copy would lose them on the next workspace switch or restart.
+    const app = await createAppHarness({ branchPrefix: "restore-ack-large" });
+    try {
+      const workspaceService = app.env.services.workspaceService;
+      const session = workspaceService.getOrCreateSession(app.workspaceId);
+      const heldInputId = await holdOneRefusedMessage(app, "held with a large file");
+      const discard = jest.spyOn(workspaceService, "discardHeldInput");
+      const largeFile = {
+        url: `data:text/plain;base64,${"A".repeat(4_100_000)}`,
+        mediaType: "text/plain",
+        filename: "large.txt",
+      };
+
+      await emitRestoreAndWaitForDispatch(
+        app,
+        "held with a large file",
+        [heldInputId],
+        [largeFile]
+      );
+
+      await app.chat.expectInputValue("held with a large file");
+      // An acknowledgement would have been requested synchronously with the restore.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(discard).not.toHaveBeenCalled();
+      expect(heldBanners(app)).toHaveLength(1);
+      expect(session.getHeldInputs().map((held) => held.id)).toEqual([heldInputId]);
+      discard.mockRestore();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
   test("when the acknowledgement fails, the taken input's banner shows again: a visible duplicate, never a hidden copy", async () => {
     const app = await createAppHarness({ branchPrefix: "restore-ack-fail" });
     try {
@@ -584,7 +619,8 @@ async function holdOneRefusedMessage(app: AppHarness, text: string): Promise<str
 async function emitRestoreAndWaitForDispatch(
   app: AppHarness,
   text: string,
-  heldInputIds: string[]
+  heldInputIds: string[],
+  fileParts?: FilePart[]
 ): Promise<void> {
   const dispatched = new Promise<void>((resolve) => {
     const listener = () => {
@@ -598,6 +634,7 @@ async function emitRestoreAndWaitForDispatch(
     workspaceId: app.workspaceId,
     text,
     heldInputIds,
+    ...(fileParts ? { fileParts } : {}),
   });
   await act(async () => {
     await dispatched;
