@@ -637,8 +637,8 @@ describe("GeneralSection", () => {
   });
 
   test("loads the SSH host setting in browser mode", async () => {
-    // GeneralSection decides browser mode (no window.api) when its module evaluates, so this
-    // only passes if the DOM bootstrap import above ran before GeneralSection was loaded.
+    // Browser mode means no window.api. It is read at render time, so this holds even when
+    // another test file in the same process imported GeneralSection before the DOM existed.
     const { api, view } = renderGeneralSection();
 
     await waitFor(() => {
