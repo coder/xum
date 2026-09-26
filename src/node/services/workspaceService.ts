@@ -6610,6 +6610,17 @@ export class WorkspaceService
           tombstonePublished = true;
         }
 
+        // #4478: stop this process's users of the checkout BEFORE deleting it. MCP servers,
+        // terminals and background processes run with their cwd inside the checkout; stopping them
+        // only after the deletion (the later calls below, kept for the metadata-less path) left
+        // them running in a deleted tree. Same trade-off as the producer drains above: a
+        // force=false deletion that fails below keeps the workspace with these already stopped,
+        // which is recoverable (MCP servers restart on demand), unlike a process outliving its
+        // checkout.
+        await this.mcpServerManager?.stopServers(workspaceId);
+        this.terminalService?.closeWorkspaceSessions(workspaceId);
+        await this.backgroundProcessManager.cleanup(workspaceId);
+
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
           const deleteErrors: string[] = [];

@@ -19,6 +19,8 @@ import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import type { TerminalService } from "@/node/services/terminalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
@@ -445,6 +447,54 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       const result = await harness.service.remove(workspaceId, true);
       expect(result.success).toBe(true);
       expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  // #4478: MCP servers, terminals and background processes run with their cwd in the checkout, so
+  // this process stops them before the checkout is deleted, never after.
+  test("stops this process's MCP servers, terminals and background processes before deleting the checkout", async () => {
+    const calls: string[] = [];
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
+    deleteWorkspace.mockImplementation(() => {
+      calls.push("deleteWorkspace");
+      return Promise.resolve({ success: true as const, deletedPath: sharedPath });
+    });
+    try {
+      await using harness = await createChildHarness(undefined);
+      harness.service.setMCPServerManager({
+        stopServers: mock((id: string) => {
+          calls.push(`stopServers:${id}`);
+          return Promise.resolve();
+        }),
+      } as unknown as MCPServerManager);
+      harness.service.setTerminalService({
+        setWorkspaceArchiveGuard: mock(() => undefined),
+        closeWorkspaceSessions: mock((id: string) => {
+          calls.push(`closeWorkspaceSessions:${id}`);
+        }),
+      } as unknown as TerminalService);
+      const cleanup = harness.backgroundProcessManager.cleanup.bind(
+        harness.backgroundProcessManager
+      );
+      spyOn(harness.backgroundProcessManager, "cleanup").mockImplementation((id: string) => {
+        calls.push(`backgroundCleanup:${id}`);
+        return cleanup(id);
+      });
+
+      const result = await harness.service.remove(workspaceId, true);
+
+      expect(result.success).toBe(true);
+      const deletedAt = calls.indexOf("deleteWorkspace");
+      expect(deletedAt).toBeGreaterThan(-1);
+      for (const stop of [
+        `stopServers:${workspaceId}`,
+        `closeWorkspaceSessions:${workspaceId}`,
+        `backgroundCleanup:${workspaceId}`,
+      ]) {
+        expect(calls.slice(0, deletedAt)).toContain(stop);
+      }
     } finally {
       createRuntimeSpy.mockRestore();
     }
