@@ -9690,15 +9690,23 @@ export class TaskService implements AgentTaskIntegration {
     const index = this.buildAgentTaskIndex(cfg);
     // The refused send's authorization must still hold: same relation and, for unrelated
     // targets, the same consent grant (a revoke or off→on cycle is a new grant).
-    const relation = this.resolveAgentTreeTargetRelation(index.parentById, senderId, targetId);
-    if (relation !== waiter.relation) return;
-    if (
-      relation === "target_unrelated" &&
-      getValidUnrelatedWorkspaceConsent(targetEntry.workspace.unrelatedWorkspaceConsent) !==
-        waiter.unrelatedConsent
-    ) {
-      return;
-    }
+    const grantStillValid = (): boolean => {
+      const freshCfg = this.config.loadConfigOrDefault();
+      const freshTarget = findWorkspaceEntry(freshCfg, targetId);
+      if (freshTarget == null) return false;
+      const relation = this.resolveAgentTreeTargetRelation(
+        this.buildAgentTaskIndex(freshCfg).parentById,
+        senderId,
+        targetId
+      );
+      return (
+        relation === waiter.relation &&
+        (relation !== "target_unrelated" ||
+          getValidUnrelatedWorkspaceConsent(freshTarget.workspace.unrelatedWorkspaceConsent) ===
+            waiter.unrelatedConsent)
+      );
+    };
+    if (!grantStillValid()) return;
     const chainIds = (workspaceId: string): string[] => [
       workspaceId,
       ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, workspaceId),
@@ -9758,31 +9766,33 @@ export class TaskService implements AgentTaskIntegration {
     // the captured restrictions stale.
     const senderTurnGeneration = this.workspaceService.getActiveTurnGeneration(senderId);
 
-    // Stops latched from here on stay authoritative through every admission gate of the send,
-    // even if the user resumes before the probe runs (same latch as peer delivery).
+    // Sender stops latched from here on stay authoritative through every admission gate of the
+    // send, even if the user resumes before the probe runs (same latch as peer delivery).
     const senderChainIds = chainIds(senderId);
     const targetChainIds = chainIds(targetId);
     const capturedStopEpochs = new Map(
-      [...senderChainIds, ...targetChainIds].map((id) => [id, this.getWorkspaceStopEpoch(id)])
+      senderChainIds.map((id) => [id, this.getWorkspaceStopEpoch(id)])
     );
-    const chainStopped = (ids: string[]): boolean =>
-      ids.some(
+    const senderChainStopped = (): boolean =>
+      senderChainIds.some(
         (id) =>
           this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id) ||
           this.isWorkspaceStopInProgress(id)
       );
+    // Target checks are level-based on purpose: a target stopped and then resumed during this
+    // notice is reachable again, and its resume's reset may already have passed this waiter.
     const targetUnavailable = (): boolean => {
       const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
       return (
         fresh == null ||
-        chainStopped(targetChainIds) ||
+        targetChainIds.some((id) => this.isWorkspaceStopInProgress(id)) ||
         chainInterrupted(targetId) ||
         this.isInactivePeerEndpointWorkspace(fresh.workspace, targetId) ||
         this.agentPeerMessageBroker.isConsecutivePeerWakeCapped(targetId)
       );
     };
     const admissionStale = (): boolean => {
-      if (chainStopped(senderChainIds) || senderInactive()) return true;
+      if (senderChainStopped() || senderInactive() || !grantStillValid()) return true;
       if (
         this.workspaceService.getActiveTurnGeneration(senderId) !== senderTurnGeneration ||
         targetUnavailable()

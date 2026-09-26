@@ -1865,6 +1865,19 @@ describe("TaskService", () => {
       expect(t.wakeCalls()).toHaveLength(1);
     });
 
+    test("a target stopped and resumed while the notice is prepared still wakes the sender", async () => {
+      const t = await setup();
+      await t.fillAndRefuseSibA("sib-c");
+      const held = t.holdNoticeInPolicyLookup();
+      t.taskService.resetAutoResumeCount("sib-b");
+      await held.reachedLookup;
+      // A full Stop→resume cycle on the target: its resume reset found no waiter (in flight).
+      t.taskService.bumpWorkspaceStopEpoch("sib-b");
+      held.release();
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
     test("a busy sender is notified only after it goes idle", async () => {
       let senderBusy = true;
       let becomeIdle!: () => void;
@@ -1926,6 +1939,7 @@ describe("TaskService", () => {
           target,
           projectWorkspace(projectPath, "f1", "f1"),
           projectWorkspace(projectPath, "f2", "f2"),
+          projectWorkspace(projectPath, "f3", "f3"),
         ],
         testTaskSettings()
       );
@@ -1939,7 +1953,9 @@ describe("TaskService", () => {
           return current;
         });
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
       const wakeCalls = () =>
         (sendMessage.mock.calls as Array<Parameters<WorkspaceHost["sendMessage"]>>).filter(
           (call) =>
@@ -1967,6 +1983,36 @@ describe("TaskService", () => {
 
       // Positive control: a refusal under the current grant is woken.
       await fillAndRefuse("f2");
+      taskService.resetAutoResumeCount("target");
+      await drainSenderLock();
+      expect(wakeCalls()).toHaveLength(1);
+
+      // A re-grant while a notice is in flight also drops it (checked again at admission).
+      await fillAndRefuse("f3");
+      const iterate = historyService.iterateFullHistory.bind(historyService);
+      let reached!: () => void;
+      const reachedLookup = new Promise<void>((resolve) => (reached = resolve));
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      let hold = true;
+      const spy = spyOn(historyService, "iterateFullHistory").mockImplementation(
+        async (...args: Parameters<typeof iterate>) => {
+          if (hold && args[0] === "sender") {
+            hold = false;
+            reached();
+            await released;
+          }
+          return iterate(...args);
+        }
+      );
+      taskService.resetAutoResumeCount("target");
+      await reachedLookup;
+      await setTargetConsent("gen-3");
+      release();
+      await drainSenderLock();
+      spy.mockRestore();
+      expect(wakeCalls()).toHaveLength(1);
+      // Dropped, not requeued: later attention has no waiter from the revoked grant.
       taskService.resetAutoResumeCount("target");
       await drainSenderLock();
       expect(wakeCalls()).toHaveLength(1);
