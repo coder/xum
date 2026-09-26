@@ -10,6 +10,8 @@ import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
+import { useMinThinkingLevels } from "xum/browser/hooks/useMinThinkingLevels";
+import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
 import { usePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { normalizeToCanonical } from "xum/common/utils/ai/models";
@@ -107,6 +109,8 @@ function ChatComposerInner(props: {
 
   const { agentId, setAgentId } = useAgent();
   const [thinkingLevel] = useThinkingLevel();
+  const { getMinimum } = useMinThinkingLevels();
+  const { config: providersConfig } = useProvidersConfig();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -192,21 +196,8 @@ function ChatComposerInner(props: {
     ensureModelInSettings(canonicalModel);
     setPreferredModel(canonicalModel);
 
-    if (!api) {
-      return;
-    }
-
-    const effectiveThinkingLevel = enforceThinkingPolicy(canonicalModel, thinkingLevel);
-
-    api.workspace
-      .updateAgentAISettings({
-        workspaceId: props.workspaceId,
-        agentId,
-        aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
+    // #4755: the webview never loads the workspace's AI settings, so a model change stays local;
+    // persisting it would also write the webview's unloaded thinking default onto the workspace.
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -262,7 +253,21 @@ function ChatComposerInner(props: {
     }, SEND_MESSAGE_TIMEOUT_MS);
 
     try {
-      const options = getSendOptionsFromStorage(props.workspaceId);
+      const storedOptions = getSendOptionsFromStorage(props.workspaceId);
+      const options = {
+        ...storedOptions,
+        // Send the level the thinking selector displays (raised to the model's minimum), not the
+        // raw stored value, so the sent level matches what the user sees.
+        thinkingLevel: enforceThinkingPolicy(
+          storedOptions.model,
+          thinkingLevel,
+          getMinimum(storedOptions.model),
+          providersConfig
+        ),
+        // #4755: these options come from webview-local storage, never loaded from the workspace.
+        // Skip persistence so a webview send cannot overwrite the workspace's agent/model/thinking.
+        skipAiSettingsPersistence: true,
+      };
 
       const result = await api.workspace.sendMessage(
         {

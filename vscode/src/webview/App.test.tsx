@@ -279,3 +279,65 @@ describe("vscode webview workspace selection", () => {
     expect(view.container.querySelector("textarea")?.disabled).toBe(false);
   });
 });
+
+// #4755: the webview never loads the workspace's AI settings, so a send must not persist its local
+// defaults onto the workspace.
+describe("vscode webview AI settings persistence", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  async function renderSelected(): Promise<{
+    bridge: TestBridge;
+    view: ReturnType<typeof render>;
+  }> {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    return { bridge, view };
+  }
+
+  function composerTextarea(view: ReturnType<typeof render>): HTMLTextAreaElement {
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    return textarea;
+  }
+
+  async function sendMessage(
+    bridge: TestBridge,
+    view: ReturnType<typeof render>
+  ): Promise<Record<string, unknown>> {
+    await typeInto(composerTextarea(view), "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    const input = sends[0].input as { options?: Record<string, unknown> };
+    if (!input.options) throw new Error("sendMessage carried no options");
+    return input.options;
+  }
+
+  test("sends without persisting AI settings onto the workspace", async () => {
+    const { bridge, view } = await renderSelected();
+    const options = await sendMessage(bridge, view);
+    expect(options.skipAiSettingsPersistence).toBe(true);
+  });
+
+  test("sends the thinking level the selector displays, not the raw stored default", async () => {
+    const { bridge, view } = await renderSelected();
+    // With nothing stored, the default model's minimum floor makes the selector show MED.
+    expect(view.container.textContent).toContain("MED");
+    const options = await sendMessage(bridge, view);
+    expect(options.thinkingLevel).toBe("medium");
+  });
+});
