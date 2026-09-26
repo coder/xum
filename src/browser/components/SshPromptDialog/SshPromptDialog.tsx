@@ -21,8 +21,15 @@ export function SshPromptDialog() {
   const pending = pendingQueue[0] ?? null;
   const [responding, setResponding] = useState(false);
   const [credentialInput, setCredentialInput] = useState("");
-  // Error reported by the backend for the current prompt's last answer attempt.
-  const [respondError, setRespondError] = useState<string | null>(null);
+  // Error reported by the backend for an answer attempt, bound to the request it answered: the
+  // prompt can be removed (timeout/another subscriber) while respond() is in flight, and a late
+  // failure must not surface on the next queued prompt.
+  const [respondFailure, setRespondFailure] = useState<{
+    requestId: string;
+    message: string;
+  } | null>(null);
+  const respondError =
+    pending && respondFailure?.requestId === pending.requestId ? respondFailure.message : null;
 
   useEffect(() => {
     if (!api) {
@@ -89,7 +96,6 @@ export function SshPromptDialog() {
   useEffect(() => {
     // Each prompt request needs a fresh credential field; carry-over risks sending stale secrets.
     setCredentialInput("");
-    setRespondError(null);
   }, [pending?.requestId]);
 
   const respond = async (response: string) => {
@@ -99,14 +105,14 @@ export function SshPromptDialog() {
 
     const requestId = pending.requestId;
     setResponding(true);
-    setRespondError(null);
+    setRespondFailure(null);
 
     try {
       const result = await api.ssh.prompt.respond({ requestId, response });
       if (!result.success) {
         // An error Result means the backend did not accept the answer: keep the
         // prompt open and show why, so the user can retry instead of losing it.
-        setRespondError(result.error);
+        setRespondFailure({ requestId, message: result.error });
         return;
       }
       // Dequeue only on success — RPC failure keeps prompt visible for retry.
@@ -118,11 +124,15 @@ export function SshPromptDialog() {
     }
   };
 
+  // role="alert" announces the failure: focus stays on the clicked button, so a silent notice
+  // would make the failed answer look like nothing happened to screen-reader users.
   const respondErrorNotice = respondError ? (
-    <WarningBox>
-      <WarningTitle>Response failed</WarningTitle>
-      <WarningText>{respondError}</WarningText>
-    </WarningBox>
+    <div role="alert">
+      <WarningBox>
+        <WarningTitle>Response failed</WarningTitle>
+        <WarningText>{respondError}</WarningText>
+      </WarningBox>
+    </div>
   ) : null;
 
   return (
