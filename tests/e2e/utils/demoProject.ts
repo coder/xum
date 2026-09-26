@@ -109,6 +109,23 @@ export function prepareDemoProject(
   };
 }
 
+function updateDemoProjectEntry(
+  demoProject: DemoProjectConfig,
+  mutate: (projectEntry: { workspaces: { path: string }[]; trusted?: boolean }) => void
+): void {
+  const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
+    projects: [string, { workspaces: { path: string }[]; trusted?: boolean }][];
+  };
+  const projectEntry = configPayload.projects.find(
+    ([projectPath]) => projectPath === demoProject.projectPath
+  );
+  if (!projectEntry) {
+    throw new Error(`Demo project ${demoProject.projectPath} is missing from config.json`);
+  }
+  mutate(projectEntry[1]);
+  fs.writeFileSync(demoProject.configPath, JSON.stringify(configPayload, null, 2));
+}
+
 /**
  * Register one more workspace in the demo project. Call before the app launches: the backend
  * reads config.json and the session metadata at startup. Returns a config shaped like the demo
@@ -132,17 +149,9 @@ export function addDemoWorkspace(
   initGitRepo(workspacePath);
 
   const workspaceId = new Config(rootDir).generateLegacyId(demoProject.projectPath, workspacePath);
-  const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
-    projects: [string, { workspaces: { path: string }[] }][];
-  };
-  const projectEntry = configPayload.projects.find(
-    ([projectPath]) => projectPath === demoProject.projectPath
-  );
-  if (!projectEntry) {
-    throw new Error(`Demo project ${demoProject.projectPath} is missing from config.json`);
-  }
-  projectEntry[1].workspaces.push({ path: workspacePath });
-  fs.writeFileSync(demoProject.configPath, JSON.stringify(configPayload, null, 2));
+  updateDemoProjectEntry(demoProject, (projectEntry) => {
+    projectEntry.workspaces.push({ path: workspacePath });
+  });
 
   const workspaceSessionDir = path.join(demoProject.sessionsDir, workspaceId);
   fs.mkdirSync(workspaceSessionDir, { recursive: true });
@@ -165,15 +174,7 @@ export function addDemoWorkspace(
  * projects. Call before the app launches: the backend reads config.json at startup.
  */
 export function trustDemoProject(demoProject: DemoProjectConfig): void {
-  const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
-    projects: [string, { trusted?: boolean }][];
-  };
-  const projectEntry = configPayload.projects.find(
-    ([projectPath]) => projectPath === demoProject.projectPath
-  );
-  if (!projectEntry) {
-    throw new Error(`Demo project ${demoProject.projectPath} is missing from config.json`);
-  }
-  projectEntry[1].trusted = true;
-  fs.writeFileSync(demoProject.configPath, JSON.stringify(configPayload, null, 2));
+  updateDemoProjectEntry(demoProject, (projectEntry) => {
+    projectEntry.trusted = true;
+  });
 }
