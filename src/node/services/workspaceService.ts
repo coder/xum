@@ -3287,8 +3287,8 @@ export class WorkspaceService
     initAbortController: AbortController;
     /**
      * What to do with a worktree checkout; default "delete" (`branch -d` keeps unmerged branches).
-     * "force-delete" is for an unpopulated checkout, which git will not remove otherwise, and
-     * "keep" for a branch this creation did not make, which a delete could remove (#4745).
+     * "force-delete" also removes a dirty or unpopulated checkout but runs `branch -D`; "keep"
+     * is for a branch this creation did not make, which any delete could remove (#4745).
      */
     checkout?: "delete" | "force-delete" | "keep";
   }): Promise<boolean> {
@@ -5770,14 +5770,9 @@ export class WorkspaceService
             workspaceName: finalWorkspaceName,
             trusted: projectConfig.trusted ?? false,
             initAbortController,
-            // Force only an unpopulated checkout on a branch this creation made: `branch -D`
-            // then hits only that fresh branch.
-            checkout:
-              createResult!.createdBranch !== true
-                ? "keep"
-                : pendingMaterialization
-                  ? "force-delete"
-                  : "delete",
+            // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
+            // is safe only on a branch this creation made.
+            checkout: createResult!.createdBranch === true ? "force-delete" : "keep",
           }).catch((rollbackError: unknown) =>
             logRegistrationRollbackFailure(workspaceId, rollbackError)
           );
@@ -6083,11 +6078,11 @@ export class WorkspaceService
         createdBranch: boolean;
       }> = [];
 
-      // onlyCreatedBranches keeps checkouts on branches this creation did not make: `branch -d`
-      // would delete such a branch when it is merged (#4745).
-      const rollbackCreatedWorkspaces = async (onlyCreatedBranches = false): Promise<void> => {
+      // ownedOnly (#4745) force-deletes only checkouts on branches this creation made and keeps the
+      // rest: any delete runs `git branch -d`/`-D`, which could remove a user's branch.
+      const rollbackCreatedWorkspaces = async (ownedOnly = false): Promise<void> => {
         for (const createdWorkspace of [...createdWorkspaces].reverse()) {
-          if (onlyCreatedBranches && !createdWorkspace.createdBranch) continue;
+          if (ownedOnly && !createdWorkspace.createdBranch) continue;
           const trusted =
             configSnapshot.projects.get(stripTrailingSlashes(createdWorkspace.project.projectPath))
               ?.trusted ?? false;
@@ -6097,7 +6092,7 @@ export class WorkspaceService
             await createdWorkspace.runtime.deleteWorkspace(
               createdWorkspace.project.projectPath,
               workspaceName,
-              false,
+              ownedOnly,
               initAbortController.signal,
               trusted
             );

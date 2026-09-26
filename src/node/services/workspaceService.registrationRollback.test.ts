@@ -16,8 +16,9 @@ import {
 } from "./workspaceService.testHarness";
 
 /**
- * #4745: when the registration config edit rejects, create/fork/rename must undo what they made
- * on disk and in memory, return the original error, and leave the next attempt unobstructed.
+ * #4745: when the registration config edit rejects, create and fork must undo what they made on
+ * disk and in memory, return the original error, and leave the next attempt unobstructed. The
+ * rename rollback is #4779.
  * Real Config, real git worktrees; only the rename that publishes config.json fails (#4752).
  */
 function failConfigPublish() {
@@ -166,6 +167,17 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       });
     }
   );
+
+  test("create removes a checkout its post-checkout hook left dirty", async () => {
+    const hook = path.join(projectPath, ".git", "hooks", "post-checkout");
+    await fs.writeFile(hook, "#!/bin/sh\necho generated > generated.txt\n", { mode: 0o755 });
+    const workspaceId = "aaaaaaaaa2";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+
+    await expectFailsWithSaveError(() => createWorktree("feature-hook"));
+    await expectNoCreationLeftovers(workspaceId, "feature-hook", [projectPath]);
+    expect(git(projectPath, "branch", "--list", "feature-hook")).toBe("");
+  });
 
   // A merged branch is the one a rollback could lose: a plain delete runs `git branch -d`.
   test.each([
