@@ -1,5 +1,5 @@
 import type { TurnCompletion } from "./streamManager";
-import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, expect, test, mock, beforeEach, afterEach, spyOn, jest } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
@@ -37,6 +37,9 @@ import {
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
+
+// bun:test's jest shim implements advanceTimersByTime; its published types omit it.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("WorkspaceService sendMessage status clearing", () => {
   let workspaceService: WorkspaceService;
@@ -2038,20 +2041,29 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
     });
 
-    // Records calls only; the real state is computed (no plan file, nothing tracked).
+    // Both record calls only; the real metadata and state are computed from disk.
+    const getInfoSpy = spyOn(workspaceService, "getInfo");
     const getPostCompactionStateSpy = spyOn(workspaceService, "getPostCompactionState");
 
+    // Fake timers make the debounce deterministic: the three clears (real disk I/O, which fake
+    // timers do not touch) all schedule before any refresh timer can fire.
+    fakeTimers.useFakeTimers();
     try {
       await session.clearPostCompactionState();
       await session.clearPostCompactionState();
       await session.clearPostCompactionState();
+      expect(getInfoSpy).not.toHaveBeenCalled();
 
-      // The refresh reads real state from disk, so wait for its emit rather than a fixed delay.
+      // Each fired refresh calls getInfo synchronously from its timer callback, so the count
+      // right after advancing is the number of refreshes the clears left scheduled.
+      fakeTimers.advanceTimersByTime(1_000);
+      expect(getInfoSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
+
+    try {
       await waitForCondition(() => emitted.length > 0, { timeoutMs: 5_000 });
-      // Duplicate refreshes would have been scheduled by the same three clears: give any second
-      // timer one more debounce window before asserting there is exactly one emit.
-      await new Promise((resolve) => setTimeout(resolve, 150));
-
       expect(getPostCompactionStateSpy).toHaveBeenCalledTimes(1);
       expect(emitted).toHaveLength(1);
 
