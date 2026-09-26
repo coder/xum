@@ -7199,10 +7199,9 @@ export class WorkspaceService
 
       // Remove from config
       try {
-        await this.config.removeWorkspace(
-          workspaceId,
-          pendingRemovalId != null ? { removalId: pendingRemovalId } : undefined
-        );
+        await (pendingRemovalId != null
+          ? this.config.removeWorkspace(workspaceId, { removalId: pendingRemovalId })
+          : this.config.removeWorkspace(workspaceId));
       } catch (error) {
         // r62: the session directory and its durable removal tombstone are
         // already committed above. If deregistration fails here (e.g. the

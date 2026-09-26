@@ -7,7 +7,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import { createTestProject, projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import type { SessionUsageService } from "./sessionUsageService";
@@ -792,13 +792,19 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       const midMetadata = await config.getWorkspaceMetadataById("ws-mid");
       if (midMetadata == null) throw new Error("ws-mid metadata is missing");
       spyOn(aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(midMetadata));
+      const readConfigFile = async () =>
+        (
+          JSON.parse(await fsPromises.readFile(configFilePath(config.rootDir), "utf-8")) as {
+            projects: unknown;
+          }
+        ).projects;
+      const configBefore = await readConfigFile();
       const loadConfigOrDefault = spyOn(config, "loadConfigOrDefault").mockImplementation(
         (options?: { throwOnError?: boolean }) => {
           if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
           return { projects: new Map() };
         }
       );
-      const editConfig = spyOn(config, "editConfig");
       const removeWorkspace = spyOn(config, "removeWorkspace");
       try {
         const refused = await harness.service.remove("ws-mid");
@@ -809,7 +815,9 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
         }
         expect(deleteWorkspace).not.toHaveBeenCalled();
         expect(removeWorkspace).not.toHaveBeenCalled();
-        expect(editConfig).not.toHaveBeenCalled();
+        // The only config writes were the removal's admission marker and its release (#4478,
+        // made on the bytes under the config lock); nothing was pinned from the fallback read.
+        expect(await readConfigFile()).toEqual(configBefore);
 
         // Forced removal accepts the loss and proceeds.
         const forced = await harness.service.remove("ws-mid", true);
