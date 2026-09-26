@@ -571,47 +571,22 @@ export async function setApiServerSettings(
   const serveWebUi =
     input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
   const port = input.port === null || input.port === 0 ? undefined : input.port;
-  const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
-  const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
-  // Restore from the live listening address, not config: a corrupt config reads as defaults,
-  // and an auto-selected port would otherwise come back as a different one.
-  const liveInfo = context.serverService.getServerInfo();
-  // Best effort, so callers see the original settings error.
-  const restartWithPreviousSettings = async (): Promise<void> => {
-    const authToken = context.serverService.getApiAuthToken();
-    if (!wasRunning || !authToken) return;
-    try {
-      await context.serverService.startServer({
-        xumHome: context.config.rootDir,
-        context,
-        serveStatic: prevServeWebUi === true,
-        authToken,
-        host: liveInfo?.bindHost ?? prevBindHost ?? "127.0.0.1",
-        port: liveInfo?.port ?? envPort ?? prevPort ?? 0,
-      });
-    } catch {
-      // Best effort: preserve the original settings error.
-    }
-  };
 
+  // Write before stopping (#4444): a rejected write then leaves the running server, with its
+  // live address and mode, untouched instead of stopped while disk keeps the old settings.
+  await context.config.editConfig((config) => {
+    config.apiServerServeWebUi = serveWebUi;
+    config.apiServerBindHost = bindHost;
+    config.apiServerPort = port;
+    return config;
+  });
   if (wasRunning) await context.serverService.stopServer();
-  try {
-    await context.config.editConfig((config) => {
-      config.apiServerServeWebUi = serveWebUi;
-      config.apiServerBindHost = bindHost;
-      config.apiServerPort = port;
-      return config;
-    });
-  } catch (error) {
-    // The previous settings are still on disk (#4444): run the server on them again
-    // instead of leaving it down.
-    await restartWithPreviousSettings();
-    throw error;
-  }
 
   if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
     const authToken = context.serverService.getApiAuthToken();
     if (!authToken) throw new Error("API server auth token not initialized");
+    const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
+    const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
     try {
       await context.serverService.startServer({
         xumHome: context.config.rootDir,
@@ -628,7 +603,20 @@ export async function setApiServerSettings(
         config.apiServerPort = prevPort;
         return config;
       });
-      await restartWithPreviousSettings();
+      if (wasRunning) {
+        try {
+          await context.serverService.startServer({
+            xumHome: context.config.rootDir,
+            context,
+            serveStatic: prevServeWebUi === true,
+            authToken,
+            host: prevBindHost ?? "127.0.0.1",
+            port: envPort ?? prevPort ?? 0,
+          });
+        } catch {
+          // Best effort: preserve the original settings error.
+        }
+      }
       throw error;
     }
   }
