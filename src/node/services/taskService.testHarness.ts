@@ -654,6 +654,7 @@ export function createTaskServiceStack(
   );
   taskService.setWorkspaceTurnManager(workspaceTurnManager);
   trackTaskTreeHolds(taskService);
+  recordTerminalAttentionDrainFailures(taskService);
   const events = overrides.aiEvents ?? aiServiceEvents.get(aiService);
   if (events != null) {
     taskServiceStreamEvents.set(taskService, events);
@@ -683,6 +684,41 @@ function trackTaskTreeHolds(taskService: TaskService): void {
   const original = target.withTaskTreeLifecycleLocks.bind(taskService);
   target.withTaskTreeLifecycleLocks = (ids, operation) =>
     original(ids, () => runWithTaskTreeHold(operation));
+}
+
+/** Terminal-attention drain rejections not yet taken, per TaskService (see flushTerminalAttentionDrains). */
+const terminalAttentionDrainFailures = new WeakMap<TaskService, unknown[]>();
+
+/**
+ * Observe (never alter) the private drain: scheduleTerminalAttentionDrain only logs a rejection,
+ * so a negative-only test ("nothing was sent") would still pass if the drain threw before
+ * deciding anything. Record each rejection so the flush helper can rethrow it.
+ */
+function recordTerminalAttentionDrainFailures(taskService: TaskService): void {
+  const target = taskService as unknown as {
+    drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+  };
+  const original = target.drainTerminalAttention.bind(taskService);
+  const failures: unknown[] = [];
+  terminalAttentionDrainFailures.set(taskService, failures);
+  target.drainTerminalAttention = async (ownerWorkspaceId) => {
+    try {
+      await original(ownerWorkspaceId);
+    } catch (error) {
+      failures.push(error);
+      throw error;
+    }
+  };
+}
+
+/** Remove and return the drain rejections recorded since the last call. */
+export function takeTerminalAttentionDrainFailures(taskService: TaskService): unknown[] {
+  const failures = terminalAttentionDrainFailures.get(taskService);
+  assert(
+    failures,
+    "drain failures are recorded only for a TaskService built by createTaskServiceStack"
+  );
+  return failures.splice(0);
 }
 
 /** Handler rejections keyed by the event object the listener handed to the handler. */

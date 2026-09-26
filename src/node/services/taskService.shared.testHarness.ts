@@ -35,6 +35,7 @@ import {
   saveLocalParentWorkspace,
   saveWorkspaces,
   stubStableIds,
+  takeTerminalAttentionDrainFailures,
   testTaskSettings,
   workspaceTurnManagerFor,
   workspaceTurnManagerInternals,
@@ -340,16 +341,62 @@ export function getTaskToolPart(
     | undefined;
 }
 
-export async function flushTerminalAttentionDrains(taskService: TaskService): Promise<void> {
-  // Terminal wake-ups are delivered by an async drain; await any in-flight drains, then await
-  // again in case a drain scheduled another (idempotent, settles quickly).
-  for (let i = 0; i < 3; i++) {
+/**
+ * Terminal wake-ups are delivered by an async drain; await any in-flight drains, then await
+ * again in case a drain scheduled another (idempotent, settles quickly). Rethrows a drain
+ * rejection, which production only logs, so a test asserting that nothing was delivered cannot
+ * pass because the drain threw. `passes: 1` awaits only the drains already scheduled, for tests
+ * whose owner never goes idle (a busy drain's idle wait would otherwise never settle).
+ */
+export async function flushTerminalAttentionDrains(
+  taskService: TaskService,
+  options: { passes?: number } = {}
+): Promise<void> {
+  const passes = options.passes ?? 3;
+  assert(passes > 0, "flushTerminalAttentionDrains needs at least one pass");
+  for (let i = 0; i < passes; i++) {
     const drains = (
       taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> }
     ).pendingTerminalAttentionDrains;
     if (drains.size === 0) break;
     await Promise.all([...drains]);
   }
+  const failures = takeTerminalAttentionDrainFailures(taskService);
+  if (failures.length > 0) {
+    throw failures[0];
+  }
+}
+
+/**
+ * Re-derive one owner's workflow wakes through the sweep's public owner-scoped route, the
+ * unarchive hook (for a workspace without a completed agent report it does nothing else).
+ * Returns how many runs the sweep newly queued, like the private sweep does. The queue is read
+ * before the drain the sweep schedules can consume it: that drain first awaits a directory read.
+ */
+export async function sweepOwnerWorkflowRunAttention(
+  taskService: TaskService,
+  ownerWorkspaceId: string
+): Promise<number> {
+  const before = queuedWorkflowRunAttention(taskService, ownerWorkspaceId);
+  await taskService.noteWorkspaceUnarchived(ownerWorkspaceId);
+  const after = queuedWorkflowRunAttention(taskService, ownerWorkspaceId);
+  return [...after].filter((runId) => !before.has(runId)).length;
+}
+
+/**
+ * Read-only copy of the owner's in-memory workflow wake queue. Nothing public reads it, and some
+ * contracts are exactly its contents (a deferred candidate must stay queued; a settled or dropped
+ * one must leave). Tests fill it through noteWorkflowRunTerminalAttention or the sweep, never by
+ * writing the map.
+ */
+export function queuedWorkflowRunAttention(
+  taskService: TaskService,
+  ownerWorkspaceId: string
+): ReadonlySet<string> {
+  const queue = (
+    taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
+  ).pendingWorkflowRunAttention;
+  return new Set(queue.get(ownerWorkspaceId));
 }
 
 export async function upsertTestSubagentReports(params: {

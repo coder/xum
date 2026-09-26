@@ -2359,10 +2359,7 @@ describe("TaskService", () => {
     );
     expect(reportMessage?.metadata?.muxMetadata).toEqual(workspaceTurnMuxMetadata(parentId));
 
-    await Promise.all([
-      ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
-        .pendingTerminalAttentionDrains,
-    ]);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(workspaceMocks.resumeStream).toHaveBeenCalledWith(
       "childworkspace",
