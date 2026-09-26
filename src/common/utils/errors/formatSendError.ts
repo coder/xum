@@ -97,6 +97,9 @@ export function formatSendMessageError(error: SendMessageError): FormattedError 
     case "history-changed":
       return { message: EDIT_HISTORY_CHANGED_MESSAGE };
 
+    case "plan_review_feedback_edit_blocked":
+      return { message: error.message };
+
     case "unknown": {
       const raw = typeof error.raw === "string" ? error.raw.trim() : "";
       return {

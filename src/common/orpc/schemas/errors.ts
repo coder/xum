@@ -31,6 +31,8 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
    * have deleted changed since the client captured its evidence. Nothing was truncated.
    */
   z.object({ type: z.literal("history-changed") }),
+  /** A direct edit targeted authentic plan-review feedback; nothing was changed. */
+  z.object({ type: z.literal("plan_review_feedback_edit_blocked"), message: z.string() }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
 ]);
 
