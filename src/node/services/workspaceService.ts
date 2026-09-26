@@ -14745,6 +14745,12 @@ export class WorkspaceService
     options?: {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
+      /**
+       * append-compaction-boundary only: the boundary is appended only while this returns true,
+       * checked under the history write lock right before the append (see
+       * HistoryService.appendToHistoryIf for the contract). A refusal returns Err.
+       */
+      admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>> {
     // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
@@ -14985,9 +14991,20 @@ export class WorkspaceService
         }
       }
 
-      const appendResult = await this.historyService.appendToHistory(workspaceId, messageToAppend);
+      const admitsAppend = options?.admitsAppend;
+      assert(
+        admitsAppend == null || replaceMode === "append-compaction-boundary",
+        "replaceHistory: admitsAppend applies to append-compaction-boundary mode only"
+      );
+      const appendResult =
+        admitsAppend != null
+          ? await this.historyService.appendToHistoryIf(workspaceId, messageToAppend, admitsAppend)
+          : await this.historyService.appendToHistory(workspaceId, messageToAppend);
       if (!appendResult.success) {
         return Err(`Failed to append summary message: ${appendResult.error}`);
+      }
+      if (appendResult.data === "refused") {
+        return Err("History append refused: its precondition no longer holds.");
       }
 
       this.sessions.get(workspaceId)?.clearUsageState();

@@ -4240,6 +4240,31 @@ export class HistoryService {
   }
 
   /**
+   * Guarded append: append `message` only while `admits()` returns true, evaluated under the same
+   * write lock (the in-process mutex plus the cross-process lockfile every backend on this Xum
+   * home takes) right before the write. Any backend's history mutation thus lands wholly before
+   * the check or wholly after this append (#4414). `admits` must be a synchronous, pure read of
+   * state outside history (e.g. a strict config read): it runs holding this workspace's history
+   * lock, so calling back into HistoryService deadlocks. A refusal is an expected outcome.
+   */
+  async appendToHistoryIf(
+    workspaceId: string,
+    message: MuxMessage,
+    admits: () => boolean
+  ): Promise<Result<"appended" | "refused">> {
+    return this.withRecoveredHistoryWriteResultLock<"appended" | "refused">(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        if (!admits()) return Ok("refused");
+        const appended = await this.appendToHistoryUnderWriteLock(workspaceId, message);
+        if (!appended.success) return Err(appended.error);
+        return Ok("appended");
+      }
+    );
+  }
+
+  /**
    * Update an existing message in history by historySequence
    * Reads the active chat.jsonl, replaces the matching message, and rewrites the file.
    *

@@ -17211,9 +17211,12 @@ export class TaskService implements AgentTaskIntegration {
 
       // The metadata and plan-file reads above awaited: another backend sharing this Xum root may
       // have re-admitted the row meanwhile, and the compaction boundary must not land in its
-      // history (#4414). MITIGATION ONLY: this check is not atomic with the history write, so a
-      // re-admission during replaceHistory's own awaits still gets the boundary. Closing that
-      // needs a history write serialized with attempt rotation (tracked on #4414).
+      // history (#4414). This check is only an early exit; the authoritative one is admitsAppend,
+      // which replaceHistory evaluates under the cross-process history write lock right before the
+      // append. A re-admission landing before that check refuses the boundary. One landing after
+      // it cannot write history until this append releases the lock (its reawaken CAS precedes its
+      // first row), so the boundary is ordered before every row of the successor: the same as
+      // "A finished its handoff, then B took over". The rest of the handoff is CAS'd below.
       if (
         rowSupersedes(
           findWorkspaceEntry(this.config.loadConfigOrDefault(), args.workspaceId)?.workspace,
@@ -17222,14 +17225,34 @@ export class TaskService implements AgentTaskIntegration {
       ) {
         return;
       }
+      let boundaryRefused = false;
       const replaceHistoryResult = await this.workspaceService.replaceHistory(
         args.workspaceId,
         summaryMessage,
         {
           mode: "append-compaction-boundary",
           deletePlanFile: false,
+          admitsAppend: () => {
+            let row: WorkspaceConfigEntry | undefined;
+            try {
+              row = findWorkspaceEntry(
+                this.config.loadConfigOrDefault({ throwOnError: true }),
+                args.workspaceId
+              )?.workspace;
+            } catch {
+              row = undefined; // Unreadable: the attempt cannot be confirmed, so fail closed.
+            }
+            boundaryRefused = row == null || rowSupersedes(row, args.streamAttemptId);
+            return !boundaryRefused;
+          },
         }
       );
+      if (boundaryRefused) {
+        log.info("Plan-task auto-handoff stopped: the row no longer names its attempt", {
+          workspaceId: args.workspaceId,
+        });
+        return;
+      }
       if (!replaceHistoryResult.success) {
         log.error("Plan-task auto-handoff failed to compact history", {
           workspaceId: args.workspaceId,

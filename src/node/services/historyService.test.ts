@@ -14,6 +14,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
+import { readFileSync } from "node:fs";
 import * as atomicWrite from "@/node/utils/writeFileAtomic";
 import * as fileLock from "@/node/utils/concurrency/fileLock";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
@@ -351,6 +352,66 @@ describe("HistoryService", () => {
 
       expect(result.success).toBe(true);
       expect(result.success && result.data).toBe("tail-mismatch");
+    });
+  });
+
+  describe("appendToHistoryIf", () => {
+    // #4414 case 5: the guard runs under the cross-process write lock, right before the append.
+    it("appends only while the guard admits, deciding while this process holds the write lock", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      const lockPath = historyWriteLockPath(config.rootDir, workspaceId);
+      const holders: string[] = [];
+      const guard = (admit: boolean) => () => {
+        holders.push(readFileSync(lockPath, "utf-8").split(":")[0]);
+        return admit;
+      };
+
+      const refused = await service.appendToHistoryIf(
+        workspaceId,
+        createMuxMessage("refused-row", "assistant", "Refused"),
+        guard(false)
+      );
+      expect(refused.success && refused.data).toBe("refused");
+      const admitted = await service.appendToHistoryIf(
+        workspaceId,
+        createMuxMessage("admitted-row", "assistant", "Admitted"),
+        guard(true)
+      );
+      expect(admitted.success && admitted.data).toBe("appended");
+
+      expect(holders).toEqual([String(process.pid), String(process.pid)]);
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "admitted-row"]);
+    });
+
+    it("a foreign backend's writer that arrives during the guard waits for the append", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createMuxMessage("msg1", "user", "Hello"));
+      const chatPath = path.join(config.sessionsDir, workspaceId, "chat.jsonl");
+      let foreign: Promise<boolean> | undefined;
+      const result = await service.appendToHistoryIf(
+        workspaceId,
+        createMuxMessage("guarded-row", "assistant", "Boundary"),
+        () => {
+          // A foreign backend's history write starts after the check has decided.
+          foreign = fileLock
+            .acquireProcessFileLock({
+              lockPath: historyWriteLockPath(config.rootDir, workspaceId),
+              timeoutMs: 5_000,
+              label: "test foreign backend",
+            })
+            .then(async (lock) => {
+              const guardedRowWritten = readFileSync(chatPath, "utf-8").includes("guarded-row");
+              await lock[Symbol.asyncDispose]();
+              return guardedRowWritten;
+            });
+          return true;
+        }
+      );
+      expect(result.success && result.data).toBe("appended");
+      // The foreign writer acquired the lock only once the guarded row was durable.
+      expect(await foreign).toBe(true);
     });
   });
 

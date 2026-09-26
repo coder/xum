@@ -3,7 +3,7 @@ import * as fsPromises from "fs/promises";
 
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
-import { Ok, type Result } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import type { TaskService } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
@@ -268,39 +268,43 @@ describe("stale attempt effects after another backend admits a successor (#4414)
     }
   );
 
-  // Known gap (#4414): the pre-write check is not atomic with the history write. A re-admission
-  // landing during replaceHistory's own read (after the check) still gets A's boundary. This
-  // test states the safe outcome and is expected to fail until the history write is serialized
-  // with attempt rotation; when it starts passing, drop `.failing`.
-  test.failing(
-    "plan-handoff history (known gap): a re-admission during replaceHistory's own read still gets A's boundary",
-    async () => {
-      const taskId = "handoffinwrite1";
-      const config = await setupChild(taskId, { agentId: "plan", agentType: "plan" });
-      const boundaries: string[] = [];
-      // Mirrors WorkspaceService.replaceHistory(append-compaction-boundary): read the current
-      // epoch's history, then append the boundary. B's admission lands during the read.
-      const replaceHistory = mock(async (_workspaceId: string, summary: { id: string }) => {
+  // #4414 case 5: the pre-write check is not atomic with the history write, so the handoff also
+  // hands replaceHistory a guard that the real one evaluates under the history write lock, right
+  // before the append (see HistoryService.appendToHistoryIf).
+  test("plan-handoff history: a re-admission during replaceHistory's own read gets no boundary from A", async () => {
+    const taskId = "handoffinwrite1";
+    const config = await setupChild(taskId, { agentId: "plan", agentType: "plan" });
+    const boundaries: string[] = [];
+    // Mirrors WorkspaceService.replaceHistory(append-compaction-boundary): read the current
+    // epoch's history, then append the boundary only if the guard admits it. B's admission
+    // lands during the read.
+    const replaceHistory = mock(
+      async (
+        _workspaceId: string,
+        summary: { id: string },
+        options?: { admitsAppend?: () => boolean }
+      ): Promise<Result<void>> => {
         await rotateOnOtherBackend(taskId, "running");
+        if (options?.admitsAppend?.() === false) return Err("history append refused");
         boundaries.push(summary.id);
         return Ok(undefined);
-      });
-      const { taskService, sendMessage } = createHarness(config, {
-        getInfo: mock(() => Promise.resolve(null)),
-        replaceHistory,
-      });
-      await endPlanStream(taskService, taskId);
-      expect(replaceHistory).toHaveBeenCalledTimes(1);
-      // The rest of the handoff is fenced: B's row keeps its agent and gets no kickoff.
-      expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
-        agentId: "plan",
-        taskAttemptId: B,
-      });
-      expect(sendMessage).not.toHaveBeenCalled();
-      // Safe outcome (currently violated): B's history gets no boundary from A.
-      expect(boundaries).toEqual([]);
-    }
-  );
+      }
+    );
+    const { taskService, sendMessage } = createHarness(config, {
+      getInfo: mock(() => Promise.resolve(null)),
+      replaceHistory,
+    });
+    await endPlanStream(taskService, taskId);
+    expect(replaceHistory).toHaveBeenCalledTimes(1);
+    // The rest of the handoff is fenced: B's row keeps its agent and gets no kickoff.
+    expect(findWorkspaceInConfig(config, taskId)).toMatchObject({
+      agentId: "plan",
+      taskAttemptId: B,
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+    // Safe outcome: B's history gets no boundary from A.
+    expect(boundaries).toEqual([]);
+  });
 
   // ---------------------------------------------------------------------------------------------
   // Plan-handoff kickoff (#4308 thread lhXRF): B takes the row after the handoff's config edit.

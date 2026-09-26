@@ -441,6 +441,8 @@ export interface WorkspaceTurnHost {
     options?: {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
+      /** See WorkspaceService.replaceHistory. */
+      admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
