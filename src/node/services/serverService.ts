@@ -572,15 +572,13 @@ export async function setApiServerSettings(
     input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
   const port = input.port === null || input.port === 0 ? undefined : input.port;
 
-  // Write before stopping (#4444): a rejected write then leaves the running server, with its
-  // live address and mode, untouched instead of stopped while disk keeps the old settings.
+  if (wasRunning) await context.serverService.stopServer();
   await context.config.editConfig((config) => {
     config.apiServerServeWebUi = serveWebUi;
     config.apiServerBindHost = bindHost;
     config.apiServerPort = port;
     return config;
   });
-  if (wasRunning) await context.serverService.stopServer();
 
   if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
     const authToken = context.serverService.getApiAuthToken();

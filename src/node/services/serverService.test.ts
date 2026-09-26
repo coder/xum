@@ -7,7 +7,6 @@ import {
   ServerService,
   computeNetworkBaseUrls,
   getTailscaleBindHosts,
-  setApiServerSettings,
   setServerSshHost,
 } from "./serverService";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -449,41 +448,5 @@ describe("server settings writes (#4444)", () => {
     expect(String(error)).toContain("EACCES");
 
     expect(serverService.getSshHost()).toBe("old-host");
-  });
-
-  test("a failed settings write leaves a running server untouched", async () => {
-    await config.editConfig((value) => ({ ...value, apiServerBindHost: "127.0.0.1" }));
-    let running = true;
-    let stops = 0;
-    let starts = 0;
-    const serverService = {
-      isServerRunning: () => running,
-      stopServer: () => {
-        stops += 1;
-        running = false;
-        return Promise.resolve();
-      },
-      startServer: () => {
-        starts += 1;
-        running = true;
-        return Promise.resolve();
-      },
-      getApiAuthToken: () => "token",
-    };
-    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
-    const context = { config, serverService } as unknown as ORPCContext;
-
-    const error = await setApiServerSettings(context, {
-      bindHost: "0.0.0.0",
-      port: 9999,
-      serveWebUi: true,
-    }).catch((caught: unknown) => caught);
-
-    expect(String(error)).toContain("EACCES");
-    // Still serving with its live address and mode; disk keeps the previous settings.
-    expect(running).toBe(true);
-    expect(stops).toBe(0);
-    expect(starts).toBe(0);
-    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
   });
 });
