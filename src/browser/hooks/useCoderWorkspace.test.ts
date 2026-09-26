@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { createElement, type ComponentProps, type ReactNode } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import {
   buildAutoSelectedTemplateConfig,
   useCoderWorkspace,
@@ -10,6 +10,7 @@ import {
 } from "./useCoderWorkspace";
 import type { CoderInfo, CoderTemplate } from "@/common/orpc/schemas/coder";
 import type { CoderWorkspaceConfig } from "@/common/types/runtime";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const makeTemplate = (name: string, org = "default-org"): CoderTemplate => ({
   name,
@@ -31,9 +32,9 @@ const coderApiMock = {
   listWorkspaces: listWorkspacesMock,
 };
 
-const apiMock = {
+const apiMock = createTestApiClient({
   coder: coderApiMock,
-} as unknown as APIClient;
+});
 
 // Inject the client through the real provider; mocking the API module leaks process-wide
 // into later suites. (This file is .ts, so build the wrapper without JSX.)

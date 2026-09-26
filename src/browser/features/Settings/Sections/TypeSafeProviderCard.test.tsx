@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { ReactNode } from "react";
 
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import * as ActualAutoModelRoutingModule from "@/browser/hooks/useAutoModelRouting";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import {
@@ -40,6 +40,7 @@ void mock.module("@/browser/hooks/useAutoModelRouting", () => ({
 }));
 
 import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function createMockApi(status: Partial<AutoModelRoutingEvaluationStatus> = {}): MockApi {
   return {
@@ -61,7 +62,7 @@ function createMockApi(status: Partial<AutoModelRoutingEvaluationStatus> = {}): 
 
 // Inject the per-test client through the real provider; mocking the API module leaks across files.
 function ApiWrapper(props: { children: ReactNode }) {
-  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 function renderCard() {

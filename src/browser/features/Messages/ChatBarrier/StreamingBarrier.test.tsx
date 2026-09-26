@@ -2,13 +2,14 @@ import "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import * as RealSettingsContextModule from "@/browser/contexts/SettingsContext";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { ReactElement, ReactNode } from "react";
 
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type * as ModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 
 interface MockWorkspaceState {
@@ -101,12 +102,12 @@ restoreModulesAfterSuite([
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
-const apiClient = {
+const apiClient = createTestApiClient({
   workspace: {
     interruptStream,
     setAutoRetryEnabled,
   },
-} as unknown as APIClient;
+});
 
 function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={apiClient}>{props.children}</APIProvider>;

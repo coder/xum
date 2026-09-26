@@ -680,6 +680,26 @@ const localPlugin = {
         };
       },
     },
+    // `x as unknown as APIClient` in tests hides typos and wrong return types in API doubles.
+    // createTestApiClient (src/browser/testUtils.ts) type-checks the partial double instead.
+    "no-unknown-cast-to-api-client": {
+      meta: {
+        type: "problem",
+        docs: { description: "Disallow `as unknown as APIClient` in tests" },
+        messages: {
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of `as unknown as APIClient`: it type-checks the double against the real procedure types.",
+        },
+      },
+      create(context) {
+        return {
+          "TSAsExpression[expression.type='TSAsExpression'][expression.typeAnnotation.type='TSUnknownKeyword'][typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name='APIClient']"(
+            node
+          ) {
+            context.report({ node, messageId: "cast" });
+          },
+        };
+      },
+    },
     // Ported from anti-slop (https://github.com/dmmulroy/anti-slop).
     // Chained assertions like `x as unknown as T` fabricate type evidence:
     // the detour through `unknown` bypasses TypeScript's assertion overlap
@@ -1847,6 +1867,9 @@ export default defineConfig([
   {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
+    rules: {
+      "local/no-unknown-cast-to-api-client": "error",
+    },
     languageOptions: {
       globals: {
         describe: "readonly",
@@ -1859,6 +1882,33 @@ export default defineConfig([
         beforeAll: "readonly",
         afterAll: "readonly",
       },
+    },
+  },
+  {
+    // Not yet migrated to createTestApiClient: their doubles do not match the real procedure
+    // types, so migrating means repairing the doubles first. Shrink-only; do not add files.
+    files: [
+      "src/browser/components/ArchivedWorkspaces/ArchivedWorkspaces.test.tsx",
+      "src/browser/components/BranchSelector/BranchSelector.test.tsx",
+      "src/browser/components/SshPromptDialog/SshPromptDialog.test.tsx",
+      "src/browser/components/UpdateRestartOverlay/UpdateRestartOverlay.test.tsx",
+      "src/browser/features/RightSidebar/CodeReview/ImmersiveReviewView.test.tsx",
+      "src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx",
+      "src/browser/features/Settings/Sections/ExperimentsSection.advisor.test.tsx",
+      "src/browser/features/Settings/Sections/ExperimentsSection.test.tsx",
+      "src/browser/features/Settings/Sections/GoalsSection.test.tsx",
+      "src/browser/features/Settings/Sections/HeartbeatSection.test.tsx",
+      "src/browser/features/Tools/ProposePlanToolCall.test.tsx",
+      "src/browser/hooks/useChatTranscriptFullWidth.test.tsx",
+      "src/browser/hooks/useContextSwitchWarning.test.ts",
+      "src/browser/hooks/useRouting.test.ts",
+      "src/browser/hooks/useWorkspaceHeartbeat.test.tsx",
+      "src/browser/utils/commands/sources.test.ts",
+      "src/browser/utils/compaction/handler.test.ts",
+      "src/browser/utils/openInEditor.test.ts",
+    ],
+    rules: {
+      "local/no-unknown-cast-to-api-client": "off",
     },
   },
   {

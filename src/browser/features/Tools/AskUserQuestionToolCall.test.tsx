@@ -1,7 +1,8 @@
 import "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import type { ReactElement, ReactNode } from "react";
@@ -67,13 +68,13 @@ const setAutoRetryEnabled = mock((input: unknown) => {
 
 // Inject the client through the real provider: a module mock of contexts/API is process-wide
 // and leaks this partial client into later-evaluated suites.
-const apiClient = {
+const apiClient = createTestApiClient({
   workspace: {
     answerAskUserQuestion,
     resumeStream,
     setAutoRetryEnabled,
   },
-} as unknown as APIClient;
+});
 
 function ApiWrapper(props: { children: ReactNode }) {
   return <APIProvider client={apiClient}>{props.children}</APIProvider>;

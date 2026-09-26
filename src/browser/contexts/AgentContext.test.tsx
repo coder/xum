@@ -13,6 +13,7 @@ import { APIProvider, type APIClient } from "./API";
 import { ProjectProvider } from "./ProjectContext";
 import { RouterProvider } from "./RouterContext";
 import { WorkspaceProvider } from "./WorkspaceContext";
+import { createTestApiClient } from "@/browser/testUtils";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
@@ -103,7 +104,7 @@ function createApiClient(): APIClient {
     ([workspaceId, overrides]) => createWorkspaceMetadata(workspaceId, overrides)
   );
 
-  return {
+  return createTestApiClient({
     agents: {
       list: () => Promise.resolve(mockAgentDefinitions),
     },
@@ -132,7 +133,7 @@ function createApiClient(): APIClient {
     terminal: {
       openWindow: () => Promise.resolve(),
     },
-  } as unknown as APIClient;
+  });
 }
 
 function renderAgentHarness(props: {

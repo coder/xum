@@ -1,6 +1,7 @@
 import "../../../../tests/ui/dom";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 // Keep the fake transport and its events in one realm even after other UI tests install a DOM.
 import { GlobalWindow, EventTarget, Event, CustomEvent } from "happy-dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -23,7 +24,7 @@ const api = {
 // is process-wide and other UI suites need their provider's full API. view.rerender() keeps
 // the wrapper.
 function ApiWrapper(props: { children: ReactNode }) {
-  return <APIProvider client={api as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(api)}>{props.children}</APIProvider>;
 }
 
 function renderWithApi(ui: ReactElement) {

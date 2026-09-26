@@ -9,9 +9,9 @@ import {
   test,
 } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import type { APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../tests/ui/dom";
 import { useVoiceInput } from "./useVoiceInput";
+import { createTestApiClient } from "@/browser/testUtils";
 
 let sampleByte = 128;
 let sampleAudioFrame: (() => void) | null = null;
@@ -126,7 +126,7 @@ function renderVoiceInput(useRecordingKeybinds = false) {
     useVoiceInput({
       useRecordingKeybinds,
       onSend,
-      api: { voice: { transcribe } } as unknown as APIClient,
+      api: createTestApiClient({ voice: { transcribe } }),
       isTranscriptionAvailable: true,
       onTranscript: mock(() => undefined),
     })

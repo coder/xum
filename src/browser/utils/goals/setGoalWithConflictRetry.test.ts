@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import type { GoalRecordV1 } from "@/common/types/goal";
 import { setGoalWithConflictRetry } from "./setGoalWithConflictRetry";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function makeGoal(overrides: Partial<GoalRecordV1> = {}): GoalRecordV1 {
   return {
@@ -33,7 +34,7 @@ function makeApi(getGoalImpl: () => unknown, setGoalImpl: () => unknown): APICli
     getGoal: mock(getGoalImpl),
     setGoal: mock(setGoalImpl),
   };
-  return { workspace: fake } as unknown as APIClient;
+  return createTestApiClient({ workspace: fake });
 }
 
 describe("setGoalWithConflictRetry", () => {

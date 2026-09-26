@@ -27,6 +27,7 @@ import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { enforceThinkingPolicy, getThinkingPolicyForModel } from "@/common/utils/thinking/policy";
+import { createTestApiClient } from "@/browser/testUtils";
 
 let currentClientMock: RecursivePartial<APIClient> = {};
 let metadataMap = new Map<string, FrontendWorkspaceMetadata>();
@@ -222,7 +223,7 @@ function createWorkspaceClient(): APIClient {
   const projectOverrides = currentClientMock.projects ?? {};
   const serverOverrides = currentClientMock.server ?? {};
 
-  return {
+  return createTestApiClient({
     ...currentClientMock,
     workspace: {
       list: () => Promise.resolve(Array.from(metadataMap.values())),
@@ -254,7 +255,7 @@ function createWorkspaceClient(): APIClient {
       getLaunchProject: () => Promise.resolve(null),
       ...serverOverrides,
     },
-  } as unknown as APIClient;
+  });
 }
 
 function renderWithWorkspaceMetadata(props: {

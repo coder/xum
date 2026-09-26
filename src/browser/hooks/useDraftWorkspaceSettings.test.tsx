@@ -18,6 +18,7 @@ import {
 } from "@/common/constants/storage";
 import { CODER_RUNTIME_PLACEHOLDER } from "@/common/types/runtime";
 import { useDraftWorkspaceSettings } from "./useDraftWorkspaceSettings";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function createStubApiClient(): APIClient {
   // useModelLRU() only needs providers.getConfig + providers.onConfigChanged.
@@ -26,7 +27,7 @@ function createStubApiClient(): APIClient {
     // no-op
   }
 
-  return {
+  return createTestApiClient({
     providers: {
       getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(empty()),
@@ -35,7 +36,7 @@ function createStubApiClient(): APIClient {
     projects: {
       list: () => Promise.resolve([]),
     },
-  } as unknown as APIClient;
+  });
 }
 
 function createWrapper(projectPath: string): React.FC<{ children: React.ReactNode }> {

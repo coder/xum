@@ -1,12 +1,13 @@
 import * as RealMarkdownCore from "../Messages/MarkdownCore";
 import * as RealMarkdownRenderer from "../Messages/MarkdownRenderer";
-import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIContext, APIProvider } from "@/browser/contexts/API";
 import type { ReactElement, ReactNode } from "react";
 import { PlanFileDialog } from "./PlanFileDialog";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
+import { createTestApiClient } from "@/browser/testUtils";
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
@@ -71,7 +72,7 @@ function ApiWrapper(props: { children: ReactNode }) {
       </APIContext.Provider>
     );
   }
-  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 function renderWithApi(ui: ReactElement) {

@@ -1,4 +1,5 @@
 import { createRequire } from "node:module";
+import type { APIClient } from "@/browser/contexts/API";
 
 // Shared test utilities for browser tests
 
@@ -102,4 +103,25 @@ export function createControllableAsyncIterable<T>(
     },
     close,
   };
+}
+
+// oRPC types streaming procedures as `Promise<AsyncIteratorClass<T>>`, a class with private
+// fields that no test double can satisfy structurally. Consumers only iterate the stream, so a
+// test may return any AsyncIterable of the same item type (e.g. an async generator).
+type TestApiResult<R> =
+  Awaited<R> extends AsyncIterable<infer Item> ? AsyncIterable<Item> : Awaited<R>;
+
+/** RecursivePartial for APIClient doubles, with the streaming relaxation above. */
+export type TestApiOverrides<T> = {
+  [P in keyof T]?: T[P] extends (...args: infer A) => infer R
+    ? (...args: A) => Promise<TestApiResult<R>> | TestApiResult<R>
+    : T[P] extends object
+      ? TestApiOverrides<T[P]>
+      : T[P];
+};
+
+/** Typed partial APIClient double: overrides are checked against the real procedure types (typos and wrong return types fail typecheck); omitted procedures are simply absent, exactly as with the old cast. */
+export function createTestApiClient(overrides: TestApiOverrides<APIClient> = {}): APIClient {
+  // The single cast: tests supply only the procedures they exercise.
+  return overrides as unknown as APIClient;
 }

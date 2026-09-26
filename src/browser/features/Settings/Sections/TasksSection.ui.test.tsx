@@ -3,8 +3,9 @@ import { installDom } from "../../../../../tests/ui/dom";
 import type React from "react";
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
-import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
@@ -155,7 +156,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // Inject the per-test client through the real provider; mocking the API module leaks into
   // later files.
   const view = render(
-    <APIProvider client={apiMock as unknown as APIClient}>
+    <APIProvider client={createTestApiClient(apiMock)}>
       <PolicyProvider>
         <TasksSection />
       </PolicyProvider>
