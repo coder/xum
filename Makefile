@@ -386,7 +386,8 @@ TB_HARBOR_VERSION := 0.6.4
 # pytest is not a repo dependency; uv (installed in CI's static-check job) supplies it.
 test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter with offline fixtures
 	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
-	@uv run --no-project --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
+	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
+	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
