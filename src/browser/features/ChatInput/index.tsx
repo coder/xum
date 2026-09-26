@@ -70,6 +70,7 @@ import {
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
+  getReviewsKey,
 } from "@/common/constants/storage";
 import {
   prepareCompactionMessage,
@@ -217,7 +218,7 @@ import {
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
 import { useComposerSuggestions } from "./useComposerSuggestions";
-import { readPersistedChatAttachments } from "./draftAttachmentsStorage";
+import { isRestoredDraftDurable } from "./restoredDraftDurability";
 import {
   commandBypassesTranscriptBarrier,
   isTranscriptMutationAllowed,
@@ -1451,44 +1452,50 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           return;
         }
         const restoredAttachments = pendingChatAttachments(restoredPending, restoredIdPrefix);
-        setInput((current) =>
-          [restoredPending.content, current].filter((part) => part.trim().length > 0).join("\n\n")
-        );
+        // Merged from the stored draft, exactly as a functional setInput would, so the
+        // acknowledgement below can check that this exact value landed.
+        const mergedText = [restoredPending.content, readPersistedState(storageKeys.inputKey, "")]
+          .filter((part) => part.trim().length > 0)
+          .join("\n\n");
+        setInput(mergedText);
         if (restoredAttachments.length > 0) {
           setAttachments((current) => [...restoredAttachments, ...current]);
         }
-        let reviewsInStore = true;
+        // Ids the review store added; null when the notes went to the memory-only override.
+        let restoredReviewIds: string[] | null = [];
         if (restoredPending.reviews.length > 0) {
           if (draftReviews === null && onAddReviewForRestore) {
             // The draft's notes live in the review store: add the restored ones there too, as
             // new attached notes. A detached copy in the override would hide later store
             // changes, and a send in flight checks off only the notes it captured, not these.
             // Called here, not in a state updater, which may run more than once.
-            for (const review of restoredPending.reviews) onAddReviewForRestore(review);
+            restoredReviewIds = restoredPending.reviews.map(
+              (review) => onAddReviewForRestore(review).id
+            );
           } else {
             // An active override (e.g. a queued-message edit) owns the composer's notes.
             setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
-            reviewsInStore = false;
+            restoredReviewIds = null;
           }
         }
         // The backend keeps this input as held input until a composer takes it (#4448). Release
-        // that copy only once every restored part is durable: the setters above write storage
-        // synchronously, but a write can be skipped (attachments too large to save) or fail, and
-        // override notes live in memory only. Otherwise the "Not sent" banner stays next to the
-        // composer's copy: a visible duplicate beats a loss. Edit mode (above) takes nothing.
+        // that copy only once every restored part is durable; otherwise the "Not sent" banner
+        // stays next to the composer's copy: a visible duplicate beats a loss. Edit mode (above)
+        // takes nothing.
         const heldInputIds = customEvent.detail.heldInputIds ?? [];
-        if (heldInputIds.length > 0) {
-          const persistedAttachmentIds = new Set(
-            readPersistedChatAttachments(storageKeys.attachmentsKey).map(({ id }) => id)
-          );
-          const durable =
-            (restoredPending.content.trim().length === 0 ||
-              readPersistedState<string>(storageKeys.inputKey, "").startsWith(
-                restoredPending.content
-              )) &&
-            restoredAttachments.every(({ id }) => persistedAttachmentIds.has(id)) &&
-            reviewsInStore;
-          if (durable) onAcceptRestoredHeldInputs?.(heldInputIds);
+        if (
+          heldInputIds.length > 0 &&
+          workspaceIdForComposerClear != null &&
+          isRestoredDraftDurable({
+            inputKey: storageKeys.inputKey,
+            expectedText: mergedText,
+            attachmentsKey: storageKeys.attachmentsKey,
+            restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
+            reviewsKey: getReviewsKey(workspaceIdForComposerClear),
+            restoredReviewIds,
+          })
+        ) {
+          onAcceptRestoredHeldInputs?.(heldInputIds);
         }
         focusMessageInput();
       } else if (mode === "replace") {
