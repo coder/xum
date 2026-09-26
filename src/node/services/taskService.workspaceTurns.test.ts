@@ -48,7 +48,6 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
-  registerLiveWorkspaceTurnHandle,
 } from "@/node/services/taskService.shared.testHarness";
 
 describe("TaskService", () => {
@@ -559,44 +558,26 @@ describe("TaskService", () => {
     stubStableIds(config, ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    // Register the child workspace the handle points at.
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push({
-        path: path.join(projectPath, "workspace-turn"),
-        id: "childworkspace",
-        name: "workspace-turn",
-        title: "Workspace turn",
-        createdAt: "2026-06-19T00:00:00.000Z",
-        runtimeConfig: { type: "local" },
-      });
-      return cfg;
-    });
-
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
-    const workspaceMocks = createWorkspaceServiceMocks({ sendMessage });
+    const workspaceMocks = createWorkspaceServiceMocks({
+      create: makeWorkspaceTurnCreateMock(config, projectPath),
+      sendMessage,
+    });
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const createdAt = "2026-06-19T00:00:00.000Z";
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "childworkspace",
-      "wst_handle",
-      parentId,
-      "reserved",
-      {
-        createdAt,
-        updatedAt: createdAt,
-        createdWorkspace: true,
-        attentionPolicy: "notify_on_terminal",
-        turnId: "turn",
-      }
-    );
+    // The real producer: creates the child, registers the live turn, and sends its prompt.
+    const created = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize",
+      title: "Workspace turn",
+      attentionPolicy: "notify_on_terminal",
+      workspace: { mode: "new" },
+    });
+    expect(created).toMatchObject({ success: true, data: { taskId: "wst_handle" } });
 
     await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
 
@@ -631,26 +612,13 @@ describe("TaskService", () => {
     stubStableIds(config, ["handle", "turn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
-    await config.editConfig((cfg) => {
-      const project = cfg.projects.get(projectPath);
-      assert(project, "test project must exist");
-      project.workspaces.push({
-        path: path.join(projectPath, "workspace-turn"),
-        id: "childworkspace",
-        name: "workspace-turn",
-        title: "Workspace turn",
-        createdAt: "2026-06-19T00:00:00.000Z",
-        runtimeConfig: { type: "local" },
-      });
-      return cfg;
-    });
-
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
     // Owner is preparing/queuing a user turn: terminal wake-up must NOT inject ahead of it.
     const hasPendingQueuedOrPreparingTurn = mock(() => true);
     const workspaceMocks = createWorkspaceServiceMocks({
+      create: makeWorkspaceTurnCreateMock(config, projectPath),
       sendMessage,
       hasPendingQueuedOrPreparingTurn,
     });
@@ -658,21 +626,15 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const createdAt = "2026-06-19T00:00:00.000Z";
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "childworkspace",
-      "wst_handle",
-      parentId,
-      "reserved",
-      {
-        createdAt,
-        updatedAt: createdAt,
-        createdWorkspace: true,
-        attentionPolicy: "notify_on_terminal",
-        turnId: "turn",
-      }
-    );
+    // The real producer: creates the child, registers the live turn, and sends its prompt.
+    const created = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize",
+      title: "Workspace turn",
+      attentionPolicy: "notify_on_terminal",
+      workspace: { mode: "new" },
+    });
+    expect(created).toMatchObject({ success: true, data: { taskId: "wst_handle" } });
 
     await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
     await flushTerminalAttentionDrains(taskService);
@@ -1209,7 +1171,8 @@ describe("TaskService", () => {
 
   test("initialize defers terminal wake-up while blocking task-owned work is active", async () => {
     const config = await createTestConfig(rootDir);
-    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    stubStableIds(config, ["handle", "turn"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
 
     const terminalAttentionStore = new TerminalAttentionStore(config);
     await terminalAttentionStore.enqueueIfAbsent({
@@ -1221,21 +1184,22 @@ describe("TaskService", () => {
     const sendMessage = mock(
       (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
     );
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { workspaceService } = createWorkspaceServiceMocks({
+      create: makeWorkspaceTurnCreateMock(config, projectPath),
+      sendMessage,
+    });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "childworkspace",
-      "wst_blocking_active",
-      parentId,
-      "reserved",
-      {
-        updatedAt: "2026-06-19T00:00:00.000Z",
-        createdWorkspace: true,
-        turnId: "turn",
-        createdAt: "2026-06-19T00:00:00.000Z",
-      }
-    );
+    // The blocking work: a live workspace turn from the real producer, still running.
+    const created = await workspaceTurnManagerFor(taskService).createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Summarize",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+    expect(created.success).toBe(true);
+    // Only the child's own prompt so far; the owner's wake must not follow it.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    sendMessage.mockClear();
 
     await taskService.initialize();
     await flushTerminalAttentionDrains(taskService);
