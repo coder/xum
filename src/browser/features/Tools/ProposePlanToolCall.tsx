@@ -54,10 +54,7 @@ import {
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
-import {
-  applyAutoRoutingOutcome,
-  setWorkspaceModelWithOrigin,
-} from "@/browser/utils/modelChange";
+import { applyAutoRoutingOutcome, setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";

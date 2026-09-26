@@ -8,7 +8,11 @@ import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspace
 import type { ProjectConfig } from "@/common/types/project";
 import {
   GLOBAL_SCOPE_ID,
+  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
+  getAutoModelRoutingKey,
+  getAutoRoutingChoiceByAgentKey,
+  getAutoThinkingLevelKey,
   getInputKey,
   getInputAttachmentsKey,
   getModelKey,
@@ -18,6 +22,7 @@ import {
   getProjectScopeId,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 
 import {
@@ -1693,6 +1698,59 @@ describe("useCreationWorkspace", () => {
     }
     const [sendRequest] = sendCall;
     expect(sendRequest?.options?.agentId).toBe("ask");
+  });
+
+  test("records only creation routing picks that differ from the agent's Auto default", async () => {
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+
+    const projectScopeId = getProjectScopeId(TEST_PROJECT_PATH);
+    persistedPreferences[getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING)] = true;
+    persistedPreferences[AGENT_AI_DEFAULTS_KEY] = { exec: { autoModelRouting: true } };
+    persistedPreferences[getAgentIdKey(projectScopeId)] = "exec";
+    persistedPreferences[getModelKey(projectScopeId)] = "gpt-4";
+    // Model Auto came from the default; thinking Auto was picked in the creation composer.
+    persistedPreferences[getAutoModelRoutingKey(projectScopeId)] = true;
+    persistedPreferences[getAutoThinkingLevelKey(projectScopeId)] = true;
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    expect(updatePersistedStateCalls).toContainEqual([
+      getAutoModelRoutingKey(TEST_WORKSPACE_ID),
+      true,
+    ]);
+    expect(updatePersistedStateCalls).toContainEqual([
+      getAutoThinkingLevelKey(TEST_WORKSPACE_ID),
+      true,
+    ]);
+    const choiceWrites = updatePersistedStateCalls.filter(
+      ([key]) => key === getAutoRoutingChoiceByAgentKey(TEST_WORKSPACE_ID)
+    );
+    expect(choiceWrites).toHaveLength(1);
+    const updater = choiceWrites[0]?.[1] as (prev: unknown) => unknown;
+    expect(updater({})).toEqual({ exec: { thinkingLevel: true } });
   });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {

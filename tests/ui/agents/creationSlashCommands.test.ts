@@ -23,8 +23,15 @@ import {
 } from "../helpers";
 import { ChatHarness } from "../harness";
 
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { getDraftScopeId, getModelKey, getProjectScopeId } from "@/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
+  getDraftScopeId,
+  getModelKey,
+  getProjectScopeId,
+} from "@/common/constants/storage";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
@@ -37,11 +44,12 @@ interface CreationView {
   chat: ChatHarness;
 }
 
-async function setupCreationView(): Promise<CreationView> {
+async function setupCreationView(options?: { beforeRender?: () => void }): Promise<CreationView> {
   const env = getSharedEnv();
   const projectPath = getSharedRepoPath();
 
   const cleanupDom = setupTestDom();
+  options?.beforeRender?.();
 
   const view = renderApp({ apiClient: env.orpc });
 
@@ -122,6 +130,32 @@ describeIntegration("Creation slash commands", () => {
       await chat.expectInputValue(command);
     } finally {
       await cleanupView(view, cleanupDom);
+    }
+  }, 30_000);
+
+  test("a configured Auto default turns Auto on in the creation composer", async () => {
+    const env = getSharedEnv();
+    await env.orpc.config.updateAgentAiDefaults({
+      agentAiDefaults: { exec: { autoModelRouting: true } },
+    });
+    const { projectPath, view, cleanupDom } = await setupCreationView({
+      beforeRender: () =>
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true),
+    });
+
+    try {
+      const projectScopeId = getProjectScopeId(projectPath);
+      // Creation sends read these keys, so the first request routes the model only.
+      await waitFor(
+        () => {
+          expect(readPersistedState(getAutoModelRoutingKey(projectScopeId), false)).toBe(true);
+        },
+        { timeout: 5_000 }
+      );
+      expect(readPersistedState(getAutoThinkingLevelKey(projectScopeId), false)).toBe(false);
+    } finally {
+      await cleanupView(view, cleanupDom);
+      await env.orpc.config.updateAgentAiDefaults({ agentAiDefaults: {} });
     }
   }, 30_000);
 });

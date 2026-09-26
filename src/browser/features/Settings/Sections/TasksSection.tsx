@@ -383,7 +383,8 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             inheritOption={{
               label: inheritLabel,
               // Auto keeps the inherited level as its fallback; only one row reads as selected.
-              selected: props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
+              selected:
+                props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
               onSelect: () => props.onThinkingChange(INHERIT),
             }}
             autoRouting={props.thinkingAutoRouting}

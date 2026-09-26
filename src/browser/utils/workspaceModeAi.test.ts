@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
-import { resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
+import { resolveAutoRoutingForAgent, resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -406,5 +406,122 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
       resolvedThinking: "off",
       resolvedReasoningMode: "standard",
     });
+  });
+});
+
+describe("resolveAutoRoutingForAgent", () => {
+  const autoExec = { exec: { autoModelRouting: true, autoThinkingLevel: true } } as const;
+  const base = { agentId: "exec", experimentEnabled: true } as const;
+
+  test("explicit switch: the workspace pick outranks the configured default", () => {
+    expect(
+      resolveAutoRoutingForAgent({
+        ...base,
+        agentAiDefaults: autoExec,
+        explicitSwitch: true,
+        routingChoices: { exec: { model: false } },
+      })
+    ).toEqual({ model: false, thinkingLevel: true });
+
+    expect(
+      resolveAutoRoutingForAgent({
+        ...base,
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+        explicitSwitch: true,
+        routingChoices: { exec: { model: true } },
+      })
+    ).toEqual({ model: true, thinkingLevel: false });
+  });
+
+  test("explicit switch without pick or configured Auto leaves Auto", () => {
+    expect(
+      resolveAutoRoutingForAgent({ ...base, agentAiDefaults: {}, explicitSwitch: true })
+    ).toEqual({ model: false, thinkingLevel: false });
+  });
+
+  test("sync only turns configured Auto on for dimensions without a pick or bucket value", () => {
+    expect(
+      resolveAutoRoutingForAgent({ ...base, agentAiDefaults: autoExec, explicitSwitch: false })
+    ).toEqual({ model: true, thinkingLevel: true });
+
+    expect(
+      resolveAutoRoutingForAgent({
+        ...base,
+        agentAiDefaults: autoExec,
+        explicitSwitch: false,
+        routingChoices: { exec: { thinkingLevel: true } },
+        workspaceByAgent: { exec: { model: "openai:gpt-5.2", thinkingLevel: "low" } },
+      })
+    ).toEqual({ model: undefined, thinkingLevel: undefined });
+
+    // Sync never turns Auto off, even when the default is concrete.
+    expect(
+      resolveAutoRoutingForAgent({
+        ...base,
+        agentAiDefaults: { exec: { modelString: "openai:gpt-5.2" } },
+        explicitSwitch: false,
+      })
+    ).toEqual({ model: undefined, thinkingLevel: undefined });
+  });
+
+  test("experiment off ignores picks and configured Auto", () => {
+    const args = {
+      agentId: "exec",
+      agentAiDefaults: autoExec,
+      experimentEnabled: false,
+      routingChoices: { exec: { model: true } },
+    };
+    expect(resolveAutoRoutingForAgent({ ...args, explicitSwitch: true })).toEqual({
+      model: false,
+      thinkingLevel: false,
+    });
+    expect(resolveAutoRoutingForAgent({ ...args, explicitSwitch: false })).toEqual({
+      model: undefined,
+      thinkingLevel: undefined,
+    });
+  });
+
+  test("the nearest declared layer setting a dimension decides Auto", () => {
+    const agentBaseById = new Map([
+      ["reviewer", "writer"],
+      ["writer", "exec"],
+    ]);
+    const resolve = (
+      agentAiDefaults: Parameters<typeof resolveAutoRoutingForAgent>[0]["agentAiDefaults"]
+    ) =>
+      resolveAutoRoutingForAgent({
+        ...base,
+        agentId: "reviewer",
+        agentAiDefaults,
+        agentBaseById,
+        explicitSwitch: true,
+      });
+
+    // A child's concrete value blocks ancestor Auto for that dimension only.
+    expect(
+      resolve({
+        reviewer: { modelString: "openai:gpt-5.2" },
+        exec: { autoModelRouting: true, autoThinkingLevel: true },
+      })
+    ).toEqual({ model: false, thinkingLevel: true });
+
+    // Auto plus a concrete value on the same layer stays Auto.
+    expect(
+      resolve({
+        writer: { modelString: "openai:gpt-5.2", autoModelRouting: true },
+        exec: { modelString: "anthropic:claude-opus-4-6" },
+      })
+    ).toEqual({ model: true, thinkingLevel: false });
+  });
+
+  test("the implicit exec fallback contributes no Auto to undeclared agents", () => {
+    expect(
+      resolveAutoRoutingForAgent({
+        ...base,
+        agentId: "custom",
+        agentAiDefaults: autoExec,
+        explicitSwitch: true,
+      })
+    ).toEqual({ model: false, thinkingLevel: false });
   });
 });

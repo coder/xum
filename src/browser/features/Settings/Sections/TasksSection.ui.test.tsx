@@ -81,19 +81,30 @@ void mock.module("@/browser/components/ModelSelector/ModelSelector", () => ({
     emptyLabel?: string;
     onChange: (value: string) => void;
     models: string[];
+    autoRouting?: { active: boolean; onSelect: () => void };
   }) => (
-    <select
-      aria-label="Model"
-      value={props.value}
-      onChange={(event) => props.onChange(event.currentTarget.value)}
-    >
-      <option value="">{props.emptyLabel ?? "Inherit"}</option>
-      {props.models.map((model) => (
-        <option key={model} value={model}>
-          {model}
-        </option>
-      ))}
-    </select>
+    <>
+      <select
+        aria-label="Model"
+        value={props.value}
+        onChange={(event) => props.onChange(event.currentTarget.value)}
+      >
+        <option value="">{props.emptyLabel ?? "Inherit"}</option>
+        {props.models.map((model) => (
+          <option key={model} value={model}>
+            {model}
+          </option>
+        ))}
+      </select>
+      {props.autoRouting ? (
+        <button
+          type="button"
+          aria-label="Model Auto"
+          aria-pressed={props.autoRouting.active}
+          onClick={props.autoRouting.onSelect}
+        />
+      ) : null}
+    </>
   ),
 }));
 
@@ -851,5 +862,119 @@ describe("TasksSection Exec subagent defaults", () => {
 
     expect(within(card).getByRole("listbox", { name: "Reasoning effort" })).toBeTruthy();
     expect(card.querySelector('[data-component="ProModeToggle"]')).toBeNull();
+  });
+});
+
+describe("TasksSection Auto routing defaults", () => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    advisorExperimentEnabled = false;
+    experimentValues = { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true };
+    apiMock = null;
+    selectedWorkspaceMock = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    apiMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  // "Plan" also labels a default-agent option, so resolve the card from its title element.
+  function getCard(view: ReturnType<typeof renderTasksSection>, name: string): HTMLElement {
+    const card = view
+      .getAllByText(name)
+      .map((element) => element.closest(".rounded-md"))
+      .find((element) => element instanceof HTMLElement);
+    if (!(card instanceof HTMLElement)) throw new Error(`Could not find ${name} agent card`);
+    return card;
+  }
+
+  function openReasoningMenu(card: HTMLElement): HTMLElement {
+    fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
+    return within(card).getByRole("listbox", { name: "Reasoning effort" });
+  }
+
+  test("offers Auto only on UI and unknown agent cards while the experiment is on", async () => {
+    const view = renderTasksSection({
+      agentAiDefaults: { mystery: { autoModelRouting: true } },
+    });
+    await view.findAllByText("Plan");
+
+    const plan = getCard(view, "Plan");
+    expect(within(plan).getByRole("button", { name: "Model Auto" })).toBeTruthy();
+    expect(within(openReasoningMenu(plan)).getByRole("option", { name: "Auto" })).toBeTruthy();
+
+    const mystery = getAgentCardByName(view, "mystery");
+    expect(
+      within(mystery).getByRole("button", { name: "Model Auto" }).getAttribute("aria-pressed")
+    ).toBe("true");
+
+    for (const card of [getAgentCardByName(view, "Explore"), getExecSubagentRow(view)]) {
+      expect(within(card).queryByRole("button", { name: "Model Auto" })).toBeNull();
+      expect(within(openReasoningMenu(card)).queryByRole("option", { name: "Auto" })).toBeNull();
+    }
+  });
+
+  test("hides Auto while the experiment is off", async () => {
+    experimentValues = {};
+    const view = renderTasksSection();
+    await view.findAllByText("Plan");
+
+    const plan = getCard(view, "Plan");
+    expect(within(plan).queryByRole("button", { name: "Model Auto" })).toBeNull();
+    expect(within(openReasoningMenu(plan)).queryByRole("option", { name: "Auto" })).toBeNull();
+  });
+
+  test("selecting Auto keeps the concrete fallback and saves the flags", async () => {
+    const view = renderTasksSection({
+      agentAiDefaults: { plan: { modelString: "anthropic:foo", thinkingLevel: "medium" } },
+    });
+    await view.findAllByText("Plan");
+    const plan = getCard(view, "Plan");
+
+    fireEvent.click(within(plan).getByRole("button", { name: "Model Auto" }));
+    fireEvent.click(within(openReasoningMenu(plan)).getByRole("option", { name: "Auto" }));
+
+    await waitFor(() => {
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.plan).toEqual({
+        modelString: "anthropic:foo",
+        thinkingLevel: "medium",
+        autoModelRouting: true,
+        autoThinkingLevel: true,
+      });
+    });
+  });
+
+  test("Reset, Inherit, and concrete picks each clear their dimension's Auto flag", async () => {
+    const view = renderTasksSection({
+      agentAiDefaults: {
+        plan: { autoModelRouting: true, autoThinkingLevel: true },
+        mystery: { modelString: "anthropic:foo", autoModelRouting: true },
+      },
+    });
+    await view.findAllByText("Plan");
+    const plan = getCard(view, "Plan");
+
+    // Auto with an inherited fallback still offers Reset, and never shows Inherit as selected.
+    const menu = openReasoningMenu(plan);
+    expect(
+      within(menu).getByRole("option", { name: "Inherit" }).getAttribute("aria-selected")
+    ).toBe("false");
+    fireEvent.click(within(menu).getByRole("option", { name: "Inherit" }));
+    fireEvent.click(within(plan).getByRole("button", { name: "Reset" }));
+
+    fireEvent.change(within(getAgentCardByName(view, "mystery")).getByLabelText("Model"), {
+      target: { value: "openai:gpt-5.6-sol" },
+    });
+
+    await waitFor(() => {
+      const payload = getLatestSavePayload(view.saveConfig);
+      expect(payload.agentAiDefaults.plan).toBeUndefined();
+      expect(payload.agentAiDefaults.mystery).toEqual({ modelString: "openai:gpt-5.6-sol" });
+    });
   });
 });

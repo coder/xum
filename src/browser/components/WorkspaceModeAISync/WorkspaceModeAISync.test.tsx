@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { ReactElement } from "react";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { consumeWorkspaceModelChange } from "@/browser/utils/modelChange";
+import { consumeWorkspaceModelChange, setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   AGENT_AI_DEFAULTS_KEY,
+  getAgentIdKey,
   getAutoModelRoutingKey,
   getAutoThinkingLevelKey,
   getModelKey,
@@ -316,6 +319,111 @@ describe("WorkspaceModeAISync", () => {
     await waitFor(() => {
       expect(readPersistedState(getModelKey(workspaceId), "")).toBe(customConfiguredModel);
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("high");
+    });
+  });
+
+  describe("Auto routing agent defaults", () => {
+    beforeEach(() => {
+      updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+    });
+
+    const readAuto = (workspaceId: string) => ({
+      model: readPersistedState(getAutoModelRoutingKey(workspaceId), false),
+      thinkingLevel: readPersistedState(getAutoThinkingLevelKey(workspaceId), false),
+    });
+
+    // Mirrors the composer: user picks resolve the active agent from its persisted key.
+    function renderAt(workspaceId: string, agentId: string) {
+      updatePersistedState(getAgentIdKey(workspaceId), agentId);
+      return renderSync({ workspaceId, agentId });
+    }
+
+    function switchTo(rerender: (ui: ReactElement) => void, workspaceId: string, agentId: string) {
+      updatePersistedState(getAgentIdKey(workspaceId), agentId);
+      rerender(<SyncHarness workspaceId={workspaceId} agentId={agentId} />);
+    }
+
+    test("agent switches turn Auto on for a configured-Auto agent and off for others", async () => {
+      const workspaceId = nextWorkspaceId();
+      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+        exec: { modelString: "openai:gpt-5.2", autoModelRouting: true, autoThinkingLevel: true },
+        plan: { modelString: "openai:gpt-5.2" },
+      });
+
+      const { rerender } = renderAt(workspaceId, "plan");
+      expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: false });
+
+      switchTo(rerender, workspaceId, "exec");
+      await waitFor(() => {
+        expect(readAuto(workspaceId)).toEqual({ model: true, thinkingLevel: true });
+      });
+      // The concrete default stays the routing fallback.
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
+
+      switchTo(rerender, workspaceId, "plan");
+      await waitFor(() => {
+        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: false });
+      });
+    });
+
+    test("mount sync applies configured Auto only when the agent has no workspace bucket", async () => {
+      const autoExec = { exec: { autoModelRouting: true, autoThinkingLevel: true } };
+      updatePersistedState(AGENT_AI_DEFAULTS_KEY, autoExec);
+
+      const fresh = nextWorkspaceId();
+      renderAt(fresh, "exec");
+      await waitFor(() => {
+        expect(readAuto(fresh)).toEqual({ model: true, thinkingLevel: true });
+      });
+      cleanup();
+
+      const legacy = nextWorkspaceId();
+      updatePersistedState(getWorkspaceAISettingsByAgentKey(legacy), {
+        exec: { model: "openai:gpt-5.2", thinkingLevel: "low" },
+      });
+      renderAt(legacy, "exec");
+      expect(readAuto(legacy)).toEqual({ model: false, thinkingLevel: false });
+    });
+
+    test("an explicit concrete pick survives an agent round trip over an Auto default", async () => {
+      const workspaceId = nextWorkspaceId();
+      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+        exec: { autoModelRouting: true, autoThinkingLevel: true },
+      });
+
+      const { rerender } = renderAt(workspaceId, "exec");
+      await waitFor(() => {
+        expect(readAuto(workspaceId)).toEqual({ model: true, thinkingLevel: true });
+      });
+      act(() => setAutoRoutingChoice(workspaceId, "model", false));
+
+      switchTo(rerender, workspaceId, "plan");
+      await waitFor(() => {
+        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: false });
+      });
+      switchTo(rerender, workspaceId, "exec");
+      await waitFor(() => {
+        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: true });
+      });
+    });
+
+    test("an explicit Auto pick survives an agent round trip over a concrete default", async () => {
+      const workspaceId = nextWorkspaceId();
+      updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+        exec: { modelString: "openai:gpt-5.2", thinkingLevel: "low" },
+      });
+
+      const { rerender } = renderAt(workspaceId, "exec");
+      act(() => setAutoRoutingChoice(workspaceId, "thinkingLevel", true));
+
+      switchTo(rerender, workspaceId, "plan");
+      await waitFor(() => {
+        expect(readAuto(workspaceId).thinkingLevel).toBe(false);
+      });
+      switchTo(rerender, workspaceId, "exec");
+      await waitFor(() => {
+        expect(readAuto(workspaceId)).toEqual({ model: false, thinkingLevel: true });
+      });
     });
   });
 });

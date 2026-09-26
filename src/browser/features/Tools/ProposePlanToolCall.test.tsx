@@ -13,12 +13,13 @@ import * as DiffRendererModule from "@/browser/features/Shared/DiffRenderer";
 import * as ReviewTypesModule from "@/common/types/review";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getAutoModelRoutingKey,
+  getAutoThinkingLevelKey,
   getModelKey,
   getPlanContentKey,
   getThinkingLevelKey,
@@ -564,6 +565,28 @@ describe("ProposePlanToolCall", () => {
     await waitFor(() => expect(sendMessageCalls.length).toBe(1));
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
+  });
+
+  test("Implement sends unrouted, then leaves the composer on exec's Auto default", async () => {
+    const execModel = "openai:gpt-5.2";
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      exec: { modelString: execModel, autoModelRouting: true, autoThinkingLevel: true },
+    });
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.AUTO_MODEL_ROUTING), true);
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
+    expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
+    expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
+    expect(readPersistedState(getAutoModelRoutingKey(WORKSPACE_ID), false)).toBe(true);
+    expect(readPersistedState(getAutoThinkingLevelKey(WORKSPACE_ID), false)).toBe(true);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

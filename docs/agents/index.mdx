@@ -219,6 +219,7 @@ For the normal `task` tool, the agent must have `subagent.runnable: true`. Workf
 Each agent has one defaults entry (`agentAiDefaults`), configured in **Settings → Agents**:
 
 - **Base fields** (`modelString`, `thinkingLevel`, `reasoningMode`) apply when you select the agent in the workspace.
+- **Auto routing** (with the Auto model routing experiment on): a UI agent's model or reasoning can default to **Auto**, which routes each prompt you send by difficulty and keeps the base field as the fallback. An Auto or concrete choice you make in a workspace keeps winning for that agent in that workspace.
 - **Delegated overrides** (the sparse nested `subagent` profile) apply only when the agent is spawned via `task`, and win over the base fields per field.
 
 Delegated overrides inherit per field from the base fields; base fields inherit per field from the agent's frontmatter `ai` block. You can override one field (e.g. only `thinkingLevel`) and leave the others inherited.

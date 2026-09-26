@@ -17,10 +17,7 @@ import {
   readPersistedString,
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
-import type {
-  AutoRoutingChoiceByAgent,
-  AutoRoutingOutcome,
-} from "@/browser/utils/workspaceModeAi";
+import type { AutoRoutingChoiceByAgent, AutoRoutingOutcome } from "@/browser/utils/workspaceModeAi";
 
 export type ModelChangeOrigin = "user" | "agent" | "sync";
 
