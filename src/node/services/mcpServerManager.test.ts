@@ -1614,6 +1614,54 @@ describe("MCPServerManager", () => {
     expect(restarted).toHaveBeenCalledTimes(0);
   });
 
+  test("a concurrent serve does not join a restart batched with a timed-out retry", async () => {
+    // One cached serve retries a re-queued plugin and a timed-out server in
+    // ONE startServers batch. Joining it would pin the concurrent serve to
+    // the possibly hanging timed-out startup; it keeps the old skip instead.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    const workspaceId = "ws-mixed-retry-batch";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({
+        "plugin:abc123:echo": stdioConfig("node server.js"),
+        slow: stdioConfig("cmd-slow"),
+      })
+    );
+    servers.serve("node server.js", { tools: { echo: testTool("stale") } });
+    servers.serve("cmd-slow", { hang: true });
+    await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest(workspaceId))
+    );
+    elapseTimedOutRetryBackoff();
+
+    token = "epoch-2";
+    servers.serve("node server.js", { tools: { echo: testTool("fresh") } });
+    const slowRetryStarted = Promise.withResolvers<void>();
+    const slowRetryFinished = Promise.withResolvers<void>();
+    servers.serve("cmd-slow", {
+      tools: { tool: testTool() },
+      connect: () => {
+        slowRetryStarted.resolve();
+        return slowRetryFinished.promise;
+      },
+    });
+    const first = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await slowRetryStarted.promise;
+    expect(servers.connectCount("node server.js")).toBe(1);
+
+    // Settles while the batch's timed-out retry is still pending.
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(second.stats.failedServerNames).toContain("slow");
+    expect(servers.connectCount("node server.js")).toBe(1);
+
+    slowRetryFinished.resolve();
+    const firstResult = await first;
+    expect(Object.keys(firstResult.tools).sort()).toEqual(["plugin_abc123_echo_echo", "slow_tool"]);
+  });
+
   test("serves loop until a startup is bracketed by an unchanged mutation token", async () => {
     // A single post-publication rebuild is not enough: a second sibling
     // mutation starting after the rebuild's preflight would let the rebuild

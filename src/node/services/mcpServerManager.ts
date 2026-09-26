@@ -1322,12 +1322,12 @@ interface WorkspaceServers {
   timedOutServerNames: string[];
   /**
    * In-flight cached retries by server name; prevents concurrent cached
-   * retries from stacking startup attempts for the same server. An explicit
-   * re-queue (plugin invalidation restart; no backoff record) carries a promise
-   * settling when its retry finishes, which concurrent serves join instead of
-   * serving without the server (#4539). A timed-out server's retry carries
-   * none: concurrent serves skip it rather than wait on a possibly hanging
-   * startup.
+   * retries from stacking startup attempts for the same server. A batch of
+   * explicit re-queues only (plugin invalidation restart; no backoff record)
+   * carries a promise settling when its retry finishes, which concurrent
+   * serves join instead of serving without the server (#4539). A batch with a
+   * timed-out server's retry carries none: concurrent serves skip it rather
+   * than wait on a possibly hanging startup.
    */
   retryingTimedOutServerNames: Map<string, Promise<void> | undefined>;
   /**
@@ -3075,12 +3075,16 @@ export class MCPServerManager {
         const retryingServerNames = new Set(timedOutServerNamesToRetry);
         // Mark retries before awaiting startup so concurrent same-signature calls do not
         // stack duplicate retry attempts while the previous timeout is still unwinding.
+        // Joinable only when the whole batch is restarts: the batch settles as
+        // one, so a timed-out retry in it would pin joiners to its startup.
         const retryDone = Promise.withResolvers<void>();
+        const joinable = [...retryingServerNames].every(
+          (serverName) => existing.timedOutRetryBackoff?.has(serverName) !== true
+        );
         for (const serverName of retryingServerNames) {
-          const restart = existing.timedOutRetryBackoff?.has(serverName) !== true;
           existing.retryingTimedOutServerNames.set(
             serverName,
-            restart ? retryDone.promise : undefined
+            joinable ? retryDone.promise : undefined
           );
         }
 
