@@ -52,6 +52,31 @@ describe("tokenizer", () => {
     expect(await countTokens(openaiModel, "<|endoftext|>")).toBeGreaterThan(1);
   });
 
+  test("never reuses one text's cached or in-flight count for a different text", async () => {
+    // Same length (16) and same CRC32, so a `CRC32:length` cache key conflated them (#4654).
+    const first = "ab1b .  ab 1baba";
+    const second = "bbbba.ba1-aba- -";
+    const tokenizer = await getTokenizerForModel(openaiModel, undefined, {
+      requireRealEncoding: true,
+    });
+    const firstAlone = await tokenizer.countTokens(first);
+    __resetTokenizerForTests();
+    const secondAlone = await tokenizer.countTokens(second);
+    // The pair only proves anything if the real counts differ.
+    expect(secondAlone).not.toBe(firstAlone);
+
+    // Cached: the first text's count must not answer for the second.
+    __resetTokenizerForTests();
+    await tokenizer.countTokens(first);
+    expect(await tokenizer.countTokens(second)).toBe(secondAlone);
+
+    // In flight: concurrent requests must not join each other's worker job.
+    __resetTokenizerForTests();
+    expect(
+      await Promise.all([tokenizer.countTokens(first), tokenizer.countTokens(second)])
+    ).toEqual([firstAlone, secondAlone]);
+  });
+
   test("countTokensBatch matches individual calls", async () => {
     const texts = ["alpha", "beta", "gamma"];
     const batch = await countTokensBatch(openaiModel, texts);
