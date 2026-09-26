@@ -159,3 +159,21 @@ export function addDemoWorkspace(
 
   return { ...demoProject, workspacePath, workspaceId, historyPath };
 }
+
+/**
+ * Mark the demo project trusted, as the workspace-creation trust prompt does for most real
+ * projects. Call before the app launches: the backend reads config.json at startup.
+ */
+export function trustDemoProject(demoProject: DemoProjectConfig): void {
+  const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
+    projects: [string, { trusted?: boolean }][];
+  };
+  const projectEntry = configPayload.projects.find(
+    ([projectPath]) => projectPath === demoProject.projectPath
+  );
+  if (!projectEntry) {
+    throw new Error(`Demo project ${demoProject.projectPath} is missing from config.json`);
+  }
+  projectEntry[1].trusted = true;
+  fs.writeFileSync(demoProject.configPath, JSON.stringify(configPayload, null, 2));
+}

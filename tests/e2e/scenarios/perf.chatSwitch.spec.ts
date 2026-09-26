@@ -12,7 +12,7 @@ import {
   type ChatSwitchRendererTimings,
   type ChatSwitchServerReplay,
 } from "../utils/chatSwitchSummary";
-import { addDemoWorkspace, type DemoProjectConfig } from "../utils/demoProject";
+import { addDemoWorkspace, trustDemoProject, type DemoProjectConfig } from "../utils/demoProject";
 import {
   seedWorkspaceHistoryProfile,
   type SeededHistoryProfileSummary,
@@ -130,6 +130,13 @@ const test = electronTest.extend({
       });
     }
     seededRounds = rounds;
+    // Measure the common trusted case (the workspace-creation flow asks for trust). In an
+    // untrusted project every executeBash first runs four `git` spawns to discover repo
+    // automation drivers. A workspace open fires four executeBash calls (git status, git fetch,
+    // gh pr view, gh stack view), so a cold open forked the Electron main process 20 times
+    // instead of 4, each blocking it ~8-16 ms inside the replay's history read: cold-open replay
+    // ~340 ms vs ~150 ms trusted (#4624). That untrusted-path cost is real: #4661.
+    trustDemoProject(workspace.demoProject);
 
     // The per-replay server line logs at debug unless the replay is slow; the app fixture
     // copies process.env into the Electron environment, so set it before launch.
