@@ -115,7 +115,7 @@ export function getSelfIdentity(): ProcessIdentity {
 }
 
 /** Test seam: judge records as if this process had `identity` (undefined restores the probe). */
-export function setSelfIdentityForTesting(identity: ProcessIdentity | undefined): void {
+export function setSelfIdentityForTests(identity: ProcessIdentity | undefined): void {
   selfIdentity = identity;
 }
 

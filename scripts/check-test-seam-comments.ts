@@ -72,12 +72,6 @@ export const FROZEN_KNOWN_DEBT: readonly string[] = [
   "src/node/services/contextManagement/sessionContextHost.ts#SessionContextHost.compactionMonitor",
   "src/node/services/mcpServerIcon.ts#IconResolverDependencies",
   "src/node/services/workflows/WorkflowRunStore.ts#WorkflowRunStoreOptions.mutationLockWaitTimeoutMs",
-  "src/node/utils/concurrency/fileLock.ts#ProcessFileLockOptions.testOnlyReclaimSeam",
-  "src/node/utils/concurrency/fileLock.ts#ReclaimSeamPhase",
-  "src/node/utils/concurrency/processLiveness.ts#setSelfIdentityForTesting",
-  "src/node/utils/journal/journal.ts#JournalOptions.testOnlyBeforeAppendWrite",
-  "src/node/utils/main/bashPath.ts#resetBashPathCache",
-  "src/node/utils/network/pinnedHttpsFetch.ts#PinnedHttpsFetchTransport",
 ];
 
 /** .ts, .tsx, .mts, .cts, .js, .jsx, .mjs and .cjs. */

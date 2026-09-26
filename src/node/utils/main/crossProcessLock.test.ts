@@ -8,7 +8,7 @@ import * as readline from "node:readline";
 
 import {
   probeProcessBirth,
-  setSelfIdentityForTesting,
+  setSelfIdentityForTests,
 } from "@/node/utils/concurrency/processLiveness";
 import {
   acquireCrossProcessLock,
@@ -518,7 +518,7 @@ describe("macOS/Windows rule (simulated identity; not natively qualified)", () =
   };
 
   test("dead pid reclaimed (even after a hostname change); live pid refused; a Linux record is retired", async () => {
-    setSelfIdentityForTesting(darwin);
+    setSelfIdentityForTests(darwin);
     const holder = liveProcess();
     try {
       const lockPath = await tempLockPath();
@@ -549,7 +549,7 @@ describe("macOS/Windows rule (simulated identity; not natively qualified)", () =
       expect((await expectRefused(lockPath)).message).toContain("cannot verify");
     } finally {
       holder.stop();
-      setSelfIdentityForTesting(undefined);
+      setSelfIdentityForTests(undefined);
     }
   });
 });
