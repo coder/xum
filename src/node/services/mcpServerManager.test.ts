@@ -312,36 +312,13 @@ describe("MCPServerManager", () => {
     /** Connections to `command`'s server, oldest first. */
     const clients = (command: string) => connections.filter((c) => c.command === command);
     const makeManager = () => {
-      // WORKAROUND for pre-existing production behavior (#4513):
-      // the real component try-lock is the exclusive, timeout-0 plugin
-      // mutation lock, exclusive even in-process and held through each launch,
-      // so sibling managed launches in one process fail closed ("unavailable
-      // ...; retry"). The old startSingleServer stub hid this. Queue this
-      // manager's own admissions; other holders still hit the fail-closed path.
-      let admissions = Promise.resolve();
+      // The production wiring: the exclusive, timeout-0 plugin mutation lock.
       const invalidation: NonNullable<MCPServerManagerOptions["pluginInvalidation"]> = {
         keyPrefix: "plugin:",
         readToken: () => Promise.resolve(undefined),
         readComponentPolicy: read,
-        tryAcquireComponentPolicyLock: async (options) => {
-          const previous = admissions;
-          const turn = Promise.withResolvers<void>();
-          admissions = turn.promise;
-          await previous;
-          try {
-            const release = await acquirePluginMutationLock(home, { timeoutMs: 0, ...options });
-            return async () => {
-              try {
-                await release();
-              } finally {
-                turn.resolve();
-              }
-            };
-          } catch (error) {
-            turn.resolve();
-            throw error;
-          }
-        },
+        tryAcquireComponentPolicyLock: (options) =>
+          acquirePluginMutationLock(home, { timeoutMs: 0, ...options }),
       };
       const { instance, sweepIdle } = constructWithIdleSweep(
         () =>
@@ -463,6 +440,73 @@ describe("MCPServerManager", () => {
       expect(f.connections).toHaveLength(3);
     }
   );
+
+  test("concurrent managed launches share the component fence; a plugin mutation still excludes them", async () => {
+    using tmp = new DisposableTempDir("mcp-component-shared-fence");
+    const f = await componentFixture(tmp.path);
+    delete f.configs.ordinary;
+    const bothKeys = ["plugin:instance:keep", "plugin:instance:remove"];
+    // Each admission reads policy while holding the fence. The first fenced
+    // read waits until the second admission either reaches its own fenced read
+    // or fails its lock attempt, so the two admissions deterministically overlap.
+    const secondProgressed = Promise.withResolvers<void>();
+    let holds = 0;
+    const tryLock = f.invalidation.tryAcquireComponentPolicyLock!;
+    f.invalidation.tryAcquireComponentPolicyLock = async (options) => {
+      try {
+        const release = await tryLock(options);
+        holds++;
+        return async () => {
+          holds--;
+          await release();
+        };
+      } catch (error) {
+        secondProgressed.resolve();
+        throw error;
+      }
+    };
+    const readPolicy = f.invalidation.readComponentPolicy!;
+    let fencedReads = 0;
+    let mutationDuringLaunches: "acquired" | "fenced" | undefined;
+    f.invalidation.readComponentPolicy = async () => {
+      if (holds > 0 && ++fencedReads === 1) {
+        await secondProgressed.promise;
+        mutationDuringLaunches = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 }).then(
+          async (release) => {
+            await release();
+            return "acquired" as const;
+          },
+          () => "fenced" as const
+        );
+      } else if (holds > 0) {
+        secondProgressed.resolve();
+      }
+      return readPolicy();
+    };
+
+    const served = await manager.getToolsForWorkspace(workspaceRequest("shared-fence"));
+    expect(served.stats.failedServerNames).toEqual([]);
+    expect(Object.values(served.toolServerNames).sort()).toEqual(bothKeys);
+    expect(fencedReads).toBe(2);
+    // The shared hold still excluded an installer-side mutation...
+    expect(mutationDuringLaunches).toBe("fenced");
+    // ...and the last launch released it.
+    const releaseAfter = await acquirePluginMutationLock(tmp.path, { timeoutMs: 0 });
+
+    // A mutation holding the lock fences every launch out of a fresh manager.
+    try {
+      const { instance } = f.makeManager();
+      try {
+        const fenced = await instance.getToolsForWorkspace(workspaceRequest("mutation-fence"));
+        expect([...fenced.stats.failedServerNames].sort()).toEqual(bothKeys);
+        expect(fenced.toolServerNames).toEqual({});
+      } finally {
+        instance.dispose();
+      }
+    } finally {
+      await releaseAfter();
+    }
+  });
 
   test.each([false, true])(
     "component cleanup failures remain retryable without blocking retained clients (readd: %s)",

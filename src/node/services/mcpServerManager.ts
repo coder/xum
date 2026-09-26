@@ -1493,6 +1493,11 @@ export class MCPServerManager {
   private readonly pluginInvalidation?: MCPServerManagerOptions["pluginInvalidation"];
   private componentPolicy: PluginMcpPolicy | undefined;
   private componentPolicyRevision = 0;
+  /** Current shared hold of the component-policy writer lock; see acquireSharedComponentPolicyLock. */
+  private componentPolicyLockShare:
+    | { acquisition: Promise<() => Promise<void>>; holders: number }
+    | undefined;
+  private componentPolicyLockReleasing: Promise<void> = Promise.resolve();
   private readonly managedPluginServers = new Map<string, NonNullable<MCPServerInfo["plugin"]>>();
   private readonly managedPluginInstances = new Map<
     string,
@@ -1678,7 +1683,8 @@ export class MCPServerManager {
     // Overrides are locked first. Uninstall takes the plugin lock and then prunes
     // overrides, so waiting here would deadlock. A contended try-lock fails closed
     // and lets the outer finally release overrides; no admission retry loop.
-    const acquisition = acquire({ signal: options.signal });
+    // Sibling admissions of this manager share one hold (see the share field).
+    const acquisition = this.acquireSharedComponentPolicyLock(acquire);
     let release: () => Promise<void>;
     try {
       release = await bounded(acquisition);
@@ -1700,6 +1706,53 @@ export class MCPServerManager {
       await release();
       throw error;
     }
+  }
+
+  /**
+   * Share one component-policy writer-lock hold across overlapping admissions
+   * of this manager (#4513). The injected try-lock is the installer's mutation
+   * lock, exclusive even within one process, but admissions only READ policy:
+   * sibling launches started concurrently by one serve must not fence each
+   * other out. The first admission try-locks; overlapping admissions join that
+   * same attempt (and its failure), and the last holder releases the lock.
+   * Plugin install/update/uninstall still take the lock exclusively, so they
+   * exclude, and are excluded by, every sharer. Admissions hold it only through
+   * launch initiation, so joiners cannot pin it indefinitely.
+   *
+   * No caller signal reaches the shared attempt: one caller's abort must not
+   * fail its joiners. Callers bound their own wait (see `bounded`).
+   */
+  private acquireSharedComponentPolicyLock(
+    tryAcquire: (options: { signal?: AbortSignal }) => Promise<() => Promise<void>>
+  ): Promise<() => Promise<void>> {
+    let share = this.componentPolicyLockShare;
+    if (share === undefined) {
+      // Wait for the previous share's release: a try-lock racing it would read
+      // this manager's own departing hold as a concurrent plugin update.
+      const acquisition = this.componentPolicyLockReleasing.then(() => tryAcquire({}));
+      const created = { acquisition, holders: 0 };
+      share = created;
+      this.componentPolicyLockShare = created;
+      acquisition.catch(() => {
+        if (this.componentPolicyLockShare === created) this.componentPolicyLockShare = undefined;
+      });
+    }
+    const joined = share;
+    joined.holders++;
+    return joined.acquisition.then((release) => {
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        joined.holders--;
+        assert(joined.holders >= 0, "component policy lock share released more than acquired");
+        if (joined.holders > 0) return;
+        if (this.componentPolicyLockShare === joined) this.componentPolicyLockShare = undefined;
+        const releasing = release();
+        this.componentPolicyLockReleasing = releasing.catch(() => undefined);
+        await releasing;
+      };
+    });
   }
 
   private async refreshComponentPolicy(): Promise<Error | undefined> {
