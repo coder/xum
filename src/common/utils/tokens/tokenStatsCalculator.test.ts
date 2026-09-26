@@ -1,6 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 
-import type { MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import {
   collectUniqueToolNames,
@@ -11,8 +13,77 @@ import {
   getConsumerInfoForToolCall,
   isEncryptedWebSearch,
   mergeResults,
+  calculateTokenStats,
   type TokenCountJob,
 } from "./tokenStatsCalculator";
+
+describe("calculateTokenStats", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  // #4643: a 1.24M-row epoch submitted every message for counting in one synchronous loop and
+  // blocked the whole server (pings, heartbeats, other subscriptions) for 10+ s.
+  test("lets due timers run while it submits a long history for counting", async () => {
+    let submissions = 0;
+    let submissionsWhenTimerRan: number | undefined;
+    const tokenizer: tokenizerModule.Tokenizer = {
+      encoding: "test",
+      countTokens: () => {
+        submissions++;
+        // Arm the timer mid-loop: a single yield before the loop would also let a timer armed
+        // up front run, without un-blocking the loop itself.
+        if (submissions === 1) {
+          setTimeout(() => {
+            submissionsWhenTimerRan = submissions;
+          }, 0);
+        }
+        return Promise.resolve(1);
+      },
+    };
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    // Report every budget as spent so the check does not depend on how fast this machine is.
+    spyOn(EventLoopYielder.prototype, "isDue").mockReturnValue(true);
+    const messages = Array.from({ length: 4 }, (_, i) =>
+      createMuxMessage(`m${i}`, i % 2 === 0 ? "user" : "assistant", `message ${i}`)
+    );
+
+    const stats = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    });
+
+    expect(submissionsWhenTimerRan).toBeDefined();
+    expect(submissionsWhenTimerRan!).toBeLessThan(messages.length);
+    expect(submissions).toBe(messages.length);
+    expect(stats.totalTokens).toBe(messages.length);
+  });
+
+  // Server mode treats an unhandled rejection as fatal, so a count that fails while the loop is
+  // yielding must reach the caller, not the process (bun fails the test on an unhandled one).
+  test("rejects with a count failure that happens while it yields", async () => {
+    let calls = 0;
+    const tokenizer: tokenizerModule.Tokenizer = {
+      encoding: "test",
+      countTokens: () =>
+        ++calls === 1 ? Promise.reject(new Error("worker died")) : Promise.resolve(1),
+    };
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    spyOn(EventLoopYielder.prototype, "isDue").mockReturnValue(true);
+    const messages = Array.from({ length: 4 }, (_, i) =>
+      createMuxMessage(`m${i}`, "user", `message ${i}`)
+    );
+
+    const failure = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    }).then(
+      () => null,
+      (error: unknown) => error
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("worker died");
+    expect(calls).toBe(messages.length);
+  });
+});
 
 describe("createDisplayUsage", () => {
   test("uses usage.reasoningTokens when available", () => {
