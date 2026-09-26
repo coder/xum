@@ -82,12 +82,23 @@ export const FROZEN_KNOWN_DEBT: readonly string[] = [
   "src/node/utils/network/pinnedHttpsFetch.ts#PinnedHttpsFetchTransport",
 ];
 
+/** .ts, .tsx, .mts, .cts, .js, .jsx, .mjs and .cjs. */
+const SOURCE_EXTENSION = /\.[cm]?[jt]sx?$/;
+export const SOURCE_GLOB = "src/**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}";
+
+function scriptKind(file: string): ts.ScriptKind {
+  if (file.endsWith(".tsx")) return ts.ScriptKind.TSX;
+  if (file.endsWith(".jsx")) return ts.ScriptKind.JSX;
+  return /\.[cm]?js$/.test(file) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+}
+
 /**
- * Production source = src/**\/*.{ts,tsx} minus tests, test support, stories and
+ * Production source = SOURCE_GLOB minus tests, test support, stories and
  * generated files. Paths are repo-relative with forward slashes.
  */
 export function isProductionSource(relPath: string): boolean {
-  if (!relPath.startsWith("src/") || !/\.tsx?$/.test(relPath)) return false;
+  // Shipped JavaScript counts too (builtin skill workflows, the workflow runtime stdlib).
+  if (!relPath.startsWith("src/") || !SOURCE_EXTENSION.test(relPath)) return false;
   const segments = relPath.split("/");
   const base = segments[segments.length - 1];
   const dirs = segments.slice(0, -1);
@@ -96,14 +107,14 @@ export function isProductionSource(relPath: string): boolean {
   if (dirs.some((dir) => supportDirs.includes(dir))) return false;
   // foo.test.ts, foo.spec.ts, foo.testHarness.ts, foo.testUtils.ts, foo.testChild.ts,
   // foo.test-fixture.ts, foo.stories.tsx, foo.generated.ts.
-  if (/\.(?:test|spec)[\w-]*\.tsx?$/.test(base)) return false;
-  if (/\.(?:stories|generated)\.tsx?$/.test(base)) return false;
+  if (/\.(?:test|spec)[\w-]*\.[cm]?[jt]sx?$/.test(base)) return false;
+  if (/\.(?:stories|generated)\.[cm]?[jt]sx?$/.test(base)) return false;
   // testUtils.ts, testHelpers.ts, testRemoteRuntime.ts, test-isolation.d.ts.
   if (/^test(?:[A-Z_.-])/.test(base)) return false;
   // refinementTestHelpers.ts, fileLockTestHelpers.ts, workspaceStoreTestOverlay.ts,
   // GoogleSearchToolCall.fixtures.ts, DesktopBridgeServer.nodeFixture.ts.
   if (/Test(?:Helpers?|Harness|Utils|Fixtures?|Overlay|Child)\b/.test(base)) return false;
-  if (/\.(?:\w*[fF]ixtures?)\.tsx?$/.test(base)) return false;
+  if (/\.(?:\w*[fF]ixtures?)\.[cm]?[jt]sx?$/.test(base)) return false;
   // Generated at build time (see Makefile's version target).
   if (relPath === "src/version.ts") return false;
   return true;
@@ -137,7 +148,20 @@ function firstMatch(body: string): string | undefined {
   return undefined;
 }
 
+/** Names bound by `{ a, b: c }` / `[d, [e]]` patterns, in source order. */
+function boundNames(pattern: ts.BindingPattern): string[] {
+  return pattern.elements.flatMap((element) => {
+    if (ts.isOmittedExpression(element)) return [];
+    return ts.isIdentifier(element.name) ? [element.name.text] : boundNames(element.name);
+  });
+}
+
 function declarationName(node: ts.Node): string | undefined {
+  // `const { a, b: c } = x` / `const [d, e] = y` bind several names; key by all of them.
+  if (ts.isVariableDeclaration(node) && !ts.isIdentifier(node.name)) {
+    const names = boundNames(node.name);
+    return names.length > 0 ? names.join(",") : undefined;
+  }
   if (ts.isVariableStatement(node)) return declarationName(node.declarationList);
   // `export { a, b as c }` has no declaration name; key it by the exported names.
   if (ts.isExportDeclaration(node) && node.exportClause && ts.isNamedExports(node.exportClause)) {
@@ -229,8 +253,13 @@ function coalesceLineComments(text: string, comments: OwnedComment[]): OwnedComm
 export function findSeamComments(file: string, text: string): SeamComment[] {
   // Cheap prefilter: most files never mention a seam phrase anywhere.
   if (firstMatch(commentBody(text)) === undefined) return [];
-  const kind = file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-  const sourceFile = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, kind);
+  const sourceFile = ts.createSourceFile(
+    file,
+    text,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind(file)
+  );
   // Every comment is leading trivia of some token (or trailing trivia on its line), so
   // visiting all tokens finds all comments. The deepest node wins as the owner.
   const owners = new Map<number, { range: ts.CommentRange; owner: ts.Node }>();
@@ -357,7 +386,7 @@ export function checkSeamComments(
 
 function main(): number {
   const root = path.resolve(import.meta.dir, "..");
-  const files = [...new Bun.Glob("src/**/*.{ts,tsx}").scanSync({ cwd: root })]
+  const files = [...new Bun.Glob(SOURCE_GLOB).scanSync({ cwd: root })]
     .map((file) => file.split(path.sep).join("/"))
     .filter(isProductionSource)
     .sort();

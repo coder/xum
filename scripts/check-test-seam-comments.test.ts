@@ -80,6 +80,20 @@ test("ignores comment-like text inside regex literals and JSX text", () => {
   expect(seams("export const B = () => <p>// Exported for tests</p>;", "src/x.tsx")).toEqual([]);
 });
 
+test("keys comments on destructured declarations by the bound names", () => {
+  expect(seams("// Exported for tests.\nexport const { a, b: c, ...rest } = x;")).toEqual([
+    "1:a,c,rest",
+  ]);
+  expect(seams("// Exported for tests.\nexport const [d, , [e]] = y;")).toEqual(["1:d,e"]);
+});
+
+test("parses shipped JavaScript with the JS script kind", () => {
+  // JS allows JSX, so this is JSX text; parsed as TS it would be a type assertion + comment.
+  const text = "export const p = <p>// Exported for tests</p>;";
+  expect(seams(text, "src/x.js")).toEqual([]);
+  expect(seams(text, "src/x.ts")).toEqual(["1:p"]);
+});
+
 test("ignores non-comment text and descriptive uses of the words", () => {
   const text = [
     'const label = "Exported for tests";',
@@ -93,11 +107,16 @@ test("ignores non-comment text and descriptive uses of the words", () => {
 test("separates production sources from tests, support code, stories and generated files", () => {
   const production = [
     "src/node/services/aiService.ts",
+    "src/node/builtinSkills/deep-research/workflow.js",
+    "src/browser/features/Analytics/sqlExplorerSampleQueryRunner.cjs",
     "src/browser/hooks/useMCPTestCache.ts",
     "src/node/services/replay/replayFixtureNotes.ts",
   ];
   const nonProduction = [
     "src/node/services/aiService.test.ts",
+    "src/node/workflowRuntime/runtime.test.mjs",
+    "src/browser/stories/mocks/data.js",
+    "src/node/services/aiService.md",
     "src/node/services/taskService.testHarness.ts",
     "src/node/services/taskWorkspaceSeam.testUtils.ts",
     "src/browser/features/desktop/desktopRfb.test-fixture.ts",
