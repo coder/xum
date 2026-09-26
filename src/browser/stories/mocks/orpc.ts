@@ -1779,6 +1779,21 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         publishWorkspaceMetadata(next);
         return Promise.resolve({ success: true as const, data: undefined });
       },
+      setAgentMessageDispatchMode: (input: {
+        workspaceId: string;
+        mode: "tool-end" | "turn-end";
+      }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same storage rule as the backend: the tool-end default is an absent field.
+        const { agentMessageDispatchMode: _previous, ...rest } = current;
+        publishWorkspaceMetadata(
+          input.mode === "turn-end" ? { ...rest, agentMessageDispatchMode: "turn-end" } : rest
+        );
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),

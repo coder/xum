@@ -97,6 +97,7 @@ import {
 import { BashToolResultSchema, FileTreeNodeSchema } from "./tools";
 import { WorkspaceStatsSnapshotSchema } from "./workspaceStats";
 import {
+  AgentMessageDispatchModeSchema,
   FrontendWorkspaceMetadataSchema,
   WorkspaceRemoveResultSchema,
   GitStatusSchema,
@@ -1747,6 +1748,15 @@ export const workspace = {
     input: z.object({
       workspaceId: z.string(),
       enabled: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  // Recipient-side delivery preference for agent messages that arrive while this workspace is
+  // busy (see WorkspaceMetadata.agentMessageDispatchMode).
+  setAgentMessageDispatchMode: {
+    input: z.object({
+      workspaceId: z.string(),
+      mode: AgentMessageDispatchModeSchema,
     }),
     output: ResultSchema(z.void(), z.string()),
   },

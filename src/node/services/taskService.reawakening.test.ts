@@ -802,7 +802,7 @@ describe("TaskService", () => {
     expect(
       await taskService.sendAgentTreeMessage("child-a", "tree-root", "after the stop")
     ).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
     );
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
@@ -838,7 +838,7 @@ describe("TaskService", () => {
     );
 
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
     );
     const [, , options, internalArg] = sendMessage.mock.calls[0] as [
       string,

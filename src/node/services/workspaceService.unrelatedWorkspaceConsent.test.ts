@@ -434,3 +434,58 @@ describe("getValidUnrelatedWorkspaceConsent", () => {
     }
   });
 });
+
+describe("WorkspaceService.setAgentMessageDispatchMode", () => {
+  let harness: Awaited<ReturnType<typeof createHarness>>;
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    mock.restore();
+    await harness.cleanup();
+  });
+
+  test("turn-end round-trips through config and metadata; tool-end restores the absent default", async () => {
+    const { config, service } = harness;
+    const persistedMode = (): unknown =>
+      [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((workspace) => workspace.id === WORKSPACE_ID)?.agentMessageDispatchMode;
+    const published: Array<{ agentMessageDispatchMode?: string } | null> = [];
+    service.on("metadata", (event: { metadata: { agentMessageDispatchMode?: string } | null }) =>
+      published.push(event.metadata)
+    );
+
+    expect((await service.setAgentMessageDispatchMode(WORKSPACE_ID, "turn-end")).success).toBe(
+      true
+    );
+    expect(persistedMode()).toBe("turn-end");
+    expect(published.at(-1)?.agentMessageDispatchMode).toBe("turn-end");
+    const reloaded = await config.getAllWorkspaceMetadata();
+    expect(reloaded.find((m) => m.id === WORKSPACE_ID)?.agentMessageDispatchMode).toBe("turn-end");
+    expect(
+      reloaded.find((m) => m.id === OTHER_WORKSPACE_ID)?.agentMessageDispatchMode
+    ).toBeUndefined();
+
+    // The default is stored as an absent field, so old and new entries read the same way.
+    expect((await service.setAgentMessageDispatchMode(WORKSPACE_ID, "tool-end")).success).toBe(
+      true
+    );
+    expect(persistedMode()).toBeUndefined();
+    expect(published.at(-1)?.agentMessageDispatchMode).toBeUndefined();
+  });
+
+  test("does not acknowledge a mode whose save was swallowed", async () => {
+    // Config.saveConfig logs and swallows write failures; model one reaching the real edit path.
+    spyOn(
+      harness.config as unknown as { saveConfig: (config: unknown) => Promise<void> },
+      "saveConfig"
+    ).mockResolvedValue(undefined);
+
+    const result = await harness.service.setAgentMessageDispatchMode(WORKSPACE_ID, "turn-end");
+
+    expect(result.success).toBe(false);
+  });
+});
