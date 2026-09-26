@@ -383,7 +383,8 @@ type AgentReportFinalizationResult =
         | "invalid_structured_output"
         | "pending_guidance"
         | "terminal_interrupted"
-        | "superseded_attempt";
+        | "superseded_attempt"
+        | "retired_attempt";
       message: string;
     };
 
@@ -16201,6 +16202,8 @@ export class TaskService implements AgentTaskIntegration {
       );
       if (finalization.finalized) {
         await this.finalizeTerminationPhaseForReportedTask(workspaceId);
+      } else if (finalization.reason === "retired_attempt") {
+        this.rejectWaiters(workspaceId, new Error(finalization.message));
       }
       return;
     }
@@ -17914,6 +17917,15 @@ export class TaskService implements AgentTaskIntegration {
         message: "The task was re-admitted under another attempt; this report was not published.",
       };
     }
+    if (published === "retired") {
+      // Same attempt, so the stable-id waiters are this attempt's: callers reject them (#4545).
+      return {
+        finalized: false,
+        reason: "retired_attempt",
+        message:
+          "A workflow retired this task attempt and its replacement owns the outcome; this report was not published.",
+      };
+    }
     if (!published) {
       return { finalized: true };
     }
@@ -18066,6 +18078,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     | null
     | "superseded"
+    | "retired"
   > {
     // An unowned stream's decision (see StreamEndDecision) is keyed by the attempt the stream was
     // admitted under when the caller knows it, else by the row as read before this report.
@@ -18113,7 +18126,7 @@ export class TaskService implements AgentTaskIntegration {
         ),
         "indeterminate"
       );
-      return "superseded";
+      return retired ? "retired" : "superseded";
     }
     this.clearTaskRecovery(childWorkspaceId);
     // Drop queued incremental updates synchronously with the terminal commit: while they sit at

@@ -4286,6 +4286,13 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");
           return;
         }
+        // A task_await in B, registered while B's turn runs: A's Stop cannot reach it (process-local).
+        const waiterB = backendB
+          .waitForAgentReport(taskId, { timeoutMs: 5_000, requestingWorkspaceId: rootId })
+          .then(
+            () => "resolved",
+            (error: unknown) => `rejected: ${getErrorMessage(error)}`
+          );
         // A is locally idle, so its Stop settles A and its workflow claims the attempt.
         await taskService.stopDescendantAgentTask(rootId, taskId);
         await settle();
@@ -4298,6 +4305,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           taskAttemptRetiredBy: { attemptId: attemptA },
         });
         expect((await readReport()).kind).not.toBe("found");
+        // Same attempt, so B's waiter is this attempt's: it ends now instead of at its timeout.
+        expect(await waiterB).toContain("retired");
       }
     );
 
