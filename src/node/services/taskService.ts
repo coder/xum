@@ -9670,10 +9670,19 @@ export class TaskService implements AgentTaskIntegration {
   ): void {
     for (const waiter of waiters) {
       const senderId = waiter.senderWorkspaceId;
+      // The waiter stays in the broker's in-flight set (counted against the per-target bound)
+      // until this settles it: requeue keeps the promise, release ends it.
       this.workspaceEventLocks
         .withLock(senderId, () =>
           this.deliverPeerWakeAvailableNotice(targetId, waiter, options?.afterIdle === true)
         )
+        .then((outcome) => {
+          if (outcome === "requeue") {
+            this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
+          } else if (outcome !== "waiting-for-idle") {
+            this.agentPeerMessageBroker.releasePeerWakeWaiter(targetId, senderId);
+          }
+        })
         .catch((error: unknown) => {
           log.error("Failed to wake a sender refused by a peer-wake limit", {
             targetId,
@@ -9690,14 +9699,14 @@ export class TaskService implements AgentTaskIntegration {
     targetId: string,
     waiter: PeerWakeWaiter,
     afterIdle: boolean
-  ): Promise<void> {
+  ): Promise<"delivered" | "dropped" | "requeue" | "waiting-for-idle"> {
     const senderId = waiter.senderWorkspaceId;
     const cfg = this.config.loadConfigOrDefault();
     const targetEntry = findWorkspaceEntry(cfg, targetId);
     const senderEntry = findWorkspaceEntry(cfg, senderId);
-    if (targetEntry == null || senderEntry == null) return;
+    if (targetEntry == null || senderEntry == null) return "dropped";
     if (isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt)) {
-      return;
+      return "dropped";
     }
     const index = this.buildAgentTaskIndex(cfg);
     // The refused send's authorization must still hold: same relation and, for unrelated
@@ -9718,7 +9727,7 @@ export class TaskService implements AgentTaskIntegration {
             waiter.unrelatedConsent)
       );
     };
-    if (!grantStillValid()) return;
+    if (!grantStillValid()) return "dropped";
     const chainIds = (workspaceId: string): string[] => [
       workspaceId,
       ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, workspaceId),
@@ -9749,10 +9758,7 @@ export class TaskService implements AgentTaskIntegration {
     // marking a user Stop, and a user message to an interrupted task resets before
     // reawakenInterruptedTask runs (and may fail). Keep waiting; a later reset or the successful
     // reawaken delivers the notice.
-    if (targetUnavailable()) {
-      this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
-      return;
-    }
+    if (targetUnavailable()) return "requeue";
     // Same rules as sending: a stopped, terminal, or archived sender must not be woken by this.
     const senderInactive = (): boolean => {
       const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), senderId);
@@ -9762,7 +9768,7 @@ export class TaskService implements AgentTaskIntegration {
         this.isInactivePeerEndpointWorkspace(fresh.workspace, senderId)
       );
     };
-    if (senderInactive()) return;
+    if (senderInactive()) return "dropped";
 
     // Deliver only into an idle sender, like the idle terminal-attention drain: a queued notice
     // would dispatch with the tool-policy snapshot taken now, even after newer user input
@@ -9774,10 +9780,7 @@ export class TaskService implements AgentTaskIntegration {
       this.workspaceService.hasQueuedMessages(senderId) ||
       this.workspaceService.hasPendingQueuedOrPreparingTurn(senderId);
     if (senderBusy()) {
-      if (afterIdle) {
-        this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
-        return;
-      }
+      if (afterIdle) return "requeue";
       this.workspaceService
         .waitForIdleAndNoQueuedMessages(senderId)
         .then(() => this.schedulePeerWakeAvailableNotices(targetId, [waiter], { afterIdle: true }))
@@ -9789,7 +9792,7 @@ export class TaskService implements AgentTaskIntegration {
           });
           this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
         });
-      return;
+      return "waiting-for-idle";
     }
     // Any turn admitted after this point (e.g. manual input racing the policy read below) makes
     // the captured restrictions stale.
@@ -9808,22 +9811,29 @@ export class TaskService implements AgentTaskIntegration {
           this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id) ||
           this.isWorkspaceStopInProgress(id)
       );
+    // Why the probe last refused: a sender stop or invalid grant ends the promise, while the
+    // other reasons are races that keep it for the target's next attention.
+    let probeRefusal: "drop" | "retry" | null = null;
     const admissionStale = (): boolean => {
-      if (senderChainStopped() || senderInactive() || !grantStillValid()) return true;
+      if (senderChainStopped() || senderInactive() || !grantStillValid()) {
+        probeRefusal = "drop";
+        return true;
+      }
       if (
         this.workspaceService.getActiveTurnGeneration(senderId) !== senderTurnGeneration ||
         (this.settledTurnCountByWorkspace.get(senderId) ?? 0) !== senderSettledTurns ||
         targetUnavailable()
       ) {
         // Either the sender admitted a turn after the policy snapshot, or the target became
-        // unreachable (stopped, inactive, or capped again). Keep waiting for the target's next
-        // attention instead of dispatching stale grants or a futile retry turn. Idempotent, so
-        // repeated probe calls re-register the same waiter.
-        this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
+        // unreachable (stopped, inactive, or capped again). Keep waiting instead of dispatching
+        // stale grants or a futile retry turn.
+        probeRefusal = "retry";
         return true;
       }
       return false;
     };
+    const refusedOutcome = (): "dropped" | "requeue" =>
+      probeRefusal === "drop" ? "dropped" : "requeue";
 
     let sendRestrictions: Awaited<
       ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
@@ -9834,10 +9844,9 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error: unknown) {
       // Fail closed without losing the waiter: the next attention retries the read.
       log.warn("Deferring peer-wake notice; sender tool policy unavailable", { senderId, error });
-      this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
-      return;
+      return "requeue";
     }
-    if (admissionStale()) return;
+    if (admissionStale()) return refusedOutcome();
 
     // Fixed text only: no title and no target ID, because legacy workspace IDs can derive from
     // repository-controlled names (Config.generateLegacyId). The refused tool call in the
@@ -9861,10 +9870,11 @@ export class TaskService implements AgentTaskIntegration {
       sendRestrictions,
     });
     if (!result.success) {
-      // Usually user input won the race; keep waiting for the target's next attention.
+      // Usually user input won the race (retryable); a probe drop decision stays authoritative.
       log.debug("Peer-wake notice was not admitted", { targetId, senderId, error: result.error });
-      this.agentPeerMessageBroker.requeuePeerWakeWaiter(targetId, waiter);
+      return refusedOutcome();
     }
+    return "delivered";
   }
 
   async stopDescendantAgentTask(

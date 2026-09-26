@@ -1896,6 +1896,51 @@ describe("TaskService", () => {
       expect(t.wakeCalls()).toHaveLength(1);
     });
 
+    test("a sender stopped at the notice's admission gate is not requeued", async () => {
+      let stopSenderAtGate = true;
+      const serviceRef: { current?: TaskService } = {};
+      const t = await setup({
+        sendMessage: mock(
+          (
+            ...args: Parameters<WorkspaceHost["sendMessage"]>
+          ): Promise<Result<void, SendMessageError>> => {
+            const internal = args[3];
+            const isNotice =
+              args[0] === "sib-a" &&
+              internal?.queueDedupeKey?.startsWith(PEER_WAKE_AVAILABLE_DEDUPE_PREFIX) === true;
+            if (isNotice && stopSenderAtGate) {
+              stopSenderAtGate = false;
+              // The user stops the sender while WorkspaceService is admitting the notice.
+              assert(serviceRef.current);
+              serviceRef.current.markParentWorkspaceInterrupted("sib-a");
+              if (internal?.admissionStale?.() === true) {
+                return Promise.resolve(Err({ type: "unknown", raw: "stale" }));
+              }
+            }
+            return Promise.resolve(Ok(undefined));
+          }
+        ),
+      });
+      serviceRef.current = t.taskService;
+      await t.fillAndRefuseSibA("sib-c");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1); // the refused admission attempt
+
+      // The user resumes the sender and the target gets attention again: the stop dropped the
+      // promise, so no stale notice follows.
+      t.taskService.resetAutoResumeCount("sib-a");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+
+      // Positive control: a fresh refusal is woken.
+      await t.fillAndRefuseSibA("sib-d");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(2);
+    });
+
     test("a busy sender is notified only after it goes idle", async () => {
       let senderBusy = true;
       let becomeIdle!: () => void;

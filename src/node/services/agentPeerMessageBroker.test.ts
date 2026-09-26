@@ -143,18 +143,32 @@ describe("AgentPeerMessageBroker", () => {
     const taken = broker.resetConsecutivePeerWakes("target");
     expect(taken).toHaveLength(MAX_PEER_WAKE_WAITERS_PER_TARGET);
 
-    // Newer refusals fill the list while the taken notices are in flight; putting a promised
-    // waiter back must still succeed, so it is not displaced by them.
+    // While those notices are in flight they still count: the target refills its cap, and a new
+    // sender is not promised a wake, while an in-flight sender stays covered without a duplicate.
     for (let i = 0; i < MAX_CONSECUTIVE_PEER_WAKES; i++) {
       broker.chargeConsecutivePeerWake("target");
     }
-    for (let i = 0; i < MAX_PEER_WAKE_WAITERS_PER_TARGET; i++) {
-      broker.checkPeerAdmission(`newer-${i}`, "target", "message", grant);
-    }
+    expect(broker.checkPeerAdmission("newer", "target", "message", grant)).toEqual({
+      code: "refused",
+      reason: PEER_WAKE_LIMIT_FULL_REFUSAL_REASON,
+    });
+    expect(broker.checkPeerAdmission("sender-0", "target", "again", grant)).toEqual({
+      code: "refused",
+      reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
+    });
+    // One notice is delivered, one must be retried: the freed slot admits a new sender.
+    broker.releasePeerWakeWaiter("target", "sender-1");
     broker.requeuePeerWakeWaiter("target", taken[0]);
+    expect(broker.checkPeerAdmission("newer", "target", "message", grant)).toEqual({
+      code: "refused",
+      reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
+    });
     expect(
-      broker.resetConsecutivePeerWakes("target").map((waiter) => waiter.senderWorkspaceId)
-    ).toContain(taken[0].senderWorkspaceId);
+      broker
+        .resetConsecutivePeerWakes("target")
+        .map((waiter) => waiter.senderWorkspaceId)
+        .sort()
+    ).toEqual(["newer", "sender-0"]);
   });
 
   test.each([

@@ -80,6 +80,12 @@ export class AgentPeerMessageBroker {
    * woken with a new turn so it can resend on its own instead of polling or giving up.
    */
   private readonly peerWakeWaitersByTarget = new Map<string, Map<string, PeerWakeWaiterGrant>>();
+  /**
+   * Waiters taken by a reset whose notice is still being delivered. They stay promised, so they
+   * count against the per-target bound and are not registered again until the notice settles
+   * (requeue or release); otherwise reset/recap cycles could stack turns for one sender.
+   */
+  private readonly peerWakeInFlightByTarget = new Map<string, Set<string>>();
 
   constructor(
     private readonly host: AgentPeerMessageBrokerHost,
@@ -181,15 +187,21 @@ export class AgentPeerMessageBroker {
   }
 
   /**
-   * Registers (or refreshes) a waiter. Bounded per target so one capped target cannot turn many
-   * refused senders into a burst of wake turns; returns false when the list is full.
+   * Registers (or refreshes) a waiter. Bounded per target, counting in-flight notices, so one
+   * capped target cannot turn many refused senders into a burst of wake turns; returns false when
+   * the list is full. A sender whose notice is already in flight stays covered by that promise.
    */
   addPeerWakeWaiter(targetId: string, waiter: PeerWakeWaiter): boolean {
     const { senderWorkspaceId, ...grant } = waiter;
     assert(senderWorkspaceId !== targetId, "addPeerWakeWaiter: sender cannot wait on itself");
+    const inFlight = this.peerWakeInFlightByTarget.get(targetId);
+    if (inFlight?.has(senderWorkspaceId) === true) return true;
     const waiters =
       this.peerWakeWaitersByTarget.get(targetId) ?? new Map<string, PeerWakeWaiterGrant>();
-    if (!waiters.has(senderWorkspaceId) && waiters.size >= MAX_PEER_WAKE_WAITERS_PER_TARGET) {
+    if (
+      !waiters.has(senderWorkspaceId) &&
+      waiters.size + (inFlight?.size ?? 0) >= MAX_PEER_WAKE_WAITERS_PER_TARGET
+    ) {
       return false;
     }
     waiters.set(senderWorkspaceId, grant);
@@ -198,25 +210,34 @@ export class AgentPeerMessageBroker {
   }
 
   /**
-   * Puts back a waiter taken by a reset whose notice could not be delivered yet. Exempt from the
-   * bound: the sender was already promised a wake, and newer refusals must not displace it.
-   * Still bounded overall, since only previously registered waiters can be requeued.
+   * Puts an in-flight waiter back because its notice could not be delivered yet. Its slot was
+   * already counted while in flight, so this cannot exceed the bound or displace it.
    */
   requeuePeerWakeWaiter(targetId: string, waiter: PeerWakeWaiter): void {
     const { senderWorkspaceId, ...grant } = waiter;
     assert(senderWorkspaceId !== targetId, "requeuePeerWakeWaiter: sender cannot wait on itself");
+    this.releasePeerWakeWaiter(targetId, senderWorkspaceId);
     const waiters =
       this.peerWakeWaitersByTarget.get(targetId) ?? new Map<string, PeerWakeWaiterGrant>();
     waiters.set(senderWorkspaceId, grant);
     this.peerWakeWaitersByTarget.set(targetId, waiters);
   }
 
+  /** Ends an in-flight promise (delivered or dropped). */
+  releasePeerWakeWaiter(targetId: string, senderWorkspaceId: string): void {
+    const inFlight = this.peerWakeInFlightByTarget.get(targetId);
+    inFlight?.delete(senderWorkspaceId);
+    if (inFlight?.size === 0) this.peerWakeInFlightByTarget.delete(targetId);
+  }
+
   private takePeerWakeWaiters(targetId: string): PeerWakeWaiter[] {
     const waiters = this.peerWakeWaitersByTarget.get(targetId);
     this.peerWakeWaitersByTarget.delete(targetId);
-    return waiters == null
-      ? []
-      : [...waiters].map(([senderWorkspaceId, grant]) => ({ senderWorkspaceId, ...grant }));
+    if (waiters == null) return [];
+    const inFlight = this.peerWakeInFlightByTarget.get(targetId) ?? new Set<string>();
+    for (const senderWorkspaceId of waiters.keys()) inFlight.add(senderWorkspaceId);
+    this.peerWakeInFlightByTarget.set(targetId, inFlight);
+    return [...waiters].map(([senderWorkspaceId, grant]) => ({ senderWorkspaceId, ...grant }));
   }
 
   preparePeerMessage(params: {
