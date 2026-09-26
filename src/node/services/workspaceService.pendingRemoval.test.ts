@@ -17,6 +17,7 @@ import {
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
 import {
@@ -111,6 +112,13 @@ describe("workspace removal across two backends on one root", () => {
     await cleanupFixture();
   });
 
+  async function editTaskRow(edit: (row: WorkspaceConfigEntry) => void): Promise<void> {
+    await a.config.editConfig((config) => {
+      edit(findWorkspaceEntry(config, taskId)!.workspace);
+      return config;
+    });
+  }
+
   /** Pause A's removal right after it closed admission (its first step after the marker). */
   function pauseRemovalAfterMarker(backend: Backend) {
     const reached = createDeferred<void>();
@@ -178,15 +186,11 @@ describe("workspace removal across two backends on one root", () => {
   });
 
   test("the other backend does not launch a queued task that is being removed", async () => {
-    await a.config.editConfig((config) => {
-      const row = [...config.projects.values()]
-        .flatMap((project) => project.workspaces)
-        .find((workspace) => workspace.id === taskId);
-      row!.taskStatus = "queued";
-      row!.taskPrompt = "queued work";
+    await editTaskRow((row) => {
+      row.taskStatus = "queued";
+      row.taskPrompt = "queued work";
       // A queued task of an inactive workflow run is interrupted instead of launched.
-      delete row!.workflowTask;
-      return config;
+      delete row.workflowTask;
     });
     const launch = spyOn(
       b.taskService as unknown as { materializeReservedTaskWorkspace: () => Promise<unknown> },
@@ -222,18 +226,14 @@ describe("workspace removal across two backends on one root", () => {
   test("a marker left by a dead backend is taken over by the next removal", async () => {
     // A pid that has exited: the owner is provably dead in this PID domain.
     const deadPid = spawnSync(process.execPath, ["--version"]).pid;
-    await a.config.editConfig((config) => {
-      const row = [...config.projects.values()]
-        .flatMap((project) => project.workspaces)
-        .find((workspace) => workspace.id === taskId);
-      row!.pendingRemoval = {
+    await editTaskRow((row) => {
+      row.pendingRemoval = {
         removalId: "removal-of-a-crashed-backend",
         instanceId: "instance-of-a-crashed-backend",
         pid: deadPid,
         identity: getSelfIdentity(),
         at: new Date().toISOString(),
       };
-      return config;
     });
 
     const result = await b.workspaceService.remove(taskId, true);
