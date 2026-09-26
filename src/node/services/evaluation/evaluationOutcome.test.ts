@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Effect, Exit } from "effect";
+import { Cause, Effect, Exit } from "effect";
 import { EvaluationError } from "./evaluationService";
 import { classifyEvaluationExit, runEvaluationToOutcome } from "./evaluationOutcome";
 
@@ -200,5 +200,21 @@ describe("classifyEvaluationExit", () => {
       status: "completed",
       result: "ok",
     });
+  });
+
+  it("reports a defect even when the cause also carries a typed failure", () => {
+    // e.g. a provider failure whose finalizer then died: the bug must not be hidden.
+    const cause = Cause.combine(
+      Cause.fail(new EvaluationError({ reason: "provider-failure", code: "api-call" })),
+      Cause.die(new Error(`finalizer exploded ${STATE_SENTINEL}`))
+    );
+    const outcome = classifyEvaluationExit(Exit.failCause(cause), new AbortController().signal);
+    expect(outcome).toEqual({
+      status: "failed",
+      reason: "provider-failure",
+      code: "unknown",
+      defect: true,
+    });
+    expect(JSON.stringify(outcome)).not.toContain(STATE_SENTINEL);
   });
 });

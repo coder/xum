@@ -5173,6 +5173,36 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     });
   });
 
+  it("sends google evaluation requests to the trimmed configured base URL", async () => {
+    await withEvaluationFixture(
+      { google: { apiKey: "sk-google", baseUrl: "  https://proxy.example/google/v1beta  " } },
+      async (_c, factory, fetchSpy) => {
+        const pinned = expectResolved(await factory.createEvaluationModel("google:gemini-2.5-flash"));
+        const urls: string[] = [];
+        fetchSpy.mockImplementation(
+          Object.assign(
+            (input: Parameters<typeof fetch>[0]) => {
+              urls.push(input instanceof Request ? input.url : String(input));
+              return Promise.reject(new Error("captured"));
+            },
+            { preconnect: () => undefined }
+          )
+        );
+        await pinned.model
+          .doEvaluate({
+            state: "hello",
+            questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+          })
+          .then(
+            () => undefined,
+            () => undefined
+          );
+        expect(urls).toHaveLength(1);
+        expect(urls[0]).toStartWith("https://proxy.example/google/v1beta/");
+      }
+    );
+  });
+
   it("sends typesafe requests to the API default or the configured base URL", async () => {
     const captureUrl = async (
       factory: ProviderModelFactory,

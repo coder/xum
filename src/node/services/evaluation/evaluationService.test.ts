@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { Cause, Effect, Exit, Option } from "effect";
 import { APICallError } from "ai";
 import { Experimental_EvaluationMockModelV4 } from "ai/test";
@@ -119,6 +119,30 @@ describe("EvaluationService.evaluate", () => {
     expect(JSON.stringify(result)).not.toContain(SENTINEL);
     expect(calls).toHaveLength(1);
     expect(calls[0].state).toEqual({ title: "hello" });
+  });
+
+  it("never logs provider warnings, even when no other module disabled SDK warning logging", async () => {
+    // streamManager sets this global at import; evaluation must not depend on import order.
+    const saved = globalThis.AI_SDK_LOG_WARNINGS;
+    globalThis.AI_SDK_LOG_WARNINGS = undefined;
+    const emitWarning = spyOn(process, "emitWarning").mockImplementation(() => undefined);
+    const consoleWarn = spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const { model } = mockModel(() =>
+        Promise.resolve({
+          answers: VALID_ANSWERS,
+          warnings: [{ type: "other" as const, message: `echoed state ${SENTINEL}` }],
+        })
+      );
+      const result = await Effect.runPromise(service.evaluate(call(model, QUESTIONS)));
+      expect(result.warningsCount).toBe(1);
+      expect(emitWarning).not.toHaveBeenCalled();
+      expect(consoleWarn).not.toHaveBeenCalled();
+    } finally {
+      emitWarning.mockRestore();
+      consoleWarn.mockRestore();
+      globalThis.AI_SDK_LOG_WARNINGS = saved;
+    }
   });
 
   it("projects only the validated rounding fields and rejects malformed rounding", async () => {

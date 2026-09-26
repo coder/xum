@@ -51,6 +51,12 @@ export function classifyEvaluationExit<A>(
     return { status: "completed", result: exit.value };
   }
 
+  // Dies win over a typed failure in the same cause (e.g. a finalizer that died after the
+  // provider failed): reporting only the typed error would hide the bug as `defect: false`.
+  if (Cause.hasDies(exit.cause)) {
+    return { status: "failed", reason: "provider-failure", code: "unknown", defect: true };
+  }
+
   const error = Cause.findErrorOption(exit.cause);
   if (Option.isSome(error)) {
     return {

@@ -107,6 +107,7 @@ export const EVALUATION_POST_COMMIT_EVENT_FAILED_CODE = "evaluation-post-commit-
 export const EVALUATION_POST_COMMIT_USAGE_FAILED_CODE = "evaluation-post-commit-usage-failed";
 export const EVALUATION_CACHED_EVENT_FAILED_CODE = "evaluation-cached-event-failed";
 export const EVALUATION_FAILED_EVENT_FAILED_CODE = "evaluation-failed-event-failed";
+export const EVALUATION_STARTED_EVENT_FAILED_CODE = "evaluation-started-event-failed";
 
 export function evaluationStepDigest(stepId: string): string {
   return sha256Hex(stepId).slice(0, 12);
@@ -242,7 +243,9 @@ export async function runWorkflowEvaluationStep(
     persisted = admission;
     attempt = persisted.attempt + 1;
   }
-  const timeoutMs = persisted?.timeoutMs ?? clampTimeoutMs(spec.timeoutMs);
+  // Re-clamp a persisted timeout too: a hand-edited or older record must not stretch the
+  // attempt budget past the host's bounds (self-healing, like other persisted state).
+  const timeoutMs = clampTimeoutMs(persisted?.timeoutMs ?? spec.timeoutMs);
   const attemptDeadlineAt = enteredAt + timeoutMs;
   const startedAt = existing?.startedAt ?? clock.nowIso();
 
@@ -327,18 +330,30 @@ export async function runWorkflowEvaluationStep(
     startedAt,
     evaluation: admission,
   });
-  await journal.appendEvent({
-    type: "evaluation",
-    at: clock.nowIso(),
-    stepId: spec.id,
-    inputHash,
-    attempt,
-    status: "started",
-    ...(spec.title !== undefined ? { title: spec.title } : {}),
-    modelString: admission.selection.modelString,
-    stateBytes,
-    questionCount,
-  });
+  try {
+    await journal.appendEvent({
+      type: "evaluation",
+      at: clock.nowIso(),
+      stepId: spec.id,
+      inputHash,
+      attempt,
+      status: "started",
+      ...(spec.title !== undefined ? { title: spec.title } : {}),
+      modelString: admission.selection.modelString,
+      stateBytes,
+      questionCount,
+    });
+  } catch (error) {
+    // The admitted started record is the source of truth; a lost progress event must not
+    // fail the run and strand that record (same rule as the completed/cached/failed appends).
+    log.warn("Workflow evaluation started event append failed after the started record", {
+      code: EVALUATION_STARTED_EVENT_FAILED_CODE,
+      runId: context.runId,
+      stepDigest,
+      attempt,
+      errorName: error instanceof Error ? error.name : typeof error,
+    });
+  }
 
   // 6. Recheck immediately before dispatch; the re-resolved instance is the
   //    one dispatched so a credential/endpoint change during preparation is

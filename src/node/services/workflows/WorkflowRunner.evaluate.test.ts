@@ -10,6 +10,7 @@ import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryElig
 import {
   EVALUATION_DEFAULT_TIMEOUT_MS,
   EVALUATION_MAX_ATTEMPTS,
+  EVALUATION_MAX_TIMEOUT_MS,
   EVALUATION_MIN_TIMEOUT_MS,
 } from "@/constants/evaluation";
 import type { EvaluationOutcome } from "@/node/services/evaluation/evaluationOutcome";
@@ -596,6 +597,27 @@ describe("WorkflowRunner evaluate()", () => {
     });
   });
 
+  test("resuming re-clamps an out-of-range persisted timeout", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path);
+    const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
+    await store.recordStepStarted(RUN_ID, {
+      stepId: STEP_ID,
+      inputHash: hashEvaluationStepInput(spec, STATE),
+      startedAt: "2026-05-29T00:00:00.500Z",
+      evaluation: { ...admissionFor({ attempt: 1 }), timeoutMs: EVALUATION_MAX_TIMEOUT_MS * 10 },
+    });
+    await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+    const fake = createFakeAdapter();
+
+    await createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true });
+
+    expect(await readStep(store)).toMatchObject({
+      status: "completed",
+      evaluation: { attempt: 2, timeoutMs: EVALUATION_MAX_TIMEOUT_MS },
+    });
+  });
+
   test("resume with a changed endpoint fingerprint fails admission-mismatch without dispatching", async () => {
     using tmp = new DisposableTempDir("workflow-eval");
     const store = await createStore(tmp.path);
@@ -1125,6 +1147,37 @@ describe("WorkflowRunner evaluate()", () => {
       expect(fake.usageCalls).toHaveLength(1);
       expect(warn.mock.calls.map(([, fields]) => (fields as { code?: string }).code)).toContain(
         "evaluation-post-commit-event-failed"
+      );
+    } finally {
+      appendSpy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  test("a rejected started-event append after the admitted record still dispatches", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+    const originalAppend = store.appendNextEvent.bind(store);
+    const appendSpy = spyOn(store, "appendNextEvent").mockImplementation(
+      async (runId, event, options) => {
+        if (event.type === "evaluation" && event.status === "started") {
+          throw new Error("disk full");
+        }
+        return await originalAppend(runId, event, options);
+      }
+    );
+    try {
+      const fake = createFakeAdapter();
+
+      const result = await createRunner(store, fake.adapter).run(RUN_ID);
+
+      expect(result.structuredOutput).toMatchObject(EXPECTED_RESULT_SHAPE);
+      expect((await store.getRun(RUN_ID)).status).toBe("completed");
+      expect((await readStep(store))?.status).toBe("completed");
+      expect(fake.dispatchCalls).toHaveLength(1);
+      expect(warn.mock.calls.map(([, fields]) => (fields as { code?: string }).code)).toContain(
+        "evaluation-started-event-failed"
       );
     } finally {
       appendSpy.mockRestore();

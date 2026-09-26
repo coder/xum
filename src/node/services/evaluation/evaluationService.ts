@@ -228,15 +228,20 @@ export function makeEvaluationService(): EvaluationService {
           // effect aborts the in-flight provider request; the resulting
           // rejection is discarded by the runtime as interruption, not mapped
           // into an EvaluationError.
-          try: (signal) =>
-            experimental_evaluate({
+          try: (signal) => {
+            // experimental_evaluate logs provider warnings unless this global is false, and a
+            // warning can echo the evaluated state. Set it here instead of relying on
+            // streamManager having been imported first (#4363).
+            globalThis.AI_SDK_LOG_WARNINGS = false;
+            return experimental_evaluate({
               model: call.model,
               state: call.state,
               questions: call.questions,
               providerOptions: call.providerOptions,
               abortSignal: signal,
               maxRetries: 0,
-            }),
+            });
+          },
           catch: classifyEvaluationError,
         });
 
