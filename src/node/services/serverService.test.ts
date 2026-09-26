@@ -1,9 +1,15 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import * as net from "net";
-import { ServerService, computeNetworkBaseUrls, getTailscaleBindHosts } from "./serverService";
+import {
+  ServerService,
+  computeNetworkBaseUrls,
+  getTailscaleBindHosts,
+  setApiServerSettings,
+  setServerSshHost,
+} from "./serverService";
 import type { ORPCContext } from "@/node/orpc/context";
 import { Config } from "@/node/config";
 import { ServerLockDataSchema } from "./serverLockfile";
@@ -416,5 +422,69 @@ describe("computeNetworkBaseUrls", () => {
     expect(computeNetworkBaseUrls({ bindHost: "2001:db8::1", port: 3000 })).toEqual([
       "http://[2001:db8::1]:3000",
     ]);
+  });
+});
+
+describe("server settings writes (#4444)", () => {
+  let tempDir: string;
+  let config: Config;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "server-settings-test-"));
+    config = new Config(tempDir);
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("a failed SSH host write leaves the in-memory host unchanged", async () => {
+    const serverService = new ServerService();
+    serverService.setSshHost("old-host");
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    const context = { config, serverService } as unknown as ORPCContext;
+
+    const error = await setServerSshHost(context, "new-host").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("EACCES");
+
+    expect(serverService.getSshHost()).toBe("old-host");
+  });
+
+  test("a failed settings write brings a running server back on its previous settings", async () => {
+    await config.editConfig((value) => ({
+      ...value,
+      apiServerBindHost: "127.0.0.1",
+      apiServerPort: 4321,
+    }));
+    let running = true;
+    const starts: Array<{ host: string; port: number; serveStatic: boolean }> = [];
+    const serverService = {
+      isServerRunning: () => running,
+      stopServer: () => {
+        running = false;
+        return Promise.resolve();
+      },
+      startServer: (options: { host: string; port: number; serveStatic: boolean }) => {
+        running = true;
+        starts.push({ host: options.host, port: options.port, serveStatic: options.serveStatic });
+        return Promise.resolve();
+      },
+      getApiAuthToken: () => "token",
+    };
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    const context = { config, serverService } as unknown as ORPCContext;
+
+    const error = await setApiServerSettings(context, {
+      bindHost: "0.0.0.0",
+      port: 9999,
+      serveWebUi: true,
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("EACCES");
+
+    expect(running).toBe(true);
+    expect(starts).toEqual([{ host: "127.0.0.1", port: 4321, serveStatic: false }]);
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
   });
 });

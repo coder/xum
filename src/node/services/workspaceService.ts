@@ -10752,6 +10752,8 @@ export class WorkspaceService
     const agentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
     const extractedSettings = this.extractWorkspaceAISettingsFromSendOptions(options);
 
+    // Best-effort (#4444): a rejected config write must not fail the user's send, which
+    // itself never needs one; the write failure is logged where it happens.
     const persistResult = await this.persistWorkspaceAISettingsForAgent(
       workspaceId,
       agentId,
@@ -10763,7 +10765,7 @@ export class WorkspaceService
         ...(pinIntent != null ? { pinIntent } : {}),
         ...(pinsOnly === true ? { pinsOnly: true } : {}),
       }
-    );
+    ).catch((error: unknown): Result<boolean, string> => Err(getErrorMessage(error)));
     if (!persistResult.success) {
       log.debug("Failed to persist workspace AI settings from user message", {
         workspaceId,

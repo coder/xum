@@ -6677,7 +6677,15 @@ export class TaskService implements AgentTaskIntegration {
     assert(plan.taskId.length > 0, "scheduleReservedTaskLaunch requires taskId");
     void this.enqueueReservedTaskLaunch(plan).catch((error: unknown) => {
       log.error("Failed to launch reserved task", { taskId: plan.taskId, error });
-      void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan);
+      void this.markTaskLaunchFailed(plan.taskId, getErrorMessage(error), plan).catch(
+        (markError: unknown) => {
+          // A rejected config write here would otherwise be an unhandled rejection (#4444).
+          log.error("Failed to record reserved task launch failure", {
+            taskId: plan.taskId,
+            error: markError,
+          });
+        }
+      );
     });
   }
 
@@ -7618,7 +7626,7 @@ export class TaskService implements AgentTaskIntegration {
       });
 
       // Schedule queue processing (best-effort).
-      void this.maybeStartQueuedTasks();
+      this.scheduleMaybeStartQueuedTasks();
       taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
       return Ok({
         taskId,
@@ -9927,14 +9935,14 @@ export class TaskService implements AgentTaskIntegration {
                   return false;
                 }
               )
-              .then(async (removed) => {
+              .then((removed) => {
                 if (this.pendingTaskWorkspaceRemovals.get(id) === trackedPromise) {
                   this.pendingTaskWorkspaceRemovals.delete(id);
                 }
                 // A removal that outlived its termination timeout frees the task slot
                 // only when it settles, so kick the scheduler for queued tasks then.
                 if (removed) {
-                  await this.maybeStartQueuedTasks();
+                  this.scheduleMaybeStartQueuedTasks();
                 }
               });
           }
@@ -18049,7 +18057,7 @@ export class TaskService implements AgentTaskIntegration {
       });
       // Best-effort: resolve any foreground waiters even if we can't deliver to a parent.
       this.resolveWaiters(childWorkspaceId, reportArgs);
-      void this.maybeStartQueuedTasks();
+      this.scheduleMaybeStartQueuedTasks();
       // Reported row, no release, nobody to report to: not a continuation of the attempt.
       this.resolveStreamEndDecision(
         childWorkspaceId,
