@@ -311,7 +311,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
             <Loader2 className="text-muted h-6 w-6 animate-spin" />
           </div>
         ) : !hasServers ? (
-          <div className="text-muted py-8 text-center">
+          <div className="text-content-secondary py-8 text-center">
             <p>No MCP servers configured for this project.</p>
             <p className="mt-2 text-sm">
               Configure servers in{" "}
@@ -329,7 +329,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
         ) : (
           <div className="space-y-4">
             <div className="flex items-start justify-between gap-3">
-              <p className="text-muted flex-1 pr-3 text-sm">
+              <p className="text-content-secondary flex-1 pr-3 text-sm">
                 Customize which MCP servers and tools are available in this workspace. Changes only
                 affect this workspace.
               </p>
@@ -402,7 +402,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             // Provenance only: the backend folds global plugin opt-in
                             // into `disabled`, so a hardcoded default-state claim here
                             // would contradict the switch for globally enabled plugins.
-                            <div className="text-muted text-xs wrap-anywhere">
+                            <div className="text-content-secondary text-xs wrap-anywhere">
                               Agent Plugin ({info.plugin.sourceScope} · {info.plugin.sourceLocation}
                               )
                             </div>
@@ -411,7 +411,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                             // untagged entries (e.g. managed servers) make no claim.
                             projectDisabled &&
                             info.configLayer && (
-                              <div className="text-muted text-xs">
+                              <div className="text-content-secondary text-xs">
                                 {info.configLayer === "project"
                                   ? "(disabled at project level)"
                                   : "(disabled globally)"}
@@ -449,7 +449,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                           onSelectNone={() => setNoToolsAllowed(name)}
                         />
                         {!hasNoAllowlist(name) && (
-                          <div className="text-muted mt-2 text-xs">
+                          <div className="text-content-secondary mt-2 text-xs">
                             {allowedTools.length} of {tools.length} tools enabled
                           </div>
                         )}
@@ -457,7 +457,7 @@ export const WorkspaceMCPModal: React.FC<WorkspaceMCPModalProps> = ({
                     )}
 
                     {effectivelyEnabled && tools?.length === 0 && (
-                      <div className="text-muted mt-2 text-sm">No tools available</div>
+                      <div className="text-content-secondary mt-2 text-sm">No tools available</div>
                     )}
                   </div>
                 );
