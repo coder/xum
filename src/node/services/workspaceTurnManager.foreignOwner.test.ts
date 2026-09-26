@@ -72,8 +72,10 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
     );
     const writesB = spyOn(internals(backendB).taskHandleStore, "upsertWorkspaceTurn");
 
-    // B's task-creation path counts active turns; A's turn is not live in B's memory.
-    expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(0);
+    // B's task-creation path counts active turns; A's turn is not live in B's memory, but A's
+    // live lock keeps it active for B too (B must not admit past it or finish without it).
+    expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(1);
+    expect(await backendB.listActiveWorkspaceTurnTaskIdsForOwner(parentId)).toEqual(["wst_handle"]);
 
     expect(writesB).not.toHaveBeenCalled();
     expect(

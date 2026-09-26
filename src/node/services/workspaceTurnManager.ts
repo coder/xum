@@ -4180,8 +4180,10 @@ export class WorkspaceTurnManager {
       if (record.workspaceId !== workspaceId || !this.isActiveWorkspaceTurn(record)) {
         continue;
       }
-      if (!(await this.isLiveWorkspaceTurn(record))) {
-        await this.settleStaleWorkspaceTurn(record);
+      if (
+        !(await this.isLiveWorkspaceTurn(record)) &&
+        (await this.settleStaleWorkspaceTurn(record)) !== "foreign-live"
+      ) {
         continue;
       }
       return record;
@@ -4256,7 +4258,10 @@ export class WorkspaceTurnManager {
     return await this.hasActiveWorkspaceTurnDeferredBlockers(record);
   }
 
-  private async settleStaleWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
+  /** "foreign-live": another live backend runs the handle, so callers must keep it active. */
+  private async settleStaleWorkspaceTurn(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<"foreign-live" | undefined> {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
@@ -4285,7 +4290,7 @@ export class WorkspaceTurnManager {
       return;
     // Not live in THIS backend's memory proves nothing about another backend that runs the turn
     // (#4446): settle only a handle whose live-owner lock this manager holds or can take now.
-    if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return;
+    if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return "foreign-live";
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
@@ -4337,8 +4342,10 @@ export class WorkspaceTurnManager {
       if (!this.isActiveWorkspaceTurn(record)) {
         continue;
       }
-      if (!(await this.isLiveWorkspaceTurn(record))) {
-        await this.settleStaleWorkspaceTurn(record);
+      if (
+        !(await this.isLiveWorkspaceTurn(record)) &&
+        (await this.settleStaleWorkspaceTurn(record)) !== "foreign-live"
+      ) {
         continue;
       }
       if (record.status === "queued") {
@@ -4363,8 +4370,10 @@ export class WorkspaceTurnManager {
     const taskIds: string[] = [];
     for (const record of records) {
       if (isActiveWorkspaceTurnTaskStatus(record.status)) {
-        if (!(await this.isLiveWorkspaceTurn(record))) {
-          await this.settleStaleWorkspaceTurn(record);
+        if (
+          !(await this.isLiveWorkspaceTurn(record)) &&
+          (await this.settleStaleWorkspaceTurn(record)) !== "foreign-live"
+        ) {
           continue;
         }
         taskIds.push(record.handleId);
