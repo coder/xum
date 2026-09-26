@@ -584,14 +584,6 @@ export class CoderService {
     await this.getWhoamiData({ useCache: false });
   }
 
-  /**
-   * Clear cached Coder info. Used for testing.
-   */
-  clearCache(): void {
-    this.cachedInfo = null;
-    this.cachedWhoami = null;
-  }
-
   // Preserve the old behavior: explicit whoami checks should hit the CLI even if cached.
   // The cache only exists so later URL lookups can reuse the last whoami response.
   private async getWhoamiData(options?: {

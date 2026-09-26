@@ -36,11 +36,6 @@ export interface AutoModelRouterClassifyInput {
   signal?: AbortSignal;
 }
 
-export interface AutoModelRouterDeps extends EvaluationModelFactoryDeps {
-  /** Test seam: defaults to the providers.jsonc-backed factory. */
-  createEvaluationModel?: typeof createEvaluationModel;
-}
-
 /**
  * Difficulty classifier for the auto-model-routing experiment: one AI SDK
  * `experimental_evaluate` "choice" question whose options are the user's tier
@@ -51,7 +46,7 @@ export interface AutoModelRouterDeps extends EvaluationModelFactoryDeps {
  * Provided to the core graph as `AutoModelRouterTag` (di/layers/core.ts).
  */
 export class AutoModelRouter {
-  constructor(private readonly deps: AutoModelRouterDeps) {}
+  constructor(private readonly deps: EvaluationModelFactoryDeps) {}
 
   /** Availability without loading a provider SDK or sending anything. */
   getEvaluationStatus(evaluationModel: string): AutoModelRoutingEvaluationStatus {
@@ -74,10 +69,7 @@ export class AutoModelRouter {
       if (input.tiers.length < AUTO_MODEL_ROUTING_MIN_TIERS) {
         return Err(`Auto model routing needs at least ${AUTO_MODEL_ROUTING_MIN_TIERS} tiers`);
       }
-      const model = yield* (self.deps.createEvaluationModel ?? createEvaluationModel)(
-        input.evaluationModel,
-        self.deps
-      );
+      const model = yield* createEvaluationModel(input.evaluationModel, self.deps);
       if (!model.success) return self.fail(model.error.message);
 
       const recentUserMessages = (input.recentUserMessages ?? [])

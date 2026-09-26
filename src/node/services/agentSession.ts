@@ -214,7 +214,6 @@ import type { CompactionHandler } from "./compactionHandler";
 import type { ContextManagementService } from "./contextManagement/contextManagementService";
 import type { SessionContextController } from "./contextManagement/sessionContextController";
 import type { SessionContextHost } from "./contextManagement/sessionContextHost";
-import type { CompactionMonitor } from "./compactionMonitor";
 import type { ContextDispatchRequest, CompactionContinuation } from "./contextManagement/types";
 import {
   inheritOpenWorkspaceTurnMetadata,
@@ -734,8 +733,6 @@ interface AgentSessionOptions {
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** Difficulty classifier for composer Auto sends; absent means Auto falls back to the composer model. */
   autoModelRouter?: Pick<AutoModelRouter, "classify">;
-  /** Replaces the context controller's default CompactionMonitor (tests drive threshold decisions). */
-  compactionMonitor?: CompactionMonitor;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
   /**
@@ -1390,7 +1387,6 @@ export class AgentSession {
       workspaceId: this.workspaceId,
       sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
       emitter: this.emitter,
-      compactionMonitor: options.compactionMonitor,
       coordinator: this.coordinator,
       streams: {
         isStreaming: (id) => this.streamManager.isStreaming(id),

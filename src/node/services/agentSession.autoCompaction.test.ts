@@ -13,46 +13,46 @@ import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentSession, AgentSessionAIService } from "./agentSession";
-import type { CompactionMonitor } from "./compactionMonitor";
+import { CompactionMonitor } from "./compactionMonitor";
 import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
 
-type CompactionMonitorStub = Pick<
-  CompactionMonitor,
-  "checkBeforeSend" | "checkMidStream" | "resetForNewStream"
->;
+type CompactionDecisions = Partial<Pick<CompactionMonitor, "checkBeforeSend" | "checkMidStream">>;
 
 /**
- * Injected monitor whose threshold decisions the test controls; compactionMonitor.test.ts owns
- * the real threshold math. Defaults stay below threshold and never interrupt mid-stream.
+ * Takes over the threshold decisions of the session's own CompactionMonitor; compactionMonitor.test.ts
+ * owns the real threshold math. Defaults stay below threshold and never interrupt mid-stream.
+ * The spies sit on the prototype because each session builds its monitor internally; every
+ * describe's afterEach calls mock.restore().
  */
-function stubCompactionMonitor(overrides: Partial<CompactionMonitorStub> = {}): CompactionMonitor {
-  const stub: CompactionMonitorStub = {
-    checkBeforeSend: () => ({
-      shouldShowWarning: false,
-      shouldForceCompact: false,
-      usagePercentage: 0,
-      thresholdPercentage: 85,
-      contextTokens: 0,
-      maxTokens: 100_000,
-    }),
-    checkMidStream: () => false,
-    resetForNewStream: () => undefined,
-    ...overrides,
+function stubCompactionDecisions(overrides: CompactionDecisions = {}) {
+  return {
+    checkBeforeSend: spyOn(CompactionMonitor.prototype, "checkBeforeSend").mockImplementation(
+      overrides.checkBeforeSend ??
+        (() => ({
+          shouldShowWarning: false,
+          shouldForceCompact: false,
+          usagePercentage: 0,
+          thresholdPercentage: 85,
+          contextTokens: 0,
+          maxTokens: 100_000,
+        }))
+    ),
+    checkMidStream: spyOn(CompactionMonitor.prototype, "checkMidStream").mockImplementation(
+      overrides.checkMidStream ?? (() => false)
+    ),
   };
-  // The session only calls these methods; the class's private state is irrelevant here.
-  return stub as CompactionMonitor;
 }
 
-/** Monitor that reports on-send pressure above the threshold. */
-function overThresholdMonitor(args: {
+/** Reports on-send pressure above the threshold. */
+function stubOverThreshold(args: {
   usagePercentage: number;
   thresholdPercentage: number;
   shouldForceCompact?: boolean;
-}): CompactionMonitor {
-  return stubCompactionMonitor({
+}) {
+  return stubCompactionDecisions({
     checkBeforeSend: () => ({
       shouldShowWarning: true,
       shouldForceCompact: args.shouldForceCompact ?? true,
@@ -68,6 +68,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
 
   afterEach(async () => {
+    mock.restore();
     await historyCleanup?.();
   });
 
@@ -76,13 +77,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     streamMessage?: AgentSessionAIService["streamMessage"];
     agentAiDefaults?: AgentAiDefaults;
     captureEvents?: boolean;
-    compactionMonitor?: CompactionMonitor;
   }) {
     const harness = await createAgentSessionHarness({
       workspaceId: args.workspaceId,
       aiServiceOverrides: args.streamMessage ? { streamMessage: args.streamMessage } : undefined,
       captureEvents: args.captureEvents,
-      compactionMonitor: args.compactionMonitor,
     });
     historyCleanup = harness.cleanup;
     const agentAiDefaults = args.agentAiDefaults;
@@ -105,11 +104,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(harness.session.closingSignal)))
     );
+    stubOverThreshold({ usagePercentage: 95, thresholdPercentage: 70 });
     const harness = await createSessionHarness({
       workspaceId: args.workspaceId,
       agentAiDefaults: args.agentAiDefaults,
       streamMessage,
-      compactionMonitor: overThresholdMonitor({ usagePercentage: 95, thresholdPercentage: 70 }),
     });
     const result = await harness.session.sendMessage("hello", args.options);
     expect(result.success).toBe(true);
@@ -134,12 +133,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() =>
       Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
     );
+    stubOverThreshold({ usagePercentage: 99, thresholdPercentage: 85 });
     const { session, historyService, events, backgroundProcessManager } =
       await createSessionHarness({
         workspaceId,
         streamMessage,
         captureEvents: true,
-        compactionMonitor: overThresholdMonitor({ usagePercentage: 99, thresholdPercentage: 85 }),
       });
     const cleanupSpy = spyOn(backgroundProcessManager, "cleanup");
 
@@ -321,10 +320,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
   test("does not materialize skill snapshots (or run their directives) on deferred on-send compaction turns", async () => {
     const workspaceId = "ws-auto-compaction-skill-snapshot-deferral";
 
-    const { session } = await createSessionHarness({
-      workspaceId,
-      compactionMonitor: overThresholdMonitor({ usagePercentage: 99, thresholdPercentage: 85 }),
-    });
+    stubOverThreshold({ usagePercentage: 99, thresholdPercentage: 85 });
+    const { session } = await createSessionHarness({ workspaceId });
 
     const internals = session as unknown as {
       materializeAgentSkillSnapshots: (...args: unknown[]) => Promise<MuxMessage[]>;
@@ -358,9 +355,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       workspaceId: string;
       experiments?: SendMessageOptions["experiments"];
     }) => {
+      stubOverThreshold({ usagePercentage: 99, thresholdPercentage: 85 });
       const { session, historyService } = await createSessionHarness({
         workspaceId: args.workspaceId,
-        compactionMonitor: overThresholdMonitor({ usagePercentage: 99, thresholdPercentage: 85 }),
       });
 
       // Seed a prior turn so the keep-recent selector has a safe user boundary
@@ -439,15 +436,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       streamRequests.push(request);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
-    const { session } = await createSessionHarness({
-      workspaceId,
-      streamMessage,
-      compactionMonitor: overThresholdMonitor({
-        usagePercentage: 72,
-        thresholdPercentage: 70,
-        shouldForceCompact: false,
-      }),
-    });
+    stubOverThreshold({ usagePercentage: 72, thresholdPercentage: 70, shouldForceCompact: false });
+    const { session } = await createSessionHarness({ workspaceId, streamMessage });
 
     const result = await session.sendMessage("hello", {
       model: "openai:gpt-4o",
@@ -476,11 +466,11 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
     const compactionModel = "openai:gpt-4o-mini";
+    stubOverThreshold({ usagePercentage: 95, thresholdPercentage: 70 });
     const { session } = await createSessionHarness({
       workspaceId,
       agentAiDefaults: { compact: { modelString: compactionModel } },
       streamMessage,
-      compactionMonitor: overThresholdMonitor({ usagePercentage: 95, thresholdPercentage: 70 }),
     });
 
     const result = await session.sendMessage("hello", {
@@ -756,6 +746,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       maxTokens: 100_000,
     }));
     const checkMidStream = mock((_params: unknown) => false);
+    stubCompactionDecisions({ checkBeforeSend, checkMidStream });
 
     const harness = await createAgentSessionHarness({
       workspaceId,
@@ -765,7 +756,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         // AIService serves ProviderService's providers-config view; the session must thread it.
         getProvidersConfig: mock(() => providersConfig),
       },
-      compactionMonitor: stubCompactionMonitor({ checkBeforeSend, checkMidStream }),
     });
     historyCleanup = harness.cleanup;
     const session = harness.session;
@@ -853,6 +843,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         maxTokens: 100_000,
       };
     });
+    stubCompactionDecisions({ checkBeforeSend });
 
     const { session } = await createAgentSessionHarness({
       workspaceId,
@@ -862,7 +853,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       aiServiceOverrides: {
         streamMessage,
       },
-      compactionMonitor: stubCompactionMonitor({ checkBeforeSend }),
     });
 
     const result = await session.sendMessage("new prompt after restart", {
@@ -926,6 +916,12 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     });
 
     let midStreamChecks = 0;
+    stubCompactionDecisions({
+      checkMidStream: () => {
+        midStreamChecks += 1;
+        return midStreamChecks === 1;
+      },
+    });
     const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
@@ -935,12 +931,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         stopStream,
         streamMessage,
       },
-      compactionMonitor: stubCompactionMonitor({
-        checkMidStream: () => {
-          midStreamChecks += 1;
-          return midStreamChecks === 1;
-        },
-      }),
     });
 
     const originalSendMessage = session.sendMessage.bind(session);
@@ -1043,6 +1033,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       midStreamChecks += 1;
       return midStreamChecks === 1;
     });
+    stubCompactionDecisions({ checkMidStream });
 
     const { session } = await createAgentSessionHarness({
       workspaceId,
@@ -1053,7 +1044,6 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         stopStream,
         streamMessage,
       },
-      compactionMonitor: stubCompactionMonitor({ checkMidStream }),
     });
 
     const workspaceTurnMetadata = {
@@ -1111,6 +1101,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
   let historyCleanup: (() => Promise<void>) | undefined;
 
   afterEach(async () => {
+    mock.restore();
     await historyCleanup?.();
   });
 
@@ -1121,7 +1112,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     aiEmitter: EventEmitter;
     streamHistories: MuxMessage[][];
     events: WorkspaceChatMessage[];
-    compactionMonitor: CompactionMonitor;
+    checkBeforeSend: ReturnType<typeof stubCompactionDecisions>["checkBeforeSend"];
   }
 
   /**
@@ -1179,14 +1170,13 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     });
 
     // Cross the on-send threshold unconditionally.
-    const compactionMonitor = overThresholdMonitor({
+    const { checkBeforeSend } = stubOverThreshold({
       usagePercentage: 95,
       thresholdPercentage: 70,
     });
     const harness = await createAgentSessionHarness({
       workspaceId,
       captureEvents: true,
-      compactionMonitor,
       aiEmitter,
       aiServiceOverrides: {
         isStreaming: mock((_workspaceId: string) => false),
@@ -1207,7 +1197,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
       aiEmitter,
       streamHistories,
       events: harness.events,
-      compactionMonitor,
+      checkBeforeSend,
     };
   }
 
@@ -1219,7 +1209,7 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
       });
 
       let firstCheck = true;
-      spyOn(fixture.compactionMonitor, "checkBeforeSend").mockImplementation(() => {
+      fixture.checkBeforeSend.mockImplementation(() => {
         const high = firstCheck;
         firstCheck = false;
         return {

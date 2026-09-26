@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import type {
   Experimental_EvaluationModelV4,
   Experimental_EvaluationModelV4Result,
@@ -9,7 +9,8 @@ import * as fs from "fs";
 import * as fsp from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { AutoModelRouter, type AutoModelRouterDeps } from "./autoModelRouter";
+import { AutoModelRouter } from "./autoModelRouter";
+import * as evaluationModelFactory from "./evaluationModelFactory";
 import {
   createEvaluationModel,
   resolveEvaluationModelTarget,
@@ -60,29 +61,35 @@ function providersStore(providers: Record<string, unknown> | null) {
   return { loadProvidersConfig: () => providers as ProvidersConfig | null };
 }
 
-/** Router over a fake evaluation model so the real experimental_evaluate runs, minus I/O. */
+/**
+ * Router whose providers.jsonc-backed factory yields a fake evaluation model, so the real
+ * experimental_evaluate runs, minus I/O.
+ */
 function createRouter(options: {
   doEvaluate?: DoEvaluate;
-  policyService?: AutoModelRouterDeps["policyService"];
+  policyService?: EvaluationModelFactoryDeps["policyService"];
 }) {
   const doEvaluate = mock<DoEvaluate>(options.doEvaluate ?? (() => Promise.resolve(verdict())));
+  const buildModel = spyOn(evaluationModelFactory, "createEvaluationModel").mockImplementation(() =>
+    Effect.succeed(Ok(fakeEvaluationModel(doEvaluate)))
+  );
   const router = new AutoModelRouter({
     providersConfigStore: providersStore({}),
     policyService: options.policyService,
     env: {},
-    createEvaluationModel: () => Effect.succeed(Ok(fakeEvaluationModel(doEvaluate))),
   });
-  return { router, doEvaluate };
+  return { router, doEvaluate, buildModel };
 }
 
 const tempPaths: string[] = [];
 afterEach(() => {
+  mock.restore();
   for (const p of tempPaths.splice(0)) fs.rmSync(p, { recursive: true, force: true });
 });
 
 describe("AutoModelRouter.classify", () => {
   it("asks one choice question keyed by tier id and maps the verdict", async () => {
-    const { router, doEvaluate } = createRouter({});
+    const { router, doEvaluate, buildModel } = createRouter({});
 
     const result = await router.classify({
       prompt: "Rename a variable",
@@ -101,6 +108,8 @@ describe("AutoModelRouter.classify", () => {
         providerMetadata: { [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } } },
       },
     });
+    // The judge is built from the requested evaluation model, not a default.
+    expect(buildModel.mock.calls.map(([modelString]) => modelString)).toEqual([EVALUATION_MODEL]);
     expect(doEvaluate).toHaveBeenCalledTimes(1);
     const call = doEvaluate.mock.calls[0][0];
     const state = call.state as { prompt: string; recentUserMessages?: string[] };
