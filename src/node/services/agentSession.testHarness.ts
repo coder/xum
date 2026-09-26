@@ -185,7 +185,6 @@ export interface AgentSessionHarnessOptions extends Pick<
   | "onTurnSettled"
   | "onTurnSuperseded"
   | "onBeforeTurnCompletion"
-  | "compactionMonitor"
   | "planSnapshotCaptureTimeoutMs"
   | "onPostCompactionStateChange"
   | "sessionUsageService"
@@ -306,7 +305,6 @@ export async function createAgentSessionHarness(
     onTurnSettled: options.onTurnSettled,
     onTurnSuperseded: options.onTurnSuperseded,
     onBeforeTurnCompletion: options.onBeforeTurnCompletion,
-    compactionMonitor: options.compactionMonitor,
     planSnapshotCaptureTimeoutMs: options.planSnapshotCaptureTimeoutMs,
     onPostCompactionStateChange: options.onPostCompactionStateChange,
     sessionUsageService: options.sessionUsageService,

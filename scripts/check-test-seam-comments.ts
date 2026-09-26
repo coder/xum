@@ -66,12 +66,6 @@ export const FROZEN_KNOWN_DEBT: readonly string[] = [
   "src/browser/hooks/useBoundedTranscriptReveal.ts#BoundedTranscriptRevealArgs.scheduleFrame",
   "src/browser/utils/mcp/iconRefCache.ts#McpIconRefCache.size",
   "src/desktop/keepAwake.ts#KeepAwakeController.isHoldingBlocker",
-  "src/node/services/agentSession.ts#AgentSessionOptions.planSnapshotCaptureTimeoutMs",
-  "src/node/services/autoModelRouter.ts#AutoModelRouterDeps.createEvaluationModel",
-  "src/node/services/coderService.ts#CoderService.clearCache",
-  "src/node/services/contextManagement/sessionContextHost.ts#SessionContextHost.compactionMonitor",
-  "src/node/services/mcpServerIcon.ts#IconResolverDependencies",
-  "src/node/services/workflows/WorkflowRunStore.ts#WorkflowRunStoreOptions.mutationLockWaitTimeoutMs",
 ];
 
 /** .ts, .tsx, .mts, .cts, .js, .jsx, .mjs and .cjs. */

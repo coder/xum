@@ -72,9 +72,9 @@ export class SessionContextController {
     });
     // Keep the handler receiver intact while limiting the session's permanent API surface.
     this.compaction = this.compactionHandler;
-    this.compactionMonitor =
-      host.compactionMonitor ??
-      new CompactionMonitor(host.workspaceId, (event) => host.emitChatEvent(event));
+    this.compactionMonitor = new CompactionMonitor(host.workspaceId, (event) =>
+      host.emitChatEvent(event)
+    );
     this.continuous = new ContinuousStrategy(
       deps,
       host,
