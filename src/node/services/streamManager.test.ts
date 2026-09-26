@@ -771,17 +771,6 @@ describe("StreamManager - stop scoped to a captured execution", () => {
 });
 
 describe("StreamManager - turn completion", () => {
-  /** Stream body that stays open until its turn abort controller fires. */
-  const hangUntilAbort = ({ abortSignal }: { abortSignal?: AbortSignal }) =>
-    createStreamResultForTests(
-      (async function* () {
-        await new Promise<void>((resolve) => {
-          abortSignal!.addEventListener("abort", () => resolve(), { once: true });
-        });
-        yield* [];
-      })()
-    );
-
   async function startWithStreamResult(input: {
     workspaceId: string;
     messageId: string;
@@ -972,23 +961,6 @@ describe("StreamManager - turn completion", () => {
     await failed.streamManager.stopStream("completion-failure-workspace");
     await Promise.resolve();
     expect(failedSettlements).toBe(1);
-
-    // Debug-injected failures reach the same terminal settlement path.
-    const debug = await startWithStreamResult({
-      workspaceId: "completion-debug-error-workspace",
-      messageId: "completion-debug-error-message",
-      streamText: hangUntilAbort,
-    });
-    expect(
-      await debug.streamManager.debugTriggerStreamError(
-        "completion-debug-error-workspace",
-        "debug injected failure"
-      )
-    ).toBe(true);
-    expect(await debug.handle.completion).toMatchObject({
-      status: "failed",
-      streamError: { error: "debug injected failure" },
-    });
   });
 
   test("hard stop and completion wait for raw delivery after attempt persistence", async () => {

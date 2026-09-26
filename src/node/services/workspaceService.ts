@@ -3753,21 +3753,6 @@ export class WorkspaceService
   }
 
   /**
-   * DEBUG ONLY: Trigger an artificial stream error for testing.
-   * This is used by integration tests to simulate network errors mid-stream.
-   * @returns true if an active stream was found and error was triggered
-   */
-  debugTriggerStreamError(
-    workspaceId: string,
-    errorMessage = "Test-triggered stream error"
-  ): Promise<boolean> {
-    return (
-      this.streamManager?.debugTriggerStreamError(workspaceId, errorMessage) ??
-      Promise.resolve(false)
-    );
-  }
-
-  /**
    * Setup listeners to update metadata store based on AIService events.
    * This tracks workspace recency and streaming status for VS Code extension integration.
    */

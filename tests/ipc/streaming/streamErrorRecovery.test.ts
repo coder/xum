@@ -1,272 +1,224 @@
 /**
- * Stream Error Recovery Integration Tests
+ * Stream error recovery ("no amnesia") integration test.
  *
- * These tests verify the "no amnesia" fix - ensuring that when a stream is interrupted
- * by an error (network failure, API error, etc.), the accumulated content is preserved
- * and available when the stream is resumed.
- *
- * Test Approach:
- * - Use structured markers (nonce + line numbers) to detect exact continuation
- * - Capture pre-error streamed text from stream-delta events (user-visible data path)
- * - Interrupt mid-stream after detecting stable prefix (≥N complete markers)
- * - Verify final message: (a) starts with exact pre-error prefix, (b) continues from exact point
- * - Focus on user-level behavior without coupling to internal storage formats
- *
- * These tests use a debug IPC channel to artificially trigger errors, allowing us to
- * test the recovery path without relying on actual network failures.
+ * When a provider stream fails mid-response, the text streamed so far must survive
+ * the error and be sent back to the provider on resume, so the model continues
+ * instead of starting over. This drives the real IPC → AgentSession → StreamManager
+ * → provider path against a loopback Anthropic Messages fixture: the first request
+ * streams numbered markers and then drops the connection, which exercises
+ * StreamManager's genuine failure handling (no debug hooks). The resumed request is
+ * captured to prove the pre-error text was replayed, and history is read back to
+ * prove the final message keeps the prefix and appends the continuation.
  */
 
-import { setupWorkspace, shouldRunIntegrationTests, validateApiKeys } from "../setup";
-import {
-  sendMessageWithModel,
-  createStreamCollector,
-  readChatHistory,
-  resolveOrpcClient,
-  configureTestRetries,
-  HAIKU_MODEL,
-} from "../helpers";
-import { resumeAndWaitForSuccess, type StreamCollector } from "../streamCollector";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
+import { setupProviders, setupWorkspaceWithoutProvider, shouldRunIntegrationTests } from "../setup";
+import { createStreamCollector, readChatHistory, resolveOrpcClient } from "../helpers";
 
-// Skip all tests if TEST_INTEGRATION is not set
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
-// Validate API keys before running tests
-if (shouldRunIntegrationTests()) {
-  validateApiKeys(["ANTHROPIC_API_KEY"]);
+const MODEL = "anthropic:claude-haiku-4-5";
+const EVENT_TIMEOUT_MS = 30_000;
+const PREFIX_MARKERS = 5;
+const NONCE = "sr7q2";
+
+function marker(n: number): string {
+  return `${NONCE}-${n}: line ${n}\n`;
 }
 
-// Use Haiku 4.5 for speed.
-const PROVIDER = "anthropic";
-const MODEL = HAIKU_MODEL;
+const PREFIX_TEXT = Array.from({ length: PREFIX_MARKERS }, (_, i) => marker(i + 1)).join("");
+const CONTINUATION_TEXT = marker(PREFIX_MARKERS + 1) + marker(PREFIX_MARKERS + 2);
 
-// Threshold for stable prefix - interrupt after this many complete markers
-const STABLE_PREFIX_THRESHOLD = 10;
-
-/**
- * Generate a random nonce for unique marker identification
- */
-function generateNonce(length = 10): string {
-  return Math.random()
-    .toString(36)
-    .substring(2, 2 + length);
+function sseEvent(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
-/**
- * Extract marker numbers from text containing structured markers
- * Returns array of numbers in the order they appear
- */
-function extractMarkers(nonce: string, text: string): number[] {
-  const regex = new RegExp(`${nonce}-(\\d+)`, "g");
-  const numbers: number[] = [];
-  let match;
-  while ((match = regex.exec(text)) !== null) {
-    numbers.push(parseInt(match[1], 10));
-  }
-  return numbers;
+function messageStart(): string {
+  return sseEvent("message_start", {
+    type: "message_start",
+    message: {
+      id: "msg_fixture",
+      type: "message",
+      role: "assistant",
+      model: "claude-haiku-4-5",
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 1 },
+    },
+  });
 }
 
-/**
- * Get the maximum complete marker number found in text
- */
-function getMaxMarker(nonce: string, text: string): number {
-  const markers = extractMarkers(nonce, text);
-  return markers.length > 0 ? Math.max(...markers) : 0;
-}
-
-/**
- * Truncate text to end at the last complete marker line
- * This ensures the stable prefix doesn't include partial markers
- */
-function truncateToLastCompleteMarker(text: string, nonce: string): string {
-  const regex = new RegExp(`${nonce}-(\\d+):[^\\n]*`, "g");
-  const matches = Array.from(text.matchAll(regex));
-  if (matches.length === 0) {
-    return text;
-  }
-  const lastMatch = matches[matches.length - 1];
-  const endIndex = lastMatch.index! + lastMatch[0].length;
-  return text.substring(0, endIndex);
-}
-
-/**
- * Collect stream deltas until predicate returns true
- * Returns the accumulated buffer
- *
- * Uses StreamCollector for ORPC-native event handling
- */
-async function collectStreamUntil(
-  collector: StreamCollector,
-  predicate: (buffer: string) => boolean,
-  timeoutMs = 15000
-): Promise<string> {
-  const startTime = Date.now();
-  let buffer = "";
-  let lastProcessedCount = 0;
-
-  await collector.waitForEvent("stream-start", 5000);
-
-  while (Date.now() - startTime < timeoutMs) {
-    // Get all deltas
-    const allDeltas = collector.getDeltas();
-
-    // Process only new deltas
-    const newDeltas = allDeltas.slice(lastProcessedCount);
-
-    if (newDeltas.length > 0) {
-      for (const delta of newDeltas) {
-        const deltaData = delta as { delta?: string };
-        if (deltaData.delta) {
-          buffer += deltaData.delta;
-        }
-      }
-      lastProcessedCount = allDeltas.length;
-
-      // Log progress periodically
-      if (allDeltas.length % 20 === 0) {
-        console.log(
-          `[collectStreamUntil] Processed ${allDeltas.length} deltas, buffer length: ${buffer.length}`
-        );
-      }
-
-      // Check predicate after processing new deltas
-      if (predicate(buffer)) {
-        console.log(
-          `[collectStreamUntil] Predicate satisfied after ${allDeltas.length} deltas, buffer length: ${buffer.length}`
-        );
-        return buffer;
-      }
-    }
-
-    // Small delay before next poll
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-
-  console.error(`[collectStreamUntil] Timeout after processing deltas, predicate never satisfied`);
-  console.error(`[collectStreamUntil] Final buffer length: ${buffer.length}`);
-  console.error(
-    `[collectStreamUntil] Buffer sample (first 500 chars): ${buffer.substring(0, 500)}`
+function textBlock(texts: string[]): string {
+  return (
+    sseEvent("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }) +
+    texts
+      .map((text) =>
+        sseEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text },
+        })
+      )
+      .join("")
   );
-  throw new Error("Timeout: predicate never satisfied");
 }
 
-// TODO: This test requires a debug IPC method (triggerStreamError) that is exposed via ORPC
-// Using describeIntegration to enable when TEST_INTEGRATION=1
+function messageEnd(): string {
+  return (
+    sseEvent("content_block_stop", { type: "content_block_stop", index: 0 }) +
+    sseEvent("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn", stop_sequence: null },
+      usage: { output_tokens: 20 },
+    }) +
+    sseEvent("message_stop", { type: "message_stop" })
+  );
+}
+
+interface CapturedRequest {
+  messages: Array<{ role: string; content: unknown }>;
+}
+
+/**
+ * Loopback Anthropic Messages endpoint. The first request streams the prefix and then
+ * destroys the socket mid-response; every later request streams the continuation.
+ */
+async function startDroppingFixture() {
+  const requests: CapturedRequest[] = [];
+  let firstResponse: http.ServerResponse | null = null;
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => {
+      if (!req.url?.endsWith("/messages")) {
+        res.writeHead(404).end();
+        return;
+      }
+      requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as CapturedRequest);
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (requests.length === 1) {
+        res.write(messageStart() + textBlock(PREFIX_TEXT.match(/[^\n]*\n/g) ?? []));
+        // Held open until the test has observed every prefix delta; see dropFirstResponse.
+        firstResponse = res;
+        return;
+      }
+      res.end(messageStart() + textBlock([CONTINUATION_TEXT]) + messageEnd());
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    baseUrl: `http://127.0.0.1:${port}/v1`,
+    requests,
+    /** Fails the first stream mid-response by destroying its socket. */
+    dropFirstResponse: () => {
+      if (!firstResponse) throw new Error("first provider request has not arrived yet");
+      firstResponse.destroy();
+    },
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+function textOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part: { type?: string; text?: string }) =>
+      part.type === "text" ? (part.text ?? "") : ""
+    )
+    .join("");
+}
+
 describeIntegration("Stream Error Recovery (No Amnesia)", () => {
-  // Enable retries in CI for flaky API tests
-  configureTestRetries(3);
-
-  test.concurrent(
-    "should preserve exact prefix and continue from exact point after stream error",
-    async () => {
-      const { env, workspaceId, cleanup } = await setupWorkspace(PROVIDER);
+  test("replays the pre-error text on resume and keeps it in the final message", async () => {
+    const fixture = await startDroppingFixture();
+    try {
+      // No-provider setup clears inherited Anthropic env auth/base URL; the fixture is the only route.
+      const { env, workspaceId, cleanup } = await setupWorkspaceWithoutProvider("stream-recovery");
       try {
-        // Generate unique nonce for this test run
-        const nonce = generateNonce();
+        await setupProviders(env, {
+          anthropic: { apiKey: "fixture-key", baseUrl: fixture.baseUrl },
+        });
+        const client = resolveOrpcClient(env);
+        const toolPolicy = [{ regex_match: ".*", action: "disable" as const }];
 
-        // Prompt model to produce structured, unambiguous output
-        // Use a very explicit instruction with examples to maximize compliance
-        const prompt = `I need you to count from 1 to 100 using a specific format. Output each number on its own line using EXACTLY this pattern:
-
-${nonce}-1: one
-${nonce}-2: two
-${nonce}-3: three
-${nonce}-4: four
-${nonce}-5: five
-
-Continue this pattern all the way to 100. Use only single-word number names (six, seven, eight, etc.).
-
-IMPORTANT: Do not add any other text. Start immediately with ${nonce}-1: one. If interrupted, resume from where you stopped without repeating any lines.`;
-
-        // Start collector before sending message
         const collector = createStreamCollector(env.orpc, workspaceId);
         collector.start();
+        try {
+          await collector.waitForSubscription(5_000);
+          const sendResult = await client.workspace.sendMessage({
+            workspaceId,
+            message: "Count with numbered markers.",
+            options: { model: MODEL, thinkingLevel: "off", agentId: "exec", toolPolicy },
+          });
+          expect(sendResult.success).toBe(true);
 
-        const sendResult = await sendMessageWithModel(env, workspaceId, prompt, MODEL, {
-          toolPolicy: [{ regex_match: ".*", action: "disable" }],
-        });
-        expect(sendResult.success).toBe(true);
+          // Fail the stream only after the backend has delivered every prefix delta, so the
+          // error path has the whole prefix to persist (no grace timer).
+          const lastPrefixMarker = `${NONCE}-${PREFIX_MARKERS}:`;
+          const deadline = Date.now() + EVENT_TIMEOUT_MS;
+          while (!collector.getStreamContent().includes(lastPrefixMarker)) {
+            if (Date.now() > deadline) throw new Error("prefix deltas never arrived");
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          fixture.dropFirstResponse();
 
-        // Collect stream deltas until we have at least STABLE_PREFIX_THRESHOLD complete markers
-        const preErrorBuffer = await collectStreamUntil(
-          collector,
-          (buf) => getMaxMarker(nonce, buf) >= STABLE_PREFIX_THRESHOLD,
-          15000
-        );
+          const terminal = await Promise.race([
+            collector.waitForEvent("stream-end", EVENT_TIMEOUT_MS),
+            collector.waitForEvent("stream-error", EVENT_TIMEOUT_MS),
+          ]);
+          expect(terminal?.type).toBe("stream-error");
+        } finally {
+          collector.stop();
+        }
 
-        // Build stable prefix (truncate to last complete marker)
-        const stablePrefix = truncateToLastCompleteMarker(preErrorBuffer, nonce);
-        const maxMarkerBeforeError = getMaxMarker(nonce, stablePrefix);
+        const resumeCollector = createStreamCollector(env.orpc, workspaceId);
+        resumeCollector.start();
+        try {
+          // Finish replay first so the earlier stream-error is not read as the resume outcome.
+          await resumeCollector.waitForSubscription(5_000);
+          resumeCollector.clear();
+          const resumeResult = await client.workspace.resumeStream({
+            workspaceId,
+            options: { model: MODEL, agentId: "exec", toolPolicy },
+          });
+          expect(resumeResult.success).toBe(true);
+          expect(await resumeCollector.waitForEvent("stream-end", EVENT_TIMEOUT_MS)).not.toBeNull();
+          expect(resumeCollector.hasError()).toBe(false);
+        } finally {
+          resumeCollector.stop();
+        }
 
-        console.log(`[Test] Nonce: ${nonce}, Max marker before error: ${maxMarkerBeforeError}`);
-        console.log(`[Test] Stable prefix ends with: ${stablePrefix.slice(-200)}`);
-
-        // Trigger error mid-stream via ORPC debug endpoint
-        const client = resolveOrpcClient(env);
-        const triggered = await client.debug.triggerStreamError({
-          workspaceId,
-          errorMessage: "Test-triggered stream error for recovery test",
-        });
-        expect(triggered).toBe(true);
-
-        // Small delay to let error propagate
-        await new Promise((resolve) => setTimeout(resolve, 500));
-
-        // Resume and wait for completion
-        // Disable all tools (same as original message) so model outputs text, not tool calls
-        await resumeAndWaitForSuccess(workspaceId, client, MODEL, 15000, {
-          toolPolicy: [{ regex_match: ".*", action: "disable" }],
-        });
-
-        // Small delay to let history update complete after stream-end
-        // stream-end is emitted before updateHistory completes
-        await new Promise((resolve) => setTimeout(resolve, 500));
-
-        // Read final assistant message from history
-        const history = await readChatHistory(env.tempDir, workspaceId);
-        const assistantMessages = history.filter((m) => m.role === "assistant");
-
-        const finalText = assistantMessages
-          .flatMap((m) => m.parts)
-          .filter((p) => p.type === "text")
-          .map((p) => (p as { text?: string }).text ?? "")
+        // The resumed provider request carries the interrupted assistant text.
+        expect(fixture.requests.length).toBeGreaterThanOrEqual(2);
+        const resumed = fixture.requests.at(-1)!;
+        const replayedAssistantText = resumed.messages
+          .filter((message) => message.role === "assistant")
+          .map((message) => textOf(message.content))
           .join("");
+        expect(replayedAssistantText).toContain(PREFIX_TEXT.trim());
 
-        // Normalize whitespace for comparison (trim trailing spaces/newlines)
-        const normalizedPrefix = stablePrefix.trim();
-        const normalizedFinal = finalText.trim();
-
-        // ASSERTION 1: Prefix preservation - final text starts with exact pre-error prefix
-        if (!normalizedFinal.startsWith(normalizedPrefix)) {
-          console.error("[FAIL] Final text does NOT start with stable prefix");
-          console.error("Expected prefix (last 300 chars):", normalizedPrefix.slice(-300));
-          console.error("Actual start (first 300 chars):", normalizedFinal.substring(0, 300));
-          console.error("Stable prefix length:", normalizedPrefix.length);
-          console.error("Final text length:", normalizedFinal.length);
-        }
-        expect(normalizedFinal.startsWith(normalizedPrefix)).toBe(true);
-
-        // ASSERTION 2: Exact continuation - search for next marker (k+1) shortly after prefix
-        const nextMarker = `${nonce}-${maxMarkerBeforeError + 1}`;
-        const searchWindow = normalizedFinal.substring(
-          normalizedPrefix.length,
-          normalizedPrefix.length + 2000
-        );
-        const foundNextMarker = searchWindow.includes(nextMarker);
-
-        if (!foundNextMarker) {
-          console.error("[FAIL] Next marker NOT found after prefix");
-          console.error("Expected marker:", nextMarker);
-          console.error("Search window (first 1200 chars):", searchWindow.substring(0, 1200));
-          const allMarkers = extractMarkers(nonce, normalizedFinal);
-          console.error("All markers found (first 30):", allMarkers.slice(0, 30));
-        }
-        expect(foundNextMarker).toBe(true);
-
-        console.log("[Test] ✅ Prefix preserved and exact continuation verified");
+        // History keeps the prefix and appends the continuation.
+        const history = await readChatHistory(env.tempDir, workspaceId);
+        const finalText = history
+          .filter((message) => message.role === "assistant")
+          .flatMap((message) => message.parts)
+          .filter((part) => part.type === "text")
+          .map((part) => (part as { text?: string }).text ?? "")
+          .join("");
+        expect(finalText.startsWith(PREFIX_TEXT.trim())).toBe(true);
+        expect(finalText).toContain(`${NONCE}-${PREFIX_MARKERS + 1}`);
       } finally {
         await cleanup();
       }
-    },
-    40000
-  );
+    } finally {
+      await fixture.close();
+    }
+  }, 60_000);
 });

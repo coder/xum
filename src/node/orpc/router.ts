@@ -2369,14 +2369,6 @@ export const router = (authToken?: string) => {
           }
         }),
     },
-    debug: {
-      triggerStreamError: t
-        .input(schemas.debug.triggerStreamError.input)
-        .output(schemas.debug.triggerStreamError.output)
-        .handler(({ context, input }) =>
-          context.workspaceService.debugTriggerStreamError(input.workspaceId, input.errorMessage)
-        ),
-    },
     telemetry: {
       track: t
         .input(schemas.telemetry.track.input)
