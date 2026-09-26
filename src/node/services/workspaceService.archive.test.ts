@@ -206,9 +206,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     spyOn(aiService, "isStreaming").mockReturnValue(true);
 
-    const interruptStreamSpy = spyOn(workspaceService, "interruptStream").mockResolvedValue(
-      Ok(undefined)
-    );
+    // Records calls only; the hook failure must stop archive before any interrupt.
+    const interruptStreamSpy = spyOn(workspaceService, "interruptStream");
 
     const result = await workspaceService.archive(workspaceId);
 

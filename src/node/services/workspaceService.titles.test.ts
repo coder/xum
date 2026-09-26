@@ -566,6 +566,7 @@ describe("WorkspaceService regenerateTitle", () => {
         "ws-regenerate-title",
         "ws-regenerate-title-compacted",
         "ws-regenerate-title-first-plus-last-three",
+        "title-hidden-review",
       ].map((id) => ({ id, name: id, path: `/tmp/proj/${id}` })),
       {
         agentAiDefaults: {
@@ -611,9 +612,14 @@ describe("WorkspaceService regenerateTitle", () => {
     const generate = spyOn(workspaceTitleGenerator, "generateWorkspaceIdentity").mockResolvedValue(
       Ok({ name: "visible-title", title: "Visible title", modelUsed: "test:model" })
     );
-    const update = spyOn(workspaceService, "updateTitle").mockResolvedValueOnce(Ok(undefined));
     try {
       expect((await workspaceService.regenerateTitle(workspaceId)).success).toBe(true);
+      expect(
+        harness.config
+          .loadConfigOrDefault()
+          .projects.get("/tmp/proj")
+          ?.workspaces.find((workspace) => workspace.id === workspaceId)?.title
+      ).toBe("Visible title");
       const call = generate.mock.calls[0];
       expect(call?.[0]).toBe("visible objective");
       expect(call?.[3]).toContain("visible progress");
@@ -621,7 +627,6 @@ describe("WorkspaceService regenerateTitle", () => {
       expect(call?.[3]).not.toContain("HIDDEN_REVIEW_SENTINEL");
       expect(call?.[4]).toBe(feedbackText);
     } finally {
-      update.mockRestore();
       generate.mockRestore();
     }
   });

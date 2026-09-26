@@ -228,7 +228,8 @@ describe("WorkspaceService init cancellation", () => {
     initStateManager.startInit(workspaceId, projectPath);
 
     // Make it obvious if archive() incorrectly chooses deletion.
-    const removeSpy = spyOn(workspaceService, "remove").mockResolvedValue(Ok(undefined));
+    // Records calls only: a wrong deletion would also remove the entry asserted below.
+    const removeSpy = spyOn(workspaceService, "remove");
 
     const result = await workspaceService.archive(workspaceId);
     expect(result.success).toBe(true);
@@ -252,7 +253,8 @@ describe("WorkspaceService init cancellation", () => {
     expect(initStateManager.getInitState(workspaceId)?.status).toBe("success");
 
     // Make it obvious if archive() incorrectly chooses deletion.
-    const removeSpy = spyOn(workspaceService, "remove").mockResolvedValue(Ok(undefined));
+    // Records calls only: a wrong deletion would also remove the entry asserted below.
+    const removeSpy = spyOn(workspaceService, "remove");
 
     const result = await workspaceService.archive(workspaceId);
     expect(result.success).toBe(true);

@@ -1,6 +1,5 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import { generateForkBranchName, generateForkTitle } from "./workspaceService";
-import type { AgentSession } from "./agentSession";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -87,9 +86,6 @@ describe("WorkspaceService fork", () => {
       ),
     });
 
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -118,7 +114,6 @@ describe("WorkspaceService fork", () => {
     } finally {
       orchestrateForkSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
     }
   });
   test("fork inherits a paused goal with fresh accounting and gets its own unrelated-message consent", async () => {
@@ -181,9 +176,6 @@ describe("WorkspaceService fork", () => {
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -288,7 +280,6 @@ describe("WorkspaceService fork", () => {
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
     }
   });
@@ -348,9 +339,6 @@ describe("WorkspaceService fork", () => {
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -397,7 +385,6 @@ describe("WorkspaceService fork", () => {
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
     }
   });
@@ -451,9 +438,6 @@ describe("WorkspaceService fork", () => {
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -500,7 +484,6 @@ describe("WorkspaceService fork", () => {
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
     }
   });
@@ -547,9 +530,6 @@ describe("WorkspaceService fork", () => {
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -593,7 +573,6 @@ describe("WorkspaceService fork", () => {
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
     }
   });
@@ -641,9 +620,6 @@ describe("WorkspaceService fork", () => {
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -688,7 +664,6 @@ describe("WorkspaceService fork", () => {
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
     }
   });
@@ -734,9 +709,6 @@ describe("WorkspaceService fork", () => {
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
 
     const generateStableIdSpy = spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      emitMetadata: mock(() => undefined),
-    } as unknown as AgentSession);
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
@@ -775,7 +747,6 @@ describe("WorkspaceService fork", () => {
       copyPlanSpy.mockRestore();
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
-      getOrCreateSessionSpy.mockRestore();
       generateStableIdSpy.mockRestore();
     }
   });
