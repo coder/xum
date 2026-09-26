@@ -6,6 +6,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 
 import type { SubagentGitPatchArtifact } from "@/common/utils/tools/toolDefinitions";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { getSubagentGitPatchMboxPath } from "@/node/services/subagentGitPatchArtifacts";
 import { initGitRepo } from "@/node/services/taskService.testHarness";
 import { findUnpreservedSubagentWork } from "./subagentRemovalWorkCheck";
 
@@ -54,6 +55,7 @@ describe("findUnpreservedSubagentWork", () => {
       runtime: new LocalRuntime(rootDir),
       projectRepos: [{ projectPath: "/proj", projectName: "repo", repoCwd: repo }],
       patchArtifact: options.patchArtifact ?? null,
+      patchArtifactSessionDir: path.join(rootDir, "sessions"),
       taskBaseCommitShaByProjectPath: taskBase,
     });
   }
@@ -84,10 +86,18 @@ describe("findUnpreservedSubagentWork", () => {
     const head = git(repo, "rev-parse HEAD");
 
     // No artifact: the commit lives only on the branch that removal deletes.
+    const mbox = getSubagentGitPatchMboxPath(path.join(rootDir, "sessions"), "child", "repo");
     expect(await check()).toEqual({
       success: true,
       data: { kind: "lossy", paths: [], uncapturedCommitCount: 1 },
     });
+    // A ready artifact whose mbox is gone no longer preserves anything.
+    expect(await check({ patchArtifact: readyArtifact(head) })).toEqual({
+      success: true,
+      data: { kind: "lossy", paths: [], uncapturedCommitCount: 1 },
+    });
+    await fsPromises.mkdir(path.dirname(mbox), { recursive: true });
+    await fsPromises.writeFile(mbox, "From 0000\n");
     expect(await check({ patchArtifact: readyArtifact(head) })).toEqual({
       success: true,
       data: { kind: "none" },
@@ -109,9 +119,30 @@ describe("findUnpreservedSubagentWork", () => {
     execSync("git checkout -q main && git commit -q --allow-empty -m main", { cwd: repo });
     execSync("git merge -q --no-ff --no-edit side", { cwd: repo });
     const head = git(repo, "rev-parse HEAD");
+    const mbox = getSubagentGitPatchMboxPath(path.join(rootDir, "sessions"), "child", "repo");
+    await fsPromises.mkdir(path.dirname(mbox), { recursive: true });
+    await fsPromises.writeFile(mbox, "From 0000\n");
     expect(await check({ patchArtifact: readyArtifact(head) })).toEqual({
       success: true,
       data: { kind: "lossy", paths: [], uncapturedCommitCount: 3 },
+    });
+  });
+
+  test("repo config cannot hide untracked files or submodule edits", async () => {
+    const sub = path.join(rootDir, "sub");
+    await fsPromises.mkdir(sub);
+    initGitRepo(sub);
+    execSync(`git -c protocol.file.allow=always submodule -q add ${sub} modules/sub`, {
+      cwd: repo,
+    });
+    execSync("git config -f .gitmodules submodule.modules/sub.ignore all", { cwd: repo });
+    execSync("git add -A && git commit -q -m sub", { cwd: repo });
+    git(repo, "config status.showUntrackedFiles no");
+    await fsPromises.writeFile(path.join(repo, "modules", "sub", "README.md"), "edited\n");
+    await fsPromises.writeFile(path.join(repo, "draft.txt"), "draft\n");
+    const result = await check({ base: git(repo, "rev-parse HEAD") });
+    expect(result.success ? result.data : null).toMatchObject({
+      paths: ["draft.txt", "modules/sub"],
     });
   });
 

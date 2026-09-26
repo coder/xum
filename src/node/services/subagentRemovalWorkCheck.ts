@@ -6,10 +6,18 @@ import assert from "node:assert/strict";
 
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
-import type { SubagentGitPatchArtifact } from "@/common/utils/tools/toolDefinitions";
+import type {
+  SubagentGitPatchArtifact,
+  SubagentGitProjectPatchArtifact,
+} from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { matchesProjectArtifactProjectPathForUpdate } from "@/node/services/subagentGitPatchArtifacts";
+import * as fsPromises from "fs/promises";
+import { expandTildeForSSH } from "@/node/runtime/tildeExpansion";
+import {
+  getSubagentGitPatchMboxPath,
+  matchesProjectArtifactProjectPathForUpdate,
+} from "@/node/services/subagentGitPatchArtifacts";
 import { parseGitStatusPorcelainZ } from "@/node/services/taskGitPatchEngine";
 import { coerceNonEmptyString } from "@/node/services/taskUtils";
 import type { WorkspaceProjectRepo } from "@/node/services/workspaceProjectRepos";
@@ -49,17 +57,36 @@ async function git(runtime: Runtime, repo: GitRepo, args: string) {
   return result.stdout;
 }
 
+/** An unapplied ready artifact preserves its commits only while its mbox still exists. */
+async function hasMbox(
+  sessionDir: string,
+  childTaskId: string,
+  artifact: SubagentGitProjectPatchArtifact
+): Promise<boolean> {
+  const mboxPath = getSubagentGitPatchMboxPath(sessionDir, childTaskId, artifact.storageKey);
+  return fsPromises.access(mboxPath).then(
+    () => true,
+    () => false
+  );
+}
+
 /** null when there is no git checkout to lose work from; throws when one cannot be inspected. */
 async function openGitRepo(
   runtime: Runtime,
   repo: SubagentRemovalProjectRepo
 ): Promise<GitRepo | null> {
-  try {
-    await runtime.stat(`${repo.repoCwd.replace(/\/+$/, "")}/.git`);
-  } catch {
-    // Gone, or a plain directory (scratch sub-agents run in copies this check cannot judge).
-    return null;
+  // Only a confirmed absence counts: an unreachable runtime makes this probe throw or misreport.
+  const gitPath = expandTildeForSSH(`${repo.repoCwd.replace(/\/+$/, "")}/.git`);
+  const exists = await execBuffered(runtime, `[ -e ${gitPath} ] && echo yes || echo no`, {
+    cwd: "/",
+    timeout: 10,
+  });
+  const answer = exists.stdout.trim();
+  if (exists.exitCode !== 0 || (answer !== "yes" && answer !== "no")) {
+    throw new Error(`cannot inspect ${repo.projectName}: ${exists.stderr.trim()}`);
   }
+  // Gone, or a plain directory (scratch sub-agents run in copies this check cannot judge).
+  if (answer === "no") return null;
   const probe = await execBuffered(
     runtime,
     `${gitEnvPrefix(gitNoRepoAutomationEnv())}git rev-parse --is-inside-work-tree`,
@@ -76,6 +103,8 @@ export async function findUnpreservedSubagentWork(params: {
   runtime: Runtime;
   projectRepos: SubagentRemovalProjectRepo[];
   patchArtifact: SubagentGitPatchArtifact | null;
+  /** Session dir holding the artifact's mbox files (the parent's). */
+  patchArtifactSessionDir: string;
   taskBaseCommitShaByProjectPath: Readonly<Record<string, string>>;
 }): Promise<Result<UnpreservedSubagentWork, string>> {
   assert(params.projectRepos.length > 0, "findUnpreservedSubagentWork requires project repos");
@@ -88,9 +117,14 @@ export async function findUnpreservedSubagentWork(params: {
       const repo = await openGitRepo(params.runtime, candidate);
       if (repo == null) continue;
       gitRepos.push(repo);
-      // Default untracked mode collapses new directories, and ignored files (build output,
-      // dependencies) are not treated as work, matching the #3950 snapshot check.
-      const status = await git(params.runtime, repo, "--no-optional-locks status --porcelain -z");
+      // "normal" collapses new directories; ignored files (build output, dependencies) are not
+      // work, matching the #3950 snapshot check. Explicit flags override repo config that could
+      // hide untracked files or submodule edits (status.showUntrackedFiles, submodule ignore).
+      const status = await git(
+        params.runtime,
+        repo,
+        "--no-optional-locks status --porcelain -z --untracked-files=normal --ignore-submodules=none"
+      );
       for (const entry of parseGitStatusPorcelainZ(status)) {
         paths.push(prefixPaths ? `${repo.projectName}/${entry.path}` : entry.path);
       }
@@ -125,8 +159,15 @@ export async function findUnpreservedSubagentWork(params: {
       const commits = await count("");
       const captured =
         artifact != null &&
+        params.patchArtifact != null &&
         (artifact.status === "ready" || artifact.status === "skipped") &&
-        artifact.headCommitSha === head;
+        artifact.headCommitSha === head &&
+        (artifact.appliedAtMs != null ||
+          (await hasMbox(
+            params.patchArtifactSessionDir,
+            params.patchArtifact.childTaskId,
+            artifact
+          )));
       if (commits > 0 && !(captured && (await count("--merges ")) === 0)) {
         uncapturedCommitCount += commits;
       }

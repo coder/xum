@@ -13581,6 +13581,10 @@ export class TaskService implements AgentTaskIntegration {
               projects: ws.projects,
             }),
             patchArtifact,
+            patchArtifactSessionDir: path.join(
+              this.config.sessionsDir,
+              ws.parentWorkspaceId ?? taskId
+            ),
             taskBaseCommitShaByProjectPath: buildTaskBaseCommitShaByProjectPath({
               projectPath: entry.projectPath,
               projects: ws.projects,
