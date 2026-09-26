@@ -11,6 +11,7 @@ import { SettingsProvider } from "xum/browser/contexts/SettingsContext";
 import { APIProvider } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
+import { RouterProvider } from "xum/browser/contexts/RouterContext";
 import {
   Tooltip,
   TooltipContent,
@@ -490,138 +491,143 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   };
 
   return (
-    <ChatHostContextProvider value={VSCODE_CHAT_HOST_CONTEXT_VALUE}>
-      <APIProvider client={apiClient}>
-        <SettingsProvider>
-          <ProviderOptionsProvider>
-            <ThemeProvider forcedTheme="dark">
-              <TooltipProvider>
-                <div className="flex h-screen flex-col">
-                  <div className="border-b border-border bg-background-secondary p-3">
-                    <div className="flex items-center gap-2">
-                      <WorkspacePicker
-                        workspaces={workspaces}
-                        selectedWorkspaceId={selectedWorkspaceId}
-                        onSelectWorkspace={(workspaceId) => {
-                          bridge.postMessage({ type: "selectWorkspace", workspaceId });
-                        }}
-                        onRequestRefresh={requestRefreshWorkspaces}
-                      />
+    // Shared providers (SettingsProvider, settings links in the model selector and tool cards) need
+    // a router. The webview renders no routes, so an embedded in-memory router is enough: those
+    // navigations become no-ops instead of crashing the mount or rewriting the webview URL.
+    <RouterProvider embedded>
+      <ChatHostContextProvider value={VSCODE_CHAT_HOST_CONTEXT_VALUE}>
+        <APIProvider client={apiClient}>
+          <SettingsProvider>
+            <ProviderOptionsProvider>
+              <ThemeProvider forcedTheme="dark">
+                <TooltipProvider>
+                  <div className="flex h-screen flex-col">
+                    <div className="border-b border-border bg-background-secondary p-3">
+                      <div className="flex items-center gap-2">
+                        <WorkspacePicker
+                          workspaces={workspaces}
+                          selectedWorkspaceId={selectedWorkspaceId}
+                          onSelectWorkspace={(workspaceId) => {
+                            bridge.postMessage({ type: "selectWorkspace", workspaceId });
+                          }}
+                          onRequestRefresh={requestRefreshWorkspaces}
+                        />
 
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <span
-                            className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
-                            aria-label="Preview feature"
-                          >
-                            Preview
-                          </span>
-                        </TooltipTrigger>
-                        <TooltipContent align="center">
-                          Preview feature — under active development; may contain bugs.
-                        </TooltipContent>
-                      </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span
+                              className="inline-flex shrink-0 items-center rounded border border-border-light bg-background px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
+                              aria-label="Preview feature"
+                            >
+                              Preview
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent align="center">
+                            Preview feature — under active development; may contain bugs.
+                          </TooltipContent>
+                        </Tooltip>
 
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            onClick={onOpenWorkspace}
-                            disabled={!selectedWorkspaceId}
-                            aria-label="Open workspace"
-                            className="text-muted hover:text-foreground h-8 w-8 shrink-0"
-                          >
-                            <Pencil className="h-4 w-4" />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent align="center">Open workspace</TooltipContent>
-                      </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={onOpenWorkspace}
+                              disabled={!selectedWorkspaceId}
+                              aria-label="Open workspace"
+                              className="text-muted hover:text-foreground h-8 w-8 shrink-0"
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent align="center">Open workspace</TooltipContent>
+                        </Tooltip>
+                      </div>
                     </div>
-                  </div>
 
-                  <div
-                    ref={contentRef}
-                    className="flex-1 overflow-y-auto p-3"
-                    onScroll={handleScroll}
-                    onWheel={handleScrollContainerWheel}
-                    onMouseDown={handleScrollContainerMouseDown}
-                    onMouseMove={handleScrollContainerMouseMove}
-                    onMouseUp={handleScrollContainerMouseUp}
-                    onKeyDown={handleScrollContainerKeyDown}
-                    onTouchMove={markUserScrollIntent}
-                  >
-                    <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
-                      {selectedWorkspaceId ? (
-                        <>
-                          {displayedMessages.map((msg) => (
-                            <DisplayedMessageRenderer
-                              key={msg.id}
-                              message={msg}
-                              workspaceId={selectedWorkspaceId}
-                            />
-                          ))}
-                          <VscodeStreamingBarrier
-                            workspaceId={selectedWorkspaceId}
-                            aggregator={aggregatorRef.current}
-                            className="mt-3"
-                          />
-                        </>
-                      ) : null}
-
-                      {notices.map((notice) => (
-                        <div
-                          key={notice.id}
-                          className={
-                            notice.level === "error"
-                              ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
-                              : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
-                          }
-                        >
-                          {notice.message}
-                        </div>
-                      ))}
-
-                      {!selectedWorkspaceId && notices.length === 0 ? (
-                        <div className="text-muted text-sm">
-                          Select a Xum workspace to view messages.
-                        </div>
-                      ) : null}
-                    </div>
-                    {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
                     <div
-                      ref={sentinelRef}
-                      data-testid="transcript-bottom-sentinel"
-                      aria-hidden="true"
-                      className="h-0 w-full"
-                      style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
-                    />
-                  </div>
+                      ref={contentRef}
+                      className="flex-1 overflow-y-auto p-3"
+                      onScroll={handleScroll}
+                      onWheel={handleScrollContainerWheel}
+                      onMouseDown={handleScrollContainerMouseDown}
+                      onMouseMove={handleScrollContainerMouseMove}
+                      onMouseUp={handleScrollContainerMouseUp}
+                      onKeyDown={handleScrollContainerKeyDown}
+                      onTouchMove={markUserScrollIntent}
+                    >
+                      <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
+                        {selectedWorkspaceId ? (
+                          <>
+                            {displayedMessages.map((msg) => (
+                              <DisplayedMessageRenderer
+                                key={msg.id}
+                                message={msg}
+                                workspaceId={selectedWorkspaceId}
+                              />
+                            ))}
+                            <VscodeStreamingBarrier
+                              workspaceId={selectedWorkspaceId}
+                              aggregator={aggregatorRef.current}
+                              className="mt-3"
+                            />
+                          </>
+                        ) : null}
 
-                  <div className="border-t border-border bg-background-secondary p-3">
-                    {selectedWorkspaceId ? (
-                      <ChatComposer
-                        key={selectedWorkspaceId}
-                        workspaceId={selectedWorkspaceId}
-                        disabled={!canChat}
-                        disabledReason={
-                          canChat ? undefined : "Chat requires Xum server connection."
-                        }
-                        aggregator={aggregatorRef.current}
-                        onSendComplete={jumpToBottom}
-                        onNotice={pushNotice}
+                        {notices.map((notice) => (
+                          <div
+                            key={notice.id}
+                            className={
+                              notice.level === "error"
+                                ? "mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200"
+                                : "mt-3 rounded-md border border-border-medium bg-background-secondary px-3 py-2 text-sm"
+                            }
+                          >
+                            {notice.message}
+                          </div>
+                        ))}
+
+                        {!selectedWorkspaceId && notices.length === 0 ? (
+                          <div className="text-muted text-sm">
+                            Select a Xum workspace to view messages.
+                          </div>
+                        ) : null}
+                      </div>
+                      {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
+                      <div
+                        ref={sentinelRef}
+                        data-testid="transcript-bottom-sentinel"
+                        aria-hidden="true"
+                        className="h-0 w-full"
+                        style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
                       />
-                    ) : (
-                      <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
-                    )}
+                    </div>
+
+                    <div className="border-t border-border bg-background-secondary p-3">
+                      {selectedWorkspaceId ? (
+                        <ChatComposer
+                          key={selectedWorkspaceId}
+                          workspaceId={selectedWorkspaceId}
+                          disabled={!canChat}
+                          disabledReason={
+                            canChat ? undefined : "Chat requires Xum server connection."
+                          }
+                          aggregator={aggregatorRef.current}
+                          onSendComplete={jumpToBottom}
+                          onNotice={pushNotice}
+                        />
+                      ) : (
+                        <div className="text-muted text-sm">Select a Xum workspace to chat.</div>
+                      )}
+                    </div>
                   </div>
-                </div>
-              </TooltipProvider>
-            </ThemeProvider>
-          </ProviderOptionsProvider>
-        </SettingsProvider>
-      </APIProvider>
-    </ChatHostContextProvider>
+                </TooltipProvider>
+              </ThemeProvider>
+            </ProviderOptionsProvider>
+          </SettingsProvider>
+        </APIProvider>
+      </ChatHostContextProvider>
+    </RouterProvider>
   );
 }

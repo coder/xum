@@ -243,10 +243,13 @@ function getInitialRoute(): string {
   return "/";
 }
 
+const EMBEDDED_INITIAL_ROUTE = "/";
+
 /** Sync router state to browser URL (dev server) and persist the desktop route. */
-function useUrlSync(): void {
+function useUrlSync(enabled: boolean): void {
   const location = useLocation();
   useEffect(() => {
+    if (!enabled) return;
     const url = location.pathname + location.search + location.hash;
 
     // The dedicated Xum home page is gone. Keep "/" as a transient compatibility
@@ -266,10 +269,10 @@ function useUrlSync(): void {
     if (browserUrl !== window.location.pathname + window.location.search + window.location.hash) {
       window.history.replaceState(null, "", browserUrl);
     }
-  }, [location.pathname, location.search, location.hash]);
+  }, [enabled, location.pathname, location.search, location.hash]);
 }
 
-function RouterContextInner(props: { children: ReactNode }) {
+function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
   function getProjectPathFromLocationState(state: unknown): string | null {
     if (!state || typeof state !== "object") return null;
     if (!("projectPath" in state)) return null;
@@ -285,7 +288,8 @@ function RouterContextInner(props: { children: ReactNode }) {
 
   const location = useLocation();
   const [searchParams] = useSearchParams();
-  useUrlSync();
+  useUrlSync(!props.embedded);
+  const initialRoute = props.embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute();
 
   const workspaceMatch = /^\/workspace\/(.+)$/.exec(location.pathname);
   const currentWorkspaceId = workspaceMatch ? decodePathSegment(workspaceMatch[1]) : null;
@@ -309,13 +313,13 @@ function RouterContextInner(props: { children: ReactNode }) {
   // the legacy ?path= deep link rewrite stores that path in location.state).
   // Include /analytics so Settings opened from Analytics can close back to Analytics.
   const lastNonSettingsLocationRef = useRef<NonSettingsLocationSnapshot>({
-    url: getInitialRoute(),
+    url: initialRoute,
     state: null,
   });
   // Keep a separate "close analytics" snapshot that intentionally excludes /analytics so
   // closing analytics still returns to the last non-analytics route.
   const lastNonAnalyticsLocationRef = useRef<NonSettingsLocationSnapshot>({
-    url: getInitialRoute(),
+    url: initialRoute,
     state: null,
   });
   useEffect(() => {
@@ -455,10 +459,18 @@ function RouterContextInner(props: { children: ReactNode }) {
 // Without this, React processes navigation at transition (lower) priority,
 // causing a flash of stale UI between normal-priority updates (e.g.
 // setIsSending(false)) and the deferred route change.
-export function RouterProvider(props: { children: ReactNode }) {
+//
+// `embedded` is for hosts whose document URL is not an app route (the VS Code webview): start at
+// "/" and keep navigation in memory only — never rewrite the host URL or persist a route for the
+// desktop app's relaunch restore.
+export function RouterProvider(props: { children: ReactNode; embedded?: boolean }) {
+  const embedded = props.embedded === true;
   return (
-    <MemoryRouter initialEntries={[getInitialRoute()]} unstable_useTransitions={false}>
-      <RouterContextInner>{props.children}</RouterContextInner>
+    <MemoryRouter
+      initialEntries={[embedded ? EMBEDDED_INITIAL_ROUTE : getInitialRoute()]}
+      unstable_useTransitions={false}
+    >
+      <RouterContextInner embedded={embedded}>{props.children}</RouterContextInner>
     </MemoryRouter>
   );
 }
