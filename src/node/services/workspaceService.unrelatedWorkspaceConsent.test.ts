@@ -476,4 +476,16 @@ describe("WorkspaceService.setAgentMessageDispatchMode", () => {
     expect(persistedMode()).toBeUndefined();
     expect(published.at(-1)?.agentMessageDispatchMode).toBeUndefined();
   });
+
+  test("does not acknowledge a mode whose save was swallowed", async () => {
+    // Config.saveConfig logs and swallows write failures; model one reaching the real edit path.
+    spyOn(
+      harness.config as unknown as { saveConfig: (config: unknown) => Promise<void> },
+      "saveConfig"
+    ).mockResolvedValue(undefined);
+
+    const result = await harness.service.setAgentMessageDispatchMode(WORKSPACE_ID, "turn-end");
+
+    expect(result.success).toBe(false);
+  });
 });

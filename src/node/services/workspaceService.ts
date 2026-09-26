@@ -326,6 +326,7 @@ import type {
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import {
   type AgentMessageDispatchMode,
+  getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
 import type {
@@ -7622,6 +7623,19 @@ export class WorkspaceService
       });
       if (!outcome.success) {
         return Err(outcome.error);
+      }
+      // Config.saveConfig logs and swallows write errors, so editConfig resolving does not prove
+      // the mode is on disk. editConfig leaves no cached snapshot, so this re-reads the file.
+      const persisted = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+        projectPath,
+        workspaceId: normalizedWorkspaceId,
+        workspacePath,
+      });
+      if (
+        (getValidAgentMessageDispatchMode(persisted?.agentMessageDispatchMode) ?? "tool-end") !==
+        mode
+      ) {
+        return Err("Failed to save agent message delivery: the config write did not persist.");
       }
       // Publish after every successful write, including no-ops (same reason as consent above).
       await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);

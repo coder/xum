@@ -1132,6 +1132,44 @@ describe("TaskService", () => {
     expect(internalArg.preTurnMessages?.[0]?.id).toBe(payloadRow!.id);
   });
 
+  test("family messages honour a recipient that holds agent messages until its turn ends", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-family-hold";
+    const childTaskId = "child-family-hold";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          agentMessageDispatchMode: "turn-end",
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
+    simulateAcceptedFamilySends(sendMessage, historyService);
+
+    // task_message_parent always asks for tool-end; the recipient's hold preference wins.
+    expect(
+      await taskService.sendMessageToParentFromAgentTask(childTaskId, "CI is red", "tool-end")
+    ).toEqual(Ok({ parentWorkspaceId }));
+    expect(sendMessage).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      expect.any(String),
+      expect.objectContaining({ queueDispatchMode: "turn-end" }),
+      expect.anything()
+    );
+  });
+
   test("concurrent family messages to the same target serialize payload+trigger delivery", async () => {
     // r30: payload + trigger ride ONE sendMessage call (pre-turn rows), so
     // each pair is atomic by construction. The delivery lock must still
