@@ -104,6 +104,7 @@ export async function getAllWorkspacesFromApi(
       streaming: activity.streaming,
       lastModel: activity.lastModel,
       lastThinkingLevel: activity.lastThinkingLevel,
+      agentStatus: null,
     });
   }
 

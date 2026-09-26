@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -179,7 +179,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     scheduledRenderRef.current = { kind: "timeout", id };
   };
 
-  const { contentRef, innerRef, handleScroll, markUserInteraction, jumpToBottom } = useAutoScroll();
+  // useAutoScroll moved to a sentinel/overflow-anchor design (#3201); the webview has not been
+  // ported yet, so it only uses the scroll container ref, scroll handler and jump-to-bottom.
+  const { contentRef, handleScroll, jumpToBottom } = useAutoScroll();
 
   const jumpToBottomRef = useRef(jumpToBottom);
   jumpToBottomRef.current = jumpToBottom;
@@ -391,7 +393,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
         default: {
           const _exhaustive: never = msg;
-          bridge.debugLog("unhandled extension message", raw);
+          bridge.debugLog("unhandled extension message", { raw, message: _exhaustive });
           return;
         }
       }
@@ -524,11 +526,8 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     ref={contentRef}
                     className="flex-1 overflow-y-auto p-3"
                     onScroll={handleScroll}
-                    onWheel={markUserInteraction}
-                    onMouseDown={markUserInteraction}
-                    onTouchStart={markUserInteraction}
                   >
-                    <div ref={innerRef}>
+                    <div>
                       {selectedWorkspaceId ? (
                         <>
                           {displayedMessages.map((msg) => (

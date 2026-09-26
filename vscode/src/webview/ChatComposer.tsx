@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { SendHorizontal } from "lucide-react";
 
@@ -22,7 +22,7 @@ import { ThinkingSelector } from "xum/browser/components/ThinkingSelector/Thinki
 import { ContextUsageIndicatorButton } from "xum/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
 import { Tooltip, TooltipTrigger, TooltipContent } from "xum/browser/components/Tooltip/Tooltip";
 
-import type { AgentId } from "xum/common/orpc/schemas";
+import type { AgentId } from "xum/common/types/agentDefinition";
 
 import { calculateTokenMeterData } from "xum/common/utils/tokens/tokenMeterUtils";
 import { createDisplayUsage } from "xum/common/utils/tokens/displayUsage";
@@ -56,7 +56,7 @@ function SimpleAgentToggle(props: { agentId: AgentId; onChange: (agentId: AgentI
         </button>
       </TooltipTrigger>
       <TooltipContent align="center">
-        Click to switch to {isPlan ? "Exec" : "Plan"} agent ({formatKeybind(KEYBINDS.TOGGLE_MODE)})
+        Click to switch to {isPlan ? "Exec" : "Plan"} agent
       </TooltipContent>
     </Tooltip>
   );

@@ -32,7 +32,7 @@ export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (pr
   const awaitingUserQuestion = aggregator.hasAwaitingUserQuestion();
   const currentModel = aggregator.getCurrentModel() ?? null;
   const pendingStreamStartTime = aggregator.getPendingStreamStartTime();
-  const pendingCompactionModel = aggregator.getPendingCompactionModel();
+  const pendingStreamModel = aggregator.getPendingStreamModel();
 
   // Determine if we're in "starting" phase (message sent, waiting for stream-start)
   const isStarting = pendingStreamStartTime !== null && !canInterrupt;
@@ -59,12 +59,11 @@ export const VscodeStreamingBarrier: React.FC<VscodeStreamingBarrierProps> = (pr
   }
 
   // Model to display:
-  // - "starting" phase with pending compaction: use the compaction model from the request
-  // - "starting" phase without compaction: read chat model from localStorage
+  // - "starting" phase: prefer the pending stream's model (from muxMetadata), then localStorage
   // - Otherwise: use currentModel from active stream
   const model =
     phase === "starting"
-      ? (pendingCompactionModel ??
+      ? (pendingStreamModel ??
         readPersistedState<string | null>(getModelKey(props.workspaceId), null) ??
         getDefaultModel())
       : currentModel;
