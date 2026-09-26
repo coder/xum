@@ -573,6 +573,9 @@ const localPlugin = {
         // shard. That made unrelated suites fail only for certain CI shard orders (#4524,
         // #3359). A mock inside a test/hook callback is not file scope; one inside `afterAll`
         // counts as a restore; `describe` callbacks run at file load, so they stay file scope.
+        // Mocks installed from hooks or local helpers leak too, but files usually pair them with
+        // restore helpers that only call-graph analysis could match, so this rule checks file
+        // scope only (hook/helper-installed leaks: #4639).
         const allowed = new Set(
           context.options[0]?.allow?.[
             path.relative(context.cwd, context.filename).split(path.sep).join("/")
