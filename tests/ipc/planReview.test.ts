@@ -169,9 +169,10 @@ async function createFixtureServer(): Promise<{
   const server = http.createServer((request, response) => {
     const bodyChunks: Buffer[] = [];
     request.on("data", (part: Buffer) => bodyChunks.push(part));
-    // Fire-and-forget: the async handler owns the response, and Node ignores listener results.
+    // The async handler owns the response, and Node ignores listener results, so a fixture
+    // failure must end the response itself (500) instead of leaving the request hanging.
     request.on("end", () => {
-      void (async () => {
+      (async () => {
         const body = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as RequestBody;
         const captured = { path: request.url ?? "", body };
         requests.push(captured);
@@ -201,7 +202,11 @@ async function createFixtureServer(): Promise<{
         });
         for (const part of chunks) response.write(`data: ${JSON.stringify(part)}\n\n`);
         response.end("data: [DONE]\n\n");
-      })();
+      })().catch((error: unknown) => {
+        console.error("planReview fixture handler failed", error);
+        if (!response.headersSent) response.writeHead(500, { "Content-Type": "text/plain" });
+        response.end(String(error));
+      });
     });
   });
   await new Promise<void>((resolve, reject) => {

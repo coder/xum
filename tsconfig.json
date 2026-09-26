@@ -29,6 +29,7 @@
     "src/**/*.tsx",
     "src/**/*.ts",
     "tests/**/*.ts",
+    "tests/**/*.tsx",
     ".storybook/**/*.ts",
     ".storybook/**/*.tsx"
   ],
