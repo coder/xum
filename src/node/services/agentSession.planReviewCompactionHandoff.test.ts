@@ -599,6 +599,45 @@ describe("plan-review feedback whose snapshot or threads leave history before it
       ["fb_1", ["thr_1"]],
     ]);
   });
+
+  test("(12) a damaged record whose two replies share one replyId is refused", async () => {
+    const h = await fixture();
+    setMonitor(h, false);
+    await seedSnapshot(h);
+    const opened = await h.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("pr-feedback", "user", feedbackText, {
+        timestamp: Date.now(),
+        muxMetadata: feedbackMeta,
+      })
+    );
+    expect(opened.success).toBe(true);
+
+    // The projection admits only the first reply, so the second body would never enter review
+    // state even though the row reads as sent.
+    const damaged: PlanReviewRecord = {
+      v: 1,
+      kind: "feedback",
+      recordId: "rec_reply",
+      feedbackId: "fb_2",
+      snapshotId: snapshot.snapshotId,
+      contentHash: snapshot.contentHash,
+      comments: [],
+      replies: [
+        { replyId: "rpl_1", threadId: "thr_1", body: "First reply" },
+        { replyId: "rpl_1", threadId: "thr_1", body: "Second reply" },
+      ],
+    };
+    const sent = await h.session.sendMessage(formatPlanReviewEnvelope(damaged), {
+      ...options,
+      muxMetadata: buildPlanReviewMetadata(damaged),
+    });
+    expect(!sent.success && sent.error.type === "unknown" && sent.error.raw).toBe(
+      PLAN_REVIEW_FEEDBACK_STALE_MESSAGE
+    );
+    expect(h.stream).not.toHaveBeenCalled();
+    expect(authenticFeedbackRows(await h.allRows())).toHaveLength(1);
+  });
 });
 
 describe("plan-review feedback refused before it streams", () => {
