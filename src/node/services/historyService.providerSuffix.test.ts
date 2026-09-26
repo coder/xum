@@ -118,6 +118,14 @@ function generateRows(random: () => number, withOversized: boolean): string[] {
         json(
           createMuxMessage(`${id}-big`, "user", big, { note: "reset" } as MuxMessage["metadata"])
         ),
+        // An oversized compaction boundary the locator re-reads and accepts as the start (#4551).
+        json(
+          createMuxMessage(`${id}-big`, "assistant", big, {
+            compactionBoundary: true,
+            compacted: true,
+            compactionEpoch: i + 1,
+          })
+        ),
       ];
       rows.push(shapes[Math.floor(random() * shapes.length)]);
     }
