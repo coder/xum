@@ -16,6 +16,7 @@ jest.mock("lottie-react", () => ({
 }));
 
 import { act, fireEvent, waitFor } from "@testing-library/react";
+import React from "react";
 
 import { preloadTestModules } from "../../ipc/setup";
 import { createAppHarness } from "../harness";
@@ -23,10 +24,22 @@ import { transcriptRevealFrameScheduler } from "@/browser/hooks/useBoundedTransc
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { TRANSCRIPT_REVEAL_TAIL_ROWS } from "@/common/constants/ui";
 import { createMuxMessage } from "@/common/types/message";
+import * as mockAiStreamAdapter from "@/node/services/mock/mockAiStreamAdapter";
 
 const SEEDED_ROWS = 300;
 const seedText = (index: number) => `Seed row ${index} of the bounded reveal`;
 const seedId = (index: number) => `seed-${index % 2 === 0 ? "user" : "assistant"}-${index}`;
+
+// Each reveal step preempts React transitions in the app, so while the backfill runs a transition
+// may never commit. happy-dom still runs them, so hold them explicitly to reproduce that. The real
+// hook still runs (hook order unchanged); only the start callback is deferred. Only Streamdown's
+// streaming mode uses useTransition in the renderer.
+const realUseTransition = React.useTransition;
+const heldTransitions: (() => void)[] = [];
+function useHeldTransition(): ReturnType<typeof React.useTransition> {
+  const [isPending, startTransition] = realUseTransition();
+  return [isPending, (callback) => heldTransitions.push(() => startTransition(callback))];
+}
 
 function mountedRowIds(container: HTMLElement): string[] {
   return Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]")).map(
@@ -156,6 +169,54 @@ describe("Tail-first transcript reveal (mock AI router)", () => {
       const cancelled = "Sent while a navigation was still pending";
       await app.chat.send(cancelled);
       await app.chat.expectTranscriptContains(`Mock response: ${cancelled}`);
+
+      // A reply streaming during the backfill paints its text even though transitions are
+      // starved (ChatPane marks the transcript as backfilling). Its next chunk is seconds away,
+      // so the text visible here is the first chunk of a still-active stream.
+      await app.chat.expectStreamComplete();
+      expect(heldFrames.length).toBeGreaterThan(0);
+      const slowMarker = "Streamed slowly while older rows are still mounting";
+      const realBuildEvents = mockAiStreamAdapter.buildMockStreamEventsFromReply;
+      let slowStream: { messageId: string; firstChunk: string } | null = null;
+      const buildEventsSpy = jest
+        .spyOn(mockAiStreamAdapter, "buildMockStreamEventsFromReply")
+        .mockImplementation((reply, options) => {
+          if (!reply.assistantText.includes(slowMarker)) return realBuildEvents(reply, options);
+          const events = realBuildEvents(reply, { ...options, chunkDelayMs: 5_000 });
+          const firstDelta = events.find((event) => event.kind === "stream-delta");
+          if (firstDelta?.kind !== "stream-delta") throw new Error("slow reply has no text");
+          slowStream = { messageId: options.messageId, firstChunk: firstDelta.text.trim() };
+          return events;
+        });
+      const useTransitionSpy = jest
+        .spyOn(React, "useTransition")
+        .mockImplementation(useHeldTransition);
+      try {
+        await app.chat.send(slowMarker);
+        const inFlightRow = () =>
+          app.view.container.querySelector(`[data-message-id="${slowStream?.messageId}"]`);
+        await waitFor(
+          () => {
+            expect(slowStream).not.toBeNull();
+            expect(inFlightRow()).not.toBeNull();
+            expect(inFlightRow()!.textContent).toContain(slowStream!.firstChunk);
+          },
+          { timeout: 4_000 }
+        );
+        expect(workspaceStore.getWorkspaceSidebarState(app.workspaceId).canInterrupt).toBe(true);
+        expect(inFlightRow()!.textContent).not.toContain(slowMarker);
+        const interrupted = await app.env.orpc.workspace.interruptStream({
+          workspaceId: app.workspaceId,
+        });
+        expect(interrupted.success).toBe(true);
+        await app.chat.expectStreamComplete();
+      } finally {
+        buildEventsSpy.mockRestore();
+        useTransitionSpy.mockRestore();
+        act(() => {
+          for (const release of heldTransitions.splice(0)) release();
+        });
+      }
 
       // Release the remaining frames one at a time; each step mounts one more chunk.
       while (heldFrames.length > 0) releaseFrame();

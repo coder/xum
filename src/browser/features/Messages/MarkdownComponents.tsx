@@ -228,7 +228,12 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
             (line, idx, arr) => idx < arr.length - 1 || line.trim() !== ""
           );
           if (filteredLines.length > 0) {
-            const result = { code, shikiLanguage, theme, lines: filteredLines };
+            const result: HighlightedCodeBlockLines = {
+              code,
+              shikiLanguage,
+              theme,
+              lines: filteredLines,
+            };
             writeHighlightCache(cacheKey, result);
             setHighlighted(result);
           } else {
