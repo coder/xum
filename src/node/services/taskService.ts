@@ -8249,6 +8249,12 @@ export class TaskService implements AgentTaskIntegration {
     aiRefresh?: { prepared: PreparedReawakenAi | undefined };
   }): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     const { ancestorWorkspaceId, taskId } = params;
+    // Before the unarchive, which can restore a checkout the removing backend is deleting (#4478).
+    const marker = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace
+      .pendingRemoval;
+    if (marker != null) {
+      return Err({ code: "send_failed" as const, message: pendingRemovalAdmissionMessage(marker) });
+    }
     const unarchiveResult = await this.unarchiveAgentTaskAncestry(ancestorWorkspaceId, taskId);
     if (!unarchiveResult.success) {
       return Err({ code: "send_failed" as const, message: unarchiveResult.error });
@@ -13613,7 +13619,11 @@ export class TaskService implements AgentTaskIntegration {
       if (!tombstoneResult.success) {
         return Ok({ status: "error", action: "remove", ...target, error: tombstoneResult.error });
       }
-      const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true);
+      // Bound to the attempt checked inactive above (#4478): another backend can reawaken the task
+      // during the awaits since, and the removal must then refuse instead of deleting its checkout.
+      const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true, {
+        expectedAttemptId: entry.workspace.taskAttemptId,
+      });
       return Ok(
         result.success
           ? { status: "removed", action: "remove", ...target }

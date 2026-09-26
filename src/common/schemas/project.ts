@@ -65,7 +65,8 @@ export const PendingRemovalSchema = z.object({
   // The owning WorkspaceService instance and its process, judged by processLiveness's
   // judgeHolder so a crashed removal's marker can be taken over.
   instanceId: z.string(),
-  pid: z.number(),
+  // A pid judgeHolder can probe; anything else is dropped as malformed at load.
+  pid: z.number().int().positive(),
   identity: z.object({
     birth: z.string().nullable(),
     bootId: z.string().nullable(),

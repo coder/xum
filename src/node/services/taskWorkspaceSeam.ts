@@ -686,7 +686,11 @@ export interface WorkspaceLifecycleHost {
     force?: boolean,
     options?: { beforeRemove?: () => Promise<boolean | RemovalAttemptBinding> }
   ): Promise<Result<void>>;
-  removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  removeWhileTaskTreeLocked(
+    workspaceId: string,
+    force?: boolean,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */
   deferWorkspaceCleanup(run: () => Promise<void>): void;
 }

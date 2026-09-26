@@ -174,6 +174,22 @@ describe("workspace removal across two backends on one root", () => {
     expect(row?.pendingRemoval).toBeUndefined();
   });
 
+  test("a model-driven removal refuses once another backend reawakened the task it checked", async () => {
+    const patches = (
+      a.taskService as unknown as { gitPatchArtifactService: { waitForGeneration: () => unknown } }
+    ).gitPatchArtifactService;
+    spyOn(patches, "waitForGeneration").mockImplementationOnce(async () => {
+      // A has checked the task inactive; B reawakens it before A's removal claims the row.
+      expect((await b.taskService.reawakenInterruptedTask(taskId)).kind).toBe("reawakened");
+    });
+
+    const result = await a.taskService.removeInactiveDescendantAgentTask(rootId, taskId);
+
+    expect(result).toMatchObject({ success: true, data: { status: "error" } });
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(rowOf(a.config, taskId)?.taskAttemptId).not.toBe(firstAttemptId);
+  });
+
   test("while one backend removes a task, the other refuses to admit, reawaken or remove it", async () => {
     const paused = pauseRemovalAfterMarker(a);
     const removal = a.workspaceService.remove(taskId, true);
@@ -244,13 +260,19 @@ describe("workspace removal across two backends on one root", () => {
     expect(admission).toMatchObject({ kind: "refused" });
   });
 
-  test("a malformed removal marker is dropped instead of blocking the task", async () => {
-    await editRow(taskId, (row) => {
-      (row as Record<string, unknown>).pendingRemoval = "not a marker";
-    });
+  test.each([
+    ["not an object", () => "not a marker"],
+    ["an unprobeable pid", () => ({ ...deadOwnerMarker(), pid: 0 })],
+  ])(
+    "a malformed removal marker (%s) is dropped instead of blocking the task",
+    async (_, marker) => {
+      await editRow(taskId, (row) => {
+        (row as Record<string, unknown>).pendingRemoval = marker();
+      });
 
-    expect((await b.taskService.reawakenInterruptedTask(taskId)).kind).toBe("reawakened");
-  });
+      expect((await b.taskService.reawakenInterruptedTask(taskId)).kind).toBe("reawakened");
+    }
+  );
 
   test("a marker left by a dead backend is taken over by the next removal", async () => {
     await editRow(taskId, (row) => {

@@ -6350,8 +6350,12 @@ export class WorkspaceService
    * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
    * under the task creation mutex, which the tree lock is ordered before).
    */
-  async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
-    return await this.removeUnlocked(workspaceId, force);
+  async removeWhileTaskTreeLocked(
+    workspaceId: string,
+    force = false,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>> {
+    return await this.removeUnlocked(workspaceId, force, binding);
   }
 
   /**
