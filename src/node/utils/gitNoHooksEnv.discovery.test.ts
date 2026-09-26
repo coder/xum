@@ -412,14 +412,14 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
     },
     {
       name: "driver query exits 3",
-      match: "--includes",
+      match: "--null --includes",
       exit: "3",
       expected: () => ({ error: AUTOMATION }),
     },
     // Real git never prints matches with exit 1; this pins how such output is handled.
     {
       name: "driver query exits 1 with output",
-      match: "--includes",
+      match: "--null --includes",
       exit: "1",
       stdout: "filter.x.smudge\\ncat\\0",
       expected: baseEnv,
@@ -456,8 +456,8 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
       expect((await fs.readFile(log, "utf8")).trimEnd().split("\n")).toEqual([
         `<unset>|${at} rev-parse --git-dir`,
         `C|${at} config --local --bool extensions.worktreeConfig`,
-        `C|${at} config --local --null --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
-        `C|${at} config --worktree --null --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
+        `C|${at} config --local --includes --null --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
+        `C|${at} config --worktree --includes --null --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
         `C|${at} config --null --includes --get-regexp ${GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN}`,
       ]);
     },
