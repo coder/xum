@@ -235,6 +235,45 @@ describe("acquireProcessFileLock", () => {
     }
   );
 
+  // #4480: like crossProcessLock's CrossProcessLockTimeoutError, the timeout names the live holder
+  // (pid, start time, host) and why it was not taken over, so the user can stop the right process.
+  test("a timeout names the live holder and why it was not taken over", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const script =
+      `const { acquireProcessFileLock } = await import(${JSON.stringify(FILE_LOCK_MODULE)});` +
+      `await acquireProcessFileLock({ lockPath: ${JSON.stringify(lockPath)}, timeoutMs: 2000, label: "child" });` +
+      `console.log("acquired"); setTimeout(() => {}, 120000);`;
+    const holder = spawn(process.execPath, ["-e", script], {
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout.on("data", (chunk: Buffer) => {
+          if (chunk.toString().includes("acquired")) resolve();
+        });
+        holder.on("exit", () => reject(new Error("holder exited before acquiring")));
+      });
+      const holderPid = holder.pid!;
+      let message = "";
+      try {
+        await (
+          await acquireProcessFileLock({ lockPath, timeoutMs: 150, label: "test lock" })
+        )[Symbol.asyncDispose]();
+      } catch (error) {
+        message = String(error);
+      }
+      expect(message).toContain(`Timed out acquiring test lock ${lockPath}`);
+      expect(message).toContain(`held by pid ${holderPid}`);
+      const hostname = getSelfIdentity().hostname;
+      if (hostname != null) expect(message).toContain(`on ${hostname}`);
+      expect(message).toContain("was not taken over because");
+      expect(message).toContain("Stop that process to free the lock.");
+    } finally {
+      holder.kill("SIGKILL");
+    }
+  }, 20_000);
+
   test.skipIf(process.platform === "win32")(
     "a SIGSTOPped holder with an ancient lockfile is refused; a SIGKILLed one is reclaimed",
     async () => {
