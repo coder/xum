@@ -14,6 +14,7 @@ import {
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
+  readProviderHistorySuffix,
   readCompactionPendingHistoryBoundary,
   readCompactionPendingHistoryObservation,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -2546,6 +2547,37 @@ export class HistoryService {
       const message = getErrorMessage(error);
       return Err(`Failed to read history from boundary: ${message}`);
     }
+  }
+
+  /**
+   * A suffix of getHistoryFromLatestBoundary(workspaceId) holding at least `minMatching` rows
+   * that satisfy `matches` (or the whole read when it has fewer), so trailing-window readers
+   * (sidebar status) do not parse the whole active epoch under the lock (#4720).
+   */
+  async getHistorySuffixFromLatestBoundary(
+    workspaceId: string,
+    minMatching: number,
+    matches: (message: MuxMessage) => boolean
+  ): Promise<Result<MuxMessage[]>> {
+    // No ensureSealedHistoryRotatedUnlocked: the bounded read needs rotation neither for
+    // correctness nor for boundedness, and a background tick must stay read-only instead of
+    // paying a one-time full-file scan under the cross-process write lock. Boundary writes,
+    // replay and provider requests still rotate.
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history suffix from boundary",
+      async () =>
+        Ok(
+          await readProviderHistorySuffix(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            minMatching,
+            matches
+          )
+        )
+    );
   }
 
   /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */
