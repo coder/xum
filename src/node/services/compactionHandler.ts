@@ -38,6 +38,8 @@ import { MAX_EDITED_FILES } from "@/common/constants/attachments";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { log } from "@/node/services/log";
 import { fitCompactionSummaryToHistoryRow, type FittedCompactionSummary } from "./historyRowBudget";
+import { countTokens } from "@/node/utils/main/tokenizer";
+import { getErrorMessage } from "@/common/utils/errors";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
 import {
   extractEditedFileDiffs,
@@ -727,13 +729,9 @@ export class CompactionHandler {
     contextUsage: LanguageModelV2Usage | undefined,
     providerMetadata: Record<string, unknown> | undefined,
     contextProviderMetadata: Record<string, unknown> | undefined,
-    /** Share of the summary text the boundary kept; below 1 when the row budget cut it (#4551). */
-    keptSummaryFraction = 1
+    /** Token count of the summary the boundary kept, when the row budget cut it (#4551). */
+    keptSummaryTokens?: number
   ): LanguageModelV2Usage | undefined {
-    assert(
-      keptSummaryFraction > 0 && keptSummaryFraction <= 1,
-      "Kept summary fraction must be in (0, 1]"
-    );
     // totalUsage and contextUsage resolve independently with separate timeout/error
     // paths, so usage can be missing while contextUsage is still available.
     const usageForEstimate = usage ?? contextUsage;
@@ -752,7 +750,10 @@ export class CompactionHandler {
       return undefined;
     }
     // Tokens the boundary truncated away are not in the next request's context.
-    const summaryTokens = Math.ceil(generatedSummaryTokens * keptSummaryFraction);
+    const summaryTokens =
+      keptSummaryTokens === undefined
+        ? generatedSummaryTokens
+        : Math.min(generatedSummaryTokens, keptSummaryTokens);
 
     const systemTokens = systemMessageTokens ?? 0;
     const estimatedInputTokens = systemTokens + summaryTokens;
@@ -1079,14 +1080,28 @@ export class CompactionHandler {
     const fitted = this.fitBoundarySummary(builtSummaryMessage);
     const summaryMessage = fitted.message;
     if (fitted.truncated && summaryMessage.metadata?.contextUsage) {
-      // The meter and next-send budget read this estimate: count only the kept summary.
+      // The meter and next-send budget read this estimate: count the kept text itself (a byte
+      // ratio misjudges token-dense prefixes). If counting fails, keep the full estimate.
+      const keptText = summaryMessage.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("");
+      let keptSummaryTokens: number | undefined;
+      try {
+        keptSummaryTokens = await countTokens(metadata.model, keptText);
+      } catch (error) {
+        log.warn("Failed to count truncated compaction summary tokens", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
       summaryMessage.metadata.contextUsage = this.computePostCompactionContextEstimate(
         metadata.systemMessageTokens,
         metadata.usage,
         metadata.contextUsage,
         metadata.providerMetadata,
         metadata.contextProviderMetadata,
-        fitted.truncated.keptBytes / fitted.truncated.originalBytes
+        keptSummaryTokens
       );
     }
 

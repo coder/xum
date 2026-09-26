@@ -20,6 +20,7 @@ import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
 import assert from "@/common/utils/assert";
 import { formatCompactionSummaryTruncationMarker } from "./historyRowBudget";
+import { countTokens } from "@/node/utils/main/tokenizer";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { TelemetryService } from "./telemetryService";
 import type { TelemetryEventPayload } from "@/common/telemetry/payload";
@@ -2226,8 +2227,9 @@ describe("CompactionHandler", () => {
       expect(streamEnd?.parts.filter((part) => part.type === "text")).toEqual([
         expect.objectContaining({ text }),
       ]);
-      // Truncated tokens are not in the next request: the meter counts only the kept share.
-      const keptTokens = Math.ceil((400_000 * kept) / summary.length);
+      // Truncated tokens are not in the next request: the meter counts the kept text itself.
+      const keptTokens = await countTokens("claude-3-5-sonnet-20241022", text);
+      expect(keptTokens).toBeLessThan(400_000);
       expect(boundary?.metadata?.contextUsage?.inputTokens).toBe(keptTokens);
       expect(streamEnd?.metadata.contextUsage?.inputTokens).toBe(keptTokens);
     });
