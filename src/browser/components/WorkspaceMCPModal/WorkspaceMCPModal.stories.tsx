@@ -228,6 +228,9 @@ export const WorkspaceMCPNoOverrides: Story = {
 // #4297: a server disabled only in the global MCP settings must not be
 // attributed to the project layer.
 export const WorkspaceMCPGlobalDisabledServer: Story = {
+  // Behavioral contract only: WorkspaceMCPProjectDisabledServer already snapshots
+  // this layout, and the Pixel budget has no headroom for a copy-only variant.
+  parameters: { pixel: { exclude: true } },
   render: () =>
     renderWorkspaceMCPModal({
       servers: {
