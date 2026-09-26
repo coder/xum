@@ -28,7 +28,6 @@
     { "file": "src/node/services/sandbox/sandboxHostService.ts", "symbol": "reclaimSupersededSnapshotBlobs", "reason": "production caller: SandboxHostService.finishPersistentMountSetupLocked in the same file" },
     { "file": "src/node/services/sandbox/sandboxHostService.ts", "symbol": "reclaimExcessResultHandleBlobs", "reason": "production caller: SandboxHostService.finishPersistentMountSetupLocked in the same file" },
     { "file": "src/node/services/tools/review_pane.ts", "symbol": "applyReviewPaneUpdate", "reason": "production caller: applyReviewPaneUpdateForSessionDir in the same file" },
-    { "file": "src/node/services/workflows/WorkflowRunStore.ts", "symbol": "KeyedFifoLock", "reason": "production caller: the module-level workflowLockQueue in the same file" },
     { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "getProcessBirth", "reason": "production caller: makeOwnershipToken in the same file" },
     { "file": "src/node/utils/main/crossProcessLock.ts", "symbol": "guardPath", "reason": "production caller: withReclaimGuard (fileLock.ts)" }
   ],
@@ -55,7 +54,6 @@
     { "file": "src/node/services/refinement/refinementRollback.ts", "symbol": "RollbackRefinementOptions.testOnlyBeforeTargetLock", "reason": "interleaving hook set only by tests" },
     { "file": "src/node/services/refinement/refinementRollback.ts", "symbol": "RollbackRefinementOptions.testOnlyBeforeRollbackJournal", "reason": "interleaving hook set only by tests" },
     { "file": "src/node/services/workflows/WorkflowRunStore.ts", "symbol": "WorkflowRunStoreOptions.mutationLockWaitTimeoutMs", "reason": "option set only by tests" },
-    { "file": "src/node/services/workflows/WorkflowRunStore.ts", "symbol": "KeyedFifoLock.waiterCount", "reason": "read only by tests" },
     { "file": "src/node/services/workspaceService.ts", "symbol": "WorkspaceService.debugTriggerStreamError", "reason": "backs the debug.triggerStreamError endpoint; only integration tests reach it" },
     { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "ReclaimSeamPhase", "reason": "type of the test-only testOnlyReclaimSeam hook" },
     { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "ProcessFileLockOptions.testOnlyReclaimSeam", "reason": "interleaving hook set only by tests" },

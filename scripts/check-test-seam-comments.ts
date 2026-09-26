@@ -69,7 +69,6 @@ export const FROZEN_KNOWN_DEBT: readonly string[] = [
   "src/node/services/refinement/refinementRollback.ts#RollbackRefinementOptions.testOnlyBeforeCommit",
   "src/node/services/refinement/refinementRollback.ts#RollbackRefinementOptions.testOnlyBeforeRollbackJournal",
   "src/node/services/refinement/refinementRollback.ts#RollbackRefinementOptions.testOnlyBeforeTargetLock",
-  "src/node/services/workflows/WorkflowRunStore.ts#KeyedFifoLock.waiterCount",
   "src/node/services/workflows/WorkflowRunStore.ts#WorkflowRunStoreOptions.mutationLockWaitTimeoutMs",
   "src/node/services/workspaceService.ts#WorkspaceService.debugTriggerStreamError",
   "src/node/utils/concurrency/fileLock.ts#ProcessFileLockOptions.testOnlyReclaimSeam",
