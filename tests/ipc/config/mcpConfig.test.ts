@@ -276,6 +276,7 @@ describeIntegration("MCP global configuration", () => {
             transport: "stdio",
             command: globalCommand,
             disabled: false,
+            configLayer: "global",
           },
         });
       } finally {
