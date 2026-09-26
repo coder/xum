@@ -17,6 +17,7 @@ import {
   type Tokenizer,
 } from "@/node/utils/main/tokenizer";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import { createDisplayUsage } from "./displayUsage";
 import type { ChatUsageDisplay } from "./usageAggregator";
 
@@ -163,10 +164,26 @@ export interface TokenCountJob {
  * Creates all token counting jobs from messages
  * Jobs are executed immediately (promises start running)
  */
-function createTokenCountingJobs(messages: MuxMessage[], tokenizer: Tokenizer): TokenCountJob[] {
+async function createTokenCountingJobs(
+  messages: MuxMessage[],
+  tokenizer: Tokenizer
+): Promise<TokenCountJob[]> {
   const jobs: TokenCountJob[] = [];
+  // Each job hashes its text and posts it to the tokenizer worker. A 1.24M-row epoch made this
+  // one synchronous loop of ~10 s that froze the whole server (pings, onChat heartbeats, every
+  // other subscription) right after the chat loaded (#4643), so give the event loop turns.
+  const yielder = new EventLoopYielder();
+  let observedJobs = 0;
 
   for (const message of messages) {
+    if (yielder.isDue()) {
+      // A job can reject while we yield (dead worker, malformed part). Server mode crashes on an
+      // unhandled rejection, so observe the jobs started so far; calculateTokenStats still
+      // awaits every job and surfaces the failure to its caller.
+      void Promise.all(jobs.slice(observedJobs).map((job) => job.promise)).catch(() => undefined);
+      observedJobs = jobs.length;
+      await yielder.yield();
+    }
     if (message.role === "user") {
       // User message text - batch all text parts together
       const textParts = message.parts.filter((p) => p.type === "text");
@@ -442,7 +459,7 @@ export async function calculateTokenStats(
   );
 
   // Phase 3: Create all token counting jobs (promises start immediately)
-  const jobs = createTokenCountingJobs(messages, tokenizer);
+  const jobs = await createTokenCountingJobs(messages, tokenizer);
 
   // Phase 4: Execute all jobs in parallel (second await point)
   const results = await Promise.all(jobs.map((j) => j.promise));
