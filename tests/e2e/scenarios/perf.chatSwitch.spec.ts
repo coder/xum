@@ -134,8 +134,8 @@ const test = electronTest.extend({
     // untrusted project every executeBash first runs four `git` spawns to discover repo
     // automation drivers. A workspace open fires four executeBash calls (git status, git fetch,
     // gh pr view, gh stack view), so a cold open forked the Electron main process 20 times
-    // instead of 4, each blocking it ~8-16 ms inside the replay's history read: cold-open replay
-    // ~340 ms vs ~150 ms trusted (#4624). That untrusted-path cost is real: #4661.
+    // instead of 4, each blocking it ~8-16 ms inside the replay's history read. Cold-open replay
+    // took 2-3x longer than trusted (#4624). That untrusted-path cost is real: #4661.
     trustDemoProject(workspace.demoProject);
 
     // The per-replay server line logs at debug unless the replay is slow; the app fixture
