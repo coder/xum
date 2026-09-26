@@ -5,6 +5,12 @@ import type { ReactNode } from "react";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ActualExperimentsModule from "@/browser/contexts/ExperimentsContext";
 import * as ActualTelemetryModule from "@/browser/hooks/useTelemetry";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 
 // Snapshot values, not Bun's live module namespaces, before installing overrides.
 const actualExperiments = { ...ActualExperimentsModule };
@@ -19,33 +25,6 @@ type PrereqStatus =
   | { available: true }
   | { available: false; reason: "binary_not_found" | "unsupported_platform" | "startup_failed" };
 
-interface MockApiClient {
-  desktop: {
-    getPrereqStatus: () => Promise<PrereqStatus>;
-  };
-  general: {
-    restartApp: () => Promise<{ supported: true } | { supported: false; message: string }>;
-  };
-  config?: {
-    getConfig: () => Promise<{
-      goalDefaults?: unknown;
-      heartbeatDefaultPrompt?: string;
-      heartbeatDefaultIntervalMs?: number;
-    }>;
-    updateGoalDefaults: (input: { goalDefaults: unknown }) => Promise<void>;
-    updateHeartbeatDefaultPrompt: (input: { defaultPrompt?: string | null }) => Promise<void>;
-    updateHeartbeatDefaultIntervalMs: (input: { intervalMs?: number | null }) => Promise<void>;
-  };
-  server?: {
-    setApiServerSettings: (input: {
-      bindHost: string | null;
-      port: number | null;
-      serveWebUi: boolean | null;
-    }) => Promise<unknown>;
-    getApiServerStatus: () => Promise<unknown>;
-  };
-}
-
 function createDeferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   const promise = new Promise<T>((res) => {
@@ -54,15 +33,14 @@ function createDeferred<T>() {
   return { promise, resolve };
 }
 
-let mockApi: MockApiClient;
+let mockApi: TestApiOverrides<APIClient>;
 let experimentEnabled = false;
 let experimentValues: Record<string, boolean> = {};
 
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
 function ApiWrapper(props: { children: ReactNode }) {
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 void mock.module("@/browser/contexts/ExperimentsContext", () => ({
@@ -133,6 +111,18 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.window.api = { platform: "linux", versions: {} };
     experimentEnabled = true;
     experimentValues = {};
+    const stoppedServerStatus = {
+      running: false,
+      baseUrl: null,
+      bindHost: null,
+      port: null,
+      token: null,
+      networkBaseUrls: [],
+      tailscaleBindHosts: [],
+      configuredBindHost: null,
+      configuredServeWebUi: false,
+      configuredPort: null,
+    };
     mockApi = {
       desktop: {
         getPrereqStatus: mock(() => Promise.resolve({ available: true as const })),
@@ -141,24 +131,14 @@ describe("PortableDesktopExperimentWarning", () => {
         restartApp: mock(() => Promise.resolve({ supported: true as const })),
       },
       config: {
-        getConfig: mock(() => Promise.resolve({})),
+        getConfig: mock(() => Promise.resolve(createTestConfig())),
         updateGoalDefaults: mock(() => Promise.resolve()),
         updateHeartbeatDefaultPrompt: mock(() => Promise.resolve()),
         updateHeartbeatDefaultIntervalMs: mock(() => Promise.resolve()),
       },
       server: {
-        setApiServerSettings: mock(() => Promise.resolve({})),
-        getApiServerStatus: mock(() =>
-          Promise.resolve({
-            running: false,
-            baseUrl: null,
-            token: null,
-            networkBaseUrls: [],
-            configuredBindHost: null,
-            configuredServeWebUi: false,
-            configuredPort: null,
-          })
-        ),
+        setApiServerSettings: mock(() => Promise.resolve(stoppedServerStatus)),
+        getApiServerStatus: mock(() => Promise.resolve(stoppedServerStatus)),
       },
     };
   });
@@ -308,11 +288,7 @@ describe("PortableDesktopExperimentWarning", () => {
       [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: true,
     };
 
-    const staleConfig = createDeferred<{
-      goalDefaults?: unknown;
-      heartbeatDefaultPrompt?: string;
-      heartbeatDefaultIntervalMs?: number;
-    }>();
+    const staleConfig = createDeferred<TestClientConfig>();
     const staleGetConfig = mock(() => staleConfig.promise);
     mockApi = {
       ...mockApi,
@@ -330,11 +306,7 @@ describe("PortableDesktopExperimentWarning", () => {
       expect(staleGetConfig).toHaveBeenCalledTimes(1);
     });
 
-    const freshConfig = createDeferred<{
-      goalDefaults?: unknown;
-      heartbeatDefaultPrompt?: string;
-      heartbeatDefaultIntervalMs?: number;
-    }>();
+    const freshConfig = createDeferred<TestClientConfig>();
     const freshGetConfig = mock(() => freshConfig.promise);
     mockApi = {
       ...mockApi,

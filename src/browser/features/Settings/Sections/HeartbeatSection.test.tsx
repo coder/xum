@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import { HEARTBEAT_DEFAULT_MESSAGE_BODY } from "@/constants/heartbeat";
 import { installDom } from "../../../../../tests/ui/dom";
 
@@ -18,21 +19,12 @@ interface MockOptions {
   getConfigError?: Error;
 }
 
-interface MockAPIClient {
-  config: {
-    getConfig: () => Promise<MockConfig>;
-    updateHeartbeatDefaultPrompt: (input: { defaultPrompt?: string | null }) => Promise<void>;
-    updateHeartbeatDefaultIntervalMs: (input: { intervalMs?: number | null }) => Promise<void>;
-  };
-}
-
-let mockApi: MockAPIClient;
+let mockApi: TestApiOverrides<APIClient>;
 
 // Inject the current client through the real provider; mocking the API module leaks across
 // files. The wrapper reads mockApi on every render, so rerenders pick up swapped clients.
 function ApiWrapper(props: { children: ReactNode }) {
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
 }
 
 import { HeartbeatSection } from "./HeartbeatSection";
@@ -61,12 +53,12 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}, options: MockO
         getConfig: mock(() =>
           options.getConfigError
             ? Promise.reject(options.getConfigError)
-            : Promise.resolve({ ...config })
+            : Promise.resolve(createTestConfig({ ...config }))
         ),
         updateHeartbeatDefaultPrompt: updateHeartbeatDefaultPromptMock,
         updateHeartbeatDefaultIntervalMs: updateHeartbeatDefaultIntervalMsMock,
       },
-    },
+    } satisfies TestApiOverrides<APIClient>,
     updateHeartbeatDefaultPromptMock,
     updateHeartbeatDefaultIntervalMsMock,
   };

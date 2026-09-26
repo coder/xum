@@ -7,27 +7,11 @@ import {
   WorkspaceContext,
   type WorkspaceContext as WorkspaceContextValue,
 } from "@/browser/contexts/WorkspaceContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
+import { Ok } from "@/common/types/result";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { installDom } from "../../../tests/ui/dom";
 import { useWorkspaceHeartbeat, type HeartbeatFormSettings } from "./useWorkspaceHeartbeat";
-
-interface HeartbeatApi {
-  workspace: {
-    heartbeat: {
-      get: (input: { workspaceId: string }) => Promise<HeartbeatFormSettings | null>;
-      set: (input: { workspaceId: string } & HeartbeatFormSettings) => Promise<{
-        success: boolean;
-        error?: string;
-      }>;
-    };
-  };
-  config: {
-    getConfig: () => Promise<{
-      heartbeatDefaultIntervalMs?: number;
-      heartbeatDefaultPrompt?: string;
-    }>;
-  };
-}
 
 const TEST_WORKSPACE_ID = "workspace-1";
 
@@ -41,7 +25,7 @@ const setWorkspaceMetadataMock = mock((update: WorkspaceMetadataUpdater) => {
 
 // Use real providers instead of mock.module(): Bun runs test files in one process, so
 // module-level API/context mocks can leak into unrelated hook tests.
-function createWrapper(api: HeartbeatApi): React.FC<{ children: React.ReactNode }> {
+function createWrapper(api: TestApiOverrides<APIClient>): React.FC<{ children: React.ReactNode }> {
   return function Wrapper(props) {
     const workspaceContext = {
       workspaceMetadata: new Map<string, FrontendWorkspaceMetadata>(),
@@ -52,8 +36,7 @@ function createWrapper(api: HeartbeatApi): React.FC<{ children: React.ReactNode 
     } as unknown as WorkspaceContextValue;
 
     return (
-      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-      <APIProvider client={api as unknown as APIClient}>
+      <APIProvider client={createTestApiClient(api)}>
         <WorkspaceContext.Provider value={workspaceContext}>
           {props.children}
         </WorkspaceContext.Provider>
@@ -112,8 +95,8 @@ describe("useWorkspaceHeartbeat", () => {
   });
 
   test("optimistically enables heartbeat metadata after a successful save", async () => {
-    const saveHeartbeat = mock(() => Promise.resolve({ success: true }));
-    const api: HeartbeatApi = {
+    const saveHeartbeat = mock(() => Promise.resolve(Ok(undefined)));
+    const api: TestApiOverrides<APIClient> = {
       workspace: {
         heartbeat: {
           get: () => Promise.resolve(null),
@@ -121,7 +104,7 @@ describe("useWorkspaceHeartbeat", () => {
         },
       },
       config: {
-        getConfig: () => Promise.resolve({}),
+        getConfig: () => Promise.resolve(createTestConfig()),
       },
     };
 
@@ -172,15 +155,15 @@ describe("useWorkspaceHeartbeat", () => {
       contextMode: "compact",
       message: "Keep watching",
     };
-    const api: HeartbeatApi = {
+    const api: TestApiOverrides<APIClient> = {
       workspace: {
         heartbeat: {
           get: () => Promise.resolve(initialSettings),
-          set: () => Promise.resolve({ success: true }),
+          set: () => Promise.resolve(Ok(undefined)),
         },
       },
       config: {
-        getConfig: () => Promise.resolve({}),
+        getConfig: () => Promise.resolve(createTestConfig()),
       },
     };
 

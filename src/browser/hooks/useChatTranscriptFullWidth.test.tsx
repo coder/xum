@@ -4,23 +4,25 @@ import type React from "react";
 import { installDom } from "../../../tests/ui/dom";
 
 import type { APIClient } from "@/browser/contexts/API";
-import { createControllableAsyncIterable } from "@/browser/testUtils";
+import {
+  createControllableAsyncIterable,
+  createTestApiClient,
+  createTestConfig,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { CHAT_TRANSCRIPT_FULL_WIDTH_KEY } from "@/common/constants/storage";
 
 import { useChatTranscriptFullWidth } from "./useChatTranscriptFullWidth";
 
-interface TranscriptWidthConfig {
-  chatTranscriptFullWidth: boolean;
-}
-
 function createConfigEventStream() {
   const returnMock = mock(() => undefined);
-  const stream = createControllableAsyncIterable<unknown>({ onReturn: returnMock });
+  // config.onConfigChanged yields void events; the hook only counts them.
+  const stream = createControllableAsyncIterable<void>({ onReturn: returnMock });
 
   return {
-    emit(value: unknown = Symbol("config-change")) {
-      stream.push(value);
+    emit() {
+      stream.push(undefined);
     },
     iterator: stream.iterable,
     returnMock,
@@ -52,16 +54,15 @@ describe("useChatTranscriptFullWidth", () => {
     updatePersistedState<boolean>(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, true);
     const stream = createConfigEventStream();
     const getConfigMock = mock(() =>
-      Promise.resolve<TranscriptWidthConfig>({ chatTranscriptFullWidth: true })
+      Promise.resolve<TestClientConfig>(createTestConfig({ chatTranscriptFullWidth: true }))
     );
     const onConfigChangedMock = mock(() => Promise.resolve(stream.iterator));
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const client = createTestApiClient({
       config: {
         getConfig: getConfigMock,
         onConfigChanged: onConfigChangedMock,
       },
-    } as unknown as APIClient;
+    });
 
     const { result, unmount } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -81,8 +82,8 @@ describe("useChatTranscriptFullWidth", () => {
   });
 
   test("ignores stale config fetches after a newer subscription refresh", async () => {
-    const firstFetch = Promise.withResolvers<TranscriptWidthConfig>();
-    const secondFetch = Promise.withResolvers<TranscriptWidthConfig>();
+    const firstFetch = Promise.withResolvers<TestClientConfig>();
+    const secondFetch = Promise.withResolvers<TestClientConfig>();
     const stream = createConfigEventStream();
     const getConfigMock = mock(() => {
       if (getConfigMock.mock.calls.length === 1) {
@@ -91,13 +92,12 @@ describe("useChatTranscriptFullWidth", () => {
 
       return secondFetch.promise;
     });
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const client = createTestApiClient({
       config: {
         getConfig: getConfigMock,
         onConfigChanged: mock(() => Promise.resolve(stream.iterator)),
       },
-    } as unknown as APIClient;
+    });
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -116,7 +116,7 @@ describe("useChatTranscriptFullWidth", () => {
     });
 
     await act(async () => {
-      secondFetch.resolve({ chatTranscriptFullWidth: true });
+      secondFetch.resolve(createTestConfig({ chatTranscriptFullWidth: true }));
       await secondFetch.promise;
     });
     await waitFor(() => {
@@ -124,7 +124,7 @@ describe("useChatTranscriptFullWidth", () => {
     });
 
     await act(async () => {
-      firstFetch.resolve({ chatTranscriptFullWidth: false });
+      firstFetch.resolve(createTestConfig({ chatTranscriptFullWidth: false }));
       await firstFetch.promise;
     });
 
@@ -132,8 +132,8 @@ describe("useChatTranscriptFullWidth", () => {
   });
 
   test("accepts a newer backend refresh after a backend-driven cache update", async () => {
-    const firstFetch = Promise.withResolvers<TranscriptWidthConfig>();
-    const secondFetch = Promise.withResolvers<TranscriptWidthConfig>();
+    const firstFetch = Promise.withResolvers<TestClientConfig>();
+    const secondFetch = Promise.withResolvers<TestClientConfig>();
     const stream = createConfigEventStream();
     const getConfigMock = mock(() => {
       if (getConfigMock.mock.calls.length === 1) {
@@ -142,13 +142,12 @@ describe("useChatTranscriptFullWidth", () => {
 
       return secondFetch.promise;
     });
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const client = createTestApiClient({
       config: {
         getConfig: getConfigMock,
         onConfigChanged: mock(() => Promise.resolve(stream.iterator)),
       },
-    } as unknown as APIClient;
+    });
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -159,7 +158,7 @@ describe("useChatTranscriptFullWidth", () => {
     });
 
     await act(async () => {
-      firstFetch.resolve({ chatTranscriptFullWidth: true });
+      firstFetch.resolve(createTestConfig({ chatTranscriptFullWidth: true }));
       await firstFetch.promise;
       stream.emit();
     });
@@ -168,7 +167,7 @@ describe("useChatTranscriptFullWidth", () => {
     });
 
     await act(async () => {
-      secondFetch.resolve({ chatTranscriptFullWidth: false });
+      secondFetch.resolve(createTestConfig({ chatTranscriptFullWidth: false }));
       await secondFetch.promise;
     });
 
@@ -178,14 +177,13 @@ describe("useChatTranscriptFullWidth", () => {
   });
 
   test("keeps a local persisted update when an older backend fetch resolves", async () => {
-    const fetch = Promise.withResolvers<TranscriptWidthConfig>();
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const fetch = Promise.withResolvers<TestClientConfig>();
+    const client = createTestApiClient({
       config: {
         getConfig: mock(() => fetch.promise),
         onConfigChanged: mock(() => Promise.resolve(createConfigEventStream().iterator)),
       },
-    } as unknown as APIClient;
+    });
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -201,7 +199,7 @@ describe("useChatTranscriptFullWidth", () => {
     });
 
     await act(async () => {
-      fetch.resolve({ chatTranscriptFullWidth: false });
+      fetch.resolve(createTestConfig({ chatTranscriptFullWidth: false }));
       await fetch.promise;
     });
 
@@ -211,14 +209,13 @@ describe("useChatTranscriptFullWidth", () => {
 
   test("ignores invalid cached preference values", () => {
     updatePersistedState<string>(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "false");
-    const getConfig = Promise.withResolvers<TranscriptWidthConfig>();
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const getConfig = Promise.withResolvers<TestClientConfig>();
+    const client = createTestApiClient({
       config: {
         getConfig: mock(() => getConfig.promise),
         onConfigChanged: mock(() => Promise.resolve(createConfigEventStream().iterator)),
       },
-    } as unknown as APIClient;
+    });
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -228,14 +225,13 @@ describe("useChatTranscriptFullWidth", () => {
   });
 
   test("responds to persisted preference updates while mounted", async () => {
-    const getConfig = Promise.withResolvers<TranscriptWidthConfig>();
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const getConfig = Promise.withResolvers<TestClientConfig>();
+    const client = createTestApiClient({
       config: {
         getConfig: mock(() => getConfig.promise),
         onConfigChanged: mock(() => Promise.resolve(createConfigEventStream().iterator)),
       },
-    } as unknown as APIClient;
+    });
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -253,8 +249,8 @@ describe("useChatTranscriptFullWidth", () => {
   });
 
   test("caches backend config for the next mount", async () => {
-    const firstFetch = Promise.withResolvers<TranscriptWidthConfig>();
-    const secondFetch = Promise.withResolvers<TranscriptWidthConfig>();
+    const firstFetch = Promise.withResolvers<TestClientConfig>();
+    const secondFetch = Promise.withResolvers<TestClientConfig>();
     const getConfigMock = mock(() => {
       if (getConfigMock.mock.calls.length === 1) {
         return firstFetch.promise;
@@ -262,13 +258,12 @@ describe("useChatTranscriptFullWidth", () => {
 
       return secondFetch.promise;
     });
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = {
+    const client = createTestApiClient({
       config: {
         getConfig: getConfigMock,
         onConfigChanged: mock(() => Promise.resolve(createConfigEventStream().iterator)),
       },
-    } as unknown as APIClient;
+    });
 
     const firstRender = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),
@@ -276,7 +271,7 @@ describe("useChatTranscriptFullWidth", () => {
 
     expect(firstRender.result.current).toBe(false);
     await act(async () => {
-      firstFetch.resolve({ chatTranscriptFullWidth: true });
+      firstFetch.resolve(createTestConfig({ chatTranscriptFullWidth: true }));
       await firstFetch.promise;
     });
     await waitFor(() => {
@@ -294,8 +289,7 @@ describe("useChatTranscriptFullWidth", () => {
 
   test("preserves the last known value while API config is unavailable", () => {
     updatePersistedState<boolean>(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, true);
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    const client = { config: {} } as unknown as APIClient;
+    const client = createTestApiClient({ config: {} });
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {
       wrapper: createWrapper(client),

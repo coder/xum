@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as tooltipModule from "@/browser/components/Tooltip/Tooltip";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
@@ -130,10 +131,11 @@ interface RenderTasksSectionOptions {
 function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   const saveConfig = mock(() => Promise.resolve(undefined));
   const getConfig = mock(() =>
-    Promise.resolve({
-      taskSettings: {},
-      agentAiDefaults: options.agentAiDefaults ?? {},
-    })
+    Promise.resolve(
+      createTestConfig({
+        agentAiDefaults: options.agentAiDefaults ?? {},
+      })
+    )
   );
 
   apiMock = {
@@ -144,7 +146,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
     ...(options.agents || options.workspaceModel
       ? { agents: { list: mock(() => Promise.resolve(options.agents ?? FALLBACK_AGENTS)) } }
       : {}),
-  };
+  } satisfies TestApiOverrides<APIClient>;
   // Discovery only runs for a selected workspace's project.
   selectedWorkspaceMock =
     options.agents || options.workspaceModel ? { projectPath: "/proj", workspaceId: "ws-1" } : null;
@@ -155,8 +157,7 @@ function renderTasksSection(options: RenderTasksSectionOptions = {}) {
   // Inject the per-test client through the real provider; mocking the API module leaks into
   // later files.
   const view = render(
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-    <APIProvider client={apiMock as unknown as APIClient}>
+    <APIProvider client={createTestApiClient(apiMock)}>
       <PolicyProvider>
         <TasksSection />
       </PolicyProvider>

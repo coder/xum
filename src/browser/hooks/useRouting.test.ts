@@ -12,14 +12,13 @@ import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
 
 import { useRouting } from "./useRouting";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 
-let providersConfig: ProvidersConfigMap | null = null;
+// providers.getConfig never resolves null; an empty map means no providers configured.
+let providersConfig: ProvidersConfigMap = {};
 let routePriority: string[] = ["direct"];
 let routeOverrides: Record<string, string> = {};
-let configGetConfig: () => Promise<{
-  routePriority: string[];
-  routeOverrides: Record<string, string>;
-}>;
+let configGetConfig: () => Promise<TestClientConfig>;
 let updateRoutePreferencesImpl: () => Promise<undefined>;
 const POLICY_DISABLED: PolicyGetResponse = {
   source: "none",
@@ -28,16 +27,17 @@ const POLICY_DISABLED: PolicyGetResponse = {
 };
 let policyResponse: PolicyGetResponse = POLICY_DISABLED;
 
+// `never` items fit every event stream (the subscriptions here yield void).
 async function* emptyStream() {
   await Promise.resolve();
-  for (const item of [] as unknown[]) {
+  const items: never[] = [];
+  for (const item of items) {
     yield item;
   }
 }
 
 function createStubApiClient(): APIClient {
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-  return {
+  return createTestApiClient({
     providers: {
       getConfig: () => Promise.resolve(providersConfig),
       onConfigChanged: () => Promise.resolve(emptyStream()),
@@ -51,7 +51,7 @@ function createStubApiClient(): APIClient {
       get: () => Promise.resolve(policyResponse),
       onChanged: () => Promise.resolve(emptyStream()),
     },
-  } as unknown as APIClient;
+  });
 }
 
 const stubClient = createStubApiClient();
@@ -76,10 +76,10 @@ describe("useRouting", () => {
     testWindow = new GlobalWindow({ url: "https://mux.example.com/" });
     globalThis.window = testWindow as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
-    providersConfig = null;
+    providersConfig = {};
     routePriority = ["direct"];
     routeOverrides = {};
-    configGetConfig = () => Promise.resolve({ routePriority, routeOverrides });
+    configGetConfig = () => Promise.resolve(createTestConfig({ routePriority, routeOverrides }));
     updateRoutePreferencesImpl = () => Promise.resolve(undefined);
     policyResponse = POLICY_DISABLED;
   });

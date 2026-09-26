@@ -14,6 +14,7 @@ import * as ActualMinThinkingLevelsModule from "@/browser/hooks/useMinThinkingLe
 import * as ActualRoutingModule from "@/browser/hooks/useRouting";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import { createTestApiClient, createTestConfig, type TestApiOverrides } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
@@ -33,21 +34,7 @@ interface MockConfig {
   advisorMaxOutputTokens: number | null | undefined;
 }
 
-interface SaveConfigInput {
-  taskSettings: TaskSettings;
-  advisorModelString?: string | null;
-  advisorThinkingLevel?: ThinkingLevel | null;
-  advisorReasoningMode?: OpenAIReasoningMode | null;
-  advisorMaxUsesPerTurn?: number | null;
-  advisorMaxOutputTokens?: number | null;
-}
-
-interface MockAPIClient {
-  config: {
-    getConfig: () => Promise<MockConfig>;
-    saveConfig: (input: SaveConfigInput) => Promise<void>;
-  };
-}
+type SaveConfigInput = Parameters<APIClient["config"]["saveConfig"]>[0];
 
 // Capture every dependency before mocking: later settings tests mount the real provider stack.
 restoreModulesAfterSuite([
@@ -61,7 +48,7 @@ restoreModulesAfterSuite([
   ["@/browser/components/SelectPrimitive/SelectPrimitive", { ...ActualSelectPrimitiveModule }],
 ]);
 
-let mockApi: MockAPIClient;
+let mockApi: TestApiOverrides<APIClient>;
 let providersConfig: ProvidersConfigMap | null = null;
 let minimumThinkingLevel: ThinkingLevel = THINKING_LEVEL_OFF;
 let experimentValues: Record<string, boolean>;
@@ -136,18 +123,21 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
   };
 
   const getConfigMock = mock(() =>
-    Promise.resolve({
-      taskSettings: config.taskSettings,
-      advisorModelString: config.advisorModelString,
-      advisorThinkingLevel: config.advisorThinkingLevel,
-      advisorReasoningMode: config.advisorReasoningMode,
-      advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
-      advisorMaxOutputTokens: config.advisorMaxOutputTokens,
-    })
+    Promise.resolve(
+      createTestConfig({
+        taskSettings: config.taskSettings,
+        advisorModelString: config.advisorModelString,
+        advisorThinkingLevel: config.advisorThinkingLevel,
+        advisorReasoningMode: config.advisorReasoningMode,
+        advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
+        advisorMaxOutputTokens: config.advisorMaxOutputTokens,
+      })
+    )
   );
 
   const saveConfigMock = mock((input: SaveConfigInput) => {
-    config.taskSettings = input.taskSettings;
+    // The real input makes taskSettings optional; the backend keeps the stored value when omitted.
+    config.taskSettings = input.taskSettings ?? config.taskSettings;
     config.advisorModelString = input.advisorModelString?.trim()
       ? input.advisorModelString.trim()
       : null;
@@ -164,7 +154,7 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
         getConfig: getConfigMock,
         saveConfig: saveConfigMock,
       },
-    },
+    } satisfies TestApiOverrides<APIClient>,
     getConfigMock,
     saveConfigMock,
   };
@@ -201,8 +191,7 @@ describe("ExperimentsSection advisor config", () => {
     mockApi = api;
 
     const view = render(
-      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-      <APIProvider client={mockApi as unknown as APIClient}>
+      <APIProvider client={createTestApiClient(mockApi)}>
         <ThemeProvider forcedTheme="dark">
           <ExperimentsSection />
         </ThemeProvider>
@@ -320,8 +309,7 @@ describe("ExperimentsSection advisor config", () => {
       });
       view.unmount();
       const restored = render(
-        // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
-        <APIProvider client={mockApi as unknown as APIClient}>
+        <APIProvider client={createTestApiClient(mockApi)}>
           <ThemeProvider forcedTheme="dark">
             <ExperimentsSection />
           </ThemeProvider>
