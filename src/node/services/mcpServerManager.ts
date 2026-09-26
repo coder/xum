@@ -1320,8 +1320,16 @@ interface WorkspaceServers {
   enabledServersGeneration: number;
   stats: MCPWorkspaceStats;
   timedOutServerNames: string[];
-  /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
-  retryingTimedOutServerNames: Set<string>;
+  /**
+   * In-flight cached retries by server name; prevents concurrent cached
+   * retries from stacking startup attempts for the same server. A batch of
+   * explicit re-queues only (plugin invalidation restart; no backoff record)
+   * carries a promise settling when its retry finishes, which concurrent
+   * serves join instead of serving without the server (#4539). A batch with a
+   * timed-out server's retry carries none: concurrent serves skip it rather
+   * than wait on a possibly hanging startup.
+   */
+  retryingTimedOutServerNames: Map<string, Promise<void> | undefined>;
   /**
    * Consecutive startup timeouts (initial start included) per server still in
    * `timedOutServerNames`, gating getTimedOutServerNamesToRetry (see
@@ -3074,7 +3082,7 @@ export class MCPServerManager {
       existing.timedOutServerNames = [];
     }
     if (existing && existing.retryingTimedOutServerNames === undefined) {
-      existing.retryingTimedOutServerNames = new Set();
+      existing.retryingTimedOutServerNames = new Map();
     }
     const leaseCount = this.getLeaseCount(workspaceId);
 
@@ -3093,6 +3101,12 @@ export class MCPServerManager {
       existing.enabledServers = enabledServers;
       existing.enabledServersGeneration = configGenerationUsed;
 
+      // Another serve's in-flight retry (e.g. a plugin-invalidation restart)
+      // of a server this serve enables: join it rather than returning without
+      // that server's tools (#4539). Captured before this serve marks its own.
+      const joinedRetries = [...existing.retryingTimedOutServerNames]
+        .filter(([name]) => enabledServers[name] !== undefined && !existing.instances.has(name))
+        .flatMap(([, retry]) => (retry === undefined ? [] : [retry]));
       const timedOutServerNamesToRetry = this.getTimedOutServerNamesToRetry(
         existing,
         enabledServers
@@ -3114,8 +3128,17 @@ export class MCPServerManager {
         const retryingServerNames = new Set(timedOutServerNamesToRetry);
         // Mark retries before awaiting startup so concurrent same-signature calls do not
         // stack duplicate retry attempts while the previous timeout is still unwinding.
+        // Joinable only when the whole batch is restarts: the batch settles as
+        // one, so a timed-out retry in it would pin joiners to its startup.
+        const retryDone = Promise.withResolvers<void>();
+        const joinable = [...retryingServerNames].every(
+          (serverName) => existing.timedOutRetryBackoff?.has(serverName) !== true
+        );
         for (const serverName of retryingServerNames) {
-          existing.retryingTimedOutServerNames.add(serverName);
+          existing.retryingTimedOutServerNames.set(
+            serverName,
+            joinable ? retryDone.promise : undefined
+          );
         }
 
         try {
@@ -3248,7 +3271,24 @@ export class MCPServerManager {
           for (const serverName of retryingServerNames) {
             existing.retryingTimedOutServerNames.delete(serverName);
           }
+          retryDone.resolve();
         }
+      }
+
+      if (joinedRetries.length > 0) {
+        // Never rejects: each owner resolves its retry in `finally`.
+        await Promise.all(joinedRetries);
+        // The owner may have lost the entry meanwhile; mirror its handling.
+        const current = this.workspaceServers.get(workspaceId);
+        if (current === undefined) {
+          return {
+            tools: {},
+            toolServerNames: {},
+            stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+            promptDescriptors: [],
+          };
+        }
+        if (current !== existing) return this.getToolsForWorkspaceInternal(options, readSignal);
       }
 
       log.debug("[MCP] Using cached servers", {
@@ -3686,7 +3726,7 @@ export class MCPServerManager {
               ...startTimedOutNames,
               ...invalidatedKeys,
             ],
-            retryingTimedOutServerNames: new Set(),
+            retryingTimedOutServerNames: new Map(),
             lastActivity: Date.now(),
             ...(carriedBackoff.records.size > 0
               ? { timedOutRetryBackoff: new Map(carriedBackoff.records) }

@@ -1644,18 +1644,66 @@ describe("MCPServerManager", () => {
 
     releaseClose();
     const [firstResult, secondResult] = await Promise.all([first, second]);
-    // Neither serve returned the stale instance. The first restarted the tree.
-    // The concurrent second serve currently skips that in-flight restart and
-    // returns no tools (#4539; main's startServers stub hid this); any tool it
-    // returns must reach the restarted server. Require its tool once fixed.
-    expect(Object.keys(firstResult.tools)).toHaveLength(1);
+    // Neither serve returned the stale instance. The first restarted the tree
+    // and the concurrent second joined that in-flight restart (#4539): both
+    // serve the restarted server, started exactly once.
     for (const served of [firstResult, secondResult]) {
+      expect(Object.keys(served.tools)).toHaveLength(1);
       for (const tool of Object.values(served.tools)) {
         expect(await tool.execute!({}, {} as never)).toBe("fresh");
       }
     }
+    expect(servers.connectCount("node server.js")).toBe(1);
     expect(staleEcho.execute).not.toHaveBeenCalled();
     expect(restarted).toHaveBeenCalledTimes(0);
+  });
+
+  test("a concurrent serve does not join a restart batched with a timed-out retry", async () => {
+    // One cached serve retries a re-queued plugin and a timed-out server in
+    // ONE startServers batch. Joining it would pin the concurrent serve to
+    // the possibly hanging timed-out startup; it keeps the old skip instead.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    const workspaceId = "ws-mixed-retry-batch";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({
+        "plugin:abc123:echo": stdioConfig("node server.js"),
+        slow: stdioConfig("cmd-slow"),
+      })
+    );
+    servers.serve("node server.js", { tools: { echo: testTool("stale") } });
+    servers.serve("cmd-slow", { hang: true });
+    await servers.expireStartupDeadline(() =>
+      manager.getToolsForWorkspace(workspaceRequest(workspaceId))
+    );
+    elapseTimedOutRetryBackoff();
+
+    token = "epoch-2";
+    servers.serve("node server.js", { tools: { echo: testTool("fresh") } });
+    const slowRetryStarted = Promise.withResolvers<void>();
+    const slowRetryFinished = Promise.withResolvers<void>();
+    servers.serve("cmd-slow", {
+      tools: { tool: testTool() },
+      connect: () => {
+        slowRetryStarted.resolve();
+        return slowRetryFinished.promise;
+      },
+    });
+    const first = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    await slowRetryStarted.promise;
+    expect(servers.connectCount("node server.js")).toBe(1);
+
+    // Settles while the batch's timed-out retry is still pending.
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(second.stats.failedServerNames).toContain("slow");
+    expect(servers.connectCount("node server.js")).toBe(1);
+
+    slowRetryFinished.resolve();
+    const firstResult = await first;
+    expect(Object.keys(firstResult.tools).sort()).toEqual(["plugin_abc123_echo_echo", "slow_tool"]);
   });
 
   test("serves loop until a startup is bracketed by an unchanged mutation token", async () => {
