@@ -6,6 +6,7 @@ import {
 import {
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
 } from "@/common/constants/contextBudget";
 import {
   hasRawResetMarker,
@@ -1655,7 +1656,8 @@ export class HistoryService {
   private static readonly REVERSE_READ_CHUNK_SIZE = 256 * 1024;
   /** String-search needles for context boundary lines. */
   private static readonly BOUNDARY_NEEDLES = [
-    '"compactionBoundary":true',
+    // Shared with the provider scanner so rotation and provider reads recognize the same rows.
+    SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
     `"contextBoundaryKind":"${CONTEXT_BOUNDARY_KINDS.RESET}"`,
   ] as const;
 
