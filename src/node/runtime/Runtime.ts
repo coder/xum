@@ -241,6 +241,8 @@ export interface WorkspaceCreationParams {
 export interface PendingMaterialization {
   /** The branch already existed and should fast-forward to origin/<trunkBranch> once checked out. */
   fastForwardFromOrigin: boolean;
+  /** This creation made the branch, so undoing the creation may delete it (#4745). */
+  createdBranch: boolean;
 }
 
 /** Init params for materializeWorkspace(), plus how far a cancellation may reach. */

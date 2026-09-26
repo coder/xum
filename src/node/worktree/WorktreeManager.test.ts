@@ -462,7 +462,7 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result).toEqual({
         success: true,
         workspacePath,
-        pendingMaterialization: { fastForwardFromOrigin: false },
+        pendingMaterialization: { fastForwardFromOrigin: false, createdBranch: false },
       });
       // Reserved but empty: registered with git, no files, no checkout activity yet.
       expect(

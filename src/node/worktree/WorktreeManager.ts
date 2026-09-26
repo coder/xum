@@ -223,6 +223,7 @@ export class WorktreeManager {
       // (preserves unpushed work).
       const pending: PendingMaterialization = {
         fastForwardFromOrigin: !skipRemoteSync && shouldUseOrigin && branchExists,
+        createdBranch,
       };
       // Older Git needs the legacy hook checkout, which briefly changes HEAD. Keep it
       // before announcement so an immediate fork cannot observe its unborn placeholder.

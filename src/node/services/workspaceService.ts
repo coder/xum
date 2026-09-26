@@ -762,6 +762,17 @@ const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
 
+/**
+ * A failed rollback after a rejected registration write (#4745) is logged, never thrown: the
+ * caller must still fail with the original write error, not the cleanup's.
+ */
+function logRegistrationRollbackFailure(workspaceId: string, error: unknown): void {
+  log.error("Failed to roll back after the workspace registration write rejected", {
+    workspaceId,
+    error: getErrorMessage(error),
+  });
+}
+
 function normalizeRepoRootProjectPath(projectPath: string | null | undefined): string {
   const normalizedPath = projectPath?.replaceAll("\\", "/").trim() ?? "";
   if (!normalizedPath) {
@@ -3229,16 +3240,42 @@ export class WorkspaceService
         return true;
       }
     }
-    log.error(
-      `Failed to roll back workspace ${workspaceId} after plugin-override sanitization aborted creation`
-    );
+    log.error(`Failed to roll back workspace ${workspaceId} after its creation aborted`);
     return false;
   }
 
   /**
-   * Undo a registration whose checkout could not be sanitized: the config entry, the
-   * worktree this creation made, and the in-memory state registered for it. Returns whether
-   * the entry is provably gone.
+   * Tear down what a creation set up before its config entry: the session, init record and
+   * abort controller, and (only when `entryGone`) the session dir. While the entry persists,
+   * the workspace still references that dir.
+   */
+  private async discardCreationState(
+    workspaceId: string,
+    initAbortController: AbortController,
+    entryGone: boolean
+  ): Promise<void> {
+    initAbortController.abort();
+    this.initAbortControllers.delete(workspaceId);
+    this.initStateManager.clearInMemoryState(workspaceId);
+    await this.disposeSession(workspaceId);
+    if (!entryGone) return;
+    // startInit persists its running status fire-and-forget. This delete queues behind that
+    // write on the per-workspace file lock, so the write cannot recreate the removed dir.
+    await this.initStateManager.deleteInitStatus(workspaceId);
+    await fsPromises
+      .rm(path.join(this.config.sessionsDir, workspaceId), { recursive: true, force: true })
+      .catch((error: unknown) => {
+        log.warn("Failed to remove the session dir of an aborted creation", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+  }
+
+  /**
+   * Undo a registration whose checkout could not be sanitized, or whose registration write
+   * rejected (#4745): the config entry, the worktree this creation made, and the state
+   * registered for it. Returns whether the entry is provably gone.
    */
   private async abortUnsanitizedCreation(args: {
     workspaceId: string;
@@ -3248,8 +3285,11 @@ export class WorkspaceService
     workspaceName: string;
     trusted: boolean;
     initAbortController: AbortController;
+    /** Set when the checkout was never populated (a deferred create whose write rejected). */
+    pendingMaterialization?: PendingMaterialization;
   }): Promise<boolean> {
     const { workspaceId } = args;
+    const pending = args.pendingMaterialization;
     const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
     // WORKTREE runtimes created a fresh checkout; without deleting it,
     // retrying the same branch collides with the orphaned worktree and leaks
@@ -3258,14 +3298,24 @@ export class WorkspaceService
     // no-op by design, but we never call it here to keep that contract
     // explicit). Only after a successful config rollback: while the entry
     // persists, the checkout is still referenced.
-    if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
+    if (rolledBack && isWorktreeRuntime(args.runtimeConfig) && pending?.createdBranch === false) {
+      // Git refuses a plain remove of an unpopulated worktree, and a forced one would
+      // `branch -D` this pre-existing, possibly unmerged, user branch.
+      log.warn("Kept the unpopulated worktree of an aborted creation on an existing branch", {
+        workspaceId,
+        branch: args.workspaceName,
+      });
+    } else if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
       const deleteResult = await args.runtime
         .deleteWorkspace(
           args.projectPath,
           // Worktree directories are named after the sanitized workspace
           // name (branch names may contain "/").
           args.workspaceName,
-          false,
+          // Force only an unpopulated checkout on a branch this creation made: its `branch -D`
+          // hits only that fresh branch. Populated checkouts keep `branch -d`, which refuses
+          // unmerged branches.
+          pending !== undefined,
           undefined,
           args.trusted
         )
@@ -3284,10 +3334,7 @@ export class WorkspaceService
     // (session, init record, abort controller) exactly like workspace
     // removal would; without this every aborted retry against the same bad
     // file leaks another unreachable session for the process lifetime.
-    args.initAbortController.abort();
-    this.initAbortControllers.delete(workspaceId);
-    this.initStateManager.clearInMemoryState(workspaceId);
-    await this.disposeSession(workspaceId);
+    await this.discardCreationState(workspaceId, args.initAbortController, rolledBack);
     return rolledBack;
   }
 
@@ -5688,7 +5735,7 @@ export class WorkspaceService
           // acquireRegistrationSanitizeLock).
           releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
         }
-        await this.config.editConfig((config) => {
+        const registration = this.config.editConfig((config) => {
           let projectConfig = config.projects.get(owningProjectPath);
           if (!projectConfig) {
             projectConfig = { workspaces: [] };
@@ -5711,6 +5758,24 @@ export class WorkspaceService
             ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
           });
           return config;
+        });
+        const registeredRuntime: Runtime = runtime;
+        await registration.catch(async (error: unknown) => {
+          // #4745: nothing references this checkout yet; undo the creation, then fail with the
+          // write's own error.
+          await this.abortUnsanitizedCreation({
+            workspaceId,
+            runtime: registeredRuntime,
+            runtimeConfig: finalRuntimeConfig,
+            projectPath: owningProjectPath,
+            workspaceName: finalWorkspaceName,
+            trusted: projectConfig.trusted ?? false,
+            initAbortController,
+            pendingMaterialization,
+          }).catch((rollbackError: unknown) =>
+            logRegistrationRollbackFailure(workspaceId, rollbackError)
+          );
+          throw error;
         });
 
         const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -6129,7 +6194,7 @@ export class WorkspaceService
       }
 
       const createdAt = new Date().toISOString();
-      await this.config.editConfig((config) => {
+      const registration = this.config.editConfig((config) => {
         const multiProjectConfig = config.projects.get(MULTI_PROJECT_CONFIG_KEY) ?? {
           workspaces: [],
           projectKind: "system",
@@ -6148,6 +6213,25 @@ export class WorkspaceService
         });
         config.projects.set(MULTI_PROJECT_CONFIG_KEY, multiProjectConfig);
         return config;
+      });
+      await registration.catch(async (error: unknown) => {
+        // #4745: undo this creation newest first (container, then worktrees), then fail with
+        // the write's own error. Checkouts go only once the entry is provably not persisted.
+        try {
+          const entryGone = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+          if (entryGone) {
+            await containerManager
+              .removeContainer(workspaceName)
+              .catch((cleanupError: unknown) =>
+                logRegistrationRollbackFailure(workspaceId, cleanupError)
+              );
+            await rollbackCreatedWorkspaces();
+          }
+          await this.discardCreationState(workspaceId, initAbortController, entryGone);
+        } catch (rollbackError: unknown) {
+          logRegistrationRollbackFailure(workspaceId, rollbackError);
+        }
+        throw error;
       });
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -8171,6 +8255,8 @@ export class WorkspaceService
       let oldPath: string;
       let newPath: string;
       let runtimeForPlanFile: ReturnType<typeof createRuntime>;
+      // Moves the checkout back when the config rewrite below rejects (#4745).
+      let revertMove: () => Promise<void>;
 
       if (isMultiProject(oldMetadata)) {
         const projects = getProjects(oldMetadata);
@@ -8278,16 +8364,7 @@ export class WorkspaceService
           newContainerExistedBeforeRename = false;
         }
 
-        try {
-          await containerManager.removeContainer(oldName);
-          await containerManager.createContainer(
-            newName,
-            renamedProjectWorkspaces.map((workspaceEntry) => ({
-              projectName: workspaceEntry.projectName,
-              workspacePath: workspaceEntry.newWorkspacePath,
-            }))
-          );
-        } catch (containerError: unknown) {
+        const revertMultiProjectMove = async (): Promise<void> => {
           await rollbackRenamedProjects();
 
           if (!newContainerExistedBeforeRename) {
@@ -8328,9 +8405,22 @@ export class WorkspaceService
           } catch (recreateErr: unknown) {
             log.error("Failed to recreate old container after rename failure", recreateErr);
           }
+        };
 
+        try {
+          await containerManager.removeContainer(oldName);
+          await containerManager.createContainer(
+            newName,
+            renamedProjectWorkspaces.map((workspaceEntry) => ({
+              projectName: workspaceEntry.projectName,
+              workspacePath: workspaceEntry.newWorkspacePath,
+            }))
+          );
+        } catch (containerError: unknown) {
+          await revertMultiProjectMove();
           return Err(`Failed to recreate container: ${getErrorMessage(containerError)}`);
         }
+        revertMove = revertMultiProjectMove;
 
         // Multi-project tasks/forks stored under a real project must keep their git-root path in
         // config so downstream artifact collection can resolve the owning repo after rename.
@@ -8378,9 +8468,21 @@ export class WorkspaceService
         oldPath = renameResult.oldPath;
         newPath = renameResult.newPath;
         runtimeForPlanFile = runtime;
+        revertMove = async () => {
+          const revert = await runtime.renameWorkspace(
+            configProjectPath,
+            newName,
+            oldName,
+            undefined,
+            trusted
+          );
+          if (!revert.success) {
+            logRegistrationRollbackFailure(workspaceId, revert.error);
+          }
+        };
       }
 
-      await this.config.editConfig((config) => {
+      const registration = this.config.editConfig((config) => {
         const projectConfig = config.projects.get(configProjectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -8392,6 +8494,19 @@ export class WorkspaceService
           }
         }
         return config;
+      });
+      await registration.catch(async (error: unknown) => {
+        // #4745: unless the write landed anyway, move the checkout back so disk and config
+        // agree, then fail with the write's own error.
+        try {
+          const landed = [...this.config.loadConfigOrDefault().projects.values()].some((project) =>
+            project.workspaces.some((entry) => entry.path === newPath)
+          );
+          if (!landed) await revertMove();
+        } catch (rollbackError: unknown) {
+          logRegistrationRollbackFailure(workspaceId, rollbackError);
+        }
+        throw error;
       });
       // Checkout and config agree again: let MCP-settings writers proceed
       // instead of queueing behind plan-file moves and .code-workspace sync.
@@ -11545,6 +11660,38 @@ export class WorkspaceService
           : {}),
       };
 
+      // Undo everything this fork made, newest first. Shared by a failed sanitization and a
+      // registration write that rejected (#4745). Returns whether the entry is provably gone.
+      const abortForkRegistration = async (): Promise<boolean> => {
+        // Background init is still running against this checkout: abort
+        // it and AWAIT termination before deleting the worktree, or the
+        // delete races init's writes/open handles and can fail, leaving
+        // an orphaned worktree that collides with the next fork attempt.
+        initAbortController.abort();
+        await initSettled;
+        const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
+        if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
+          // Matches the copy-failure cleanup above: the fork's checkout
+          // is known fresh, so force-delete is safe here.
+          await targetRuntime
+            .deleteWorkspace(
+              foundProjectPath,
+              resolvedName,
+              true,
+              undefined,
+              projectConfig.trusted ?? false
+            )
+            .catch((error: unknown) => {
+              log.warn("Failed to remove forked worktree after an aborted registration", {
+                newWorkspaceId,
+                error: getErrorMessage(error),
+              });
+            });
+        }
+        await this.discardCreationState(newWorkspaceId, initAbortController, rolledBack);
+        return rolledBack;
+      };
+
       // Same pre-announcement sanitization as create(): a worktree fork of a
       // trusted repo materializes tracked files, so a committed
       // .mux/mcp.local.jsonc can carry a stale canonical plugin: enable that
@@ -11565,44 +11712,20 @@ export class WorkspaceService
           // acquireRegistrationSanitizeLock).
           releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
         }
-        await this.config.addWorkspace(foundProjectPath, metadata);
+        await this.config.addWorkspace(foundProjectPath, metadata).catch(async (error: unknown) => {
+          // #4745: fail with the write's own error once the fork is undone.
+          await abortForkRegistration().catch((rollbackError: unknown) =>
+            logRegistrationRollbackFailure(newWorkspaceId, rollbackError)
+          );
+          throw error;
+        });
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,
             workspacePath
           );
           if (sanitizeError !== undefined) {
-            // Background init is still running against this checkout: abort
-            // it and AWAIT termination before deleting the worktree, or the
-            // delete races init's writes/open handles and can fail, leaving
-            // an orphaned worktree that collides with the next fork attempt.
-            initAbortController.abort();
-            await initSettled;
-            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
-            if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
-              // Matches the copy-failure cleanup above: the fork's checkout
-              // is known fresh, so force-delete is safe here.
-              await targetRuntime
-                .deleteWorkspace(
-                  foundProjectPath,
-                  resolvedName,
-                  true,
-                  undefined,
-                  projectConfig.trusted ?? false
-                )
-                .catch((error: unknown) => {
-                  log.warn("Failed to remove forked worktree after sanitization abort", {
-                    newWorkspaceId,
-                    error: getErrorMessage(error),
-                  });
-                });
-            }
-            await this.disposeSession(newWorkspaceId);
-            await fsPromises
-              .rm(newSessionDir, { recursive: true, force: true })
-              .catch(() => undefined);
-            this.initAbortControllers.delete(newWorkspaceId);
-            this.initStateManager.clearInMemoryState(newWorkspaceId);
+            const rolledBack = await abortForkRegistration();
             initLogger.logComplete(-1);
             return Err(
               rolledBack
