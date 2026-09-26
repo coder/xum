@@ -16,7 +16,7 @@ import { createTestHistoryService } from "./testHistoryService";
 
 const workspaceId = "oversized-boundary";
 const NEEDLE = '"compactionBoundary":true';
-const line = (message: object) => JSON.stringify({ ...message, workspaceId }) + "\n";
+const line = (message: MuxMessage) => JSON.stringify({ ...message, workspaceId }) + "\n";
 
 const olderBoundary = createMuxMessage("b1", "assistant", "Older summary", {
   compactionBoundary: true,
@@ -71,9 +71,12 @@ describe("HistoryService oversized compaction boundaries", () => {
     await h.cleanup();
   });
 
-  async function seed(chat: object[], archive: object[] = []) {
-    await fs.writeFile(chatPath, chat.map(line).join(""));
-    if (archive.length > 0) await fs.writeFile(archivePath, archive.map(line).join(""));
+  // Seed through the real service: serialization and sequence stamping match production rows.
+  async function seed(messages: MuxMessage[], target = workspaceId) {
+    for (const message of messages) {
+      const appended = await h.historyService.appendToHistory(target, message);
+      if (!appended.success) throw new Error(appended.error);
+    }
   }
 
   async function providerIds(): Promise<string[]> {
@@ -83,7 +86,7 @@ describe("HistoryService oversized compaction boundaries", () => {
   }
 
   test.each(["normal", "oversized"] as const)(
-    "a %s boundary starts the provider epoch",
+    "a %s boundary starts the provider epoch after rotation",
     async (size) => {
       const boundary = newBoundary(size);
       if (size === "oversized") {
@@ -91,20 +94,18 @@ describe("HistoryService oversized compaction boundaries", () => {
       }
       await seed([olderBoundary, beforeCompaction, request, boundary, after]);
 
-      expect(await providerIds()).toEqual(["b2", "t1"]);
+      // The first read seals everything before the newest boundary into the archive; the
+      // provider scan must then start at that boundary instead of reviving the archive.
       const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!history.success) throw new Error(history.error);
+      expect(history.data.map((message) => message.id)).toEqual(["b2", "t1"]);
       expect(history.data[0]?.metadata?.muxMetadata).toEqual(boundary.metadata?.muxMetadata);
+      expect(await fs.readFile(archivePath, "utf8")).toContain('"id":"b1"');
     }
   );
 
-  test("after rotation, an oversized boundary does not bring back the archive", async () => {
-    await seed([newBoundary("oversized"), after], [olderBoundary, beforeCompaction, request]);
-
-    expect(await providerIds()).toEqual(["b2", "t1"]);
-  });
-
   test("pending-state observation reports the oversized boundary's publication", async () => {
+    // Read the unrotated layout directly: every row is still in chat.jsonl.
     await seed([olderBoundary, beforeCompaction, request, newBoundary("oversized"), after]);
 
     const observation = await readCompactionPendingHistoryObservation({
@@ -115,23 +116,26 @@ describe("HistoryService oversized compaction boundaries", () => {
   });
 
   test("recognizes a boundary whose marker straddles a scan-chunk edge", async () => {
-    const boundaryLine = line(newBoundary("oversized"));
-    const prefix = line(olderBoundary) + line(beforeCompaction) + line(request);
-    const needleAt =
-      Buffer.byteLength(prefix) +
-      Buffer.byteLength(boundaryLine.slice(0, boundaryLine.indexOf(NEEDLE)));
-    // Reverse scan chunks end at fileSize - k * CHUNK; pad the tail so one edge splits the marker.
-    const unpadded = Buffer.byteLength(prefix + boundaryLine + line(after));
+    await seed([olderBoundary, beforeCompaction, request, newBoundary("oversized")]);
+    const seeded = await fs.readFile(chatPath);
+    const needleAt = seeded.lastIndexOf(NEEDLE);
+    // Reverse scan chunks end at fileSize - k * CHUNK; size the tail row so one edge splits the
+    // marker. A same-width scratch workspace gives the serialized length of the unpadded tail.
+    const scratch = workspaceId.slice(0, -1) + "x";
+    await seed([after], scratch);
+    const unpaddedTail = (
+      await fs.readFile(path.join(path.dirname(chatPath), "..", scratch, CHAT_FILE_NAME))
+    ).length;
     const splitAt = needleAt + 5;
     const pad =
-      (((splitAt - unpadded) % SESSION_HISTORY_SCAN_CHUNK_BYTES) +
+      (((splitAt - seeded.length - unpaddedTail) % SESSION_HISTORY_SCAN_CHUNK_BYTES) +
         SESSION_HISTORY_SCAN_CHUNK_BYTES) %
       SESSION_HISTORY_SCAN_CHUNK_BYTES;
-    const paddedAfter = createMuxMessage("t1", "user", "after compaction" + "x".repeat(pad));
-    const contents = prefix + boundaryLine + line(paddedAfter);
-    expect((Buffer.byteLength(contents) - splitAt) % SESSION_HISTORY_SCAN_CHUNK_BYTES).toBe(0);
-    await fs.writeFile(chatPath, contents);
+    await seed([createMuxMessage("t1", "user", "after compaction" + "x".repeat(pad))]);
+    const size = (await fs.stat(chatPath)).size;
+    expect((size - splitAt) % SESSION_HISTORY_SCAN_CHUNK_BYTES).toBe(0);
 
+    // Rotation keeps the tail bytes, so the edge still splits the marker after the lazy seal.
     expect(await providerIds()).toEqual(["b2", "t1"]);
   });
 
@@ -161,7 +165,10 @@ describe("HistoryService oversized compaction boundaries", () => {
 
   test("an oversized boundary carrying reset evidence stays a privacy floor", async () => {
     // Raw reset evidence in a nested object: the oversized row's classifier treats it as ambiguous.
-    const boundary = { ...newBoundary("oversized"), evidence: { contextBoundaryKind: "reset" } };
+    const boundary: MuxMessage = {
+      ...newBoundary("oversized"),
+      ...{ evidence: { contextBoundaryKind: "reset" } },
+    };
     await seed([olderBoundary, beforeCompaction, boundary, after]);
 
     expect(await providerIds()).toEqual(["t1"]);
