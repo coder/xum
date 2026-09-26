@@ -2046,7 +2046,10 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       await session.clearPostCompactionState();
       await session.clearPostCompactionState();
 
-      // Debounce is short, but use a safe buffer.
+      // The refresh reads real state from disk, so wait for its emit rather than a fixed delay.
+      await waitForCondition(() => emitted.length > 0, { timeoutMs: 5_000 });
+      // Duplicate refreshes would have been scheduled by the same three clears: give any second
+      // timer one more debounce window before asserting there is exactly one emit.
       await new Promise((resolve) => setTimeout(resolve, 150));
 
       expect(getPostCompactionStateSpy).toHaveBeenCalledTimes(1);
