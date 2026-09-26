@@ -5177,7 +5177,9 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
     await withEvaluationFixture(
       { google: { apiKey: "sk-google", baseUrl: "  https://proxy.example/google/v1beta  " } },
       async (_c, factory, fetchSpy) => {
-        const pinned = expectResolved(await factory.createEvaluationModel("google:gemini-2.5-flash"));
+        const pinned = expectResolved(
+          await factory.createEvaluationModel("google:gemini-2.5-flash")
+        );
         const urls: string[] = [];
         fetchSpy.mockImplementation(
           Object.assign(
