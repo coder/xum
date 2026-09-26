@@ -26,10 +26,18 @@ describe("calculateTokenStats", () => {
   // blocked the whole server (pings, heartbeats, other subscriptions) for 10+ s.
   test("lets due timers run while it submits a long history for counting", async () => {
     let submissions = 0;
+    let submissionsWhenTimerRan: number | undefined;
     const tokenizer: tokenizerModule.Tokenizer = {
       encoding: "test",
       countTokens: () => {
         submissions++;
+        // Arm the timer mid-loop: a single yield before the loop would also let a timer armed
+        // up front run, without un-blocking the loop itself.
+        if (submissions === 1) {
+          setTimeout(() => {
+            submissionsWhenTimerRan = submissions;
+          }, 0);
+        }
         return Promise.resolve(1);
       },
     };
@@ -40,10 +48,6 @@ describe("calculateTokenStats", () => {
       createMuxMessage(`m${i}`, i % 2 === 0 ? "user" : "assistant", `message ${i}`)
     );
 
-    let submissionsWhenTimerRan: number | undefined;
-    setTimeout(() => {
-      submissionsWhenTimerRan = submissions;
-    }, 0);
     const stats = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
       enableAgentReport: false,
     });
