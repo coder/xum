@@ -1600,16 +1600,16 @@ describe("MCPServerManager", () => {
 
     releaseClose();
     const [firstResult, secondResult] = await Promise.all([first, second]);
-    // Neither serve returned the stale instance. The first restarted the tree.
-    // The concurrent second serve currently skips that in-flight restart and
-    // returns no tools (#4539; main's startServers stub hid this); any tool it
-    // returns must reach the restarted server. Require its tool once fixed.
-    expect(Object.keys(firstResult.tools)).toHaveLength(1);
+    // Neither serve returned the stale instance. The first restarted the tree
+    // and the concurrent second joined that in-flight restart (#4539): both
+    // serve the restarted server, started exactly once.
     for (const served of [firstResult, secondResult]) {
+      expect(Object.keys(served.tools)).toHaveLength(1);
       for (const tool of Object.values(served.tools)) {
         expect(await tool.execute!({}, {} as never)).toBe("fresh");
       }
     }
+    expect(servers.connectCount("node server.js")).toBe(1);
     expect(staleEcho.execute).not.toHaveBeenCalled();
     expect(restarted).toHaveBeenCalledTimes(0);
   });
