@@ -2,7 +2,10 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
-import { STARTUP_RECOVERY_CONCURRENCY } from "./workspaceService";
+import {
+  PLAN_FILE_DELETE_UNREACHABLE_MESSAGE,
+  STARTUP_RECOVERY_CONCURRENCY,
+} from "./workspaceService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { existsSync } from "fs";
@@ -29,6 +32,10 @@ import {
 } from "./workspaceService.testHarness";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
+import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { HistoryService } from "./historyService";
 
@@ -1230,7 +1237,8 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
   async function setup(
     workspaceId: string,
     location: "canonical" | "legacy" = "canonical",
-    seeded = true
+    seeded = true,
+    runtimeConfig: RuntimeConfig = { type: "local" }
   ) {
     const harness = await createWorkspaceServiceHarness({
       aiServiceOverrides: { stopStream: mock(() => Promise.resolve(Ok(undefined))) },
@@ -1243,7 +1251,7 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
       name: workspaceId,
       projectName,
       projectPath,
-      runtimeConfig: { type: "local" as const },
+      runtimeConfig,
     };
     await config.addWorkspace(projectPath, metadata);
     const other = new HistoryService(config);
@@ -1310,6 +1318,7 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
       planPath,
       snapshotCount,
       historyIds,
+      projectPath,
       capture,
       inFlightCapture,
       teardown,
@@ -1489,6 +1498,81 @@ describe("WorkspaceService full clear vs another backend's plan snapshot capture
       expect(existsSync(t.planPath)).toBe(false);
     } finally {
       await t.teardown();
+    }
+  });
+
+  /**
+   * #4568: SSH and Docker plans are deleted through a remote shell before the commit. SSH
+   * metadata routes the deletion there; the runtime is a real local one standing in for the host.
+   * Its exec refuses a missing cwd the way the remote `cd <cwd> &&` prefix does.
+   */
+  describe("remote plan deletion", () => {
+    const sshConfig: RuntimeConfig = { type: "ssh", host: "remote.invalid", srcBaseDir: "~/src" };
+
+    async function remoteSetup(workspaceId: string) {
+      const t = await setup(workspaceId, "canonical", true, sshConfig);
+      const runtime = runtimeFactory.createRuntime(
+        { type: "local" },
+        { projectPath: t.projectPath }
+      );
+      const createRuntime = spyOn(runtimeFactory, "createRuntime").mockReturnValue(runtime);
+      // The workspace directory the pre-#4568 deletion used as its cwd does not exist.
+      expect(existsSync(runtime.getWorkspacePath(t.projectPath, workspaceId))).toBe(false);
+      return {
+        ...t,
+        runtime,
+        teardown: async () => {
+          createRuntime.mockRestore();
+          await t.teardown();
+        },
+      };
+    }
+
+    test("a full clear deletes the plan when the workspace worktree is missing", async () => {
+      const t = await remoteSetup("plan-remote-missing-worktree");
+      try {
+        const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
+        expect(cleared.success ? "" : cleared.error).toBe("");
+        expect(await t.historyIds()).toEqual([]);
+        expect(existsSync(t.planPath)).toBe(false);
+      } finally {
+        await t.teardown();
+      }
+    });
+
+    const unreachable = [
+      {
+        name: "cannot connect",
+        exec: () => Promise.reject(new RuntimeError("SSH connection failed", "network")),
+      },
+      {
+        name: "times out",
+        exec: () =>
+          Promise.resolve({
+            stdout: new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+            stderr: new ReadableStream<Uint8Array>({ start: (c) => c.close() }),
+            stdin: new WritableStream<Uint8Array>(),
+            exitCode: Promise.resolve(EXIT_CODE_TIMEOUT),
+            duration: Promise.resolve(0),
+          }),
+      },
+    ];
+    for (const host of unreachable) {
+      test(`a host that ${host.name} refuses the full clear with an actionable error`, async () => {
+        const t = await remoteSetup(`plan-remote-${slug(host.name)}`);
+        try {
+          spyOn(t.runtime, "exec").mockImplementation(host.exec);
+          const cleared = await t.clearer.truncateHistory(t.workspaceId, 1.0);
+          expect(cleared.success ? "" : cleared.error).toStartWith(
+            PLAN_FILE_DELETE_UNREACHABLE_MESSAGE
+          );
+          // Fail closed: the old plan stays with the old history instead of outliving the clear.
+          expect(await t.historyIds()).toEqual(["user-1"]);
+          expect(existsSync(t.planPath)).toBe(true);
+        } finally {
+          await t.teardown();
+        }
+      });
     }
   });
 

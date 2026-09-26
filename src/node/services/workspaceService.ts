@@ -177,7 +177,8 @@ import {
   stopDevcontainer,
 } from "@/node/runtime/devcontainerCli";
 import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
-import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
+import { expandTilde } from "@/node/runtime/tildeExpansion";
+import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
 import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
@@ -453,6 +454,20 @@ const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
  * during launch; recovery is best-effort background work with no latency requirement.
  */
 export const STARTUP_RECOVERY_CONCURRENCY = 8;
+
+/**
+ * Refusal for a history clear whose SSH host or container could not be reached to delete the
+ * plan file first (#4568). The clear stays refused instead of committing without the deletion:
+ * the old plan would otherwise remain on the host and could be snapshotted into the fresh
+ * history (#4420). The message tells the user how to get past it.
+ */
+export const PLAN_FILE_DELETE_UNREACHABLE_MESSAGE =
+  "History was not cleared: the plan file could not be deleted because the workspace's SSH host or container did not respond. Reconnect the host (or start the container) and try again.";
+
+/** Why the plan deletion before a history-discarding commit refused that commit. */
+type PlanFileDeletionError =
+  | { type: "runtime_unreachable"; message: string }
+  | { type: "delete_failed"; message: string };
 
 interface ActiveWorkflowRunIdsOptions {
   /**
@@ -14103,7 +14118,9 @@ export class WorkspaceService
    * commit then fails, history is kept without its plan. The user asked for the deletion, and
    * snapshot rows already in history keep the reviewed content.
    */
-  private async deletePlanFilesForWorkspace(workspaceId: string): Promise<Result<void>> {
+  private async deletePlanFilesForWorkspace(
+    workspaceId: string
+  ): Promise<Result<void, PlanFileDeletionError>> {
     const metadata = await this.getInfo(workspaceId);
     // No metadata: no plan path to derive, so there is nothing to delete.
     if (!metadata) return Ok(undefined);
@@ -14113,44 +14130,54 @@ export class WorkspaceService
     const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
     const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
 
-    const isDocker = isDockerRuntime(metadata.runtimeConfig);
-    const isSSH = isSSHRuntime(metadata.runtimeConfig);
-
-    // For Docker: paths are already absolute (/var/mux/...), just quote
-    // For SSH: use $HOME expansion so the runtime shell resolves to the runtime home directory
-    // For local: expand tilde locally since shellQuote prevents shell expansion
-    const quotedPlanPath = isDocker
-      ? shellQuote(planPath)
-      : isSSH
-        ? expandTildeForSSH(planPath)
-        : shellQuote(expandTilde(planPath));
-    // For legacy path: SSH/Docker use $HOME expansion, local expands tilde
-    const quotedLegacyPlanPath =
-      isDocker || isSSH
-        ? expandTildeForSSH(legacyPlanPath)
-        : shellQuote(expandTilde(legacyPlanPath));
+    if (isDockerRuntime(metadata.runtimeConfig) || isSSHRuntime(metadata.runtimeConfig)) {
+      // Plan paths are absolute or home-relative, never relative to the cwd below.
+      for (const remotePath of [planPath, legacyPlanPath]) {
+        assert(
+          remotePath.startsWith("/") || remotePath.startsWith("~/"),
+          `remote plan path must be absolute or home-relative: ${remotePath}`
+        );
+      }
+      // Run from /tmp, like ensurePlanSnapshot's existence probe, not from the workspace
+      // directory: RemoteRuntime.exec prefixes `cd <cwd> &&`, so a deleted, renamed or unmounted
+      // worktree would skip the rm and refuse the clear although neither plan lives under it
+      // (#4568). pathEnv turns both paths absolute per runtime (tilde -> remote home).
+      let result: Awaited<ReturnType<typeof execBuffered>>;
+      try {
+        result = await execBuffered(runtime, 'rm -f -- "$XUM_PLAN" "$XUM_LEGACY_PLAN"', {
+          cwd: "/tmp",
+          pathEnv: { XUM_PLAN: planPath, XUM_LEGACY_PLAN: legacyPlanPath },
+          timeout: 10,
+          maxOutputBytes: 4096,
+        });
+      } catch (error) {
+        // The exec could not start (no connection, container gone).
+        return Err({
+          type: "runtime_unreachable",
+          message: `${PLAN_FILE_DELETE_UNREACHABLE_MESSAGE} (${getErrorMessage(error)})`,
+        });
+      }
+      if (result.exitCode === 0) return Ok(undefined);
+      // Fail closed either way (see PLAN_FILE_DELETE_UNREACHABLE_MESSAGE). ssh itself exits 255
+      // when it cannot connect; rm never does.
+      if (
+        result.exitCode === EXIT_CODE_TIMEOUT ||
+        result.exitCode === EXIT_CODE_ABORTED ||
+        (isSSHRuntime(metadata.runtimeConfig) && result.exitCode === 255)
+      ) {
+        return Err({
+          type: "runtime_unreachable",
+          message: `${PLAN_FILE_DELETE_UNREACHABLE_MESSAGE} (exit ${result.exitCode})`,
+        });
+      }
+      const stderr = result.stderr.trim();
+      return Err({
+        type: "delete_failed",
+        message: `Failed to delete the plan file (rm exited ${result.exitCode}${stderr ? `: ${stderr}` : ""})`,
+      });
+    }
 
     try {
-      if (isDocker || isSSH) {
-        // Use exec to delete files since runtime doesn't have a deleteFile method.
-        // Use runtime workspace path (not host projectPath) for Docker containers.
-        const workspacePath = runtime.getWorkspacePath(metadata.projectPath, metadata.name);
-        const execStream = await runtime.exec(`rm -f ${quotedPlanPath} ${quotedLegacyPlanPath}`, {
-          cwd: workspacePath,
-          timeout: 10,
-        });
-
-        try {
-          await execStream.stdin.close();
-        } catch {
-          // Ignore stdin-close errors (e.g. already closed).
-        }
-
-        const exitCode = await execStream.exitCode;
-        if (exitCode !== 0) return Err(`Failed to delete the plan file (rm exited ${exitCode})`);
-        return Ok(undefined);
-      }
-
       // Local runtimes: delete directly on the local filesystem (force: a missing file is fine).
       await Promise.all([
         fsPromises.rm(expandTilde(planPath), { force: true }),
@@ -14158,7 +14185,10 @@ export class WorkspaceService
       ]);
       return Ok(undefined);
     } catch (error) {
-      return Err(`Failed to delete the plan file: ${getErrorMessage(error)}`);
+      return Err({
+        type: "delete_failed",
+        message: `Failed to delete the plan file: ${getErrorMessage(error)}`,
+      });
     }
   }
 
@@ -14358,7 +14388,7 @@ export class WorkspaceService
       // After every refusal check above, right before the commit (#4420): see
       // deletePlanFilesForWorkspace. A failed deletion refuses the clear with nothing committed.
       const deleted = await this.deletePlanFilesForWorkspace(workspaceId);
-      if (!deleted.success) return Err(deleted.error);
+      if (!deleted.success) return Err(deleted.error.message);
       return this.clearHistoryThroughCompactionCancellation(
         workspaceId,
         effectivePercentage,
@@ -14663,7 +14693,7 @@ export class WorkspaceService
     // committed. Where the replacement keeps the context generation (compaction-boundary mode, or
     // a compaction clear of empty history), this deletion plus ensurePlanSnapshot's existence
     // check is the whole fence against an earlier plan read landing in the new history.
-    const deletePlanBeforeCommit = (): Promise<Result<void>> =>
+    const deletePlanBeforeCommit = (): Promise<Result<void, PlanFileDeletionError>> =>
       options?.deletePlanFile === true
         ? this.deletePlanFilesForWorkspace(workspaceId)
         : Promise.resolve(Ok(undefined));
@@ -14725,7 +14755,7 @@ export class WorkspaceService
         );
         // This mode's commit is the boundary append below.
         const deleted = await deletePlanBeforeCommit();
-        if (!deleted.success) return Err(deleted.error);
+        if (!deleted.success) return Err(deleted.error.message);
       } else {
         assert(
           replaceMode === "destructive",
@@ -14795,7 +14825,7 @@ export class WorkspaceService
           workspaceId,
           async () => {
             const deleted = await deletePlanBeforeCommit();
-            if (!deleted.success) return Err(deleted.error);
+            if (!deleted.success) return Err(deleted.error.message);
             return isCompaction
               ? this.historyService.clearHistory(workspaceId, { fenceEmptyHistory: false })
               : this.clearHistoryThroughCompactionCancellation(workspaceId, 1, (error) => {
