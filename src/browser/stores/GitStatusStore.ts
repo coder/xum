@@ -5,6 +5,7 @@ import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/worksp
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
+import { deferWhileChatReplayPending, type ChatReplayGate } from "@/browser/utils/chatReplayGate";
 import {
   canRunPassiveRuntimeCommand,
   onPassiveRuntimeEligible,
@@ -97,6 +98,8 @@ export class GitStatusStore {
   private fetchCache = new Map<string, FetchState>();
   private runtimeStatusRetryUnsubscribers = new Map<string, () => void>();
   private runtimeFetchRetryUnsubscribers = new Map<string, () => void>();
+  private chatReplayGate: ChatReplayGate | null = null;
+  private chatReplayRetryUnsubscribers = new Map<string, () => void>();
   private client: RouterClient<AppRouter> | null = null;
   private immediateUpdateQueued = false;
   private workspaceMetadata = new Map<string, FrontendWorkspaceMetadata>();
@@ -139,6 +142,11 @@ export class GitStatusStore {
     if (this.workspaceMetadata.size > 0) {
       this.refreshController.requestImmediate();
     }
+  }
+
+  /** Defer refreshes of a workspace while its chat replay is pending; null disables gating. */
+  setChatReplayGate(gate: ChatReplayGate | null): void {
+    this.chatReplayGate = gate;
   }
 
   /**
@@ -338,6 +346,7 @@ export class GitStatusStore {
 
     this.cleanupRuntimeRetryMap(this.runtimeStatusRetryUnsubscribers, metadata);
     this.cleanupRuntimeRetryMap(this.runtimeFetchRetryUnsubscribers, metadata);
+    this.cleanupRuntimeRetryMap(this.chatReplayRetryUnsubscribers, metadata);
 
     // Remove statuses for deleted workspaces
     // Iterate plain map (statusCache) for membership, not reactive store
@@ -371,9 +380,17 @@ export class GitStatusStore {
       return;
     }
 
-    // Only poll workspaces that have active subscribers.
-    const workspaces = Array.from(this.workspaceMetadata.values()).filter((ws) =>
-      this.hasWorkspaceSubscribers(ws.id)
+    // Only poll workspaces that have active subscribers and whose chat replay has settled
+    // (#4662: a deferred workspace skips both the status script and git fetch).
+    const workspaces = Array.from(this.workspaceMetadata.values()).filter(
+      (ws) =>
+        this.hasWorkspaceSubscribers(ws.id) &&
+        !deferWhileChatReplayPending(
+          this.chatReplayGate,
+          this.chatReplayRetryUnsubscribers,
+          ws.id,
+          () => this.refreshController.requestImmediate()
+        )
     );
 
     if (workspaces.length === 0) {
@@ -1085,6 +1102,10 @@ export class GitStatusStore {
       unsub();
     }
     this.runtimeFetchRetryUnsubscribers.clear();
+    for (const unsub of this.chatReplayRetryUnsubscribers.values()) {
+      unsub();
+    }
+    this.chatReplayRetryUnsubscribers.clear();
     this.refreshController.dispose();
   }
 

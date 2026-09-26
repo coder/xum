@@ -484,6 +484,47 @@ describe("GitStatusStore", () => {
     unsub();
   });
 
+  // #4662: opening a workspace must not spawn git status/fetch while its chat replay runs.
+  it("defers a workspace's status and fetch until its chat replay settles", async () => {
+    const pendingId = "replay-pending";
+    const readyId = "replay-settled";
+    let pending = true;
+    const gateListeners = new Set<() => void>();
+    store.setChatReplayGate({
+      isReplayPending: (workspaceId) => pending && workspaceId === pendingId,
+      subscribeKey: (workspaceId, listener) => {
+        if (workspaceId !== pendingId) return () => undefined;
+        gateListeners.add(listener);
+        return () => gateListeners.delete(listener);
+      },
+    });
+    const scriptsFor = (workspaceId: string) =>
+      mockExecuteBash.mock.calls
+        .map((call) => (call as unknown[])[0] as { workspaceId: string; script: string })
+        .filter((args) => args.workspaceId === workspaceId)
+        .map((args) => (args.script === GIT_FETCH_SCRIPT ? "fetch" : "status"));
+    store.syncWorkspaces(
+      new Map([
+        // Separate projects: local fetches are deduplicated per project.
+        [pendingId, { ...createWorkspaceMetadata(pendingId), projectName: "pending-project" }],
+        [readyId, createWorkspaceMetadata(readyId)],
+      ])
+    );
+    const unsubscribers = [pendingId, readyId].map((id) => store.subscribeKey(id, jest.fn()));
+
+    await waitUntil(() => scriptsFor(readyId).length === 2);
+    expect(scriptsFor(pendingId)).toEqual([]);
+    expect(gateListeners.size).toBe(1);
+
+    pending = false;
+    for (const listener of Array.from(gateListeners)) listener();
+
+    await waitUntil(() => scriptsFor(pendingId).length === 2);
+    expect(scriptsFor(pendingId).sort()).toEqual(["fetch", "status"]);
+    expect(gateListeners.size).toBe(0);
+    for (const unsubscribe of unsubscribers) unsubscribe();
+  });
+
   describe("passive fetch runtime gating", () => {
     it("skips passive fetch and status checks for devcontainer with unresolved runtime status", async () => {
       store.dispose();

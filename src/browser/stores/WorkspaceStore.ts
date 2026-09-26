@@ -900,6 +900,9 @@ export class WorkspaceStore {
 
   // Workspace currently owning the live onChat subscription.
   private activeOnChatWorkspaceId: string | null = null;
+  // Workspaces whose first onChat replay since activation has not settled yet (#4662).
+  // Kept outside chatTransientState because full-replay resets replace transient objects.
+  private chatReplayPendingWorkspaces = new Set<string>();
   // Loop signal of that subscription, so a refresh request can bind to the loop it was made under.
   private activeOnChatSignal: AbortSignal | null = null;
   // The in-flight onChat attempt per workspace (set in subscribe, cleared when the attempt finishes).
@@ -1803,6 +1806,7 @@ export class WorkspaceStore {
         unsubscribe();
       }
       this.ipcUnsubscribers.delete(previousActiveWorkspaceId);
+      this.chatReplayPendingWorkspaces.delete(previousActiveWorkspaceId);
       this.activeOnChatWorkspaceId = null;
       this.activeOnChatSignal = null;
     }
@@ -1819,6 +1823,9 @@ export class WorkspaceStore {
 
       const controller = new AbortController();
       this.ipcUnsubscribers.set(targetWorkspaceId, () => controller.abort());
+      // Set even without a client: probes cannot run without one either, and the replay
+      // starts once the client arrives.
+      this.chatReplayPendingWorkspaces.add(targetWorkspaceId);
       this.activeOnChatWorkspaceId = targetWorkspaceId;
       this.activeOnChatSignal = controller.signal;
       void this.runOnChatSubscription(targetWorkspaceId, controller.signal);
@@ -3186,6 +3193,21 @@ export class WorkspaceStore {
     return transient !== undefined && transient.caughtUp && transient.historyVerified;
   }
 
+  /**
+   * Whether the active workspace is still waiting for its first onChat replay since it was
+   * activated. Workspace-open git/PR probes wait for this (#4662) so their process spawns
+   * and result renders do not compete with the replay's history read and transcript paint.
+   * The gate opens on caught-up (complete or failed replay), when an attempt ends without
+   * caught-up (transport error, stall watchdog), or when the workspace stops being active.
+   * Subscribers of {@link subscribeKey} are notified when it opens.
+   */
+  isWorkspaceChatReplayPending(workspaceId: string): boolean {
+    return (
+      this.activeOnChatWorkspaceId === workspaceId &&
+      this.chatReplayPendingWorkspaces.has(workspaceId)
+    );
+  }
+
   getWorkspaceHistoryEpoch(workspaceId: string): number {
     return this.aggregators.get(workspaceId)?.getHistoryEpoch() ?? 0;
   }
@@ -4378,10 +4400,15 @@ export class WorkspaceStore {
         }
         if (!this.isWorkspaceRegistered(workspaceId)) return;
         this.clearReplayBuffers(workspaceId);
+        // An attempt that ended without caught-up (transport error, stall watchdog) opens
+        // the replay gate anyway, so deferred git/PR probes cannot wait forever on retries.
+        const openedReplayGate = this.chatReplayPendingWorkspaces.delete(workspaceId);
         const transient = this.chatTransientState.get(workspaceId);
         if (transient) {
           // Backoff is still catch-up; cleared stream buffers must also invalidate cached barriers.
           transient.isHydratingTranscript = true;
+        }
+        if (transient || openedReplayGate) {
           this.states.bump(workspaceId);
         }
         if (transient && !transient.caughtUp && this.preReplayUsageSnapshot.delete(workspaceId))
@@ -4576,6 +4603,7 @@ export class WorkspaceStore {
       this.activeOnChatWorkspaceId = null;
       this.activeOnChatSignal = null;
     }
+    this.chatReplayPendingWorkspaces.delete(workspaceId);
     this.currentOnChatAttempts.delete(workspaceId);
     // A pending refresh can never get its baseline from a removed workspace.
     this.settleTranscriptRefresh(workspaceId, {
@@ -4696,6 +4724,7 @@ export class WorkspaceStore {
     this.activeWorkspaceId = null;
     this.activeOnChatWorkspaceId = null;
     this.activeOnChatSignal = null;
+    this.chatReplayPendingWorkspaces.clear();
     this.pendingReplayReset.clear();
     this.states.clear();
     this.derived.clear();
@@ -5072,6 +5101,7 @@ export class WorkspaceStore {
       // store never requests live mode (it replays no history), so a live caught-up lets
       // events flow but leaves the mutation barrier closed.
       transient.caughtUp = true;
+      this.chatReplayPendingWorkspaces.delete(workspaceId);
       transient.historyVerified = replay !== "live";
       transient.replayFailed = false;
       transient.isHydratingTranscript = false;
@@ -5436,6 +5466,8 @@ export const workspaceStore = {
    */
   isWorkspaceTranscriptCaughtUp: (workspaceId: string) =>
     getStoreInstance().isWorkspaceTranscriptCaughtUp(workspaceId),
+  isWorkspaceChatReplayPending: (workspaceId: string) =>
+    getStoreInstance().isWorkspaceChatReplayPending(workspaceId),
   /** Per-workspace change notifications, so barrier-derived disabled states can subscribe. */
   subscribeKey: (workspaceId: string, listener: () => void) =>
     getStoreInstance().subscribeKey(workspaceId, listener),
