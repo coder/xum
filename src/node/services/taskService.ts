@@ -2622,6 +2622,9 @@ export class TaskService implements AgentTaskIntegration {
     if (record.receipt !== "failed") {
       this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
     }
+    // A failed reawaken's settlement deferred to this Stop (#4310): drop or finish it now; no
+    // later disposal or turn settlement is guaranteed to recheck it.
+    this.recheckResumeFailureSettlement(workspaceId);
   }
 
   /**
@@ -15227,39 +15230,60 @@ export class TaskService implements AgentTaskIntegration {
     let revertedToInterrupted = false;
     let closedAttempt: (OwnedTaskAttempt & { attemptId: string }) | undefined;
     let parentWorkspaceId: string | undefined;
-    await this.editWorkspaceEntry(
-      workspaceId,
-      (ws) => {
-        if (!ws.parentWorkspaceId) {
-          return;
-        }
-        if (ws.taskStatus !== "running") {
-          return;
-        }
-        // A stale resume's rollback never flips a successor another writer admitted since.
-        if (rowSupersedes(ws, expectedAttemptId)) {
-          return;
-        }
+    try {
+      await this.editWorkspaceEntry(
+        workspaceId,
+        (ws) => {
+          if (!ws.parentWorkspaceId) {
+            return;
+          }
+          if (ws.taskStatus !== "running") {
+            return;
+          }
+          // A stale resume's rollback never flips a successor another writer admitted since.
+          if (rowSupersedes(ws, expectedAttemptId)) {
+            return;
+          }
 
-        parentWorkspaceId = ws.parentWorkspaceId;
-        ws.taskStatus = previousStatus === "reported" ? "reported" : "interrupted";
-        if (previousStatus !== "reported") ws.reportedAt = undefined;
-        revertedToInterrupted = true;
-        // Idle-producer linearization (closeAttemptAdmission): synchronously with the decision,
-        // before the write is awaited, so no further send is admitted under this attempt.
-        if (
-          expectedAttemptId != null &&
-          ws.taskAttemptId === expectedAttemptId &&
-          ownedAttempt?.attemptId === expectedAttemptId &&
-          this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt
-        ) {
-          this.closeAttemptAdmission(workspaceId, expectedAttemptId, ownedAttempt, "resume-failed");
-          // Identity is what later checks compare; its attemptId was just checked to be a string.
-          closedAttempt = ownedAttempt as OwnedTaskAttempt & { attemptId: string };
-        }
-      },
-      { allowMissing: true }
-    );
+          parentWorkspaceId = ws.parentWorkspaceId;
+          ws.taskStatus = previousStatus === "reported" ? "reported" : "interrupted";
+          if (previousStatus !== "reported") ws.reportedAt = undefined;
+          revertedToInterrupted = true;
+          // Idle-producer linearization (closeAttemptAdmission): synchronously with the decision,
+          // before the write is awaited, so no further send is admitted under this attempt.
+          if (
+            expectedAttemptId != null &&
+            ws.taskAttemptId === expectedAttemptId &&
+            ownedAttempt?.attemptId === expectedAttemptId &&
+            this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt
+          ) {
+            this.closeAttemptAdmission(
+              workspaceId,
+              expectedAttemptId,
+              ownedAttempt,
+              "resume-failed"
+            );
+            // Identity is what later checks compare; its attemptId was just checked to be a string.
+            closedAttempt = ownedAttempt as OwnedTaskAttempt & { attemptId: string };
+          }
+        },
+        { allowMissing: true }
+      );
+    } catch (error) {
+      // The revert never became durable (the row still runs under this attempt): reopen what the
+      // updater closed, or every send stays refused with nothing left to settle the closure.
+      const closure = this.attemptSettlementByTaskId.get(workspaceId);
+      if (
+        closedAttempt != null &&
+        closure?.attempt === closedAttempt &&
+        closure.phase === "closing" &&
+        closure.source === "resume-failed"
+      ) {
+        this.attemptSettlementByTaskId.delete(workspaceId);
+        this.notifyAttemptSettlementListeners(workspaceId);
+      }
+      throw error;
+    }
 
     if (!revertedToInterrupted) {
       return;

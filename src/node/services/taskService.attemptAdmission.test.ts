@@ -103,6 +103,7 @@ interface Internals {
     }
   >;
   currentAttemptIdByTaskId: Map<string, string>;
+  resumeFailureSettlementByTaskId: Map<string, unknown>;
   markTaskLaunchFailed: (taskId: string, message: string) => Promise<void>;
   closeAttemptAdmission: (
     taskId: string,
@@ -1624,10 +1625,39 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const settlement = svc.attemptSettlementByTaskId.get(taskId);
         expect(settlement).toMatchObject({ attemptId, phase: "settled" });
         expect(settlement?.source).not.toBe("resume-failed");
+        // The deferral does not outlive the Stop that settled it.
+        expect(svc.resumeFailureSettlementByTaskId.has(taskId)).toBe(false);
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
           kind: "terminal-no-report",
           attemptId,
         });
+      });
+
+      test("a rollback whose write fails reopens the attempt it closed", async () => {
+        const { config, taskService, svc, attemptId, token } = await reawakenAndBindSend();
+        token.onDisposed("refused");
+        // The updater runs (and closes the attempt), but the config write never persists.
+        spyOn(taskService, "editWorkspaceEntry").mockImplementationOnce(async (_id, updater) => {
+          const row = structuredClone(entryOf(config, taskId)!);
+          await updater(row);
+          throw new Error("disk full");
+        });
+        await expect(
+          taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptId)
+        ).rejects.toThrow("disk full");
+        // The row still runs under the attempt, which stays open to sends and unsettled.
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: attemptId,
+        });
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toBeUndefined();
+        expect(svc.resumeFailureSettlementByTaskId.has(taskId)).toBe(false);
+        expect(
+          taskService.admitTaskWorkspaceTurn(taskId, {
+            acceptanceOrigin: "manual",
+            expectedAttemptId: attemptId,
+          }).kind
+        ).toBe("admitted");
       });
 
       test("a superseding reawaken keeps its ownership and the monotonic unproven lineage", async () => {
