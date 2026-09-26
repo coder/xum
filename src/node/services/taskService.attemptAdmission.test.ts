@@ -12,6 +12,7 @@ import * as fsPromises from "fs/promises";
 import * as path from "path";
 
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -25,7 +26,10 @@ import {
   TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
+import {
+  readSubagentAttemptSettlementReceiptStrict,
+  writeSubagentAttemptSettlementReceipt,
+} from "@/node/services/subagentAttemptSettlements";
 import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import * as subagentReportArtifacts from "@/node/services/subagentReportArtifacts";
 import type { TaskService } from "@/node/services/taskService";
@@ -100,6 +104,7 @@ interface Internals {
     }
   >;
   currentAttemptIdByTaskId: Map<string, string>;
+  resumeFailureSettlementByTaskId: Map<string, unknown>;
   markTaskLaunchFailed: (taskId: string, message: string) => Promise<void>;
   closeAttemptAdmission: (
     taskId: string,
@@ -1473,59 +1478,213 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
     });
 
-    test("a reawaken whose send fails restores `interrupted` and discharges its obligation; the owner stays unsettled until an explicit Stop settles it", async () => {
-      // Deferred by the accepted plan (owned attempt interrupted without settlement evidence): the
-      // witness pins the recovery contract — no dangling obligation, and a Stop proves the lineage.
+    describe("a reawaken whose manual send/resume fails settles its owned attempt (#4310)", () => {
       const taskId = "reawaken-send-failed";
-      const { config } = await setupTree([
-        {
-          id: taskId,
-          overrides: { taskStatus: "interrupted", taskAttemptId: "att_00000000000000c9" },
-        },
-      ]);
-      const { taskService } = createHarness(config);
-      const svc = internals(taskService);
-      shortenTerminationTimers();
-      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-      const attemptId = entryOf(config, taskId)!.taskAttemptId!;
-      // WorkspaceService binds the obligation, the send fails before a turn: the token is refused
-      // and the status restored.
-      const token = admitted(
-        taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+      const predecessor = "att_00000000000000c9";
+
+      /**
+       * A proven manual reawaken (the predecessor's receipt exists) whose send obligation
+       * WorkspaceService bound under exactly the reawakened attempt; the send is about to fail.
+       */
+      async function reawakenAndBindSend(workspaceService?: WorkspaceHost) {
+        const { config } = await setupTree([
+          { id: taskId, overrides: { taskStatus: "interrupted", taskAttemptId: predecessor } },
+        ]);
+        await writeSubagentAttemptSettlementReceipt({
+          ownerWorkspaceSessionDirs: [path.join(config.sessionsDir, rootId)],
+          receipt: {
+            taskId,
+            attemptId: predecessor,
+            parentWorkspaceId: rootId,
+            source: "idle-settled",
+            settledAt: "2026-09-18T00:00:00.000Z",
+          },
+        });
+        const { taskService } = createHarness(
+          config,
+          workspaceService != null ? { workspaceService } : undefined
+        );
+        const reawaken = await taskService.reawakenInterruptedTask(taskId);
+        assert(reawaken.kind === "reawakened", "expected a reawakened attempt");
+        const token = admitted(
+          taskService.admitTaskWorkspaceTurn(taskId, {
+            acceptanceOrigin: "manual",
+            expectedAttemptId: reawaken.attemptId,
+          })
+        );
+        return {
+          config,
+          taskService,
+          svc: internals(taskService),
+          attemptId: reawaken.attemptId,
+          token,
+        };
+      }
+      const receiptFor = (config: Config, attemptId: string) =>
+        readSubagentAttemptSettlementReceiptStrict(
+          path.join(config.sessionsDir, rootId),
+          taskId,
+          attemptId
+        );
+
+      // WorkspaceService's admission scope disposes a refused/no-work obligation after the rollback
+      // returned; either order must settle, and never before the disposal.
+      test.each([
+        { disposal: "refused", disposed: "after the rollback" },
+        { disposal: "no-work", disposed: "after the rollback" },
+        { disposal: "refused", disposed: "before the rollback" },
+      ] as const)(
+        "a failure before any turn ($disposal, disposed $disposed) settles; the retry's lineage stays proven",
+        async ({ disposal, disposed }) => {
+          const { config, taskService, svc, attemptId, token } = await reawakenAndBindSend();
+          if (disposed === "before the rollback") token.onDisposed(disposal);
+          await taskService.restoreInterruptedTaskAfterResumeFailure(
+            taskId,
+            "interrupted",
+            attemptId
+          );
+          expect(entryOf(config, taskId)).toMatchObject({
+            taskStatus: "interrupted",
+            taskAttemptId: attemptId,
+          });
+          if (disposed === "after the rollback") {
+            // Closed to sends at once, but not settled while the obligation could still start a
+            // turn.
+            expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe(
+              "cleanup-pending"
+            );
+            expect(
+              taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" }).kind
+            ).toBe("refused");
+            token.onDisposed(disposal);
+          }
+          await waitForCondition(
+            () => svc.attemptSettlementByTaskId.get(taskId)?.phase === "settled"
+          );
+          expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+            kind: "terminal-no-report",
+            attemptId,
+          });
+          expect((await receiptFor(config, attemptId)).kind).toBe("found");
+          // The retry is proven by that settlement: no unproven marker, receipt-eligible.
+          expect((await taskService.reawakenInterruptedTask(taskId)).kind).toBe("reawakened");
+          expect(entryOf(config, taskId)?.taskAttemptUnproven).toBeUndefined();
+          expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
+            source: "reawaken",
+            receiptEligible: true,
+          });
+        }
       );
-      token.onDisposed("refused");
-      await taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted");
-      expect(entryOf(config, taskId)).toMatchObject({
-        taskStatus: "interrupted",
-        taskAttemptId: attemptId,
+
+      test("an admitted preparation failure settles only when its turn settles", async () => {
+        let activeTurn: symbol | undefined;
+        const host = hostWithTurnEvents({ getActiveTurnGeneration: mock(() => activeTurn) });
+        const { taskService, svc, attemptId, token } = await reawakenAndBindSend(
+          host.workspaceService
+        );
+        const turn = Symbol("preparation-failed-turn");
+        activeTurn = turn;
+        token.onAdmitted(turn);
+        // onAcceptedPreStreamFailure: the rollback runs while the accepted turn is still live.
+        await taskService.restoreInterruptedTaskAfterResumeFailure(
+          taskId,
+          "interrupted",
+          attemptId
+        );
+        await settle();
+        // Closed, but the live turn keeps it unsettled (the outcome reports that turn as live).
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+          attemptId,
+          phase: "closing",
+        });
+        expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("live");
+        activeTurn = undefined;
+        host.settleTurn(taskId, turn);
+        await waitForCondition(
+          () => svc.attemptSettlementByTaskId.get(taskId)?.phase === "settled"
+        );
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+          attemptId,
+        });
       });
-      expect(svc.admittedSendsByTaskId.get(taskId)).toBeUndefined();
-      expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(attemptId);
-      expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
-      // A retry rotates again; its predecessor is owned but unsettled, so the retry's lineage is
-      // marked unproven (the deferred cost: no receipt can ever describe this chain)...
-      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-      expect(entryOf(config, taskId)?.taskAttemptId).not.toBe(attemptId);
-      const rotated = entryOf(config, taskId)!.taskAttemptId!;
-      expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
-      // ...and an explicit Stop settles whatever is owned: the outcome recovers to terminal, the
-      // id is closed, and the next reawaken is admitted (still marked, as the marker is inherited).
-      await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
-        kind: "terminal-no-report",
+
+      test("a concurrent Stop owns the settlement; the disposal adds none", async () => {
+        const { taskService, svc, attemptId, token } = await reawakenAndBindSend();
+        shortenTerminationTimers();
+        await taskService.restoreInterruptedTaskAfterResumeFailure(
+          taskId,
+          "interrupted",
+          attemptId
+        );
+        const stop = taskService.terminateAllDescendantAgentTasks(rootId);
+        await settle();
+        token.onDisposed("refused");
+        await raceWithTimeout(stop, 2_000);
+        await waitForStopRelease(taskService, taskId);
+        await settle();
+        const settlement = svc.attemptSettlementByTaskId.get(taskId);
+        expect(settlement).toMatchObject({ attemptId, phase: "settled" });
+        expect(settlement?.source).not.toBe("resume-failed");
+        // The deferral does not outlive the Stop that settled it.
+        expect(svc.resumeFailureSettlementByTaskId.has(taskId)).toBe(false);
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+          kind: "terminal-no-report",
+          attemptId,
+        });
       });
-      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
-        attemptId: rotated,
-        phase: "settled",
+
+      test("a rollback whose write fails reopens the attempt it closed", async () => {
+        const { config, taskService, svc, attemptId, token } = await reawakenAndBindSend();
+        token.onDisposed("refused");
+        // The updater runs, but the config write never persists.
+        spyOn(taskService, "editWorkspaceEntry").mockImplementationOnce((_id, updater) => {
+          updater(structuredClone(entryOf(config, taskId)!), config.loadConfigOrDefault());
+          return Promise.reject(new Error("disk full"));
+        });
+        const rollback = await taskService
+          .restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptId)
+          .then(
+            () => "resolved",
+            (error: unknown) => getErrorMessage(error)
+          );
+        expect(rollback).toBe("disk full");
+        // The row still runs under the attempt, which stays open to sends and unsettled.
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "running",
+          taskAttemptId: attemptId,
+        });
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toBeUndefined();
+        expect(svc.resumeFailureSettlementByTaskId.has(taskId)).toBe(false);
+        expect(
+          taskService.admitTaskWorkspaceTurn(taskId, {
+            acceptanceOrigin: "manual",
+            expectedAttemptId: attemptId,
+          }).kind
+        ).toBe("admitted");
       });
-      expect(taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })).toEqual({
-        kind: "refused",
-        message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
-      });
-      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-      expect(svc.ownedAttemptByTaskId.get(taskId)).toMatchObject({
-        source: "reawaken",
-        receiptEligible: false,
+
+      test("a superseding reawaken keeps its ownership and the monotonic unproven lineage", async () => {
+        const { config, taskService, svc, attemptId, token } = await reawakenAndBindSend();
+        shortenTerminationTimers();
+        await taskService.restoreInterruptedTaskAfterResumeFailure(
+          taskId,
+          "interrupted",
+          attemptId
+        );
+        // A retry before the failed send's obligation is disposed: its lineage waits (bounded) for
+        // the closing predecessor and stays unproven.
+        const retry = await taskService.reawakenInterruptedTask(taskId);
+        assert(retry.kind === "reawakened", "expected the retry to reawaken");
+        expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
+        token.onDisposed("refused");
+        await settle();
+        // The stale obligation's disposal settles nothing: the successor stays owned and live, and
+        // no receipt vouches for the superseded attempt.
+        expect(svc.attemptSettlementByTaskId.get(taskId)).toBeUndefined();
+        expect(svc.ownedAttemptByTaskId.get(taskId)?.attemptId).toBe(retry.attemptId);
+        expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("live");
+        expect((await receiptFor(config, attemptId)).kind).toBe("not_found");
       });
     });
 
