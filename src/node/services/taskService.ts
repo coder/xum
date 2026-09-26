@@ -6710,9 +6710,28 @@ export class TaskService implements AgentTaskIntegration {
      * fence never admitted the send (sendAdmitted still false). Without it the attempt settles in
      * memory only, as before receipts existed.
      */
-    launch?: Pick<TaskLaunchPlan, "attemptId" | "sendAdmitted">
+    launch?: Pick<TaskLaunchPlan, "attemptId" | "sendAdmitted" | "abortSignal">
   ): Promise<void> {
     assert(taskId.length > 0, "markTaskLaunchFailed requires taskId");
+    // A reserved launch that fails once shutdown has latched the sessions is not a task failure
+    // (#4473): shutdown latches before its bounded join of the queue drain, so a launch still in
+    // flight fails against the latch. The latch is set before any session refuses, so every such
+    // failure observes it here. Leave the row untouched: startup recovery already requeues a
+    // stale `starting` row (dropping a prompt history already accepted, marking the lineage
+    // unproven), exactly as after a crash mid-launch. A failure that merely coincides with
+    // shutdown is retried on the next start rather than recorded. The caller's own cancellation
+    // stays authoritative.
+    if (
+      launch != null &&
+      launch.abortSignal?.aborted !== true &&
+      this.workspaceService.isShuttingDown()
+    ) {
+      log.info("Task launch failure during shutdown: leaving the task for startup recovery", {
+        taskId,
+        message,
+      });
+      return;
+    }
     // The launch owner gives up: settle exactly the attempt it owned when it decided. The
     // closure is recorded inside the updater, against the fresh row's id, before the write is
     // awaited — no send can be admitted for that id from here on.
@@ -14830,8 +14849,16 @@ export class TaskService implements AgentTaskIntegration {
         // reservation already owns it; eligibility is read from the fresh row (another process's
         // stale-starting revert can add the marker without changing the id).
         let launch: { attemptId: string; receiptEligible: boolean } | undefined;
+        let shuttingDown = false;
         try {
           await this.editActiveWorkspaceEntry(taskId, (workspace) => {
+            // Once shutdown latched the sessions the launch would only fail against them: the
+            // task stays queued for the next start (#4473). Checked inside the CAS so no await
+            // separates the check from the reservation.
+            if (this.workspaceService.isShuttingDown()) {
+              shuttingDown = true;
+              return;
+            }
             if (workspace.taskStatus !== "queued" || workspace.taskAttemptRetiredBy != null) return;
             const owned = this.ownedAttemptByTaskId.get(taskId);
             const attemptId =
@@ -14845,6 +14872,10 @@ export class TaskService implements AgentTaskIntegration {
         } catch (error) {
           await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
           continue;
+        }
+        if (shuttingDown) {
+          log.info("TaskService.maybeStartQueuedTasks: shutdown began; leaving tasks queued");
+          break;
         }
         if (launch == null) {
           log.debug("TaskService.maybeStartQueuedTasks: launch CAS lost or attempt retired", {

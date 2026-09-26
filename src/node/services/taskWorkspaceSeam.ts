@@ -455,6 +455,11 @@ export interface WorkspaceTurnHost {
 }
 
 export interface TurnAdmissionHost {
+  /**
+   * Whether shutdown has latched the sessions (WorkspaceService.beginShutdown). Set before any
+   * session refuses work, so a send that failed against the latch always observes it.
+   */
+  isShuttingDown(): boolean;
   acquireIdleTurnExclusion(workspaceId: string): Result<Disposable>;
   getStartupRecoveryState(workspaceId: string): Promise<StartupRecoveryState>;
   /**

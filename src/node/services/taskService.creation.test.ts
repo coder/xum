@@ -1148,6 +1148,113 @@ describe("TaskService", () => {
     expect(acceptedStarting?.taskPrompt).toBeUndefined();
   }, 20_000);
 
+  // #4473: shutdown latches every session before its bounded join of the queue drain, so a launch
+  // still in flight fails against the latch. That failure must not strand the task interrupted.
+  test.each([
+    { latch: "during the reserved launch's send" },
+    { latch: "before the drain reserves" },
+  ] as const)(
+    "a queued task survives shutdown latching $latch and launches after restart",
+    async ({ latch }) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = await createTestProject(rootDir);
+      const runtimeConfig = { type: "worktree" as const, srcBaseDir: config.srcDir };
+      const runtime = createRuntime(runtimeConfig, { projectPath });
+      const parentName = "parent";
+      await runtime.createWorkspace({
+        projectPath,
+        branchName: parentName,
+        trunkBranch: "main",
+        directoryName: parentName,
+        initLogger: createNullInitLogger(),
+      });
+      const parentId = "1111111111";
+      const taskId = "task-queued-at-shutdown";
+      const workspaceName = "agent_explore_task-queued-at-shutdown";
+      const prompt = "queued work";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          {
+            path: runtime.getWorkspacePath(projectPath, parentName),
+            id: parentId,
+            name: parentName,
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+          },
+          {
+            path: runtime.getWorkspacePath(projectPath, workspaceName),
+            id: taskId,
+            name: workspaceName,
+            title: "Queued at shutdown",
+            createdAt: new Date().toISOString(),
+            runtimeConfig,
+            parentWorkspaceId: parentId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "queued",
+            taskPrompt: prompt,
+            taskModelString: defaultModel,
+            taskTrunkBranch: parentName,
+          },
+        ],
+        testTaskSettings(2, 3)
+      );
+
+      const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
+        () => Promise.resolve(undefined)
+      );
+      try {
+        // First process. The latch flips exactly where the real WorkspaceService.beginShutdown flips
+        // it relative to this launch; its sessions then refuse the send (createSession throws).
+        let shuttingDown = latch === "before the drain reserves";
+        const first = createWorkspaceServiceMocks({
+          isShuttingDown: mock(() => shuttingDown),
+          sendMessage: mock((): Promise<Result<void>> => {
+            shuttingDown = true;
+            return Promise.resolve(Err("Server is shutting down"));
+          }),
+        });
+        const { taskService: firstTaskService } = createTaskServiceHarness(config, {
+          workspaceService: first.workspaceService,
+        });
+        await firstTaskService.maybeStartQueuedTasks();
+        await firstTaskService.queueDrainSettled();
+
+        // Positive evidence that the intended interleaving happened (not a drain that never ran).
+        expect(first.sendMessage).toHaveBeenCalledTimes(
+          latch === "before the drain reserves" ? 0 : 1
+        );
+        const afterShutdown = findWorkspaceInConfig(config, taskId);
+        expect(afterShutdown?.taskStatus).not.toBe("interrupted");
+        expect(afterShutdown?.taskLaunchError).toBeUndefined();
+        expect(afterShutdown?.taskPrompt).toBe(prompt);
+        if (latch === "before the drain reserves") {
+          expect(afterShutdown?.taskStatus).toBe("queued");
+        }
+
+        // Restart: a fresh process recovers and drains the queue.
+        const second = createWorkspaceServiceMocks();
+        const { taskService: secondTaskService } = createTaskServiceHarness(config, {
+          workspaceService: second.workspaceService,
+        });
+        await secondTaskService.initialize();
+        await secondTaskService.maybeStartQueuedTasks();
+        await waitForWorkspaceTaskStatus(config, taskId, "running");
+        expect(second.sendMessage).toHaveBeenCalledWith(
+          taskId,
+          prompt,
+          expect.objectContaining({ agentId: "explore" }),
+          expect.objectContaining({ allowQueuedAgentTask: true })
+        );
+      } finally {
+        runBackgroundInitSpy.mockRestore();
+      }
+    },
+    20_000
+  );
+
   test("does not count foreground-awaiting tasks towards maxParallelAgentTasks", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"], "dddddddddd");
