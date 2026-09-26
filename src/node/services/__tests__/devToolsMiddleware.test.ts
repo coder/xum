@@ -417,14 +417,18 @@ describe("createDevToolsMiddleware", () => {
       const params = createMockParams();
       const failure = new Error("400 invalid_encrypted_content");
 
-      await expect(
-        wrapGenerate({
+      let thrownError: unknown;
+      try {
+        await wrapGenerate({
           doGenerate: () => rejectAfterFetch(params, failure),
           doStream: () => Promise.reject(new Error("doStream should not be called")),
           params,
           model: createMockModel(),
-        })
-      ).rejects.toBe(failure);
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+      expect(thrownError).toBe(failure);
 
       await expectRedactedFailedRequest(service);
     });
@@ -700,14 +704,18 @@ describe("createDevToolsMiddleware", () => {
       const params = createMockParams();
       const failure = new Error("400 invalid_encrypted_content");
 
-      await expect(
-        wrapStream({
+      let thrownError: unknown;
+      try {
+        await wrapStream({
           doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
           doStream: () => rejectAfterFetch(params, failure),
           params,
           model: createMockModel(),
-        })
-      ).rejects.toBe(failure);
+        });
+      } catch (error) {
+        thrownError = error;
+      }
+      expect(thrownError).toBe(failure);
 
       await expectRedactedFailedRequest(service);
     });
