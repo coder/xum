@@ -7622,8 +7622,8 @@ export class WorkspaceService
       if (!outcome.success) {
         return Err(outcome.error);
       }
-      // Config.saveConfig logs and swallows write errors, so editConfig resolving does not prove
-      // the mode is on disk. editConfig leaves no cached snapshot, so this re-reads the file.
+      // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
+      // write another writer replaced. editConfig leaves no cached snapshot, so it reads the file.
       const persisted = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
         projectPath,
         workspaceId: normalizedWorkspaceId,
