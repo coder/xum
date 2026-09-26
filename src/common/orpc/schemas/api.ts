@@ -3421,21 +3421,6 @@ export const voice = {
   },
 };
 
-// Debug endpoints (test-only, not for production use)
-export const debug = {
-  /**
-   * Trigger an artificial stream error for testing recovery.
-   * Used by integration tests to simulate network errors mid-stream.
-   */
-  triggerStreamError: {
-    input: z.object({
-      workspaceId: z.string(),
-      errorMessage: z.string().optional(),
-    }),
-    output: z.boolean(), // true if error was triggered on an active stream
-  },
-};
-
 const DesktopPrereqStatusSchema = z.discriminatedUnion("available", [
   z.object({
     available: z.literal(true),

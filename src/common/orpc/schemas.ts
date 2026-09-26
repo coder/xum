@@ -167,7 +167,6 @@ export {
   browser,
   devtools,
   uiLayouts,
-  debug,
   desktop,
   general,
   menu,
