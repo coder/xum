@@ -61,6 +61,19 @@ test("matches unit/integration qualifiers after used in/by/for", () => {
   expect(seams("// used in integration tests\nexport const b = 1;")).toEqual(["1:b"]);
 });
 
+test("matches honest phrasings without the word test in the seam claim", () => {
+  expect(
+    seams("class Lock {\n  /** No production caller: kept as an observable. */\n  count() {}\n}")
+  ).toEqual(["2:Lock.count"]);
+  expect(seams("// Has no non-test consumers.\nexport const a = 1;")).toEqual(["1:a"]);
+  expect(
+    seams("/** `timeoutMs` is overridable for tests only. */\nexport function b() {}")
+  ).toEqual(["1:b"]);
+  // Descriptive uses stay quiet.
+  expect(seams("// No production data leaves this process.\nexport const c = 1;")).toEqual([]);
+  expect(seams("// Some focused tests only need metadata.\nexport const d = 1;")).toEqual([]);
+});
+
 test("keys comments on star re-exports by module or namespace", () => {
   expect(seams('// Exported for tests.\nexport * from "./a";')).toEqual(["1:* from ./a"]);
   expect(seams('// Exported for tests.\nexport * as ns from "./a";')).toEqual(["1:ns"]);
