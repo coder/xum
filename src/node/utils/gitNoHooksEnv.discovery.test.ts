@@ -469,6 +469,27 @@ describe("gitNoRepoAutomationEnvForLocalRepo discovery", () => {
     );
   }
 
+  // The matches are discarded instead of buffered in the shell, so size cannot matter. The legacy
+  // discovery hit its 256 KiB output cap, which failed closed with the same outer message.
+  test(
+    "unsupported-key matches over 256 KiB are refused without being buffered",
+    async () => {
+      const repo = await makeRepo(root.path, "many-includeifs", (r) =>
+        appendConfig(
+          r,
+          Array.from(
+            { length: 3000 },
+            (_, i) => `[includeIf "onbranch:${"b".repeat(80)}${i}"]\n\tpath = x\n`
+          ).join("")
+        )
+      );
+      await expectOneSpawnOutcome(repo, { error: INCLUDES, cause: REFUSED_INCLUDEIF });
+      const legacy = legacyGitNoRepoAutomationEnvForLocalRepo;
+      expect(await discover(repo, false, undefined, legacy)).toEqual({ error: INCLUDES });
+    },
+    TEST_TIMEOUT_MS
+  );
+
   test(
     "the legacy discovery spawned 4 processes, or 5 with worktreeConfig",
     async () => {
@@ -725,8 +746,8 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
       expect((await fs.readFile(log, "utf8")).trimEnd().split("\n")).toEqual([
         `<unset>|${at} rev-parse --git-dir`,
         `C|${at} config --local --bool extensions.worktreeConfig`,
-        `C|${at} config --local --includes --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
-        `C|${at} config --worktree --includes --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
+        `C|${at} config --local --includes --null --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
+        `C|${at} config --worktree --includes --null --name-only --get-regexp ${UNREPRESENTABLE_PATTERN}`,
         `C|${at} config --null --includes --get-regexp ${GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN}`,
       ]);
     },

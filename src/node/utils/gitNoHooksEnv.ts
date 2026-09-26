@@ -150,6 +150,8 @@ export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 // include.path would otherwise go unchecked.
 const GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN =
   "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$";
+// The conditional-include part of the pattern above; only picks the refusal message.
+const GIT_CONDITIONAL_INCLUDE_KEY_PATTERN = "^includeif[.].*[.]path$";
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
   /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs|proxy)$/i;
@@ -401,12 +403,12 @@ const LOCAL_DISCOVERY_RECORD_REGEX =
 
 // Runs the git queries in sequence and prints each decisive exit status in-band. `command`
 // bypasses shell functions, and the cwd is inherited so PATH lookup matches spawning git
-// directly. rev-parse stdout is discarded, the worktree-config and unrepresentable-key queries
-// are captured and decided here, and only the driver query (last) streams repo-controlled bytes.
-// The unrepresentable-key query omits --null because its output lands in a shell variable; the
-// refusal decision is "exited 0", and the keys only choose the refusal message. The record after
-// the last NUL is written after the last git call exits, and the script exits 0 only after
-// writing it.
+// directly. The script keeps no repo-controlled output: rev-parse and unrepresentable-key
+// matches are discarded (the refusal decision is "exited 0", and only then does a second query
+// for conditional includes pick the message), the worktree-config answer is a git-normalized
+// boolean, and only the driver query (last) streams repo-controlled bytes, under the caller's
+// output cap. The record after the last NUL is written after the last git call exits, and the
+// script exits 0 only after writing it.
 const LOCAL_DISCOVERY_SCRIPT_BODY = String.raw`printf 'xum-git-discovery 1\n'
 command git -C "$repo" rev-parse --git-dir >/dev/null
 rc=$?
@@ -418,14 +420,15 @@ case $worktree_rc in
   *) printf '\000worktree-config %s\n' "$worktree_rc"; exit 0 ;;
 esac
 check_unrepresentable() {
-  keys=$(LC_ALL=C command git -C "$repo" config "$1" --includes --name-only --get-regexp "$unrepresentable_pattern")
+  LC_ALL=C command git -C "$repo" config "$1" --includes --null --name-only --get-regexp "$unrepresentable_pattern" >/dev/null
   rc=$?
   case $rc in
     1) return 0 ;;
-    0) case $keys in
-         *[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ii][Ff].*) printf '\000unrepresentable includeif\n' ;;
-         *) printf '\000unrepresentable executable\n' ;;
-       esac ;;
+    0) if LC_ALL=C command git -C "$repo" config "$1" --includes --name-only --get-regexp "$includeif_pattern" >/dev/null; then
+         printf '\000unrepresentable includeif\n'
+       else
+         printf '\000unrepresentable executable\n'
+       fi ;;
     *) printf '\000unrepresentable-failed %s\n' "$rc" ;;
   esac
   exit 0
@@ -543,6 +546,7 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
   const script = [
     `repo=${shellQuote(repoPath)}`,
     `unrepresentable_pattern=${shellQuote(GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN)}`,
+    `includeif_pattern=${shellQuote(GIT_CONDITIONAL_INCLUDE_KEY_PATTERN)}`,
     `automation_pattern=${shellQuote(GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN)}`,
     LOCAL_DISCOVERY_SCRIPT_BODY,
   ].join("\n");
