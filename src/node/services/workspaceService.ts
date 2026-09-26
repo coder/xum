@@ -4615,6 +4615,7 @@ export class WorkspaceService
   beginShutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.retireRemovalInstanceIfIdle();
     // Capture before disposal can remove transient instances from either registry.
     for (const session of [
       ...this.sessions.values(),
@@ -7325,6 +7326,17 @@ export class WorkspaceService
         hold[Symbol.dispose]();
       }
       this.removingWorkspaces.delete(workspaceId);
+      this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * A shut-down instance with no removal in flight writes no more markers: drop it from the live
+   * set so a marker it left behind can be taken over by another service in this process.
+   */
+  private retireRemovalInstanceIfIdle(): void {
+    if (this.shuttingDown && this.removingWorkspaces.size === 0) {
+      liveRemovalInstanceIds.delete(this.removalInstanceId);
     }
   }
 

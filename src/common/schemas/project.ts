@@ -59,6 +59,24 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
+/** A backend's in-flight workspace removal (#4478); see WorkspaceConfigSchema.pendingRemoval. */
+export const PendingRemovalSchema = z.object({
+  removalId: z.string(),
+  // The owning WorkspaceService instance and its process, judged by processLiveness's
+  // judgeHolder so a crashed removal's marker can be taken over.
+  instanceId: z.string(),
+  pid: z.number(),
+  identity: z.object({
+    birth: z.string().nullable(),
+    bootId: z.string().nullable(),
+    pidNs: z.string().nullable(),
+    machineId: z.string().nullable(),
+    platform: z.string().nullable(),
+    hostname: z.string().nullable(),
+  }),
+  at: z.string(),
+});
+
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
@@ -306,28 +324,10 @@ export const WorkspaceConfigSchema = z.object({
       description:
         "Monotonic workflow claim that retired this attempt for replacement. Never cleared; every later admission of the task refuses while it is set.",
     }),
-  pendingRemoval: z
-    .object({
-      removalId: z.string(),
-      // The owning WorkspaceService instance and its process, judged by processLiveness's
-      // judgeHolder so a crashed removal's marker can be taken over.
-      instanceId: z.string(),
-      pid: z.number(),
-      identity: z.object({
-        birth: z.string().nullable(),
-        bootId: z.string().nullable(),
-        pidNs: z.string().nullable(),
-        machineId: z.string().nullable(),
-        platform: z.string().nullable(),
-        hostname: z.string().nullable(),
-      }),
-      at: z.string(),
-    })
-    .optional()
-    .meta({
-      description:
-        "Set by a backend's workspace removal before any destructive effect. Every task admission refuses while it is set; a failed removal clears it, and a removal whose owner process is dead is taken over by the next removal.",
-    }),
+  pendingRemoval: PendingRemovalSchema.optional().meta({
+    description:
+      "Set by a backend's workspace removal before any destructive effect. Every task admission refuses while it is set; a failed removal clears it, and a removal whose owner process is dead is taken over by the next removal.",
+  }),
   taskTerminalFailure: z.object({ attemptId: z.string(), errorType: z.string() }).optional().meta({
     description:
       "The attempt a terminal stream failure (e.g. model_refusal) ended, written with its interrupted status. Applies only while taskAttemptId still names that attempt.",

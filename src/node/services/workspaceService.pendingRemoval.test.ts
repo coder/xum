@@ -112,11 +112,22 @@ describe("workspace removal across two backends on one root", () => {
     await cleanupFixture();
   });
 
-  async function editTaskRow(edit: (row: WorkspaceConfigEntry) => void): Promise<void> {
+  async function editRow(id: string, edit: (row: WorkspaceConfigEntry) => void): Promise<void> {
     await a.config.editConfig((config) => {
-      edit(findWorkspaceEntry(config, taskId)!.workspace);
+      edit(findWorkspaceEntry(config, id)!.workspace);
       return config;
     });
+  }
+
+  /** A marker left by a process that has exited: its owner is provably dead in this PID domain. */
+  function deadOwnerMarker(): NonNullable<WorkspaceConfigEntry["pendingRemoval"]> {
+    return {
+      removalId: "removal-of-a-crashed-backend",
+      instanceId: "instance-of-a-crashed-backend",
+      pid: spawnSync(process.execPath, ["--version"]).pid,
+      identity: getSelfIdentity(),
+      at: new Date().toISOString(),
+    };
   }
 
   /** Pause A's removal right after it closed admission (its first step after the marker). */
@@ -186,7 +197,7 @@ describe("workspace removal across two backends on one root", () => {
   });
 
   test("the other backend does not launch a queued task that is being removed", async () => {
-    await editTaskRow((row) => {
+    await editRow(taskId, (row) => {
       row.taskStatus = "queued";
       row.taskPrompt = "queued work";
       // A queued task of an inactive workflow run is interrupted instead of launched.
@@ -223,17 +234,27 @@ describe("workspace removal across two backends on one root", () => {
     expect((await b.taskService.reawakenInterruptedTask(taskId)).kind).toBe("reawakened");
   });
 
+  test("a removal marker on a root workspace refuses the other backend's sends", async () => {
+    await editRow(rootId, (row) => {
+      row.pendingRemoval = deadOwnerMarker();
+    });
+
+    const admission = b.taskService.admitTaskWorkspaceTurn(rootId, { acceptanceOrigin: "manual" });
+
+    expect(admission).toMatchObject({ kind: "refused" });
+  });
+
+  test("a malformed removal marker is dropped instead of blocking the task", async () => {
+    await editRow(taskId, (row) => {
+      (row as Record<string, unknown>).pendingRemoval = "not a marker";
+    });
+
+    expect((await b.taskService.reawakenInterruptedTask(taskId)).kind).toBe("reawakened");
+  });
+
   test("a marker left by a dead backend is taken over by the next removal", async () => {
-    // A pid that has exited: the owner is provably dead in this PID domain.
-    const deadPid = spawnSync(process.execPath, ["--version"]).pid;
-    await editTaskRow((row) => {
-      row.pendingRemoval = {
-        removalId: "removal-of-a-crashed-backend",
-        instanceId: "instance-of-a-crashed-backend",
-        pid: deadPid,
-        identity: getSelfIdentity(),
-        at: new Date().toISOString(),
-      };
+    await editRow(taskId, (row) => {
+      row.pendingRemoval = deadOwnerMarker();
     });
 
     const result = await b.workspaceService.remove(taskId, true);

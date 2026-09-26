@@ -3480,14 +3480,16 @@ export class TaskService implements AgentTaskIntegration {
     if (entry == null && options.expectedAttemptId != null) {
       return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
     }
+    // Checked before the task classification: another backend's removal of a root workspace
+    // deletes its checkout too (#4478).
+    if (entry?.pendingRemoval != null) {
+      return { kind: "refused", message: pendingRemovalAdmissionMessage(entry.pendingRemoval) };
+    }
     if (!entry?.parentWorkspaceId) return { kind: "not-a-task" };
     // The claim is monotonic and stronger than the id: a retired task refuses even when its id
     // is missing or malformed (fail closed on partial state), so check it before the id.
     if (entry.taskAttemptRetiredBy != null) {
       return { kind: "refused", message: retiredAttemptMessage(entry.taskAttemptRetiredBy) };
-    }
-    if (entry.pendingRemoval != null) {
-      return { kind: "refused", message: pendingRemovalAdmissionMessage(entry.pendingRemoval) };
     }
     const attemptId = this.currentTaskAttemptId(workspaceId, entry);
     if (attemptId == null) {

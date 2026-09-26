@@ -75,6 +75,7 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
+import { PendingRemovalSchema } from "@/common/schemas/project";
 import {
   getValidAgentMessageDispatchMode,
   getValidUnrelatedWorkspaceConsent,
@@ -735,17 +736,25 @@ function normalizePersistedWorkspace(
     taskExperiments.programmaticToolCalling !== true;
   const hasMalformedTaskAttemptId =
     persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
+  // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
+  // admission refuses while one is set, and the removal could not judge its owner, so the
+  // workspace could neither be used nor removed.
+  const hasMalformedPendingRemoval =
+    persisted.pendingRemoval !== undefined &&
+    !PendingRemovalSchema.safeParse(persisted.pendingRemoval).success;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
-    !hasMalformedTaskAttemptId
+    !hasMalformedTaskAttemptId &&
+    !hasMalformedPendingRemoval
   ) {
     return workspace;
   }
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+  if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
 
   if (hasLegacyPtcExclusive) {

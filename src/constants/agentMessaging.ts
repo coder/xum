@@ -100,7 +100,7 @@ export function retiredAttemptMessage(claim: { runId: string; stepId: string }):
 
 /** Refusal for every task admission while a backend is removing the workspace (pendingRemoval). */
 export function pendingRemovalAdmissionMessage(marker: { pid: number }): string {
-  return `This sub-agent is being removed (by Xum process ${marker.pid}); nothing was sent.`;
+  return `This workspace is being removed (by Xum process ${marker.pid}); nothing was sent.`;
 }
 
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
