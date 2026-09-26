@@ -12,6 +12,7 @@ import * as fsPromises from "fs/promises";
 import * as path from "path";
 
 import assert from "@/common/utils/assert";
+import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -1637,14 +1638,17 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const { config, taskService, svc, attemptId, token } = await reawakenAndBindSend();
         token.onDisposed("refused");
         // The updater runs (and closes the attempt), but the config write never persists.
-        spyOn(taskService, "editWorkspaceEntry").mockImplementationOnce(async (_id, updater) => {
-          const row = structuredClone(entryOf(config, taskId)!);
-          await updater(row);
-          throw new Error("disk full");
+        spyOn(taskService, "editWorkspaceEntry").mockImplementationOnce((_id, updater) => {
+          updater(structuredClone(entryOf(config, taskId)!), config.loadConfigOrDefault());
+          return Promise.reject(new Error("disk full"));
         });
-        await expect(
-          taskService.restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptId)
-        ).rejects.toThrow("disk full");
+        const rollback = await taskService
+          .restoreInterruptedTaskAfterResumeFailure(taskId, "interrupted", attemptId)
+          .then(
+            () => "resolved",
+            (error: unknown) => getErrorMessage(error)
+          );
+        expect(rollback).toBe("disk full");
         // The row still runs under the attempt, which stays open to sends and unsettled.
         expect(entryOf(config, taskId)).toMatchObject({
           taskStatus: "running",
