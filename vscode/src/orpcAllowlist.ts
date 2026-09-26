@@ -22,7 +22,7 @@ function hasSafeSegments(path: string[]): boolean {
 }
 
 const ALLOWED_PROCEDURES = {
-  general: new Set(["listDirectory", "createDirectory", "ping", "tick", "openInEditor"]),
+  general: new Set(["listDirectory", "createDirectory", "ping", "openInEditor"]),
   workspace: new Set([
     "sendMessage",
     "interruptStream",

@@ -181,12 +181,6 @@ describe("CLI via HTTP", () => {
       const result = await runCli(["workspace", "get-info", "--workspace-id", "nonexistent"]);
       expect(result).toBeNull(); // Non-existent workspace returns null
     });
-
-    test("general tick with object options", async () => {
-      const result = await runCli(["general", "tick", "--count", "2", "--interval-ms", "10"]);
-      // tick returns an async generator, so result should be the generator
-      expect(result).toBeDefined();
-    });
   });
 });
 

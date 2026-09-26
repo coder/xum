@@ -152,23 +152,6 @@ export function subscribePolicyChanges(
   });
 }
 
-/**
- * Deliberately NOT on the Effect Stream bridge: this is a pure timed
- * generator with no event source to attach and no resource to release, so the
- * bridge's acquireRelease lifecycle would add machinery without value.
- */
-export function createTickIterable(
-  count: number,
-  intervalMs: number
-): AsyncGenerator<{ tick: number; timestamp: number }> {
-  return (async function* () {
-    for (let tick = 1; tick <= count; tick++) {
-      yield { tick, timestamp: Date.now() };
-      if (tick < count) await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
-  })();
-}
-
 export function subscribeLogs(
   context: ORPCContext,
   minLevel: LogEntry["level"],

@@ -95,7 +95,6 @@ import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 
 import {
   attachTerminal,
-  createTickIterable,
   subscribeConfigChanges,
   subscribeDevTools,
   subscribeLogs,
@@ -987,10 +986,6 @@ export const router = (authToken?: string) => {
         .input(schemas.general.ping.input)
         .output(schemas.general.ping.output)
         .handler(({ input }) => `Pong: ${input}`),
-      tick: t
-        .input(schemas.general.tick.input)
-        .output(schemas.general.tick.output)
-        .handler(({ input }) => createTickIterable(input.count, input.intervalMs)),
       getLogPath: t
         .input(schemas.general.getLogPath.input)
         .output(schemas.general.getLogPath.output)
