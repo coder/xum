@@ -660,6 +660,12 @@ function isFeedbackFullyAccepted(
 ): boolean {
   const feedback = state.feedbacks.find((entry) => entry.feedbackId === record.feedbackId);
   if (feedback === undefined || feedback.threadIds.length !== record.comments.length) return false;
+  // Replies must match 1:1 by distinct id: the projection admits only the first of two replies
+  // sharing one replyId (a damaged record), so a per-reply lookup would find that one accepted
+  // reply for both and admit a row whose second body never enters review state.
+  if (new Set(record.replies.map((reply) => reply.replyId)).size !== record.replies.length) {
+    return false;
+  }
   return record.replies.every((reply) =>
     state.threads.some(
       (thread) =>
