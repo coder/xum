@@ -36,33 +36,8 @@ const summarizeSpec: WorkflowAgentSpec = {
 const summarizeHash = hashWorkflowStepInput(summarizeSpec.id, summarizeSpec);
 const PRIOR_ATTEMPT = "att_00000000000000e5";
 
-/**
- * WorkflowRunner.run() clears its renewal interval before releasing the lease, but a renewal tick
- * that was already in flight keeps retrying the lease mutation lock (jittered backoff) and can
- * re-create `lease.json.xlock` AFTER run() settled. acquireLease deliberately does not wait through
- * that lock, so a back-to-back run() would see a spurious "already active" (lease: null). Polling
- * the lock directory is a TOCTOU (absent at stat time, re-created before mkdir); awaiting the
- * in-flight renewal promises themselves is the deterministic barrier.
- */
-class RenewalTrackingRunStore extends WorkflowRunStore {
-  private readonly renewals = new Set<Promise<boolean>>();
-
-  override renewLease(runId: string, ownerId: string, nowMs?: number): Promise<boolean> {
-    const renewal = super.renewLease(runId, ownerId, nowMs);
-    this.renewals.add(renewal);
-    const forget = () => this.renewals.delete(renewal);
-    renewal.then(forget, forget);
-    return renewal;
-  }
-
-  /** Call after run() settled: no new ticks can start, only in-flight ones can still hold the lock. */
-  async settleLeaseRenewals(): Promise<void> {
-    await Promise.allSettled([...this.renewals]);
-  }
-}
-
 async function createStore(sessionDir: string, source = SINGLE_STEP_SOURCE) {
-  const store = new RenewalTrackingRunStore({ sessionDir, staleLeaseMs: STALE_LEASE_MS });
+  const store = new WorkflowRunStore({ sessionDir, staleLeaseMs: STALE_LEASE_MS });
   await store.createRun({
     id: RUN_ID,
     workspaceId: "workspace-1",
@@ -291,7 +266,6 @@ describe("WorkflowRunner attempt disposition", () => {
       { stepId: "ok", taskId: "task_ok_1", status: "completed" },
     ]);
 
-    await store.settleLeaseRenewals();
     const retried = await runner.run(RUN_ID, { allowRetryFromFailedCheckpoint: true });
     expect(retried).toEqual({ reportMarkdown: "report from task_fail_2|report from task_ok_1" });
     // Only the failed step reran; the settled sibling was reused.
@@ -398,7 +372,6 @@ describe("WorkflowRunner attempt disposition", () => {
         run.steps.find((step) => step.stepId === "reported")?.result?.structuredOutput
       ).toEqual({ label: "r" });
       // Every settled sibling is disposed and the lease is free for a checkpoint retry.
-      await store.settleLeaseRenewals();
       await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
     }
   });
@@ -636,7 +609,8 @@ describe("WorkflowRunner attempt disposition", () => {
     expect(errorEvent?.type === "error" ? errorEvent.message : "").toContain(
       "cleanup is still in progress"
     );
-    // The lease was released: a fresh runner can take the run immediately.
+    // The lease was released: a fresh runner can take the run immediately (run() joins an
+    // in-flight renewal tick before releasing, so no renewal can hold the lease lock now).
     await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
   });
 
@@ -895,7 +869,6 @@ describe("WorkflowRunner attempt disposition", () => {
         },
       ]);
       // The lease is released after the drain so an explicit resume is accepted.
-      await store.settleLeaseRenewals();
       await expect(store.acquireLease(RUN_ID, "runner-next", Date.now())).resolves.toBe(true);
     }
   });
