@@ -3392,9 +3392,12 @@ export class WorkspaceService
     // Archive admission pairing for terminal startups: create() checks this guard in the same
     // synchronous block as its startup reservation, so whichever of {archive gate, terminal
     // entry} runs first is observed by the other (see archiveUnlocked's refuseLiveUserActivity
-    // gate and TerminalService.create).
-    terminalService.setWorkspaceArchiveGuard((workspaceId) =>
-      this.archivingWorkspaces.has(workspaceId)
+    // gate and TerminalService.create). Removal is covered too (#4478): it closes terminals
+    // before deleting the checkout, so a terminal still starting then must be refused or
+    // closed by TerminalService's post-spawn recheck, as the desktop-session guard does.
+    terminalService.setWorkspaceArchiveGuard(
+      (workspaceId) =>
+        this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)
     );
   }
 

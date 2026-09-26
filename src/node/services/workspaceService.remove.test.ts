@@ -463,14 +463,21 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     });
     try {
       await using harness = await createChildHarness(undefined);
+      // The terminal admission guard must refuse new terminals while the removal runs: a
+      // terminal starting after the close below would otherwise outlive the checkout.
+      let terminalGuard: ((id: string) => boolean) | undefined;
+      let terminalGuardDuringRemoval: boolean | undefined;
       harness.service.setMCPServerManager({
         stopServers: mock((id: string) => {
           calls.push(`stopServers:${id}`);
+          terminalGuardDuringRemoval ??= terminalGuard?.(id);
           return Promise.resolve();
         }),
       } as unknown as MCPServerManager);
       harness.service.setTerminalService({
-        setWorkspaceArchiveGuard: mock(() => undefined),
+        setWorkspaceArchiveGuard: mock((guard: (id: string) => boolean) => {
+          terminalGuard = guard;
+        }),
         closeWorkspaceSessions: mock((id: string) => {
           calls.push(`closeWorkspaceSessions:${id}`);
         }),
@@ -495,6 +502,8 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       ]) {
         expect(calls.slice(0, deletedAt)).toContain(stop);
       }
+      expect(terminalGuardDuringRemoval).toBe(true);
+      expect(terminalGuard?.(workspaceId)).toBe(false);
     } finally {
       createRuntimeSpy.mockRestore();
     }
