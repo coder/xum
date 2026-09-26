@@ -110,13 +110,6 @@ export interface AcquireConnectionOptions extends BaseSshAcquireConnectionOption
    * the default host-scoped ControlPath is used.
    */
   controlPath?: string;
-
-  /**
-   * Test seam.
-   *
-   * If provided, this is used for sleeping between wait cycles.
-   */
-  sleep?: (ms: number, abortSignal?: AbortSignal) => Promise<void>;
 }
 
 async function waitForPromiseWithTimeout<T>(
@@ -203,7 +196,6 @@ export class SSHConnectionPool {
         : (timeoutMsOrOptions ?? {});
 
     const timeoutMs = options.timeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
-    const sleep = options.sleep ?? sleepWithAbort;
 
     const maxWaitMs = options.maxWaitMs ?? DEFAULT_SSH_MAX_WAIT_MS;
     const shouldWait = maxWaitMs > 0;
@@ -245,7 +237,7 @@ export class SSHConnectionPool {
 
         const waitMs = Math.min(remainingMs, budgetMs);
         options.onWait?.(waitMs);
-        await sleep(waitMs, options.abortSignal);
+        await sleepWithAbort(waitMs, options.abortSignal);
         continue;
       }
 
@@ -431,7 +423,7 @@ export class SSHConnectionPool {
    * Clear all health state. Used in tests to reset between test cases
    * so backoff from one test doesn't affect subsequent tests.
    */
-  clearAllHealth(): void {
+  clearAllHealthForTests(): void {
     this.health.clear();
     this.readyControlPaths.clear();
     this.inflight.clear();
