@@ -9,6 +9,7 @@ import {
 } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+import { log } from "./log";
 
 export type CompactionStatusEvent =
   | {
@@ -52,6 +53,15 @@ interface CheckMidStreamParams {
  */
 export class CompactionMonitor {
   private hasTriggeredForCurrentStream = false;
+  /**
+   * Set when auto-compaction triggers; cleared by a user turn or by a live mid-stream usage reading
+   * below the threshold (proof that compaction relieved the pressure). While set, pressure that
+   * stays high does not auto-compact again: when compaction cannot bring usage under the
+   * threshold (a huge system prompt, or a provider reporting constant usage), every follow-up
+   * would otherwise compact again in a loop (#4421). Clearing on relief, not only on a user
+   * turn, keeps long autonomous runs (sub-agents never get user turns) able to compact again.
+   */
+  private awaitingRelief = false;
 
   constructor(
     private readonly workspaceId: string,
@@ -133,12 +143,18 @@ export class CompactionMonitor {
 
     const usagePercent = (usageTokens / contextLimit) * 100;
     const forceThresholdPercent = params.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+    // Relief counts only from a live provider reading of the prompt. The on-send usage state
+    // right after a compaction is an estimate (the summary's size), not a reading.
+    if (usagePercent < params.threshold * 100) this.awaitingRelief = false;
 
     if (usagePercent < forceThresholdPercent) {
       return false;
     }
 
     this.hasTriggeredForCurrentStream = true;
+    if (this.suppressRepeatedAutoCompaction("mid-stream", usagePercent)) {
+      return false;
+    }
     this.onStatusChange({
       type: "auto-compaction-triggered",
       reason: "mid-stream",
@@ -149,6 +165,28 @@ export class CompactionMonitor {
 
   resetForNewStream(): void {
     this.hasTriggeredForCurrentStream = false;
+  }
+
+  /** A real user turn re-arms auto-compaction even while pressure stays high. */
+  noteUserTurn(): void {
+    this.awaitingRelief = false;
+  }
+
+  /**
+   * Returns true, and logs, when an auto-compaction must be skipped because the previous one
+   * brought no relief and no user turn happened since. Otherwise arms the guard and returns false:
+   * the caller then runs the compaction.
+   */
+  suppressRepeatedAutoCompaction(reason: "on-send" | "mid-stream", usagePercent: number): boolean {
+    if (this.awaitingRelief) {
+      log.warn(
+        "Skipping auto-compaction: the previous auto-compaction did not bring usage under the threshold and no user turn happened since",
+        { workspaceId: this.workspaceId, reason, usagePercent: Math.round(usagePercent) }
+      );
+      return true;
+    }
+    this.awaitingRelief = true;
+    return false;
   }
 
   private assertThreshold(threshold: number): void {

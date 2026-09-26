@@ -4565,6 +4565,7 @@ export class AgentSession {
         // Pre-gate decision: the follow-up re-gates against the post-compaction context.
         autoModelRouting: routedOptions.autoModelRoutingRecord,
         replacement: manualReplacement || automaticReplacement,
+        synthetic: internal?.synthetic === true,
         cancelBeforeAcceptance,
       });
       if (preparation.kind === "cancelled") return Ok(undefined);

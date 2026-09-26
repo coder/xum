@@ -15,7 +15,11 @@ import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { AgentSession, AgentSessionAIService } from "./agentSession";
 import { CompactionMonitor } from "./compactionMonitor";
 import { buildAutoCompactionFollowUp } from "./contextManagement/compactionRequests";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+  seedAutoCompactionThreshold,
+} from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { waitForCondition } from "./testDispatchHelpers";
 
@@ -1092,6 +1096,100 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(compactionRequestText).not.toContain("The user wants to continue with:");
     expect(compactionRequestText).not.toContain("[CONTINUE]");
     expect(stopStream).toHaveBeenCalledTimes(1);
+
+    await session.dispose();
+  });
+
+  // #4421: a UAT fixture reporting constant high usage drove compaction epoch 1 → 303 in 40 s.
+  test("constant high provider usage triggers exactly one auto-compaction", async () => {
+    const workspaceId = "ws-auto-compaction-loop-guard";
+    const model = "openai:gpt-4o";
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    await seedAutoCompactionThreshold(config, model, 70);
+    // The real monitor decides: every stream reports usage far past the model's window.
+    const checkMidStream = spyOn(CompactionMonitor.prototype, "checkMidStream");
+    const usage = { inputTokens: 10_000_000, outputTokens: 1, totalTokens: 10_000_001 };
+
+    const aiEmitter = new EventEmitter();
+    const aborted = new Set<string>();
+    let activeMessageId = "";
+    let streams = 0;
+    let compactions = 0;
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>((request) => {
+      streams += 1;
+      const messageId = `assistant-${streams}`;
+      activeMessageId = messageId;
+      const isCompaction =
+        request.messages.at(-1)?.metadata?.muxMetadata?.type === "compaction-request";
+      if (isCompaction) compactions += 1;
+      // Runaway cap so the unguarded (red) run still terminates.
+      if (compactions <= 5) {
+        setTimeout(() => {
+          aiEmitter.emit("stream-start", {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            model,
+            historySequence: streams,
+            startTime: Date.now(),
+          });
+          // Compaction streams end with their summary; ordinary streams report pressure and
+          // stay open unless the session interrupts them for compaction.
+          if (isCompaction) {
+            void runSessionTerminalPolicy(session, aiEmitter, {
+              type: "stream-end",
+              workspaceId,
+              messageId,
+              parts: [{ type: "text", text: "summary" }],
+              metadata: { model, agentId: "exec", finishReason: "stop", usage },
+            });
+          } else {
+            aiEmitter.emit("usage-delta", {
+              type: "usage-delta",
+              workspaceId,
+              messageId,
+              usage,
+              cumulativeUsage: usage,
+            });
+          }
+        }, 0);
+      }
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
+    });
+    const stopStream = mock((_workspaceId: string) => {
+      aborted.add(activeMessageId);
+      void runSessionTerminalPolicy(session, aiEmitter, {
+        type: "stream-abort",
+        workspaceId,
+        messageId: activeMessageId,
+        abortReason: "system",
+      });
+      return Promise.resolve(Ok(undefined));
+    });
+
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: { stopStream, streamMessage },
+    });
+
+    const result = await session.sendMessage("hello", { model, agentId: "exec" });
+    expect(result.success).toBe(true);
+
+    // Stream 1 interrupts for compaction (stream 2); the follow-up (stream 3) reports the same
+    // pressure, and its check must not start a second compaction.
+    await waitForCondition(() => checkMidStream.mock.results.length >= 2, {
+      timeoutMs: 5_000,
+    });
+    // Let an erroneous interrupt, if any, reach the provider before counting.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(checkMidStream.mock.results.map((entry) => entry.value)).toEqual([true, false]);
+    expect(compactions).toBe(1);
+    expect(streams).toBe(3);
+    expect(aborted).toEqual(new Set(["assistant-1"]));
 
     await session.dispose();
   });

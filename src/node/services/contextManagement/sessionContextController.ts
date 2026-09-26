@@ -391,6 +391,8 @@ export class SessionContextController {
     const modelForStream = input.modelForStream;
     const optionsForStream = input.options;
     const providersConfigForCompaction = this.host.state.providersConfig;
+    // A real user turn re-arms auto-compaction after one that brought no relief (#4421).
+    if (!input.agentInitiated && !input.synthetic) this.compactionMonitor.noteUserTurn();
     // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
     if (await this.recover()) this.host.transitionContextState("invalidate");
     // One threshold per admission decision: resolved from persisted preferences here and
@@ -436,7 +438,11 @@ export class SessionContextController {
     // An explicit replacement instead publishes its witness before compaction can hide debt.
     if (
       shouldCompactBeforeSend &&
-      (input.replacement || !(await this.host.isCompactionRecoveryBlocked()))
+      (input.replacement || !(await this.host.isCompactionRecoveryBlocked())) &&
+      !this.compactionMonitor.suppressRepeatedAutoCompaction(
+        "on-send",
+        compactionResult.usagePercentage
+      )
     ) {
       this.reset("legacy-fallback");
       const followUpFileParts = input.fileParts?.map((part) => ({

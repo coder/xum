@@ -46,6 +46,8 @@ async function fixture() {
     })),
     checkMidStream: mock(() => false),
     resetForNewStream: mock(() => undefined),
+    noteUserTurn: mock(() => undefined),
+    suppressRepeatedAutoCompaction: mock(() => false),
   } as unknown as CompactionMonitor;
   const rows = async (): Promise<MuxMessage[]> => {
     const result = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -170,6 +172,8 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
+      noteUserTurn: mock(() => undefined),
+      suppressRepeatedAutoCompaction: mock(() => false),
     } as unknown as CompactionMonitor;
 
     await runSessionTerminalPolicy(h.session, h.aiEmitter, {
@@ -256,6 +260,8 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
+      noteUserTurn: mock(() => undefined),
+      suppressRepeatedAutoCompaction: mock(() => false),
     } as unknown as CompactionMonitor;
     expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
     const feedbackRows = authenticFeedbackRows(await h.allRows());
@@ -365,6 +371,8 @@ describe("plan-review feedback whose snapshot or threads leave history before it
       })),
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
+      noteUserTurn: mock(() => undefined),
+      suppressRepeatedAutoCompaction: mock(() => false),
     } as unknown as CompactionMonitor;
   }
 

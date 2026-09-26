@@ -224,6 +224,8 @@ describe("CompactionMonitor", () => {
     expect(statusEvents).toHaveLength(1);
 
     monitor.resetForNewStream();
+    // A user turn lifts the no-relief guard, so only the per-stream latch is exercised here.
+    monitor.noteUserTurn();
 
     expect(
       monitor.checkMidStream({
@@ -234,6 +236,32 @@ describe("CompactionMonitor", () => {
         providersConfig: null,
       })
     ).toBe(true);
+    expect(statusEvents).toHaveLength(2);
+  });
+
+  test("pressure that stays high after an auto-compaction does not trigger another (#4421)", () => {
+    const { monitor, statusEvents } = createMonitor();
+    const check = (inputTokens: number) =>
+      monitor.checkMidStream({
+        model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
+        usage: createMidStreamUsage(inputTokens),
+        use1MContext: false,
+        providersConfig: null,
+      });
+
+    expect(check(150_000)).toBe(true);
+    // The follow-up stream after that compaction still reports the same pressure.
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(false);
+    expect(check(150_000)).toBe(false);
+    expect(statusEvents).toHaveLength(1);
+    expect(monitor.suppressRepeatedAutoCompaction("on-send", 75)).toBe(true);
+
+    // A reading under the threshold proves the compaction helped, so later growth may compact.
+    monitor.resetForNewStream();
+    expect(check(20_000)).toBe(false);
+    expect(check(150_000)).toBe(true);
     expect(statusEvents).toHaveLength(2);
   });
 
