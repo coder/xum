@@ -1627,63 +1627,16 @@ describe("TaskService", () => {
       workspaceService,
     });
     for (let i = 0; i < PEER_MESSAGE_RATE_LIMIT_MAX; i++) {
-      taskService.resetAutoResumeCount("sib-b");
       expect(
         (await taskService.sendAgentTreeMessage("sib-a", "sib-b", `message ${i}`)).success
       ).toBe(true);
     }
 
-    taskService.resetAutoResumeCount("sib-b");
     const limited = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "limited");
     expect(limited.success).toBe(false);
     if (!limited.success) {
       expect(limited.error.code).toBe("rate_limited");
     }
-  });
-
-  test("sendAgentTreeMessage charges the consecutive-wake budget at admission, before dispatch", async () => {
-    const config = await createTestConfig(rootDir);
-    const projectPath = path.join(rootDir, "repo");
-
-    await saveWorkspaces(
-      config,
-      projectPath,
-      [
-        projectWorkspace(projectPath, "root", "tree-root"),
-        projectWorkspace(projectPath, "sib-a", "sib-a", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-        projectWorkspace(projectPath, "sib-b", "sib-b", {
-          parentWorkspaceId: "tree-root",
-          taskStatus: "running",
-        }),
-      ],
-      testTaskSettings()
-    );
-
-    // The busy-target mock never dequeues entries (no onAccepted), so this exercises the
-    // admission-time charge: undispatched sends must fill the budget with no
-    // dequeue-to-acceptance gap for parallel senders to slip through.
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
-
-    for (let i = 1; i <= 3; i++) {
-      const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `queued wake ${i}`);
-      expect(result).toEqual(
-        Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
-      );
-    }
-    expect(sendMessage).toHaveBeenCalledTimes(3);
-
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued wake 4")).toEqual(
-      Err({
-        code: "refused",
-        reason:
-          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-      })
-    );
-    expect(sendMessage).toHaveBeenCalledTimes(3);
   });
 
   test("sendAgentTreeMessage refuses targets hard-interrupted by the user", async () => {

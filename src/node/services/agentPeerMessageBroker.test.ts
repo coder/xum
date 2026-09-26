@@ -2,7 +2,6 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
-  MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
   PEER_MESSAGE_RATE_LIMIT_MAX,
@@ -92,19 +91,6 @@ describe("AgentPeerMessageBroker", () => {
       reason: "Duplicate of an identical message recently sent to this target.",
     });
     expect(harness.countQueuedAgentPeerMessages).not.toHaveBeenCalled();
-  });
-
-  test("caps consecutive wakes until attention resets the target", () => {
-    const { broker } = createHarness();
-    for (let i = 0; i < MAX_CONSECUTIVE_PEER_WAKES; i++) {
-      broker.chargeConsecutivePeerWake("target");
-    }
-    expect(broker.checkPeerAdmission("sender", "target", "message")).toEqual({
-      code: "refused",
-      reason: "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-    });
-    broker.resetConsecutivePeerWakes("target");
-    expect(broker.checkPeerAdmission("sender", "target", "message")).toBeNull();
   });
 
   test.each([

@@ -9567,9 +9567,8 @@ export class TaskService implements AgentTaskIntegration {
           synthetic: true,
           agentInitiated: true,
           startStreamInBackground: true,
-          // Peer sends must not count as fresh user attention: resetAutoResumeCount also clears
-          // consecutivePeerWakes, so letting a peer message trigger it would let peers extend each
-          // other's wake budget indefinitely.
+          // Peer sends must not count as fresh user attention: resetAutoResumeCount clears the
+          // auto-resume budget and the user's interrupt latch, which only the user or parent may do.
           skipAutoResumeReset: true,
           // Unique key ⇒ never coalesces (removable dedupe keys force a sealed queue entry), so
           // sender attribution, queue caps, and previews survive later queued messages.
@@ -9608,12 +9607,6 @@ export class TaskService implements AgentTaskIntegration {
           });
         }
 
-        // Charge the wake budget at ADMISSION (still inside the target's event lock), not at
-        // dispatch: acceptance callbacks fire only when an entry is dequeued into a turn, so any
-        // dispatch-time accounting leaves a dequeue-to-acceptance window where a parallel sender
-        // sees neither a queued entry nor an incremented counter. Counting admitted sends makes
-        // the budget independent of queue state; user attention still resets it.
-        this.agentPeerMessageBroker.chargeConsecutivePeerWake(targetId);
         this.agentPeerMessageBroker.recordPeerSend(senderWorkspaceId, targetId, message);
         return Ok(
           accepted
@@ -15001,9 +14994,6 @@ export class TaskService implements AgentTaskIntegration {
     assert(workspaceId.length > 0, "resetAutoResumeCount: workspaceId must be non-empty");
     this.consecutiveAutoResumes.delete(workspaceId);
     this.interruptedParentWorkspaceIds.delete(workspaceId);
-    // User-authored sends (and parent guidance, which does not skip this reset) count as fresh
-    // attention: peer messages may wake this workspace again.
-    this.agentPeerMessageBroker.resetConsecutivePeerWakes(workspaceId);
   }
 
   /** Mark a parent workspace as hard-interrupted by the user. */

@@ -74,13 +74,6 @@ export function taskRecoveryPromptDedupeKey(taskId: string, kind: TaskRecoveryPr
 }
 
 /**
- * Max peer messages admitted for a target without any user-authored input or parent guidance in
- * between; at the cap the target is deemed to need user attention. Charged when a send is
- * admitted (queued or delivered), so dispatch timing cannot exceed the advertised turn count.
- */
-export const MAX_CONSECUTIVE_PEER_WAKES = 3;
-
-/**
  * Single retryable refusal for every admission path (direct/automatic sends, queued dispatch,
  * task resume, recovery, queued launch) while a stop cascade holds a workspace's latch. The
  * latch drops once the stopped execution has settled; callers may simply retry afterwards.

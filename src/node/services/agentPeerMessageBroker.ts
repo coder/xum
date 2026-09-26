@@ -5,7 +5,6 @@ import {
   type AgentMessageRelationship,
 } from "@/common/utils/agentMessageEnvelope";
 import {
-  MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
   PEER_MESSAGE_RATE_LIMIT_MAX,
@@ -52,8 +51,6 @@ export class AgentPeerMessageBroker {
   private readonly peerMessageSendTimesByPair = new Map<string, number[]>();
   private readonly peerMessageSendTimesByTarget = new Map<string, number[]>();
   private readonly peerMessageDedupeTimes = new Map<string, number>();
-  /** Peer sends admitted since the target's last user or parent attention. */
-  private readonly consecutivePeerWakes = new Map<string, number>();
 
   constructor(
     private readonly host: AgentPeerMessageBrokerHost,
@@ -104,16 +101,6 @@ export class AgentPeerMessageBroker {
       };
     }
 
-    // Charged synchronously under the target event lock, so queued and delivered entries share
-    // one admission cap without a dequeue-to-acceptance gap.
-    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) {
-      return {
-        code: "refused",
-        reason:
-          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-      };
-    }
-
     return null;
   }
 
@@ -127,14 +114,6 @@ export class AgentPeerMessageBroker {
     targetTimes.push(now);
     this.peerMessageSendTimesByTarget.set(targetId, targetTimes);
     this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, now);
-  }
-
-  chargeConsecutivePeerWake(targetId: string): void {
-    this.consecutivePeerWakes.set(targetId, (this.consecutivePeerWakes.get(targetId) ?? 0) + 1);
-  }
-
-  resetConsecutivePeerWakes(targetId: string): void {
-    this.consecutivePeerWakes.delete(targetId);
   }
 
   preparePeerMessage(params: {
