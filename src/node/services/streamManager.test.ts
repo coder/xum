@@ -11,7 +11,6 @@ import { closeScopeBounded } from "./di/appRuntime";
 import { Scope } from "effect";
 import * as tokenizer from "@/node/utils/main/tokenizer";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
 import {
   createStreamManagerForTests,
   engineInternals,
@@ -47,13 +46,6 @@ function untilAborted(signal: AbortSignal): AsyncGenerator<unknown, void, unknow
     }
     yield* [];
   })();
-}
-
-// Skip integration tests if TEST_INTEGRATION is not set
-
-// Validate API keys before running tests
-if (shouldRunIntegrationTests()) {
-  validateApiKeys(["ANTHROPIC_API_KEY"]);
 }
 
 describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
