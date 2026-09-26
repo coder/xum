@@ -209,7 +209,7 @@ import {
   CREATION_COLUMN_MAX_WIDTH_CLASS,
 } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
-import { prepareMessagePayload } from "./prepareMessagePayload";
+import { getModelOneShotOverrides, prepareMessagePayload } from "./prepareMessagePayload";
 import {
   estimateBase64DataUrlBytes,
   isPdfAttachment,
@@ -822,6 +822,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           const parsedCreationCommand = parseCommand(input.trim());
           if (parsedCreationCommand?.type === "goal-set") {
             return parsedCreationCommand.objective;
+          }
+          // Name the workspace from the request, not the one-shot model/thinking modifier.
+          if (parsedCreationCommand?.type === "model-oneshot") {
+            return parsedCreationCommand.message;
           }
           if (input.trim().length === 0 && attachments.length > 0) {
             const filenames = attachments
@@ -1701,16 +1705,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     // /<model-alias> ... is a *send modifier* (one-shot model override), not a command with its own
-    // side effects. Let the normal send flow handle it so post-send behavior can't drift.
+    // side effects. Let the normal send flow (workspace or creation) handle it so post-send
+    // behavior can't drift.
     if (parsed.type === "model-oneshot") {
-      if (variant !== "workspace") {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: "Model one-shot is only available in workspace view",
-        });
-        return true;
-      }
       return false;
     }
 
@@ -2097,6 +2094,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
+    // One-shot model overrides apply to both variants; the model also governs thinking/PDF policy.
+    const modelOneShot = parsed?.type === "model-oneshot" ? parsed : undefined;
+    const policyModel = modelOneShot?.modelString ?? baseModel;
+
     // Route to creation handler for creation variant
     if (variant === "creation") {
       // The initial /goal path sets a goal without sending a user message, so
@@ -2117,9 +2118,31 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
       }
 
+      const oneShot =
+        modelOneShot &&
+        getModelOneShotOverrides(
+          modelOneShot,
+          messageText,
+          attachments,
+          policyModel,
+          providersConfig
+        );
+      // Parsing makes a one-shot and a slash skill mutually exclusive, so this only ever combines
+      // with inline skill refs below. requestedModel keeps the new workspace's starting indicator
+      // on the one-shot model once the durable user row replaces the optimistic one.
+      const oneShotMetadata: MuxMessageMetadata | undefined = oneShot && {
+        type: "normal",
+        requestedModel: policyModel,
+        ...oneShot.metadata,
+      };
       let creationMessageTextForSend =
-        initialSlashCommand?.type === "goal-set" ? initialSlashCommand.objective : messageText;
-      let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
+        initialSlashCommand?.type === "goal-set"
+          ? initialSlashCommand.objective
+          : (modelOneShot?.message ?? messageText);
+      let creationOptionsOverride: Partial<SendMessageOptions> | undefined = oneShot && {
+        ...oneShot.options,
+        muxMetadata: oneShotMetadata,
+      };
 
       if (skillInvocation) {
         if (!api) {
@@ -2137,13 +2160,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               skillInvocation.descriptor,
               skillInvocation.argumentText
             )
-          : undefined;
+          : oneShotMetadata;
         const muxMetadata = withAgentSkillRefs(baseMetadata, combinedSkillRefs);
         if (!muxMetadata) {
           throw new Error("Expected skill metadata when skill refs are present");
         }
 
         creationOptionsOverride = {
+          ...oneShot?.options,
           muxMetadata,
           // In the creation flow, project-scoped skills may not exist in the new worktree.
           // Force project-path discovery for this send so resolution matches suggestions.
@@ -2175,6 +2199,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       );
 
       if (creationResult.success) {
+        if (modelOneShot) {
+          trackCommandUsed("model");
+        }
         if (isMountedRef.current) {
           setInput("");
           setAttachments([]);
@@ -2207,20 +2234,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const runWorkspaceSend = async () => {
-      const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
       // Mirror the creation-composer /goal bypass: with attachments present,
       // send the raw text as a normal message instead of processing the
       // command, which would drop the files. Transferred staging-failure
       // drafts (raw /goal text + staged/pending chips) retry through here.
       const goalCommandBypassedForAttachments =
         parsed?.type === "goal-set" && attachments.length > 0;
-      const commandHandled =
-        modelOneShot || goalCommandBypassedForAttachments
-          ? false
-          : await executeParsedCommand(parsed, input, {
-              goalInterventionPolicy: overrides?.goalInterventionPolicy,
-              queueDispatchMode: overrides?.queueDispatchMode,
-            });
+      const commandHandled = goalCommandBypassedForAttachments
+        ? false
+        : await executeParsedCommand(parsed, input, {
+            goalInterventionPolicy: overrides?.goalInterventionPolicy,
+            queueDispatchMode: overrides?.queueDispatchMode,
+          });
       if (commandHandled) {
         return;
       }
@@ -2229,8 +2254,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       // command completion. If that older command fails after this send clears
       // the composer, it must not restore stale command text over the newer turn.
       asyncCommandTokenRef.current++;
-
-      const modelOverride = modelOneShot?.modelString;
 
       // Regular message (or /<model-alias> one-shot override) - send directly via API
       const messageTextForSend =
@@ -2285,8 +2308,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             commandPrefix: `/${mcpPromptInvocation.descriptor.commandKey}`,
           }
         : undefined;
-
-      const policyModel = modelOverride ?? baseModel;
 
       // Preflight: if the message includes PDFs, ensure the selected model can accept them.
       const pdfAttachments = attachments.filter(isPdfAttachment);
@@ -2399,7 +2420,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         }
 
         const preparedMessage = prepareMessagePayload({
-          messageText,
           messageTextForSend,
           attachments: sendAttachments,
           fileParts,
@@ -2417,8 +2437,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           compactionOptions,
           compactionMessageText: actualMessageText,
           appendStagedNotice: appendStagedNoticeToUserMessage,
-          modelOneShot,
-          policyModel,
+          oneShot:
+            modelOneShot &&
+            getModelOneShotOverrides(
+              modelOneShot,
+              messageText,
+              sendAttachments,
+              policyModel,
+              providersConfig
+            ),
           transferredDraftProjectDiscovery,
           additionalSystemContextHydrated,
           additionalSystemContext,

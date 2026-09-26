@@ -1,7 +1,12 @@
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import type { ChatAttachment } from "./ChatAttachments";
 import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
-import type { FilePart, HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
+import type {
+  FilePart,
+  HistoryEditPrecondition,
+  ProvidersConfigMap,
+  SendMessageOptions,
+} from "@/common/orpc/types";
 import {
   prepareUserMessageForSend,
   type AgentSkillReference,
@@ -18,8 +23,45 @@ import type { GoalInterventionPolicy, QueueDispatchMode } from "./types";
 
 type ModelOneShot = Extract<NonNullable<ParsedCommand>, { type: "model-oneshot" }>;
 
+/** Per-turn overrides for `/<model>[+level] message`, shared by workspace and creation sends. */
+export function getModelOneShotOverrides(
+  modelOneShot: ModelOneShot,
+  messageText: string,
+  attachments: ChatAttachment[],
+  policyModel: string,
+  // Resolves mapped model aliases so numeric levels index the real thinking ladder.
+  providersConfig: ProvidersConfigMap | null
+) {
+  const trimmedMessageText = messageText.trim();
+  const commandPrefix = trimmedMessageText
+    .slice(0, trimmedMessageText.length - modelOneShot.message.length)
+    .trimEnd();
+  const thinkingLevel =
+    modelOneShot.thinkingLevel != null
+      ? resolveThinkingInput(modelOneShot.thinkingLevel, policyModel, providersConfig)
+      : undefined;
+  return {
+    // rawCommand keeps the typed command for transcript display and draft restoration.
+    metadata: {
+      rawCommand: appendStagedAttachmentNotice(trimmedMessageText, attachments),
+      commandPrefix,
+    },
+    // A one-shot command is the user's explicit choice for this turn, per dimension: a
+    // model one-shot pins the model and a thinking override pins the level, so a
+    // thinking-only command (`/+2 hello`) leaves model Auto routing the turn.
+    options: {
+      skipAiSettingsPersistence: true,
+      ...(modelOneShot.modelString
+        ? { model: modelOneShot.modelString, autoModelRouting: false }
+        : {}),
+      ...(thinkingLevel ? { thinkingLevel, autoThinkingLevel: false } : {}),
+    } satisfies Partial<SendMessageOptions>,
+  };
+}
+
+type ModelOneShotOverrides = ReturnType<typeof getModelOneShotOverrides>;
+
 interface PrepareMessagePayloadInput {
-  messageText: string;
   messageTextForSend: string;
   attachments: ChatAttachment[];
   fileParts?: FilePart[];
@@ -35,8 +77,7 @@ interface PrepareMessagePayloadInput {
   compactionOptions?: Partial<SendMessageOptions>;
   compactionMessageText?: string;
   appendStagedNotice?: boolean;
-  modelOneShot?: ModelOneShot | null;
-  policyModel: string;
+  oneShot?: ModelOneShotOverrides;
   transferredDraftProjectDiscovery: boolean;
   additionalSystemContextHydrated: boolean;
   additionalSystemContext: { enabled: boolean; content: string };
@@ -89,27 +130,12 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
     compactionOptions.additionalSystemInstructions ??
     input.sendMessageOptions.additionalSystemInstructions;
   const effectiveModel =
-    input.modelOneShot?.modelString ?? compactionOptions.model ?? input.sendMessageOptions.model;
-  const trimmedMessageText = input.messageText.trim();
-  const commandPrefix = input.modelOneShot
-    ? trimmedMessageText
-        .slice(0, trimmedMessageText.length - input.modelOneShot.message.length)
-        .trimEnd()
-    : undefined;
-  const rawCommand = commandPrefix
-    ? appendStagedAttachmentNotice(trimmedMessageText, input.attachments)
-    : undefined;
+    input.oneShot?.options.model ?? compactionOptions.model ?? input.sendMessageOptions.model;
   metadata = {
     ...(prepared.metadata ?? { type: "normal" }),
     requestedModel: effectiveModel,
-    ...(rawCommand ? { rawCommand, commandPrefix } : {}),
+    ...input.oneShot?.metadata,
   };
-
-  const rawThinkingOverride = input.modelOneShot?.thinkingLevel;
-  const thinkingOverride =
-    rawThinkingOverride != null
-      ? resolveThinkingInput(rawThinkingOverride, input.policyModel)
-      : undefined;
 
   return {
     message: prepared.finalText,
@@ -121,14 +147,7 @@ export function prepareMessagePayload(input: PrepareMessagePayloadInput): Prepar
       ...(input.transferredDraftProjectDiscovery && hasProjectScopedSkillRef(input.agentSkillRefs)
         ? { disableWorkspaceAgents: true }
         : {}),
-      ...(input.modelOneShot?.modelString ? { model: input.modelOneShot.modelString } : {}),
-      ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
-      // A one-shot command is the user's explicit choice for this turn, per dimension: a
-      // model one-shot pins the model and a thinking override pins the level, so a
-      // thinking-only command (`/+2 hello`) leaves model Auto routing the turn.
-      ...(input.modelOneShot ? { skipAiSettingsPersistence: true } : {}),
-      ...(input.modelOneShot?.modelString ? { autoModelRouting: false } : {}),
-      ...(thinkingOverride ? { autoThinkingLevel: false } : {}),
+      ...input.oneShot?.options,
       ...(input.goalInterventionPolicy
         ? { goalInterventionPolicy: input.goalInterventionPolicy }
         : {}),
