@@ -11726,11 +11726,21 @@ export class WorkspaceService
     }
     // No in-process fencing needed: ensurePlanSnapshot re-checks the generation and the plan
     // file's existence under the history write lock (see its admission contract).
-    return ensurePlanSnapshot(this.planReviewHistoryDeps, {
+    const result = await ensurePlanSnapshot(this.planReviewHistoryDeps, {
       workspaceId,
       metadata,
       ...(proposalToolCallId !== undefined ? { proposalToolCallId } : {}),
     });
+    // The client only shows the error; log the skip so an oversized plan is visible server-side
+    // too, as the propose_plan capture path already does (#4421).
+    if (!result.success && result.error.type === "plan_too_large") {
+      log.warn("plan review: skipping on-demand snapshot, plan too large", {
+        workspaceId,
+        proposalToolCallId,
+        error: result.error.message,
+      });
+    }
+    return result;
   }
 
   planReviewSetThreadResolved(

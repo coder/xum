@@ -192,9 +192,9 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
     expect(refused.success).toBe(false);
     if (!refused.success) {
-      expect(refused.error).toMatchObject({
-        type: "unknown",
-        raw: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+      expect(refused.error).toEqual({
+        type: "plan_review_feedback_edit_blocked",
+        message: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
       });
     }
     expect(truncateAfterMessage).not.toHaveBeenCalled();
@@ -275,9 +275,9 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
 
     expect(refused.success).toBe(false);
     if (!refused.success) {
-      expect(refused.error).toMatchObject({
-        type: "unknown",
-        raw: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+      expect(refused.error).toEqual({
+        type: "plan_review_feedback_edit_blocked",
+        message: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
       });
     }
     expect(truncateAfterMessage).not.toHaveBeenCalled();

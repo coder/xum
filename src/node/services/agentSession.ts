@@ -4144,9 +4144,10 @@ export class AgentSession {
           )
         );
       if (feedbackTarget.data)
-        return refuseBeforeAcceptance(
-          createUnknownSendMessageError(PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE)
-        );
+        return refuseBeforeAcceptance({
+          type: "plan_review_feedback_edit_blocked",
+          message: PLAN_REVIEW_FEEDBACK_EDIT_BLOCKED_MESSAGE,
+        });
       // Reserve before interrupting: terminal policy can otherwise start queued work
       // while stopStream settles, leaving this edit waiting on the wrong turn.
       attempt.editReservation = this.coordinator.reserve("edit");

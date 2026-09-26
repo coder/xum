@@ -132,6 +132,8 @@ export const formatSendMessageError = (
       };
     case "history-changed":
       return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
+    case "plan_review_feedback_edit_blocked":
+      return { message: error.message, errorType: "unknown" };
   }
 };
 

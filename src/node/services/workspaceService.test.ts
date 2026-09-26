@@ -36,6 +36,8 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
+import { log } from "@/node/services/log";
+import { MAX_PLAN_SNAPSHOT_BYTES } from "@/constants/planReview";
 import { ensurePlanSnapshot, getPlanReviewState } from "./planReviewService";
 import { HistoryService } from "./historyService";
 
@@ -1211,6 +1213,46 @@ describe("WorkspaceService disposal ownership", () => {
       await service.disposeSession("dispose-replacement");
       await h.cleanup();
       await replacement.cleanup();
+    }
+  });
+});
+
+// #4421: an on-demand snapshot of an oversized plan is skipped; the server log must say so.
+describe("WorkspaceService.planReviewEnsureSnapshot oversized plan", () => {
+  const projectName = `plan-too-large-${process.pid}-${Date.now()}`;
+  const planDir = expandTilde(path.dirname(getPlanFilePath("x", projectName)));
+
+  afterEach(async () => {
+    mock.restore();
+    await fsPromises.rm(planDir, { recursive: true, force: true });
+  });
+
+  test("logs the skipped snapshot", async () => {
+    const harness = await createWorkspaceServiceHarness();
+    try {
+      const workspaceId = "plan-too-large";
+      const projectPath = path.join(harness.config.rootDir, projectName);
+      await harness.config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName,
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const planPath = expandTilde(getPlanFilePath(workspaceId, projectName));
+      await fsPromises.mkdir(path.dirname(planPath), { recursive: true });
+      await fsPromises.writeFile(planPath, "x".repeat(MAX_PLAN_SNAPSHOT_BYTES + 1));
+      const warn = spyOn(log, "warn");
+
+      const result = await harness.service.planReviewEnsureSnapshot(workspaceId);
+
+      expect(!result.success && result.error.type).toBe("plan_too_large");
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("plan review"),
+        expect.objectContaining({ workspaceId })
+      );
+    } finally {
+      await harness.cleanup();
     }
   });
 });

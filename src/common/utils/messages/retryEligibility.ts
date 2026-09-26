@@ -90,6 +90,7 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     case "policy_denied": // Policy blocks won't resolve automatically
     case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
     case "context_budget_blocked":
+    case "plan_review_feedback_edit_blocked": // Feedback rows never become editable
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":
