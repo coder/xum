@@ -27,7 +27,7 @@ import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 import type { ProjectConfig } from "@/common/types/project";
 import { shouldExposeLaunchProject } from "@/cli/launchProject";
-import { log } from "@/node/services/log";
+import { pushLogEntry } from "@/node/services/logBuffer";
 
 // --- Test Server Factory ---
 
@@ -239,9 +239,10 @@ describe("oRPC Server Endpoints", () => {
 
   // Every transport must carry unary calls and event-iterator subscriptions the same way.
   // The subscription is the real log feed the Output tab uses: its snapshot proves the
-  // subscription is live, and a line logged by the (in-process) server must then stream
-  // to the client. Logging is non-destructive; clearing logs would truncate the real
-  // log file when no isolated XUM_ROOT is set.
+  // subscription is live, and an entry pushed into the (in-process) server's log feed must
+  // then stream to the client. The probe goes into the in-memory feed only: logging or
+  // clearing through the logger would write to the real log file when no isolated
+  // XUM_ROOT is set.
   const transports: Array<{
     name: string;
     connect: () => Promise<{ client: RouterClient<AppRouter>; close: () => void }>;
@@ -287,7 +288,12 @@ describe("oRPC Server Endpoints", () => {
         }
 
         const probe = `transport subscription probe ${Math.random().toString(36).slice(2)}`;
-        log.info(probe);
+        pushLogEntry({
+          timestamp: Date.now(),
+          level: "info",
+          message: probe,
+          location: "server.test",
+        });
         // Other server log lines may arrive first; wait for the probe's append.
         let next = await iterator.next();
         while (
