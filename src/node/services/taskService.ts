@@ -3654,9 +3654,12 @@ export class TaskService implements AgentTaskIntegration {
       return undefined;
     }
     if (!committed) {
-      log.info("[startup] task skipped: a workflow claim retired its attempt, or it is being removed", {
-        taskId,
-      });
+      log.info(
+        "[startup] task skipped: a workflow claim retired its attempt, or it is being removed",
+        {
+          taskId,
+        }
+      );
       return undefined;
     }
     this.publishAttemptRotation(taskId, attemptId);

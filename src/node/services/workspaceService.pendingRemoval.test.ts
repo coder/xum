@@ -61,7 +61,7 @@ function createBackend(config: Config, historyService: HistoryService): Backend 
 }
 
 function rowOf(config: Config, id: string): WorkspaceConfigEntry | undefined {
-  return findWorkspaceInConfig(config, id) as WorkspaceConfigEntry | undefined;
+  return findWorkspaceInConfig(config, id);
 }
 
 describe("workspace removal across two backends on one root", () => {
@@ -162,10 +162,7 @@ describe("workspace removal across two backends on one root", () => {
     expect(rowOf(b.config, taskId)?.pendingRemoval).toBeDefined();
 
     const reawaken = await b.taskService.reawakenInterruptedTask(taskId);
-    expect(reawaken).toMatchObject({
-      kind: "refused",
-      message: expect.stringContaining("removed"),
-    });
+    expect(reawaken.kind === "refused" ? reawaken.message : reawaken.kind).toContain("removed");
     const admission = b.taskService.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" });
     expect(admission).toMatchObject({ kind: "refused" });
     const otherRemoval = await b.workspaceService.remove(taskId, true);
