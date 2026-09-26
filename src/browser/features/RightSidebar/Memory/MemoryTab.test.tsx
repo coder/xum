@@ -4,6 +4,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactElement, ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -66,11 +67,14 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
     listeners: new Set<(event: MemoryChangeEvent) => void>(),
   };
 
-  const api = {
+  const api: TestApiOverrides<APIClient> = {
     memory: {
-      list: (_input: { workspaceId: string }, _opts?: { signal?: AbortSignal }) =>
+      list: (_input: { workspaceId?: string | null }, _opts?: { signal?: AbortSignal }) =>
         Promise.resolve({ success: true as const, data: { files: state.files } }),
-      read: (input: { workspaceId: string; path: string }, _opts?: { signal?: AbortSignal }) => {
+      read: (
+        input: { workspaceId?: string | null; path: string },
+        _opts?: { signal?: AbortSignal }
+      ) => {
         const entry = state.contents.get(input.path);
         return Promise.resolve(
           entry
@@ -79,7 +83,7 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
         );
       },
       save: (input: {
-        workspaceId: string;
+        workspaceId?: string | null;
         path: string;
         content: string;
         expectedSha256: string | null;
@@ -105,30 +109,33 @@ function createFakeMemoryApi(initialFiles: MemoryFileInfo[], options: FakeMemory
           data: { sha256: `sha-${input.content}` },
         });
       },
-      delete: (input: { workspaceId: string; path: string }) => {
+      delete: (input: { workspaceId?: string | null; path: string }) => {
         state.deleteCalls.push(input.path);
         state.files = state.files.filter((file) => file.path !== input.path);
         return Promise.resolve({ success: true as const, data: undefined });
       },
-      setPinned: (input: { workspaceId: string; path: string; pinned: boolean }) => {
+      setPinned: (input: { workspaceId?: string | null; path: string; pinned: boolean }) => {
         state.pinCalls.push({ path: input.path, pinned: input.pinned });
         state.files = state.files.map((file) =>
           file.path === input.path ? { ...file, pinned: input.pinned } : file
         );
         return Promise.resolve({ success: true as const, data: undefined });
       },
-      consolidationStatus: (_input: { workspaceId: string }, _opts?: { signal?: AbortSignal }) => {
+      consolidationStatus: (
+        _input: { workspaceId?: string | null },
+        _opts?: { signal?: AbortSignal }
+      ) => {
         if (state.consolidationStatusFailuresRemaining > 0) {
           state.consolidationStatusFailuresRemaining -= 1;
           return Promise.reject(new Error("status unavailable"));
         }
         return Promise.resolve({ success: true as const, data: state.consolidationStatus });
       },
-      consolidate: (_input: { workspaceId: string }) => {
+      consolidate: (_input: { workspaceId?: string | null }) => {
         state.consolidateCalls += 1;
         return Promise.resolve({ success: true as const, data: state.consolidateRecord });
       },
-      onChange: (_input: { workspaceId: string }, opts?: { signal?: AbortSignal }) => {
+      onChange: (_input: { workspaceId?: string | null }, opts?: { signal?: AbortSignal }) => {
         async function* iterate(): AsyncGenerator<MemoryChangeEvent> {
           const queue: MemoryChangeEvent[] = [];
           let resolveNext: ((event: MemoryChangeEvent) => void) | null = null;
@@ -211,8 +218,7 @@ function ApiWrapper(props: { children: ReactNode }) {
   if (!fake) {
     throw new Error("Test bug: assign `fake` before rendering MemoryTab");
   }
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-  return <APIProvider client={fake.api as unknown as APIClient}>{props.children}</APIProvider>;
+  return <APIProvider client={createTestApiClient(fake.api)}>{props.children}</APIProvider>;
 }
 
 function renderWithApi(ui: ReactElement) {

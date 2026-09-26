@@ -1,7 +1,7 @@
 import { describe, expect, test, mock } from "bun:test";
-import type { APIClient } from "@/browser/contexts/API";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { cancelCompaction } from "./handler";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const STAGED_ATTACHMENT = {
   kind: "staged" as const,
@@ -18,15 +18,14 @@ describe("cancelCompaction", () => {
 
     const interruptStream = mock(() => {
       calls.push("interrupt");
-      return Promise.resolve({ success: true });
+      return Promise.resolve({ success: true as const, data: undefined });
     });
 
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-    const client = {
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const aggregator = {
       getAllMessages: () => [
@@ -69,13 +68,14 @@ describe("cancelCompaction", () => {
   });
 
   test("strips generated staged notices from raw compaction commands", async () => {
-    const interruptStream = mock(() => Promise.resolve({ success: true }));
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-    const client = {
+    const interruptStream = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const aggregator = {
       getAllMessages: () => [
@@ -123,15 +123,14 @@ describe("cancelCompaction", () => {
 
     const interruptStream = mock(() => {
       calls.push("interrupt");
-      return Promise.resolve({ success: true });
+      return Promise.resolve({ success: true as const, data: undefined });
     });
 
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-    const client = {
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const mockFilePart = {
       type: "file" as const,
@@ -184,13 +183,14 @@ describe("cancelCompaction", () => {
   });
 
   test("restores staged follow-up attachments without exposing the hidden notice", async () => {
-    const interruptStream = mock(() => Promise.resolve({ success: true }));
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-    const client = {
+    const interruptStream = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const aggregator = {
       getAllMessages: () => [
