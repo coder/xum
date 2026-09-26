@@ -6,7 +6,15 @@ import type { UpdateStatus } from "@/common/orpc/types";
 import { APIContext, type APIClient } from "@/browser/contexts/API";
 import { installDom } from "../../../../tests/ui/dom";
 import { ThemeProvider } from "../../contexts/ThemeContext";
+import * as RealDarkLogoModule from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import * as RealLightLogoModule from "@/browser/assets/logos/xum-logo-light.svg?react";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
+// Restore the real logo modules after this suite so the stubs cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/assets/logos/xum-logo-dark.svg?react", { ...RealDarkLogoModule }],
+  ["@/browser/assets/logos/xum-logo-light.svg?react", { ...RealLightLogoModule }],
+]);
 // SVG ?react imports don't work in happy-dom; stub them as simple svgs.
 void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
   __esModule: true,

@@ -5,6 +5,9 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const useAdvisorToolLiveOutputMock = mock(
   (
@@ -32,6 +35,11 @@ const actualWorkspaceStore =
   require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
+  ["@/browser/features/Tools/Shared/ElapsedTimeDisplay", { ...RealElapsedTimeDisplayModule }],
+]);
 void mock.module("@/browser/stores/WorkspaceStore", () => ({
   ...actualWorkspaceStore,
   useAdvisorToolLiveOutput: useAdvisorToolLiveOutputMock,
@@ -39,7 +47,7 @@ void mock.module("@/browser/stores/WorkspaceStore", () => ({
   useAdvisorToolLiveReasoning: useAdvisorToolLiveReasoningMock,
 }));
 
-void mock.module("./Shared/ElapsedTimeDisplay", () => ({
+void mock.module("@/browser/features/Tools/Shared/ElapsedTimeDisplay", () => ({
   ElapsedTimeDisplay: ({
     startedAt,
     isActive,

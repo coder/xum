@@ -13,6 +13,8 @@ import type {
   BrowserPageTab,
   BrowserSession,
 } from "./browserBridgeTypes";
+import * as RealBrowserBridgeConnectionModule from "@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection";
+import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 
 const listSessionsMock = mock(() =>
   Promise.resolve({
@@ -59,7 +61,14 @@ function renderWithApi(ui: ReactElement) {
 // GeneralSection CI failures once the CommandPalette suite — whose imports used to load
 // the real module graph first — moved out of the monolithic pass).
 
-void mock.module("./useBrowserBridgeConnection", () => ({
+// Restore the real hook after this suite so the stub cannot leak into later files.
+restoreModulesAfterSuite([
+  [
+    "@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection",
+    { ...RealBrowserBridgeConnectionModule },
+  ],
+]);
+void mock.module("@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection", () => ({
   useBrowserBridgeConnection: () => ({
     session: mockSession,
     connect: connectMock,

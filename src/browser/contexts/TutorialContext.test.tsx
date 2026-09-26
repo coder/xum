@@ -6,7 +6,15 @@ import {
   TUTORIAL_STATE_KEY,
   type TutorialState,
 } from "@/common/constants/storage";
+import * as RealTutorialTooltipModule from "@/browser/components/TutorialTooltip/TutorialTooltip";
+import * as RealSplashScreenProviderModule from "@/browser/features/SplashScreens/SplashScreenProvider";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/components/TutorialTooltip/TutorialTooltip", { ...RealTutorialTooltipModule }],
+  ["@/browser/features/SplashScreens/SplashScreenProvider", { ...RealSplashScreenProviderModule }],
+]);
 void mock.module("@/browser/components/TutorialTooltip/TutorialTooltip", () => ({
   TutorialTooltip: (props: { step: { title: string } }) => (
     <div data-testid="tutorial-tooltip">{props.step.title}</div>

@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { SavedQuery } from "@/common/types/savedQueries";
 import * as RealUseAnalyticsModule from "@/browser/hooks/useAnalytics";
+import * as RealSavedQuerySqlDialogModule from "@/browser/features/Analytics/SavedQuerySqlDialog";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const executeQueryMock = mock(() => Promise.resolve());
@@ -16,12 +17,15 @@ const useAnalyticsRawQueryMock = mock(() => ({
 
 // The stub below exports only useAnalyticsRawQuery; restore the real hooks afterwards so later
 // suites (useAnalytics.test) do not import undefined hooks.
-restoreModulesAfterSuite([["@/browser/hooks/useAnalytics", { ...RealUseAnalyticsModule }]]);
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useAnalytics", { ...RealUseAnalyticsModule }],
+  ["@/browser/features/Analytics/SavedQuerySqlDialog", { ...RealSavedQuerySqlDialogModule }],
+]);
 void mock.module("@/browser/hooks/useAnalytics", () => ({
   useAnalyticsRawQuery: useAnalyticsRawQueryMock,
 }));
 
-void mock.module("./SavedQuerySqlDialog", () => ({
+void mock.module("@/browser/features/Analytics/SavedQuerySqlDialog", () => ({
   SavedQuerySqlDialog: (props: {
     open: boolean;
     label: string;

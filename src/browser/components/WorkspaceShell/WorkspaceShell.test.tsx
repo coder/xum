@@ -4,6 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { cleanup, render } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as RealLottieModule from "lottie-react";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import * as RealChatPaneModule from "@/browser/components/ChatPane/ChatPane";
+import * as RealRightSidebarModule from "@/browser/features/RightSidebar/RightSidebar";
+import * as RealThemeContextModule from "@/browser/contexts/ThemeContext";
+import * as RealBackgroundBashContextModule from "@/browser/contexts/BackgroundBashContext";
+import * as RealOpenTerminalModule from "@/browser/hooks/useOpenTerminal";
+import * as RealReviewsModule from "@/browser/hooks/useReviews";
+import * as RealConnectionStatusToastModule from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 interface MockWorkspaceState {
   loading?: boolean;
@@ -20,6 +30,22 @@ let originalWindowApi: WindowApi | undefined;
 const openTerminalMock = mock(() => Promise.resolve());
 const addReviewMock = mock(() => undefined);
 
+// Restore every module stubbed below (including the per-test WorkspaceStore double) after
+// this suite so the stubs cannot leak into later files.
+restoreModulesAfterSuite([
+  ["lottie-react", { ...RealLottieModule }],
+  ["@/browser/stores/WorkspaceStore", { ...RealWorkspaceStoreModule }],
+  ["@/browser/components/ChatPane/ChatPane", { ...RealChatPaneModule }],
+  ["@/browser/features/RightSidebar/RightSidebar", { ...RealRightSidebarModule }],
+  ["@/browser/contexts/ThemeContext", { ...RealThemeContextModule }],
+  ["@/browser/contexts/BackgroundBashContext", { ...RealBackgroundBashContextModule }],
+  ["@/browser/hooks/useOpenTerminal", { ...RealOpenTerminalModule }],
+  ["@/browser/hooks/useReviews", { ...RealReviewsModule }],
+  [
+    "@/browser/components/ConnectionStatusToast/ConnectionStatusToast",
+    { ...RealConnectionStatusToastModule },
+  ],
+]);
 // Mock lottie-react before importing WorkspaceShell.
 void mock.module("lottie-react", () => ({
   __esModule: true,
@@ -44,7 +70,7 @@ function installTestDoubles() {
   }));
 }
 
-void mock.module("../ChatPane/ChatPane", () => ({
+void mock.module("@/browser/components/ChatPane/ChatPane", () => ({
   ChatPane: (props: { workspaceId: string }) => (
     <div data-testid="chat-pane">Chat pane for {props.workspaceId}</div>
   ),
@@ -76,7 +102,7 @@ void mock.module("@/browser/hooks/useReviews", () => ({
   }),
 }));
 
-void mock.module("../ConnectionStatusToast/ConnectionStatusToast", () => ({
+void mock.module("@/browser/components/ConnectionStatusToast/ConnectionStatusToast", () => ({
   ConnectionStatusToast: () => null,
 }));
 

@@ -2,12 +2,20 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { GoalSnapshot } from "@/common/types/goal";
+import * as RealGoalDefaultsModalModule from "@/browser/features/RightSidebar/GoalDefaultsModal";
+import * as RealGoalBoardSectionsModule from "@/browser/features/RightSidebar/GoalBoardSections";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 // No APIProvider and no contexts/API module mock: GoalTab, `useGoalDefaults` and
 // `useGoalBoard` read `APIContext` directly and fall back to canonical defaults when it is
 // null (the real context's default), matching Storybook rendering without a provider. A
 // module mock here would leak process-wide into later-evaluated suites.
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/features/RightSidebar/GoalDefaultsModal", { ...RealGoalDefaultsModalModule }],
+  ["@/browser/features/RightSidebar/GoalBoardSections", { ...RealGoalBoardSectionsModule }],
+]);
 // `GoalDefaultsModal` opens a Radix Dialog with portaled content that
 // happy-dom can't render. The test never opens the modal — only that
 // the trigger button exists — so a stub here keeps the form tree

@@ -6,6 +6,9 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 import type { ReactNode } from "react";
 import { APIProvider } from "@/browser/contexts/API";
+import * as RealGhosttyModule from "ghostty-web";
+import * as RealTerminalRouterContextModule from "@/browser/terminal/TerminalRouterContext";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 interface TerminalSubscribeCallbacks {
   onOutput: (data: string) => void;
@@ -99,6 +102,11 @@ class MockFitAddon {
   proposeDimensions = mock(() => ({ cols: 80, rows: 24 }));
 }
 
+// Restore the real modules after this suite so the stubs below cannot leak into later files.
+restoreModulesAfterSuite([
+  ["ghostty-web", { ...RealGhosttyModule }],
+  ["@/browser/terminal/TerminalRouterContext", { ...RealTerminalRouterContextModule }],
+]);
 void mock.module("ghostty-web", () => ({
   init: initMock,
   Terminal: MockTerminal,

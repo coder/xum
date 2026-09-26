@@ -7,8 +7,27 @@ import { useTheme } from "../../contexts/ThemeContext";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as realAPI from "@/browser/contexts/API";
+import * as realDarkLogo from "@/browser/assets/logos/xum-logo-dark.svg?react";
+import * as realLightLogo from "@/browser/assets/logos/xum-logo-light.svg?react";
+import * as realLottie from "lottie-react";
+import * as realLoadingScreen from "@/browser/components/LoadingScreen/LoadingScreen";
+import * as realStartupConnectionError from "@/browser/components/StartupConnectionError/StartupConnectionError";
+import * as realAuthTokenModal from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
-restoreModulesAfterSuite([["@/browser/contexts/API", { ...realAPI }]]);
+// Restore every module stubbed below once this suite finishes so none of them leak into
+// later files.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/API", { ...realAPI }],
+  ["@/browser/assets/logos/xum-logo-dark.svg?react", { ...realDarkLogo }],
+  ["@/browser/assets/logos/xum-logo-light.svg?react", { ...realLightLogo }],
+  ["lottie-react", { ...realLottie }],
+  ["@/browser/components/LoadingScreen/LoadingScreen", { ...realLoadingScreen }],
+  [
+    "@/browser/components/StartupConnectionError/StartupConnectionError",
+    { ...realStartupConnectionError },
+  ],
+  ["@/browser/components/AuthTokenModal/AuthTokenModal", { ...realAuthTokenModal }],
+]);
 
 let cleanupDom: (() => void) | null = null;
 
