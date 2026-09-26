@@ -911,7 +911,7 @@ describe("StreamManager - turn completion", () => {
     });
   });
 
-  test("completed, failed, and debug-injected turns settle once after their terminal event", async () => {
+  test("completed and failed turns settle once after their terminal event; a failed turn stays settled after stop", async () => {
     const completedEvents: TurnEngineEvent[] = [];
     const completed = await startWithStreamResult({
       workspaceId: "completion-success-workspace",

@@ -7,7 +7,8 @@
  * Why: the 2026-09 test audit found production exports and options that existed only
  * so tests could reach private state. Such seams couple tests to internals and ship
  * dead surface. New seams must either get a production caller (then allowlist them
- * with that caller as the reason) or move into test support code.
+ * with that caller as the reason), be a deliberate injection point (allowlist them
+ * with the contract the test witnesses through it), or move into test support code.
  *
  * Entries are keyed by file + symbol, not line numbers, so unrelated edits don't
  * break them. An entry that no longer matches any comment fails too, so the list
@@ -40,7 +41,18 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   /\btests?(?:\/debug)?\s+visibility\s+only\b/i,
   // "Test-only: reset ...", "(test-only, not for production use)", "Test-only seams".
   /\btest[- ]only(?:\s*[:,)]|\s+seams?\b)/i,
+  // Honest phrasings that say the same thing without "test": "No production caller: ...",
+  // "Has no non-test consumers." The claim must be a whole sentence (start of the comment or
+  // after a full stop, ending at . or : or the comment end), so invariants such as "No
+  // production callers pass null" or "Skip delivery (no production consumers)" stay quiet.
+  /(?:^|[.!?]\s)\s*(?:has\s+)?no\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:]|$))/i,
+  // "overridable for tests only", "set by tests only". The seam verb is required so behavior
+  // notes such as "runs in tests only when isolation is enabled" stay quiet.
+  /\b(?:overridable|overridden|settable|set|passed|injected|kept)\s+(?:for|by|in)\s+tests\s+only\b/i,
 ];
+
+/** Unanchored twin of the no-caller pattern, used only by the whole-file prefilter. */
+const NO_CALLER_PREFILTER = /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i;
 
 export const ALLOWLIST_PATH = "scripts/check-test-seam-comments.allowlist.json";
 
@@ -248,8 +260,10 @@ function coalesceLineComments(text: string, comments: OwnedComment[]): OwnedComm
 
 /** Finds seam comments in one file. `file` is only used for reporting and TSX detection. */
 export function findSeamComments(file: string, text: string): SeamComment[] {
-  // Cheap prefilter: most files never mention a seam phrase anywhere.
-  if (firstMatch(commentBody(text)) === undefined) return [];
+  // Cheap prefilter: most files never mention a seam phrase anywhere. Collapsing the whole file
+  // loses comment and sentence starts, so the anchored no-caller pattern gets a loose twin here.
+  const fileBody = commentBody(text);
+  if (firstMatch(fileBody) === undefined && !NO_CALLER_PREFILTER.test(fileBody)) return [];
   const sourceFile = ts.createSourceFile(
     file,
     text,
@@ -316,7 +330,11 @@ export interface AllowlistEntry {
 }
 
 /**
- * `allowed`: seams with a production caller (named in the reason) or ...ForTests reset hooks.
+ * `allowed`: seams with a production caller (named in the reason), ...ForTests reset hooks, or
+ * deliberate injection points: a clock/timer/transport injection that keeps a test fast and
+ * deterministic, an interleaving hook that is the only way to witness an ordering contract, or a
+ * read-only observation getter that is the only way to witness a retention contract.
+ * The reason names the test and the contract it witnesses.
  * `knownDebt`: seams that existed without a production caller when this guard landed. It may
  * only shrink; do not add to it.
  */
@@ -412,12 +430,14 @@ function main(): number {
         "",
         "Production code should not grow exports or options that only tests use.",
         "Test through a public API, or move the helper into a test support file.",
-        `If the symbol has a production caller (or is a clearly named ...ForTests reset hook),`,
-        `add it to "allowed" in ${ALLOWLIST_PATH} and name that caller in the reason`,
+        `If the symbol has a production caller, is a clearly named ...ForTests reset hook, is a`,
+        `deliberate clock/timer/transport or interleaving injection point, or is a read-only getter`,
+        `that is the only witness of a retention contract, add it to "allowed" in`,
+        `${ALLOWLIST_PATH} and name that caller (or the test and the contract it witnesses) in the reason`,
         `("knownDebt" is a shrink-only baseline; do not add to it):`,
         ...unlisted.map(
           (comment) =>
-            `  { "file": "${comment.file}", "symbol": "${comment.symbol}", "reason": "<production caller>" }`
+            `  { "file": "${comment.file}", "symbol": "${comment.symbol}", "reason": "<production caller, or the test and the contract it witnesses>" }`
         ),
       ].join("\n")
     );
