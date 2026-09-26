@@ -700,9 +700,8 @@ describe("WorkspaceService regenerateTitle", () => {
         modelUsed: "anthropic:claude-3-5-haiku-latest",
       })
     );
-    const updateTitleSpy = spyOn(workspaceService, "updateTitle").mockResolvedValueOnce(
-      Ok(undefined)
-    );
+    // Records the call; the real updateTitle persists into the harness Config.
+    const updateTitleSpy = spyOn(workspaceService, "updateTitle");
 
     try {
       const result = await workspaceService.regenerateTitle(workspaceId);
@@ -753,9 +752,8 @@ describe("WorkspaceService regenerateTitle", () => {
         modelUsed: "anthropic:claude-3-5-haiku-latest",
       })
     );
-    const updateTitleSpy = spyOn(workspaceService, "updateTitle").mockResolvedValueOnce(
-      Ok(undefined)
-    );
+    // Records the call; the real updateTitle persists into the harness Config.
+    const updateTitleSpy = spyOn(workspaceService, "updateTitle");
 
     try {
       const result = await workspaceService.regenerateTitle(workspaceId);
