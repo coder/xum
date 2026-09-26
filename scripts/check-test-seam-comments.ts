@@ -42,13 +42,17 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Test-only: reset ...", "(test-only, not for production use)", "Test-only seams".
   /\btest[- ]only(?:\s*[:,)]|\s+seams?\b)/i,
   // Honest phrasings that say the same thing without "test": "No production caller: ...",
-  // "Has no non-test consumers." The claim must end there, so invariants such as
-  // "No production callers pass null" stay quiet.
-  /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:)]|$))/i,
+  // "Has no non-test consumers." The claim must be a whole sentence (start of the comment or
+  // after a full stop, ending at . or : or the comment end), so invariants such as "No
+  // production callers pass null" or "Skip delivery (no production consumers)" stay quiet.
+  /(?:^|[.!?]\s)\s*(?:has\s+)?no\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:]|$))/i,
   // "overridable for tests only", "set by tests only". The seam verb is required so behavior
   // notes such as "runs in tests only when isolation is enabled" stay quiet.
   /\b(?:overridable|overridden|settable|set|passed|injected|kept)\s+(?:for|by|in)\s+tests\s+only\b/i,
 ];
+
+/** Unanchored twin of the no-caller pattern, used only by the whole-file prefilter. */
+const NO_CALLER_PREFILTER = /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i;
 
 export const ALLOWLIST_PATH = "scripts/check-test-seam-comments.allowlist.json";
 
@@ -256,8 +260,10 @@ function coalesceLineComments(text: string, comments: OwnedComment[]): OwnedComm
 
 /** Finds seam comments in one file. `file` is only used for reporting and TSX detection. */
 export function findSeamComments(file: string, text: string): SeamComment[] {
-  // Cheap prefilter: most files never mention a seam phrase anywhere.
-  if (firstMatch(commentBody(text)) === undefined) return [];
+  // Cheap prefilter: most files never mention a seam phrase anywhere. Collapsing the whole file
+  // loses comment and sentence starts, so the anchored no-caller pattern gets a loose twin here.
+  const fileBody = commentBody(text);
+  if (firstMatch(fileBody) === undefined && !NO_CALLER_PREFILTER.test(fileBody)) return [];
   const sourceFile = ts.createSourceFile(
     file,
     text,
@@ -431,7 +437,7 @@ function main(): number {
         `("knownDebt" is a shrink-only baseline; do not add to it):`,
         ...unlisted.map(
           (comment) =>
-            `  { "file": "${comment.file}", "symbol": "${comment.symbol}", "reason": "<production caller>" }`
+            `  { "file": "${comment.file}", "symbol": "${comment.symbol}", "reason": "<production caller, or the test and the contract it witnesses>" }`
         ),
       ].join("\n")
     );
