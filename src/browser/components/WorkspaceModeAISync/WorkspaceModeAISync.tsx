@@ -6,6 +6,7 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import {
+  getAutoRoutingChoiceByAgentKey,
   getModelKey,
   getReasoningModeKey,
   getThinkingLevelKey,
@@ -14,14 +15,18 @@ import {
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import {
-  leaveAutoRoutingForAgentSwitch,
+  applyAutoRoutingOutcome,
   setWorkspaceModelWithOrigin,
   setWorkspaceThinkingLevelWithOrigin,
 } from "@/browser/utils/modelChange";
 import {
+  resolveAutoRoutingForAgent,
   resolveWorkspaceAiSettingsForAgent,
+  type AutoRoutingChoiceByAgent,
   type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { normalizeAgentId } from "@/common/utils/agentIds";
@@ -29,6 +34,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 export function WorkspaceModeAISync(props: { workspaceId: string }): null {
   const workspaceId = props.workspaceId;
   const { agentId, agents } = useAgent();
+  const autoRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
 
   const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
     AGENT_AI_DEFAULTS_KEY,
@@ -71,6 +77,7 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     const reasoningKey = getReasoningModeKey(workspaceId);
     const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
 
+    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
     const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
       resolveWorkspaceAiSettingsForAgent({
         agentId: normalizedAgentId,
@@ -84,12 +91,21 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         existingModel,
         existingThinking,
         existingReasoningMode: existingReasoning,
-        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+        agentBaseById,
       });
+    const autoRoutingOutcome = resolveAutoRoutingForAgent({
+      agentId: normalizedAgentId,
+      agentAiDefaults,
+      agentBaseById,
+      explicitSwitch: isExplicitAgentSwitch,
+      experimentEnabled: autoRoutingEnabled,
+      routingChoices: readPersistedState<AutoRoutingChoiceByAgent>(
+        getAutoRoutingChoiceByAgentKey(workspaceId),
+        {}
+      ),
+      workspaceByAgent,
+    });
 
-    if (isExplicitAgentSwitch) {
-      leaveAutoRoutingForAgentSwitch(workspaceId);
-    }
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(
         workspaceId,
@@ -109,7 +125,9 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     if (existingReasoning !== resolvedReasoningMode) {
       updatePersistedState(reasoningKey, resolvedReasoningMode);
     }
-  }, [agentAiDefaults, agentId, agents, workspaceId]);
+
+    applyAutoRoutingOutcome(workspaceId, autoRoutingOutcome);
+  }, [agentAiDefaults, agentId, agents, autoRoutingEnabled, workspaceId]);
 
   return null;
 }

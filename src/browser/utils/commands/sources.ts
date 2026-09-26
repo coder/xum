@@ -6,7 +6,7 @@ import type { ConfirmDialogOptions } from "@/browser/contexts/ConfirmDialogConte
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { PinnedMoveDirection } from "@/browser/utils/ui/pinnedReorder";
-import type { AutoRoutingDimension } from "@/browser/hooks/useSendMessageOptions";
+import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
 import {
   THINKING_LEVELS,
   type OpenAIReasoningMode,

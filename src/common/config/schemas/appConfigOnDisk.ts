@@ -48,6 +48,11 @@ export const AgentAiDefaultsEntrySchema = z.object({
   // Sparse like the other fields: only explicit "pro" is persisted; absent
   // inherits the workspace's current reasoning mode.
   reasoningMode: OpenAIReasoningModeSchema.optional(),
+  // Interactive-only Auto routing defaults (auto-model-routing experiment): only
+  // `true` is persisted, and the concrete value above stays the routing fallback.
+  // Delegated profiles never route, so `subagent` has no counterpart.
+  autoModelRouting: z.boolean().optional(),
+  autoThinkingLevel: z.boolean().optional(),
   enabled: z.boolean().optional(),
   advisorEnabled: z.boolean().optional(),
   subagent: AgentAiSubagentProfileSchema.optional(),

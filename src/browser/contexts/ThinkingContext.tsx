@@ -13,7 +13,6 @@ import {
 } from "@/browser/hooks/usePersistedState";
 import {
   getAgentIdKey,
-  getAutoThinkingLevelKey,
   getModelKey,
   getProjectScopeId,
   getReasoningModeKey,
@@ -34,6 +33,7 @@ import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { markAiSelectionIntent } from "@/browser/utils/aiSelectionIntent";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 
 interface ThinkingContextType {
   thinkingLevel: ThinkingLevel;
@@ -203,7 +203,7 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       }
       // A concrete pick (selector row or keybind step) leaves thinking Auto,
       // mirroring setWorkspaceModelWithOrigin for the model dimension.
-      updatePersistedState(getAutoThinkingLevelKey(scopeId), false);
+      setAutoRoutingChoice(scopeId, "thinkingLevel", false);
       persistAgentAiSettings({
         model,
         thinkingLevel: level,

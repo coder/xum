@@ -15,15 +15,23 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  getAutoRoutingKey,
+  recordAutoRoutingChoiceForAgent,
+  setWorkspaceModelWithOrigin,
+  type AutoRoutingDimension,
+} from "@/browser/utils/modelChange";
+import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
+import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
+  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getInputKey,
   getInputAttachmentsKey,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
   getModelKey,
   getNotifyOnResponseAutoEnableKey,
   getNotifyOnResponseKey,
@@ -109,9 +117,15 @@ interface UseCreationWorkspaceOptions {
   dynamicWorkflowsEnabled?: boolean;
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
+  /** Agent id -> base id, for resolving the new workspace agent's configured Auto defaults. */
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
 }
 
-function syncCreationPreferences(projectPath: string, workspaceId: string): void {
+function syncCreationPreferences(
+  projectPath: string,
+  workspaceId: string,
+  agentBaseById: ReadonlyMap<string, string | undefined> | undefined
+): void {
   const projectScopeId = getProjectScopeId(projectPath);
 
   // Sync model from project scope to workspace scope
@@ -120,14 +134,6 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
   if (projectModel) {
     setWorkspaceModelWithOrigin(workspaceId, projectModel, "sync");
   }
-  // The creation composer's Auto choices are keyed to the project scope; the new
-  // workspace's composer must keep reading Auto rather than the fallback model/level.
-  for (const getAutoKey of [getAutoModelRoutingKey, getAutoThinkingLevelKey]) {
-    if (readPersistedState<boolean>(getAutoKey(projectScopeId), false) === true) {
-      updatePersistedState(getAutoKey(workspaceId), true);
-    }
-  }
-
   const projectAgentId = readPersistedState<string | null>(getAgentIdKey(projectScopeId), null);
   const globalDefaultAgentId = readPersistedState<string>(
     getAgentIdKey(GLOBAL_SCOPE_ID),
@@ -138,6 +144,37 @@ function syncCreationPreferences(projectPath: string, workspaceId: string): void
       ? normalizeAgentId(projectAgentId, WORKSPACE_DEFAULTS.agentId)
       : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId);
   updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
+
+  // The creation composer's Auto choices are keyed to the project scope; the new
+  // workspace's composer must keep reading Auto rather than the fallback model/level.
+  // Only a state that differs from the agent's configured Auto default is an explicit
+  // creation pick worth keeping as the workspace's routing choice; recording a
+  // default-derived state would freeze it against later Settings changes.
+  const configuredDefaults = resolveConfiguredAiDefaults(
+    effectiveAgentId,
+    readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}),
+    agentBaseById
+  );
+  const routingChoice: Partial<Record<AutoRoutingDimension, boolean>> = {};
+  for (const [dimension, configuredAuto] of [
+    ["model", configuredDefaults.autoModelRouting === true],
+    ["thinkingLevel", configuredDefaults.autoThinkingLevel === true],
+  ] as const) {
+    const creationAuto =
+      readPersistedState<boolean>(getAutoRoutingKey(projectScopeId, dimension), false) === true;
+    if (creationAuto) {
+      updatePersistedState(getAutoRoutingKey(workspaceId, dimension), true);
+    }
+    if (creationAuto !== configuredAuto) {
+      routingChoice[dimension] = creationAuto;
+    }
+  }
+  if (
+    Object.keys(routingChoice).length > 0 &&
+    isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING) === true
+  ) {
+    recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
+  }
 
   const projectThinkingLevel = readPersistedState<ThinkingLevel | null>(
     getThinkingLevelKey(projectScopeId),
@@ -326,6 +363,7 @@ export function useCreationWorkspace({
   draftId,
   dynamicWorkflowsEnabled = false,
   userModel,
+  agentBaseById,
 }: UseCreationWorkspaceOptions): UseCreationWorkspaceReturn {
   const workspaceContext = useOptionalWorkspaceContext();
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
@@ -343,6 +381,9 @@ export function useCreationWorkspace({
 
   // Keep router state fresh synchronously so auto-navigation checks don't lag behind route changes.
   latestRouteRef.current = { currentWorkspaceId, currentProjectId, pendingDraftId };
+  // Read through a ref so a per-render agent map does not destabilize handleSend.
+  const agentBaseByIdRef = useRef(agentBaseById);
+  agentBaseByIdRef.current = agentBaseById;
   const { api } = useAPI();
   const { getProjectConfig, refreshProjects, loading: projectsLoading } = useProjectContext();
   const { config: providersConfig } = useProvidersConfig();
@@ -695,7 +736,7 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(projectPath, metadata.id);
+        syncCreationPreferences(projectPath, metadata.id, agentBaseByIdRef.current);
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).

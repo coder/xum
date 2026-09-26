@@ -64,7 +64,6 @@ import { isWorkspaceForkSwitchEvent } from "./utils/workspaceEvents";
 import {
   getAgentIdKey,
   getAgentsInitNudgeKey,
-  getAutoThinkingLevelKey,
   getModelKey,
   getNotifyOnResponseKey,
   getProjectScopeId,
@@ -116,7 +115,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { getAutoRoutingKey } from "@/browser/hooks/useSendMessageOptions";
+import { getAutoRoutingKey, setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
@@ -577,7 +576,7 @@ function AppInner() {
       updatePersistedState(key, normalized);
       markAiSelectionIntent(workspaceId, "thinkingLevel", normalized);
       // The palette bypasses ThinkingProvider.setThinkingLevel, so leave Auto here too.
-      updatePersistedState(getAutoThinkingLevelKey(workspaceId), false);
+      setAutoRoutingChoice(workspaceId, "thinkingLevel", false);
 
       type WorkspaceAISettingsByAgentCache = Partial<
         Record<
@@ -980,7 +979,7 @@ function AppInner() {
     getAutoRouting: (scopeId, dimension) =>
       readPersistedState<boolean>(getAutoRoutingKey(scopeId, dimension), false) === true,
     onSetAutoRouting: (scopeId, dimension, active) =>
-      updatePersistedState(getAutoRoutingKey(scopeId, dimension), active),
+      setAutoRoutingChoice(scopeId, dimension, active),
     getEffectiveComposerModel: getModelForWorkspace,
     providersConfig,
     getRouteForModel,

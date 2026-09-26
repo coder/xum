@@ -7,18 +7,18 @@ import {
   buildSendMessageOptions,
   normalizeModelPreference,
 } from "@/browser/utils/messages/buildSendMessageOptions";
-import {
-  DEFAULT_MODEL_KEY,
-  getAutoModelRoutingKey,
-  getAutoThinkingLevelKey,
-  getModelKey,
-} from "@/common/constants/storage";
+import { DEFAULT_MODEL_KEY, getModelKey } from "@/common/constants/storage";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { useProviderOptions } from "./useProviderOptions";
 import { useExperimentOverrideValue, useExperimentValue } from "./useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { resolveEffectiveComposerModel } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  getAutoRoutingKey,
+  setAutoRoutingChoice,
+  type AutoRoutingDimension,
+} from "@/browser/utils/modelChange";
 
 /**
  * Extended send options that includes both the canonical model used for backend routing
@@ -29,36 +29,24 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
   baseModel: string;
 }
 
-/** The composer dimensions Auto can take over, each with its own persisted flag. */
-export type AutoRoutingDimension = "model" | "thinkingLevel";
-
-const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (workspaceId: string) => string> =
-  {
-    model: getAutoModelRoutingKey,
-    thinkingLevel: getAutoThinkingLevelKey,
-  };
-
-/** Persisted-state key of one Auto dimension's flag; the palette reads and writes it outside React. */
-export function getAutoRoutingKey(scopeId: string, dimension: AutoRoutingDimension): string {
-  return AUTO_ROUTING_KEY_BY_DIMENSION[dimension](scopeId);
-}
-
 /**
  * Composer Auto selection for one dimension (auto-model-routing experiment),
  * workspace-scoped and forced off while the experiment is disabled so a stale
- * persisted true cannot reach the backend.
+ * persisted true cannot reach the backend. The setter is for user picks only:
+ * it also records the pick as the workspace's routing choice for the active agent.
  */
 export function useAutoRoutingSelection(
   workspaceId: string,
   dimension: AutoRoutingDimension
 ): [active: boolean, setActive: (active: boolean) => void] {
   const experimentEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
-  const [persisted, setPersisted] = usePersistedState<boolean>(
-    getAutoRoutingKey(workspaceId, dimension),
-    false,
-    { listener: true }
-  );
-  return [experimentEnabled && persisted === true, setPersisted];
+  const [persisted] = usePersistedState<boolean>(getAutoRoutingKey(workspaceId, dimension), false, {
+    listener: true,
+  });
+  return [
+    experimentEnabled && persisted === true,
+    (active) => setAutoRoutingChoice(workspaceId, dimension, active),
+  ];
 }
 
 /**

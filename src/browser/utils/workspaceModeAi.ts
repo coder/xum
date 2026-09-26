@@ -10,6 +10,7 @@ import {
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
+import type { AutoRoutingDimension } from "@/browser/utils/modelChange";
 
 export type WorkspaceAISettingsCache = Partial<
   Record<
@@ -38,16 +39,46 @@ export function resolveConfiguredAiDefaults(
   agentId: string,
   agentAiDefaults: AgentAiDefaults,
   agentBaseById?: ReadonlyMap<string, string | undefined>
-): { modelString?: string; thinkingLevel?: ThinkingLevel; reasoningMode?: OpenAIReasoningMode } {
+): {
+  modelString?: string;
+  thinkingLevel?: ThinkingLevel;
+  reasoningMode?: OpenAIReasoningMode;
+  /** Present only when the nearest config layer deciding the dimension chose Auto. */
+  autoModelRouting?: true;
+  autoThinkingLevel?: true;
+} {
   const normalizedAgentId = normalizeAgentId(agentId);
   const descriptorsById = new Map([...(agentBaseById ?? [])].map(([id, base]) => [id, { base }]));
+  const ancestors = collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById);
   const resolved = resolveAgentAiSettings({
     targetAgentId: normalizedAgentId,
     profile: "interactive",
     agentAiDefaults,
-    ancestors: collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById),
+    ancestors,
   });
   const fromConfig = (source: AiSettingSource | undefined) => source?.tier === "config";
+
+  // Auto is decided by the closest declared layer that sets either the Auto
+  // flag or a concrete value for the dimension, so a child's concrete pick
+  // blocks an ancestor's Auto. The implicit exec fallback is not in the chain:
+  // it contributes reasoningMode only.
+  const chainIds = [normalizedAgentId, ...ancestors.map((ancestor) => ancestor.agentId)];
+  const resolveConfiguredAuto = (
+    flag: "autoModelRouting" | "autoThinkingLevel",
+    source: AiSettingSource | undefined
+  ): true | undefined => {
+    for (const id of chainIds) {
+      if (agentAiDefaults[id]?.[flag] === true) return true;
+      if (fromConfig(source) && source?.agentId === id) return undefined;
+    }
+    return undefined;
+  };
+  const autoModelRouting = resolveConfiguredAuto("autoModelRouting", resolved.sources.model);
+  const autoThinkingLevel = resolveConfiguredAuto(
+    "autoThinkingLevel",
+    resolved.sources.thinkingLevel
+  );
+
   return {
     modelString: fromConfig(resolved.sources.model) ? resolved.selected.model : undefined,
     thinkingLevel: fromConfig(resolved.sources.thinkingLevel)
@@ -56,7 +87,72 @@ export function resolveConfiguredAiDefaults(
     reasoningMode: fromConfig(resolved.sources.reasoningMode)
       ? resolved.selected.reasoningMode
       : undefined,
+    ...(autoModelRouting ? { autoModelRouting } : {}),
+    ...(autoThinkingLevel ? { autoThinkingLevel } : {}),
   };
+}
+
+/** Browser-local per-agent record of explicit composer routing picks (true = Auto, false = concrete). */
+export type AutoRoutingChoiceByAgent = Partial<
+  Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
+>;
+
+/** Per dimension: true/false sets the scope's Auto flag; undefined leaves it unchanged. */
+export type AutoRoutingOutcome = Record<AutoRoutingDimension, boolean | undefined>;
+
+/**
+ * Auto routing state an agent resolution applies to a composer scope.
+ * Precedence per dimension: the workspace's explicit routing pick for the agent,
+ * then the configured default. Explicit agent switches always settle the flag;
+ * background sync only turns Auto on for a configured default the workspace has
+ * no pick or per-agent bucket value for (the same condition under which a
+ * configured concrete value applies), and never turns it off so a user's Auto
+ * survives Settings edits.
+ */
+export function resolveAutoRoutingForAgent(args: {
+  agentId: string;
+  agentAiDefaults: AgentAiDefaults;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
+  explicitSwitch: boolean;
+  experimentEnabled: boolean;
+  routingChoices?: AutoRoutingChoiceByAgent;
+  workspaceByAgent?: WorkspaceAISettingsCache;
+}): AutoRoutingOutcome {
+  if (!args.experimentEnabled) {
+    // Saved routing preferences stay stored but inert while the experiment is off.
+    const outcome = args.explicitSwitch ? false : undefined;
+    return { model: outcome, thinkingLevel: outcome };
+  }
+
+  const normalizedAgentId = normalizeAgentId(args.agentId);
+  const configured = resolveConfiguredAiDefaults(
+    normalizedAgentId,
+    args.agentAiDefaults,
+    args.agentBaseById
+  );
+  const choices = args.routingChoices?.[normalizedAgentId];
+  const bucket = args.workspaceByAgent?.[normalizedAgentId];
+  const bucketModel = typeof bucket?.model === "string" ? bucket.model.trim() : "";
+  const hasBucketValue: Record<AutoRoutingDimension, boolean> = {
+    model: isValidModelFormat(bucketModel),
+    thinkingLevel: coerceThinkingLevel(bucket?.thinkingLevel) != null,
+  };
+  const configuredAuto: Record<AutoRoutingDimension, boolean> = {
+    model: configured.autoModelRouting === true,
+    thinkingLevel: configured.autoThinkingLevel === true,
+  };
+
+  const resolveDimension = (dimension: AutoRoutingDimension): boolean | undefined => {
+    const choice = choices?.[dimension];
+    if (args.explicitSwitch) {
+      return choice ?? configuredAuto[dimension];
+    }
+    return configuredAuto[dimension] && choice === undefined && !hasBucketValue[dimension]
+      ? true
+      : undefined;
+  };
+
+  return { model: resolveDimension("model"), thinkingLevel: resolveDimension("thinkingLevel") };
 }
 
 // Keep agent -> model/thinking precedence in one place so mode switches that send immediately
