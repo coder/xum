@@ -52,7 +52,9 @@ test("restores from afterAll/afterEach, restoreModulesAfterSuite and teardown he
     reported(`mock.module("a", () => ({})); afterAll(() => { mock.module("a", () => real); });`)
   ).toEqual([]);
   expect(
-    reported(`restoreModulesAfterSuite([["a", real]]); mock.module("a", () => ({}));`)
+    reported(
+      `import { restoreModulesAfterSuite } from "../tests/ui/moduleMocks"; restoreModulesAfterSuite([["a", real]]); mock.module("a", () => ({}));`
+    )
   ).toEqual([]);
   // Inline and direct-reference hook callbacks, and helpers called from them.
   expect(
@@ -164,8 +166,40 @@ test("restores that never run do not count", () => {
   ).toEqual(["a"]);
   expect(
     reported(`
+      import { restoreModulesAfterSuite } from "../tests/ui/moduleMocks";
       function registerCleanup() { restoreModulesAfterSuite([["a", real]]); }
       beforeEach(() => { mock.module("a", () => ({})); });
     `)
   ).toEqual(["a"]);
+});
+
+test("a local look-alike of restoreModulesAfterSuite restores nothing", () => {
+  expect(
+    reported(`
+      function restoreModulesAfterSuite(entries) {}
+      restoreModulesAfterSuite([["a", real]]);
+      mock.module("a", () => ({}));
+    `)
+  ).toEqual(["a"]);
+});
+
+test("describe callbacks passed by name are suites", () => {
+  expect(
+    reported(`
+      function restores() { afterEach(() => { mock.module("a", () => real); }); }
+      function leaks() { beforeEach(() => { mock.module("a", () => ({})); }); }
+      describe("restores", restores);
+      describe("leaks", leaks);
+    `)
+  ).toEqual(["a"]);
+});
+
+test("code that never runs is not checked", () => {
+  expect(
+    reported(`
+      function register(p) { mock.module(p, () => ({})); }
+      function skipped() { beforeEach(() => register(pathFromSomewhere())); }
+      describe.skip("skipped", skipped);
+    `)
+  ).toEqual([]);
 });

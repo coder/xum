@@ -580,8 +580,11 @@ const localPlugin = {
         // restores too. A restore covers installs in the `describe` block (or file) its hook
         // runs in, including nested blocks; load-time installs run before every test, so any
         // restore that runs covers them. Skipped suites and never-called helpers do not run.
-        // This is a lint heuristic for the repo's idioms, not a proof: mutating a restore list
-        // after the fact or passing helpers around dynamically is not modeled.
+        // This is a flow-insensitive lint heuristic for the repo's idioms, not a proof. Not
+        // modeled (known false negatives, #4660): mutated restore lists, helpers passed
+        // around dynamically, `if` filters inside loops over specifier arrays, suites whose
+        // tests are all skipped (their afterEach never runs), and a helper invoked both at load
+        // and from a scoped hook (treated as a load-time install).
         const allowed = new Set(
           context.options[0]?.allow?.[
             path.relative(context.cwd, context.filename).split(path.sep).join("/")
@@ -820,17 +823,19 @@ const localPlugin = {
             } else if (
               parent.type === "CallExpression" &&
               parent.arguments.includes(identifier) &&
-              HOOK_CALLS.has(getCalleeRootName(parent.callee))
+              (HOOK_CALLS.has(getCalleeRootName(parent.callee)) ||
+                SUITE_CALLS.has(getCalleeRootName(parent.callee)))
             ) {
-              // `beforeEach(install)` / `afterEach(restore)`.
+              // `beforeEach(install)` / `afterEach(restore)` / `describe("x", suiteBody)`.
+              const owner = getCalleeRootName(parent.callee);
               const outer = infoOf(enclosingContext(parent));
-              site = isSkippedCall(parent)
-                ? NEVER
-                : {
-                    suites: outer.suites,
-                    atLoad: false,
-                    teardown: RESTORE_HOOKS.has(getCalleeRootName(parent.callee)),
-                  };
+              if (isSkippedCall(parent) || outer.suites.size === 0) {
+                site = NEVER;
+              } else if (SUITE_CALLS.has(owner)) {
+                site = { suites: new Set([fn]), atLoad: true, teardown: false };
+              } else {
+                site = { suites: outer.suites, atLoad: false, teardown: RESTORE_HOOKS.has(owner) };
+              }
             } else {
               // Passed around or stored: assume it runs where it is defined, not as teardown.
               site = { ...infoOf(enclosingContext(fn)), teardown: false };
@@ -848,7 +853,14 @@ const localPlugin = {
               node.callee.type === "Identifier" &&
               node.callee.name === "restoreModulesAfterSuite"
             ) {
-              restoreListCalls.push(node);
+              // Only the real helper registers an afterAll; a local look-alike does not.
+              const def = findVariable(node.callee)?.defs[0];
+              if (
+                def?.type === "ImportBinding" &&
+                String(def.parent.source.value).endsWith("/moduleMocks")
+              ) {
+                restoreListCalls.push(node);
+              }
               return;
             }
             if (isMockModuleCall(node)) {
@@ -873,9 +885,11 @@ const localPlugin = {
               const specifiers = resolveSpecifiers(node.arguments[0]);
               if (info.teardown) {
                 restores.push({ specifiers: new Set(specifiers ?? []), suites: info.suites });
+              } else if (info.suites.size === 0) {
+                // Never runs (skipped suite, uncalled helper): nothing to restore or resolve.
               } else if (specifiers == null) {
                 context.report({ node, messageId: "dynamicSpecifier" });
-              } else if (info.suites.size > 0) {
+              } else {
                 installs.push({ node, specifiers, info });
               }
             }
