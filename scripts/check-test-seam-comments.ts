@@ -41,9 +41,10 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   /\btests?(?:\/debug)?\s+visibility\s+only\b/i,
   // "Test-only: reset ...", "(test-only, not for production use)", "Test-only seams".
   /\btest[- ]only(?:\s*[:,)]|\s+seams?\b)/i,
-  // Honest phrasings that say the same thing without "test": "No production caller",
-  // "no production callers", "no non-test consumers".
-  /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i,
+  // Honest phrasings that say the same thing without "test": "No production caller: ...",
+  // "Has no non-test consumers." The claim must end there, so invariants such as
+  // "No production callers pass null" stay quiet.
+  /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)(?=\s*(?:[.:;,)]|$))/i,
   // "overridable for tests only", "set by tests only".
   /\b(?:for|by|in)\s+tests\s+only\b/i,
 ];
@@ -324,7 +325,8 @@ export interface AllowlistEntry {
 /**
  * `allowed`: seams with a production caller (named in the reason), ...ForTests reset hooks, or
  * deliberate injection points: a clock/timer/transport injection that keeps a test fast and
- * deterministic, or an interleaving hook that is the only way to witness an ordering contract.
+ * deterministic, an interleaving hook that is the only way to witness an ordering contract, or a
+ * read-only observation getter that is the only way to witness a retention contract.
  * The reason names the test and the contract it witnesses.
  * `knownDebt`: seams that existed without a production caller when this guard landed. It may
  * only shrink; do not add to it.

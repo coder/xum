@@ -29,7 +29,7 @@
     { "file": "src/node/services/sandbox/sandboxHostService.ts", "symbol": "reclaimSupersededSnapshotBlobs", "reason": "production caller: SandboxHostService.finishPersistentMountSetupLocked in the same file" },
     { "file": "src/node/services/sandbox/sandboxHostService.ts", "symbol": "reclaimExcessResultHandleBlobs", "reason": "production caller: SandboxHostService.finishPersistentMountSetupLocked in the same file" },
     { "file": "src/node/services/tools/review_pane.ts", "symbol": "applyReviewPaneUpdate", "reason": "production caller: applyReviewPaneUpdateForSessionDir in the same file" },
-    { "file": "src/node/services/workflows/keyedFifoLock.ts", "symbol": "KeyedFifoLock.waiterCount", "reason": "observation getter: keyedFifoLock.test.ts reads it to witness that waiters timing out behind a hung holder leave no queue entry (nothing retained per abandoned waiter); no production caller" },
+    { "file": "src/node/services/workflows/keyedFifoLock.ts", "symbol": "KeyedFifoLock.waiterCount", "reason": "observation getter: keyedFifoLock.test.ts reads it to witness that waiters timing out behind a hung holder are spliced out while the holder still hangs; a lazy skip-at-release implementation passes every public-behavior assertion and fails only this one; no production caller" },
     { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "getProcessBirth", "reason": "production caller: makeOwnershipToken in the same file" },
     { "file": "src/node/utils/main/crossProcessLock.ts", "symbol": "guardPath", "reason": "production caller: withReclaimGuard (fileLock.ts)" }
   ],
