@@ -22,6 +22,7 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
 import { normalizePersistedMessage } from "@/node/utils/messages/normalizePersistedMessage";
+import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
 import {
   isHistoryIdentifierRepresentable,
   type HistoryArtifact,
@@ -385,7 +386,10 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
       if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
       onBytesRead?.(read.bytesRead);
       const messages: Row[] = [];
+      // Multi-hundred-MB epochs parse for seconds; keep timers (onChat heartbeats) alive.
+      const yielder = new EventLoopYielder();
       for (const line of buffer.toString("utf8").split("\n")) {
+        if (yielder.isDue()) await yielder.yield();
         if (!line.trim()) continue;
         try {
           const row = project(JSON.parse(line) as unknown);
