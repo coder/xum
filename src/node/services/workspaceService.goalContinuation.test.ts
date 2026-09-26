@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, mock, spyOn } from "bun:test";
+import { afterEach, describe, expect, test, mock } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
@@ -7,7 +7,6 @@ import type { ProjectsConfig } from "@/common/types/project";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -554,7 +553,18 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         const projects = new Map([
           [
             projectPath,
-            { workspaces: [{ id: workspaceId, path: projectPath, agentId: "researcher" }] },
+            {
+              // getInfo reads this real entry, so the checkout root is the fixture directory
+              // holding the agent definition.
+              workspaces: [
+                {
+                  id: workspaceId,
+                  path: projectPath,
+                  runtimeConfig: { type: "local" as const },
+                  agentId: "researcher",
+                },
+              ],
+            },
           ],
         ]);
         const service = await makeServiceWithConfig({
@@ -564,15 +574,6 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
             exec: { thinkingLevel: "low" as const, reasoningMode: "standard" as const },
           },
         });
-        // In-place metadata (projectPath === name) resolves the checkout root
-        // to the fixture directory holding .mux/agents/researcher.md.
-        spyOn(service, "getInfo").mockResolvedValue({
-          id: workspaceId,
-          name: projectPath,
-          projectPath,
-          projectName: "goal-chain",
-          runtimeConfig: { type: "local" },
-        } as FrontendWorkspaceMetadata);
 
         const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
         expect(result?.thinkingLevel).toBe("high");
@@ -598,7 +599,20 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
 
         const workspaceId = "ws-1";
         const projects = new Map([
-          [projectPath, { workspaces: [{ id: workspaceId, path: projectPath, agentId: "exec" }] }],
+          [
+            projectPath,
+            {
+              // Real entry read by getInfo, like the researcher test above.
+              workspaces: [
+                {
+                  id: workspaceId,
+                  path: projectPath,
+                  runtimeConfig: { type: "local" as const },
+                  agentId: "exec",
+                },
+              ],
+            },
+          ],
         ]);
         const service = await makeServiceWithConfig({
           projects,
@@ -606,13 +620,6 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
             plan: { reasoningMode: "pro" as const },
           },
         });
-        spyOn(service, "getInfo").mockResolvedValue({
-          id: workspaceId,
-          name: projectPath,
-          projectPath,
-          projectName: "exec-chain",
-          runtimeConfig: { type: "local" },
-        } as FrontendWorkspaceMetadata);
 
         const result = await service.getGoalContinuationKickoffSendOptions(workspaceId);
         expect(result?.reasoningMode).toBe("pro");
@@ -661,7 +668,18 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         const projects = new Map([
           [
             projectPath,
-            { workspaces: [{ id: workspaceId, path: projectPath, agentId: "researcher" }] },
+            {
+              // getInfo reads this real entry, so the checkout root is the fixture directory
+              // holding the agent definition.
+              workspaces: [
+                {
+                  id: workspaceId,
+                  path: projectPath,
+                  runtimeConfig: { type: "local" as const },
+                  agentId: "researcher",
+                },
+              ],
+            },
           ],
         ]);
         const service = await makeServiceWithConfig({
@@ -679,13 +697,6 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
             },
           },
         });
-        spyOn(service, "getInfo").mockResolvedValue({
-          id: workspaceId,
-          name: projectPath,
-          projectPath,
-          projectName: "hb-chain",
-          runtimeConfig: { type: "local" },
-        } as FrontendWorkspaceMetadata);
 
         // Model, thinking, and reasoning must ALL resolve through the chain:
         // inheriting pro beside exec's Anthropic model would gate pro out.

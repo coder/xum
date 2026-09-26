@@ -1,5 +1,5 @@
 import type { TurnCompletion } from "./streamManager";
-import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, expect, test, mock, beforeEach, afterEach, spyOn, jest } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
@@ -15,10 +15,7 @@ import {
   type ExtensionMetadataStreamingUpdate,
 } from "./ExtensionMetadataService";
 import path from "path";
-import type {
-  FrontendWorkspaceMetadata,
-  WorkspaceActivitySnapshot,
-} from "@/common/types/workspace";
+import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import {
   FAKE_REAWAKENED_ATTEMPT_ID,
   makeAgentTaskIntegrationFake,
@@ -41,6 +38,9 @@ import {
 } from "./workspaceService.testHarness";
 import { saveWorkspaces } from "./taskService.testHarness";
 
+// bun:test's jest shim implements advanceTimersByTime; its published types omit it.
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+
 describe("WorkspaceService sendMessage status clearing", () => {
   let workspaceService: WorkspaceService;
   let harness: WorkspaceServiceHarness;
@@ -50,6 +50,8 @@ describe("WorkspaceService sendMessage status clearing", () => {
     promotedToolEndWouldLeadQueue: ReturnType<typeof mock>;
     hasQueuedOrDispatchingEntry: ReturnType<typeof mock>;
     dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
+    hasQueuedDedupeKey: ReturnType<typeof mock>;
+    emitMetadata: ReturnType<typeof mock>;
     queueMessage: ReturnType<typeof mock>;
     sendMessage: ReturnType<typeof mock>;
     resumeStream: ReturnType<typeof mock>;
@@ -58,19 +60,15 @@ describe("WorkspaceService sendMessage status clearing", () => {
     onMetadataEvent: ReturnType<typeof mock>;
   };
   let persistSettings: ReturnType<typeof mock>;
-  let getOrCreateSessionSpy: ReturnType<typeof spyOn<WorkspaceService, "getOrCreateSession">>;
 
   /**
-   * A real session built and registered by the service (so it carries the service's
-   * preflight probe), while sends keep reaching the fake session.
+   * A real session the service builds and registers for a second workspace, so it carries the
+   * service's preflight probe for that workspace. Sends to PROBE_WORKSPACE reach this session;
+   * tests stub its provider-facing entry points with spyOn.
    */
+  const PROBE_WORKSPACE = "probe-workspace";
   function createRegisteredRealSession(): AgentSession {
-    getOrCreateSessionSpy.mockRestore();
-    const realSession = workspaceService.getOrCreateSession("test-workspace");
-    getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
-      fakeSession as unknown as AgentSession
-    );
-    return realSession;
+    return workspaceService.getOrCreateSession(PROBE_WORKSPACE);
   }
 
   beforeEach(async () => {
@@ -80,6 +78,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
     workspaceService = harness.service;
     await saveWorkspaces(harness.config, "/tmp/test/project", [
       { id: "test-workspace", path: "/tmp/test/workspace", name: "workspace" },
+      { id: "probe-workspace", path: "/tmp/test/probe-workspace", name: "probe-workspace" },
     ]);
     // sendMessage fires its recency write without awaiting it. These tests assert admission
     // and queueing, not recency, so keep that write off disk instead of racing cleanup.
@@ -99,18 +98,20 @@ describe("WorkspaceService sendMessage status clearing", () => {
       promotedToolEndWouldLeadQueue: mock(() => true),
       hasQueuedOrDispatchingEntry: mock(() => false),
       dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
+      hasQueuedDedupeKey: mock(() => false),
       queueMessage: mock(() => "tool-end" as const),
       sendMessage: mock(() => Promise.resolve(Ok(undefined))),
       resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
       drainQueuedMessagesIfIdle: mock(() => undefined),
+      // Metadata changes are published to the registered session.
+      emitMetadata: mock(() => undefined),
       // registerSession subscribes to both streams.
       onChatEvent: mock(() => () => undefined),
       onMetadataEvent: mock(() => () => undefined),
     };
 
-    getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
-      fakeSession as unknown as AgentSession
-    );
+    // The production injection point for an externally created session (`mux run`).
+    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
 
     // Private preflight await: the queue-ordering tests below hold it to park a send
     // mid-preflight, which no public entry point can do deterministically.
@@ -206,7 +207,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // end fires. Draining while the earlier send is still in preflight would let the queued
     // entry jump ahead of it.
     fakeSession.isBusy.mockReturnValue(false);
-    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     const firstSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
 
@@ -233,7 +233,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // queued behind the failed one. Draining as soon as the head of the line settles makes
     // the younger send observe the dispatched (busy) session instead.
     fakeSession.isBusy.mockReturnValue(false);
-    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     const firstSend = createDeferred<Result<void, SendMessageError>>();
     fakeSession.sendMessage.mockImplementationOnce(() => firstSend.promise);
     const sendOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
@@ -305,7 +304,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // queues behind it, so it must not decide who drains. Otherwise the entry queued behind
     // the failed manual send waits until the maintenance preflight settles.
     fakeSession.isBusy.mockReturnValue(false);
-    workspaceService.registerSession("test-workspace", fakeSession as unknown as AgentSession);
     const pricingGate = mock(() => Promise.resolve(Ok(undefined)));
     workspaceService.setWorkspaceGoalService({
       assertPricedModelForBudgetedGoal: pricingGate,
@@ -490,7 +488,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // continuation's on-send compaction completion veto the continuation's
     // OWN saved follow-up. The probe must see unrelated preflights (round-37
     // semantics) but release the originating send at its session handoff.
-    fakeSession.isBusy.mockReturnValue(false);
     const realSession = createRegisteredRealSession();
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
@@ -516,7 +513,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
       // control-flow narrowing at the later assertion sites.
       const probeBeforeAdmission: { value: boolean | null } = { value: null };
       const probeAfterAdmission: { value: boolean | null } = { value: null };
-      fakeSession.sendMessage.mockImplementationOnce(
+      spyOn(realSession, "sendMessage").mockImplementationOnce(
         (
           _message: unknown,
           _options: unknown,
@@ -534,7 +531,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
         }
       );
 
-      const sendPromise = workspaceService.sendMessage("test-workspace", "manual message", {
+      const sendPromise = workspaceService.sendMessage(PROBE_WORKSPACE, "manual message", {
         model: "openai:gpt-4o-mini",
         agentId: "exec",
       });
@@ -560,7 +557,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // recovery admit a recovered synthetic turn that then ran concurrently
     // with the resumed stream — the reservation must survive until the session
     // call settles.
-    fakeSession.isBusy.mockReturnValue(false);
     const realSession = createRegisteredRealSession();
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
@@ -571,12 +567,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
         getPendingGoalSnapshot: mock(() => null),
       } as unknown as WorkspaceGoalService);
       const probeDuringResume: { value: boolean | null } = { value: null };
-      fakeSession.resumeStream.mockImplementationOnce(() => {
+      spyOn(realSession, "resumeStream").mockImplementationOnce(() => {
         probeDuringResume.value = probe!();
         return Promise.resolve(Ok({ started: true }));
       });
 
-      const result = await workspaceService.resumeStream("test-workspace", {
+      const result = await workspaceService.resumeStream(PROBE_WORKSPACE, {
         model: "openai:gpt-4o-mini",
         agentId: "exec",
       });
@@ -596,7 +592,6 @@ describe("WorkspaceService sendMessage status clearing", () => {
     // follow-up. Releasing the reservation before that fallback let a
     // completing goal-scoped follow-up be admitted ahead of the user's
     // intervention; the reservation must survive until the fallback settles.
-    fakeSession.isBusy.mockReturnValue(false);
     const realSession = createRegisteredRealSession();
     const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
       .hasExternalSendPreflight;
@@ -608,12 +603,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
         getPendingGoalSnapshot: mock(() => null),
       } as unknown as WorkspaceGoalService);
       const probeDuringFallback: { value: boolean | null } = { value: null };
-      fakeSession.sendMessage.mockImplementationOnce(() => {
+      spyOn(realSession, "sendMessage").mockImplementationOnce(() => {
         probeDuringFallback.value = probe!();
         return Promise.resolve(Err(pricingError));
       });
 
-      const result = await workspaceService.sendMessage("test-workspace", "please stop", {
+      const result = await workspaceService.sendMessage(PROBE_WORKSPACE, "please stop", {
         model: "custom:unpriced-model",
         agentId: "exec",
       });
@@ -1288,6 +1283,24 @@ describe("WorkspaceService sendMessage status clearing", () => {
   });
 });
 
+/**
+ * Register a session double through the service's public injection point (`mux run` uses it
+ * for externally created sessions). executeIdleCompaction reads only isBusy: idle before its
+ * send, streaming after it when the stream stays active.
+ */
+function registerIdleCompactionSession(
+  service: WorkspaceService,
+  workspaceId: string,
+  isBusy: () => boolean
+): void {
+  service.registerSession(workspaceId, {
+    isBusy,
+    // registerSession subscribes to both streams.
+    onChatEvent: () => () => undefined,
+    onMetadataEvent: () => () => undefined,
+  } as unknown as AgentSession);
+}
+
 describe("WorkspaceService idle compaction dispatch", () => {
   let workspaceService: WorkspaceService;
   let harness: WorkspaceServiceHarness;
@@ -1310,9 +1323,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
   async function markIdleCompacting(workspaceId: string): Promise<void> {
     spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
     let busyChecks = 0;
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      isBusy: () => ++busyChecks >= 2,
-    } as unknown as AgentSession);
+    registerIdleCompactionSession(workspaceService, workspaceId, () => ++busyChecks >= 2);
     await workspaceService.executeIdleCompaction(workspaceId);
   }
 
@@ -1346,15 +1357,8 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
 
     let busyChecks = 0;
-    const session = {
-      isBusy: mock(() => {
-        busyChecks += 1;
-        return busyChecks >= 2;
-      }),
-    } as unknown as AgentSession;
-
     spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
+    registerIdleCompactionSession(workspaceService, workspaceId, () => ++busyChecks >= 2);
 
     await workspaceService.executeIdleCompaction(workspaceId);
 
@@ -1380,12 +1384,8 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const workspaceId = "idle-no-stream-ws";
     const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
 
-    const session = {
-      isBusy: mock(() => false),
-    } as unknown as AgentSession;
-
     spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
+    registerIdleCompactionSession(workspaceService, workspaceId, () => false);
 
     await workspaceService.executeIdleCompaction(workspaceId);
 
@@ -1438,10 +1438,8 @@ describe("WorkspaceService idle compaction dispatch", () => {
         })
       )
     );
-    const session = { isBusy: mock(() => false) } as unknown as AgentSession;
-
     spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
+    registerIdleCompactionSession(workspaceService, workspaceId, () => false);
 
     const outcomes: Array<{ workspaceId: string; outcome: IdleCompactionOutcome }> = [];
     workspaceService.setIdleCompactionOutcomeListener((id, outcome) =>
@@ -1462,10 +1460,8 @@ describe("WorkspaceService idle compaction dispatch", () => {
   test("reports a non-model_not_found outcome for generic pre-stream failures", async () => {
     const workspaceId = "idle-generic-failure-ws";
     const sendMessage = mock(() => Promise.resolve(Err({ type: "unknown" as const, raw: "boom" })));
-    const session = { isBusy: mock(() => false) } as unknown as AgentSession;
-
     spyOn(workspaceService, "sendMessage").mockImplementation(sendMessage);
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(session);
+    registerIdleCompactionSession(workspaceService, workspaceId, () => false);
 
     const outcomes: Array<{ workspaceId: string; outcome: IdleCompactionOutcome }> = [];
     workspaceService.setIdleCompactionOutcomeListener((id, outcome) =>
@@ -1488,9 +1484,7 @@ describe("WorkspaceService idle compaction dispatch", () => {
     const workspacePath = "/tmp/project/ws";
 
     const sendMessage = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      isBusy: () => false,
-    } as unknown as AgentSession);
+    registerIdleCompactionSession(workspaceService, "ws", () => false);
 
     await saveWorkspaces(
       harness.config,
@@ -1916,9 +1910,7 @@ describe("WorkspaceService streaming generation guard", () => {
     // streaming after it.
     spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
     let busyChecks = 0;
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue({
-      isBusy: () => ++busyChecks >= 2,
-    } as unknown as AgentSession);
+    registerIdleCompactionSession(workspaceService, workspaceId, () => ++busyChecks >= 2);
     await workspaceService.executeIdleCompaction(workspaceId);
 
     emitAiEvent("stream-start", { workspaceId, messageId: "compact-1", model: "openai:gpt-4o" });
@@ -2010,16 +2002,16 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       const projectName = "cmux";
       const planFile = await writePlanFile(muxRoot, projectName, workspaceName);
 
-      const fakeMetadata: FrontendWorkspaceMetadata = {
+      // Registered in the real Config that getInfo reads; the project path's basename is the
+      // project name the plan path is keyed by.
+      await harness.config.addWorkspace(`/tmp/${projectName}`, {
         id: workspaceId,
         name: workspaceName,
         projectName,
-        projectPath: "/tmp/proj",
-        namedWorkspacePath: "/tmp/proj/plan-workspace",
+        projectPath: `/tmp/${projectName}`,
+        namedWorkspacePath: `/tmp/${projectName}/${workspaceName}`,
         runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
-      };
-
-      spyOn(workspaceService, "getInfo").mockResolvedValue(fakeMetadata);
+      });
 
       const result = await workspaceService.getPostCompactionState(workspaceId);
 
@@ -2039,42 +2031,47 @@ describe("WorkspaceService post-compaction metadata refresh", () => {
       if (event.workspaceId === workspaceId) emitted.push(event.metadata);
     });
 
-    const fakeMetadata: FrontendWorkspaceMetadata = {
+    // Registered in the real Config that the refresh's getInfo reads.
+    await harness.config.addWorkspace("/tmp/proj", {
       id: workspaceId,
       name: "ws",
       projectName: "proj",
       projectPath: "/tmp/proj",
       namedWorkspacePath: "/tmp/proj/ws",
       runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
-    };
+    });
 
-    const getInfoMock = spyOn(workspaceService, "getInfo").mockResolvedValue(fakeMetadata);
+    // Both record calls only; the real metadata and state are computed from disk.
+    const getInfoSpy = spyOn(workspaceService, "getInfo");
+    const getPostCompactionStateSpy = spyOn(workspaceService, "getPostCompactionState");
 
-    const postCompactionState = {
-      planPath: "~/.mux/plans/cmux/plan.md",
-      trackedFilePaths: ["/tmp/proj/file.ts"],
-      excludedItems: [],
-    };
-
-    const getPostCompactionStateMock = spyOn(
-      workspaceService,
-      "getPostCompactionState"
-    ).mockResolvedValue(postCompactionState);
-
+    // Fake timers make the debounce deterministic: the three clears (real disk I/O, which fake
+    // timers do not touch) all schedule before any refresh timer can fire.
+    fakeTimers.useFakeTimers();
     try {
       await session.clearPostCompactionState();
       await session.clearPostCompactionState();
       await session.clearPostCompactionState();
+      expect(getInfoSpy).not.toHaveBeenCalled();
 
-      // Debounce is short, but use a safe buffer.
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Each fired refresh calls getInfo synchronously from its timer callback, so the count
+      // right after advancing is the number of refreshes the clears left scheduled.
+      fakeTimers.advanceTimersByTime(1_000);
+      expect(getInfoSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fakeTimers.useRealTimers();
+    }
 
-      expect(getInfoMock).toHaveBeenCalledTimes(1);
-      expect(getPostCompactionStateMock).toHaveBeenCalledTimes(1);
+    try {
+      await waitForCondition(() => emitted.length > 0, { timeoutMs: 5_000 });
+      expect(getPostCompactionStateSpy).toHaveBeenCalledTimes(1);
       expect(emitted).toHaveLength(1);
 
-      const enriched = emitted[0] as { postCompaction?: { planPath: string | null } };
-      expect(enriched.postCompaction?.planPath).toBe(postCompactionState.planPath);
+      const enriched = emitted[0] as { id?: string; postCompaction?: unknown };
+      expect(enriched.id).toBe(workspaceId);
+      expect(enriched.postCompaction).toEqual(
+        await getPostCompactionStateSpy.mock.results[0]?.value
+      );
     } finally {
       await workspaceService.disposeSession(workspaceId);
     }
@@ -2098,7 +2095,8 @@ describe("WorkspaceService interruptStream", () => {
       ),
       backgroundProcessManager: h.backgroundProcessManager,
     });
-    spyOn(service, "getOrCreateSession").mockReturnValue(h.session);
+    // The production injection point for an externally created session (`mux run`).
+    service.registerSession(workspaceId, h.session);
     const accepted = Promise.withResolvers<void>();
     try {
       h.session.queueMessage(
@@ -2185,7 +2183,8 @@ describe("WorkspaceService interruptStream", () => {
       extensionMetadata,
       backgroundProcessManager: h.backgroundProcessManager,
     });
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(h.session);
+    // The production injection point for an externally created session (`mux run`).
+    workspaceService.registerSession(workspaceId, h.session);
     const policy = h.session as unknown as {
       recordGoalAccountingFromUsage(input: unknown): Promise<void>;
     };
@@ -2252,10 +2251,12 @@ describe("WorkspaceService interruptStream", () => {
       interruptStream,
       sendNextUserQueuedMessage,
       restoreQueueToInput,
+      // registerSession subscribes to both streams.
+      onChatEvent: () => () => undefined,
+      onMetadataEvent: () => () => undefined,
     };
-    const getOrCreateSessionSpy = spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
-      fakeSession as unknown as AgentSession
-    );
+    // The production injection point for an externally created session (`mux run`).
+    workspaceService.registerSession(workspaceId, fakeSession as unknown as AgentSession);
 
     try {
       const result = await workspaceService.interruptStream(workspaceId, {
@@ -2269,7 +2270,6 @@ describe("WorkspaceService interruptStream", () => {
       expect(sendNextUserQueuedMessage).toHaveBeenCalledTimes(1);
       expect(restoreQueueToInput).not.toHaveBeenCalled();
     } finally {
-      getOrCreateSessionSpy.mockRestore();
       await harness.cleanup();
     }
   });
