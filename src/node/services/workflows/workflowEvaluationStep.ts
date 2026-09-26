@@ -107,7 +107,6 @@ export const EVALUATION_POST_COMMIT_EVENT_FAILED_CODE = "evaluation-post-commit-
 export const EVALUATION_POST_COMMIT_USAGE_FAILED_CODE = "evaluation-post-commit-usage-failed";
 export const EVALUATION_CACHED_EVENT_FAILED_CODE = "evaluation-cached-event-failed";
 export const EVALUATION_FAILED_EVENT_FAILED_CODE = "evaluation-failed-event-failed";
-export const EVALUATION_STARTED_EVENT_FAILED_CODE = "evaluation-started-event-failed";
 
 export function evaluationStepDigest(stepId: string): string {
   return sha256Hex(stepId).slice(0, 12);
@@ -330,30 +329,21 @@ export async function runWorkflowEvaluationStep(
     startedAt,
     evaluation: admission,
   });
-  try {
-    await journal.appendEvent({
-      type: "evaluation",
-      at: clock.nowIso(),
-      stepId: spec.id,
-      inputHash,
-      attempt,
-      status: "started",
-      ...(spec.title !== undefined ? { title: spec.title } : {}),
-      modelString: admission.selection.modelString,
-      stateBytes,
-      questionCount,
-    });
-  } catch (error) {
-    // The admitted started record is the source of truth; a lost progress event must not
-    // fail the run and strand that record (same rule as the completed/cached/failed appends).
-    log.warn("Workflow evaluation started event append failed after the started record", {
-      code: EVALUATION_STARTED_EVENT_FAILED_CODE,
-      runId: context.runId,
-      stepDigest,
-      attempt,
-      errorName: error instanceof Error ? error.name : typeof error,
-    });
-  }
+  // Deliberately unguarded (#4363 item 5 declined): this append is the last lease-fenced
+  // write before a billable dispatch. Swallowing its rejection could let a runner that just
+  // lost the lease dispatch a duplicate request; failing the run here bills nothing.
+  await journal.appendEvent({
+    type: "evaluation",
+    at: clock.nowIso(),
+    stepId: spec.id,
+    inputHash,
+    attempt,
+    status: "started",
+    ...(spec.title !== undefined ? { title: spec.title } : {}),
+    modelString: admission.selection.modelString,
+    stateBytes,
+    questionCount,
+  });
 
   // 6. Recheck immediately before dispatch; the re-resolved instance is the
   //    one dispatched so a credential/endpoint change during preparation is

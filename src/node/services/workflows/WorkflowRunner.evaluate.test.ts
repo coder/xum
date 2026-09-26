@@ -1154,37 +1154,6 @@ describe("WorkflowRunner evaluate()", () => {
     }
   });
 
-  test("a rejected started-event append after the admitted record still dispatches", async () => {
-    using tmp = new DisposableTempDir("workflow-eval");
-    const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
-    const warn = spyOn(log, "warn").mockImplementation(() => undefined);
-    const originalAppend = store.appendNextEvent.bind(store);
-    const appendSpy = spyOn(store, "appendNextEvent").mockImplementation(
-      async (runId, event, options) => {
-        if (event.type === "evaluation" && event.status === "started") {
-          throw new Error("disk full");
-        }
-        return await originalAppend(runId, event, options);
-      }
-    );
-    try {
-      const fake = createFakeAdapter();
-
-      const result = await createRunner(store, fake.adapter).run(RUN_ID);
-
-      expect(result.structuredOutput).toMatchObject(EXPECTED_RESULT_SHAPE);
-      expect((await store.getRun(RUN_ID)).status).toBe("completed");
-      expect((await readStep(store))?.status).toBe("completed");
-      expect(fake.dispatchCalls).toHaveLength(1);
-      expect(warn.mock.calls.map(([, fields]) => (fields as { code?: string }).code)).toContain(
-        "evaluation-started-event-failed"
-      );
-    } finally {
-      appendSpy.mockRestore();
-      warn.mockRestore();
-    }
-  });
-
   test("an existing record is trusted only with an admission bound to the current input", async () => {
     // Same (stepId, inputHash) key, but the record's admission is missing or
     // describes another request (the store's schema already rejects malformed
