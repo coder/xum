@@ -31,7 +31,9 @@ def codex_running_row: codex_review_row_prefix + "Running\\*\\* since " + codex_
 # board's metadata; a Completed board for another head is a review of an older
 # push, not of this one. Codex re-reviews on new commits and edits the board in
 # place, so that state is "running" for the current head, never "completed".
-def codex_summary_status($bot; $head):
+# $resolved holds the discussion ids (strings) of Codex review threads resolved on
+# GitHub; callers without thread data pass [] and stay fail-closed.
+def codex_summary_status($bot; $head; $resolved):
   if .author.login != $bot then null
   else
     (.body | codex_without_help) as $body
@@ -60,11 +62,14 @@ def codex_summary_status($bot; $head):
               or test(codex_running_row)
               # Security advisories stay listed after their review threads are resolved, and
               # Codex adds the Resolved marker only when a later review completes. A bullet
-              # without it is a live finding and keeps blocking; other sections stay unknown.
+              # counts as resolved with that marker or when its linked Codex thread is resolved
+              # on GitHub; otherwise it is a live finding and blocks. Other sections stay unknown.
               or . == "### Security findings"
               or test("^#### Advisory findings \\([0-9]+\\)$")
-              or test("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r[0-9]+\\)"
-                + " · \\*\\*[A-Za-z]+\\*\\* · \\*\\*Resolved\\*\\*$")
+              # capture() yields empty on no match, which all() would count as true.
+              or ((capture("^- [^[:alnum:]|\\[]*\\[[^\\]]+\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+#discussion_r(?<id>[0-9]+)\\)"
+                + " · \\*\\*[A-Za-z]+\\*\\*(?<marker> · \\*\\*Resolved\\*\\*)?$") // null)
+                | . != null and (.marker != null or (.id | IN($resolved[]))))
             ))
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
                      or $security.headSha != $head
@@ -80,15 +85,15 @@ def codex_summary_status($bot; $head):
 
 # Codex is still reviewing. Callers may wait on this state instead of failing on
 # it, but it never supplies approval: after any wait budget it blocks like before.
-def codex_review_in_progress($bot; $head):
-  codex_summary_status($bot; $head) == "running";
+def codex_review_in_progress($bot; $head; $resolved):
+  codex_summary_status($bot; $head; $resolved) == "running";
 
-def codex_comment_is_informational($bot; $head):
+def codex_comment_is_informational($bot; $head; $resolved):
   if .author.login != $bot then false
   else
     (.body | codex_without_help) as $body
     | if $body | startswith(codex_summary_marker) then
-        codex_summary_status($bot; $head) == "completed"
+        codex_summary_status($bot; $head; $resolved) == "completed"
       else
         ($body | test("Didn.t find any major issues|usage limits have been reached|create a Codex account"))
         # codex_without_help removed at most one known heading; a second or
@@ -99,3 +104,6 @@ def codex_comment_is_informational($bot; $head):
           + "\n+_Only the user who started this review can view the report in Codex\\._$"))
       end
   end;
+
+# Without review-thread data (wait_pr_codex.sh), board bullets need Codex's marker.
+def codex_comment_is_informational($bot; $head): codex_comment_is_informational($bot; $head; []);

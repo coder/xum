@@ -239,6 +239,30 @@ else:
                     data = snapshot([comment(body)])
                     self.assert_gate(expected, data, cache=data if cached else None)
 
+    def test_board_advisory_is_resolved_once_its_codex_thread_is(self):
+        # Codex adds its Resolved marker only when a later review completes; the
+        # linked Codex thread resolved on GitHub settles the bullet before that.
+        board = FIXTURES["security_findings_summary"]["body"]
+        link = "https://github.com/coder/xum/pull/4149#discussion_r3960253571"
+
+        def linked(resolved, url=link, author=BOT):
+            node = thread("finding", author=author, resolved=resolved)
+            node["comments"]["nodes"][0]["url"] = url
+            return node
+
+        for threads, expected in (
+            ([linked(True)], 0),
+            ([linked(False)], 1),
+            ([], 1),
+            # Ids match exactly, not by prefix, and only for Codex's own threads.
+            ([linked(True, url=link[:-1])], 1),
+            ([linked(True, author="someone")], 1),
+        ):
+            for cached in (False, True):
+                with self.subTest(threads=threads, cached=cached):
+                    data = snapshot([comment(board)], threads)
+                    self.assert_gate(expected, data, cache=data if cached else None)
+
     def test_wait_for_review_polls_until_codex_finishes(self):
         running = snapshot([comment(FIXTURES["running_summary"]["body"])])
         completed = snapshot([comment(FIXTURES["summary"]["body"])])
