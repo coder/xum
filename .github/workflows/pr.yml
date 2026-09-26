@@ -200,6 +200,13 @@ jobs:
         # The single-process suite was the pipeline's critical path; see scripts/test-unit-ci.sh.
         # A manual test_filter runs unsharded.
         shard: ${{ fromJSON(github.event.inputs.test_filter != '' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
+    env:
+      # Bun 1.3.5's JSC Wasm in-place interpreter (IPInt) crashes in the QuickJS suites
+      # ("access to a null reference", "Unreachable code should not be executed", or a
+      # native exit 132); see oven-sh/bun#17841. Job-level so the test_filter step gets it
+      # too. Remove after upgrading Bun to >= 1.3.10 (the WebKit fix). Mirrored in the
+      # Makefile test targets for local runs.
+      BUN_JSC_useWasmIPInt: "0"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:

@@ -482,6 +482,11 @@ test-pr-checks: ## Test PR check discovery and readiness with offline GitHub fix
 test-required-superseded: ## Test the Required stand-down decision for cancelled duplicate PR runs
 	@python3 scripts/required_superseded_test.py
 
+# Bun 1.3.5's JSC Wasm in-place interpreter (IPInt) crashes in the QuickJS suites
+# (oven-sh/bun#17841); JSC reads this at startup, so it must be in the environment.
+# Mirrors the Test / Unit job env in pr.yml. Remove after upgrading Bun to >= 1.3.10.
+test-integration test-unit test-unit-ci: export BUN_JSC_useWasmIPInt := 0
+
 test-integration: node_modules/.installed build-main ## Run all tests (unit + integration)
 	@bun test src
 	@TEST_INTEGRATION=1 bun x jest tests
