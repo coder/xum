@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { retiredAttemptMessage } from "@/constants/agentMessaging";
 import { Ok, type Result } from "@/common/types/result";
@@ -161,6 +161,22 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
         attemptId: ATTEMPT,
         failure: { errorMessage: "refused by the model" },
       });
+    });
+
+    test("no-record needs a strict read: a missing row in a well-formed config, never a damaged one", async () => {
+      const config = await setupChild("present");
+      const noRecord = {
+        kind: "indeterminate",
+        reason: "no task record and no attempt owned by this process",
+        code: "no-record",
+      } as const;
+      expect(await read(otherProcess(config), "absent")).toEqual(noRecord);
+      await fsPromises.writeFile(configFilePath(config.rootDir), "{ not json", "utf-8");
+      const damaged = await read(otherProcess(config), "absent");
+      expect(damaged.kind).toBe("indeterminate");
+      expect(damaged.kind === "indeterminate" && damaged.code).toBeUndefined();
+      await fsPromises.rm(configFilePath(config.rootDir));
+      expect(await read(otherProcess(config), "absent")).toEqual(noRecord);
     });
 
     test.each([

@@ -65,7 +65,10 @@ interface TerminalFailureInternals {
   ) => Promise<void>;
 }
 
-async function end(root: string, outcome: "reported" | "no-report" | "refused") {
+async function end(
+  root: string,
+  outcome: "reported" | "no-report" | "refused" | "failed-checkpoint" | "refused-failed-checkpoint"
+) {
   const config = new Config(root);
   await fs.mkdir(config.srcDir, { recursive: true });
   const projectPath = await createTestProject(root, "repo", { initGit: false });
@@ -121,13 +124,25 @@ async function end(root: string, outcome: "reported" | "no-report" | "refused") 
   );
   if (!created.success) throw new Error(`reservation failed: ${created.error}`);
   const childId = created.data[0].taskId;
-  if (outcome === "no-report") {
+  if (outcome === "no-report" || outcome === "failed-checkpoint") {
     const stopped = await taskService.stopDescendantAgentTask(FIXTURE_PARENT_ID, childId);
     if (!stopped.success) throw new Error(`stop failed: ${stopped.error}`);
     for (let i = 0; i < 400 && taskService.isWorkspaceStopInProgress(childId); i++) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
-  } else if (outcome === "refused") {
+    if (outcome === "failed-checkpoint") {
+      // A runner classified the ended child and recorded the step failed, then crashed before
+      // its claim (the cut-1 window): the journal says failed but nothing retired the child.
+      await store.recordStepFailed(FIXTURE_RUN_ID, {
+        stepId: FIXTURE_STEP_ID,
+        inputHash: hashWorkflowStepInput(FIXTURE_STEP_ID, stepSpec),
+        taskId: childId,
+        error: `agent ${FIXTURE_STEP_ID} task ${childId} ended without a report`,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+    }
+  } else if (outcome === "refused" || outcome === "refused-failed-checkpoint") {
     // The real terminal-failure path: interrupted row, settlement receipt, failure artifact.
     const row = findWorkspaceInConfig(config, childId);
     if (row == null) throw new Error("reserved child row missing");
@@ -137,6 +152,18 @@ async function end(root: string, outcome: "reported" | "no-report" | "refused") 
       FIXTURE_REFUSAL,
       { expectedAttemptId: row.taskAttemptId ?? null }
     );
+    if (outcome === "refused-failed-checkpoint") {
+      // What the child's own runner records: the step failed with the refusal, the run failed.
+      await store.recordStepFailed(FIXTURE_RUN_ID, {
+        stepId: FIXTURE_STEP_ID,
+        inputHash: hashWorkflowStepInput(FIXTURE_STEP_ID, stepSpec),
+        taskId: childId,
+        error: FIXTURE_REFUSAL.errorMessage,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      await store.appendStatus(FIXTURE_RUN_ID, "failed", new Date().toISOString());
+    }
   } else {
     await upsertSubagentReportArtifact({
       workspaceId: FIXTURE_PARENT_ID,
@@ -150,7 +177,7 @@ async function end(root: string, outcome: "reported" | "no-report" | "refused") 
   return { childId, row: findWorkspaceInConfig(config, childId) };
 }
 
-async function resume(root: string) {
+async function resume(root: string, retryFromFailedCheckpoint: boolean) {
   const config = new Config(root);
   stubStableIds(config, ["replacement01"]);
   const taskService = stack(config);
@@ -179,7 +206,10 @@ async function resume(root: string) {
   let result: unknown;
   let error: string | undefined;
   try {
-    result = await runner.run(FIXTURE_RUN_ID);
+    result = await runner.run(
+      FIXTURE_RUN_ID,
+      retryFromFailedCheckpoint ? { allowRetryFromFailedCheckpoint: true } : undefined
+    );
   } catch (caught: unknown) {
     error = caught instanceof Error ? caught.message : String(caught);
   }
@@ -206,8 +236,16 @@ const [phase, root, outcome] = process.argv.slice(2);
 try {
   const output =
     phase === "end"
-      ? await end(root, outcome === "reported" || outcome === "refused" ? outcome : "no-report")
-      : await resume(root);
+      ? await end(
+          root,
+          outcome === "reported" ||
+            outcome === "refused" ||
+            outcome === "failed-checkpoint" ||
+            outcome === "refused-failed-checkpoint"
+            ? outcome
+            : "no-report"
+        )
+      : await resume(root, outcome === "retry");
   process.stdout.write(`FIXTURE_RESULT ${JSON.stringify(output)}\n`);
   process.exit(0);
 } catch (error: unknown) {

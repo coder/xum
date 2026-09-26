@@ -3812,6 +3812,21 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
+  /**
+   * Strict read (see TaskAttemptOutcome's `code: "no-record"`): true only when a well-formed
+   * config, or no config file, has no row for the task. The lenient read also returns an empty
+   * config for a malformed or unreadable file, which must never read as "no row".
+   */
+  private taskRowPositivelyAbsent(taskId: string): boolean {
+    try {
+      return (
+        findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId) == null
+      );
+    } catch {
+      return false;
+    }
+  }
+
   private async inspectAttemptOutcome(
     taskId: string,
     options?: { requestingWorkspaceId?: string }
@@ -3901,7 +3916,10 @@ export class TaskService implements AgentTaskIntegration {
     const owned = this.ownedAttemptByTaskId.get(taskId);
     if (owned == null) {
       if (entry == null) {
-        return indeterminate("no task record and no attempt owned by this process");
+        const reason = "no task record and no attempt owned by this process";
+        return this.taskRowPositivelyAbsent(taskId)
+          ? { kind: "indeterminate", reason, code: "no-record" }
+          : indeterminate(reason);
       }
       // Report first: this branch runs only once the report artifact read positively found none.
       if (reportPositivelyAbsent) {
@@ -3944,6 +3962,10 @@ export class TaskService implements AgentTaskIntegration {
         kind: "terminal-no-report",
         ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
         ...(failure != null ? { failure } : {}),
+        // Ended before (or without) a published row, e.g. a canceled reservation.
+        ...(entry == null && this.taskRowPositivelyAbsent(taskId)
+          ? { code: "no-record" as const }
+          : {}),
       };
     }
     if (status != null && ACTIVE_AGENT_TASK_STATUSES.has(status)) {

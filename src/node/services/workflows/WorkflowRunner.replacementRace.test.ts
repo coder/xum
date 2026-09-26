@@ -9,6 +9,7 @@
  * A's lease reads as stale to B without real waits. Launch is stubbed (startReservedAgentTask);
  * reservation, claim and the single-use publishing commit are the real TaskService code.
  */
+import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
@@ -17,7 +18,10 @@ import { Ok, type Result } from "@/common/types/result";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { Config } from "@/node/config";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { writeSubagentAttemptSettlementReceipt } from "@/node/services/subagentAttemptSettlements";
+import {
+  readSubagentAttemptSettlementReceiptStrict,
+  writeSubagentAttemptSettlementReceipt,
+} from "@/node/services/subagentAttemptSettlements";
 import type { TaskService } from "@/node/services/taskService";
 import {
   createTaskServiceStack,
@@ -249,17 +253,27 @@ describe("replacing one retired attempt across runners (G2)", () => {
     return ids.sort();
   }
 
+  async function setStatus(config: Config, taskId: string, status: "running" | "interrupted") {
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const ws of project.workspaces) {
+          if (ws.id === taskId) ws.taskStatus = status;
+        }
+      }
+      return cfg;
+    });
+  }
+
   const journalChild = (run: WorkflowRunRecord) =>
     run.steps.filter((step) => step.stepId === STEP_ID).at(-1)?.taskId;
 
   // A classified the prior child (journal: step failed), claimed it, and stalled before reserving.
-  // B's resume re-runs that FAILED checkpoint with a fresh reservation (today's failed-checkpoint
-  // behavior). In this window the LEASE, not the claim, is the fence: A, having lost it, can no
-  // longer checkpoint or reserve, so exactly one child is published and the journal names it.
-  // Interim gap until G2 PR B2 (failed-checkpoint consultation) closes the ordering: B's
-  // reservation neither re-claims the prior attempt nor consumes a claim, so A's claim stays live.
+  // B's resume consults that FAILED checkpoint's child (ended, no report: consultFailedCheckpoint),
+  // claims it again, which re-stamps the nonce so A's claim can no longer publish, and consumes
+  // its own claim in the replacement's publishing commit. The lease also stops A here; the claim
+  // is now a second, independent fence.
   test(
-    "cut after A's claim: B re-runs the failed checkpoint and publishes; A publishes nothing",
+    "cut after A's claim: B re-claims the failed checkpoint's child and publishes; A publishes nothing",
     async () => {
       const { config, storeA, storeB } = await setup();
       const a = backend(config, "replacementa");
@@ -288,13 +302,11 @@ describe("replacing one retired attempt across runners (G2)", () => {
       expect(journalChild(await storeB.getRun(RUN_ID))).toBe("replacementb");
       expect(a.createManyCalls()).toBe(0);
       expect(b.createManyCalls()).toBe(1);
-      // B2 flips this: B's re-run will claim the prior attempt again and consume that claim.
+      // B re-claimed the prior attempt and its replacement consumed that claim.
       expect(findWorkspaceInConfig(config, PRIOR)?.taskAttemptRetiredBy).toMatchObject({
         attemptId: PRIOR_ATTEMPT,
+        replacementTaskId: "replacementb",
       });
-      expect(
-        findWorkspaceInConfig(config, PRIOR)?.taskAttemptRetiredBy?.replacementTaskId
-      ).toBeUndefined();
     },
     RACE_TEST_TIMEOUT_MS
   );
@@ -328,6 +340,102 @@ describe("replacing one retired attempt across runners (G2)", () => {
       expect(journalChild(await storeB.getRun(RUN_ID))).toBe("replacementa");
       expect(findWorkspaceInConfig(config, PRIOR)?.taskAttemptRetiredBy).toMatchObject({
         replacementTaskId: "replacementa",
+      });
+    },
+    RACE_TEST_TIMEOUT_MS
+  );
+
+  // Stale runner: A checkpoints R_A, stalls past its lease, B leaves the step unresolved, and A
+  // then publishes R_A. A failure recorded while R_A may still run elsewhere (a hard timeout, or
+  // any runner that decided before B2's evidence rule) labels the step FAILED naming R_A. The
+  // retry must consult R_A: nothing proves it ended, so the step stays unresolved (no second
+  // child) until R_A settles with a receipt; then the next retry retires and replaces it once.
+  test(
+    "a failed checkpoint naming a published, unproven child stays unresolved until the child settles",
+    async () => {
+      const { config, storeA, storeB } = await setup();
+      const a = backend(config, "replacementa");
+      const b = backend(new Config(config.rootDir), "replacementb");
+      const aCheckpointed = createDeferred();
+      const resumeA = createDeferred();
+      a.hooks.afterCheckpoint = async () => {
+        aCheckpointed.resolve();
+        await resumeA.promise;
+      };
+      storeA.stallRenewals();
+      const runA = settle(runner(storeA, a.service, OWNER_A).run(RUN_ID));
+      await aCheckpointed.promise;
+      expect((await settle(runner(storeB, b.service, OWNER_B, 60_000).run(RUN_ID))).kind).toBe(
+        "rejected"
+      );
+      resumeA.resolve();
+      storeA.unstallRenewals();
+      await runA;
+      expect(publishedReplacements(config)).toEqual(["replacementa"]);
+
+      const inputHash = hashWorkflowStepInput(STEP_ID, stepSpec);
+      // Past B's clock (60 s ahead): the journal's events stay ordered.
+      const at = (offsetMs: number) => new Date(Date.now() + offsetMs).toISOString();
+      await storeB.appendStatus(RUN_ID, "running", at(61_000), { allowInterruptedResume: true });
+      await storeB.recordStepFailed(RUN_ID, {
+        stepId: STEP_ID,
+        inputHash,
+        taskId: "replacementa",
+        error: "hard timeout",
+        startedAt: at(61_000),
+        completedAt: at(62_000),
+      });
+      await storeB.appendStatus(RUN_ID, "failed", at(62_000));
+
+      // A's run, ending after its lost lease, stopped R_A (the parent holds R_A's receipt). Model
+      // the window before that: R_A still running in A's backend, unprovable from any other one.
+      const attemptId = findWorkspaceInConfig(config, "replacementa")?.taskAttemptId;
+      assert(attemptId != null, "the published child has an attempt");
+      expect(
+        (
+          await readSubagentAttemptSettlementReceiptStrict(
+            path.join(config.sessionsDir, PARENT_ID),
+            "replacementa",
+            attemptId
+          )
+        ).kind
+      ).toBe("found");
+      await setStatus(config, "replacementa", "running");
+      const c = backend(new Config(config.rootDir), "replacementc");
+      const retry = await settle(
+        runner(storeB, c.service, OWNER_B, 120_000).run(RUN_ID, {
+          allowRetryFromFailedCheckpoint: true,
+        })
+      );
+      expect(retry.kind === "rejected" && retry.error).toBeInstanceOf(
+        WorkflowPriorAttemptUnresolvedError
+      );
+      expect(retry.kind === "rejected" && retry.error).toMatchObject({
+        stepId: STEP_ID,
+        taskId: "replacementa",
+        outcome: "indeterminate",
+      });
+      expect(c.createManyCalls()).toBe(0);
+      expect(publishedReplacements(config)).toEqual(["replacementa"]);
+      const unresolvedRun = await storeB.getRun(RUN_ID);
+      expect(journalChild(unresolvedRun)).toBe("replacementa");
+      // Resumable, not failed: resuming again once R_A settles re-consults it.
+      expect(unresolvedRun.status).toBe("interrupted");
+
+      // R_A settles: interrupted again, its receipt already in the parent's dir.
+      await setStatus(config, "replacementa", "interrupted");
+      const d = backend(new Config(config.rootDir), "replacementd");
+      expect(
+        await runner(storeB, d.service, OWNER_B, 180_000).run(RUN_ID, {
+          allowRetryFromFailedCheckpoint: true,
+          allowResumeFromInterrupted: true,
+        })
+      ).toEqual({ reportMarkdown: "Final: report from replacementd" });
+      expect(publishedReplacements(config)).toEqual(["replacementa", "replacementd"]);
+      expect(journalChild(await storeB.getRun(RUN_ID))).toBe("replacementd");
+      expect(findWorkspaceInConfig(config, "replacementa")?.taskAttemptRetiredBy).toMatchObject({
+        attemptId,
+        replacementTaskId: "replacementd",
       });
     },
     RACE_TEST_TIMEOUT_MS

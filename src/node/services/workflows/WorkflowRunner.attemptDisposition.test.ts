@@ -273,7 +273,12 @@ describe("WorkflowRunner attempt disposition", () => {
         await okReport.promise;
         return report(taskId);
       },
-      readSettledAgentResult: async () => ({ kind: "terminal-no-report" }),
+      readSettledAgentResult: async () => ({
+        kind: "terminal-no-report",
+        attemptId: "att_00000000000000a1",
+      }),
+      // The retry consults the failed step's child (ended, no report) and retires it first.
+      claimRetiredAttempt: mock(async () => ({ success: true as const, nonce: "nonce-retry" })),
       async interruptRun() {
         okReport.resolve();
       },
@@ -291,6 +296,9 @@ describe("WorkflowRunner attempt disposition", () => {
     expect(retried).toEqual({ reportMarkdown: "report from task_fail_2|report from task_ok_1" });
     // Only the failed step reran; the settled sibling was reused.
     expect(createAgentTasks.mock.calls.at(-1)?.[0].map((spec) => spec.id)).toEqual(["fail"]);
+    expect(createAgentTasks.mock.calls.at(-1)?.[1]).toMatchObject({
+      retires: [{ taskId: "task_fail_1", attemptId: "att_00000000000000a1", nonce: "nonce-retry" }],
+    });
   });
 
   test("pipeline fail-fast disposes live siblings concurrently, keeping their reports and the original error", async () => {

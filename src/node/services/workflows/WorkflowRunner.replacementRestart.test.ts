@@ -53,6 +53,32 @@ describe("workflow step replacement across a backend restart (G2)", () => {
     });
   }, 60_000);
 
+  test("a failed checkpoint whose child ended without a report is retired and replaced once", async () => {
+    await runFixture(["end", root.path, "failed-checkpoint"]);
+
+    const resumed = await runFixture(["resume", root.path]);
+    expect(resumed).toMatchObject({
+      result: { reportMarkdown: "Final: report from replacement01" },
+      children: ["priorchild01", "replacement01"],
+      journal: "replacement01",
+      priorRetiredBy: { childTaskId: "priorchild01", replacementTaskId: "replacement01" },
+    });
+  }, 60_000);
+
+  test("retrying a failed checkpoint whose child failed terminally fails again, never replaced", async () => {
+    await runFixture(["end", root.path, "refused-failed-checkpoint"]);
+
+    const retried = await runFixture(["resume", root.path, "retry"]);
+    expect(String(retried.error)).toContain("fixture: the model refused");
+    expect(retried).toMatchObject({
+      runStatus: "failed",
+      children: ["priorchild01"],
+      journal: "priorchild01",
+      journalStatus: "failed",
+    });
+    expect(retried.priorRetiredBy).toBeUndefined();
+  }, 60_000);
+
   test("a child that failed terminally is never replaced: the next process fails the step", async () => {
     const ended = await runFixture(["end", root.path, "refused"]);
     expect(ended).toMatchObject({ childId: "priorchild01", row: { taskStatus: "interrupted" } });
