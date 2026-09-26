@@ -99,7 +99,7 @@ describe("KeepAwakeController", () => {
     h.emit("b", snapshot({ activeBashMonitorCount: 1 }));
 
     expect(h.blocker.startCalls).toEqual([]);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
   });
 
   test("holds exactly one blocker across overlapping busy workspaces", async () => {
@@ -108,7 +108,7 @@ describe("KeepAwakeController", () => {
 
     h.emit("a", snapshot({ streaming: true }));
     expect(h.blocker.startCalls).toEqual(["prevent-display-sleep"]);
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     // A second busy workspace (armed bash monitor) must not start a second blocker.
     h.emit("b", snapshot({ activeBashMonitorCount: 1 }));
@@ -117,13 +117,13 @@ describe("KeepAwakeController", () => {
     // First workspace goes idle: still held for the second.
     h.emit("a", snapshot({ streaming: false }));
     expect(h.blocker.stopCalls).toEqual([]);
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     // Last busy workspace goes idle: released exactly once.
     h.emit("b", snapshot({ activeBashMonitorCount: 0 }));
     expect(h.blocker.stopCalls).toEqual([h.blocker.startedIds[0]]);
     expect(h.blocker.runningCount).toBe(0);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
   });
 
   test("workflow runs count as busy and a null activity clears the workspace", async () => {
@@ -131,11 +131,11 @@ describe("KeepAwakeController", () => {
     await h.controller.start();
 
     h.emit("a", snapshot({ activeWorkflowRunCount: 2 }));
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     // Workspace removed while its workflow run was still counted.
     h.emit("a", null);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
     expect(h.blocker.stopCalls).toHaveLength(1);
   });
 
@@ -148,11 +148,11 @@ describe("KeepAwakeController", () => {
     expect(h.blocker.startCalls).toEqual([]);
 
     h.emit("a", snapshot({ streaming: true }));
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     // ...nor release while the workspace is otherwise still busy.
     h.emit("a", snapshot({ streaming: false, transientGoalOnly: true }));
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
     expect(h.blocker.stopCalls).toEqual([]);
   });
 
@@ -165,11 +165,11 @@ describe("KeepAwakeController", () => {
 
     h.setEnabled(true);
     expect(h.blocker.startCalls).toHaveLength(1);
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     h.setEnabled(false);
     expect(h.blocker.stopCalls).toEqual([h.blocker.startedIds[0]]);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
 
     // Unrelated config edits while already in the wanted state are idempotent.
     h.setEnabled(false);
@@ -179,7 +179,7 @@ describe("KeepAwakeController", () => {
     h.setEnabled(true);
     expect(h.blocker.startCalls).toHaveLength(2);
     expect(h.blocker.startedIds[1]).not.toBe(h.blocker.startedIds[0]);
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
   });
 
   test("seeds from the activity list and acquires for an already-streaming workspace", async () => {
@@ -194,10 +194,10 @@ describe("KeepAwakeController", () => {
     await h.controller.start();
 
     expect(h.blocker.startCalls).toHaveLength(1);
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     h.emit("streaming", snapshot({ streaming: false }));
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
   });
 
   test("a live event during the seed read wins over the older snapshot", async () => {
@@ -220,11 +220,11 @@ describe("KeepAwakeController", () => {
     resolveList({ ended: snapshot({ streaming: true }), fresh: snapshot() });
     await started;
 
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
     // Only "fresh" is busy: releasing it must drop the blocker even though the snapshot
     // claimed "ended" was streaming.
     h.emit("fresh", snapshot({ activeBashMonitorCount: 0 }));
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
   });
 
   // Desktop startup does not wait for the seed read (it can be slow on large workspace
@@ -243,14 +243,14 @@ describe("KeepAwakeController", () => {
 
     const started = h.controller.start();
     h.emit("a", snapshot({ streaming: true }));
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
     h.emit("a", snapshot({ streaming: false }));
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
 
     resolveList({});
     await started;
     expect(h.blocker.startCalls).toHaveLength(1);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
   });
 
   test("dispose during the seed read releases and ignores the late snapshot", async () => {
@@ -267,7 +267,7 @@ describe("KeepAwakeController", () => {
 
     const started = h.controller.start();
     h.emit("a", snapshot({ streaming: true }));
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     h.controller.dispose();
     expect(h.blocker.runningCount).toBe(0);
@@ -276,7 +276,7 @@ describe("KeepAwakeController", () => {
     resolveList({ b: snapshot({ streaming: true }) });
     await started;
     expect(h.blocker.startCalls).toHaveLength(1);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
   });
 
   test("dispose releases the blocker and stops reacting to later events", async () => {
@@ -284,7 +284,7 @@ describe("KeepAwakeController", () => {
     await h.controller.start();
 
     h.emit("a", snapshot({ streaming: true }));
-    expect(h.controller.isHoldingBlocker).toBe(true);
+    expect(h.blocker.runningCount).toBe(1);
 
     h.controller.dispose();
     expect(h.blocker.stopCalls).toEqual([h.blocker.startedIds[0]]);
@@ -294,7 +294,7 @@ describe("KeepAwakeController", () => {
     h.emit("b", snapshot({ streaming: true }));
     h.setEnabled(true);
     expect(h.blocker.startCalls).toHaveLength(1);
-    expect(h.controller.isHoldingBlocker).toBe(false);
+    expect(h.blocker.runningCount).toBe(0);
 
     // Idempotent.
     h.controller.dispose();
@@ -314,11 +314,15 @@ describe("KeepAwakeController", () => {
     );
     expect(startOutcome).toBeInstanceOf(AssertionError);
     expect((startOutcome as AssertionError).message).toMatch(/not running/);
-    expect(h.controller.isHoldingBlocker).toBe(false);
 
     // Listener failures stay inside the controller: the emitter (WorkspaceService) must
     // never see the assertion thrown from an activity event.
     expect(() => h.emit("b", snapshot({ streaming: true }))).not.toThrow();
-    expect(h.controller.isHoldingBlocker).toBe(false);
+
+    // The unverified ids were never adopted: a controller that kept one would stop it
+    // once every workspace goes idle.
+    h.emit("a", snapshot({ streaming: false }));
+    h.emit("b", snapshot({ streaming: false }));
+    expect(h.blocker.stopCalls).toEqual([]);
   });
 });

@@ -26,12 +26,6 @@ export interface BoundedTranscriptRevealArgs<Row extends RevealRow> {
    * row, which makes the row ceilings the only limit.
    */
   rowWeight?: (index: number) => number;
-  /**
-   * Test seam. Defaults to a staged double requestAnimationFrame: the first callback runs
-   * before this frame's paint, the second after the committed tail had a rendering
-   * opportunity. Returns a cancel function.
-   */
-  scheduleFrame?: (callback: () => void) => () => void;
 }
 
 export interface BoundedTranscriptReveal {
@@ -65,6 +59,10 @@ interface RevealState {
   newestMessageId: string | null;
 }
 
+/**
+ * Staged double requestAnimationFrame: the first callback runs before this frame's paint, the
+ * second after the committed tail had a rendering opportunity. Returns a cancel function.
+ */
 function scheduleStagedFrame(callback: () => void): () => void {
   let second: number | undefined;
   const first = requestAnimationFrame(() => {
@@ -77,9 +75,9 @@ function scheduleStagedFrame(callback: () => void): () => void {
 }
 
 /**
- * Default frame scheduler, swappable by full-app tests that need to hold the reveal between
- * chunks without stubbing the global requestAnimationFrame (which streaming text also uses).
- * Production never reassigns it.
+ * Frame scheduler for reveal steps, swappable by tests that need to hold the reveal between
+ * chunks without stubbing the global requestAnimationFrame (which streaming text also uses):
+ * the hook's unit tests and full-app tests. Production never reassigns it.
  */
 export const transcriptRevealFrameScheduler: {
   schedule: (callback: () => void) => () => void;
@@ -250,7 +248,7 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   useLayoutEffect(() => {
     latest.current = { messages: args.messages, stepInputs, fromIndex };
   });
-  const scheduleFrame = args.scheduleFrame ?? transcriptRevealFrameScheduler.schedule;
+  const scheduleFrame = transcriptRevealFrameScheduler.schedule;
 
   const anchorMessageId = current.anchorMessageId;
   const generation = current.generation;

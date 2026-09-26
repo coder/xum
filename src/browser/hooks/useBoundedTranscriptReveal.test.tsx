@@ -9,14 +9,19 @@ import {
   TRANSCRIPT_REVEAL_TAIL_ROWS,
 } from "@/common/constants/ui";
 
-import { useBoundedTranscriptReveal } from "./useBoundedTranscriptReveal";
+import {
+  transcriptRevealFrameScheduler,
+  useBoundedTranscriptReveal,
+} from "./useBoundedTranscriptReveal";
 
+const defaultSchedule = transcriptRevealFrameScheduler.schedule;
 let cleanupDom: (() => void) | null = null;
 beforeEach(() => {
   cleanupDom = installDom();
 });
 afterEach(() => {
   cleanup();
+  transcriptRevealFrameScheduler.schedule = defaultSchedule;
   cleanupDom?.();
   cleanupDom = null;
 });
@@ -28,7 +33,10 @@ interface Row {
 const rows = (count: number, prefix = "m"): Row[] =>
   Array.from({ length: count }, (_, index) => ({ id: `${prefix}-${index}` }));
 
-/** Manual frame scheduler: `flush()` runs the pending callback, `cancelled` counts cancels. */
+/**
+ * Installs a manual frame scheduler for the hook (restored after each test): `flush()` runs the
+ * pending callback, `cancelled` counts cancels.
+ */
 function manualFrames() {
   let pending: (() => void) | null = null;
   let cancelled = 0;
@@ -39,8 +47,8 @@ function manualFrames() {
       cancelled += 1;
     };
   };
+  transcriptRevealFrameScheduler.schedule = scheduleFrame;
   return {
-    scheduleFrame,
     hasPending: () => pending !== null,
     flush: () => {
       const callback = pending;
@@ -62,7 +70,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.isFullyRevealed).toBe(false);
@@ -91,7 +98,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages: rows(TRANSCRIPT_REVEAL_TAIL_ROWS),
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current).toEqual({ fromIndex: 0, isFullyRevealed: true });
@@ -105,7 +111,6 @@ describe("useBoundedTranscriptReveal", () => {
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const initialFrom = result.current.fromIndex;
@@ -157,7 +162,6 @@ describe("useBoundedTranscriptReveal", () => {
         ...props,
         isSafeCut: alwaysSafe,
         rowWeight,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     while (frames.hasPending()) act(() => frames.flush());
@@ -179,7 +183,6 @@ describe("useBoundedTranscriptReveal", () => {
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.isFullyRevealed).toBe(true);
@@ -190,13 +193,13 @@ describe("useBoundedTranscriptReveal", () => {
   });
 
   test("(f) a vanished anchor falls back to a safe cut at or before its index hint, never 0", () => {
-    const frames = manualFrames();
+    // Hold every step so only the boundary logic under test moves fromIndex.
+    manualFrames();
     let props = { workspaceId: "ws", messages: rows(300) };
     const { result, rerender } = renderHook(() =>
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const anchorIndex = result.current.fromIndex;
@@ -222,7 +225,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     // 200 - 40 = 160 lies inside bundle A → the cut moves to its head.
@@ -258,7 +260,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.fromIndex).toBe(160);
@@ -280,13 +281,13 @@ describe("useBoundedTranscriptReveal", () => {
     // A scheduler whose cancel is a no-op, so an already-cancelled (stale) callback can still be
     // invoked — the way a frame that slipped past cancellation would fire.
     const scheduled: Array<() => void> = [];
-    const scheduleFrame = (callback: () => void) => {
+    transcriptRevealFrameScheduler.schedule = (callback) => {
       scheduled.push(callback);
       return () => undefined;
     };
     let props = { workspaceId: "ws", messages: rows(300) };
     const { result, rerender } = renderHook(() =>
-      useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe, scheduleFrame })
+      useBoundedTranscriptReveal({ ...props, isSafeCut: alwaysSafe })
     );
     const initialFrom = result.current.fromIndex;
     expect(scheduled).toHaveLength(1);
@@ -308,13 +309,13 @@ describe("useBoundedTranscriptReveal", () => {
   });
 
   test("an empty transcript that fills starts tail-first, judged by the initial-tail limits", () => {
-    const frames = manualFrames();
+    // Hold every step so only the boundary logic under test moves fromIndex.
+    manualFrames();
     let props = { workspaceId: "ws", messages: rows(0) };
     const { result, rerender } = renderHook(() =>
       useBoundedTranscriptReveal({
         ...props,
         isSafeCut: alwaysSafe,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.fromIndex).toBe(0);
@@ -346,7 +347,6 @@ describe("useBoundedTranscriptReveal", () => {
         workspaceId: "ws",
         messages,
         isSafeCut,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const eligible = () => new Set(messages.slice(result.current.fromIndex).map((row) => row.id));
@@ -388,7 +388,6 @@ describe("useBoundedTranscriptReveal", () => {
         messages,
         isSafeCut: alwaysSafe,
         rowWeight,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     const stepWeight = (from: number, to: number) => {
@@ -421,7 +420,6 @@ describe("useBoundedTranscriptReveal", () => {
         messages,
         isSafeCut: alwaysSafe,
         rowWeight: () => TRANSCRIPT_REVEAL_STEP_CHARS * 10,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     expect(result.current.fromIndex).toBe(2);
@@ -443,7 +441,6 @@ describe("useBoundedTranscriptReveal", () => {
         messages,
         isSafeCut,
         rowWeight: () => TRANSCRIPT_REVEAL_STEP_CHARS * 0.4,
-        scheduleFrame: frames.scheduleFrame,
       })
     );
     // Weight allows rows 48, 49 only (a third row would exceed the ceiling) → cut 48 is safe.

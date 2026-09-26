@@ -50,10 +50,5 @@
     { "file": "src/node/utils/main/crossProcessLock.ts", "symbol": "guardPath", "reason": "production caller: withReclaimGuard (fileLock.ts)" },
     { "file": "src/node/utils/network/pinnedHttpsFetch.ts", "symbol": "PinnedHttpsFetchTransport", "reason": "injection point: DNS lookup and undici Agent factory; pinnedHttpsFetch.test.ts uses it to route validated, pinned dials to a loopback HTTPS harness (the production block list rejects loopback and the harness certificate is not system-trusted) and witness single DNS resolution, whole-answer block-list rejection, pinned connect.lookup/servername, no redirects, body caps, abort bounds and agent cleanup; production uses the default" }
   ],
-  "knownDebt": [
-    { "file": "src/browser/features/ChatInput/placeholderTips.ts", "symbol": "getPlaceholderTip", "reason": "nowMs parameter: only tests pass it (ChatInput passes undefined)" },
-    { "file": "src/browser/hooks/useBoundedTranscriptReveal.ts", "symbol": "BoundedTranscriptRevealArgs.scheduleFrame", "reason": "option set only by tests" },
-    { "file": "src/browser/utils/mcp/iconRefCache.ts", "symbol": "McpIconRefCache.size", "reason": "getter read only by tests" },
-    { "file": "src/desktop/keepAwake.ts", "symbol": "KeepAwakeController.isHoldingBlocker", "reason": "getter read only by keepAwake.test.ts" }
-  ]
+  "knownDebt": []
 }

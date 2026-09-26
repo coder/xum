@@ -61,12 +61,7 @@ export const ALLOWLIST_PATH = "scripts/check-test-seam-comments.allowlist.json";
  * these keys, so the baseline can only shrink: fixing a seam removes its entry here and in the
  * JSON file. Never add a key here; give a new seam a production caller or remove it instead.
  */
-export const FROZEN_KNOWN_DEBT: readonly string[] = [
-  "src/browser/features/ChatInput/placeholderTips.ts#getPlaceholderTip",
-  "src/browser/hooks/useBoundedTranscriptReveal.ts#BoundedTranscriptRevealArgs.scheduleFrame",
-  "src/browser/utils/mcp/iconRefCache.ts#McpIconRefCache.size",
-  "src/desktop/keepAwake.ts#KeepAwakeController.isHoldingBlocker",
-];
+export const FROZEN_KNOWN_DEBT: readonly string[] = [];
 
 /** .ts, .tsx, .mts, .cts, .js, .jsx, .mjs and .cjs. */
 const SOURCE_EXTENSION = /\.[cm]?[jt]sx?$/;
