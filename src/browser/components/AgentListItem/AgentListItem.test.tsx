@@ -252,7 +252,7 @@ function installAgentListItemTestDoubles() {
     }),
   }));
 
-  void mock.module("../WorkspaceHeartbeatModal", () => ({
+  void mock.module("@/browser/components/WorkspaceHeartbeatModal", () => ({
     WorkspaceHeartbeatModal: () => null,
   }));
 

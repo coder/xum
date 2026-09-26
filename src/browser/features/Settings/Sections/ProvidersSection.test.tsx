@@ -13,26 +13,12 @@ import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import * as ActualPolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
   AddCustomProviderInput,
   ProviderConfigInfo,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
-
-function installTestDoubles() {
-  // Bun mock.module registrations are global across files, so keep this test
-  // insulated from incomplete WorkspaceStore mocks registered by earlier files.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
-
-  void mock.module("@/browser/stores/WorkspaceStore", () => ({
-    ...actualWorkspaceStore,
-  }));
-}
 
 let repairRemovedProviderMock = mock(
   (_provider: string, _workspaceIds: Iterable<string>) => undefined
@@ -247,7 +233,6 @@ describe("ProvidersSection", () => {
     void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
       createSelectPrimitiveDouble()
     );
-    installTestDoubles();
     repairRemovedProviderMock = mock(
       (_provider: string, _workspaceIds: Iterable<string>) => undefined
     );

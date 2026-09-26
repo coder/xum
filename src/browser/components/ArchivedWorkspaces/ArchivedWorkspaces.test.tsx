@@ -12,7 +12,6 @@ import {
 import { installDom } from "../../../../tests/ui/dom";
 import * as APIModule from "@/browser/contexts/API";
 import type { APIClient } from "@/browser/contexts/API";
-import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as TooltipModule from "@/browser/components/Tooltip/Tooltip";
 import * as ForceDeleteModalModule from "@/browser/components/ForceDeleteModal/ForceDeleteModal";
@@ -37,18 +36,6 @@ import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePer
 import { ArchivedWorkspaces } from "./ArchivedWorkspaces";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { Result } from "@/common/types/result";
-
-function installTestDoubles() {
-  // Re-register the full WorkspaceStore mock before each test to avoid Bun's global mock leakage.
-  /* eslint-disable @typescript-eslint/no-require-imports */
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
-  /* eslint-enable @typescript-eslint/no-require-imports */
-
-  void mock.module("@/browser/stores/WorkspaceStore", () => ({
-    ...actualWorkspaceStore,
-  }));
-}
 
 function stubPageChrome() {
   spyOn(AgentContextModule, "AgentProvider").mockImplementation((props) => <>{props.children}</>);
@@ -136,7 +123,6 @@ describe("ArchivedWorkspaces", () => {
 
   beforeEach(() => {
     modalProps = undefined;
-    installTestDoubles();
     cleanupDom = installDom();
     deleteWorktreeMock.mockClear();
     getSessionUsageBatchMock.mockClear();

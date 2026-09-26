@@ -545,13 +545,13 @@ const localPlugin = {
         type: "problem",
         docs: {
           description:
-            "Require every file-scope bun `mock.module` registration in a test to be restored after the suite",
+            "Require every bun `mock.module` registration in a test to be restored after the suite",
         },
         schema: [
           {
             type: "object",
             properties: {
-              // Repo-relative test path -> specifiers whose file-scope mock may stay unrestored.
+              // Repo-relative test path -> specifiers whose mock may stay unrestored.
               allow: {
                 type: "object",
                 additionalProperties: { type: "array", items: { type: "string" } },
@@ -562,28 +562,43 @@ const localPlugin = {
         ],
         messages: {
           unrestored:
-            'File-scope mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`, or inject the dependency instead of mocking the module.',
+            'mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`/`afterEach`, or inject the dependency instead of mocking the module.',
           dynamicSpecifier:
-            "File-scope mock.module needs a string-literal specifier so its restore can be verified.",
+            "mock.module needs a statically known specifier (a string literal, a `const` string, or a loop over a `const` array of them) so its restore can be verified.",
         },
       },
       create(context) {
-        // bun registers mock.module process-wide and never unregisters it, so a file-scope
-        // mock silently replaces the module for every test file that runs later in the same
-        // shard. That made unrelated suites fail only for certain CI shard orders (#4524,
-        // #3359). A mock inside a test/hook callback is not file scope; one inside `afterAll`
-        // counts as a restore; `describe` callbacks run at file load, so they stay file scope.
-        // Mocks installed from hooks or local helpers leak too, but files usually pair them with
-        // restore helpers that only call-graph analysis could match, so this rule checks file
-        // scope only (hook/helper-installed leaks: #4639).
+        // bun registers mock.module process-wide and never unregisters it, so a mock silently
+        // replaces the module for every test file that runs later in the same shard, whether it
+        // was registered at file scope, from a hook, a test body or a helper. That made
+        // unrelated suites fail only for certain CI shard orders (#4524, #3359, #4639).
+        //
+        // A registration is a restore when it runs only from teardown: inside an
+        // `afterAll`/`afterEach` callback, or inside a same-file function whose every use is a
+        // call from teardown code (or its registration as the hook callback itself). A helper
+        // that setup code also calls is an installer. `restoreModulesAfterSuite` entries are
+        // restores too. A restore covers installs in the `describe` block (or file) its hook
+        // runs in, including nested blocks; load-time installs run before every test, so any
+        // restore that runs covers them. Skipped suites and never-called helpers do not run.
+        // This is a flow-insensitive lint heuristic for the repo's idioms, not a proof. Not
+        // modeled (known false negatives, #4660): mutated restore lists, helpers passed
+        // around dynamically, `if` filters inside loops over specifier arrays, suites whose
+        // tests are all skipped (their afterEach never runs), and a helper invoked both at load
+        // and from a scoped hook (treated as a load-time install).
         const allowed = new Set(
           context.options[0]?.allow?.[
             path.relative(context.cwd, context.filename).split(path.sep).join("/")
           ] ?? []
         );
-        const fileScopeMocks = [];
-        const restored = new Set();
+        const RESTORE_HOOKS = new Set(["afterAll", "afterEach"]);
+        const { sourceCode } = context;
+        const mockCalls = [];
+        const restoreListCalls = [];
 
+        const isFunctionNode = (node) =>
+          node?.type === "ArrowFunctionExpression" ||
+          node?.type === "FunctionExpression" ||
+          node?.type === "FunctionDeclaration";
         const isMockModuleCall = (node) =>
           node.callee.type === "MemberExpression" &&
           !node.callee.computed &&
@@ -591,8 +606,110 @@ const localPlugin = {
           node.callee.object.name === "mock" &&
           node.callee.property.type === "Identifier" &&
           node.callee.property.name === "module";
-        const getStringLiteral = (node) =>
-          node?.type === "Literal" && typeof node.value === "string" ? node.value : null;
+        const unwrapTypeAssertions = (node) => {
+          let current = node;
+          while (current?.type === "TSAsExpression" || current?.type === "TSSatisfiesExpression") {
+            current = current.expression;
+          }
+          return current;
+        };
+        const findVariable = (identifier) => {
+          for (let scope = sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (variable) {
+              return variable;
+            }
+          }
+          return null;
+        };
+        // Element nodes of a statically known array: an array literal (spreads of other known
+        // arrays included) or a `const` bound to one.
+        const resolveArrayElements = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Identifier") {
+            const def = findVariable(node)?.defs[0];
+            return def?.type === "Variable" && def.parent.kind === "const"
+              ? resolveArrayElements(def.node.init, depth + 1)
+              : null;
+          }
+          if (node.type !== "ArrayExpression") {
+            return null;
+          }
+          const elements = [];
+          for (const element of node.elements) {
+            if (element?.type === "SpreadElement") {
+              const spread = resolveArrayElements(element.argument, depth + 1);
+              if (spread == null) {
+                return null;
+              }
+              elements.push(...spread);
+            } else if (element != null) {
+              elements.push(element);
+            }
+          }
+          return elements;
+        };
+        // Every specifier string an expression can evaluate to, or null when not static. Covers
+        // literals, `const` strings, and loop variables over known arrays (`for (const p of
+        // PATHS)`, `for (const [p, exports] of realModules)`), so looped installs and restores
+        // stay checkable.
+        const resolveSpecifiers = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Literal") {
+            return typeof node.value === "string" ? [node.value] : null;
+          }
+          if (node.type === "TemplateLiteral") {
+            return node.expressions.length === 0 ? [node.quasis[0].value.cooked] : null;
+          }
+          if (node.type !== "Identifier") {
+            return null;
+          }
+          const def = findVariable(node)?.defs[0];
+          if (def?.type !== "Variable") {
+            return null;
+          }
+          const declarator = def.node;
+          const declaration = def.parent;
+          if (
+            declaration.parent?.type === "ForOfStatement" &&
+            declaration.parent.left === declaration
+          ) {
+            const elements = resolveArrayElements(declaration.parent.right, depth + 1);
+            if (elements == null) {
+              return null;
+            }
+            let pick;
+            if (declarator.id.type === "Identifier") {
+              pick = (element) => element;
+            } else if (
+              declarator.id.type === "ArrayPattern" &&
+              declarator.id.elements[0]?.type === "Identifier" &&
+              declarator.id.elements[0].name === node.name
+            ) {
+              pick = (element) => (element.type === "ArrayExpression" ? element.elements[0] : null);
+            } else {
+              return null;
+            }
+            const specifiers = [];
+            for (const element of elements) {
+              const resolved = resolveSpecifiers(pick(element), depth + 1);
+              if (resolved == null) {
+                return null;
+              }
+              specifiers.push(...resolved);
+            }
+            return specifiers;
+          }
+          return declaration.kind === "const" && declarator.id.type === "Identifier"
+            ? resolveSpecifiers(declarator.init, depth + 1)
+            : null;
+        };
         const getCalleeRootName = (callee) => {
           let current = callee;
           while (current.type === "MemberExpression" || current.type === "CallExpression") {
@@ -600,59 +717,199 @@ const localPlugin = {
           }
           return current.type === "Identifier" ? current.name : null;
         };
-        // Name of the call (e.g. "afterAll", "describe") a function is passed to, if any.
-        const getCallbackOwner = (fn) =>
-          fn.parent?.type === "CallExpression" && fn.parent.arguments.includes(fn)
-            ? getCalleeRootName(fn.parent.callee)
-            : null;
+        const SUITE_CALLS = new Set(["describe", "xdescribe"]);
+        const HOOK_CALLS = new Set(["beforeAll", "beforeEach", "afterAll", "afterEach"]);
+        const TEST_CALLS = new Set(["test", "it", "xtest", "xit"]);
+        // `describe.skip(...)`, `test.todo(...)`, `xit(...)`: the callback never runs.
+        const isSkippedCall = (call) => {
+          const root = getCalleeRootName(call.callee);
+          if (root?.startsWith("x")) {
+            return true;
+          }
+          for (
+            let callee = call.callee;
+            callee.type === "MemberExpression";
+            callee = callee.object
+          ) {
+            if (
+              !callee.computed &&
+              callee.property.type === "Identifier" &&
+              (callee.property.name === "skip" || callee.property.name === "todo")
+            ) {
+              return true;
+            }
+          }
+          return false;
+        };
+        const isFunctionContext = (node) => isFunctionNode(node) || node.type === "Program";
+        const enclosingContext = (node) =>
+          sourceCode.getAncestors(node).findLast((ancestor) => isFunctionContext(ancestor));
+        // The function a variable names: `function f() {}` or `const f = () => {}`.
+        const functionOfVariable = (variable) => {
+          const def = variable?.defs[0];
+          if (def?.type === "FunctionName") {
+            return def.node;
+          }
+          return def?.type === "Variable" && isFunctionNode(def.node.init) ? def.node.init : null;
+        };
+        const variableOfFunction = (fn) => {
+          const id =
+            fn.type === "FunctionDeclaration"
+              ? fn.id
+              : fn.parent?.type === "VariableDeclarator"
+                ? fn.parent.id
+                : null;
+          return id?.type === "Identifier" ? findVariable(id) : null;
+        };
+        const suiteIsWithin = (inner, outer) =>
+          outer === null ||
+          (inner !== null && outer.range[0] <= inner.range[0] && inner.range[1] <= outer.range[1]);
+
+        // Where a function (or the Program) runs:
+        // - suites: the `describe` callbacks (null = the whole file) whose tests execute it; empty
+        //   when it never runs (skipped suites, dead helpers);
+        // - atLoad: it runs while the file evaluates, before any test;
+        // - teardown: it runs only from `afterAll`/`afterEach`.
+        // Named helpers take the union over their call sites, resolved by binding, so a helper
+        // that setup code also calls is not teardown and its installs belong to every suite that
+        // calls it.
+        const contextInfo = new Map();
+        const NEVER = { suites: new Set(), atLoad: false, teardown: false };
+        const infoOf = (fn) => {
+          const known = contextInfo.get(fn);
+          if (known) {
+            return known;
+          }
+          contextInfo.set(fn, NEVER); // cycle guard
+          const info = computeInfo(fn);
+          contextInfo.set(fn, info);
+          return info;
+        };
+        const computeInfo = (fn) => {
+          if (fn.type === "Program") {
+            return { suites: new Set([null]), atLoad: true, teardown: false };
+          }
+          const call =
+            fn.parent?.type === "CallExpression" && fn.parent.arguments.includes(fn)
+              ? fn.parent
+              : null;
+          const owner = call ? getCalleeRootName(call.callee) : null;
+          if (call && (SUITE_CALLS.has(owner) || HOOK_CALLS.has(owner) || TEST_CALLS.has(owner))) {
+            const outer = infoOf(enclosingContext(call));
+            if (isSkippedCall(call) || outer.suites.size === 0) {
+              return NEVER;
+            }
+            if (SUITE_CALLS.has(owner)) {
+              return { suites: new Set([fn]), atLoad: true, teardown: false };
+            }
+            return { suites: outer.suites, atLoad: false, teardown: RESTORE_HOOKS.has(owner) };
+          }
+          const variable = variableOfFunction(fn);
+          const reads = variable?.references.filter((reference) => reference.isRead()) ?? [];
+          if (reads.length === 0) {
+            // Anonymous callbacks and IIFEs run wherever their enclosing code runs; an unused
+            // named function never runs.
+            return variable ? NEVER : infoOf(enclosingContext(fn));
+          }
+          const suites = new Set();
+          let atLoad = false;
+          let teardown = true;
+          for (const reference of reads) {
+            const identifier = reference.identifier;
+            const parent = identifier.parent;
+            let site;
+            if (parent.type === "CallExpression" && parent.callee === identifier) {
+              site = infoOf(enclosingContext(parent));
+            } else if (
+              parent.type === "CallExpression" &&
+              parent.arguments.includes(identifier) &&
+              (HOOK_CALLS.has(getCalleeRootName(parent.callee)) ||
+                SUITE_CALLS.has(getCalleeRootName(parent.callee)))
+            ) {
+              // `beforeEach(install)` / `afterEach(restore)` / `describe("x", suiteBody)`.
+              const owner = getCalleeRootName(parent.callee);
+              const outer = infoOf(enclosingContext(parent));
+              if (isSkippedCall(parent) || outer.suites.size === 0) {
+                site = NEVER;
+              } else if (SUITE_CALLS.has(owner)) {
+                site = { suites: new Set([fn]), atLoad: true, teardown: false };
+              } else {
+                site = { suites: outer.suites, atLoad: false, teardown: RESTORE_HOOKS.has(owner) };
+              }
+            } else {
+              // Passed around or stored: assume it runs where it is defined, not as teardown.
+              site = { ...infoOf(enclosingContext(fn)), teardown: false };
+            }
+            site.suites.forEach((suite) => suites.add(suite));
+            atLoad ||= site.atLoad;
+            teardown &&= site.teardown;
+          }
+          return { suites, atLoad, teardown };
+        };
 
         return {
           CallExpression(node) {
             if (
               node.callee.type === "Identifier" &&
-              node.callee.name === "restoreModulesAfterSuite" &&
-              node.arguments[0]?.type === "ArrayExpression"
+              node.callee.name === "restoreModulesAfterSuite"
             ) {
-              for (const entry of node.arguments[0].elements) {
-                const specifier =
-                  entry?.type === "ArrayExpression" ? getStringLiteral(entry.elements[0]) : null;
-                if (specifier != null) {
-                  restored.add(specifier);
-                }
+              // Only the real helper registers an afterAll; a local look-alike does not.
+              const def = findVariable(node.callee)?.defs[0];
+              if (
+                def?.type === "ImportBinding" &&
+                String(def.parent.source.value).endsWith("/moduleMocks")
+              ) {
+                restoreListCalls.push(node);
               }
               return;
             }
-            if (!isMockModuleCall(node)) {
-              return;
+            if (isMockModuleCall(node)) {
+              mockCalls.push(node);
             }
-            const enclosingFunctions = context.sourceCode
-              .getAncestors(node)
-              .filter(
-                (ancestor) =>
-                  ancestor.type === "ArrowFunctionExpression" ||
-                  ancestor.type === "FunctionExpression" ||
-                  ancestor.type === "FunctionDeclaration"
-              );
-            const specifier = getStringLiteral(node.arguments[0]);
-            if (enclosingFunctions.some((fn) => getCallbackOwner(fn) === "afterAll")) {
-              if (specifier != null) {
-                restored.add(specifier);
-              }
-              return;
-            }
-            if (enclosingFunctions.some((fn) => getCallbackOwner(fn) !== "describe")) {
-              return;
-            }
-            if (specifier == null) {
-              context.report({ node, messageId: "dynamicSpecifier" });
-              return;
-            }
-            fileScopeMocks.push({ node, specifier });
           },
           "Program:exit"() {
-            for (const { node, specifier } of fileScopeMocks) {
-              if (!restored.has(specifier) && !allowed.has(specifier)) {
-                context.report({ node, messageId: "unrestored", data: { specifier } });
+            const restores = [];
+            for (const node of restoreListCalls) {
+              const specifiers = new Set();
+              for (const entry of resolveArrayElements(node.arguments[0]) ?? []) {
+                if (entry.type === "ArrayExpression") {
+                  (resolveSpecifiers(entry.elements[0]) ?? []).forEach((s) => specifiers.add(s));
+                }
+              }
+              // It registers an `afterAll` in each suite its call runs in.
+              restores.push({ specifiers, suites: infoOf(enclosingContext(node)).suites });
+            }
+            const installs = [];
+            for (const node of mockCalls) {
+              const info = infoOf(enclosingContext(node));
+              const specifiers = resolveSpecifiers(node.arguments[0]);
+              if (info.teardown) {
+                restores.push({ specifiers: new Set(specifiers ?? []), suites: info.suites });
+              } else if (info.suites.size === 0) {
+                // Never runs (skipped suite, uncalled helper): nothing to restore or resolve.
+              } else if (specifiers == null) {
+                context.report({ node, messageId: "dynamicSpecifier" });
+              } else {
+                installs.push({ node, specifiers, info });
+              }
+            }
+            for (const { node, specifiers, info } of installs) {
+              for (const specifier of specifiers) {
+                const matching = restores.filter(
+                  (restore) => restore.specifiers.has(specifier) && restore.suites.size > 0
+                );
+                // A load-time install precedes every test, so any restore that runs covers it.
+                // Otherwise each suite that installs needs a restore in it or an enclosing suite.
+                const covered = info.atLoad
+                  ? matching.length > 0
+                  : [...info.suites].every((suite) =>
+                      matching.some((restore) =>
+                        [...restore.suites].some((outer) => suiteIsWithin(suite, outer))
+                      )
+                    );
+                if (!covered && !allowed.has(specifier)) {
+                  context.report({ node, messageId: "unrestored", data: { specifier } });
+                }
               }
             }
           },
