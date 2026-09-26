@@ -35,6 +35,7 @@ function createStatusStream() {
     }
   };
   return {
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
     api: { update: { onStatus } } as unknown as APIClient,
     push(status: UpdateStatus) {
       queue.push(status);

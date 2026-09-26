@@ -107,20 +107,26 @@ export function createControllableAsyncIterable<T>(
 
 // oRPC types streaming procedures as `Promise<AsyncIteratorClass<T>>`, a class with private
 // fields that no test double can satisfy structurally. Consumers only iterate the stream, so a
-// test may return any AsyncIterable of the same item type (e.g. an async generator).
+// streaming double may resolve to any AsyncIterable of the same item type (e.g. an async
+// generator). Every other procedure keeps its real Promise result.
 type TestApiResult<R> =
-  Awaited<R> extends AsyncIterable<infer Item> ? AsyncIterable<Item> : Awaited<R>;
+  Awaited<R> extends AsyncIterable<infer Item> ? Promise<AsyncIterable<Item>> : Promise<Awaited<R>>;
 
 /** RecursivePartial for APIClient doubles, with the streaming relaxation above. */
 export type TestApiOverrides<T> = {
   [P in keyof T]?: T[P] extends (...args: infer A) => infer R
-    ? (...args: A) => Promise<TestApiResult<R>> | TestApiResult<R>
+    ? (...args: A) => TestApiResult<R>
     : T[P] extends object
       ? TestApiOverrides<T[P]>
       : T[P];
 };
 
-/** Typed partial APIClient double: overrides are checked against the real procedure types (typos and wrong return types fail typecheck); omitted procedures are simply absent, exactly as with the old cast. */
+/**
+ * Typed partial APIClient double. Procedures are checked against the real procedure types (wrong
+ * return types fail typecheck); omitted procedures are simply absent, exactly as with the old
+ * cast. Misspelled procedure names fail typecheck only for inline object literals, so annotate
+ * predeclared override objects as `TestApiOverrides<APIClient>` to get the same excess-key check.
+ */
 export function createTestApiClient(overrides: TestApiOverrides<APIClient> = {}): APIClient {
   // The single cast: tests supply only the procedures they exercise.
   return overrides as unknown as APIClient;

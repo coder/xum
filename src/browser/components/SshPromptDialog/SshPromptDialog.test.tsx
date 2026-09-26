@@ -76,6 +76,7 @@ function MutableAPIWrapper(props: { children: ReactNode }) {
         api
           ? {
               status: "connected",
+              // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
               api: api as unknown as APIClient,
               error: null,
               authenticate,

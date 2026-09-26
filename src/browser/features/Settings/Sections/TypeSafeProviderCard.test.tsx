@@ -40,7 +40,8 @@ void mock.module("@/browser/hooks/useAutoModelRouting", () => ({
 }));
 
 import { TypeSafeProviderCard } from "./TypeSafeProviderCard";
-import { createTestApiClient } from "@/browser/testUtils";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 function createMockApi(status: Partial<AutoModelRoutingEvaluationStatus> = {}): MockApi {
   return {
@@ -57,7 +58,7 @@ function createMockApi(status: Partial<AutoModelRoutingEvaluationStatus> = {}): 
     providers: {
       setProviderConfig: mock(() => Promise.resolve({ success: true as const, data: undefined })),
     },
-  };
+  } satisfies TestApiOverrides<APIClient>;
 }
 
 // Inject the per-test client through the real provider; mocking the API module leaks across files.

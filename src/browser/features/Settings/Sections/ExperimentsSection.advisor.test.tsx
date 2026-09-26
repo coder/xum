@@ -201,6 +201,7 @@ describe("ExperimentsSection advisor config", () => {
     mockApi = api;
 
     const view = render(
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
       <APIProvider client={mockApi as unknown as APIClient}>
         <ThemeProvider forcedTheme="dark">
           <ExperimentsSection />
@@ -319,6 +320,7 @@ describe("ExperimentsSection advisor config", () => {
       });
       view.unmount();
       const restored = render(
+        // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
         <APIProvider client={mockApi as unknown as APIClient}>
           <ThemeProvider forcedTheme="dark">
             <ExperimentsSection />

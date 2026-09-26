@@ -103,6 +103,7 @@ describe("BranchSelector", () => {
     };
 
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
       api: mockApi as unknown as APIClient,
       status: "connected" as const,
       error: null,

@@ -1885,33 +1885,6 @@ export default defineConfig([
     },
   },
   {
-    // Not yet migrated to createTestApiClient: their doubles do not match the real procedure
-    // types, so migrating means repairing the doubles first. Shrink-only; do not add files.
-    files: [
-      "src/browser/components/ArchivedWorkspaces/ArchivedWorkspaces.test.tsx",
-      "src/browser/components/BranchSelector/BranchSelector.test.tsx",
-      "src/browser/components/SshPromptDialog/SshPromptDialog.test.tsx",
-      "src/browser/components/UpdateRestartOverlay/UpdateRestartOverlay.test.tsx",
-      "src/browser/features/RightSidebar/CodeReview/ImmersiveReviewView.test.tsx",
-      "src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx",
-      "src/browser/features/Settings/Sections/ExperimentsSection.advisor.test.tsx",
-      "src/browser/features/Settings/Sections/ExperimentsSection.test.tsx",
-      "src/browser/features/Settings/Sections/GoalsSection.test.tsx",
-      "src/browser/features/Settings/Sections/HeartbeatSection.test.tsx",
-      "src/browser/features/Tools/ProposePlanToolCall.test.tsx",
-      "src/browser/hooks/useChatTranscriptFullWidth.test.tsx",
-      "src/browser/hooks/useContextSwitchWarning.test.ts",
-      "src/browser/hooks/useRouting.test.ts",
-      "src/browser/hooks/useWorkspaceHeartbeat.test.tsx",
-      "src/browser/utils/commands/sources.test.ts",
-      "src/browser/utils/compaction/handler.test.ts",
-      "src/browser/utils/openInEditor.test.ts",
-    ],
-    rules: {
-      "local/no-unknown-cast-to-api-client": "off",
-    },
-  },
-  {
     // Storybook story files - disable type-aware rules for Storybook 10 barrel exports
     files: ["**/*.stories.ts", "**/*.stories.tsx", ".storybook/**/*.ts", ".storybook/**/*.tsx"],
     rules: {

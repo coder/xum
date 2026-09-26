@@ -55,6 +55,7 @@ describe("useChatTranscriptFullWidth", () => {
       Promise.resolve<TranscriptWidthConfig>({ chatTranscriptFullWidth: true })
     );
     const onConfigChangedMock = mock(() => Promise.resolve(stream.iterator));
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: getConfigMock,
@@ -90,6 +91,7 @@ describe("useChatTranscriptFullWidth", () => {
 
       return secondFetch.promise;
     });
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: getConfigMock,
@@ -140,6 +142,7 @@ describe("useChatTranscriptFullWidth", () => {
 
       return secondFetch.promise;
     });
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: getConfigMock,
@@ -176,6 +179,7 @@ describe("useChatTranscriptFullWidth", () => {
 
   test("keeps a local persisted update when an older backend fetch resolves", async () => {
     const fetch = Promise.withResolvers<TranscriptWidthConfig>();
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: mock(() => fetch.promise),
@@ -208,6 +212,7 @@ describe("useChatTranscriptFullWidth", () => {
   test("ignores invalid cached preference values", () => {
     updatePersistedState<string>(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, "false");
     const getConfig = Promise.withResolvers<TranscriptWidthConfig>();
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: mock(() => getConfig.promise),
@@ -224,6 +229,7 @@ describe("useChatTranscriptFullWidth", () => {
 
   test("responds to persisted preference updates while mounted", async () => {
     const getConfig = Promise.withResolvers<TranscriptWidthConfig>();
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: mock(() => getConfig.promise),
@@ -256,6 +262,7 @@ describe("useChatTranscriptFullWidth", () => {
 
       return secondFetch.promise;
     });
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = {
       config: {
         getConfig: getConfigMock,
@@ -287,6 +294,7 @@ describe("useChatTranscriptFullWidth", () => {
 
   test("preserves the last known value while API config is unavailable", () => {
     updatePersistedState<boolean>(CHAT_TRANSCRIPT_FULL_WIDTH_KEY, true);
+    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
     const client = { config: {} } as unknown as APIClient;
 
     const { result } = renderHook(() => useChatTranscriptFullWidth(), {

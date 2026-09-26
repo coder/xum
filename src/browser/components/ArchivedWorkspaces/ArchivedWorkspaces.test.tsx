@@ -67,6 +67,7 @@ function stubPageChrome() {
 }
 
 function stubPageApi(list: APIClient["workspace"]["list"], getSessionUsageBatch: unknown) {
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
   const api = {
     workspace: {
       list,
@@ -135,6 +136,7 @@ describe("ArchivedWorkspaces", () => {
     localStorage.clear();
 
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
+      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
       api: {
         workspace: {
           deleteWorktree: deleteWorktreeMock,

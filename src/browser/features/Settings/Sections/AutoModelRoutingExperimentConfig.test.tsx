@@ -1,11 +1,10 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createTestApiClient } from "@/browser/testUtils";
 import type { ReactNode } from "react";
 
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
-import { APIProvider } from "@/browser/contexts/API";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as ActualModelsFromSettingsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as ActualWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
@@ -136,7 +135,8 @@ function createMockApi(initial?: AutoModelRoutingConfig): MockApi {
 
 // Inject the per-test client through the real provider; mocking the API module leaks across files.
 function ApiWrapper(props: { children: ReactNode }) {
-  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
+  return <APIProvider client={mockApi as unknown as APIClient}>{props.children}</APIProvider>;
 }
 
 function renderConfig() {

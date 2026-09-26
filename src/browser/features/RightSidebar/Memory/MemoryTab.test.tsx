@@ -211,6 +211,7 @@ function ApiWrapper(props: { children: ReactNode }) {
   if (!fake) {
     throw new Error("Test bug: assign `fake` before rendering MemoryTab");
   }
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
   return <APIProvider client={fake.api as unknown as APIClient}>{props.children}</APIProvider>;
 }
 

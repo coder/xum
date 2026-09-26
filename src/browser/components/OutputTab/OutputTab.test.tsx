@@ -21,17 +21,11 @@ type LogStreamEvent =
   | { type: "append"; epoch: number; entries: LogEntry[] }
   | { type: "reset"; epoch: number };
 
-interface MockAPI {
-  general: {
-    subscribeLogs: () => Promise<AsyncGenerator<LogStreamEvent, void, unknown>>;
-    clearLogs: () => Promise<{ success: boolean; error?: string | null }>;
-  };
-}
-
-let mockApi: MockAPI | null = null;
+let mockApi: TestApiOverrides<APIClient> | null = null;
 
 import { OutputTab } from "../OutputTab/OutputTab";
-import { createTestApiClient } from "@/browser/testUtils";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 // Inject the per-test client through the real provider; mocking the API module leaks
 // process-wide into later suites.

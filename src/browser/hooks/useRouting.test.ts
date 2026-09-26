@@ -36,6 +36,7 @@ async function* emptyStream() {
 }
 
 function createStubApiClient(): APIClient {
+  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (needs full config fixture)
   return {
     providers: {
       getConfig: () => Promise.resolve(providersConfig),

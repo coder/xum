@@ -10,7 +10,8 @@ import {
 } from "./useCoderWorkspace";
 import type { CoderInfo, CoderTemplate } from "@/common/orpc/schemas/coder";
 import type { CoderWorkspaceConfig } from "@/common/types/runtime";
-import { createTestApiClient } from "@/browser/testUtils";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 const makeTemplate = (name: string, org = "default-org"): CoderTemplate => ({
   name,
@@ -25,7 +26,7 @@ const listTemplatesMock = mock(() => Promise.resolve({ ok: true as const, templa
 const listPresetsMock = mock(() => Promise.resolve({ ok: true as const, presets: [] }));
 const listWorkspacesMock = mock(() => Promise.resolve({ ok: true as const, workspaces: [] }));
 
-const coderApiMock = {
+const coderApiMock: TestApiOverrides<APIClient["coder"]> = {
   getInfo: getInfoMock,
   listTemplates: listTemplatesMock,
   listPresets: listPresetsMock,

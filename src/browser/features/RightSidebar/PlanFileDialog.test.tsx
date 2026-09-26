@@ -7,19 +7,14 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { cleanup, render, waitFor } from "@testing-library/react";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
-import { createTestApiClient } from "@/browser/testUtils";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
   | { success: false; error: string };
 
-interface MockApiClient {
-  workspace: {
-    getPlanContent: () => Promise<GetPlanContentResult>;
-  };
-}
-
-let mockApi: MockApiClient | null = null;
+let mockApi: TestApiOverrides<APIClient> | null = null;
 
 // Scope module mocks to each test so renderer assertions use the real pipeline.
 const realModules: Array<[string, Record<string, unknown>]> = [

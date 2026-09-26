@@ -1,7 +1,7 @@
 import "../../../../tests/ui/dom";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createTestApiClient } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 // Keep the fake transport and its events in one realm even after other UI tests install a DOM.
 import { GlobalWindow, EventTarget, Event, CustomEvent } from "happy-dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
@@ -19,7 +19,7 @@ const api = {
     acknowledgeViewerRelease: () => Promise.resolve(),
     detachViewer: () => Promise.resolve(),
   },
-};
+} satisfies TestApiOverrides<APIClient>;
 // Inject this desktop-only client through the real provider: a module mock of contexts/API
 // is process-wide and other UI suites need their provider's full API. view.rerender() keeps
 // the wrapper.
