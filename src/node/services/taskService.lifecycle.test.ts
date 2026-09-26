@@ -418,7 +418,21 @@ describe("TaskService", () => {
     expect(await removeAsModel(sharedTaskId)).toMatchObject(
       Ok({ status: "removed", taskId: sharedTaskId })
     );
-    expect(remove).toHaveBeenCalledTimes(2);
+    // Project-dir local runtimes run children in the project checkout and delete nothing either.
+    const localTaskId = "child-remove-local";
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)?.workspaces.push(
+        projectWorkspace(projectPath, "parent", localTaskId, {
+          name: "local-child",
+          parentWorkspaceId,
+          taskStatus: "reported",
+          runtimeConfig: { type: "local" },
+        })
+      );
+      return cfg;
+    });
+    expect(await removeAsModel(localTaskId)).toMatchObject(Ok({ status: "removed" }));
+    expect(remove).toHaveBeenCalledTimes(3);
   });
 
   test("task removal preserves an inactive child while its patch artifact is pending", async () => {

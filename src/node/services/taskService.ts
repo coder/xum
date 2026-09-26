@@ -13555,11 +13555,12 @@ export class TaskService implements AgentTaskIntegration {
     patchArtifact: SubagentGitPatchArtifact | null
   ): Promise<{ error: string; paths?: string[] } | null> {
     const ws = entry.workspace;
-    // isolation "none" children share the parent's checkout, which removal never deletes.
-    if (ws.taskIsolation === "none") return null;
+    const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+    // Removal deletes no checkout for isolation "none" children (they share the parent's) or for
+    // project-dir local runtimes (deleteWorkspace is a no-op there).
+    if (ws.taskIsolation === "none" || isLocalProjectRuntime(runtimeConfig)) return null;
     const workspacePath = coerceNonEmptyString(ws.path);
     const workspaceName = coerceNonEmptyString(ws.name);
-    const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
     const check =
       workspacePath == null || workspaceName == null
         ? Err("the checkout path is unknown")

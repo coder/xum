@@ -104,6 +104,33 @@ describe("findUnpreservedSubagentWork", () => {
     expect((await check({ base: null })).success).toBe(false);
   });
 
+  test("a merge commit is never treated as captured, since format-patch drops merge resolutions", async () => {
+    execSync("git checkout -q -b side && git commit -q --allow-empty -m side", { cwd: repo });
+    execSync("git checkout -q main && git commit -q --allow-empty -m main", { cwd: repo });
+    execSync("git merge -q --no-ff --no-edit side", { cwd: repo });
+    const head = git(repo, "rev-parse HEAD");
+    expect(await check({ patchArtifact: readyArtifact(head) })).toEqual({
+      success: true,
+      data: { kind: "lossy", paths: [], uncapturedCommitCount: 3 },
+    });
+  });
+
+  test("fails closed when an existing checkout cannot be inspected", async () => {
+    await fsPromises.rm(path.join(repo, ".git"), { recursive: true, force: true });
+    await fsPromises.writeFile(path.join(repo, ".git"), "gitdir: /nonexistent/worktree\n");
+    expect((await check()).success).toBe(false);
+  });
+
+  test("never runs checkout-configured repository automation", async () => {
+    const marker = path.join(rootDir, "fsmonitor-ran");
+    const hook = path.join(rootDir, "fsmonitor.sh");
+    await fsPromises.writeFile(hook, `#!/bin/sh\ntouch ${marker}\n`, { mode: 0o755 });
+    git(repo, `config core.fsmonitor ${hook}`);
+    await fsPromises.writeFile(path.join(repo, "notes.txt"), "draft\n");
+    expect((await check()).success).toBe(true);
+    expect(await fsPromises.stat(marker).catch(() => null)).toBeNull();
+  });
+
   test("skips checkouts that are gone or are not git work trees", async () => {
     await fsPromises.rm(repo, { recursive: true, force: true });
     expect(await check()).toEqual({ success: true, data: { kind: "none" } });
