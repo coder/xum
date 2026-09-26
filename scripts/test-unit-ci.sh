@@ -56,6 +56,12 @@ isolated_unit_tests=(
   # or installDom alike) makes the portal land in a stale document. Verified
   # order-dependent on origin/main; only reliable in its own process.
   src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx
+  # GeneralSection picks browser vs Electron mode (window.api) when its module first evaluates.
+  # SettingsPage.test.tsx imports it through SettingsPage earlier in the shared process, so the
+  # cached mode hides the SSH Host setting and "loads the SSH host setting in browser mode" times
+  # out. Verified with a two-file repro (SettingsPage.test.tsx, then GeneralSection.test.tsx);
+  # the size-balanced shards put both files in one shard on 2026-09-25 and failed the merge queue.
+  src/browser/features/Settings/Sections/GeneralSection.test.tsx
   # Its "last prompt" popup tests fail when any earlier test file in the
   # shared process evaluated UI modules without a DOM installed (Radix's
   # use-layout-effect binds to `globalThis.document` at module eval, so a
