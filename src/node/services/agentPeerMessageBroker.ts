@@ -6,6 +6,7 @@ import {
 } from "@/common/utils/agentMessageEnvelope";
 import {
   MAX_CONSECUTIVE_PEER_WAKES,
+  MAX_PEER_WAKE_WAITERS_PER_TARGET,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
   PEER_MESSAGE_RATE_LIMIT_MAX,
@@ -26,10 +27,25 @@ interface AgentPeerMessageBrokerHost {
   countQueuedAgentPeerMessages(targetId: string): number;
 }
 
+export const PEER_WAKE_LIMIT_FULL_REFUSAL_REASON =
+  "Target reached its consecutive peer-wake limit and needs user or parent attention.";
 // Tells the refused sender it will be woken, so it waits instead of polling or working around it.
 export const PEER_WAKE_LIMIT_REFUSAL_REASON =
-  "Target reached its consecutive peer-wake limit and needs user or parent attention. " +
-  "You will get a new turn once it accepts agent messages again; resend then instead of polling.";
+  PEER_WAKE_LIMIT_FULL_REFUSAL_REASON +
+  " You will get a new turn once it accepts agent messages again; resend then instead of polling.";
+
+/**
+ * What authorized a cap-refused send. The wake notice is dropped if the sender's relation to the
+ * target changed or, for unrelated targets, the recipient's consent grant is no longer this one.
+ */
+export interface PeerWakeWaiterGrant {
+  relation: PeerPathRelation;
+  unrelatedConsent?: string;
+}
+
+export interface PeerWakeWaiter extends PeerWakeWaiterGrant {
+  senderWorkspaceId: string;
+}
 
 export type AgentPeerMessageAdmissionError =
   | { code: "refused"; reason: string }
@@ -63,7 +79,7 @@ export class AgentPeerMessageBroker {
    * Senders refused by a target's consecutive-wake cap. When attention resets the cap, each one is
    * woken with a new turn so it can resend on its own instead of polling or giving up.
    */
-  private readonly peerWakeWaitersByTarget = new Map<string, Set<string>>();
+  private readonly peerWakeWaitersByTarget = new Map<string, Map<string, PeerWakeWaiterGrant>>();
 
   constructor(
     private readonly host: AgentPeerMessageBrokerHost,
@@ -73,7 +89,9 @@ export class AgentPeerMessageBroker {
   checkPeerAdmission(
     senderWorkspaceId: string,
     targetId: string,
-    message: string
+    message: string,
+    /** When given, a cap refusal registers the sender to be woken once attention resets the cap. */
+    waiterGrant?: PeerWakeWaiterGrant
   ): AgentPeerMessageAdmissionError | null {
     const now = this.now();
     this.sweepPeerMessageThrottleState(now);
@@ -117,10 +135,13 @@ export class AgentPeerMessageBroker {
     // Charged synchronously under the target event lock, so queued and delivered entries share
     // one admission cap without a dequeue-to-acceptance gap.
     if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) {
-      this.addPeerWakeWaiter(targetId, senderWorkspaceId);
+      const waiting =
+        waiterGrant != null &&
+        this.addPeerWakeWaiter(targetId, { senderWorkspaceId, ...waiterGrant });
       return {
         code: "refused",
-        reason: PEER_WAKE_LIMIT_REFUSAL_REASON,
+        // Only promise a wake when one is registered (the waiter list is bounded).
+        reason: waiting ? PEER_WAKE_LIMIT_REFUSAL_REASON : PEER_WAKE_LIMIT_FULL_REFUSAL_REASON,
       };
     }
 
@@ -144,18 +165,40 @@ export class AgentPeerMessageBroker {
   }
 
   /** Clears the target's wake cap and returns (and forgets) the senders it refused meanwhile. */
-  resetConsecutivePeerWakes(targetId: string): string[] {
+  resetConsecutivePeerWakes(targetId: string): PeerWakeWaiter[] {
     this.consecutivePeerWakes.delete(targetId);
-    const waiters = this.peerWakeWaitersByTarget.get(targetId);
-    this.peerWakeWaitersByTarget.delete(targetId);
-    return waiters != null ? [...waiters] : [];
+    return this.takePeerWakeWaiters(targetId);
   }
 
-  addPeerWakeWaiter(targetId: string, senderWorkspaceId: string): void {
+  /** Returns (and forgets) the target's waiters unless the cap has been filled again. */
+  takePeerWakeWaitersIfUncapped(targetId: string): PeerWakeWaiter[] {
+    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) return [];
+    return this.takePeerWakeWaiters(targetId);
+  }
+
+  /**
+   * Registers (or refreshes) a waiter. Bounded per target so one capped target cannot turn many
+   * refused senders into a burst of wake turns; returns false when the list is full.
+   */
+  addPeerWakeWaiter(targetId: string, waiter: PeerWakeWaiter): boolean {
+    const { senderWorkspaceId, ...grant } = waiter;
     assert(senderWorkspaceId !== targetId, "addPeerWakeWaiter: sender cannot wait on itself");
-    const waiters = this.peerWakeWaitersByTarget.get(targetId) ?? new Set<string>();
-    waiters.add(senderWorkspaceId);
+    const waiters =
+      this.peerWakeWaitersByTarget.get(targetId) ?? new Map<string, PeerWakeWaiterGrant>();
+    if (!waiters.has(senderWorkspaceId) && waiters.size >= MAX_PEER_WAKE_WAITERS_PER_TARGET) {
+      return false;
+    }
+    waiters.set(senderWorkspaceId, grant);
     this.peerWakeWaitersByTarget.set(targetId, waiters);
+    return true;
+  }
+
+  private takePeerWakeWaiters(targetId: string): PeerWakeWaiter[] {
+    const waiters = this.peerWakeWaitersByTarget.get(targetId);
+    this.peerWakeWaitersByTarget.delete(targetId);
+    return waiters == null
+      ? []
+      : [...waiters].map(([senderWorkspaceId, grant]) => ({ senderWorkspaceId, ...grant }));
   }
 
   preparePeerMessage(params: {

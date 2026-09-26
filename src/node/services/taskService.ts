@@ -237,6 +237,7 @@ import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
 import {
   AgentPeerMessageBroker,
   type AgentPeerMessageAdmissionError,
+  type PeerWakeWaiter,
 } from "@/node/services/agentPeerMessageBroker";
 import { taskQueueDebug } from "@/node/services/taskQueueDebug";
 import {
@@ -9127,7 +9128,7 @@ export class TaskService implements AgentTaskIntegration {
         workspaceId: string
       ): boolean => this.hasLiveRunningTaskExecution(workspace, workspaceId);
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean =>
-        this.isInactivePeerSenderWorkspace(workspace, senderWorkspaceId);
+        this.isInactivePeerEndpointWorkspace(workspace, senderWorkspaceId);
       if (isInactivePeerSender(senderEntry.workspace)) {
         return Err(senderInactiveRefusal);
       }
@@ -9275,7 +9276,13 @@ export class TaskService implements AgentTaskIntegration {
       const throttleError = this.agentPeerMessageBroker.checkPeerAdmission(
         senderWorkspaceId,
         targetId,
-        message
+        message,
+        {
+          relation,
+          ...(relation === "target_unrelated" && unrelatedConsent != null
+            ? { unrelatedConsent }
+            : {}),
+        }
       );
       if (throttleError != null) {
         return Err(throttleError);
@@ -9621,7 +9628,8 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  private isInactivePeerSenderWorkspace(
+  /** Archived, or an agent task that is neither running nor backed by a live execution. */
+  private isInactivePeerEndpointWorkspace(
     workspace: WorkspaceConfigEntry,
     workspaceId: string
   ): boolean {
@@ -9645,10 +9653,14 @@ export class TaskService implements AgentTaskIntegration {
    * either polls or abandons the message (observed: it fell back to posting on a GitHub issue).
    * Each notice runs under the sender's event lock and never blocks the attention reset itself.
    */
-  private schedulePeerWakeAvailableNotices(targetId: string, senderIds: readonly string[]): void {
-    for (const senderId of senderIds) {
+  private schedulePeerWakeAvailableNotices(
+    targetId: string,
+    waiters: readonly PeerWakeWaiter[]
+  ): void {
+    for (const waiter of waiters) {
+      const senderId = waiter.senderWorkspaceId;
       this.workspaceEventLocks
-        .withLock(senderId, () => this.deliverPeerWakeAvailableNotice(targetId, senderId))
+        .withLock(senderId, () => this.deliverPeerWakeAvailableNotice(targetId, waiter))
         .catch((error: unknown) => {
           log.error("Failed to wake a sender refused by a peer-wake limit", {
             targetId,
@@ -9659,7 +9671,11 @@ export class TaskService implements AgentTaskIntegration {
     }
   }
 
-  private async deliverPeerWakeAvailableNotice(targetId: string, senderId: string): Promise<void> {
+  private async deliverPeerWakeAvailableNotice(
+    targetId: string,
+    waiter: PeerWakeWaiter
+  ): Promise<void> {
+    const senderId = waiter.senderWorkspaceId;
     const cfg = this.config.loadConfigOrDefault();
     const targetEntry = findWorkspaceEntry(cfg, targetId);
     const senderEntry = findWorkspaceEntry(cfg, senderId);
@@ -9668,24 +9684,56 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
     const index = this.buildAgentTaskIndex(cfg);
-    const chainInterrupted = (workspaceId: string): boolean =>
-      [
-        workspaceId,
-        ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, workspaceId),
-      ].some((id) => this.interruptedParentWorkspaceIds.has(id));
-    // A user Stop also resets the cap (interruptStream resets before marking the interrupt), but
-    // the stopped target still refuses peer messages. Keep waiting for the resume instead.
-    if (chainInterrupted(targetId)) {
-      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, senderId);
-      return;
-    }
-    // Same rules as sending: a stopped, terminal, or archived sender must not be woken by this.
+    // The refused send's authorization must still hold: same relation and, for unrelated
+    // targets, the same consent grant (a revoke or off→on cycle is a new grant).
+    const relation = this.resolveAgentTreeTargetRelation(index.parentById, senderId, targetId);
+    if (relation !== waiter.relation) return;
     if (
-      chainInterrupted(senderId) ||
-      this.isInactivePeerSenderWorkspace(senderEntry.workspace, senderId)
+      relation === "target_unrelated" &&
+      getValidUnrelatedWorkspaceConsent(targetEntry.workspace.unrelatedWorkspaceConsent) !==
+        waiter.unrelatedConsent
     ) {
       return;
     }
+    const chainIds = (workspaceId: string): string[] => [
+      workspaceId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, workspaceId),
+    ];
+    const chainInterrupted = (workspaceId: string): boolean =>
+      chainIds(workspaceId).some((id) => this.interruptedParentWorkspaceIds.has(id));
+    // The cap reset can precede the target becoming reachable: interruptStream resets before
+    // marking a user Stop, and a user message to an interrupted task resets before
+    // reawakenInterruptedTask runs (and may fail). Keep waiting; a later reset or the successful
+    // reawaken delivers the notice.
+    if (
+      chainInterrupted(targetId) ||
+      this.isInactivePeerEndpointWorkspace(targetEntry.workspace, targetId)
+    ) {
+      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+      return;
+    }
+    // Same rules as sending: a stopped, terminal, or archived sender must not be woken by this.
+    const senderInactive = (): boolean => {
+      const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), senderId);
+      return (
+        fresh == null ||
+        chainInterrupted(senderId) ||
+        this.isInactivePeerEndpointWorkspace(fresh.workspace, senderId)
+      );
+    };
+    if (senderInactive()) return;
+    // Stops latched from here on stay authoritative through every admission gate of the send,
+    // even if the user resumes before the probe runs (same latch as peer delivery).
+    const senderChainIds = chainIds(senderId);
+    const capturedStopEpochs = new Map(
+      senderChainIds.map((id) => [id, this.getWorkspaceStopEpoch(id)])
+    );
+    const admissionStale = (): boolean =>
+      senderChainIds.some(
+        (id) =>
+          this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id) ||
+          this.isWorkspaceStopInProgress(id)
+      ) || senderInactive();
 
     let sendRestrictions: Awaited<
       ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
@@ -9697,6 +9745,7 @@ export class TaskService implements AgentTaskIntegration {
       log.warn("Skipping peer-wake notice; sender tool policy unavailable", { senderId, error });
       return;
     }
+    if (admissionStale()) return;
 
     // Zero peer-controlled bytes: workspace IDs are server-generated and the title is omitted.
     const content =
@@ -9712,6 +9761,7 @@ export class TaskService implements AgentTaskIntegration {
       queueDispatchMode: "turn-end",
       // An opportunistic notice must not fail the sender's own delegated workspace turn.
       settleContinuationOnSendRefusal: false,
+      admissionStale,
       sendRestrictions,
     });
     if (!result.success) {
@@ -15095,9 +15145,9 @@ export class TaskService implements AgentTaskIntegration {
     this.interruptedParentWorkspaceIds.delete(workspaceId);
     // User-authored sends (and parent guidance, which does not skip this reset) count as fresh
     // attention: peer messages may wake this workspace again.
-    const refusedSenderIds = this.agentPeerMessageBroker.resetConsecutivePeerWakes(workspaceId);
-    if (refusedSenderIds.length > 0) {
-      this.schedulePeerWakeAvailableNotices(workspaceId, refusedSenderIds);
+    const refusedSenders = this.agentPeerMessageBroker.resetConsecutivePeerWakes(workspaceId);
+    if (refusedSenders.length > 0) {
+      this.schedulePeerWakeAvailableNotices(workspaceId, refusedSenders);
     }
   }
 
@@ -15315,6 +15365,11 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     await this.emitWorkspaceMetadata(workspaceId);
+    // Senders whose notice found this task still interrupted were requeued; deliver now.
+    const peerWakeWaiters = this.agentPeerMessageBroker.takePeerWakeWaitersIfUncapped(workspaceId);
+    if (peerWakeWaiters.length > 0) {
+      this.schedulePeerWakeAvailableNotices(workspaceId, peerWakeWaiters);
+    }
     return { kind: "reawakened", attemptId, statusChanged: !resumeSettledReportedTask };
   }
 

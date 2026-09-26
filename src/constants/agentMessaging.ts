@@ -89,6 +89,12 @@ export function taskRecoveryPromptDedupeKey(taskId: string, kind: TaskRecoveryPr
 export const MAX_CONSECUTIVE_PEER_WAKES = 3;
 
 /**
+ * Max senders remembered per target for the "target is reachable again" wake after a
+ * consecutive-wake refusal. Bounds the wake turns one attention reset can start.
+ */
+export const MAX_PEER_WAKE_WAITERS_PER_TARGET = 5;
+
+/**
  * Single retryable refusal for every admission path (direct/automatic sends, queued dispatch,
  * task resume, recovery, queued launch) while a stop cascade holds a workspace's latch. The
  * latch drops once the stopped execution has settled; callers may simply retry afterwards.

@@ -1709,17 +1709,19 @@ describe("TaskService", () => {
         ],
         testTaskSettings()
       );
-      const setSenderStatus = (taskStatus: "running" | "reported") =>
+      const setStatus = (id: string, taskStatus: "running" | "reported" | "interrupted") =>
         config.editConfig((current) => {
-          const sender = current.projects
+          const workspace = current.projects
             .get(projectPath)
-            ?.workspaces.find((workspace) => workspace.id === "sib-a");
-          assert(sender);
-          sender.taskStatus = taskStatus;
+            ?.workspaces.find((candidate) => candidate.id === id);
+          assert(workspace);
+          workspace.taskStatus = taskStatus;
           return current;
         });
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
-      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
       const wakeCalls = () =>
         (sendMessage.mock.calls as Array<Parameters<WorkspaceHost["sendMessage"]>>).filter(
           (call) =>
@@ -1740,7 +1742,14 @@ describe("TaskService", () => {
           Err({ code: "refused", reason: PEER_WAKE_LIMIT_REFUSAL_REASON })
         );
       };
-      return { taskService, setSenderStatus, wakeCalls, drainSenderLock, fillAndRefuseSibA };
+      return {
+        taskService,
+        historyService,
+        setStatus,
+        wakeCalls,
+        drainSenderLock,
+        fillAndRefuseSibA,
+      };
     };
 
     test("attention on the target wakes the refused sender once, after a user stop is resumed", async () => {
@@ -1772,16 +1781,129 @@ describe("TaskService", () => {
       );
     });
 
+    test("a target task still interrupted at the reset is announced only by its reawaken", async () => {
+      const t = await setup();
+      await t.fillAndRefuseSibA("sib-c");
+      // A user message to an interrupted task resets the cap before reawakenInterruptedTask runs.
+      await t.setStatus("sib-b", "interrupted");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(0);
+
+      expect(await t.taskService.reawakenInterruptedTask("sib-b")).toMatchObject({
+        kind: "reawakened",
+      });
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
+    test("a sender stopped while its notice is being prepared is not woken", async () => {
+      const t = await setup();
+      await t.fillAndRefuseSibA("sib-c");
+      // Hold the notice inside its sender tool-policy lookup, then stop the sender there.
+      const iterate = t.historyService.iterateFullHistory.bind(t.historyService);
+      let hold = true;
+      let reached!: () => void;
+      const reachedLookup = new Promise<void>((resolve) => (reached = resolve));
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      const spy = spyOn(t.historyService, "iterateFullHistory").mockImplementation(
+        async (...args: Parameters<typeof iterate>) => {
+          if (hold && args[0] === "sib-a") {
+            hold = false;
+            reached();
+            await released;
+          }
+          return iterate(...args);
+        }
+      );
+      t.taskService.resetAutoResumeCount("sib-b");
+      await reachedLookup;
+      t.taskService.markParentWorkspaceInterrupted("sib-a");
+      release();
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(0);
+      spy.mockRestore();
+
+      // Positive control: after the user resumes the sender, a new refusal does wake it.
+      t.taskService.resetAutoResumeCount("sib-a");
+      await t.fillAndRefuseSibA("sib-d");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
+    test("an unrelated target's consent re-grant drops waiters from the old grant", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const target = projectWorkspace(projectPath, "target", "target");
+      const sender = projectWorkspace(projectPath, "sender", "sender");
+      Object.assign(target, { unrelatedWorkspaceConsent: "gen-1" });
+      Object.assign(sender, { unrelatedWorkspaceConsent: "sender-consent" });
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          sender,
+          target,
+          projectWorkspace(projectPath, "f1", "f1"),
+          projectWorkspace(projectPath, "f2", "f2"),
+        ],
+        testTaskSettings()
+      );
+      const setTargetConsent = (consent: string) =>
+        config.editConfig((current) => {
+          const entry = current.projects
+            .get(projectPath)
+            ?.workspaces.find((workspace) => workspace.id === "target");
+          assert(entry);
+          Object.assign(entry, { unrelatedWorkspaceConsent: consent });
+          return current;
+        });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+      const wakeCalls = () =>
+        (sendMessage.mock.calls as Array<Parameters<WorkspaceHost["sendMessage"]>>).filter(
+          (call) =>
+            call[0] === "sender" &&
+            call[3]?.queueDedupeKey?.startsWith(PEER_WAKE_AVAILABLE_DEDUPE_PREFIX) === true
+        );
+      // Takes the sender's event lock after any earlier notice (see drainSenderLock above).
+      const drainSenderLock = () => taskService.sendAgentTreeMessage("target", "sender", "barrier");
+      const fillAndRefuse = async (filler: string) => {
+        for (let i = 1; i <= 3; i++) {
+          const sent = await taskService.sendAgentTreeMessage(filler, "target", `${filler} ${i}`);
+          expect(sent.success).toBe(true);
+        }
+        expect(await taskService.sendAgentTreeMessage("sender", "target", "need you")).toEqual(
+          Err({ code: "refused", reason: PEER_WAKE_LIMIT_REFUSAL_REASON })
+        );
+      };
+
+      await fillAndRefuse("f1");
+      // An off→on cycle is a new grant; the waiter from the old grant must not be woken.
+      await setTargetConsent("gen-2");
+      taskService.resetAutoResumeCount("target");
+      await drainSenderLock();
+      expect(wakeCalls()).toHaveLength(0);
+
+      // Positive control: a refusal under the current grant is woken.
+      await fillAndRefuse("f2");
+      taskService.resetAutoResumeCount("target");
+      await drainSenderLock();
+      expect(wakeCalls()).toHaveLength(1);
+    });
+
     test("a sender that went terminal is not reactivated by the notice", async () => {
       const t = await setup();
       await t.fillAndRefuseSibA("sib-c");
-      await t.setSenderStatus("reported");
+      await t.setStatus("sib-a", "reported");
       t.taskService.resetAutoResumeCount("sib-b");
       await t.drainSenderLock();
       expect(t.wakeCalls()).toHaveLength(0);
 
       // Positive control: once running again, a new refusal does wake it.
-      await t.setSenderStatus("running");
+      await t.setStatus("sib-a", "running");
       await t.fillAndRefuseSibA("sib-d");
       t.taskService.resetAutoResumeCount("sib-b");
       await t.drainSenderLock();
