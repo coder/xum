@@ -188,11 +188,13 @@ describe("devToolsHeaderCapture", () => {
     // The caller's Request stays readable: the helper reads a clone.
     expect(await tracked.text()).toBe(body);
     // `init.body` wins, as fetch itself would send it.
-    expect(await resolveDevToolsCaptureBody(tracked.headers, "https://api.example", { body: "{}" })).toBe(
-      "{}"
-    );
+    expect(
+      await resolveDevToolsCaptureBody(tracked.headers, "https://api.example", { body: "{}" })
+    ).toBe("{}");
     const untracked = new Request("https://api.example/v1", { method: "POST", body });
-    expect(await resolveDevToolsCaptureBody(untracked.headers, untracked, undefined)).toBeUndefined();
+    expect(
+      await resolveDevToolsCaptureBody(untracked.headers, untracked, undefined)
+    ).toBeUndefined();
   });
 
   it("ignores a capture that arrives after its step was closed by an abort", () => {
