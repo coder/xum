@@ -68,12 +68,14 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
           queueMessage: mock(() => "tool-end" as const),
           sendMessage: mock(() => Promise.resolve(Ok(undefined))),
           drainQueuedMessagesIfIdle: mock(() => undefined),
+          // Persisted settings are published to the registered session.
+          emitMetadata: mock(() => undefined),
+          // registerSession subscribes to both streams.
+          onChatEvent: mock(() => () => undefined),
+          onMetadataEvent: mock(() => () => undefined),
         };
-        (
-          workspaceService as unknown as {
-            getOrCreateSession: (workspaceId: string) => AgentSession;
-          }
-        ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+        // The production injection point for an externally created session (`mux run`).
+        workspaceService.registerSession(workspaceId, fakeSession as unknown as AgentSession);
 
         const result = await workspaceService.sendMessage(
           workspaceId,
@@ -170,12 +172,14 @@ describe("WorkspaceService sendMessage AI selection pins", () => {
         }
       ),
       drainQueuedMessagesIfIdle: mock(() => undefined),
+      // Persisted settings are published to the registered session.
+      emitMetadata: mock(() => undefined),
+      // registerSession subscribes to both streams.
+      onChatEvent: mock(() => () => undefined),
+      onMetadataEvent: mock(() => () => undefined),
     };
-    (
-      workspaceService as unknown as {
-        getOrCreateSession: (workspaceId: string) => AgentSession;
-      }
-    ).getOrCreateSession = mock(() => fakeSession as unknown as AgentSession);
+    // The production injection point for an externally created session (`mux run`).
+    workspaceService.registerSession(workspaceId, fakeSession as unknown as AgentSession);
     const readEntry = () =>
       config
         .loadConfigOrDefault()
@@ -381,6 +385,12 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     await harness.cleanup();
   });
 
+  const readEntry = () =>
+    harness.config
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((workspace) => workspace.id === "ws");
+
   test("refuses unpriced model persistence for budgeted active goals", async () => {
     workspaceService.setWorkspaceGoalService({
       getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
@@ -398,16 +408,10 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
   });
 
   test("allows unpriced model persistence when no budgeted goal is active", async () => {
-    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
     workspaceService.setWorkspaceGoalService({
       // No goal record (or one without a budget) — the gate must pass through.
       getGoal: mock(() => Promise.resolve(null)),
     } as unknown as WorkspaceGoalService);
-    (
-      workspaceService as unknown as {
-        persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
-      }
-    ).persistWorkspaceAISettingsForAgent = persistSpy;
 
     const result = await workspaceService.updateAgentAISettings("ws", "exec", {
       model: "openai:not-priced-model",
@@ -415,19 +419,18 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(persistSpy).toHaveBeenCalledTimes(1);
+    expect(readEntry()?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:not-priced-model",
+      thinkingLevel: "off",
+    });
   });
 
   test("persists AI settings for sub-agent workspaces so auto-resume can use latest model", async () => {
-    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
-
     interface WorkspaceServiceTestAccess {
       maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
-      persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
     }
 
     const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.persistWorkspaceAISettingsForAgent = persistSpy;
 
     await saveWorkspaces(harness.config, projectPath, [
       { id: "ws", path: workspacePath, name: "ws", parentWorkspaceId: "parent-ws" },
@@ -439,13 +442,13 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
       thinkingLevel: "off",
     });
 
-    expect(persistSpy).toHaveBeenCalledTimes(1);
-    expect(persistSpy).toHaveBeenCalledWith(
-      "ws",
-      "exec",
-      { model: "openai:gpt-4o-mini", thinkingLevel: "off" },
-      { persistSelectedAgentId: true }
-    );
+    const entry = readEntry();
+    expect(entry?.parentWorkspaceId).toBe("parent-ws");
+    expect(entry?.agentId).toBe("exec");
+    expect(entry?.aiSettingsByAgent?.exec).toEqual({
+      model: "openai:gpt-4o-mini",
+      thinkingLevel: "off",
+    });
   });
 });
 

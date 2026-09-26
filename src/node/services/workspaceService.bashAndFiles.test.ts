@@ -3,7 +3,10 @@ import type { WorkspaceService } from "./workspaceService";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { InitStateManager } from "./initStateManager";
-import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import type { RuntimeConfig } from "@/common/types/runtime";
 import type { BashToolResult } from "@/common/types/tools";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as bashToolModule from "@/node/services/tools/bash";
@@ -320,9 +323,36 @@ describe("WorkspaceService getFileCompletions", () => {
   let createRuntimeSpy: Mock<typeof runtimeFactory.createRuntime>;
   let execBufferedSpy: Mock<typeof runtimeExecHelpers.execBuffered>;
 
+  /** Persist a two-repo workspace the way multi-project creation does (shared config key). */
+  async function registerMultiProjectWorkspace(entry: {
+    id: string;
+    path: string;
+    runtimeConfig: RuntimeConfig;
+  }): Promise<void> {
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.set(MULTI_PROJECT_CONFIG_KEY, {
+        workspaces: [
+          {
+            ...entry,
+            name: "ws",
+            projects: [
+              { projectPath: "/tmp/project-a", projectName: "project-a" },
+              { projectPath: "/tmp/project-b", projectName: "project-b" },
+            ],
+          },
+        ],
+      });
+      return cfg;
+    });
+  }
+
   beforeEach(async () => {
     harness = await createWorkspaceServiceHarness({
       aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      // Multi-project workspaces are hidden from getInfo unless the experiment is on.
+      experimentsService: {
+        isExperimentEnabled: mock(() => true),
+      } as unknown as ExperimentsService,
     });
     workspaceService = harness.service;
 
@@ -353,21 +383,15 @@ describe("WorkspaceService getFileCompletions", () => {
   });
 
   test("keeps single-project completions unchanged", async () => {
-    interface WorkspaceServiceTestAccess {
-      getInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.getInfo = mock(() =>
-      Promise.resolve({
-        id: "ws-single",
-        name: "ws",
-        projectName: "project-a",
-        projectPath: "/tmp/project-a",
-        namedWorkspacePath: "/persisted/project-a/ws",
-        runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-      } satisfies FrontendWorkspaceMetadata)
-    );
+    // Registered in the real Config, which getInfo reads.
+    await harness.config.addWorkspace("/tmp/project-a", {
+      id: "ws-single",
+      name: "ws",
+      projectName: "project-a",
+      projectPath: "/tmp/project-a",
+      namedWorkspacePath: "/persisted/project-a/ws",
+      runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+    });
 
     execBufferedSpy.mockResolvedValue({
       stdout: "src/single.ts\n",
@@ -384,28 +408,10 @@ describe("WorkspaceService getFileCompletions", () => {
   });
 
   test("preserves the current SSH workspace path and derives sibling legacy paths for multi-project completions when the persisted root matches that layout", async () => {
-    interface WorkspaceServiceTestAccess {
-      getInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.getInfo = mock(() =>
-      Promise.resolve({
-        id: "ws-multi-ssh",
-        name: "ws",
-        projectName: "project-a",
-        projectPath: "/tmp/project-a",
-        namedWorkspacePath: "/tmp/src/project-a/ws",
-        runtimeConfig: { type: "ssh", host: "example.com", srcBaseDir: "/tmp/src" },
-        projects: [
-          { projectPath: "/tmp/project-a", projectName: "project-a" },
-          { projectPath: "/tmp/project-b", projectName: "project-b" },
-        ],
-      } satisfies FrontendWorkspaceMetadata)
-    );
-    spyOn(harness.config, "findWorkspace").mockReturnValue({
-      projectPath: "/tmp/project-a",
-      workspacePath: "/tmp/src/project-a/ws",
+    await registerMultiProjectWorkspace({
+      id: "ws-multi-ssh",
+      path: "/tmp/src/project-a/ws",
+      runtimeConfig: { type: "ssh", host: "example.com", srcBaseDir: "/tmp/src" },
     });
     createRuntimeSpy.mockImplementation((_runtimeConfig, options) => {
       const runtimeProjectPath = options?.projectPath;
@@ -455,25 +461,11 @@ describe("WorkspaceService getFileCompletions", () => {
   });
 
   test("aggregates multi-project completions using project-prefixed paths", async () => {
-    interface WorkspaceServiceTestAccess {
-      getInfo: (workspaceId: string) => Promise<FrontendWorkspaceMetadata | null>;
-    }
-
-    const svc = workspaceService as unknown as WorkspaceServiceTestAccess;
-    svc.getInfo = mock(() =>
-      Promise.resolve({
-        id: "ws-multi",
-        name: "ws",
-        projectName: "project-a",
-        projectPath: "/tmp/project-a",
-        namedWorkspacePath: "/persisted/container/ws",
-        runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
-        projects: [
-          { projectPath: "/tmp/project-a", projectName: "project-a" },
-          { projectPath: "/tmp/project-b", projectName: "project-b" },
-        ],
-      } satisfies FrontendWorkspaceMetadata)
-    );
+    await registerMultiProjectWorkspace({
+      id: "ws-multi",
+      path: "/persisted/container/ws",
+      runtimeConfig: { type: "worktree", srcBaseDir: "/tmp/src" },
+    });
 
     execBufferedSpy.mockImplementation((_runtime, _command, options) => {
       if (options.cwd === "/runtime/project-a/ws") {

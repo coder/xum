@@ -20,7 +20,6 @@ import {
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import * as workspaceTitleGenerator from "./workspaceTitleGenerator";
 import {
-  createCompactionAdmissionMocks,
   createDeferred,
   createMockAIService,
   createWorkspaceServiceHarness,
@@ -36,15 +35,7 @@ describe("WorkspaceService pending auto-title", () => {
   let workspaceId: string;
   let projectPath: string;
   let workspacePath: string;
-  let fakeSession: {
-    isBusy: ReturnType<typeof mock>;
-    hasQueuedMessages: ReturnType<typeof mock>;
-    hasQueuedOrDispatchingEntry: ReturnType<typeof mock>;
-    dropQueuedMessageWithOnlyDedupeKey: ReturnType<typeof mock>;
-    queueMessage: ReturnType<typeof mock>;
-    sendMessage: ReturnType<typeof mock>;
-    resumeStream: ReturnType<typeof mock>;
-  };
+  let sessionSend: ReturnType<typeof spyOn<AgentSession, "sendMessage">>;
 
   beforeEach(async () => {
     workspaceId = "pending-auto-title-workspace";
@@ -76,6 +67,10 @@ describe("WorkspaceService pending auto-title", () => {
       createdAt: new Date().toISOString(),
       runtimeConfig: { type: "local" },
       namedWorkspacePath: workspacePath,
+      // The sends below select this agent without a thinking level, so AI-settings persistence
+      // finds nothing to change and never writes. A write would let one of the concurrent sends
+      // finish before the other reaches the auto-title claim, so the two would no longer overlap.
+      agentId: "exec",
     });
 
     const metadata: FrontendWorkspaceMetadata = {
@@ -91,29 +86,10 @@ describe("WorkspaceService pending auto-title", () => {
     };
     spyOn(harness.aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(metadata));
 
-    fakeSession = {
-      ...createCompactionAdmissionMocks(),
-      isBusy: mock(() => false),
-      hasQueuedMessages: mock(() => false),
-      hasQueuedOrDispatchingEntry: mock(() => false),
-      dropQueuedMessageWithOnlyDedupeKey: mock(() => false),
-      queueMessage: mock(() => "tool-end" as const),
-      sendMessage: mock(() => Promise.resolve(Ok(undefined))),
-      resumeStream: mock(() => Promise.resolve(Ok({ started: true }))),
-    };
-
-    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(
-      fakeSession as unknown as AgentSession
-    );
-
-    // Keep AI-settings persistence instant: it runs between the concurrent-send test's capture
-    // barrier and the auto-title claim, and real disk I/O lets one send finish before the other
-    // reaches the claim, so the two sends no longer overlap.
-    (
-      workspaceService as unknown as {
-        maybePersistAISettingsFromOptions: (workspaceId: string, options: unknown) => Promise<void>;
-      }
-    ).maybePersistAISettingsFromOptions = mock(() => Promise.resolve());
+    // The real session the service creates and registers; only the provider-facing send is
+    // stubbed, so title updates reach the service's metadata event through the session relay.
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    sessionSend = spyOn(session, "sendMessage").mockResolvedValue(Ok(undefined));
   });
 
   /** Resolves once the service publishes `title` for this workspace (auto-title completion). */
@@ -167,7 +143,7 @@ describe("WorkspaceService pending auto-title", () => {
 
   test("concurrent sends only claim one pending auto-title generation", async () => {
     const releaseSend = createDeferred<Result<void, SendMessageError>>();
-    fakeSession.sendMessage.mockImplementation(() => releaseSend.promise);
+    sessionSend.mockImplementation(() => releaseSend.promise);
     const capturesEntered = createDeferred<void>();
     const releaseCaptures = createDeferred<void>();
     const capture = historyService.captureCompactionReplacement.bind(historyService);
