@@ -21,6 +21,8 @@ export function SshPromptDialog() {
   const pending = pendingQueue[0] ?? null;
   const [responding, setResponding] = useState(false);
   const [credentialInput, setCredentialInput] = useState("");
+  // Error reported by the backend for the current prompt's last answer attempt.
+  const [respondError, setRespondError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!api) {
@@ -87,6 +89,7 @@ export function SshPromptDialog() {
   useEffect(() => {
     // Each prompt request needs a fresh credential field; carry-over risks sending stale secrets.
     setCredentialInput("");
+    setRespondError(null);
   }, [pending?.requestId]);
 
   const respond = async (response: string) => {
@@ -96,9 +99,16 @@ export function SshPromptDialog() {
 
     const requestId = pending.requestId;
     setResponding(true);
+    setRespondError(null);
 
     try {
-      await api.ssh.prompt.respond({ requestId, response });
+      const result = await api.ssh.prompt.respond({ requestId, response });
+      if (!result.success) {
+        // An error Result means the backend did not accept the answer: keep the
+        // prompt open and show why, so the user can retry instead of losing it.
+        setRespondError(result.error);
+        return;
+      }
       // Dequeue only on success — RPC failure keeps prompt visible for retry.
       setPendingQueue((prev) => prev.filter((item) => item.requestId !== requestId));
     } catch {
@@ -107,6 +117,13 @@ export function SshPromptDialog() {
       setResponding(false);
     }
   };
+
+  const respondErrorNotice = respondError ? (
+    <WarningBox>
+      <WarningTitle>Response failed</WarningTitle>
+      <WarningText>{respondError}</WarningText>
+    </WarningBox>
+  ) : null;
 
   return (
     <Dialog
@@ -145,6 +162,8 @@ export function SshPromptDialog() {
               <WarningTitle>Host Key Verification</WarningTitle>
               <WarningText>Accepting will add the host to your known_hosts file.</WarningText>
             </WarningBox>
+
+            {respondErrorNotice}
 
             <DialogFooter className="justify-center">
               <Button
@@ -190,6 +209,8 @@ export function SshPromptDialog() {
                   setCredentialInput(event.target.value);
                 }}
               />
+
+              {respondErrorNotice}
 
               <DialogFooter className="justify-center">
                 <Button

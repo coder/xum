@@ -283,6 +283,45 @@ describe("SshPromptDialog", () => {
     expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", response: "no" });
   });
 
+  it("keeps request visible and shows the error when respond returns an error result", async () => {
+    respondMock = mock(() => Promise.resolve({ success: false, error: "Prompt expired" }));
+    subscribeMock = mock(() => Promise.resolve(mockSubscription.iterable));
+    api = {
+      ssh: {
+        prompt: {
+          subscribe: subscribeMock,
+          respond: respondMock,
+        },
+      },
+    };
+
+    const { getByRole, queryByRole, queryByText } = renderDialog();
+
+    await waitFor(() => expect(subscribeMock).toHaveBeenCalledTimes(1));
+    await enqueueRequest(MOCK_REQUEST);
+
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Reject" }));
+      await flushReactWork();
+    });
+    await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(1));
+
+    // An error Result is not an answer: the prompt stays open with the reason.
+    await waitFor(() => expect(queryByText("Prompt expired")).not.toBeNull());
+    expect(queryByRole("button", { name: "Reject" })).not.toBeNull();
+
+    // Retry succeeds: the error clears with the dequeued prompt.
+    respondMock.mockImplementation(() => Promise.resolve({ success: true, data: undefined }));
+    await act(async () => {
+      fireEvent.click(getByRole("button", { name: "Reject" }));
+      await flushReactWork();
+    });
+    await waitFor(() => expect(respondMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(queryByRole("button", { name: "Reject" })).toBeNull());
+    expect(queryByText("Prompt expired")).toBeNull();
+    expect(respondMock).toHaveBeenNthCalledWith(2, { requestId: "req-1", response: "no" });
+  });
+
   it("closes late iterator when cleanup runs before subscribe resolves", async () => {
     let resolveSubscribe: ((iterable: AsyncIterable<SshPromptEvent>) => void) | null = null;
     subscribeMock = mock(
