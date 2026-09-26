@@ -147,13 +147,16 @@ export const CODEX_OAUTH_REQUIRED_MODELS = new Set<string>([
  */
 const CODEX_OAUTH_CONTEXT_WINDOW_OVERRIDES: Record<string, number> = {
   // The public API exposes a 1.05M window for these models, but the ChatGPT/Codex
-  // model catalog publishes smaller context windows (372K for the GPT-5.6 family).
+  // model catalog publishes smaller context windows.
   // Keep auth-route caps separate so API-key requests retain the full public window.
   "gpt-5.5": 272_000,
-  "gpt-5.6": 372_000,
-  "gpt-5.6-sol": 372_000,
-  "gpt-5.6-terra": 372_000,
-  "gpt-5.6-luna": 372_000,
+  // GPT-5.6 Sol/Terra/Luna: 272K default context_window (872K configurable max) in the
+  // pinned catalog below. The earlier 372K came from the July 2026 catalog, which
+  // openai/codex#39102 replaced. The bare alias routes to Sol.
+  "gpt-5.6": 272_000,
+  "gpt-5.6-sol": 272_000,
+  "gpt-5.6-terra": 272_000,
+  "gpt-5.6-luna": 272_000,
   // GPT-6 Astra/Sol/Luna are each published at 272K (default context_window; the
   // configurable max_context_window is 872K) in the pinned Codex catalog:
   // https://github.com/openai/codex/blob/04fc75adbe67a612a1cb0fc469533f24b24fa499/codex-rs/models-manager/models.json
