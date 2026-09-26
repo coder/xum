@@ -3008,15 +3008,6 @@ export class WorkspaceService
   private readonly pendingPluginSanitizations = new Set<string>();
 
   /**
-   * Deferred-checkout creations whose default consent waits for the checkout's sanitization
-   * (materializeDeferredCheckout). The workspace is already announced then, so an explicit
-   * consent toggle removes the entry and the grant (re-checked inside the serialized config
-   * edit) can never reverse a choice the user already made. Process-local: a toggle handled by
-   * another backend sharing this root cannot cancel it (tracked with #4446).
-   */
-  private readonly pendingDefaultUnrelatedConsent = new Set<string>();
-
-  /**
    * Serializes persist + sanitize of a new host-local registration across
    * PROCESSES sharing this config root. pendingPluginSanitizations only
    * covers this process: two processes registering the same preserved
@@ -5779,6 +5770,11 @@ export class WorkspaceService
             // Mirror /fork: when /new is invoked with a start message, defer title
             // selection until the first message can drive LLM-based generation.
             ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+            // Default consent is granted once setup completes; marked in this same write so a
+            // toggle from any backend that sees the row cancels it (#4446).
+            ...(options?.skipDefaultUnrelatedWorkspaceConsent === true
+              ? {}
+              : { unrelatedWorkspaceConsentPending: true as const }),
           });
           return config;
         });
@@ -5847,9 +5843,8 @@ export class WorkspaceService
           // Delegated target: stays off (see the option).
         } else if (pendingMaterialization !== undefined) {
           // Deferred checkout: its files (and their sanitization) arrive after the announcement,
-          // so the grant waits for materializeDeferredCheckout. Marked before announcing, so a
-          // toggle the user makes once the workspace appears cancels it.
-          this.pendingDefaultUnrelatedConsent.add(workspaceId);
+          // so the grant waits for materializeDeferredCheckout. The row's pending mark lets a
+          // toggle the user makes once the workspace appears cancel it.
         } else {
           // Registration is complete (sanitized when required) and nothing has been announced
           // yet: only now may other task trees discover and message this workspace.
@@ -5903,7 +5898,7 @@ export class WorkspaceService
                 pending: pendingMaterialization,
                 initAbortController,
                 // Removal, failed checkout or failed sanitization: the default never applies.
-              }).finally(() => this.pendingDefaultUnrelatedConsent.delete(workspaceId))
+              }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
             : runBackgroundInit(runtime, initParams, workspaceId, log)
         );
       } else {
@@ -7768,9 +7763,6 @@ export class WorkspaceService
       }
 
       const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
-      // An explicit choice (either value) supersedes a still-pending creation default; cleared
-      // before this edit is queued, so a deferred grant queued later re-checks and skips.
-      this.pendingDefaultUnrelatedConsent.delete(normalizedWorkspaceId);
       // Mutate inside the serialized editConfig transform against the FRESH entry (see
       // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
       let outcome: Result<void, string> = Err("Workspace not found");
@@ -7785,6 +7777,9 @@ export class WorkspaceService
           return freshConfig;
         }
         outcome = Ok(undefined);
+        // An explicit choice (either value) supersedes a still-pending creation default, even
+        // one another backend sharing this root is about to grant (#4446).
+        delete entry.unrelatedWorkspaceConsentPending;
         if (!enabled) {
           // Absent is the only "off" representation on disk. A malformed value already reads
           // as off, but it is scrubbed here so the entry does not carry junk indefinitely.
@@ -7893,9 +7888,7 @@ export class WorkspaceService
   private async grantCreationUnrelatedWorkspaceConsent(
     projectPath: string,
     workspaceId: string,
-    workspacePath: string,
-    /** Re-checked inside the serialized edit; false skips the grant. */
-    shouldGrant: () => boolean = () => true
+    workspacePath: string
   ): Promise<string | undefined> {
     let granted: string | undefined;
     try {
@@ -7905,9 +7898,11 @@ export class WorkspaceService
           workspaceId,
           workspacePath,
         });
-        if (!entry || !shouldGrant()) {
+        // Only while the registration's pending mark survives: an explicit toggle cleared it.
+        if (entry?.unrelatedWorkspaceConsentPending !== true) {
           return freshConfig;
         }
+        delete entry.unrelatedWorkspaceConsentPending;
         granted =
           getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent) ??
           mintUnrelatedWorkspaceConsent();
@@ -7941,20 +7936,19 @@ export class WorkspaceService
 
   /**
    * Default consent for a deferred-checkout creation, once materializeDeferredCheckout has
-   * populated and sanitized it. Applies only while the creation is still pending (an explicit
-   * toggle cancels it), and publishes the metadata since the workspace is already announced.
+   * populated and sanitized it. Applies only while the row's pending mark survives (an explicit
+   * toggle clears it), and publishes the metadata since the workspace is already announced.
    */
   private async grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
     try {
       const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-      if (found == null || !this.pendingDefaultUnrelatedConsent.has(workspaceId)) {
+      if (found?.workspace.unrelatedWorkspaceConsentPending !== true) {
         return;
       }
       const granted = await this.grantCreationUnrelatedWorkspaceConsent(
         found.projectPath,
         workspaceId,
-        found.workspace.path,
-        () => this.pendingDefaultUnrelatedConsent.has(workspaceId)
+        found.workspace.path
       );
       if (granted != null) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
@@ -7967,8 +7961,32 @@ export class WorkspaceService
         workspaceId,
         error: getErrorMessage(error),
       });
-    } finally {
-      this.pendingDefaultUnrelatedConsent.delete(workspaceId);
+    }
+  }
+
+  /**
+   * A deferred checkout that failed, was cancelled or was removed never gets its default: drop
+   * the row's pending mark (a no-op once the grant consumed it). Never throws: it runs in the
+   * deferred checkout's init settlement.
+   */
+  private async clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void> {
+    if (
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+        .unrelatedWorkspaceConsentPending !== true
+    ) {
+      return;
+    }
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+        if (entry) delete entry.unrelatedWorkspaceConsentPending;
+        return freshConfig;
+      });
+    } catch (error) {
+      log.warn("Failed to clear pending default unrelated-workspace consent", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -11821,13 +11839,17 @@ export class WorkspaceService
           // acquireRegistrationSanitizeLock).
           releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
         }
-        await this.config.addWorkspace(foundProjectPath, metadata).catch(async (error: unknown) => {
-          // #4745: fail with the write's own error once the fork is undone.
-          await abortForkRegistration().catch((rollbackError: unknown) =>
-            logRegistrationRollbackFailure(newWorkspaceId, rollbackError)
-          );
-          throw error;
-        });
+        // Marked in the registration write itself so a toggle from any backend cancels the
+        // default granted below (#4446).
+        await this.config
+          .addWorkspace(foundProjectPath, metadata, { unrelatedWorkspaceConsentPending: true })
+          .catch(async (error: unknown) => {
+            // #4745: fail with the write's own error once the fork is undone.
+            await abortForkRegistration().catch((rollbackError: unknown) =>
+              logRegistrationRollbackFailure(newWorkspaceId, rollbackError)
+            );
+            throw error;
+          });
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,

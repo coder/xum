@@ -499,11 +499,7 @@ describe("WorkspaceService init cancellation", () => {
       // Delegated targets are not opted in (yet): nothing persisted, announced or pending.
       expect(newEntry?.unrelatedWorkspaceConsent).toBeUndefined();
       expect(result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
-      expect(
-        (
-          workspaceService as unknown as { pendingDefaultUnrelatedConsent: Set<string> }
-        ).pendingDefaultUnrelatedConsent.has(workspaceId)
-      ).toBe(false);
+      expect(newEntry?.unrelatedWorkspaceConsentPending).toBeUndefined();
     } finally {
       setup.createRuntimeSpy.mockRestore();
     }

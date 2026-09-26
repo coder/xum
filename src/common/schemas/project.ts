@@ -126,6 +126,10 @@ export const WorkspaceConfigSchema = z.object({
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
   }),
+  unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
+    description:
+      "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
+  }),
   agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
     description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),

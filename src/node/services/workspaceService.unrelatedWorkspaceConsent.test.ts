@@ -5,10 +5,14 @@ import * as path from "node:path";
 
 import type { Workspace } from "@/common/types/project";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
-import type { Config } from "@/node/config";
+import { Config } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { WorkspaceService } from "./workspaceService";
-import { createWorkspaceServiceHarness } from "./workspaceService.testHarness";
+import {
+  createWorkspaceServiceForTest,
+  createWorkspaceServiceHarness,
+} from "./workspaceService.testHarness";
 
 const WORKSPACE_ID = "a1b2c3d4e5";
 const OTHER_WORKSPACE_ID = "f6e5d4c3b2";
@@ -329,7 +333,6 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   });
 
   interface ServiceInternals {
-    pendingDefaultUnrelatedConsent: Set<string>;
     grantPendingDefaultUnrelatedWorkspaceConsent: (workspaceId: string) => Promise<void>;
     sanitizeMaterializedTaskWorkspace: (...args: unknown[]) => Promise<string | undefined>;
     abortUnsanitizedCreation: (...args: unknown[]) => Promise<boolean>;
@@ -342,9 +345,19 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     ) => Promise<string | undefined>;
   }
   const internals = () => harness.service as unknown as ServiceInternals;
-  /** What create() records for a deferred checkout before announcing it. */
+  /** What create() writes on the row when it registers a workspace that gets the default. */
   const markPending = (workspaceId = WORKSPACE_ID) =>
-    internals().pendingDefaultUnrelatedConsent.add(workspaceId);
+    harness.config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const entry = project.workspaces.find((workspace) => workspace.id === workspaceId);
+        if (entry) entry.unrelatedWorkspaceConsentPending = true;
+      }
+      return cfg;
+    });
+  const persistedPending = (workspaceId = WORKSPACE_ID) =>
+    [...harness.config.loadConfigOrDefault().projects.values()]
+      .flatMap((project) => project.workspaces)
+      .find((workspace) => workspace.id === workspaceId)?.unrelatedWorkspaceConsentPending;
   const grantPending = (workspaceId = WORKSPACE_ID) =>
     internals().grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
 
@@ -374,7 +387,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   }
 
   test("grants only after the checkout is sanitized, before the init hook runs", async () => {
-    markPending();
+    await markPending();
     const consentAtSanitize: unknown[] = [];
     const consentAtInit: unknown[] = [];
     spyOn(internals(), "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
@@ -396,6 +409,8 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     const generation = harness.persistedConsent();
     expect(getValidUnrelatedWorkspaceConsent(generation)).toBe(generation as string);
     expect(consentAtInit).toEqual([generation]);
+    // The grant consumed the row's pending mark in the same write.
+    expect(persistedPending()).toBeUndefined();
     expect(published.map((event) => event.workspaceId)).toEqual([WORKSPACE_ID]);
     expect(harness.persistedConsent(OTHER_WORKSPACE_ID)).toBeUndefined();
   });
@@ -404,7 +419,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     { label: "failed sanitization", sanitizeError: "stale enable", materializeError: undefined },
     { label: "failed checkout", sanitizeError: undefined, materializeError: new Error("clone") },
   ])("$label never grants", async ({ sanitizeError, materializeError }) => {
-    markPending();
+    await markPending();
     spyOn(internals(), "sanitizeMaterializedTaskWorkspace").mockResolvedValue(sanitizeError);
     spyOn(internals(), "abortUnsanitizedCreation").mockResolvedValue(true);
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
@@ -415,7 +430,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   });
 
   test("an explicit toggle while the default is pending wins", async () => {
-    markPending();
+    await markPending();
     // The user turns it on and back off after the workspace appeared, before the grant runs.
     expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, true)).success).toBe(
       true
@@ -426,6 +441,8 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     const published: unknown[] = [];
     harness.service.on("metadata", (event: unknown) => published.push(event));
 
+    // The explicit choice cleared the pending mark.
+    expect(persistedPending()).toBeUndefined();
     await grantPending();
 
     expect(harness.persistedConsent()).toBeUndefined();
@@ -437,7 +454,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
     await grantPending(OTHER_WORKSPACE_ID);
     expect(harness.persistedConsent(OTHER_WORKSPACE_ID)).toBeUndefined();
 
-    markPending();
+    await markPending();
     await grantPending();
     expect(harness.persistedConsent()).toBeDefined();
     expect((await harness.service.setUnrelatedWorkspaceConsent(WORKSPACE_ID, false)).success).toBe(
@@ -448,6 +465,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   });
 
   test("does not report consent whose save failed (#4444)", async () => {
+    await markPending();
     const publish = failConfigPublish();
 
     const reported = await internals().grantCreationUnrelatedWorkspaceConsent(
@@ -462,6 +480,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   });
 
   test("does not report consent that is not on disk after the edit", async () => {
+    await markPending();
     // A write another writer replaced: editConfig resolved, but the file lacks the grant.
     spyOn(harness.config as unknown as ServiceInternals, "saveConfig").mockResolvedValue(undefined);
 
@@ -478,7 +497,7 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   });
 
   test("a failing metadata publication does not throw out of the grant", async () => {
-    markPending();
+    await markPending();
     harness.service.on("metadata", () => {
       throw new Error("metadata consumer exploded");
     });
@@ -554,5 +573,121 @@ describe("WorkspaceService.setAgentMessageDispatchMode", () => {
     const result = await harness.service.setAgentMessageDispatchMode(WORKSPACE_ID, "turn-end");
 
     expect(result.success).toBe(false);
+  });
+});
+
+/**
+ * #4446: two backends share one root (desktop beside `xum server`). Backend A creates a root
+ * workspace and grants its default consent once setup completes; backend B, which sees the row
+ * in config, can toggle consent in that window. B's explicit choice must win: the pending
+ * default lives on the row, so B's toggle clears it.
+ */
+describe("default consent pending across backends (#4446)", () => {
+  const CREATED_ID = "c0ffee0001";
+  let harness: Awaited<ReturnType<typeof createWorkspaceServiceHarness>>;
+  let projectPath: string;
+
+  beforeEach(async () => {
+    harness = await createWorkspaceServiceHarness();
+    projectPath = path.join(harness.rootDir, "proj");
+    await saveWorkspaces(harness.config, projectPath, [
+      projectWorkspace(projectPath, "existing", "e0e0e0e0e0"),
+    ]);
+    spyOn(harness.config, "generateStableId").mockReturnValue(CREATED_ID);
+  });
+
+  afterEach(async () => {
+    mock.restore();
+    await harness.cleanup();
+  });
+
+  const readEntry = () =>
+    new Config(harness.rootDir)
+      .loadConfigOrDefault()
+      .projects.get(projectPath)
+      ?.workspaces.find((entry) => entry.id === CREATED_ID) as
+      | (Workspace & Record<string, unknown>)
+      | undefined;
+  /** Backend B: its own Config on the same root. */
+  const backendB = () => createWorkspaceServiceForTest({ config: new Config(harness.rootDir) });
+
+  interface CreateInternals {
+    sanitizeStalePluginOverridesForNewWorkspace: (
+      ...args: unknown[]
+    ) => Promise<string | undefined>;
+    sanitizeMaterializedTaskWorkspace: (...args: unknown[]) => Promise<string | undefined>;
+  }
+  const internals = () => harness.service as unknown as CreateInternals;
+
+  /** create() with a deferred checkout whose materialization waits for `gate`. */
+  async function createDeferred(gate: Promise<void>) {
+    let initStarted!: () => void;
+    const initRan = new Promise<void>((resolve) => (initStarted = resolve));
+    const workspacePath = path.join(projectPath, "deferred");
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      createWorkspace: mock(() =>
+        Promise.resolve({ success: true as const, workspacePath, pendingMaterialization: {} })
+      ),
+      materializeWorkspace: mock(() => gate),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    spyOn(internals(), "sanitizeMaterializedTaskWorkspace").mockResolvedValue(undefined);
+    spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() => {
+      initStarted();
+      return Promise.resolve(undefined);
+    });
+    const result = await harness.service.create(projectPath, "deferred", undefined, undefined, {
+      type: "local",
+    });
+    expect(result.success).toBe(true);
+    // Wrapped: returning the bare promise would make `await createDeferred()` wait for init.
+    return { initRan };
+  }
+
+  test.each([
+    { choice: false, label: "opts out" },
+    { choice: true, label: "opts in" },
+  ])("deferred checkout: B $label while A materializes, and B's choice wins", async (row) => {
+    let release!: () => void;
+    const { initRan } = await createDeferred(new Promise<void>((resolve) => (release = resolve)));
+    expect(readEntry()).toBeDefined();
+
+    expect((await backendB().setUnrelatedWorkspaceConsent(CREATED_ID, row.choice)).success).toBe(
+      true
+    );
+    const chosen = readEntry()?.unrelatedWorkspaceConsent;
+    release();
+    await initRan;
+
+    // A's grant never reverses B's opt-out, nor rotates B's opt-in generation.
+    expect(readEntry()?.unrelatedWorkspaceConsent).toBe(chosen);
+    expect(chosen === undefined).toBe(!row.choice);
+    expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
+  });
+
+  test("immediate checkout: B opts out between registration and A's grant, and stays out", async () => {
+    const workspacePath = path.join(projectPath, "immediate");
+    await fs.mkdir(workspacePath, { recursive: true });
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      createWorkspace: mock(() => Promise.resolve({ success: true as const, workspacePath })),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+    // The row is registered; A sanitizes before granting. B toggles in that window.
+    spyOn(internals(), "sanitizeStalePluginOverridesForNewWorkspace").mockImplementation(
+      async () => {
+        expect((await backendB().setUnrelatedWorkspaceConsent(CREATED_ID, false)).success).toBe(
+          true
+        );
+        return undefined;
+      }
+    );
+
+    const result = await harness.service.create(projectPath, "immediate", undefined, undefined, {
+      type: "local",
+    });
+
+    expect(result.success).toBe(true);
+    expect(readEntry()?.unrelatedWorkspaceConsent).toBeUndefined();
+    expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
+    expect(result.success && result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
   });
 });

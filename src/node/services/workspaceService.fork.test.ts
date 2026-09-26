@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
-import type { Config } from "@/node/config";
+import { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { SessionUsageService } from "./sessionUsageService";
@@ -281,6 +281,81 @@ describe("WorkspaceService fork", () => {
       runBackgroundInitSpy.mockRestore();
       createRuntimeSpy.mockRestore();
       generateStableIdSpy.mockRestore();
+    }
+  });
+
+  test("a consent toggle from another backend during fork setup wins over the default (#4446)", async () => {
+    const sourceWorkspaceId = "source-workspace";
+    const newWorkspaceId = "forked-workspace";
+    const sourceProjectPath = path.join(tempDir, "project");
+    const forkedWorkspacePath = path.join(sourceProjectPath, "fork-child");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+    };
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      current.projects.get(sourceProjectPath)!.trusted = true;
+      return current;
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      }),
+    });
+    // Backend B: its own Config on the same root.
+    const backendB = createWorkspaceServiceForTest({ config: new Config(config.rootDir) });
+    spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getWorkspacePath: mock(() => forkedWorkspacePath),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+    spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+    spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+      Ok({
+        workspacePath: forkedWorkspacePath,
+        trunkBranch: "main",
+        forkedRuntimeConfig: { type: "local" },
+        targetRuntime: {
+          getWorkspacePath: mock(() => forkedWorkspacePath),
+        } as unknown as ReturnType<typeof runtimeFactory.createRuntime>,
+        forkedFromSource: true,
+        sourceRuntimeConfigUpdated: false,
+      })
+    );
+    // The fork is registered; B sees the row and opts it out before A's grant.
+    spyOn(
+      workspaceService as unknown as {
+        sanitizeStalePluginOverridesForNewWorkspace: (...args: unknown[]) => Promise<undefined>;
+      },
+      "sanitizeStalePluginOverridesForNewWorkspace"
+    ).mockImplementation(async () => {
+      expect((await backendB.setUnrelatedWorkspaceConsent(newWorkspaceId, false)).success).toBe(
+        true
+      );
+      return undefined;
+    });
+
+    try {
+      const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
+
+      expect(result.success).toBe(true);
+      const forkEntry = [...config.loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((entry) => entry.id === newWorkspaceId);
+      expect(forkEntry?.unrelatedWorkspaceConsent).toBeUndefined();
+      expect(forkEntry?.unrelatedWorkspaceConsentPending).toBeUndefined();
+      expect(result.success && result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
+    } finally {
+      mock.restore();
     }
   });
 

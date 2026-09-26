@@ -4170,7 +4170,9 @@ export class Config {
    */
   async addWorkspace(
     projectPath: string,
-    metadata: WorkspaceMetadata & { namedWorkspacePath?: string }
+    metadata: WorkspaceMetadata & { namedWorkspacePath?: string },
+    /** Written only on a new row, in its registration write (see the schema field). */
+    options: { unrelatedWorkspaceConsentPending?: true } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
       let project = config.projects.get(projectPath);
@@ -4249,10 +4251,16 @@ export class Config {
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
           pendingRemoval: existing.pendingRemoval,
+          unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
         };
       } else {
         // Add new workspace
-        project.workspaces.push(workspaceEntry);
+        project.workspaces.push({
+          ...workspaceEntry,
+          ...(options.unrelatedWorkspaceConsentPending === true
+            ? { unrelatedWorkspaceConsentPending: true as const }
+            : {}),
+        });
       }
 
       return config;
