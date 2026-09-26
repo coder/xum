@@ -168,8 +168,12 @@ const WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS: Array<{
   { value: "snapshot", label: "Snapshot and delete" },
 ];
 
-// Browser mode: window.api is not set (only exists in Electron via preload)
-const isBrowserMode = typeof window !== "undefined" && !window.api;
+// Browser mode: window.api is not set (only exists in Electron via preload). Read it when
+// used rather than at module evaluation, so the answer never depends on which environment
+// happened to import this module first (e.g. an earlier test file in the same process).
+function isBrowserMode(): boolean {
+  return typeof window !== "undefined" && !window.api;
+}
 
 export function GeneralSection() {
   const { themePreference, setTheme } = useTheme();
@@ -625,7 +629,7 @@ export function GeneralSection() {
 
   // Load SSH host from server on mount (browser mode only)
   useEffect(() => {
-    if (isBrowserMode && api) {
+    if (isBrowserMode() && api) {
       void api.server.getSshHost().then((host) => {
         setSshHost(host ?? "");
         setSshHostLoaded(true);
@@ -1234,7 +1238,7 @@ export function GeneralSection() {
                   className="border-border-medium bg-background-secondary h-9 w-40"
                 />
               </div>
-              {isBrowserMode && (
+              {isBrowserMode() && (
                 <div className="text-warning text-xs">
                   Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
                 </div>
@@ -1256,7 +1260,7 @@ export function GeneralSection() {
             />
           </div>
 
-          {isBrowserMode && sshHostLoaded && (
+          {isBrowserMode() && sshHostLoaded && (
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-foreground text-sm">SSH Host</div>
