@@ -127,10 +127,11 @@ done
 
 # Bun-run test trees outside src/ (Jest ignores them, see jest.config.js): Storybook
 # policy tests, the VS Code extension's pure helpers (incl. the webview oRPC allowlist
-# guard) and tooling tests under scripts/. check-startup-imports.test.ts is excluded
-# because `make check-startup-imports` (static-check) runs it right before its
-# analyzer; orpcConnection.integration.test.ts needs a live xum server (see
-# scripts/check-test-routing.sh for every file run outside this lane).
+# guard) and tooling tests under scripts/. check-startup-imports.test.ts and
+# check-test-seam-comments.test.ts are excluded because their static-check make
+# targets run them right before the guard itself; orpcConnection.integration.test.ts
+# needs a live xum server (see scripts/check-test-routing.sh for every file run
+# outside this lane).
 #
 # Paths outside bunfig's `root = "src"` need a ./ prefix (here and in
 # isolated_unit_tests): without it `bun test` treats them as name filters over src/
@@ -145,6 +146,7 @@ while IFS= read -r tooling_file; do
 done < <(
   find "${tooling_roots[@]}" -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
     ! -path ./scripts/check-startup-imports.test.ts \
+    ! -path ./scripts/check-test-seam-comments.test.ts \
     ! -path ./vscode/src/api/orpcConnection.integration.test.ts \
     "${find_excludes[@]}" | LC_ALL=C sort
 )

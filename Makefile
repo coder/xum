@@ -90,7 +90,7 @@ include fmt.mk
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
 .PHONY: benchmark-terminal
 .PHONY: ensure-deps mux
-.PHONY: check-startup-imports check-react-compiler check-test-routing test-bench-scripts
+.PHONY: check-startup-imports check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
 # Use the package binary instead of its internal path so native-preview can change wrappers safely.
 TSGO := bun run tsgo
@@ -375,7 +375,7 @@ build/icon.png: docs/img/logo-white.svg scripts/generate-icons.ts
 ## Quality checks (can run in parallel)
 # Keep the default local path fast. Docs link crawling and lockfile-free bench-agent
 # verification stay in static-check-full so local validation remains responsive.
-static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing lint-shellcheck lint-hadolint ## Run fast local static checks
+static-check: lint typecheck fmt-check check-startup-imports check-react-compiler check-code-docs-links check-test-routing check-test-seam-comments lint-shellcheck lint-hadolint ## Run fast local static checks
 
 static-check-full: static-check check-bench-agent test-bench-scripts check-docs-links ## Run the full CI static check suite
 
@@ -385,6 +385,11 @@ test-bench-scripts: ## Test the Terminal-Bench result checker with offline fixtu
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
+
+# <1 s: the matcher's tests run first so a broken guard cannot pass vacuously.
+check-test-seam-comments: node_modules/.installed ## Fail when production code gains an unlisted "Exported for tests"-style comment
+	@bun test ./scripts/check-test-seam-comments.test.ts
+	@bun scripts/check-test-seam-comments.ts
 
 check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Verify terminal-bench agent configuration and imports
 	@./scripts/check-bench-agent.sh
