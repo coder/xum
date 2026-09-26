@@ -1557,6 +1557,16 @@ describe("TaskService", () => {
 
   const OWNER_FOLLOW_UP_SUPERSEDE_PREFIX = "Workspace turn superseded by follow-up turn ";
 
+  /**
+   * Tests below seed queued follow-ups as bare handle records. A real queued follow-up is also a
+   * pending queued turn on the child; without that the queue drain each settlement schedules in
+   * the background reaps the record as stale, and that sweep's disposable cleanup calls `remove`
+   * at a time the test does not control (#4463).
+   */
+  function childHasQueuedFollowUp() {
+    return mock((workspaceId: string) => workspaceId === "childworkspace");
+  }
+
   function ownerFollowUpCutter(ownerWorkspaceId: string, successorHandleId: string) {
     return {
       stage: "queued" as const,
@@ -1798,6 +1808,7 @@ describe("TaskService", () => {
       {
         disposable: true,
         remove,
+        hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
       }
     );
     const taskHandleStore = new TaskHandleStore(config);
@@ -1961,6 +1972,7 @@ describe("TaskService", () => {
       {
         disposable: true,
         remove,
+        hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
       }
     );
     const taskHandleStore = new TaskHandleStore(config);
@@ -2155,6 +2167,7 @@ describe("TaskService", () => {
       {
         disposable: true,
         remove,
+        hasPendingQueuedOrPreparingTurn: childHasQueuedFollowUp(),
       }
     );
     const taskHandleStore = new TaskHandleStore(config);

@@ -227,6 +227,7 @@ interface MockAPISetup {
   updateKeepScreenAwakeMock: ReturnType<
     typeof mock<(input: { enabled: boolean }) => Promise<void>>
   >;
+  getSshHostMock: ReturnType<typeof mock<() => Promise<string | null>>>;
   /** Mutable backing config, so tests can simulate edits made outside this section. */
   config: MockConfig;
   /** Notifies every live `config.onConfigChanged` subscriber, like the backend does. */
@@ -276,6 +277,8 @@ function createMockAPI(
 
     return Promise.resolve();
   });
+
+  const getSshHostMock = mock(() => Promise.resolve<string | null>(null));
 
   // Minimal stand-in for the backend's config-change event stream: each subscriber
   // counts its own pending notifications.
@@ -332,7 +335,7 @@ function createMockAPI(
         onConfigChanged,
       },
       server: {
-        getSshHost: mock(() => Promise.resolve(null)),
+        getSshHost: getSshHostMock,
         setSshHost: mock((_input: { sshHost: string | null }) => Promise.resolve()),
       },
       projects: {
@@ -347,6 +350,7 @@ function createMockAPI(
     updateCoderPrefsMock,
     updateChatTranscriptFullWidthMock,
     updateKeepScreenAwakeMock,
+    getSshHostMock,
     config,
     emitConfigChanged,
   };
@@ -438,6 +442,20 @@ describe("GeneralSection", () => {
     { continuous: false, budget: true, label: "Token Budget" },
     { continuous: true, budget: true, label: "Continuous" },
   ];
+
+  /**
+   * Settle the mount-time config and SSH host reads inside act. The mocks resolve at once, but
+   * the commits they trigger land outside act, so polling for them with waitFor raced its 1 s
+   * wall-clock budget on loaded CI runners (#4463). Awaiting the reads themselves inside act
+   * flushes those commits before returning, with no wall-clock budget.
+   */
+  async function settleMountLoads(setup: MockAPISetup) {
+    const reads = [...setup.getConfigMock.mock.results, ...setup.getSshHostMock.mock.results];
+    expect(reads.length).toBeGreaterThan(0);
+    await act(async () => {
+      await Promise.all(reads.map((result) => result.value));
+    });
+  }
 
   async function hydrateExperiments(setup: MockAPISetup) {
     await act(async () => {
@@ -634,23 +652,22 @@ describe("GeneralSection", () => {
   test("loads the SSH host setting in browser mode", async () => {
     // Browser mode means no window.api. It is read at render time, so this holds even when
     // another test file in the same process imported GeneralSection before the DOM existed.
-    const { api, view } = renderGeneralSection();
+    const setup = renderGeneralSection();
+    // The mount effect requests the host synchronously; a missing call means browser mode was
+    // not detected, which is a different failure from a slow load.
+    expect(setup.getSshHostMock).toHaveBeenCalledTimes(1);
 
-    await waitFor(() => {
-      expect(view.getByText("SSH Host")).toBeTruthy();
-    });
-    expect(api.server.getSshHost).toHaveBeenCalled();
+    await settleMountLoads(setup);
+    expect(setup.view.getByText("SSH Host")).toBeTruthy();
   });
 
   test("loads and persists the full-width chat transcript toggle", async () => {
-    const { updateChatTranscriptFullWidthMock, view } = renderGeneralSection({
-      chatTranscriptFullWidth: true,
-    });
+    const setup = renderGeneralSection({ chatTranscriptFullWidth: true });
+    const { updateChatTranscriptFullWidthMock, view } = setup;
 
     const toggle = view.getByRole("switch", { name: "Toggle full-width chat transcript" });
-    await waitFor(() => {
-      expect(toggle.getAttribute("aria-checked")).toBe("true");
-    });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
 
     fireEvent.click(toggle);
 
@@ -661,16 +678,14 @@ describe("GeneralSection", () => {
   });
 
   test("loads and persists the keep screen awake toggle", async () => {
-    const { updateKeepScreenAwakeMock, view } = renderGeneralSection({
-      keepScreenAwake: true,
-    });
+    const setup = renderGeneralSection({ keepScreenAwake: true });
+    const { updateKeepScreenAwakeMock, view } = setup;
 
     const toggle = view.getByRole("switch", {
       name: "Toggle keep screen awake while agents are working",
     });
-    await waitFor(() => {
-      expect(toggle.getAttribute("aria-checked")).toBe("true");
-    });
+    await settleMountLoads(setup);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
 
     fireEvent.click(toggle);
 
