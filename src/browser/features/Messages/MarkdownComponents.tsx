@@ -3,6 +3,7 @@ import React, { useContext, useEffect, useState } from "react";
 import { Play } from "lucide-react";
 import { Mermaid } from "./Mermaid";
 import { useOptionalMessageListContext } from "./MessageListContext";
+import { StreamingContext } from "./StreamingContext";
 import { highlightCode } from "@/browser/utils/highlighting/highlightWorkerClient";
 import { extractShikiLines, isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { useTheme } from "@/browser/contexts/ThemeContext";
@@ -160,10 +161,12 @@ export function getCurrentHighlightedCodeBlockLines(
 // Streamdown remounts its whole subtree when a message switches between static and streaming
 // mode (the two modes build different trees), e.g. when a stream completes or the transcript
 // backfill ends mid-stream. A remounted CodeBlock loses its Shiki state and would repaint as plain
-// text until the async highlighter answers again, so recent results are kept here to seed it.
-// Bounded because every intermediate streaming highlight lands here and the highlighted HTML of a
-// large block can be hundreds of KB.
-const HIGHLIGHT_CACHE_MAX_ENTRIES = 12;
+// text until the async highlighter answers again, so results from streaming rows (the only rows
+// that switch modes) are kept here to seed it. Completed rows never write, so an older row
+// mounting during the backfill cannot evict the in-flight reply's blocks. A growing block replaces
+// its own earlier, shorter states, so each streamed block holds one entry. Bounded because the
+// highlighted HTML of a large block can be hundreds of KB.
+const HIGHLIGHT_CACHE_MAX_ENTRIES = 32;
 const highlightCache = new Map<string, HighlightedCodeBlockLines>();
 
 function highlightCacheKey(code: string, shikiLanguage: string, theme: "light" | "dark"): string {
@@ -180,7 +183,15 @@ function readHighlightCache(key: string): HighlightedCodeBlockLines | null {
 }
 
 function writeHighlightCache(key: string, highlighted: HighlightedCodeBlockLines): void {
-  highlightCache.delete(key);
+  for (const [existingKey, existing] of highlightCache) {
+    if (
+      existing.theme === highlighted.theme &&
+      existing.shikiLanguage === highlighted.shikiLanguage &&
+      highlighted.code.startsWith(existing.code)
+    ) {
+      highlightCache.delete(existingKey);
+    }
+  }
   highlightCache.set(key, highlighted);
   while (highlightCache.size > HIGHLIGHT_CACHE_MAX_ENTRIES) {
     const oldestKey = highlightCache.keys().next().value;
@@ -198,6 +209,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
   const { theme: themeMode } = useTheme();
   const theme = isLightThemeMode(themeMode) ? "light" : "dark";
   const cacheKey = highlightCacheKey(code, shikiLanguage, theme);
+  const { isStreaming } = useContext(StreamingContext);
 
   const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(() =>
     readHighlightCache(cacheKey)
@@ -234,7 +246,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
               theme,
               lines: filteredLines,
             };
-            writeHighlightCache(cacheKey, result);
+            if (isStreaming) writeHighlightCache(cacheKey, result);
             setHighlighted(result);
           } else {
             setHighlighted(null);
@@ -250,7 +262,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     return () => {
       cancelled = true;
     };
-  }, [cacheKey, code, shikiLanguage, theme]);
+  }, [cacheKey, code, isStreaming, shikiLanguage, theme]);
 
   const messageListContext = useOptionalMessageListContext();
   const openTerminal = messageListContext?.openTerminal;

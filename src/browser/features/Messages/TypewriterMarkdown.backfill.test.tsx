@@ -105,4 +105,57 @@ describe("TypewriterMarkdown during a transcript backfill", () => {
       expect(normalizedMarkup()).toBe(duringBackfill);
     }
   );
+
+  test("keeps every block of the reply highlighted when many other highlights land first", async () => {
+    // Older rows mounting during the backfill highlight their own code blocks, and the reply's
+    // growing block is re-highlighted after each chunk. Neither may push the reply's finished
+    // block out of the highlight results its remount reads.
+    const historyRows = Array.from({ length: 16 }, (_, index) => (
+      <TypewriterMarkdown
+        key={index}
+        content={"```ts\nconst history" + index + " = " + index + ";\n```"}
+        isComplete={true}
+      />
+    ));
+    const renderScene = (content: string, isTranscriptBackfilling: boolean) =>
+      flushSync(() => {
+        root?.render(
+          <ThemeProvider forcedTheme="dark">
+            <TranscriptBackfillContext.Provider value={isTranscriptBackfilling}>
+              {historyRows}
+              <TypewriterMarkdown
+                content={content}
+                isComplete={false}
+                streamKey="in-flight"
+                streamSource="replay"
+              />
+            </TranscriptBackfillContext.Provider>
+          </ThemeProvider>
+        );
+      });
+    const allHighlighted = () =>
+      Array.from(container.querySelectorAll(".code-line")).every(
+        (line) => line.querySelector("span") !== null
+      );
+    const waitForHighlights = async () => {
+      for (let i = 0; i < 300 && !allHighlighted(); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(allHighlighted()).toBe(true);
+    };
+
+    let content = "```ts\nconst finished = 1;\n```\n\n```ts\nlet growing = 0;";
+    renderScene(content, true);
+    await waitForHighlights();
+    for (let chunk = 0; chunk < 16; chunk++) {
+      content += `\ngrowing += ${chunk};`;
+      renderScene(content, true);
+      await waitForHighlights();
+    }
+    await tick();
+    const duringBackfill = normalizedMarkup();
+
+    renderScene(content, false);
+    expect(normalizedMarkup()).toBe(duringBackfill);
+  });
 });
