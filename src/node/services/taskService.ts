@@ -1985,6 +1985,14 @@ export class TaskService implements AgentTaskIntegration {
   private readonly attemptSettlementByTaskId = new Map<string, AttemptSettlementEntry>();
   private readonly attemptSettlementListenersByTaskId = new Map<string, Set<() => void>>();
   /**
+   * Failed reawakens whose closed attempt still awaits settlement (#4310): the owner snapshot
+   * restoreInterruptedTaskAfterResumeFailure closed, settled by recheckResumeFailureSettlement.
+   */
+  private readonly resumeFailureSettlementByTaskId = new Map<
+    string,
+    OwnedTaskAttempt & { attemptId: string }
+  >();
+  /**
    * The last attempt id THIS process published for each task (every local rotation, owned or
    * not). Not an authority on the current id — currentTaskAttemptId reads the persisted row, so
    * a rotation committed by another process is honored and a row that is missing or unreadable
@@ -2671,6 +2679,7 @@ export class TaskService implements AgentTaskIntegration {
       decisionTurnSettled = true;
     }
     if (decisionTurnSettled) this.pruneStreamEndDecisions(workspaceId);
+    this.recheckResumeFailureSettlement(workspaceId);
     const record = this.workspaceStopRecords.get(workspaceId);
     if (!record?.capturedTurns.has(turnGeneration)) return;
     record.capturedTurns.delete(turnGeneration);
@@ -3404,6 +3413,7 @@ export class TaskService implements AgentTaskIntegration {
               this.recheckWorkspaceStopRelease(taskId);
             }
           }
+          this.recheckResumeFailureSettlement(taskId);
         },
       },
     };
@@ -15195,6 +15205,11 @@ export class TaskService implements AgentTaskIntegration {
   /**
    * Revert a pre-stream interrupted->running transition when send/resume fails to start
    * or complete. This preserves fail-fast interrupted semantics for task_await.
+   *
+   * The reawakened attempt this process owns (`expectedAttemptId`) ends here too (#4310): it is
+   * closed to sends together with the revert and settled once no execution of it can still
+   * publish (recheckResumeFailureSettlement). Without that, readAttemptOutcome stayed
+   * indeterminate and every retry inherited an unproven lineage.
    */
   async restoreInterruptedTaskAfterResumeFailure(
     workspaceId: string,
@@ -15206,7 +15221,11 @@ export class TaskService implements AgentTaskIntegration {
       "restoreInterruptedTaskAfterResumeFailure: workspaceId must be non-empty"
     );
 
+    // Captured before the awaited write: only the exact attempt the failed send was bound to,
+    // and only while this process owns it, is ended here.
+    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
     let revertedToInterrupted = false;
+    let closedAttempt: (OwnedTaskAttempt & { attemptId: string }) | undefined;
     let parentWorkspaceId: string | undefined;
     await this.editWorkspaceEntry(
       workspaceId,
@@ -15226,6 +15245,18 @@ export class TaskService implements AgentTaskIntegration {
         ws.taskStatus = previousStatus === "reported" ? "reported" : "interrupted";
         if (previousStatus !== "reported") ws.reportedAt = undefined;
         revertedToInterrupted = true;
+        // Idle-producer linearization (closeAttemptAdmission): synchronously with the decision,
+        // before the write is awaited, so no further send is admitted under this attempt.
+        if (
+          expectedAttemptId != null &&
+          ws.taskAttemptId === expectedAttemptId &&
+          ownedAttempt?.attemptId === expectedAttemptId &&
+          this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt
+        ) {
+          this.closeAttemptAdmission(workspaceId, expectedAttemptId, ownedAttempt, "resume-failed");
+          // Identity is what later checks compare; its attemptId was just checked to be a string.
+          closedAttempt = ownedAttempt as OwnedTaskAttempt & { attemptId: string };
+        }
       },
       { allowMissing: true }
     );
@@ -15235,7 +15266,42 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
+    if (closedAttempt != null) {
+      this.resumeFailureSettlementByTaskId.set(workspaceId, closedAttempt);
+      this.recheckResumeFailureSettlement(workspaceId);
+    }
     await this.emitWorkspaceMetadata(workspaceId);
+  }
+
+  /**
+   * Settle a failed reawaken's closed attempt (restoreInterruptedTaskAfterResumeFailure) once the
+   * shared no-report boundary holds (attemptCannotStillReport): never from the send's error alone.
+   * The failed send's obligation is typically disposed only after the rollback returned (a refused
+   * or no-work send), and an admitted preparation failure rolls back while its turn is still
+   * live, so this is rechecked on the rollback, on every obligation disposal and on every turn
+   * settlement. It drops out without settling when the attempt was superseded (a new owner) or
+   * settled by another producer (Stop), and defers to an in-progress Stop, whose release settles.
+   */
+  private recheckResumeFailureSettlement(taskId: string): void {
+    const attempt = this.resumeFailureSettlementByTaskId.get(taskId);
+    if (attempt == null) return;
+    const closure = this.attemptSettlementByTaskId.get(taskId);
+    if (
+      this.ownedAttemptByTaskId.get(taskId) !== attempt ||
+      closure?.attempt !== attempt ||
+      closure.phase !== "closing"
+    ) {
+      this.resumeFailureSettlementByTaskId.delete(taskId);
+      return;
+    }
+    if (this.workspaceStopRecords.has(taskId)) return;
+    if (!this.attemptCannotStillReport(taskId, attempt)) return;
+    this.resumeFailureSettlementByTaskId.delete(taskId);
+    this.persistOwnedAttemptSettlement(taskId, attempt, "idle-settled", "resume-failed").catch(
+      (error: unknown) => {
+        log.error("[task-attempt] failed reawaken settlement failed", { taskId, error });
+      }
+    );
   }
 
   private buildTaskCompletionRecoveryMessage(
