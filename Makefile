@@ -429,17 +429,24 @@ pin-actions: ## Pin GitHub Actions to SHA hashes (requires GH_TOKEN or gh CLI)
 	./scripts/pin-actions.sh .github/workflows/*.yml .github/actions/*/action.yml
 
 ifeq ($(OS),Windows_NT)
-typecheck: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED) ## Run TypeScript type checking (uses tsgo for 10x speedup)
 	@# On Windows, use npm run because bun x doesn't correctly pass arguments
 	@npm x concurrently -g \
 		"$(TSGO) --noEmit" \
-		"$(TSGO) --noEmit -p tsconfig.main.json"
+		"$(TSGO) --noEmit -p tsconfig.main.json" \
+		"$(TSGO) --noEmit -p tsconfig.tooling.json"
 else
-typecheck: node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+typecheck: node_modules/.installed vscode/node_modules/.installed src/version.ts $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
 	@bun x concurrently -g \
 		"$(TSGO) --noEmit" \
-		"$(TSGO) --noEmit -p tsconfig.main.json"
+		"$(TSGO) --noEmit -p tsconfig.main.json" \
+		"$(TSGO) --noEmit -p tsconfig.tooling.json"
 endif
+
+# tsconfig.tooling.json type-checks vscode/src (which needs the extension's own devDependencies,
+# e.g. @types/vscode) and scripts/**/*.test.ts alongside the app sources.
+vscode/node_modules/.installed: vscode/package.json vscode/bun.lock
+	@$(MAKE) -C vscode node_modules/.installed
 
 PERF_REPETITIONS ?= 3
 .PHONY: perf-workspace-scale

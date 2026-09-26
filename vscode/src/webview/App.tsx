@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -179,7 +179,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     scheduledRenderRef.current = { kind: "timeout", id };
   };
 
-  const { contentRef, innerRef, handleScroll, markUserInteraction, jumpToBottom } = useAutoScroll();
+  // useAutoScroll releases the bottom lock only for scrolls preceded by user intent (wheel,
+  // pointer, keyboard, touch), so those handlers must be on the scroll container. The
+  // sentinel/overflow-anchor bottom-stick is not ported to the webview yet (#4626).
+  const {
+    contentRef,
+    handleScroll,
+    jumpToBottom,
+    markUserScrollIntent,
+    handleScrollContainerWheel,
+    handleScrollContainerMouseDown,
+    handleScrollContainerMouseMove,
+    handleScrollContainerMouseUp,
+    handleScrollContainerKeyDown,
+  } = useAutoScroll();
 
   const jumpToBottomRef = useRef(jumpToBottom);
   jumpToBottomRef.current = jumpToBottom;
@@ -391,7 +404,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
         default: {
           const _exhaustive: never = msg;
-          bridge.debugLog("unhandled extension message", raw);
+          bridge.debugLog("unhandled extension message", { raw, message: _exhaustive });
           return;
         }
       }
@@ -524,11 +537,14 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     ref={contentRef}
                     className="flex-1 overflow-y-auto p-3"
                     onScroll={handleScroll}
-                    onWheel={markUserInteraction}
-                    onMouseDown={markUserInteraction}
-                    onTouchStart={markUserInteraction}
+                    onWheel={handleScrollContainerWheel}
+                    onMouseDown={handleScrollContainerMouseDown}
+                    onMouseMove={handleScrollContainerMouseMove}
+                    onMouseUp={handleScrollContainerMouseUp}
+                    onKeyDown={handleScrollContainerKeyDown}
+                    onTouchMove={markUserScrollIntent}
                   >
-                    <div ref={innerRef}>
+                    <div>
                       {selectedWorkspaceId ? (
                         <>
                           {displayedMessages.map((msg) => (

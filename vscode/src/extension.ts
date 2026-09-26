@@ -65,11 +65,7 @@ function formatLogData(data: unknown): string {
   }
 }
 
-function xumLog(
-  level: "debug" | "info" | "warn" | "error",
-  message: string,
-  data?: unknown
-): void {
+function xumLog(level: "debug" | "info" | "warn" | "error", message: string, data?: unknown): void {
   const channel = getXumLogChannel();
   const suffix = data === undefined ? "" : ` ${formatLogData(data)}`;
 
@@ -467,7 +463,6 @@ function createWorkspaceQuickPickItem(
 
   const aiByAgent =
     workspace.aiSettingsByAgent ??
-    workspace.aiSettingsByMode ??
     (workspace.aiSettings
       ? {
           plan: workspace.aiSettings,
@@ -527,9 +522,7 @@ async function openWorkspaceCommand(
 
     // User can't easily open Xum from VS Code, so just inform them
     if (selection === "Open Xum") {
-      vscode.window.showInformationMessage(
-        "Please open the Xum application to create workspaces."
-      );
+      vscode.window.showInformationMessage("Please open the Xum application to create workspaces.");
     }
     return;
   }
