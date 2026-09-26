@@ -2854,9 +2854,9 @@ export class TaskService implements AgentTaskIntegration {
       // An unreadable config, or a parent cycle in it.
       return { kind: "unreadable", error: getErrorMessage(error) };
     }
-    // Inconsistent ancestry (e.g. duplicate workspace ids with different parents: the row lookup
-    // and the task index can pick different rows) is malformed config, not a programming error:
-    // fail closed like an unreadable read instead of throwing out of a settlement path.
+    // Inconsistent ancestry is malformed config, not a programming error: fail closed like an
+    // unreadable read instead of throwing out of a settlement path. (Duplicate workspace ids no
+    // longer cause it: the row lookup and the task index both take the first row, #4550.)
     if (owners[0] !== parentWorkspaceId) {
       return {
         kind: "unreadable",
