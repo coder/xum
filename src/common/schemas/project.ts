@@ -162,6 +162,10 @@ export const WorkspaceConfigSchema = z.object({
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
   }),
+  taskCheckoutUnsanitized: z.boolean().optional().meta({
+    description:
+      "The task's launch could not sanitize its checkout's plugin overrides and the checkout was retained. MCP and sends refuse the task until it is removed; persisted so a restart keeps refusing (#4674).",
+  }),
   taskTimeoutFinalizationTokens: z.array(z.string().min(1)).optional().meta({
     description:
       "Idempotency tokens for workflow timeout finalization prompts already sent to this task.",

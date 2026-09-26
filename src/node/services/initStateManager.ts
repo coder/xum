@@ -93,12 +93,13 @@ export class InitStateManager extends EventEmitter {
 
   /**
    * Task checkouts whose launch sanitize failed (#4674). Terminal for the task id: removal may
-   * leave the checkout behind, so clearInMemoryState keeps it. MCP discovery and turns check it after waitForInit,
-   * which itself never throws (tools and inspection proceed).
+   * leave the checkout behind, so clearInMemoryState keeps it; a retained row's persisted marker
+   * covers restarts. MCP discovery and turns check it after waitForInit, which itself never
+   * throws (tools and inspection proceed).
    */
   private readonly unsanitizedCheckouts = new Set<string>();
 
-  constructor(config: Config) {
+  constructor(private readonly config: Config) {
     super();
     this.store = new EventStore(
       config,
@@ -469,9 +470,19 @@ export class InitStateManager extends EventEmitter {
   }
 
   getUnsanitizedCheckoutError(workspaceId: string): UnsanitizedTaskCheckoutError | undefined {
-    return this.unsanitizedCheckouts.has(workspaceId)
+    return this.unsanitizedCheckouts.has(workspaceId) || this.hasPersistedMarker(workspaceId)
       ? new UnsanitizedTaskCheckoutError(workspaceId)
       : undefined;
+  }
+
+  /** The row's persisted marker (written with the launch failure) survives a restart. */
+  private hasPersistedMarker(workspaceId: string): boolean {
+    // Stat-keyed snapshot: cheap on the send and discovery paths.
+    for (const project of this.config.loadConfigOrDefault().projects.values()) {
+      const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (row) return row.taskCheckoutUnsanitized === true;
+    }
+    return false;
   }
 
   /**

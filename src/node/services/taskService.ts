@@ -6804,6 +6804,10 @@ export class TaskService implements AgentTaskIntegration {
         parentWorkspaceId = ws.parentWorkspaceId;
         ws.taskStatus = "interrupted";
         ws.taskLaunchError = message;
+        // Survives a restart: the in-memory record alone is lost with the process (#4674).
+        if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
+          ws.taskCheckoutUnsanitized = true;
+        }
         this.closeAttemptAdmission(taskId, ws.taskAttemptId, ownedAttempt, "launch-failed");
       },
       { allowMissing: true }
@@ -7772,6 +7776,10 @@ export class TaskService implements AgentTaskIntegration {
             parentWorkspaceId = ws.parentWorkspaceId;
             ws.taskStatus = "interrupted";
             ws.taskLaunchError = message;
+            // Survives a restart, like markTaskLaunchFailed (#4674).
+            if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
+              ws.taskCheckoutUnsanitized = true;
+            }
           },
           { allowMissing: true }
         );

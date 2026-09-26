@@ -24,6 +24,7 @@ import {
   sendMessage,
 } from "../../../tests/ipc/helpers";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { InitStateManager } from "@/node/services/initStateManager";
 import { UNSANITIZED_TASK_CHECKOUT_CODE } from "@/node/services/unsanitizedTaskCheckout";
 
 // Runs under `bun test` with the real ServiceContainer (TaskService, WorkspaceService,
@@ -404,6 +405,20 @@ function expectTypedPromptRefusal(outcome: object) {
   });
 }
 
+/**
+ * The retained row carries the persisted marker, so a restarted backend (a fresh InitStateManager
+ * over the same config, without this process's in-memory record) still refuses it (#4674).
+ */
+function expectRefusedAfterRestart(env: TestEnvironment, taskId: string, parentId: string) {
+  const row = [...env.config.loadConfigOrDefault().projects.values()]
+    .flatMap((project) => project.workspaces)
+    .find((w) => w.id === taskId);
+  expect(row?.taskCheckoutUnsanitized).toBe(true);
+  const restarted = new InitStateManager(env.config);
+  expect(restarted.getUnsanitizedCheckoutError(taskId)?.code).toBe(UNSANITIZED_TASK_CHECKOUT_CODE);
+  expect(restarted.getUnsanitizedCheckoutError(parentId)).toBeUndefined();
+}
+
 const listPrompts = (env: TestEnvironment, workspaceId: string) =>
   resolveOrpcClient(env)
     .workspace.mcp.prompts.list({ workspaceId })
@@ -480,6 +495,7 @@ describe("unsanitized task checkout whose reclaim failed", () => {
           ?.workspaces.some((w) => w.id === replacementId)
       ).toBe(true);
       expect(await fs.stat(checkout).catch(() => null)).not.toBeNull();
+      expectRefusedAfterRestart(env, replacementId, parentId);
       // Inspection and removal stay available.
       expect(
         (await resolveOrpcClient(env).workspace.getInfo({ workspaceId: replacementId }))?.id
@@ -589,6 +605,7 @@ describe("unsanitized task checkout whose reclaim failed", () => {
         .projects.get(repoPath)
         ?.workspaces.find((w) => w.parentWorkspaceId === parentId && w.id !== "retiredmcp");
       assert(taskRow?.id, "the direct create retains its interrupted row");
+      expectRefusedAfterRestart(env, taskRow.id, parentId);
 
       const sent = await sendMessage(env, taskRow.id, "continue", { model: HAIKU_MODEL });
       expect(sent).toMatchObject({
