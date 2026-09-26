@@ -88,7 +88,7 @@ export function installDom(): () => void {
   globalThis.navigator = domWindow.navigator;
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
-  globalThis.CustomEvent = domWindow.CustomEvent as typeof globalThis.CustomEvent;
+  globalThis.CustomEvent = domWindow.CustomEvent;
   (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   (globalThis as unknown as { DocumentFragment: unknown }).DocumentFragment =
     domWindow.DocumentFragment;

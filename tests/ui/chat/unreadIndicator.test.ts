@@ -53,14 +53,14 @@ function getWorkspaceUnreadIndicator(
 ): { element: HTMLElement; hasUnreadBar: boolean } | null {
   const workspaceEl = container.querySelector(
     `[data-workspace-id="${workspaceId}"]`
-  ) as HTMLElement | null;
+  );
 
   if (!workspaceEl) return null;
 
   // The unread indicator is a StatusDot span with the idle/unread styling
   const statusDot = workspaceEl.querySelector(
     'span[class*="bg-surface-invert-secondary"]'
-  ) as HTMLElement | null;
+  );
 
   return {
     element: workspaceEl,
@@ -248,7 +248,7 @@ describe("Unread indicator (mock AI router)", () => {
       // Navigate to settings — this replaces AIView with SettingsPage.
       const settingsButton = app.view.container.querySelector(
         '[data-testid="settings-button"]'
-      ) as HTMLButtonElement;
+      )!;
       expect(settingsButton).not.toBeNull();
       fireEvent.click(settingsButton);
 
@@ -287,7 +287,7 @@ describe("Unread indicator (mock AI router)", () => {
       // Navigate to settings — this replaces AIView with SettingsPage.
       const settingsButton = app.view.container.querySelector(
         '[data-testid="settings-button"]'
-      ) as HTMLButtonElement;
+      )!;
       expect(settingsButton).not.toBeNull();
       fireEvent.click(settingsButton);
 
@@ -389,7 +389,7 @@ describe("Unread indicator (mock AI router)", () => {
     let createdWorkspaceIds: string[];
 
     function queryMenuItem(label: string): HTMLButtonElement | null {
-      const menuButtons = Array.from(document.querySelectorAll("button")) as HTMLButtonElement[];
+      const menuButtons = Array.from(document.querySelectorAll("button"));
       return menuButtons.find((button) => button.textContent?.includes(label)) ?? null;
     }
 
@@ -398,7 +398,7 @@ describe("Unread indicator (mock AI router)", () => {
         () => {
           const button = app.view.container.querySelector(
             `button[aria-label="Workspace actions for ${displayTitle}"]`
-          ) as HTMLButtonElement | null;
+          );
           if (!button) {
             throw new Error(`Workspace actions button not found for ${displayTitle}`);
           }
@@ -442,7 +442,7 @@ describe("Unread indicator (mock AI router)", () => {
         () => {
           const workspaceRow = app.view.container.querySelector(
             `[data-workspace-id="${createdWorkspace.id}"]`
-          ) as HTMLElement | null;
+          );
           if (!workspaceRow) {
             throw new Error("Created workspace row not visible yet");
           }
@@ -472,12 +472,12 @@ describe("Unread indicator (mock AI router)", () => {
     ): HTMLSpanElement | null {
       const workspaceRow = app.view.container.querySelector(
         `[data-workspace-id="${workspaceId}"]`
-      ) as HTMLElement | null;
+      );
       if (!workspaceRow) {
         return null;
       }
 
-      const textSpans = Array.from(workspaceRow.querySelectorAll("span")) as HTMLSpanElement[];
+      const textSpans = Array.from(workspaceRow.querySelectorAll("span"));
       return textSpans.find((span) => span.textContent?.trim() === displayTitle) ?? null;
     }
 
@@ -608,7 +608,7 @@ describe("Unread indicator (mock AI router)", () => {
       await waitFor(() => {
         const selectedRow = app.view.container.querySelector(
           `[data-workspace-id="${app.workspaceId}"]`
-        ) as HTMLElement | null;
+        );
         if (!selectedRow) {
           throw new Error("Selected workspace row not found");
         }

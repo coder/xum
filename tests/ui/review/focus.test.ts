@@ -39,7 +39,7 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
         await view.selectTab("costs");
         const costsTab = view.container.querySelector(
           '[role="tab"][aria-controls*="costs"]'
-        ) as HTMLElement | null;
+        );
         expect(costsTab).not.toBeNull();
         costsTab?.focus();
 
@@ -52,7 +52,7 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
           () => {
             const reviewPanel = view.container.querySelector(
               '[data-testid="review-panel"]'
-            ) as HTMLElement | null;
+            );
             if (!reviewPanel) {
               throw new Error("Review panel not mounted");
             }

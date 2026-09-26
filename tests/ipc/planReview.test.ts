@@ -68,7 +68,7 @@ const STREAM_TIMEOUT_MS = 30_000;
 const PLAN_A = "# Plan A\n\n## Step 1\n\nRead the config loader.\n\n## Step 2\n\nAdd the flag.\n";
 const PLAN_B = `${PLAN_A}\n## Step 3\n\nWrite tests.\n`;
 
-type ChatMessage = { role?: unknown; content?: unknown };
+interface ChatMessage { role?: unknown; content?: unknown }
 type RequestBody = { messages?: ChatMessage[] } & Record<string, unknown>;
 
 interface CapturedRequest {
@@ -356,7 +356,7 @@ describeIntegration("workspace.planReview", () => {
     await fs.rm(planPath, { force: true });
     execFileSync("mkfifo", [planPath]);
     // Owned read attempts against the FIFO; the finally block drains until they have settled.
-    const attempts: Array<Promise<unknown>> = [];
+    const attempts: Promise<unknown>[] = [];
     try {
       // Writer-less FIFO: a plain open() would block a libuv worker; the regular-file read must not.
       const started = performance.now();

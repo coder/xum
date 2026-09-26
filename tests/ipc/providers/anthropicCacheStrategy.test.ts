@@ -12,7 +12,7 @@ const describeIntegration = shouldRunSuite ? describe : describe.skip;
 const TEST_TIMEOUT_MS = 120000;
 
 if (shouldRunIntegrationTests() && !shouldRunSuite) {
-  // eslint-disable-next-line no-console
+   
   console.warn("Skipping Anthropic cache strategy integration tests: missing ANTHROPIC_API_KEY");
 }
 

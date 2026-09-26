@@ -176,7 +176,7 @@ describe("New chat streaming flash regression", () => {
       beforeRender: (env) => {
         const originalSendMessage = env.orpc.workspace.sendMessage.bind(
           env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
+        );
         restoreSendMessage = overrideWorkspaceSendMessage(env, (async (input) => {
           await sendGate;
           return originalSendMessage(input);
@@ -264,12 +264,12 @@ describe("New chat streaming flash regression", () => {
     const typed = "Show my first message before the workspace exists";
     const createGate = gate();
     const sendGate = gate();
-    const restores: Array<() => void> = [];
+    const restores: (() => void)[] = [];
     const app = await createCreationHarness({
       beforeRender: (env) => {
         const originalCreate = env.orpc.workspace.create.bind(
           env.orpc.workspace
-        ) as WorkspaceCreateFn;
+        );
         restores.push(
           overrideWorkspaceCreate(env, (async (input) => {
             await createGate.wait;
@@ -278,7 +278,7 @@ describe("New chat streaming flash regression", () => {
         );
         const originalSendMessage = env.orpc.workspace.sendMessage.bind(
           env.orpc.workspace
-        ) as WorkspaceSendMessageFn;
+        );
         restores.push(
           overrideWorkspaceSendMessage(env, (async (input) => {
             await sendGate.wait;

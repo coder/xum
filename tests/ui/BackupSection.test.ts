@@ -763,7 +763,7 @@ describe("BackupSection", () => {
     const restore = jest.spyOn(client.backup, "restore");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
     const targetInputs = canvas.getAllByLabelText("Local project directory");
-    fireEvent.change(targetInputs[0]!, { target: { value: "/home/other/rocket" } });
+    fireEvent.change(targetInputs[0], { target: { value: "/home/other/rocket" } });
     await confirmRestore(canvas);
 
     await waitFor(() =>
@@ -823,7 +823,7 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);
@@ -908,7 +908,7 @@ describe("BackupSection", () => {
     fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
     await canvas.findByText("Projects to reimport");
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);
@@ -919,7 +919,7 @@ describe("BackupSection", () => {
     ).toBeTruthy();
 
     fireEvent.click(canvas.getByRole("checkbox", { name: "Import project rocket" }));
-    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0]!, {
+    fireEvent.change(canvas.getAllByLabelText("Local project directory")[0], {
       target: { value: "/home/other/rocket" },
     });
     await confirmRestore(canvas);

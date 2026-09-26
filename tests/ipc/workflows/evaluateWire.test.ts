@@ -269,7 +269,7 @@ describeIntegration("workflow evaluate() wire", () => {
     fixture.setMode("valid");
   });
 
-  async function readSidecar(): Promise<Array<Record<string, unknown>>> {
+  async function readSidecar(): Promise<Record<string, unknown>[]> {
     const sidecar = path.join(env.config.sessionsDir, workspaceId, HEADLESS_USAGE_FILE_NAME);
     const text = await fs.readFile(sidecar, "utf-8").catch(() => "");
     return text
@@ -323,7 +323,7 @@ describeIntegration("workflow evaluate() wire", () => {
         });
 
         expect(fixture.requests).toHaveLength(1);
-        const request = fixture.requests[0]!;
+        const request = fixture.requests[0];
         expect(request.path).toBe(EXPECTED_PATH[provider]);
         expect(request.hasAuth).toBe(true);
         expect(request.body).not.toHaveProperty("tools");
@@ -429,7 +429,7 @@ describeIntegration("workflow evaluate() wire", () => {
     });
     expect(started.status).toBe("completed");
 
-    const body = fixture.requests[0]!.body;
+    const body = fixture.requests[0].body;
     expect(body.model).toBe("jev-latest");
     // Questions travel verbatim (ids and criteria), except the boolean rename.
     expect(body.questions).toMatchObject({

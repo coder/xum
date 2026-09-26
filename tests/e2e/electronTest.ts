@@ -359,13 +359,13 @@ export const electronTest = base.extend<ElectronFixtures>({
                 const destination = path.join(videosDir, `${baseName}${suffix}${ext}`);
                 await fsPromises.rm(destination, { force: true });
                 await fsPromises.rename(path.join(recordVideoDir, file), destination);
-                console.log(`[video] saved to ${destination}`); // eslint-disable-line no-console
+                console.log(`[video] saved to ${destination}`);  
               }
             } else if (electronApp) {
-              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`); // eslint-disable-line no-console
+              console.warn(`[video] no video captured for "${displayName}" at ${recordVideoDir}`);  
             }
           } catch (error) {
-            console.error(`[video] failed to process video for "${displayName}":`, error); // eslint-disable-line no-console
+            console.error(`[video] failed to process video for "${displayName}":`, error);  
           } finally {
             await fsPromises.rm(recordVideoDir, { recursive: true, force: true });
           }
@@ -397,7 +397,7 @@ export const electronTest = base.extend<ElectronFixtures>({
     await window.waitForLoadState("domcontentloaded");
 
     window.on("console", (msg) => {
-      // eslint-disable-next-line no-console
+       
       console.log(`[renderer:${msg.type()}]`, msg.text());
     });
     window.on("pageerror", (error) => {

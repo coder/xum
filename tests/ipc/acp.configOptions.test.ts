@@ -60,16 +60,16 @@ function createHarness(
   client: ORPCClient;
   getWorkspaceState: () => WorkspaceState;
   onAgentModeChanged: jest.Mock<void, [string, WorkspaceAiSettings]>;
-  updateModeCalls: Array<{
+  updateModeCalls: {
     workspaceId: string;
     mode: "exec" | "plan";
     aiSettings: WorkspaceAiSettings;
-  }>;
-  updateAgentCalls: Array<{
+  }[];
+  updateAgentCalls: {
     workspaceId: string;
     agentId: string;
     aiSettings: WorkspaceAiSettings;
-  }>;
+  }[];
 } {
   const workspaceState: WorkspaceState = {
     agentId: initial.agentId,
@@ -77,16 +77,16 @@ function createHarness(
     aiSettingsByAgent: { ...initial.aiSettingsByAgent },
   };
 
-  const updateModeCalls: Array<{
+  const updateModeCalls: {
     workspaceId: string;
     mode: "exec" | "plan";
     aiSettings: WorkspaceAiSettings;
-  }> = [];
-  const updateAgentCalls: Array<{
+  }[] = [];
+  const updateAgentCalls: {
     workspaceId: string;
     agentId: string;
     aiSettings: WorkspaceAiSettings;
-  }> = [];
+  }[] = [];
 
   const availableAgents = options?.agents ?? DEFAULT_AGENT_DESCRIPTORS;
 
@@ -143,7 +143,7 @@ function getSelectConfigOption(
   id: string
 ): Extract<SessionConfigOption, { type: "select" }> {
   const option = options.find((candidate) => candidate.id === id);
-  if (option == null || option.type !== "select") {
+  if (option?.type !== "select") {
     throw new Error(`Expected select config option '${id}'`);
   }
   return option;

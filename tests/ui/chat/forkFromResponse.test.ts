@@ -17,7 +17,7 @@ async function collectFullHistory(
   );
 }
 
-function getMessageText(messages: Array<{ parts: MuxMessage["parts"] }>): string {
+function getMessageText(messages: { parts: MuxMessage["parts"] }[]): string {
   return messages
     .flatMap((message) =>
       message.parts

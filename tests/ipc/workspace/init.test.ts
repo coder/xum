@@ -343,7 +343,7 @@ describeIntegration("Workspace init hook", () => {
         // The checkout must be complete before the hook runs against it.
         const lines = initEvents.filter(isInitOutput).map((e) => e.line);
         const materializedAt = lines.indexOf("Worktree created successfully");
-        const hookAt = lines.findIndex((line) => /Running init hook:/.test(line));
+        const hookAt = lines.findIndex((line) => line.includes('Running init hook:'));
         expect(materializedAt).toBeGreaterThanOrEqual(0);
         expect(hookAt).toBeGreaterThan(materializedAt);
         expect(lines).toContain("hook ran");
@@ -429,7 +429,7 @@ describeIntegration("Workspace init hook", () => {
         expect(
           errorLines.filter((line) => line.includes("smudge filter fail failed"))
         ).toHaveLength(1);
-        expect(initEvents.filter(isInitOutput).some((e) => /Running init hook/.test(e.line))).toBe(
+        expect(initEvents.filter(isInitOutput).some((e) => e.line.includes('Running init hook'))).toBe(
           false
         );
         // Like a remote sync failure, the workspace stays so the user can inspect and remove it.

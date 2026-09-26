@@ -131,7 +131,7 @@ export function addDemoWorkspace(
 
   const workspaceId = new Config(rootDir).generateLegacyId(demoProject.projectPath, workspacePath);
   const configPayload = JSON.parse(fs.readFileSync(demoProject.configPath, "utf-8")) as {
-    projects: Array<[string, { workspaces: Array<{ path: string }> }]>;
+    projects: [string, { workspaces: { path: string }[] }][];
   };
   const projectEntry = configPayload.projects.find(
     ([projectPath]) => projectPath === demoProject.projectPath

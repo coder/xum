@@ -15,9 +15,9 @@ function createRouter(overrides?: {
   extMethod?: (toolName: string, params: Record<string, unknown>) => Promise<unknown>;
 }): {
   router: ToolRouter;
-  writeCalls: Array<{ sessionId: string; path: string; content: string }>;
+  writeCalls: { sessionId: string; path: string; content: string }[];
 } {
-  const writeCalls: Array<{ sessionId: string; path: string; content: string }> = [];
+  const writeCalls: { sessionId: string; path: string; content: string }[] = [];
 
   const connection = {
     readTextFile:

@@ -39,11 +39,11 @@ export class StreamCollector {
   private stopped = false;
   private subscriptionReady = false;
   private subscriptionReadyResolve: (() => void) | null = null;
-  private waiters: Array<{
+  private waiters: {
     eventType: string;
     resolve: (event: WorkspaceChatMessage | null) => void;
     timer: ReturnType<typeof setTimeout>;
-  }> = [];
+  }[] = [];
 
   constructor(
     private client: OrpcTestClient,
@@ -74,7 +74,7 @@ export class StreamCollector {
    * after the event subscription is set up and history replay is complete.
    * Call this after start() and before sending messages to avoid race conditions.
    */
-  async waitForSubscription(timeoutMs: number = 5000): Promise<void> {
+  async waitForSubscription(timeoutMs = 5000): Promise<void> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
     }
@@ -224,7 +224,7 @@ export class StreamCollector {
    */
   async waitForEvent(
     eventType: string,
-    timeoutMs: number = 30000
+    timeoutMs = 30000
   ): Promise<WorkspaceChatMessage | null> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
@@ -262,7 +262,7 @@ export class StreamCollector {
   async waitForEventN(
     eventType: string,
     n: number,
-    timeoutMs: number = 30000
+    timeoutMs = 30000
   ): Promise<WorkspaceChatMessage | null> {
     if (!this.started) {
       throw new Error("StreamCollector not started. Call start() first.");
@@ -400,7 +400,7 @@ export class StreamCollector {
     // Log all events with details
     this.events.forEach((event, idx) => {
       const timestamp =
-        "timestamp" in event ? new Date(event.timestamp as number).toISOString() : "no-ts";
+        "timestamp" in event ? new Date(event.timestamp).toISOString() : "no-ts";
       const type = "type" in event ? (event as { type: string }).type : "no-type";
 
       console.error(`  [${idx}] ${timestamp} - ${type}`);
@@ -499,7 +499,7 @@ export async function resumeAndWaitForSuccess(
   model: string,
   timeoutMs = 15000,
   options?: {
-    toolPolicy?: Array<{ regex_match: string; action: "enable" | "disable" | "require" }>;
+    toolPolicy?: { regex_match: string; action: "enable" | "disable" | "require" }[];
   }
 ): Promise<void> {
   const collector = createStreamCollector(client, workspaceId);
@@ -614,7 +614,7 @@ export async function withStreamCollection<T>(
 export async function waitForStreamSuccess(
   client: OrpcTestClient,
   workspaceId: string,
-  timeoutMs: number = 30000
+  timeoutMs = 30000
 ): Promise<StreamCollector> {
   const collector = createStreamCollector(client, workspaceId);
   collector.start();

@@ -85,7 +85,7 @@ async function executeWorkspaceBashOrThrow(params: {
 }
 
 function getHunk(container: HTMLElement): HTMLElement | null {
-  return container.querySelector("[data-hunk-id]") as HTMLElement | null;
+  return container.querySelector("[data-hunk-id]");
 }
 
 async function refreshReviewAndWaitForHunk(view: RenderedApp): Promise<void> {
@@ -109,7 +109,7 @@ async function refreshReviewAndWaitForHunk(view: RenderedApp): Promise<void> {
 async function waitForButtonToDisappear(
   container: HTMLElement,
   ariaLabel: string,
-  timeoutMs: number = 10_000
+  timeoutMs = 10_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -122,7 +122,7 @@ async function waitForButtonToDisappear(
 
 async function waitForNotLoading(
   container: HTMLElement,
-  timeoutMs: number = 15_000
+  timeoutMs = 15_000
 ): Promise<void> {
   await waitFor(
     () => {
@@ -155,7 +155,7 @@ async function withReviewPanel(
 async function waitForButton(
   container: HTMLElement,
   ariaLabel: string,
-  timeoutMs: number = 10_000
+  timeoutMs = 10_000
 ): Promise<HTMLElement> {
   return waitFor(
     () => {

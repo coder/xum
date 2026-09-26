@@ -162,11 +162,11 @@ describeIntegration("File Change Notification Integration", () => {
       if (redactedFile) {
         const redactedPath = join(debugObjDir, redactedFile);
         const content = await readFile(redactedPath, "utf-8");
-        const messages = JSON.parse(content) as Array<{
+        const messages = JSON.parse(content) as {
           role: string;
-          parts?: Array<{ type: string; text?: string }>;
+          parts?: { type: string; text?: string }[];
           metadata?: { synthetic?: boolean };
-        }>;
+        }[];
 
         // Find the synthetic file change message
         const fileChangeMessage = messages.find(
@@ -266,11 +266,11 @@ describeIntegration("File Change Notification Integration", () => {
       if (redactedFile) {
         const redactedPath = join(debugObjDir, redactedFile);
         const content = await readFile(redactedPath, "utf-8");
-        const messages = JSON.parse(content) as Array<{
+        const messages = JSON.parse(content) as {
           role: string;
-          parts?: Array<{ type: string; text?: string }>;
+          parts?: { type: string; text?: string }[];
           metadata?: { synthetic?: boolean };
-        }>;
+        }[];
 
         // Should NOT find a file change message
         const fileChangeMessage = messages.find(

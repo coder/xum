@@ -309,7 +309,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       const timeoutMs = options?.timeoutMs ?? 30_000;
       const workspaceId = context.workspaceId;
       await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -319,11 +319,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
 
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
@@ -445,8 +445,8 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         await action();
         await page.waitForFunction(
           (id: string) => {
-            type StreamCaptureEvent = { type: string };
-            type StreamCapture = { events: StreamCaptureEvent[] };
+            interface StreamCaptureEvent { type: string }
+            interface StreamCapture { events: StreamCaptureEvent[] }
             const win = window as unknown as {
               __muxStreamCapture?: Record<string, StreamCapture>;
             };
@@ -467,7 +467,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       }
 
       const events = await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -477,11 +477,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
         };

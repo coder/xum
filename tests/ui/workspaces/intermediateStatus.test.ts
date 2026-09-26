@@ -17,7 +17,7 @@ import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 function getWorkspaceElement(container: HTMLElement, workspaceId: string): HTMLElement {
   const el = container.querySelector(
     `[role="button"][data-workspace-id="${workspaceId}"]`
-  ) as HTMLElement | null;
+  );
   if (!el) {
     throw new Error(`Workspace element not found for ${workspaceId}`);
   }

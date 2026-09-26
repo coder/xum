@@ -184,7 +184,7 @@ describeIntegration("Calling-chat Exec inheritance", () => {
   }, 120_000);
 
   test("reawakened children follow the current Delegated default unless pinned", async () => {
-    const requestLog: Array<{ workspaceId: string; model: string }> = [];
+    const requestLog: { workspaceId: string; model: string }[] = [];
     const handled = new Set<string>();
     const app = await createAppHarness({
       branchPrefix: "exec-reawaken",

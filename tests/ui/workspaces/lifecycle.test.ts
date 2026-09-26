@@ -36,7 +36,7 @@ async function findQuickArchiveButton(params: {
     () => {
       const button = params.container.querySelector(
         `button[aria-label="Archive workspace ${params.title}"]`
-      ) as HTMLButtonElement | null;
+      );
       if (!button) {
         throw new Error(`Quick archive button not found for ${params.title}`);
       }
@@ -73,7 +73,7 @@ describeIntegration("Workspace Creation (UI)", () => {
         // Click the workspace again to simulate navigation
         const wsElement = view.container.querySelector(
           `[data-workspace-id="${workspaceId}"]`
-        ) as HTMLElement;
+        )!;
         fireEvent.click(wsElement);
 
         // Give React time to process the navigation
@@ -252,7 +252,7 @@ describeIntegration("Workspace Archive (UI)", () => {
           () => {
             const btn = view.container.querySelector(
               `[aria-label="Workspace actions for ${displayTitle}"]`
-            ) as HTMLElement;
+            )!;
             if (!btn) throw new Error("Workspace actions menu button not found");
             return btn;
           },
@@ -377,7 +377,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
         () => {
           const btn = view.container.querySelector(
             `[aria-label="Workspace actions for ${secondDisplayTitle}"]`
-          ) as HTMLElement;
+          )!;
           if (!btn) throw new Error("Workspace actions menu button not found for second workspace");
           return btn;
         },
@@ -404,10 +404,10 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
         () => {
           const expand = view.container.querySelector(
             '[aria-label="Expand archived workspaces"]'
-          ) as HTMLElement | null;
+          );
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
-          ) as HTMLElement | null;
+          );
 
           if (!expand && !collapse) {
             throw new Error(
@@ -511,10 +511,10 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
         () => {
           const expand = view.container.querySelector(
             '[aria-label="Expand archived workspaces"]'
-          ) as HTMLElement | null;
+          );
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
-          ) as HTMLElement | null;
+          );
 
           if (!expand && !collapse) {
             throw new Error("Archived workspaces toggle not found");
@@ -546,7 +546,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
         () => {
           const btn = view.container.querySelector(
             `[aria-label="Delete workspace ${displayTitle}"]`
-          ) as HTMLElement;
+          )!;
           if (!btn) throw new Error("Delete button not found in archived list");
           return btn;
         },
@@ -615,10 +615,10 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
         () => {
           const expand = view.container.querySelector(
             '[aria-label="Expand archived workspaces"]'
-          ) as HTMLElement | null;
+          );
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
-          ) as HTMLElement | null;
+          );
 
           if (!expand && !collapse) {
             throw new Error("Archived workspaces toggle not found");
@@ -650,7 +650,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
         () => {
           const btn = view.container.querySelector(
             `[aria-label="Delete workspace ${displayTitle}"]`
-          ) as HTMLElement;
+          )!;
           if (!btn) throw new Error("Delete button not found in archived list");
           return btn;
         },

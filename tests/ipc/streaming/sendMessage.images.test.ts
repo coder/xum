@@ -61,7 +61,7 @@ const BLUE_PIXEL = {
 // vision model to keep this test stable.
 const OPENAI_VISION_MODEL = KNOWN_MODELS.GPT.providerModelId;
 
-const PROVIDER_CONFIGS: Array<[string, string]> = [
+const PROVIDER_CONFIGS: [string, string][] = [
   // NOTE: Use a chat-mode vision-capable model. Some *responses-only* models may advertise
   // supports_vision but still fail to ingest data-URI image parts in our current adapter.
   ["openai", OPENAI_VISION_MODEL],

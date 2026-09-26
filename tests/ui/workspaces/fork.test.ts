@@ -63,7 +63,7 @@ describeIntegration("Workspace Fork (UI)", () => {
         () => {
           const el = app.view.container.querySelector(
             `[data-workspace-id=\"${forkedWorkspaceId}\"]`
-          ) as HTMLElement | null;
+          );
           if (!el) {
             throw new Error("Forked workspace not found in sidebar");
           }
@@ -98,7 +98,7 @@ describeIntegration("Workspace Fork (UI)", () => {
         () => {
           const btn = app.view.container.querySelector(
             `[aria-label="Workspace actions for ${sourceDisplayTitle}"]`
-          ) as HTMLElement | null;
+          );
           if (!btn) throw new Error("Workspace actions menu button not found");
           return btn;
         },
@@ -143,7 +143,7 @@ describeIntegration("Workspace Fork (UI)", () => {
         () => {
           const el = app.view.container.querySelector(
             `[data-workspace-id=\"${forkedWorkspaceId}\"]`
-          ) as HTMLElement | null;
+          );
           if (!el) {
             throw new Error("Forked workspace not found in sidebar");
           }

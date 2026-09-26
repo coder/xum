@@ -76,7 +76,7 @@ function collectTaskAwaitOutputs(events: WorkspaceChatMessage[]): string {
     if (!("toolName" in event) || event.toolName !== "task_await") continue;
 
     const results = (
-      event as { result?: { results?: Array<{ output?: string; reportMarkdown?: string }> } }
+      event as { result?: { results?: { output?: string; reportMarkdown?: string }[] } }
     ).result?.results;
 
     if (!Array.isArray(results)) continue;
@@ -104,7 +104,7 @@ function extractStoppedTaskIds(events: WorkspaceChatMessage[]): string[] {
     const results = (
       event as {
         result?: {
-          results?: Array<{ status?: string; stoppedTaskIds?: string[] }>;
+          results?: { status?: string; stoppedTaskIds?: string[] }[];
         };
       }
     ).result?.results;

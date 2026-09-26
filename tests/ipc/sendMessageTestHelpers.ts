@@ -245,7 +245,7 @@ export async function withSharedWorkspaceNoProvider(
  * Only enables retries in CI environment to avoid masking real bugs locally.
  * Call at module level (before describe blocks).
  */
-export function configureTestRetries(count: number = 2): void {
+export function configureTestRetries(count = 2): void {
   if (process.env.CI && typeof jest !== "undefined" && jest.retryTimes) {
     jest.retryTimes(count, { logErrorsBeforeRetry: true });
   }

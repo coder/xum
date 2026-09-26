@@ -56,7 +56,7 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
     () => {
       const textareas = Array.from(
         container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -82,7 +82,7 @@ async function getComposerDockTextarea(container: HTMLElement): Promise<HTMLText
 
       const textarea = dock.querySelector(
         'textarea[aria-label="Message Claude"]'
-      ) as HTMLTextAreaElement | null;
+      );
       if (!textarea) {
         throw new Error("Composer textarea not found");
       }
@@ -108,7 +108,7 @@ async function waitForSendModeMenuTrigger(container: HTMLElement): Promise<HTMLB
     () => {
       const buttons = Array.from(
         container.querySelectorAll('button[aria-label="Send message"]')
-      ) as HTMLButtonElement[];
+      );
       const trigger = [...buttons]
         .reverse()
         .find((button) => button.getAttribute("aria-haspopup") === "menu" && !button.disabled);

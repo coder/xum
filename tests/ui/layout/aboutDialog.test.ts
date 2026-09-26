@@ -20,13 +20,13 @@ import { detectDefaultTrunkBranch } from "@/node/git";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { UpdateStatus } from "@/common/orpc/types";
 
-type MutableUpdateService = {
+interface MutableUpdateService {
   check: (options?: { source?: "auto" | "manual" }) => Promise<void>;
   download: () => Promise<void>;
   install: (options?: { force?: boolean }) => void;
   currentStatus: UpdateStatus;
   notifySubscribers: () => void;
-};
+}
 
 function getUpdateService(env: TestEnvironment): MutableUpdateService {
   return env.services.updateService as unknown as MutableUpdateService;
@@ -52,7 +52,7 @@ async function openAboutDialog(view: RenderedApp) {
   const trigger = await waitFor(() => {
     const triggerButton = view.container.querySelector(
       'button[aria-label="Open about dialog"]'
-    ) as HTMLButtonElement | null;
+    );
     if (!triggerButton) {
       throw new Error("About dialog trigger was not found in the title bar");
     }
@@ -64,7 +64,7 @@ async function openAboutDialog(view: RenderedApp) {
   const dialog = await waitFor(() => {
     const dialogElement = view.container.ownerDocument.body.querySelector(
       '[role="dialog"]'
-    ) as HTMLElement | null;
+    );
     if (!dialogElement) {
       throw new Error("About dialog did not open");
     }

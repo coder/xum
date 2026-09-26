@@ -37,7 +37,7 @@ type UserMessageChunkUpdate = Extract<
 
 interface AcpTestClient {
   client: ClientSideConnection;
-  sessionUpdates: Array<schema.SessionNotification>;
+  sessionUpdates: schema.SessionNotification[];
   getStderr: () => string;
   runRpc: <T>(label: string, operation: Promise<T>) => Promise<T>;
   close: () => Promise<void>;
@@ -215,7 +215,7 @@ async function createAcpClient(options: CreateAcpClientOptions = {}): Promise<Ac
     );
   }
 
-  const sessionUpdates: Array<schema.SessionNotification> = [];
+  const sessionUpdates: schema.SessionNotification[] = [];
   const stream = ndJsonStream(
     Writable.toWeb(child.stdin) as unknown as WritableStream<Uint8Array>,
     Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>
@@ -314,7 +314,7 @@ function isUserMessageChunk(
   return notification.update.sessionUpdate === "user_message_chunk";
 }
 
-function extractTextChunks(notifications: Array<schema.SessionNotification>): string {
+function extractTextChunks(notifications: schema.SessionNotification[]): string {
   return notifications
     .filter(isAgentMessageChunk)
     .map((notification) => {

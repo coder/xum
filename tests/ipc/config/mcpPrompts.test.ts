@@ -144,7 +144,7 @@ describeIntegration("MCP prompts", () => {
       });
 
       const manager = env.services.mcpServerManager;
-      const seenSecrets: Array<Record<string, string> | undefined> = [];
+      const seenSecrets: (Record<string, string> | undefined)[] = [];
       // getPrompt refreshes through the private ensureWorkspaceServers seam
       // (it skips tool catalog refreshes), so observe secrets there.
       const access = manager as unknown as {

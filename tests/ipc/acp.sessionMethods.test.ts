@@ -40,22 +40,22 @@ interface HarnessOptions {
   activityListUnavailable?: boolean;
   onChatEvents?: WorkspaceChatMessage[];
   /** Stream for the Nth onChat call (falls back to `onChatEvents`); each call is its own replay. */
-  onChatStreamByCall?: Array<() => AsyncIterable<WorkspaceChatMessage>>;
+  onChatStreamByCall?: (() => AsyncIterable<WorkspaceChatMessage>)[];
   onChatStream?: AsyncIterable<WorkspaceChatMessage>;
   requireTrustedProjectForCreate?: boolean;
-  projectEntries?: Array<[string, ProjectConfig]>;
+  projectEntries?: [string, ProjectConfig][];
   agentOptions?: ConstructorParameters<typeof MuxAgent>[2];
 }
 
 interface Harness {
   agent: MuxAgent;
-  onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
-  sendMessageCalls: Array<{ workspaceId: string; message: string }>;
-  truncateHistoryCalls: Array<{ workspaceId: string }>;
-  setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
+  onChatCalls: { workspaceId: string; mode?: OnChatMode }[];
+  sendMessageCalls: { workspaceId: string; message: string }[];
+  truncateHistoryCalls: { workspaceId: string }[];
+  setTrustCalls: { projectPath: string; trusted: boolean }[];
   createCalls: WorkspaceCreateInput[];
   forkCalls: WorkspaceForkInput[];
-  listCalls: Array<{ archived?: boolean } | undefined>;
+  listCalls: ({ archived?: boolean } | undefined)[];
 }
 
 function createInMemoryAcpStream() {
@@ -88,13 +88,13 @@ function createWorkspaceInfo(overrides?: Partial<WorkspaceInfo>): WorkspaceInfo 
 
 interface MockServer {
   server: ServerConnection;
-  onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }>;
-  sendMessageCalls: Array<{ workspaceId: string; message: string }>;
-  truncateHistoryCalls: Array<{ workspaceId: string }>;
-  setTrustCalls: Array<{ projectPath: string; trusted: boolean }>;
+  onChatCalls: { workspaceId: string; mode?: OnChatMode }[];
+  sendMessageCalls: { workspaceId: string; message: string }[];
+  truncateHistoryCalls: { workspaceId: string }[];
+  setTrustCalls: { projectPath: string; trusted: boolean }[];
   createCalls: WorkspaceCreateInput[];
   forkCalls: WorkspaceForkInput[];
-  listCalls: Array<{ archived?: boolean } | undefined>;
+  listCalls: ({ archived?: boolean } | undefined)[];
 }
 
 function createMockServer(options?: HarnessOptions): MockServer {
@@ -109,14 +109,14 @@ function createMockServer(options?: HarnessOptions): MockServer {
     allWorkspacesById.set(workspace.id, workspace);
   }
 
-  const setTrustCalls: Array<{ projectPath: string; trusted: boolean }> = [];
+  const setTrustCalls: { projectPath: string; trusted: boolean }[] = [];
   const createCalls: WorkspaceCreateInput[] = [];
   const forkCalls: WorkspaceForkInput[] = [];
   const projectsByPath = new Map<string, ProjectConfig>(options?.projectEntries ?? []);
-  const onChatCalls: Array<{ workspaceId: string; mode?: OnChatMode }> = [];
-  const sendMessageCalls: Array<{ workspaceId: string; message: string }> = [];
-  const truncateHistoryCalls: Array<{ workspaceId: string }> = [];
-  const listCalls: Array<{ archived?: boolean } | undefined> = [];
+  const onChatCalls: { workspaceId: string; mode?: OnChatMode }[] = [];
+  const sendMessageCalls: { workspaceId: string; message: string }[] = [];
+  const truncateHistoryCalls: { workspaceId: string }[] = [];
+  const listCalls: ({ archived?: boolean } | undefined)[] = [];
 
   const client = {
     config: {

@@ -82,7 +82,7 @@ function messageEnd(): string {
 }
 
 interface CapturedRequest {
-  messages: Array<{ role: string; content: unknown }>;
+  messages: { role: string; content: unknown }[];
 }
 
 /**

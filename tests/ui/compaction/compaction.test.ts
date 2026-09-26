@@ -63,7 +63,7 @@ async function getActiveTextarea(container: HTMLElement): Promise<HTMLTextAreaEl
     () => {
       const textareas = Array.from(
         container.querySelectorAll('textarea[aria-label="Message Claude"]')
-      ) as HTMLTextAreaElement[];
+      );
       if (textareas.length === 0) {
         throw new Error("Chat textarea not found");
       }
@@ -391,7 +391,7 @@ describe("Compaction UI (mock AI router)", () => {
 });
 
 describe("Auto-follow-up and compaction notification behavior (mock AI router)", () => {
-  const notifications: Array<{ title: string; body?: string }> = [];
+  const notifications: { title: string; body?: string }[] = [];
   let originalWindowNotification: unknown;
 
   beforeAll(async () => {

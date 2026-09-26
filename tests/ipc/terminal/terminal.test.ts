@@ -238,7 +238,7 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 500));
 
         // Use attach endpoint - first message should be screenState
-        const messages: Array<{ type: "screenState" | "output"; data: string }> = [];
+        const messages: { type: "screenState" | "output"; data: string }[] = [];
         const attachPromise = (async () => {
           const iterator = await client.terminal.attach({ sessionId: session.sessionId });
           for await (const msg of iterator) {
@@ -327,7 +327,7 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 200));
 
         // Now attach and send more lines - verify order is preserved
-        const messages: Array<{ type: "screenState" | "output"; data: string }> = [];
+        const messages: { type: "screenState" | "output"; data: string }[] = [];
         const attachPromise = (async () => {
           const iterator = await client.terminal.attach({ sessionId: session.sessionId });
           for await (const msg of iterator) {
@@ -437,7 +437,7 @@ describeIntegration("terminal PTY", () => {
         ]);
 
         // Now use attach to reattach - simulating what happens on workspace switch
-        const attachMessages: Array<{ type: "screenState" | "output"; data: string }> = [];
+        const attachMessages: { type: "screenState" | "output"; data: string }[] = [];
         const attachPromise = (async () => {
           const iterator = await client.terminal.attach({ sessionId: session.sessionId });
           for await (const msg of iterator) {

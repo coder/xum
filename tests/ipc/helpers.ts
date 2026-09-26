@@ -119,7 +119,7 @@ type SendMessageOptionsWithAgentFallback = Omit<SendMessageOptions, "agentId"> &
 };
 
 type SendMessageWithModelOptions = Omit<SendMessageOptionsWithAgentFallback, "model"> & {
-  fileParts?: Array<{ url: string; mediaType: string }>;
+  fileParts?: { url: string; mediaType: string }[];
 };
 
 const DEFAULT_MODEL_ID = INTEGRATION_TEST_MODEL;
@@ -155,7 +155,7 @@ export async function sendMessage(
     });
   } catch (error) {
     // Normalize ORPC input validation or transport errors into Result shape expected by tests.
-    let raw: string = "";
+    let raw = "";
 
     if (
       error instanceof ORPCError &&
@@ -254,8 +254,8 @@ export async function createWorkspaceWithInit(
   projectPath: string,
   branchName: string,
   runtimeConfig?: RuntimeConfig,
-  waitForInit: boolean = false,
-  isSSH: boolean = false
+  waitForInit = false,
+  isSSH = false
 ): Promise<{ workspaceId: string; workspacePath: string; cleanup: () => Promise<void> }> {
   const trunkBranch = await detectDefaultTrunkBranch(projectPath);
 
@@ -408,7 +408,7 @@ export async function waitForInitComplete(
       .getEvents()
       .filter(
         (msg) => isInitStart(msg) || isInitOutput(msg) || isInitProgress(msg) || isInitEnd(msg)
-      ) as WorkspaceInitEvent[];
+      );
 
     // Check if init succeeded (exitCode === 0)
     const exitCode = (initEndEvent as { exitCode?: number }).exitCode;
@@ -463,7 +463,7 @@ export async function waitForInitEnd(
       .getEvents()
       .filter(
         (msg) => isInitStart(msg) || isInitOutput(msg) || isInitProgress(msg) || isInitEnd(msg)
-      ) as WorkspaceInitEvent[];
+      );
   } finally {
     collector.stop();
   }
@@ -475,7 +475,7 @@ export async function waitForInitEnd(
 export async function readChatHistory(
   tempDir: string,
   workspaceId: string
-): Promise<Array<{ role: string; parts: Array<{ type: string; [key: string]: unknown }> }>> {
+): Promise<{ role: string; parts: { type: string; [key: string]: unknown }[] }[]> {
   const historyPath = path.join(tempDir, "sessions", workspaceId, "chat.jsonl");
   const historyContent = await fs.readFile(historyPath, "utf-8");
   return historyContent
@@ -563,7 +563,7 @@ export async function addFakeOrigin(repoPath: string): Promise<void> {
 export async function addSubmodule(
   repoPath: string,
   submoduleUrl?: string,
-  submoduleName: string = "vendor/left-pad"
+  submoduleName = "vendor/left-pad"
 ): Promise<void> {
   const resolvedSubmoduleUrl = submoduleUrl ?? (await createLocalSubmoduleRepo());
   await execAsync(
@@ -618,7 +618,7 @@ export async function cleanupTempGitRepo(repoPath: string): Promise<void> {
  * Only enables retries in CI environment to avoid masking real bugs locally.
  * Call at module level (before describe blocks).
  */
-export function configureTestRetries(count: number = 2): void {
+export function configureTestRetries(count = 2): void {
   if (process.env.CI && typeof jest !== "undefined" && jest.retryTimes) {
     jest.retryTimes(count, { logErrorsBeforeRetry: true });
   }

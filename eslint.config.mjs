@@ -1985,6 +1985,37 @@ export default defineConfig([
     },
   },
   {
+    // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
+    // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
+    files: ["tests/**/*.ts"],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Harness doubles implement async interfaces with synchronous or empty bodies
+      // (`async () => {}` stubs for services, windows, and IPC handlers).
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {

@@ -247,7 +247,7 @@ async function openTaskCard(view: RenderedApp): Promise<HTMLElement> {
 
   const taskMessageBlock = taskToolName.closest(
     '[data-testid="chat-message"]'
-  ) as HTMLElement | null;
+  );
   if (!taskMessageBlock) {
     throw new Error("Task chat message block not found");
   }
@@ -265,7 +265,7 @@ async function openTaskCard(view: RenderedApp): Promise<HTMLElement> {
 
 async function renderCompletedBestOfParentWorkspace(params: {
   requestedCount: number;
-  completedReports: Array<{ taskId: string; title: string; reportMarkdown: string }>;
+  completedReports: { taskId: string; title: string; reportMarkdown: string }[];
 }): Promise<{
   env: Awaited<ReturnType<typeof createTestEnvironment>>;
   repoPath: string;

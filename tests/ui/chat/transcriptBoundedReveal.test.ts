@@ -41,7 +41,7 @@ describe("Tail-first transcript reveal (mock AI router)", () => {
 
   test("mounts the tail first, keeps the UI live, and reveals the rest in chunks", async () => {
     const app = await createAppHarness({ branchPrefix: "bounded-reveal" });
-    const heldFrames: Array<() => void> = [];
+    const heldFrames: (() => void)[] = [];
     const originalSchedule = transcriptRevealFrameScheduler.schedule;
     const scrolledTo: string[] = [];
     const originalScrollIntoView = Element.prototype.scrollIntoView;
