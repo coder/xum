@@ -9725,15 +9725,37 @@ export class TaskService implements AgentTaskIntegration {
     // Stops latched from here on stay authoritative through every admission gate of the send,
     // even if the user resumes before the probe runs (same latch as peer delivery).
     const senderChainIds = chainIds(senderId);
+    const targetChainIds = chainIds(targetId);
     const capturedStopEpochs = new Map(
-      senderChainIds.map((id) => [id, this.getWorkspaceStopEpoch(id)])
+      [...senderChainIds, ...targetChainIds].map((id) => [id, this.getWorkspaceStopEpoch(id)])
     );
-    const admissionStale = (): boolean =>
-      senderChainIds.some(
+    const chainStopped = (ids: string[]): boolean =>
+      ids.some(
         (id) =>
           this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id) ||
           this.isWorkspaceStopInProgress(id)
-      ) || senderInactive();
+      );
+    const targetUnavailable = (): boolean => {
+      const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
+      return (
+        fresh == null ||
+        chainStopped(targetChainIds) ||
+        chainInterrupted(targetId) ||
+        this.isInactivePeerEndpointWorkspace(fresh.workspace, targetId) ||
+        this.agentPeerMessageBroker.isConsecutivePeerWakeCapped(targetId)
+      );
+    };
+    const admissionStale = (): boolean => {
+      if (chainStopped(senderChainIds) || senderInactive()) return true;
+      if (targetUnavailable()) {
+        // The target became unreachable (stopped, inactive, or capped again) while this notice
+        // was in flight: keep waiting for its next attention instead of a futile retry turn.
+        // Idempotent, so repeated probe calls re-register the same waiter.
+        this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+        return true;
+      }
+      return false;
+    };
 
     let sendRestrictions: Awaited<
       ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>

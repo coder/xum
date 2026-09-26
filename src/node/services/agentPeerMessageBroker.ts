@@ -170,9 +170,13 @@ export class AgentPeerMessageBroker {
     return this.takePeerWakeWaiters(targetId);
   }
 
+  isConsecutivePeerWakeCapped(targetId: string): boolean {
+    return (this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES;
+  }
+
   /** Returns (and forgets) the target's waiters unless the cap has been filled again. */
   takePeerWakeWaitersIfUncapped(targetId: string): PeerWakeWaiter[] {
-    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) return [];
+    if (this.isConsecutivePeerWakeCapped(targetId)) return [];
     return this.takePeerWakeWaiters(targetId);
   }
 

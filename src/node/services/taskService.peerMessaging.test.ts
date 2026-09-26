@@ -1742,9 +1742,35 @@ describe("TaskService", () => {
           Err({ code: "refused", reason: PEER_WAKE_LIMIT_REFUSAL_REASON })
         );
       };
+      // Holds the next notice for sib-a inside its sender tool-policy lookup (its first await).
+      const holdNoticeInPolicyLookup = () => {
+        const iterate = historyService.iterateFullHistory.bind(historyService);
+        let hold = true;
+        let reached!: () => void;
+        const reachedLookup = new Promise<void>((resolve) => (reached = resolve));
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        const spy = spyOn(historyService, "iterateFullHistory").mockImplementation(
+          async (...args: Parameters<typeof iterate>) => {
+            if (hold && args[0] === "sib-a") {
+              hold = false;
+              reached();
+              await released;
+            }
+            return iterate(...args);
+          }
+        );
+        return {
+          reachedLookup,
+          release: () => {
+            release();
+            spy.mockRestore();
+          },
+        };
+      };
       return {
         taskService,
-        historyService,
+        holdNoticeInPolicyLookup,
         setStatus,
         wakeCalls,
         drainSenderLock,
@@ -1800,34 +1826,39 @@ describe("TaskService", () => {
     test("a sender stopped while its notice is being prepared is not woken", async () => {
       const t = await setup();
       await t.fillAndRefuseSibA("sib-c");
-      // Hold the notice inside its sender tool-policy lookup, then stop the sender there.
-      const iterate = t.historyService.iterateFullHistory.bind(t.historyService);
-      let hold = true;
-      let reached!: () => void;
-      const reachedLookup = new Promise<void>((resolve) => (reached = resolve));
-      let release!: () => void;
-      const released = new Promise<void>((resolve) => (release = resolve));
-      const spy = spyOn(t.historyService, "iterateFullHistory").mockImplementation(
-        async (...args: Parameters<typeof iterate>) => {
-          if (hold && args[0] === "sib-a") {
-            hold = false;
-            reached();
-            await released;
-          }
-          return iterate(...args);
-        }
-      );
+      const held = t.holdNoticeInPolicyLookup();
       t.taskService.resetAutoResumeCount("sib-b");
-      await reachedLookup;
+      await held.reachedLookup;
       t.taskService.markParentWorkspaceInterrupted("sib-a");
-      release();
+      held.release();
       await t.drainSenderLock();
       expect(t.wakeCalls()).toHaveLength(0);
-      spy.mockRestore();
 
       // Positive control: after the user resumes the sender, a new refusal does wake it.
       t.taskService.resetAutoResumeCount("sib-a");
       await t.fillAndRefuseSibA("sib-d");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
+    test("a target capped again while the notice is prepared keeps the sender waiting", async () => {
+      const t = await setup();
+      await t.fillAndRefuseSibA("sib-c");
+      const held = t.holdNoticeInPolicyLookup();
+      t.taskService.resetAutoResumeCount("sib-b");
+      await held.reachedLookup;
+      // Other peers refill the cap before the notice is admitted: a retry would be refused.
+      for (let i = 1; i <= 3; i++) {
+        expect((await t.taskService.sendAgentTreeMessage("sib-d", "sib-b", `d ${i}`)).success).toBe(
+          true
+        );
+      }
+      held.release();
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(0);
+
+      // The waiter was requeued, so the next attention wakes the sender without a new refusal.
       t.taskService.resetAutoResumeCount("sib-b");
       await t.drainSenderLock();
       expect(t.wakeCalls()).toHaveLength(1);
