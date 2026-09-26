@@ -75,6 +75,134 @@ function answeringModel(): MockLanguageModelV3 {
   });
 }
 
+type TestEnvironment = Awaited<ReturnType<typeof createTestEnvironment>>;
+
+/**
+ * Parent workspace with the recording MCP server enabled (project config + trust), a model
+ * that answers in text, the workflow step's retired child, and pass-through spies that ledger
+ * every MCP entry point by workspace. `launchReplacement` claims the retired child and
+ * launches its replacement through createMany's claim, returning the replacement's id.
+ */
+async function setUpReplacement(env: TestEnvironment, repoPath: string, recordFile: string) {
+  await setupProviders(env, { anthropic: { apiKey: "mock-model-key" } });
+  // Project MCP config, consented by project trust (createWorkspace trusts the project):
+  // the server is enabled for every workspace of the project, the replacement included.
+  await fs.mkdir(path.join(repoPath, ".xum"), { recursive: true });
+  await fs.writeFile(
+    path.join(repoPath, ".xum", "mcp.jsonc"),
+    JSON.stringify({
+      servers: {
+        recorder: [process.execPath, RECORDING_SERVER, recordFile].map(shellQuote).join(" "),
+      },
+    })
+  );
+  const parent = await createWorkspace(env, repoPath, generateBranchName("mcp-order"));
+  if (!parent.success) throw new Error(parent.error);
+  const parentId = parent.metadata.id;
+  // The parent's checkout materializes (and is sanitized) after create returns.
+  await env.services.initStateManager.waitForInit(parentId);
+
+  const factory = (
+    env.services.aiService as unknown as { providerModelFactory: ProviderModelFactory }
+  ).providerModelFactory;
+  spyOn(factory, "resolveAndCreateModel").mockImplementation(() =>
+    Promise.resolve(
+      Ok({
+        model: answeringModel(),
+        effectiveModelString: HAIKU_MODEL,
+        canonicalModelString: HAIKU_MODEL,
+        canonicalProviderName: "anthropic",
+        canonicalModelId: HAIKU_MODEL.slice(HAIKU_MODEL.indexOf(":") + 1),
+        wireProviderName: "anthropic",
+        routedThroughGateway: false,
+      } satisfies ResolveAndCreateModelResult)
+    )
+  );
+
+  // The workflow step's previous child: ended without a report (interrupted, no receipt
+  // needed in the owning process), so the runner may claim and replace it.
+  await env.config.editConfig((cfg) => {
+    const project = cfg.projects.get(repoPath);
+    assert(project, "parent project must be registered");
+    project.workspaces.push({
+      id: "retiredmcp",
+      name: "retired-mcp",
+      path: path.join(env.config.srcDir, "retired-mcp"),
+      createdAt: new Date().toISOString(),
+      parentWorkspaceId: parentId,
+      agentType: "explore",
+      agentId: "explore",
+      runtimeConfig: parent.metadata.runtimeConfig,
+      taskStatus: "interrupted",
+      taskAttemptId: ATTEMPT,
+      workflowTask: { runId: RUN.runId, stepId: RUN.stepId },
+    });
+    return cfg;
+  });
+
+  // In-process order ledger. Every MCP entry point is a pass-through spy on the real
+  // manager, so a start that the stub process has not yet recorded is still caught.
+  const ledger: Array<{ step: string; workspaceId: string }> = [];
+  const mcp = env.services.mcpServerManager;
+  for (const method of ["getToolsForWorkspace", "getPromptsForWorkspace"] as const) {
+    const real = mcp[method].bind(mcp) as (...args: unknown[]) => Promise<unknown>;
+    spyOn(mcp, method).mockImplementation(((...args: unknown[]) => {
+      ledger.push({
+        step: method,
+        workspaceId: (args[0] as { workspaceId: string }).workspaceId,
+      });
+      return real(...args);
+    }) as never);
+  }
+
+  const launchReplacement = async (): Promise<string> => {
+    const taskService = env.services.taskService;
+    const claim = await taskService.claimRetiredAttempt("retiredmcp", ATTEMPT, RUN);
+    assert(claim.success, `claim must succeed: ${claim.success ? "" : claim.error}`);
+    const created = await taskService.createMany(
+      [
+        {
+          parentWorkspaceId: parentId,
+          kind: "agent",
+          agentId: "explore",
+          prompt: "Summarize durable workflows",
+          title: "Replacement",
+          workflowTask: { runId: RUN.runId, stepId: RUN.stepId },
+        },
+      ],
+      { retires: [{ taskId: "retiredmcp", attemptId: ATTEMPT, nonce: claim.data.nonce }] }
+    );
+    assert(created.success, `createMany must succeed: ${created.success ? "" : created.error}`);
+    const replacementId = created.data[0]?.taskId;
+    assert(replacementId, "createMany must return the replacement's task id");
+    return replacementId;
+  };
+  return { parentId, ledger, launchReplacement };
+}
+
+/**
+ * Pass-through spies on init state: `parked` resolves once a request for `target.workspaceId`
+ * waits on init, and `completed` lists every workspace whose init was completed (endInit), the
+ * point that releases such waiters.
+ */
+function observeInit(env: TestEnvironment) {
+  const initStateManager = env.services.initStateManager;
+  const realWaitForInit = initStateManager.waitForInit.bind(initStateManager);
+  const realEndInit = initStateManager.endInit.bind(initStateManager);
+  const parked = Promise.withResolvers<void>();
+  const target: { workspaceId?: string } = {};
+  const completed: string[] = [];
+  spyOn(initStateManager, "waitForInit").mockImplementation((workspaceId, signal) => {
+    if (workspaceId === target.workspaceId) parked.resolve();
+    return realWaitForInit(workspaceId, signal);
+  });
+  spyOn(initStateManager, "endInit").mockImplementation((workspaceId, exitCode) => {
+    completed.push(workspaceId);
+    return realEndInit(workspaceId, exitCode);
+  });
+  return { target, parked: parked.promise, completed };
+}
+
 /**
  * Gate 4 of G2 end to end (#4576): a workflow replacement's launch must not start MCP servers or
  * run prompt discovery before its checkout's plugin overrides are sanitized. Two discovery
@@ -88,76 +216,11 @@ describe("workflow replacement launch: MCP after sanitize", () => {
     const repoPath = await createTempGitRepo();
     const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
     try {
-      await setupProviders(env, { anthropic: { apiKey: "mock-model-key" } });
-      // Project MCP config, consented by project trust (createWorkspace trusts the project):
-      // the server is enabled for every workspace of the project, the replacement included.
-      await fs.mkdir(path.join(repoPath, ".xum"), { recursive: true });
-      await fs.writeFile(
-        path.join(repoPath, ".xum", "mcp.jsonc"),
-        JSON.stringify({
-          servers: {
-            recorder: [process.execPath, RECORDING_SERVER, recordFile].map(shellQuote).join(" "),
-          },
-        })
+      const { parentId, ledger, launchReplacement } = await setUpReplacement(
+        env,
+        repoPath,
+        recordFile
       );
-      const parent = await createWorkspace(env, repoPath, generateBranchName("mcp-order"));
-      if (!parent.success) throw new Error(parent.error);
-      const parentId = parent.metadata.id;
-      // The parent's checkout materializes (and is sanitized) after create returns.
-      await env.services.initStateManager.waitForInit(parentId);
-
-      const factory = (
-        env.services.aiService as unknown as { providerModelFactory: ProviderModelFactory }
-      ).providerModelFactory;
-      spyOn(factory, "resolveAndCreateModel").mockImplementation(() =>
-        Promise.resolve(
-          Ok({
-            model: answeringModel(),
-            effectiveModelString: HAIKU_MODEL,
-            canonicalModelString: HAIKU_MODEL,
-            canonicalProviderName: "anthropic",
-            canonicalModelId: HAIKU_MODEL.slice(HAIKU_MODEL.indexOf(":") + 1),
-            wireProviderName: "anthropic",
-            routedThroughGateway: false,
-          } satisfies ResolveAndCreateModelResult)
-        )
-      );
-
-      // The workflow step's previous child: ended without a report (interrupted, no receipt
-      // needed in the owning process), so the runner may claim and replace it.
-      await env.config.editConfig((cfg) => {
-        const project = cfg.projects.get(repoPath);
-        assert(project, "parent project must be registered");
-        project.workspaces.push({
-          id: "retiredmcp",
-          name: "retired-mcp",
-          path: path.join(env.config.srcDir, "retired-mcp"),
-          createdAt: new Date().toISOString(),
-          parentWorkspaceId: parentId,
-          agentType: "explore",
-          agentId: "explore",
-          runtimeConfig: parent.metadata.runtimeConfig,
-          taskStatus: "interrupted",
-          taskAttemptId: ATTEMPT,
-          workflowTask: { runId: RUN.runId, stepId: RUN.stepId },
-        });
-        return cfg;
-      });
-
-      // In-process order ledger. Every MCP entry point is a pass-through spy on the real
-      // manager, so a start that the stub process has not yet recorded is still caught.
-      const ledger: Array<{ step: string; workspaceId: string }> = [];
-      const mcp = env.services.mcpServerManager;
-      for (const method of ["getToolsForWorkspace", "getPromptsForWorkspace"] as const) {
-        const real = mcp[method].bind(mcp) as (...args: unknown[]) => Promise<unknown>;
-        spyOn(mcp, method).mockImplementation(((...args: unknown[]) => {
-          ledger.push({
-            step: method,
-            workspaceId: (args[0] as { workspaceId: string }).workspaceId,
-          });
-          return real(...args);
-        }) as never);
-      }
 
       // Hold the replacement's sanitize (the real call runs once released).
       const workspaceService = env.services.workspaceService;
@@ -180,34 +243,10 @@ describe("workflow replacement launch: MCP after sanitize", () => {
         }
       );
       // Witness that a client's prompt-catalog request has parked on the launch's init state.
+      const initWaits = observeInit(env);
       const initStateManager = env.services.initStateManager;
-      const realWaitForInit = initStateManager.waitForInit.bind(initStateManager);
-      const probeParked = Promise.withResolvers<void>();
-      const probeTarget: { workspaceId?: string } = {};
-      spyOn(initStateManager, "waitForInit").mockImplementation((workspaceId, signal) => {
-        if (workspaceId === probeTarget.workspaceId) probeParked.resolve();
-        return realWaitForInit(workspaceId, signal);
-      });
 
-      const taskService = env.services.taskService;
-      const claim = await taskService.claimRetiredAttempt("retiredmcp", ATTEMPT, RUN);
-      assert(claim.success, `claim must succeed: ${claim.success ? "" : claim.error}`);
-      const created = await taskService.createMany(
-        [
-          {
-            parentWorkspaceId: parentId,
-            kind: "agent",
-            agentId: "explore",
-            prompt: "Summarize durable workflows",
-            title: "Replacement",
-            workflowTask: { runId: RUN.runId, stepId: RUN.stepId },
-          },
-        ],
-        { retires: [{ taskId: "retiredmcp", attemptId: ATTEMPT, nonce: claim.data.nonce }] }
-      );
-      assert(created.success, `createMany must succeed: ${created.success ? "" : created.error}`);
-      const replacementId = created.data[0]?.taskId;
-      assert(replacementId, "createMany must return the replacement's task id");
+      const replacementId = await launchReplacement();
 
       const held = await sanitizeEntered.promise;
       expect(held.taskId).toBe(replacementId);
@@ -216,14 +255,15 @@ describe("workflow replacement launch: MCP after sanitize", () => {
       expect(await readRecord(recordFile)).toEqual([]);
       // The row is published and its checkout materialized: a renderer may ask for the new
       // workspace's prompt catalog now. The request must wait for sanitize, not race it.
-      probeTarget.workspaceId = replacementId;
+      initWaits.target.workspaceId = replacementId;
       const probe = resolveOrpcClient(env).workspace.mcp.prompts.list({
         workspaceId: replacementId,
       });
-      await probeParked.promise;
+      await initWaits.parked;
       // Parked, not passed through: the launch's init is still running, and it completes only
       // after sanitize (waitForInit returns at once for a completed or absent init).
       expect(initStateManager.getInitState(replacementId)?.status).toBe("running");
+      expect(initWaits.completed).not.toContain(replacementId);
 
       releaseSanitize.resolve();
 
@@ -269,6 +309,83 @@ describe("workflow replacement launch: MCP after sanitize", () => {
       expect(childMethods).toContain("tools/list");
       expect(childMethods).toContain("prompts/list");
       for (const event of childEvents) expect(event.at).toBeGreaterThanOrEqual(sanitizedAt);
+    } finally {
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(repoPath);
+    }
+  }, 120_000);
+
+  test("a failed sanitize releases no parked discovery into the checkout before its reclaim", async () => {
+    const env = await createTestEnvironment();
+    const repoPath = await createTempGitRepo();
+    const recordFile = path.join(env.tempDir, "mcp-record.jsonl");
+    try {
+      const { parentId, ledger, launchReplacement } = await setUpReplacement(
+        env,
+        repoPath,
+        recordFile
+      );
+      // The replacement's sanitize fails; the launch must then unpublish the row and delete
+      // the checkout. The first config edit after the failure (the reclaim's unpublish) is held.
+      const reclaimHeld = Promise.withResolvers<void>();
+      const releaseReclaim = Promise.withResolvers<void>();
+      let holdNextEdit = false;
+      const realEditConfig = env.config.editConfig.bind(env.config);
+      spyOn(env.config, "editConfig").mockImplementation((async (...args: unknown[]) => {
+        if (holdNextEdit) {
+          holdNextEdit = false;
+          reclaimHeld.resolve();
+          await releaseReclaim.promise;
+        }
+        return (realEditConfig as (...a: unknown[]) => Promise<unknown>)(...args);
+      }) as never);
+      let checkout: string | undefined;
+      spyOn(env.services.workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(
+        async (id: string, workspacePath: string) => {
+          if (id === parentId) return undefined;
+          checkout = await fs.realpath(workspacePath);
+          holdNextEdit = true;
+          return "fixture: sanitize failed";
+        }
+      );
+      const initWaits = observeInit(env);
+
+      const replacementId = await launchReplacement();
+      await reclaimHeld.promise;
+      assert(checkout, "the replacement's sanitize must have run");
+      // The unsanitized row is still published; a renderer asks for its prompt catalog.
+      initWaits.target.workspaceId = replacementId;
+      const probe = resolveOrpcClient(env)
+        .workspace.mcp.prompts.list({ workspaceId: replacementId })
+        .then(
+          (prompts) => ({ prompts }),
+          (error: unknown) => ({ error })
+        );
+      await initWaits.parked;
+      // Parked: init completes only after the reclaim attempt (completing it is what releases
+      // the request), so nothing reaches the manager or starts a server while it is held.
+      expect(initWaits.completed).not.toContain(replacementId);
+      expect(ledger.filter((entry) => entry.workspaceId === replacementId)).toEqual([]);
+      expect(await readRecord(recordFile)).toEqual([]);
+
+      releaseReclaim.resolve();
+      const outcome = await probe;
+      // The reclaim removed the row, checkout and session dir before the request resumed: it
+      // finds no workspace and fails, and no server ever ran in the reclaimed checkout.
+      expect("error" in outcome).toBe(true);
+      expect(ledger.filter((entry) => entry.workspaceId === replacementId)).toEqual([]);
+      expect((await readRecord(recordFile)).filter((e) => e.cwd === checkout)).toEqual([]);
+      expect(
+        env.config
+          .loadConfigOrDefault()
+          .projects.get(repoPath)
+          ?.workspaces.some((w) => w.id === replacementId)
+      ).toBe(false);
+      expect(await fs.stat(checkout).catch(() => null)).toBeNull();
+      // Dropping (not completing) the reclaimed task's init writes no init-status.json back.
+      expect(
+        await fs.stat(path.join(env.config.sessionsDir, replacementId)).catch(() => null)
+      ).toBeNull();
     } finally {
       await cleanupTestEnvironment(env);
       await cleanupTempGitRepo(repoPath);

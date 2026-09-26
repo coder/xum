@@ -61,6 +61,7 @@ export function createMockInitStateManager(): InitStateManager {
     appendOutput: mock(() => undefined),
     reportProgress: mock(() => undefined),
     endInit: mock(() => Promise.resolve()),
+    clearInMemoryState: mock(() => undefined),
     getInitState: mock(() => undefined),
     readInitStatus: mock(() => Promise.resolve(null)),
   } as unknown as InitStateManager;
