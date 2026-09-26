@@ -46,6 +46,13 @@ const VSCODE_CHAT_HOST_CONTEXT_VALUE = {
   actions: {},
 } as const;
 
+// Bottom-stick uses native CSS scroll anchoring, as in the main app's ChatPane (see
+// useAutoScroll): while locked, the transcript content opts out of anchoring so the 0-height
+// bottom sentinel is the only anchor candidate, and the browser keeps it pinned as rows append.
+// When released, rows are candidates again, so the reading position survives appends.
+const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
+const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
+
 const MAX_BUFFERED_HISTORICAL_MESSAGES = CHAT_BUFFER_LIMITS.MAX_HISTORICAL_MESSAGES;
 const MAX_BUFFERED_STREAM_EVENTS = CHAT_BUFFER_LIMITS.MAX_STREAM_EVENTS;
 
@@ -180,10 +187,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   };
 
   // useAutoScroll releases the bottom lock only for scrolls preceded by user intent (wheel,
-  // pointer, keyboard, touch), so those handlers must be on the scroll container. The
-  // sentinel/overflow-anchor bottom-stick is not ported to the webview yet (#4626).
+  // pointer, keyboard, touch), so those handlers must be on the scroll container.
   const {
     contentRef,
+    sentinelRef,
+    autoScroll,
     handleScroll,
     jumpToBottom,
     markUserScrollIntent,
@@ -544,7 +552,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     onKeyDown={handleScrollContainerKeyDown}
                     onTouchMove={markUserScrollIntent}
                   >
-                    <div>
+                    <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
                       {selectedWorkspaceId ? (
                         <>
                           {displayedMessages.map((msg) => (
@@ -581,6 +589,14 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                         </div>
                       ) : null}
                     </div>
+                    {/* Bottom anchor: last child of the scrollport, so content appends above it. */}
+                    <div
+                      ref={sentinelRef}
+                      data-testid="transcript-bottom-sentinel"
+                      aria-hidden="true"
+                      className="h-0 w-full"
+                      style={TRANSCRIPT_BOTTOM_SENTINEL_STYLE}
+                    />
                   </div>
 
                   <div className="border-t border-border bg-background-secondary p-3">
