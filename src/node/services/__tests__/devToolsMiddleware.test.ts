@@ -11,7 +11,11 @@ import type {
   LanguageModelV4Usage,
 } from "@ai-sdk/provider";
 import { Config } from "@/node/config";
-import { captureAndStripDevToolsHeader } from "@/node/services/devToolsHeaderCapture";
+import {
+  DEVTOOLS_STEP_ID_HEADER,
+  captureAndStripDevToolsHeader,
+  consumeRedactedRequestBody,
+} from "@/node/services/devToolsHeaderCapture";
 import { createDevToolsMiddleware, extractUsage } from "@/node/services/devToolsMiddleware";
 import { DevToolsService } from "@/node/services/devToolsService";
 
@@ -718,6 +722,41 @@ describe("createDevToolsMiddleware", () => {
       expect(thrownError).toBe(failure);
 
       await expectRedactedFailedRequest(service);
+    });
+
+    it("drops the captured body on abort even when the fetch never settles", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () => {
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          // A custom fetch that ignores the abort signal and never settles.
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      controller.abort();
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
     });
 
     it("records 'Request aborted' on stream cancel", async () => {

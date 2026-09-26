@@ -117,7 +117,12 @@ export function createOpenAIWebSocketTransportFetch(
     const headers = new Headers(
       init?.headers ?? (input instanceof Request ? input.headers : undefined)
     );
-    captureAndStripDevToolsHeader(headers, init?.body);
+    // The SDK passes the body in `init`, but a Request input carries its own body (the
+    // routing check above already reads it the same way).
+    captureAndStripDevToolsHeader(
+      headers,
+      init?.body ?? (input instanceof Request ? await input.clone().text() : undefined)
+    );
     const response = await activeWebSocketFetch(input, { ...(init ?? {}), headers });
     if (closeRequested) {
       try {

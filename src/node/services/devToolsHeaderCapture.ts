@@ -1,3 +1,4 @@
+import { CREDENTIAL_URL_PARAMETER_NAMES } from "@/common/config/schemas/settingsBackup";
 import assert from "@/common/utils/assert";
 
 /**
@@ -84,24 +85,17 @@ export function redactHeaders(
 }
 
 /**
- * Body keys (lowercased, non-alphanumerics removed) that hold credentials. Exact matches only:
- * substring rules would also hide operational fields such as `max_output_tokens`.
+ * Body keys (lowercased, non-alphanumerics removed) that hold credentials: the vocabulary the
+ * settings backup already treats as credentials, plus header-style names that can appear in
+ * bodies. Exact matches only: substring rules would also hide operational fields such as
+ * `max_output_tokens`.
  */
-const CREDENTIAL_BODY_KEYS = new Set([
-  "apikey",
+const CREDENTIAL_BODY_KEYS: ReadonlySet<string> = new Set([
+  ...CREDENTIAL_URL_PARAMETER_NAMES,
   "xapikey",
-  "authorization",
   "proxyauthorization",
   "cookie",
-  "token",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
   "sessiontoken",
-  "bearertoken",
-  "secret",
-  "clientsecret",
-  "password",
 ]);
 
 /**
@@ -134,14 +128,16 @@ function redactBodyValue(value: unknown): unknown {
   const redacted: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(record)) {
     const normalized = normalizeBodyKey(key);
-    if (CREDENTIAL_BODY_KEYS.has(normalized)) {
-      redacted[key] = "[REDACTED]";
-    } else if (
+    // Encrypted reasoning first: `signature` is also a credential name, but for reasoning
+    // blocks the length is useful evidence and is still not the secret itself.
+    if (
       ENCRYPTED_REASONING_BODY_KEYS.has(normalized) ||
       // Anthropic redacted_thinking blocks carry their encrypted payload in `data`.
       (normalized === "data" && record.type === "redacted_thinking")
     ) {
       redacted[key] = redactEncrypted(child);
+    } else if (CREDENTIAL_BODY_KEYS.has(normalized)) {
+      redacted[key] = "[REDACTED]";
     } else {
       redacted[key] = redactBodyValue(child);
     }

@@ -547,6 +547,9 @@ export function createDevToolsMiddleware(
       };
 
       const abortHandler = (): void => {
+        // A fetch that ignores the abort may never settle doStream(), so drop the captured
+        // body here instead of waiting for the success/failure paths below.
+        discardCapturedRequestBody(stepId);
         void finalizeStep({
           output: buildOutput(),
           usage,

@@ -129,6 +129,28 @@ describe("devToolsHeaderCapture", () => {
     expect(consumeRedactedRequestBody("step-text")).toBeNull();
   });
 
+  it("redacts the shared credential vocabulary in request bodies", () => {
+    captureAndStripDevToolsHeader(
+      new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-creds" }),
+      JSON.stringify({
+        auth_token: "a",
+        privateKey: "b",
+        credentials: { user: "c", pass: "d" },
+        jwt: "e",
+        max_tokens: 64,
+        prompt_cache_key: "visible",
+      })
+    );
+    expect(consumeRedactedRequestBody("step-creds")).toEqual({
+      auth_token: "[REDACTED]",
+      privateKey: "[REDACTED]",
+      credentials: "[REDACTED]",
+      jwt: "[REDACTED]",
+      max_tokens: 64,
+      prompt_cache_key: "visible",
+    });
+  });
+
   it("redacts Anthropic redacted_thinking payloads but keeps unrelated data fields", () => {
     captureAndStripDevToolsHeader(
       new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-anthropic" }),
