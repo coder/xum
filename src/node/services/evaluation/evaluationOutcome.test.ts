@@ -202,6 +202,31 @@ describe("classifyEvaluationExit", () => {
     });
   });
 
+  it("keeps a typed failure's billed usage, and drops it when the cause is a defect", () => {
+    const billedUsage = {
+      usage: { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+      usageProviderMetadata: null,
+    };
+    const typed = new EvaluationError({
+      reason: "invalid-output",
+      code: "invalid-response",
+      billedUsage,
+    });
+    expect(classifyEvaluationExit(Exit.fail(typed), new AbortController().signal)).toEqual({
+      status: "failed",
+      reason: "invalid-output",
+      code: "invalid-response",
+      defect: false,
+      billedUsage,
+    });
+    const withDefect = Cause.combine(Cause.fail(typed), Cause.die(new Error("finalizer")));
+    const outcome = classifyEvaluationExit(
+      Exit.failCause(withDefect),
+      new AbortController().signal
+    );
+    expect(outcome).not.toHaveProperty("billedUsage");
+  });
+
   it("reports a defect even when the cause also carries a typed failure", () => {
     // e.g. a provider failure whose finalizer then died: the bug must not be hidden.
     const cause = Cause.combine(

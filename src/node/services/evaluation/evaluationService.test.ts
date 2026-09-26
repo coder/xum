@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { Cause, Effect, Exit, Option } from "effect";
+import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
 import { Experimental_EvaluationMockModelV4 } from "ai/test";
 import type {
@@ -335,6 +336,116 @@ describe("EvaluationService.evaluate", () => {
     if (!Exit.isFailure(exit)) return;
     expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true);
     expect(Option.isNone(Cause.findErrorOption(exit.cause))).toBe(true);
+  });
+});
+
+/**
+ * A Responses API fake for `createOpenAI().evaluationModel()`: the real
+ * provider-utils evaluation adapter parses `text` as its JSON answer object.
+ */
+function fakeResponsesFetch(text: string, usage = { input_tokens: 120, output_tokens: 30 }) {
+  return () =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          id: `resp_${SENTINEL}`,
+          created_at: 0,
+          model: "gpt-6-sol",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              id: "msg_test",
+              content: [{ type: "output_text", text, annotations: [] }],
+            },
+          ],
+          usage,
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      )
+    );
+}
+
+describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", () => {
+  const service = makeEvaluationService();
+
+  it("keeps the sanitized usage of a response Xum rejects after the SDK accepted it", async () => {
+    const { model } = mockModel(() =>
+      Promise.resolve({
+        answers: VALID_ANSWERS,
+        rounding: SENTINEL as unknown as { scoreDecimals: number },
+        usage: { inputTokens: 40, outputTokens: 4 },
+        providerMetadata: { openai: { reasoningTokens: 2, responseId: `resp_${SENTINEL}` } },
+        warnings: [],
+        response: { modelId: SENTINEL, body: { raw: SENTINEL } },
+      })
+    );
+    const error = expectFailure(await runExit(service.evaluate(call(model, QUESTIONS))));
+    expect(error).toMatchObject({ reason: "invalid-output", code: "answer-validation" });
+    expect(error.billedUsage).toEqual({
+      usage: { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+      usageProviderMetadata: { openai: { reasoningTokens: 2 } },
+    });
+    expect(JSON.stringify(error)).not.toContain(SENTINEL);
+  });
+
+  it("keeps the usage of an answer the SDK's own validation rejects after the model returned", async () => {
+    const { model } = mockModel(() =>
+      Promise.resolve({
+        answers: { ...VALID_ANSWERS, injection: { type: "choice" as const, choice: SENTINEL } },
+        usage: { inputTokens: -1, outputTokens: 9 },
+        warnings: [],
+      })
+    );
+    const error = expectFailure(await runExit(service.evaluate(call(model, QUESTIONS))));
+    expect(error).toMatchObject({ reason: "invalid-output", code: "invalid-response" });
+    // A malformed count stays unknown (never zero), exactly like the success path.
+    expect(error.billedUsage).toEqual({
+      usage: { inputTokens: null, outputTokens: 9, totalTokens: null },
+      usageProviderMetadata: null,
+    });
+    expect(JSON.stringify(error)).not.toContain(SENTINEL);
+  });
+
+  it("keeps the usage of an answer the real OpenAI evaluation adapter rejects inside doEvaluate", async () => {
+    // q0 is the choice question; "c9" is not one of its option codes, so the
+    // provider-utils adapter throws before it would return usage.
+    const model = createOpenAI({
+      apiKey: "test",
+      fetch: fakeResponsesFetch(JSON.stringify({ q0: "c9", q1: 1, q2: 0.25 })),
+    }).evaluationModel("gpt-6-sol");
+    const error = expectFailure(
+      await runExit(service.evaluate({ model, state: { title: "hello" }, questions: QUESTIONS }))
+    );
+    expect(error).toMatchObject({ reason: "invalid-output", code: "invalid-response" });
+    expect(error.billedUsage).toEqual({
+      usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
+      usageProviderMetadata: null,
+    });
+    expect(JSON.stringify(error)).not.toContain(SENTINEL);
+  });
+
+  it("carries no billed usage when the provider call itself failed", async () => {
+    const model = createOpenAI({
+      apiKey: "test",
+      fetch: () => Promise.resolve(new Response(`{"error":"${SENTINEL}"}`, { status: 500 })),
+    }).evaluationModel("gpt-6-sol");
+    const error = expectFailure(
+      await runExit(service.evaluate({ model, state: { title: "hello" }, questions: QUESTIONS }))
+    );
+    expect(error.reason).toBe("provider-failure");
+    expect(error.billedUsage).toBeUndefined();
+  });
+
+  it("contract: the OpenAI evaluation model keeps its inner LanguageModelV4 on `model`", () => {
+    // evaluationService reads this SDK-internal field to capture the usage of a
+    // response the adapter rejects. If an SDK upgrade moves it, fail here loudly.
+    const model = createOpenAI({ apiKey: "test" }).evaluationModel("gpt-6-sol");
+    const inner = (
+      model as unknown as { model?: { specificationVersion?: unknown; doGenerate?: unknown } }
+    ).model;
+    expect(inner?.specificationVersion).toBe("v4");
+    expect(typeof inner?.doGenerate).toBe("function");
   });
 });
 
