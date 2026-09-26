@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "@jest/globals";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { EventStore } from "./eventStore";
-import type { Config } from "@/node/config";
+import { Config } from "@/node/config";
+import { DisposableTempDir } from "@/node/services/tempDir";
 
 // Test types
 interface TestState {
@@ -18,11 +19,11 @@ interface TestEvent {
 }
 
 describe("EventStore", () => {
-  const testSessionDir = path.join(__dirname, "../../test-sessions");
   const testWorkspaceId = "test-workspace-123";
   const testFilename = "test-state.json";
 
-  let mockConfig: Config;
+  let tempDir: DisposableTempDir;
+  let config: Config;
   let store: EventStore<TestState, TestEvent>;
   let emittedEvents: TestEvent[] = [];
 
@@ -42,32 +43,15 @@ describe("EventStore", () => {
     emittedEvents.push(event);
   };
 
-  beforeEach(async () => {
-    // Create test session directory
-    try {
-      await fs.access(testSessionDir);
-    } catch {
-      await fs.mkdir(testSessionDir, { recursive: true });
-    }
-
-    mockConfig = {
-      muxDir: path.join(__dirname, "../.."),
-      sessionsDir: testSessionDir,
-    } as unknown as Config;
-
+  beforeEach(() => {
+    tempDir = new DisposableTempDir("event-store-test");
+    config = new Config(tempDir.path);
     emittedEvents = [];
-
-    store = new EventStore(mockConfig, testFilename, serializeState, emitEvent, "TestStore");
+    store = new EventStore(config, testFilename, serializeState, emitEvent, "TestStore");
   });
 
-  afterEach(async () => {
-    // Clean up test files
-    try {
-      await fs.access(testSessionDir);
-      await fs.rm(testSessionDir, { recursive: true, force: true });
-    } catch {
-      // Directory doesn't exist, nothing to clean up
-    }
+  afterEach(() => {
+    tempDir[Symbol.dispose]();
   });
 
   describe("State Management", () => {
@@ -121,7 +105,7 @@ describe("EventStore", () => {
       await store.persist(testWorkspaceId, state);
 
       // Verify file exists
-      const workspaceDir = path.join(testSessionDir, testWorkspaceId);
+      const workspaceDir = path.join(config.sessionsDir, testWorkspaceId);
       const filePath = path.join(workspaceDir, testFilename);
       try {
         await fs.access(filePath);
