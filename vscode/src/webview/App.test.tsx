@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../tests/ui/dom";
+import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { getThinkingLevelKey } from "xum/common/constants/storage";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -336,9 +338,11 @@ describe("vscode webview AI settings persistence", () => {
   test("sends the selected thinking level without raising it to a client-side floor", async () => {
     // The webview only knows built-in minimum levels, not the user's configured ones, so it must
     // not clamp; the backend applies the authoritative floor to the turn.
-    window.localStorage.setItem(`thinkingLevel:${WORKSPACE.id}`, JSON.stringify("off"));
+    // "low" is below the default model's built-in minimum (medium), so a client-side clamp would
+    // raise it; it is also not the default, so the test proves the stored choice is what is sent.
+    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
     const { bridge, view } = await renderSelected();
     const options = await sendMessage(bridge, view);
-    expect(options.thinkingLevel).toBe("off");
+    expect(options.thinkingLevel).toBe("low");
   });
 });
