@@ -27,6 +27,7 @@ import {
   collectFullHistory,
   createTaskServiceHarness,
   createTaskServiceTestRoot,
+  flushTerminalAttentionDrains,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
 
@@ -1741,10 +1742,7 @@ describe("TaskService", () => {
     });
 
     // The terminal report resumes the parent through the async attention drain.
-    await Promise.all([
-      ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
-        .pendingTerminalAttentionDrains,
-    ]);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).toHaveBeenCalledWith(
@@ -1814,12 +1812,7 @@ describe("TaskService", () => {
         toolPolicy: restrictedPolicy,
       })
     );
-    const drainAll = async () => {
-      await Promise.all([
-        ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
-          .pendingTerminalAttentionDrains,
-      ]);
-    };
+    const drainAll = () => flushTerminalAttentionDrains(taskService);
 
     await streamEnd(taskService, {
       type: "stream-end",
@@ -1946,10 +1939,8 @@ describe("TaskService", () => {
         metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
         parts: [{ type: "text", text: "Hello from child" }],
       });
-      await Promise.all([
-        ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
-          .pendingTerminalAttentionDrains,
-      ]);
+      // One pass: the parent never goes idle, so the busy drain's idle wait never settles.
+      await flushTerminalAttentionDrains(taskService, { passes: 1 });
 
       expect(sendMessage).toHaveBeenCalledTimes(expectCut ? 1 : 0);
     });
@@ -1973,10 +1964,7 @@ describe("TaskService", () => {
     });
     assert(notification);
     taskService.scheduleTerminalAttentionDrain(parentId);
-    await Promise.all([
-      ...(taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> })
-        .pendingTerminalAttentionDrains,
-    ]);
+    await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).not.toHaveBeenCalled();

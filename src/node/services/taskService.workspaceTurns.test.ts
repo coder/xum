@@ -44,6 +44,7 @@ import {
 import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
+  queuedWorkflowRunAttention,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
@@ -597,13 +598,10 @@ describe("TaskService", () => {
       }
     );
 
-    const internal = taskService as unknown as {
-      pendingTerminalAttentionDrains: Set<Promise<void>>;
-    };
     await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
 
     // Drain runs asynchronously; await any in-flight drains before asserting.
-    await Promise.all([...internal.pendingTerminalAttentionDrains]);
+    await flushTerminalAttentionDrains(taskService);
 
     const wakeCall = sendMessage.mock.calls.find(
       (call) => typeof call[1] === "string" && call[1].includes("wst_handle")
@@ -676,11 +674,8 @@ describe("TaskService", () => {
       }
     );
 
-    const internal = taskService as unknown as {
-      pendingTerminalAttentionDrains: Set<Promise<void>>;
-    };
     await streamEnd(taskService, workspaceTurnStreamEndEvent(parentId, "msg_1", "Done"));
-    await Promise.all([...internal.pendingTerminalAttentionDrains]);
+    await flushTerminalAttentionDrains(taskService);
 
     // No wake-up sent while a queued/preparing turn exists.
     const wakeCall = sendMessage.mock.calls.find(
@@ -819,10 +814,7 @@ describe("TaskService", () => {
     expect(stillPending.map((notification) => notification.sourceId)).toEqual([
       "wst_backoff_deliverable",
     ]);
-    const queued = (
-      taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-    ).pendingWorkflowRunAttention.get(parentId);
-    expect(queued?.has(runId) ?? false).toBe(false);
+    expect(queuedWorkflowRunAttention(taskService, parentId).has(runId)).toBe(false);
   });
 
   test("a fully suppressed batch re-pokes the drain for unselected workflow groups", async () => {
@@ -2148,16 +2140,13 @@ describe("TaskService", () => {
       ...running,
       attentionPolicy: "notify_on_terminal",
     });
-    const internal = taskService as unknown as {
-      pendingTerminalAttentionDrains: Set<Promise<void>>;
-    };
     await streamEnd(
       taskService,
       workspaceTurnStreamEndEvent(parentId, "msg_truncated_before_quiet", "Truncated", {
         finishReason: "length",
       })
     );
-    await Promise.all([...internal.pendingTerminalAttentionDrains]);
+    await flushTerminalAttentionDrains(taskService);
     const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
     assert(errored, "errored handle must exist");
     const attentionStore = new TerminalAttentionStore(config);
