@@ -1692,7 +1692,7 @@ describe("TaskService", () => {
   });
 
   describe("peer-wake limit refusals", () => {
-    const setup = async () => {
+    const setup = async (hostOverrides: Parameters<typeof createWorkspaceServiceMocks>[0] = {}) => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       await saveWorkspaces(
@@ -1718,7 +1718,7 @@ describe("TaskService", () => {
           workspace.taskStatus = taskStatus;
           return current;
         });
-      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks(hostOverrides);
       const { taskService, historyService } = createTaskServiceHarness(config, {
         workspaceService,
       });
@@ -1793,10 +1793,11 @@ describe("TaskService", () => {
       t.taskService.resetAutoResumeCount("sib-b");
       await t.drainSenderLock();
       expect(t.wakeCalls()).toHaveLength(1);
-      const [, content, options, internal] = t.wakeCalls()[0];
+      const [, content, , internal] = t.wakeCalls()[0];
       expect(content).toContain("sib-b");
-      expect(options).toMatchObject({ queueDispatchMode: "turn-end" });
+      // Idle-only: never queued behind the sender's work with a stale tool-policy snapshot.
       expect(internal).toMatchObject({
+        requireIdle: true,
         synthetic: true,
         skipAutoResumeReset: true,
         queueDedupeKey: `${PEER_WAKE_AVAILABLE_DEDUPE_PREFIX}sib-b`,
@@ -1859,6 +1860,52 @@ describe("TaskService", () => {
       expect(t.wakeCalls()).toHaveLength(0);
 
       // The waiter was requeued, so the next attention wakes the sender without a new refusal.
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
+    test("a busy sender is notified only after it goes idle", async () => {
+      let senderBusy = true;
+      let becomeIdle!: () => void;
+      const idle = new Promise<void>((resolve) => (becomeIdle = resolve));
+      const t = await setup({
+        isBusyForMessage: mock((workspaceId: string) => workspaceId === "sib-a" && senderBusy),
+        waitForIdleAndNoQueuedMessages: mock((workspaceId: string) =>
+          workspaceId === "sib-a" ? idle : Promise.resolve()
+        ),
+      });
+      await t.fillAndRefuseSibA("sib-c");
+      t.taskService.resetAutoResumeCount("sib-b");
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(0);
+
+      senderBusy = false;
+      becomeIdle();
+      // The idle continuation registered first, so it claims sib-a's lock before this barrier.
+      await idle;
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(1);
+    });
+
+    test("a turn admitted while the notice reads the sender's policy invalidates it", async () => {
+      let generation = Symbol("before");
+      const t = await setup({
+        getActiveTurnGeneration: mock((workspaceId: string) =>
+          workspaceId === "sib-a" ? generation : undefined
+        ),
+      });
+      await t.fillAndRefuseSibA("sib-c");
+      const held = t.holdNoticeInPolicyLookup();
+      t.taskService.resetAutoResumeCount("sib-b");
+      await held.reachedLookup;
+      // Manual input was admitted meanwhile: its tool policy may be stricter than the snapshot.
+      generation = Symbol("manual input");
+      held.release();
+      await t.drainSenderLock();
+      expect(t.wakeCalls()).toHaveLength(0);
+
+      // The waiter was requeued: the next attention resolves a fresh snapshot and wakes it.
       t.taskService.resetAutoResumeCount("sib-b");
       await t.drainSenderLock();
       expect(t.wakeCalls()).toHaveLength(1);

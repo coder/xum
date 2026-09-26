@@ -9655,12 +9655,15 @@ export class TaskService implements AgentTaskIntegration {
    */
   private schedulePeerWakeAvailableNotices(
     targetId: string,
-    waiters: readonly PeerWakeWaiter[]
+    waiters: readonly PeerWakeWaiter[],
+    options?: { afterIdle?: boolean }
   ): void {
     for (const waiter of waiters) {
       const senderId = waiter.senderWorkspaceId;
       this.workspaceEventLocks
-        .withLock(senderId, () => this.deliverPeerWakeAvailableNotice(targetId, waiter))
+        .withLock(senderId, () =>
+          this.deliverPeerWakeAvailableNotice(targetId, waiter, options?.afterIdle === true)
+        )
         .catch((error: unknown) => {
           log.error("Failed to wake a sender refused by a peer-wake limit", {
             targetId,
@@ -9673,7 +9676,8 @@ export class TaskService implements AgentTaskIntegration {
 
   private async deliverPeerWakeAvailableNotice(
     targetId: string,
-    waiter: PeerWakeWaiter
+    waiter: PeerWakeWaiter,
+    afterIdle: boolean
   ): Promise<void> {
     const senderId = waiter.senderWorkspaceId;
     const cfg = this.config.loadConfigOrDefault();
@@ -9722,6 +9726,38 @@ export class TaskService implements AgentTaskIntegration {
       );
     };
     if (senderInactive()) return;
+
+    // Deliver only into an idle sender, like the idle terminal-attention drain: a queued notice
+    // would dispatch with the tool-policy snapshot taken now, even after newer user input
+    // restricted it. Wait outside the sender's event lock (its stream-end handling takes it),
+    // then retry once; a sender still busy after that waits for the target's next attention.
+    const senderBusy = (): boolean =>
+      this.aiService.isStreaming(senderId) ||
+      this.workspaceService.isBusyForMessage(senderId) ||
+      this.workspaceService.hasQueuedMessages(senderId) ||
+      this.workspaceService.hasPendingQueuedOrPreparingTurn(senderId);
+    if (senderBusy()) {
+      if (afterIdle) {
+        this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+        return;
+      }
+      this.workspaceService
+        .waitForIdleAndNoQueuedMessages(senderId)
+        .then(() => this.schedulePeerWakeAvailableNotices(targetId, [waiter], { afterIdle: true }))
+        .catch((error: unknown) => {
+          log.debug("Peer-wake notice idle wait failed; waiting for the next attention", {
+            targetId,
+            senderId,
+            error,
+          });
+          this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
+        });
+      return;
+    }
+    // Any turn admitted after this point (e.g. manual input racing the policy read below) makes
+    // the captured restrictions stale.
+    const senderTurnGeneration = this.workspaceService.getActiveTurnGeneration(senderId);
+
     // Stops latched from here on stay authoritative through every admission gate of the send,
     // even if the user resumes before the probe runs (same latch as peer delivery).
     const senderChainIds = chainIds(senderId);
@@ -9747,10 +9783,14 @@ export class TaskService implements AgentTaskIntegration {
     };
     const admissionStale = (): boolean => {
       if (chainStopped(senderChainIds) || senderInactive()) return true;
-      if (targetUnavailable()) {
-        // The target became unreachable (stopped, inactive, or capped again) while this notice
-        // was in flight: keep waiting for its next attention instead of a futile retry turn.
-        // Idempotent, so repeated probe calls re-register the same waiter.
+      if (
+        this.workspaceService.getActiveTurnGeneration(senderId) !== senderTurnGeneration ||
+        targetUnavailable()
+      ) {
+        // Either the sender admitted a turn after the policy snapshot, or the target became
+        // unreachable (stopped, inactive, or capped again). Keep waiting for the target's next
+        // attention instead of dispatching stale grants or a futile retry turn. Idempotent, so
+        // repeated probe calls re-register the same waiter.
         this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
         return true;
       }
@@ -9779,15 +9819,18 @@ export class TaskService implements AgentTaskIntegration {
       parentEntry: senderEntry,
       content,
       queueDedupeKey: `${PEER_WAKE_AVAILABLE_DEDUPE_PREFIX}${targetId}`,
-      // Never cut into the sender's current work; an idle sender starts a new turn right away.
-      queueDispatchMode: "turn-end",
+      // Never queue behind (or cut into) the sender's work; requireIdle also yields to a manual
+      // send in preflight at every admission gate.
+      requireIdle: true,
       // An opportunistic notice must not fail the sender's own delegated workspace turn.
       settleContinuationOnSendRefusal: false,
       admissionStale,
       sendRestrictions,
     });
     if (!result.success) {
-      log.warn("Peer-wake notice was not delivered", { targetId, senderId, error: result.error });
+      // Usually user input won the race; keep waiting for the target's next attention.
+      log.debug("Peer-wake notice was not admitted", { targetId, senderId, error: result.error });
+      this.agentPeerMessageBroker.addPeerWakeWaiter(targetId, waiter);
     }
   }
 
@@ -12631,6 +12674,8 @@ export class TaskService implements AgentTaskIntegration {
     settleContinuationOnSendRefusal?: boolean;
     /** See SendMessageInternalOptions.yieldToPreflightSends. */
     yieldToPreflightSends?: boolean;
+    /** Refuse instead of queueing when busy, yielding to manual sends in preflight. */
+    requireIdle?: boolean;
     /** Caller restrictions restored onto the wake's turn (see resolveTerminalWakeCallerSendRestrictions). */
     sendRestrictions?: {
       toolPolicy?: ToolPolicy;
@@ -12731,6 +12776,7 @@ export class TaskService implements AgentTaskIntegration {
           ? { promoteAheadOfHiddenTurnEnd: true }
           : {}),
         ...(params.yieldToPreflightSends === true ? { yieldToPreflightSends: true } : {}),
+        ...(params.requireIdle === true ? { requireIdle: true } : {}),
         ...(params.admissionStale != null ? { admissionStale: params.admissionStale } : {}),
         ...(workspaceTurnMuxMetadata != null
           ? {
