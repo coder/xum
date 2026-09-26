@@ -759,6 +759,41 @@ describe("createDevToolsMiddleware", () => {
       expect(consumeRedactedRequestBody(stepId)).toBeNull();
     });
 
+    it("keeps no body when the provider reaches fetch only after the abort", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const controller = new AbortController();
+      controller.abort();
+      const params = { ...createMockParams(), abortSignal: controller.signal };
+      let captured!: () => void;
+      const fetched = new Promise<void>((resolve) => {
+        captured = resolve;
+      });
+
+      void wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: async () => {
+          // An asynchronous provider that only reaches its (abort-ignoring) fetch now.
+          await Promise.resolve();
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(params.headers ?? {})) {
+            if (typeof value === "string") headers.set(key, value);
+          }
+          captureAndStripDevToolsHeader(headers, FAILED_REQUEST_BODY);
+          captured();
+          return new Promise<never>(() => undefined);
+        },
+        params,
+        model: createMockModel(),
+      });
+      await fetched;
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      expect(consumeRedactedRequestBody(stepId)).toBeNull();
+    });
+
     it("records 'Request aborted' on stream cancel", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);

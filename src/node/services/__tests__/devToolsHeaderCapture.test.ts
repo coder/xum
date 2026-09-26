@@ -4,9 +4,11 @@ import {
   DEVTOOLS_STEP_ID_HEADER,
   captureAndStripDevToolsHeader,
   consumeCapturedRequestHeaders,
+  closeCapturedRequestBody,
   consumeRedactedRequestBody,
   discardCapturedRequestBody,
   redactHeaders,
+  resolveDevToolsCaptureBody,
 } from "../devToolsHeaderCapture";
 
 describe("devToolsHeaderCapture", () => {
@@ -173,6 +175,33 @@ describe("devToolsHeaderCapture", () => {
     captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-ok" }), "{}");
     discardCapturedRequestBody("step-ok");
     expect(consumeRedactedRequestBody("step-ok")).toBeNull();
+  });
+
+  it("reads the body of a Request input only for a DevTools-tracked request", async () => {
+    const body = JSON.stringify({ model: "m" });
+    const tracked = new Request("https://api.example/v1", {
+      method: "POST",
+      headers: { [DEVTOOLS_STEP_ID_HEADER]: "step-request" },
+      body,
+    });
+    expect(await resolveDevToolsCaptureBody(tracked.headers, tracked, undefined)).toBe(body);
+    // The caller's Request stays readable: the helper reads a clone.
+    expect(await tracked.text()).toBe(body);
+    // `init.body` wins, as fetch itself would send it.
+    expect(await resolveDevToolsCaptureBody(tracked.headers, "https://api.example", { body: "{}" })).toBe(
+      "{}"
+    );
+    const untracked = new Request("https://api.example/v1", { method: "POST", body });
+    expect(await resolveDevToolsCaptureBody(untracked.headers, untracked, undefined)).toBeUndefined();
+  });
+
+  it("ignores a capture that arrives after its step was closed by an abort", () => {
+    closeCapturedRequestBody("step-late");
+    captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-late" }), "{}");
+    expect(consumeRedactedRequestBody("step-late")).toBeNull();
+    // Settling the step clears the closed mark, so the id holds no state afterwards.
+    captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: "step-late" }), "{}");
+    expect(consumeRedactedRequestBody("step-late")).toEqual({});
   });
 
   it("strips run metadata header even without step header", () => {

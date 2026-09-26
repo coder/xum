@@ -21,6 +21,7 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  closeCapturedRequestBody,
   consumeRedactedRequestBody,
   discardCapturedRequestBody,
   redactHeaders,
@@ -394,7 +395,7 @@ export function createDevToolsMiddleware(
 
       const abortHandler = (): void => {
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
-        discardCapturedRequestBody(stepId);
+        closeCapturedRequestBody(stepId);
         void finalizeStep({
           output: null,
           usage: null,
@@ -548,8 +549,8 @@ export function createDevToolsMiddleware(
 
       const abortHandler = (): void => {
         // A fetch that ignores the abort may never settle doStream(), so drop the captured
-        // body here instead of waiting for the success/failure paths below.
-        discardCapturedRequestBody(stepId);
+        // body here (and any later capture) instead of waiting for the paths below.
+        closeCapturedRequestBody(stepId);
         void finalizeStep({
           output: buildOutput(),
           usage,

@@ -26,6 +26,14 @@ const capturedRequestHeaders = new Map<string, Record<string, string>>();
 const capturedRequestBodies = new Map<string, string>();
 
 /**
+ * Steps whose abort already ran cleanup. A provider can still reach its fetch afterwards, and
+ * a fetch that ignores cancellation may never settle, so captures for these ids are dropped
+ * instead of being retained until a settle path that may never come. The mark is cleared when
+ * the step does settle (consume/discard).
+ */
+const closedCaptureSteps = new Set<string>();
+
+/**
  * Header names (lowercased) whose values must be redacted before persistence.
  * Matches common auth/credential headers across AI providers.
  */
@@ -170,12 +178,39 @@ export function consumeRedactedRequestBody(stepId: string): unknown {
 
   const body = capturedRequestBodies.get(stepId);
   capturedRequestBodies.delete(stepId);
+  closedCaptureSteps.delete(stepId);
   return redactRequestBody(body);
 }
 
 /** Drops a captured body the step does not need (its result carries the SDK's own body). */
 export function discardCapturedRequestBody(stepId: string): void {
   capturedRequestBodies.delete(stepId);
+  closedCaptureSteps.delete(stepId);
+}
+
+/** Abort cleanup: drops the body and refuses later captures until the step settles. */
+export function closeCapturedRequestBody(stepId: string): void {
+  capturedRequestBodies.delete(stepId);
+  closedCaptureSteps.add(stepId);
+}
+
+/**
+ * The body a fetch wrapper should hand to captureAndStripDevToolsHeader: `init.body` (what
+ * fetch sends), else the body of a Request input. A Request body is read from a clone, and
+ * only for DevTools-tracked requests, so untracked traffic pays nothing.
+ */
+export async function resolveDevToolsCaptureBody(
+  headers: Headers,
+  input: RequestInfo | URL,
+  init: RequestInit | undefined
+): Promise<unknown> {
+  if (init?.body != null) {
+    return init.body;
+  }
+  if (!(input instanceof Request) || headers.get(DEVTOOLS_STEP_ID_HEADER) == null) {
+    return undefined;
+  }
+  return await input.clone().text();
 }
 
 /** Called by the middleware to retrieve (and clean up) captured headers for a step. */
@@ -212,7 +247,7 @@ export function captureAndStripDevToolsHeader(headers: Headers, body?: unknown):
   const stepId = rawStepId.trim();
   if (stepId.length > 0) {
     capturedRequestHeaders.set(stepId, redactHeaders(Object.fromEntries(headers.entries())));
-    if (typeof body === "string") {
+    if (typeof body === "string" && !closedCaptureSteps.has(stepId)) {
       capturedRequestBodies.set(stepId, body);
     }
   }
