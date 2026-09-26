@@ -2,18 +2,18 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { getBashPath, getBashPathForPlatform, resetBashPathCache } from "./bashPath";
+import { getBashPath, getBashPathForPlatform, resetBashPathCacheForTests } from "./bashPath";
 
 describe("getBashPath (Unix)", () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    resetBashPathCache();
+    resetBashPathCacheForTests();
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-bash-path-test-"));
   });
 
   afterEach(async () => {
-    resetBashPathCache();
+    resetBashPathCacheForTests();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -115,7 +115,7 @@ describe("getBashPathForPlatform (Windows)", () => {
 
 describe("getBashPath (Windows)", () => {
   beforeEach(() => {
-    resetBashPathCache();
+    resetBashPathCacheForTests();
   });
 
   it("caches failures to avoid repeated `where` probes", () => {

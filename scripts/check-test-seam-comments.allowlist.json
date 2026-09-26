@@ -39,7 +39,13 @@
     { "file": "src/node/services/tools/review_pane.ts", "symbol": "applyReviewPaneUpdate", "reason": "production caller: applyReviewPaneUpdateForSessionDir in the same file" },
     { "file": "src/node/services/workflows/keyedFifoLock.ts", "symbol": "KeyedFifoLock.waiterCount", "reason": "observation getter: keyedFifoLock.test.ts reads it to witness that waiters timing out behind a hung holder are spliced out while the holder still hangs; a lazy skip-at-release implementation passes every public-behavior assertion and fails only this one; no production caller" },
     { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "getProcessBirth", "reason": "production caller: makeOwnershipToken in the same file" },
-    { "file": "src/node/utils/main/crossProcessLock.ts", "symbol": "guardPath", "reason": "production caller: withReclaimGuard (fileLock.ts)" }
+    { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "ReclaimSeamPhase", "reason": "type of the testOnlyReclaimSeam interleaving hook (see ProcessFileLockOptions.testOnlyReclaimSeam); no production caller" },
+    { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "ProcessFileLockOptions.testOnlyReclaimSeam", "reason": "interleaving hook: fileLock.test.ts uses it to witness that a reclaimer acting on a stale read aborts (verify-before-displace under the reclaim guard) instead of displacing a fresh owner, and that a wrongful displacement is restored before a third process can claim the path; no production caller" },
+    { "file": "src/node/utils/concurrency/processLiveness.ts", "symbol": "setSelfIdentityForTests", "reason": "module-singleton override named ...ForTests; crossProcessLock.test.ts uses it to simulate a macOS/Windows process identity on Linux CI and witness the non-Linux judgeHolder rules" },
+    { "file": "src/node/utils/journal/journal.ts", "symbol": "JournalOptions.testOnlyBeforeAppendWrite", "reason": "interleaving hook: journal.test.ts uses it to witness that an appender whose append lock is displaced after sequence derivation aborts before writing a duplicate sequence; no production caller" },
+    { "file": "src/node/utils/main/bashPath.ts", "symbol": "resetBashPathCacheForTests", "reason": "module-singleton reset hook named ...ForTests" },
+    { "file": "src/node/utils/main/crossProcessLock.ts", "symbol": "guardPath", "reason": "production caller: withReclaimGuard (fileLock.ts)" },
+    { "file": "src/node/utils/network/pinnedHttpsFetch.ts", "symbol": "PinnedHttpsFetchTransport", "reason": "injection point: DNS lookup and undici Agent factory; pinnedHttpsFetch.test.ts uses it to route validated, pinned dials to a loopback HTTPS harness (the production block list rejects loopback and the harness certificate is not system-trusted) and witness single DNS resolution, whole-answer block-list rejection, pinned connect.lookup/servername, no redirects, body caps, abort bounds and agent cleanup; production uses the default" }
   ],
   "knownDebt": [
     { "file": "src/browser/features/ChatInput/placeholderTips.ts", "symbol": "getPlaceholderTip", "reason": "nowMs parameter: only tests pass it (ChatInput passes undefined)" },
@@ -51,12 +57,6 @@
     { "file": "src/node/services/coderService.ts", "symbol": "CoderService.clearCache", "reason": "called only by tests" },
     { "file": "src/node/services/contextManagement/sessionContextHost.ts", "symbol": "SessionContextHost.compactionMonitor", "reason": "set only by tests (AgentSession forwards an option no production code passes)" },
     { "file": "src/node/services/mcpServerIcon.ts", "symbol": "IconResolverDependencies", "reason": "production calls createIconResolver() with no dependencies" },
-    { "file": "src/node/services/workflows/WorkflowRunStore.ts", "symbol": "WorkflowRunStoreOptions.mutationLockWaitTimeoutMs", "reason": "option set only by tests" },
-    { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "ReclaimSeamPhase", "reason": "type of the test-only testOnlyReclaimSeam hook" },
-    { "file": "src/node/utils/concurrency/fileLock.ts", "symbol": "ProcessFileLockOptions.testOnlyReclaimSeam", "reason": "interleaving hook set only by tests" },
-    { "file": "src/node/utils/concurrency/processLiveness.ts", "symbol": "setSelfIdentityForTesting", "reason": "test override (not a reset hook) called only by tests" },
-    { "file": "src/node/utils/journal/journal.ts", "symbol": "JournalOptions.testOnlyBeforeAppendWrite", "reason": "interleaving hook set only by tests" },
-    { "file": "src/node/utils/main/bashPath.ts", "symbol": "resetBashPathCache", "reason": "reset hook called only by tests; not named ...ForTests" },
-    { "file": "src/node/utils/network/pinnedHttpsFetch.ts", "symbol": "PinnedHttpsFetchTransport", "reason": "production calls createPinnedHttpsFetch() with no transport" }
+    { "file": "src/node/services/workflows/WorkflowRunStore.ts", "symbol": "WorkflowRunStoreOptions.mutationLockWaitTimeoutMs", "reason": "option set only by tests" }
   ]
 }
