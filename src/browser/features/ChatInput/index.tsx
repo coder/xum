@@ -2821,7 +2821,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (isMobileTouch || props.kind === "scratch") {
       return "Type a message...";
     }
-    return getPlaceholderTip(undefined, { dynamicWorkflows: dynamicWorkflowsExperimentEnabled });
+    return getPlaceholderTip({ dynamicWorkflows: dynamicWorkflowsExperimentEnabled });
   })();
 
   const activeToast = toast ?? (variant === "creation" ? creationState.toast : null);

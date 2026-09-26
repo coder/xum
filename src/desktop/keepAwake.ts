@@ -60,11 +60,6 @@ export class KeepAwakeController {
     this.deps = deps;
   }
 
-  /** Test/debug visibility only. */
-  get isHoldingBlocker(): boolean {
-    return this.blockerId !== null;
-  }
-
   async start(): Promise<void> {
     assert(!this.disposed, "KeepAwakeController.start() called after dispose()");
     assert(!this.subscribed, "KeepAwakeController.start() called twice");
