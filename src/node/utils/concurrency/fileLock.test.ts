@@ -274,6 +274,36 @@ describe("acquireProcessFileLock", () => {
     }
   }, 20_000);
 
+  test("a timeout names a live reclaim-guard holder that blocks taking over a dead owner", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const guard = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
+      stdio: "ignore",
+    });
+    try {
+      const guardPid = guard.pid!;
+      // The lock's owner is dead, but a live process holds the takeover guard.
+      await fs.writeFile(lockPath, v2Token(deadPid(), "dead", {}), "utf-8");
+      await fs.writeFile(
+        `${lockPath}.reclaim`,
+        v2Token(guardPid, "guard", { birth: probeProcessBirth(guardPid) }),
+        "utf-8"
+      );
+      let message = "";
+      try {
+        await (
+          await acquireProcessFileLock({ lockPath, timeoutMs: 150, label: "test lock" })
+        )[Symbol.asyncDispose]();
+      } catch (error) {
+        message = String(error);
+      }
+      expect(message).toContain(`Its reclaim guard ${lockPath}.reclaim is held by pid ${guardPid}`);
+      expect(message).toContain("Stop that process to free the lock.");
+    } finally {
+      guard.kill("SIGKILL");
+    }
+  });
+
   test.skipIf(process.platform === "win32")(
     "a SIGSTOPped holder with an ancient lockfile is refused; a SIGKILLed one is reclaimed",
     async () => {
