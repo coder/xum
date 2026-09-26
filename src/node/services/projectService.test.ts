@@ -2411,6 +2411,28 @@ exit 1
         config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
       ).toBeUndefined();
     });
+
+    it("keeps the sync error when the rollback write also fails (#4748)", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.writeFile(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+      const realEdit = config.editConfig.bind(config);
+      spyOn(config, "editConfig")
+        .mockImplementationOnce(realEdit)
+        .mockImplementationOnce(() => Promise.reject(new Error("rollback write failed")));
+
+      const thrown = await service
+        .setCodeWorkspaceSyncPath(projectPath, "broken.code-workspace")
+        .catch((error: unknown) => error);
+
+      // The user needs the reason the sync failed, not the secondary rollback failure.
+      expect(thrown).toBeInstanceOf(ORPCError);
+      expect((thrown as Error).message).toContain("not valid JSONC");
+    });
   });
 
   describe("assignWorkspaceToSubProject", () => {

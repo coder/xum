@@ -2080,13 +2080,21 @@ export class ProjectService {
     if (result.ok) {
       return;
     }
-    await this.config.editConfig((config) => {
-      const project = config.projects.get(normalizedPath);
-      if (project?.codeWorkspaceSyncPath === trimmed) {
-        project.codeWorkspaceSyncPath = previousValue;
-      }
-      return config;
-    });
+    // Best effort (#4748): a failed rollback must not replace the sync error the user needs.
+    await this.config
+      .editConfig((config) => {
+        const project = config.projects.get(normalizedPath);
+        if (project?.codeWorkspaceSyncPath === trimmed) {
+          project.codeWorkspaceSyncPath = previousValue;
+        }
+        return config;
+      })
+      .catch((rollbackError: unknown) => {
+        log.warn("Failed to roll back the code workspace sync path", {
+          projectPath: normalizedPath,
+          error: getErrorMessage(rollbackError),
+        });
+      });
     throw new ORPCError("BAD_REQUEST", { message: result.error });
   }
   // ─────────────────────────────────────────────────────────────────────────────

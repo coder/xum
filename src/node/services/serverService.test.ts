@@ -7,6 +7,7 @@ import {
   ServerService,
   computeNetworkBaseUrls,
   getTailscaleBindHosts,
+  setApiServerSettings,
   setServerSshHost,
 } from "./serverService";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -448,5 +449,91 @@ describe("server settings writes (#4444)", () => {
     expect(String(error)).toContain("EACCES");
 
     expect(serverService.getSshHost()).toBe("old-host");
+  });
+
+  function fakeServer(options: { stopError?: Error; startErrors?: Error[] } = {}) {
+    const state = {
+      running: true,
+      stops: 0,
+      starts: [] as Array<{ host: string; port: number }>,
+    };
+    const startErrors = [...(options.startErrors ?? [])];
+    const serverService = {
+      isServerRunning: () => state.running,
+      stopServer: () => {
+        state.stops += 1;
+        if (options.stopError) return Promise.reject(options.stopError);
+        state.running = false;
+        return Promise.resolve();
+      },
+      startServer: (start: { host: string; port: number }) => {
+        state.starts.push({ host: start.host, port: start.port });
+        const error = startErrors.shift();
+        if (error) return Promise.reject(error);
+        state.running = true;
+        return Promise.resolve();
+      },
+      getApiAuthToken: () => "token",
+      getServerInfo: () => null,
+      getTailscaleBindHosts: () => [],
+    };
+    return { state, context: { config, serverService } as unknown as ORPCContext };
+  }
+
+  async function seedApiServerSettings(): Promise<void> {
+    await config.editConfig((value) => ({
+      ...value,
+      apiServerBindHost: "127.0.0.1",
+      apiServerPort: 4321,
+    }));
+  }
+
+  test("a failed settings write leaves a running server untouched (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer();
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("EACCES");
+    expect(state).toEqual({ running: true, stops: 0, starts: [] });
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
+  });
+
+  test("a failed stop puts the previous settings back on disk (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer({ stopError: new Error("close failed") });
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("close failed");
+    // The old server is still up, so disk must describe it, not the requested settings.
+    expect(state.running).toBe(true);
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
+    expect(config.loadConfigOrDefault().apiServerPort).toBe(4321);
+  });
+
+  test("a failed rollback write keeps the start error and still restarts the previous server (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer({ startErrors: [new Error("EADDRINUSE")] });
+    const realEdit = config.editConfig.bind(config);
+    spyOn(config, "editConfig")
+      .mockImplementationOnce(realEdit)
+      .mockImplementationOnce(() => Promise.reject(new Error("rollback write failed")));
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("EADDRINUSE");
+    expect(state.starts).toEqual([
+      { host: "0.0.0.0", port: 9999 },
+      { host: "127.0.0.1", port: 4321 },
+    ]);
+    expect(state.running).toBe(true);
   });
 });

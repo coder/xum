@@ -10253,20 +10253,29 @@ export class WorkspaceService
             error: restoreResult.error,
           });
           if (persistedUnarchivedAt) {
-            await this.config.editConfig((config) => {
-              const projectConfig = config.projects.get(projectPath);
-              const workspaceEntry =
-                projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
-                projectConfig?.workspaces.find((w) => w.path === workspacePath);
-              if (workspaceEntry && workspaceEntry.unarchivedAt === persistedUnarchivedAt) {
-                if (previousUnarchivedAt === undefined) {
-                  delete workspaceEntry.unarchivedAt;
-                } else {
-                  workspaceEntry.unarchivedAt = previousUnarchivedAt;
+            // Best effort (#4748): a failed rollback must not replace the restore error, and the
+            // UI still needs what disk now says.
+            await this.config
+              .editConfig((config) => {
+                const projectConfig = config.projects.get(projectPath);
+                const workspaceEntry =
+                  projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
+                  projectConfig?.workspaces.find((w) => w.path === workspacePath);
+                if (workspaceEntry && workspaceEntry.unarchivedAt === persistedUnarchivedAt) {
+                  if (previousUnarchivedAt === undefined) {
+                    delete workspaceEntry.unarchivedAt;
+                  } else {
+                    workspaceEntry.unarchivedAt = previousUnarchivedAt;
+                  }
                 }
-              }
-              return config;
-            });
+                return config;
+              })
+              .catch((rollbackError: unknown) => {
+                log.warn("Failed to roll back unarchive after a failed snapshot restore", {
+                  workspaceId,
+                  error: getErrorMessage(rollbackError),
+                });
+              });
             await this.emitCurrentWorkspaceMetadata(workspaceId);
           }
           return Err(restoreResult.error);

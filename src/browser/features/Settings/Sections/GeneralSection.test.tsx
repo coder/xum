@@ -3,6 +3,7 @@
 import { installDom } from "../../../../../tests/ui/dom";
 import React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { APIProvider } from "@/browser/contexts/API";
@@ -228,6 +229,7 @@ interface MockAPISetup {
     typeof mock<(input: { enabled: boolean }) => Promise<void>>
   >;
   getSshHostMock: ReturnType<typeof mock<() => Promise<string | null>>>;
+  setSshHostMock: ReturnType<typeof mock<(input: { sshHost: string | null }) => Promise<void>>>;
   /** Mutable backing config, so tests can simulate edits made outside this section. */
   config: MockConfig;
   /** Notifies every live `config.onConfigChanged` subscriber, like the backend does. */
@@ -279,6 +281,7 @@ function createMockAPI(
   });
 
   const getSshHostMock = mock(() => Promise.resolve<string | null>(null));
+  const setSshHostMock = mock((_input: { sshHost: string | null }) => Promise.resolve());
 
   // Minimal stand-in for the backend's config-change event stream: each subscriber
   // counts its own pending notifications.
@@ -336,7 +339,7 @@ function createMockAPI(
       },
       server: {
         getSshHost: getSshHostMock,
-        setSshHost: mock((_input: { sshHost: string | null }) => Promise.resolve()),
+        setSshHost: setSshHostMock,
       },
       projects: {
         getDefaultProjectDir: mock(() => Promise.resolve("")),
@@ -351,6 +354,7 @@ function createMockAPI(
     updateChatTranscriptFullWidthMock,
     updateKeepScreenAwakeMock,
     getSshHostMock,
+    setSshHostMock,
     config,
     emitConfigChanged,
   };
@@ -659,6 +663,25 @@ describe("GeneralSection", () => {
 
     await settleMountLoads(setup);
     expect(setup.view.getByText("SSH Host")).toBeTruthy();
+  });
+
+  test("shows the saved SSH host again when saving an edit fails (#4748)", async () => {
+    const setup = renderGeneralSection();
+    await settleMountLoads(setup);
+    // What the backend still holds after the rejected save.
+    setup.getSshHostMock.mockResolvedValue("saved-host");
+    setup.setSshHostMock.mockRejectedValueOnce(new Error("config write failed"));
+    const label = await setup.view.findByText("SSH Host");
+    const input = label.parentElement?.parentElement?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error("SSH host input not found");
+
+    await userEvent.setup({ document: input.ownerDocument }).type(input, "n");
+
+    // The backend kept the old host, so the field must not keep advertising the unsaved one.
+    await waitFor(() => {
+      expect(setup.setSshHostMock).toHaveBeenCalledWith({ sshHost: "n" });
+      expect(input.value).toBe("saved-host");
+    });
   });
 
   test("loads and persists the full-width chat transcript toggle", async () => {
