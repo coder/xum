@@ -157,16 +157,51 @@ export function getCurrentHighlightedCodeBlockLines(
   return null;
 }
 
+// Streamdown remounts its whole subtree when a message switches between static and streaming
+// mode (the two modes build different trees), e.g. when a stream completes or the transcript
+// backfill ends mid-stream. A remounted CodeBlock loses its Shiki state and would repaint as plain
+// text until the async highlighter answers again, so recent results are kept here to seed it.
+// Bounded because every intermediate streaming highlight lands here and the highlighted HTML of a
+// large block can be hundreds of KB.
+const HIGHLIGHT_CACHE_MAX_ENTRIES = 12;
+const highlightCache = new Map<string, HighlightedCodeBlockLines>();
+
+function highlightCacheKey(code: string, shikiLanguage: string, theme: "light" | "dark"): string {
+  return `${theme}\0${shikiLanguage}\0${code}`;
+}
+
+function readHighlightCache(key: string): HighlightedCodeBlockLines | null {
+  const cached = highlightCache.get(key);
+  if (cached === undefined) return null;
+  // Refresh recency: Map iteration order is insertion order, so the first key is the oldest.
+  highlightCache.delete(key);
+  highlightCache.set(key, cached);
+  return cached;
+}
+
+function writeHighlightCache(key: string, highlighted: HighlightedCodeBlockLines): void {
+  highlightCache.delete(key);
+  highlightCache.set(key, highlighted);
+  while (highlightCache.size > HIGHLIGHT_CACHE_MAX_ENTRIES) {
+    const oldestKey = highlightCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    highlightCache.delete(oldestKey);
+  }
+}
+
 /**
  * CodeBlock component with async Shiki highlighting
  * Displays code with line numbers in a CSS grid
  */
 const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage }) => {
-  const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(null);
-
   const shikiLanguage = highlightLanguage ?? language;
   const { theme: themeMode } = useTheme();
   const theme = isLightThemeMode(themeMode) ? "light" : "dark";
+  const cacheKey = highlightCacheKey(code, shikiLanguage, theme);
+
+  const [highlighted, setHighlighted] = useState<HighlightedCodeBlockLines | null>(() =>
+    readHighlightCache(cacheKey)
+  );
 
   // Split code into lines, removing trailing empty line
   const plainLines = code
@@ -174,6 +209,12 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     .filter((line, idx, arr) => idx < arr.length - 1 || line !== "");
 
   useEffect(() => {
+    const cached = readHighlightCache(cacheKey);
+    if (cached) {
+      setHighlighted(cached);
+      return;
+    }
+
     let cancelled = false;
 
     async function highlight() {
@@ -187,7 +228,9 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
             (line, idx, arr) => idx < arr.length - 1 || line.trim() !== ""
           );
           if (filteredLines.length > 0) {
-            setHighlighted({ code, shikiLanguage, theme, lines: filteredLines });
+            const result = { code, shikiLanguage, theme, lines: filteredLines };
+            writeHighlightCache(cacheKey, result);
+            setHighlighted(result);
           } else {
             setHighlighted(null);
           }
@@ -202,7 +245,7 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ code, language, highlightLanguage
     return () => {
       cancelled = true;
     };
-  }, [code, shikiLanguage, theme]);
+  }, [cacheKey, code, shikiLanguage, theme]);
 
   const messageListContext = useOptionalMessageListContext();
   const openTerminal = messageListContext?.openTerminal;

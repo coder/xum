@@ -136,6 +136,7 @@
     "rehype-harden": "^1.1.5",
     "rehype-sanitize": "^6.0.0",
     "remark-breaks": "^4.0.0",
+    "remend": "1.0.2-canary.0",
     "saxes": "6.0.0",
     "sharp": "^0.34.5",
     "shescape": "^2.1.6",
