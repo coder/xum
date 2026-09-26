@@ -21,8 +21,10 @@ void mock.module("@/browser/assets/logos/xum-logo-light.svg?react", () => ({
 function createStatusStream() {
   const queue: UpdateStatus[] = [];
   let wake: (() => void) | null = null;
-  const onStatus = async function* (_input: undefined, options: { signal: AbortSignal }) {
-    while (!options.signal.aborted) {
+  const onStatus = async function* (_input: unknown, options?: { signal?: AbortSignal }) {
+    const signal = options?.signal;
+    if (!signal) throw new Error("update.onStatus double expects the consumer's abort signal");
+    while (!signal.aborted) {
       const next = queue.shift();
       if (next) {
         yield next;
@@ -30,13 +32,14 @@ function createStatusStream() {
       }
       await new Promise<void>((resolve) => {
         wake = resolve;
-        options.signal.addEventListener("abort", () => resolve(), { once: true });
+        signal.addEventListener("abort", () => resolve(), { once: true });
       });
     }
   };
   return {
-    // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-    api: { update: { onStatus } } as unknown as APIClient,
+    api: createTestApiClient({
+      update: { onStatus: (input, options) => Promise.resolve(onStatus(input, options)) },
+    }),
     push(status: UpdateStatus) {
       queue.push(status);
       wake?.();
@@ -51,6 +54,7 @@ let apiState: { api: APIClient | null; status: "connected" | "reconnecting" } = 
 };
 
 import type { UpdateRestartOverlay as UpdateRestartOverlayComponent } from "./UpdateRestartOverlay";
+import { createTestApiClient } from "@/browser/testUtils";
 
 // Required after the mocks above so the svg stubs are in place when LoadingScreen evaluates.
 /* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */

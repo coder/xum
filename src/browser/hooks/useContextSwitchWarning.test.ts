@@ -15,6 +15,7 @@ import {
 } from "@/browser/utils/modelChange";
 import { getModelKey } from "@/common/constants/storage";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { createTestApiClient } from "@/browser/testUtils";
 
 async function* emptyStream() {
   // no-op
@@ -23,17 +24,16 @@ async function* emptyStream() {
 function createStubApiClient(): APIClient {
   // Avoid mock.module (global) by injecting a minimal client through providers.
   // Keep this stub local unless other tests need the same wiring.
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-  return {
+  return createTestApiClient({
     providers: {
-      getConfig: () => Promise.resolve(null),
+      getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(emptyStream()),
     },
     policy: {
-      get: () => Promise.resolve({ status: { state: "disabled" }, policy: null }),
+      get: () => Promise.resolve({ source: "none", status: { state: "disabled" }, policy: null }),
       onChanged: () => Promise.resolve(emptyStream()),
     },
-  } as unknown as APIClient;
+  });
 }
 
 const stubClient = createStubApiClient();
@@ -57,19 +57,20 @@ const createPolicyChurnClient = () => {
   async function* policyEvents() {
     for (let i = 0; i < 2; i++) {
       await new Promise<void>((resolve) => policyEventResolvers.push(resolve));
-      yield {};
+      yield;
     }
   }
 
-  // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-  const client = {
+  const client = createTestApiClient({
     providers: {
-      getConfig: () => Promise.resolve(null),
+      getConfig: () => Promise.resolve({}),
       onConfigChanged: () => Promise.resolve(emptyStream()),
     },
     policy: {
       get: () =>
         Promise.resolve({
+          // PolicyContext reads a missing source as "none"; the real response always sets one.
+          source: "none",
           status: { state: "enforced" },
           policy: {
             policyFormatVersion: "0.1",
@@ -80,7 +81,7 @@ const createPolicyChurnClient = () => {
         }),
       onChanged: () => Promise.resolve(policyEvents()),
     },
-  } as unknown as APIClient;
+  });
 
   return { client, triggerPolicyEvent };
 };

@@ -5,7 +5,9 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import {
   createControllableAsyncIterable,
+  createTestApiClient,
   type ControllableAsyncIterable,
+  type TestApiOverrides,
 } from "@/browser/testUtils";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
@@ -46,20 +48,8 @@ function createMockIterableSubscription<T>(): ControlledSubscription<T> {
   };
 }
 
-interface SshPromptApi {
-  ssh: {
-    prompt: {
-      subscribe: (
-        _input?: undefined,
-        _options?: { signal?: AbortSignal }
-      ) => Promise<AsyncIterable<SshPromptEvent>>;
-      respond: (input: { requestId: string; response: string }) => Promise<void>;
-    };
-  };
-}
-
 let cleanupDom: (() => void) | null = null;
-let api: SshPromptApi | null = null;
+let api: TestApiOverrides<APIClient> | null = null;
 let respondMock: ReturnType<typeof mock>;
 let subscribeMock: ReturnType<typeof mock>;
 let mockSubscription: ControlledSubscription<SshPromptEvent>;
@@ -76,8 +66,7 @@ function MutableAPIWrapper(props: { children: ReactNode }) {
         api
           ? {
               status: "connected",
-              // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-              api: api as unknown as APIClient,
+              api: createTestApiClient(api),
               error: null,
               authenticate,
               retry,
@@ -128,7 +117,7 @@ describe("SshPromptDialog", () => {
     cleanupDom = installDom();
 
     mockSubscription = createMockIterableSubscription<SshPromptEvent>();
-    respondMock = mock(() => Promise.resolve());
+    respondMock = mock(() => Promise.resolve({ success: true, data: undefined }));
     subscribeMock = mock(() => Promise.resolve(mockSubscription.iterable));
 
     api = {

@@ -9,7 +9,6 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import * as APIModule from "@/browser/contexts/API";
-import type { APIClient } from "@/browser/contexts/API";
 import * as GitStatusStoreModule from "@/browser/stores/GitStatusStore";
 import type { GitStatus } from "@/common/types/workspace";
 import * as CopyToClipboardModule from "@/browser/hooks/useCopyToClipboard";
@@ -17,38 +16,14 @@ import * as PopoverModule from "../Popover/Popover";
 import * as TooltipModule from "../Tooltip/Tooltip";
 
 import { BranchSelector } from "./BranchSelector";
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
-interface ExecuteBashInput {
-  workspaceId: string;
-  script: string;
-  command?: string;
-  args?: string[];
-  options?: {
-    timeout_secs?: number;
-    cwdMode?: "default" | "repo-root";
-  };
-}
+type ExecuteBashInput = Parameters<APIClient["workspace"]["executeBash"]>[0];
 
-type ExecuteBashResult =
-  | {
-      success: true;
-      data: {
-        success: boolean;
-        output?: string;
-        exitCode: number;
-        wall_duration_ms: number;
-        error?: string;
-      };
-    }
-  | { success: false; error: string };
+type ExecuteBashResult = Awaited<ReturnType<APIClient["workspace"]["executeBash"]>>;
 
-interface MockApiClient {
-  workspace: {
-    executeBash: (input: ExecuteBashInput) => Promise<ExecuteBashResult>;
-  };
-}
-
-let mockApi: MockApiClient;
+let mockApi: TestApiOverrides<APIClient>;
 let mockGitStatus: GitStatus | null = null;
 const invalidateGitStatusMock = mock(() => undefined);
 const clearGitStatusMock = mock(() => undefined);
@@ -103,8 +78,7 @@ describe("BranchSelector", () => {
     };
 
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
-      // eslint-disable-next-line local/no-unknown-cast-to-api-client -- #4627 (double needs type repair)
-      api: mockApi as unknown as APIClient,
+      api: createTestApiClient(mockApi),
       status: "connected" as const,
       error: null,
       authenticate: () => undefined,
