@@ -472,6 +472,7 @@ export function createDevToolsMiddleware(
       injectStepIdHeader(params, stepId);
 
       let finalized = false;
+      let doStreamSettled = false;
       let capturedRequestHeaders: Record<string, string> | null = null;
       let rawRequest: unknown = null;
       let responseHeaders: Record<string, string> | null = null;
@@ -548,9 +549,14 @@ export function createDevToolsMiddleware(
       };
 
       const abortHandler = (): void => {
-        // A fetch that ignores the abort may never settle doStream(), so drop the captured
-        // body here (and any later capture) instead of waiting for the paths below.
-        closeCapturedRequestBody(stepId);
+        // Before doStream() settles, a fetch that ignores the abort may never settle it, so
+        // drop the body and refuse later captures. Once it settled, the paths below already
+        // cleaned up; a closed mark here would never be cleared.
+        if (doStreamSettled) {
+          discardCapturedRequestBody(stepId);
+        } else {
+          closeCapturedRequestBody(stepId);
+        }
         void finalizeStep({
           output: buildOutput(),
           usage,
@@ -574,9 +580,11 @@ export function createDevToolsMiddleware(
       let streamResult: LanguageModelV4StreamResult;
       try {
         streamResult = await doStream();
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
         discardCapturedRequestBody(stepId);
       } catch (error) {
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
         await finalizeStep({
           output: null,

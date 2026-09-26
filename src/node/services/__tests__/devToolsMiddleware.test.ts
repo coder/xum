@@ -873,6 +873,31 @@ describe("createDevToolsMiddleware", () => {
       await reader.cancel();
     });
 
+    it("leaves no closed-step mark behind when a started stream is aborted", async () => {
+      const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
+      const middleware = createDevToolsMiddleware("ws-1", service);
+      const wrapStream = getWrapStream(middleware);
+      const abortController = new AbortController();
+      const params = { ...createMockParams(), abortSignal: abortController.signal };
+
+      const result = await wrapStream({
+        doGenerate: () => Promise.reject(new Error("doGenerate should not be called")),
+        doStream: () => Promise.resolve({ stream: new ReadableStream<LanguageModelV4StreamPart>() }),
+        params,
+        model: createMockModel(),
+      });
+      const stepId = params.headers?.[DEVTOOLS_STEP_ID_HEADER];
+      if (typeof stepId !== "string") throw new Error("Expected an injected step id");
+
+      abortController.abort();
+
+      // The fetch already settled, so the abort must not mark the id closed for good: a
+      // capture under that id is accepted again (a leaked mark would drop it).
+      captureAndStripDevToolsHeader(new Headers({ [DEVTOOLS_STEP_ID_HEADER]: stepId }), "{}");
+      expect(consumeRedactedRequestBody(stepId)).toEqual({});
+      await result.stream.cancel();
+    });
+
     it("does not double-finalize when abort fires after normal completion", async () => {
       const service = new DevToolsService(createTestConfig({ sessionsDir, enabled: true }));
       const middleware = createDevToolsMiddleware("ws-1", service);
