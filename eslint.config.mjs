@@ -545,13 +545,13 @@ const localPlugin = {
         type: "problem",
         docs: {
           description:
-            "Require every file-scope bun `mock.module` registration in a test to be restored after the suite",
+            "Require every bun `mock.module` registration in a test to be restored after the suite",
         },
         schema: [
           {
             type: "object",
             properties: {
-              // Repo-relative test path -> specifiers whose file-scope mock may stay unrestored.
+              // Repo-relative test path -> specifiers whose mock may stay unrestored.
               allow: {
                 type: "object",
                 additionalProperties: { type: "array", items: { type: "string" } },
@@ -562,28 +562,40 @@ const localPlugin = {
         ],
         messages: {
           unrestored:
-            'File-scope mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`, or inject the dependency instead of mocking the module.',
+            'mock.module("{{specifier}}") leaks into every later test file in the same bun process (`mock.restore()` does not undo module mocks). Restore it with `restoreModulesAfterSuite([["{{specifier}}", { ...realModule }]])` from tests/ui/moduleMocks, re-register the real exports in `afterAll`/`afterEach`, or inject the dependency instead of mocking the module.',
           dynamicSpecifier:
-            "File-scope mock.module needs a string-literal specifier so its restore can be verified.",
+            "mock.module needs a statically known specifier (a string literal, a `const` string, or a loop over a `const` array of them) so its restore can be verified.",
         },
       },
       create(context) {
-        // bun registers mock.module process-wide and never unregisters it, so a file-scope
-        // mock silently replaces the module for every test file that runs later in the same
-        // shard. That made unrelated suites fail only for certain CI shard orders (#4524,
-        // #3359). A mock inside a test/hook callback is not file scope; one inside `afterAll`
-        // counts as a restore; `describe` callbacks run at file load, so they stay file scope.
-        // Mocks installed from hooks or local helpers leak too, but files usually pair them with
-        // restore helpers that only call-graph analysis could match, so this rule checks file
-        // scope only (hook/helper-installed leaks: #4639).
+        // bun registers mock.module process-wide and never unregisters it, so a mock silently
+        // replaces the module for every test file that runs later in the same shard, whether it
+        // was registered at file scope, from a hook, a test body or a helper. That made
+        // unrelated suites fail only for certain CI shard orders (#4524, #3359, #4639).
+        //
+        // A registration counts as a restore when it runs from an `afterAll`/`afterEach`
+        // callback, directly or through same-file functions those callbacks call (restore
+        // helpers such as `restoreXModuleMocks()`), or when `restoreModulesAfterSuite` lists
+        // the specifier. Every other registration needs a restore of the same specifier.
         const allowed = new Set(
           context.options[0]?.allow?.[
             path.relative(context.cwd, context.filename).split(path.sep).join("/")
           ] ?? []
         );
-        const fileScopeMocks = [];
-        const restored = new Set();
+        const RESTORE_HOOKS = new Set(["afterAll", "afterEach"]);
+        const mocks = [];
+        const restoreListed = new Set();
+        // Function node -> names of same-file functions it calls.
+        const callsByFunction = new Map();
+        // Function name -> function nodes declared/assigned under that name.
+        const functionsByName = new Map();
+        // `afterAll`/`afterEach` callbacks.
+        const restoreHookCallbacks = [];
 
+        const isFunctionNode = (node) =>
+          node.type === "ArrowFunctionExpression" ||
+          node.type === "FunctionExpression" ||
+          node.type === "FunctionDeclaration";
         const isMockModuleCall = (node) =>
           node.callee.type === "MemberExpression" &&
           !node.callee.computed &&
@@ -591,8 +603,110 @@ const localPlugin = {
           node.callee.object.name === "mock" &&
           node.callee.property.type === "Identifier" &&
           node.callee.property.name === "module";
-        const getStringLiteral = (node) =>
-          node?.type === "Literal" && typeof node.value === "string" ? node.value : null;
+        const unwrapTypeAssertions = (node) => {
+          let current = node;
+          while (current?.type === "TSAsExpression" || current?.type === "TSSatisfiesExpression") {
+            current = current.expression;
+          }
+          return current;
+        };
+        const findVariable = (identifier) => {
+          for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (variable) {
+              return variable;
+            }
+          }
+          return null;
+        };
+        // Element nodes of a statically known array: an array literal (spreads of other known
+        // arrays included) or a `const` bound to one.
+        const resolveArrayElements = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Identifier") {
+            const def = findVariable(node)?.defs[0];
+            return def?.type === "Variable" && def.parent.kind === "const"
+              ? resolveArrayElements(def.node.init, depth + 1)
+              : null;
+          }
+          if (node.type !== "ArrayExpression") {
+            return null;
+          }
+          const elements = [];
+          for (const element of node.elements) {
+            if (element?.type === "SpreadElement") {
+              const spread = resolveArrayElements(element.argument, depth + 1);
+              if (spread == null) {
+                return null;
+              }
+              elements.push(...spread);
+            } else if (element != null) {
+              elements.push(element);
+            }
+          }
+          return elements;
+        };
+        // Every specifier string an expression can evaluate to, or null when not static. Covers
+        // literals, `const` strings, and loop variables over known arrays (`for (const p of
+        // PATHS)`, `for (const [p, exports] of realModules)`), so looped installs and restores
+        // stay checkable.
+        const resolveSpecifiers = (rawNode, depth = 0) => {
+          const node = unwrapTypeAssertions(rawNode);
+          if (depth > 5 || node == null) {
+            return null;
+          }
+          if (node.type === "Literal") {
+            return typeof node.value === "string" ? [node.value] : null;
+          }
+          if (node.type === "TemplateLiteral") {
+            return node.expressions.length === 0 ? [node.quasis[0].value.cooked] : null;
+          }
+          if (node.type !== "Identifier") {
+            return null;
+          }
+          const def = findVariable(node)?.defs[0];
+          if (def?.type !== "Variable") {
+            return null;
+          }
+          const declarator = def.node;
+          const declaration = def.parent;
+          if (
+            declaration.parent?.type === "ForOfStatement" &&
+            declaration.parent.left === declaration
+          ) {
+            const elements = resolveArrayElements(declaration.parent.right, depth + 1);
+            if (elements == null) {
+              return null;
+            }
+            let pick;
+            if (declarator.id.type === "Identifier") {
+              pick = (element) => element;
+            } else if (
+              declarator.id.type === "ArrayPattern" &&
+              declarator.id.elements[0]?.type === "Identifier" &&
+              declarator.id.elements[0].name === node.name
+            ) {
+              pick = (element) => (element.type === "ArrayExpression" ? element.elements[0] : null);
+            } else {
+              return null;
+            }
+            const specifiers = [];
+            for (const element of elements) {
+              const resolved = resolveSpecifiers(pick(element), depth + 1);
+              if (resolved == null) {
+                return null;
+              }
+              specifiers.push(...resolved);
+            }
+            return specifiers;
+          }
+          return declaration.kind === "const" && declarator.id.type === "Identifier"
+            ? resolveSpecifiers(declarator.init, depth + 1)
+            : null;
+        };
         const getCalleeRootName = (callee) => {
           let current = callee;
           while (current.type === "MemberExpression" || current.type === "CallExpression") {
@@ -605,19 +719,49 @@ const localPlugin = {
           fn.parent?.type === "CallExpression" && fn.parent.arguments.includes(fn)
             ? getCalleeRootName(fn.parent.callee)
             : null;
+        const getFunctionName = (fn) => {
+          if (fn.type === "FunctionDeclaration") {
+            return fn.id?.name ?? null;
+          }
+          if (fn.parent?.type === "VariableDeclarator" && fn.parent.id.type === "Identifier") {
+            return fn.parent.id.name;
+          }
+          return null;
+        };
+        const enclosingFunction = (node) =>
+          context.sourceCode.getAncestors(node).findLast((ancestor) => isFunctionNode(ancestor)) ??
+          null;
 
         return {
+          ":function"(node) {
+            if (RESTORE_HOOKS.has(getCallbackOwner(node))) {
+              restoreHookCallbacks.push(node);
+            }
+            const name = getFunctionName(node);
+            if (name != null) {
+              const list = functionsByName.get(name) ?? [];
+              list.push(node);
+              functionsByName.set(name, list);
+            }
+          },
           CallExpression(node) {
+            if (node.callee.type === "Identifier") {
+              const caller = enclosingFunction(node);
+              if (caller != null) {
+                const callees = callsByFunction.get(caller) ?? new Set();
+                callees.add(node.callee.name);
+                callsByFunction.set(caller, callees);
+              }
+            }
             if (
               node.callee.type === "Identifier" &&
-              node.callee.name === "restoreModulesAfterSuite" &&
-              node.arguments[0]?.type === "ArrayExpression"
+              node.callee.name === "restoreModulesAfterSuite"
             ) {
-              for (const entry of node.arguments[0].elements) {
-                const specifier =
-                  entry?.type === "ArrayExpression" ? getStringLiteral(entry.elements[0]) : null;
-                if (specifier != null) {
-                  restored.add(specifier);
+              for (const entry of resolveArrayElements(node.arguments[0]) ?? []) {
+                const specifiers =
+                  entry.type === "ArrayExpression" ? resolveSpecifiers(entry.elements[0]) : null;
+                for (const specifier of specifiers ?? []) {
+                  restoreListed.add(specifier);
                 }
               }
               return;
@@ -627,32 +771,46 @@ const localPlugin = {
             }
             const enclosingFunctions = context.sourceCode
               .getAncestors(node)
-              .filter(
-                (ancestor) =>
-                  ancestor.type === "ArrowFunctionExpression" ||
-                  ancestor.type === "FunctionExpression" ||
-                  ancestor.type === "FunctionDeclaration"
-              );
-            const specifier = getStringLiteral(node.arguments[0]);
-            if (enclosingFunctions.some((fn) => getCallbackOwner(fn) === "afterAll")) {
-              if (specifier != null) {
-                restored.add(specifier);
-              }
-              return;
-            }
-            if (enclosingFunctions.some((fn) => getCallbackOwner(fn) !== "describe")) {
-              return;
-            }
-            if (specifier == null) {
-              context.report({ node, messageId: "dynamicSpecifier" });
-              return;
-            }
-            fileScopeMocks.push({ node, specifier });
+              .filter((ancestor) => isFunctionNode(ancestor));
+            mocks.push({ node, enclosingFunctions });
           },
           "Program:exit"() {
-            for (const { node, specifier } of fileScopeMocks) {
-              if (!restored.has(specifier) && !allowed.has(specifier)) {
-                context.report({ node, messageId: "unrestored", data: { specifier } });
+            // Functions that run from a restore hook: the hook callbacks themselves plus every
+            // same-file function reachable from them by name.
+            const restoreFunctions = new Set();
+            const pending = [...restoreHookCallbacks];
+            while (pending.length > 0) {
+              const fn = pending.pop();
+              if (restoreFunctions.has(fn)) {
+                continue;
+              }
+              restoreFunctions.add(fn);
+              for (const name of callsByFunction.get(fn) ?? []) {
+                pending.push(...(functionsByName.get(name) ?? []));
+              }
+            }
+
+            const restored = new Set(restoreListed);
+            const installs = [];
+            for (const { node, enclosingFunctions } of mocks) {
+              const specifiers = resolveSpecifiers(node.arguments[0]);
+              if (enclosingFunctions.some((fn) => restoreFunctions.has(fn))) {
+                for (const specifier of specifiers ?? []) {
+                  restored.add(specifier);
+                }
+                continue;
+              }
+              if (specifiers == null) {
+                context.report({ node, messageId: "dynamicSpecifier" });
+                continue;
+              }
+              installs.push({ node, specifiers });
+            }
+            for (const { node, specifiers } of installs) {
+              for (const specifier of specifiers) {
+                if (!restored.has(specifier) && !allowed.has(specifier)) {
+                  context.report({ node, messageId: "unrestored", data: { specifier } });
+                }
               }
             }
           },
