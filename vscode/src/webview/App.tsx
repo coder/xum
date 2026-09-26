@@ -179,9 +179,20 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     scheduledRenderRef.current = { kind: "timeout", id };
   };
 
-  // useAutoScroll moved to a sentinel/overflow-anchor design (#3201); the webview has not been
-  // ported yet, so it only uses the scroll container ref, scroll handler and jump-to-bottom.
-  const { contentRef, handleScroll, jumpToBottom } = useAutoScroll();
+  // useAutoScroll releases the bottom lock only for scrolls preceded by user intent (wheel,
+  // pointer, keyboard, touch), so those handlers must be on the scroll container. The
+  // sentinel/overflow-anchor bottom-stick is not ported to the webview yet (#4626).
+  const {
+    contentRef,
+    handleScroll,
+    jumpToBottom,
+    markUserScrollIntent,
+    handleScrollContainerWheel,
+    handleScrollContainerMouseDown,
+    handleScrollContainerMouseMove,
+    handleScrollContainerMouseUp,
+    handleScrollContainerKeyDown,
+  } = useAutoScroll();
 
   const jumpToBottomRef = useRef(jumpToBottom);
   jumpToBottomRef.current = jumpToBottom;
@@ -526,6 +537,12 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     ref={contentRef}
                     className="flex-1 overflow-y-auto p-3"
                     onScroll={handleScroll}
+                    onWheel={handleScrollContainerWheel}
+                    onMouseDown={handleScrollContainerMouseDown}
+                    onMouseMove={handleScrollContainerMouseMove}
+                    onMouseUp={handleScrollContainerMouseUp}
+                    onKeyDown={handleScrollContainerKeyDown}
+                    onTouchMove={markUserScrollIntent}
                   >
                     <div>
                       {selectedWorkspaceId ? (
