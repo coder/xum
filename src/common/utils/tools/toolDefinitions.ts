@@ -1338,6 +1338,7 @@ const TaskRemoveToolBaseResultSchema = z.object({
   taskId: z.string(),
   workspaceId: z.string().optional(),
   descendantTaskIds: z.array(z.string()).optional(),
+  paths: z.array(z.string()).optional(),
   error: z.string().optional(),
 });
 
@@ -3186,7 +3187,7 @@ export const TOOL_DEFINITIONS = {
   task_remove: {
     resultSchema: TaskRemoveToolResultSchema,
     description:
-      "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
+      "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first. A target whose checkout holds uncommitted or untracked work, or commits not captured by a ready patch artifact, is refused (status error, with the paths); only the user can discard that work.",
     schema: TaskRemoveToolArgsSchema,
   },
   task_workspace_lifecycle: {

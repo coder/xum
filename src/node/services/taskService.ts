@@ -177,7 +177,12 @@ import {
   resolvePersistedAgentId,
   resolvePersistedAgentIdCandidates,
 } from "@/common/utils/agentIds";
-import { GitPatchArtifactService } from "@/node/services/gitPatchArtifactService";
+import {
+  buildTaskBaseCommitShaByProjectPath,
+  getPrimaryProjectName,
+  GitPatchArtifactService,
+} from "@/node/services/gitPatchArtifactService";
+import { findUnpreservedSubagentWork } from "@/node/services/subagentRemovalWorkCheck";
 import { getWorkspaceProjectRepos } from "@/node/services/workspaceProjectRepos";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -230,6 +235,7 @@ import {
   AgentReportSubmittedReportSchema,
   TaskToolResultSchema,
   TaskToolArgsSchema,
+  type SubagentGitPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { formatSendMessageError } from "@/node/services/utils/sendMessageError";
@@ -289,6 +295,11 @@ export class AgentReportWaitTimeoutError extends Error {
     super("Timed out waiting for agent_report");
     this.name = "AgentReportWaitTimeoutError";
   }
+}
+
+/** "refuse" is for model-driven task_remove (#4723); user-confirmed and automatic removals omit it. */
+export interface SubagentRemovalOptions {
+  lossyWorkPolicy?: "refuse";
 }
 
 interface TaskParentAiMeta {
@@ -13430,19 +13441,21 @@ export class TaskService implements AgentTaskIntegration {
 
   async removeInactiveDescendantAgentTask(
     ownerWorkspaceId: string,
-    taskId: string
+    taskId: string,
+    options?: SubagentRemovalOptions
   ): Promise<Result<WorkspaceLifecycleResult, string>> {
     assert(ownerWorkspaceId.length > 0, "removeInactiveDescendantAgentTask requires owner");
     assert(taskId.length > 0, "removeInactiveDescendantAgentTask requires taskId");
 
     return await this.withTaskTreeLifecycleLock(taskId, () =>
-      this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(ownerWorkspaceId, taskId)
+      this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(ownerWorkspaceId, taskId, options)
     );
   }
 
   private async removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
     ownerWorkspaceId: string,
-    taskId: string
+    taskId: string,
+    options?: SubagentRemovalOptions
   ): Promise<Result<WorkspaceLifecycleResult, string>> {
     const config = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(config, taskId);
@@ -13498,19 +13511,25 @@ export class TaskService implements AgentTaskIntegration {
       // child worktree is the source needed to recover that artifact.
       await this.gitPatchArtifactService.waitForGeneration(taskId);
       const parentWorkspaceId = entry.workspace.parentWorkspaceId;
-      if (parentWorkspaceId) {
-        const patchArtifact = await readSubagentGitPatchArtifact(
-          path.join(this.config.sessionsDir, parentWorkspaceId),
-          taskId
-        );
-        if (patchArtifact?.status === "pending") {
-          return Ok({
-            status: "error",
-            action: "remove",
-            ...target,
-            error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
-          });
-        }
+      const patchArtifact = parentWorkspaceId
+        ? await readSubagentGitPatchArtifact(
+            path.join(this.config.sessionsDir, parentWorkspaceId),
+            taskId
+          )
+        : null;
+      if (patchArtifact?.status === "pending") {
+        return Ok({
+          status: "error",
+          action: "remove",
+          ...target,
+          error: "Cannot remove the sub-agent while its git patch artifact is still pending.",
+        });
+      }
+      // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
+      if (options?.lossyWorkPolicy === "refuse") {
+        const refusal = await this.refuseLossySubagentRemoval(taskId, entry, patchArtifact ?? null);
+        if (refusal != null)
+          return Ok({ status: "error", action: "remove", ...target, ...refusal });
       }
 
       const tombstoneResult = await this.persistRemovedAgentTaskTombstones(taskId);
@@ -13524,6 +13543,74 @@ export class TaskService implements AgentTaskIntegration {
           : { status: "error", action: "remove", ...target, error: result.error }
       );
     });
+  }
+
+  /**
+   * #4723: a model's task_remove must not discard a child's unsaved work (the rule #3950 applies
+   * to peer archives). Returns the refusal fields, or null when removal loses nothing.
+   */
+  private async refuseLossySubagentRemoval(
+    taskId: string,
+    entry: { projectPath: string; workspace: WorkspaceConfigEntry },
+    patchArtifact: SubagentGitPatchArtifact | null
+  ): Promise<{ error: string; paths?: string[] } | null> {
+    const ws = entry.workspace;
+    // isolation "none" children share the parent's checkout, which removal never deletes.
+    if (ws.taskIsolation === "none") return null;
+    const workspacePath = coerceNonEmptyString(ws.path);
+    const workspaceName = coerceNonEmptyString(ws.name);
+    const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
+    const check =
+      workspacePath == null || workspaceName == null
+        ? Err("the checkout path is unknown")
+        : await findUnpreservedSubagentWork({
+            runtime: createRuntimeForWorkspace({
+              runtimeConfig,
+              projectPath: entry.projectPath,
+              name: workspaceName,
+              namedWorkspacePath: workspacePath,
+            }),
+            projectRepos: getWorkspaceProjectRepos({
+              workspaceId: taskId,
+              workspaceName,
+              workspacePath,
+              runtimeConfig,
+              projectPath: entry.projectPath,
+              projectName: getPrimaryProjectName(entry.projectPath, ws.projects),
+              projects: ws.projects,
+            }),
+            patchArtifact,
+            taskBaseCommitShaByProjectPath: buildTaskBaseCommitShaByProjectPath({
+              projectPath: entry.projectPath,
+              projects: ws.projects,
+              taskBaseCommitSha: coerceNonEmptyString(ws.taskBaseCommitSha),
+              taskBaseCommitShaByProjectPath: ws.taskBaseCommitShaByProjectPath,
+            }),
+          });
+    // No per-sub-agent removal with a dirty-checkout confirmation exists in the UI today; the
+    // parent deletion dialog is the user-confirmed path that removes sub-agents.
+    const guidance =
+      "This tool cannot approve losing a sub-agent's work, and you must not delete that work to get around it. " +
+      "Leave the sub-agent in place and tell the user what it holds; the user can save or clear it and ask you to retry, " +
+      "or delete the parent workspace, whose confirmation dialog lists the sub-agents it removes.";
+    if (!check.success) {
+      return {
+        error: `Cannot verify that removing this sub-agent keeps its work (${check.error}), so it was not removed. ${guidance}`,
+      };
+    }
+    const work = check.data;
+    if (work.kind === "none") return null;
+    const lost = [
+      ...(work.paths.length > 0 ? ["the uncommitted or untracked files listed in paths"] : []),
+      ...(work.uncapturedCommitCount > 0
+        ? [`${work.uncapturedCommitCount} commit(s) not captured by a ready patch artifact`]
+        : []),
+    ];
+    assert(lost.length > 0, "a lossy removal result must name what would be lost");
+    return {
+      error: `Removing this sub-agent would permanently delete ${lost.join(" and ")}. ${guidance}`,
+      ...(work.paths.length > 0 ? { paths: work.paths } : {}),
+    };
   }
 
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[] {

@@ -779,7 +779,7 @@ interface GitStatusPorcelainEntry {
   status: string;
 }
 
-function parseGitStatusPorcelainZ(stdout: string): GitStatusPorcelainEntry[] {
+export function parseGitStatusPorcelainZ(stdout: string): GitStatusPorcelainEntry[] {
   const entriesByPath: GitStatusPorcelainEntry[] = [];
   const entries = stdout.split("\0");
   for (let i = 0; i < entries.length; i += 1) {

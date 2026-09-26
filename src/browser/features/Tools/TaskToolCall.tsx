@@ -1914,8 +1914,12 @@ interface TaskRemoveToolCallProps {
 export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion(false);
   const results = props.result?.results ?? [];
-  const displayResults: Array<{ taskId: string; status?: string; error?: string }> =
-    results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
+  const displayResults: Array<{
+    taskId: string;
+    status?: string;
+    error?: string;
+    paths?: string[];
+  }> = results.length > 0 ? results : props.args.task_ids.map((taskId) => ({ taskId }));
   const removed = results.filter((result) => result.status === "removed").length;
   return (
     <ToolContainer expanded={expanded}>
@@ -1940,6 +1944,11 @@ export const TaskRemoveToolCall: React.FC<TaskRemoveToolCallProps> = (props) => 
                 {result.error != null && (
                   <div className="text-danger mt-1 text-[11px]">{result.error}</div>
                 )}
+                {result.paths?.map((filePath) => (
+                  <div key={filePath} className="text-secondary font-mono text-[11px] break-all">
+                    {filePath}
+                  </div>
+                ))}
               </div>
             ))}
           </div>
