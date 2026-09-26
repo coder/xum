@@ -81,6 +81,8 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
     }
   };
 
+  const HoldDescription = props.consentSupported ? "div" : DialogDescription;
+
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
       <DialogContent className="max-h-[90vh] max-w-[calc(100vw-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:max-w-lg">
@@ -133,12 +135,14 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
                 <div id="agent-message-hold-label" className="text-foreground text-sm font-medium">
                   Hold agent messages until the turn ends
                 </div>
-                <div className="text-muted mt-1 text-xs">
+                {/* Radix links the dialog to exactly one Description; the hold copy takes that role when the
+                    consent row (which holds it otherwise) is hidden on remote runtimes. */}
+                <HoldDescription className="text-muted mt-1 text-xs">
                   Off by default: while this chat is busy, messages that agents send it (from its
                   sub-agents, sibling tasks, and other workspaces) arrive after the next step. Turn
                   on to make them wait for the current turn to end. Sub-agent reports are not
                   affected.
-                </div>
+                </HoldDescription>
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {savingSetting === "hold" && (
