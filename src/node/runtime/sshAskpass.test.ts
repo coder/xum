@@ -153,7 +153,7 @@ describe("sshAskpass", () => {
 
         session.cleanup();
         expect(() => session.cleanup()).not.toThrow();
-        expect(fs.existsSync(session.env.MUX_ASKPASS_DIR)).toBe(false);
+        await expect(fs.promises.access(session.env.MUX_ASKPASS_DIR)).rejects.toThrow();
       } finally {
         watch.mockRestore();
       }
