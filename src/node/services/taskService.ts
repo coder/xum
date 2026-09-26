@@ -11692,7 +11692,11 @@ export class TaskService implements AgentTaskIntegration {
     // restrictions that are not in history yet, and promotion never overtakes it, so a wake queued
     // behind it would run after it with older grants. A queued tool-end entry already cuts this
     // turn, and the turn it starts sees the report. Both cases defer to the idle drain.
+    // An owner that holds agent messages until its turn ends is never cut (#4737): the idle drain
+    // delivers the report when the turn ends. Re-read with the other checks so a preference
+    // change acknowledged during the awaits below applies.
     const liveTurnStillCuttable = (): boolean =>
+      this.resolveRecipientDispatchMode(ownerWorkspaceId, undefined) === "tool-end" &&
       this.aiService.isStreaming(ownerWorkspaceId) &&
       !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
       this.workspaceService.promotedToolEndWouldLeadQueue(ownerWorkspaceId);
@@ -12496,6 +12500,9 @@ export class TaskService implements AgentTaskIntegration {
         parentEntry,
         content: reportContent,
         queueDedupeKey: `${dedupePrefix}${toolCallId}`,
+        // Reports are agent messages too (#4737): a parent that holds agent messages until its
+        // turn ends gets this update at turn end instead of being cut at the next step.
+        queueDispatchMode: this.resolveRecipientDispatchMode(parentWorkspaceId, undefined),
         // Only the queue head's dispatch mode can cut the parent's stream. A child's earlier
         // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
         // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.

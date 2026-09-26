@@ -1876,6 +1876,69 @@ describe("TaskService", () => {
     );
   });
 
+  test("terminal report waits for the turn to end when the parent holds agent messages", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-hold-111";
+    const childTaskId = "task-hold-222";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+          agentMessageDispatchMode: "turn-end",
+        }),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        },
+      ],
+      testTaskSettings()
+    );
+    let parentStreaming = true;
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock(
+        (workspaceId: string) => workspaceId === parentWorkspaceId && parentStreaming
+      ),
+    });
+    const liveTurn = Symbol("parent-turn");
+    const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks({
+      getActiveTurnGeneration: mock(() => (parentStreaming ? liveTurn : undefined)),
+    });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+      parts: [{ type: "text", text: "Hello from child" }],
+    });
+    await flushTerminalAttentionDrains(taskService);
+
+    // Mid-turn: no tool-end wake cuts the busy parent.
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(resumeStream).not.toHaveBeenCalled();
+
+    // At turn end the idle drain delivers the report.
+    parentStreaming = false;
+    taskService.scheduleTerminalAttentionDrain(parentWorkspaceId);
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(resumeStream).toHaveBeenCalledWith(
+      parentWorkspaceId,
+      expect.anything(),
+      expect.objectContaining({ acceptanceOrigin: "automatic" })
+    );
+  });
+
   for (const [name, wakeWouldLead, replaceTurnAfterDelivery, expectCut] of [
     // Hidden turn-end entries (peer messages, heartbeats) are overtaken by the promoted wake.
     ["only hidden turn-end work is queued", true, false, true],

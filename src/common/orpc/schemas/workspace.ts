@@ -149,7 +149,7 @@ export function getValidUnrelatedWorkspaceConsent(value: unknown): string | unde
  * the current turn ends, even if the sender asked for tool-end.
  */
 export const AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION =
-  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports are not affected.';
+  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports follow the same setting.';
 
 export const AgentMessageDispatchModeSchema = z.enum(["tool-end", "turn-end"]);
 export type AgentMessageDispatchMode = z.infer<typeof AgentMessageDispatchModeSchema>;

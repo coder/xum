@@ -3520,6 +3520,49 @@ describe("TaskService", () => {
     ).toBeNull();
   });
 
+  for (const [name, parentHold, expectedMode] of [
+    ["a parent that holds agent messages waits for its turn to end", "turn-end", "turn-end"],
+    ["a parent with the default preference is cut at the next step", undefined, "tool-end"],
+  ] satisfies Array<[string, "turn-end" | undefined, "turn-end" | "tool-end"]>) {
+    test(`agent_report wake: ${name}`, async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = "parent-progress-hold";
+      const childId = "child-progress-hold";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId, {
+            ...(parentHold != null ? { agentMessageDispatchMode: parentHold } : {}),
+          }),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_review_child",
+            parentWorkspaceId: parentId,
+            agentType: "review",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      await taskService.reportAgentProgress(childId, "progress-1", {
+        reportMarkdown: "Found a correctness issue.",
+      });
+
+      // Only a tool-end queue entry cuts the parent's busy turn; a turn-end entry dispatches
+      // when that turn ends.
+      expect(sendMessage).toHaveBeenCalledWith(
+        parentId,
+        expect.stringContaining("Found a correctness issue."),
+        expect.objectContaining({ queueDispatchMode: expectedMode }),
+        expect.anything()
+      );
+    });
+  }
+
   test("agent_report refuses an update whose run ended before the wake was sent", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

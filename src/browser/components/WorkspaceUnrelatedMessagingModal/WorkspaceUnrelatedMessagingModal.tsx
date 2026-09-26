@@ -140,8 +140,7 @@ export function WorkspaceUnrelatedMessagingModal(props: WorkspaceUnrelatedMessag
                 <HoldDescription className="text-muted mt-1 text-xs">
                   Off by default: while this chat is busy, messages that agents send it (from its
                   sub-agents, sibling tasks, and other workspaces) arrive after the next step. Turn
-                  on to make them wait for the current turn to end. Sub-agent reports are not
-                  affected.
+                  on to make them, including sub-agent reports, wait for the current turn to end.
                 </HoldDescription>
               </div>
               <div className="flex shrink-0 items-center gap-2">
