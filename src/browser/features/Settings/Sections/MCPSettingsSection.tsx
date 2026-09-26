@@ -1333,7 +1333,9 @@ export const MCPSettingsSection: React.FC = () => {
                   Loading servers…
                 </div>
               ) : Object.keys(servers).length === 0 ? (
-                <p className="text-content-secondary py-2 text-sm">No MCP servers configured yet.</p>
+                <p className="text-content-secondary py-2 text-sm">
+                  No MCP servers configured yet.
+                </p>
               ) : (
                 Object.entries(servers).map(([name, entry]) => {
                   const isTesting = testingServer === name;
@@ -1405,11 +1407,15 @@ export const MCPSettingsSection: React.FC = () => {
                                 </TooltipContent>
                               </Tooltip>
                             )}
-                            {!isEnabled && <span className="text-content-secondary text-xs">disabled</span>}
+                            {!isEnabled && (
+                              <span className="text-content-secondary text-xs">disabled</span>
+                            )}
                           </div>
                           {isEditing ? (
                             <div className="mt-2 space-y-2">
-                              <p className="text-content-secondary text-xs">transport: {editing.transport}</p>
+                              <p className="text-content-secondary text-xs">
+                                transport: {editing.transport}
+                              </p>
                               <input
                                 type="text"
                                 value={editing.value}
@@ -1632,7 +1638,10 @@ export const MCPSettingsSection: React.FC = () => {
               </summary>
               <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
                 <div>
-                  <label htmlFor="server-name" className="text-content-secondary mb-1 block text-xs">
+                  <label
+                    htmlFor="server-name"
+                    className="text-content-secondary mb-1 block text-xs"
+                  >
                     Name
                   </label>
                   <input
@@ -1679,7 +1688,10 @@ export const MCPSettingsSection: React.FC = () => {
                 </div>
 
                 <div>
-                  <label htmlFor="server-value" className="text-content-secondary mb-1 block text-xs">
+                  <label
+                    htmlFor="server-value"
+                    className="text-content-secondary mb-1 block text-xs"
+                  >
                     {newServer.transport === "stdio" ? "Command" : "URL"}
                   </label>
                   <input
@@ -1700,7 +1712,9 @@ export const MCPSettingsSection: React.FC = () => {
 
                 {newServer.transport !== "stdio" && (
                   <div>
-                    <label className="text-content-secondary mb-1 block text-xs">HTTP headers (optional)</label>
+                    <label className="text-content-secondary mb-1 block text-xs">
+                      HTTP headers (optional)
+                    </label>
                     <MCPHeadersEditor
                       rows={newServer.headersRows}
                       onChange={(rows) =>
