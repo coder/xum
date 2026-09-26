@@ -56,8 +56,6 @@ export type BeforeSendInput =
   | (Parameters<typeof buildAutoCompactionFollowUp>[0] & {
       stage: "pressure";
       replacement: boolean;
-      /** Internal sends (compaction follow-ups, guidance, wakes) are not user turns. */
-      synthetic: boolean;
       /** Request-owned cancellation performs the original queue/admission bookkeeping. */
       cancelBeforeAcceptance(): Promise<boolean>;
     })

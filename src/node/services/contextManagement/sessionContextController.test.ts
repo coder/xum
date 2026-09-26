@@ -90,8 +90,6 @@ test("one factory gives each controller independent pressure latches over one pe
   expect(monitorOf(first).checkMidStream(pressure)).toBe(false);
   // A disabled threshold never interrupts, whatever the latch state.
   expect(monitorOf(second).checkMidStream({ ...pressure, threshold: 1 })).toBe(false);
-  // A user turn lifts the no-relief guard (#4421), so only the stream latch is exercised here.
-  monitorOf(first).noteUserTurn();
   expect(first.onStreamStarting()).toBeUndefined();
   expect(monitorOf(first).checkMidStream(pressure)).toBe(true);
   expect(events).toHaveLength(2);

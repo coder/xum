@@ -54,14 +54,15 @@ interface CheckMidStreamParams {
 export class CompactionMonitor {
   private hasTriggeredForCurrentStream = false;
   /**
-   * Set when auto-compaction triggers; cleared by a user turn or by a live mid-stream usage reading
-   * below the threshold (proof that compaction relieved the pressure). While set, pressure that
-   * stays high does not auto-compact again: when compaction cannot bring usage under the
-   * threshold (a huge system prompt, or a provider reporting constant usage), every follow-up
-   * would otherwise compact again in a loop (#4421). Clearing on relief, not only on a user
-   * turn, keeps long autonomous runs (sub-agents never get user turns) able to compact again.
+   * Usage percent a live reading must fall under to prove the last auto-compaction helped: the
+   * level that triggered it. `null` when no unrelieved auto-compaction is pending. While set,
+   * pressure that stays high does not auto-compact again: when compaction cannot bring usage
+   * under its trigger (a huge system prompt, or a provider reporting constant usage), every
+   * follow-up would otherwise compact again in a loop (#4421). A user turn also clears it.
+   * Clearing on relief, not only on a user turn, keeps long autonomous runs (sub-agents never
+   * get user turns) able to compact again.
    */
-  private awaitingRelief = false;
+  private reliefBelowPercent: number | null = null;
 
   constructor(
     private readonly workspaceId: string,
@@ -145,7 +146,9 @@ export class CompactionMonitor {
     const forceThresholdPercent = params.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
     // Relief counts only from a live provider reading of the prompt. The on-send usage state
     // right after a compaction is an estimate (the summary's size), not a reading.
-    if (usagePercent < params.threshold * 100) this.awaitingRelief = false;
+    if (this.reliefBelowPercent !== null && usagePercent < this.reliefBelowPercent) {
+      this.reliefBelowPercent = null;
+    }
 
     if (usagePercent < forceThresholdPercent) {
       return false;
@@ -169,23 +172,27 @@ export class CompactionMonitor {
 
   /** A real user turn re-arms auto-compaction even while pressure stays high. */
   noteUserTurn(): void {
-    this.awaitingRelief = false;
+    this.reliefBelowPercent = null;
+  }
+
+  /** Arms the guard once an auto-compaction request was actually sent. */
+  noteAutoCompactionStarted(triggerPercent: number): void {
+    assert(Number.isFinite(triggerPercent), "noteAutoCompactionStarted requires a finite percent");
+    this.reliefBelowPercent = triggerPercent;
   }
 
   /**
    * Returns true, and logs, when an auto-compaction must be skipped because the previous one
-   * brought no relief and no user turn happened since. Otherwise arms the guard and returns false:
-   * the caller then runs the compaction.
+   * brought no relief and no user turn happened since.
    */
   suppressRepeatedAutoCompaction(reason: "on-send" | "mid-stream", usagePercent: number): boolean {
-    if (this.awaitingRelief) {
+    if (this.reliefBelowPercent !== null) {
       log.warn(
         "Skipping auto-compaction: the previous auto-compaction did not bring usage under the threshold and no user turn happened since",
         { workspaceId: this.workspaceId, reason, usagePercent: Math.round(usagePercent) }
       );
       return true;
     }
-    this.awaitingRelief = true;
     return false;
   }
 

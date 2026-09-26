@@ -292,6 +292,7 @@ describe("AgentSession workspace-turn correlation inheritance", () => {
           checkMidStream: mock(() => false),
           resetForNewStream: mock(() => undefined),
           noteUserTurn: mock(() => undefined),
+          noteAutoCompactionStarted: mock(() => undefined),
           suppressRepeatedAutoCompaction: mock(() => false),
         };
 

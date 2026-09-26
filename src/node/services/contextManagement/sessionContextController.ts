@@ -17,6 +17,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { log } from "../log";
+import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { ContinuousStrategy } from "./strategies/continuous";
 import { SummarizeStrategy } from "./strategies/summarize";
 import { resolveContextStrategy } from "./selection";
@@ -187,6 +188,11 @@ export class SessionContextController {
       input.stream.contextBudgetFlushTurn
       ? (step: SettledStepBudget) => this.tokenBudget.onContextBudgetStepSettled(step)
       : undefined;
+  }
+
+  /** A real user turn re-arms auto-compaction after one that brought no relief (#4421). */
+  noteUserTurn(): void {
+    this.compactionMonitor.noteUserTurn();
   }
 
   onStreamStarting(): void {
@@ -360,8 +366,11 @@ export class SessionContextController {
       openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
     });
 
-    if (shouldInterruptForCompaction) {
-      await this.summarize.interruptForCompaction();
+    // Arm the no-relief guard only once a compaction request was actually sent (#4421).
+    if (shouldInterruptForCompaction && (await this.summarize.interruptForCompaction())) {
+      this.compactionMonitor.noteAutoCompactionStarted(
+        threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
+      );
     }
   }
 
@@ -391,8 +400,6 @@ export class SessionContextController {
     const modelForStream = input.modelForStream;
     const optionsForStream = input.options;
     const providersConfigForCompaction = this.host.state.providersConfig;
-    // A real user turn re-arms auto-compaction after one that brought no relief (#4421).
-    if (!input.agentInitiated && !input.synthetic) this.compactionMonitor.noteUserTurn();
     // Recover before measuring pressure so the old pre-swap usage cannot force another fold.
     if (await this.recover()) this.host.transitionContextState("invalidate");
     // One threshold per admission decision: resolved from persisted preferences here and
@@ -444,6 +451,12 @@ export class SessionContextController {
         compactionResult.usagePercentage
       )
     ) {
+      // Relief means a live reading under the level that triggered this compaction.
+      this.compactionMonitor.noteAutoCompactionStarted(
+        continuousContext.enabled
+          ? threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
+          : compactionResult.thresholdPercentage
+      );
       this.reset("legacy-fallback");
       const followUpFileParts = input.fileParts?.map((part) => ({
         url: part.url,

@@ -2102,6 +2102,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       checkMidStream: () => false,
       resetForNewStream: () => undefined,
       noteUserTurn: () => undefined,
+      noteAutoCompactionStarted: () => undefined,
       suppressRepeatedAutoCompaction: () => false,
     } as unknown as CompactionMonitor;
 

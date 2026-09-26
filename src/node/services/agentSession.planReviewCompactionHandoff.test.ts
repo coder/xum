@@ -47,6 +47,7 @@ async function fixture() {
     checkMidStream: mock(() => false),
     resetForNewStream: mock(() => undefined),
     noteUserTurn: mock(() => undefined),
+    noteAutoCompactionStarted: mock(() => undefined),
     suppressRepeatedAutoCompaction: mock(() => false),
   } as unknown as CompactionMonitor;
   const rows = async (): Promise<MuxMessage[]> => {
@@ -173,6 +174,7 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
       noteUserTurn: mock(() => undefined),
+      noteAutoCompactionStarted: mock(() => undefined),
       suppressRepeatedAutoCompaction: mock(() => false),
     } as unknown as CompactionMonitor;
 
@@ -261,6 +263,7 @@ describe("plan-review feedback diverted into on-send auto-compaction", () => {
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
       noteUserTurn: mock(() => undefined),
+      noteAutoCompactionStarted: mock(() => undefined),
       suppressRepeatedAutoCompaction: mock(() => false),
     } as unknown as CompactionMonitor;
     expect(await restarted.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
@@ -372,6 +375,7 @@ describe("plan-review feedback whose snapshot or threads leave history before it
       checkMidStream: mock(() => false),
       resetForNewStream: mock(() => undefined),
       noteUserTurn: mock(() => undefined),
+      noteAutoCompactionStarted: mock(() => undefined),
       suppressRepeatedAutoCompaction: mock(() => false),
     } as unknown as CompactionMonitor;
   }
