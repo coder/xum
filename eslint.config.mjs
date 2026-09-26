@@ -813,13 +813,34 @@ const localPlugin = {
         },
       },
       create(context) {
+        // Whether a type name refers to APIClient, including an aliased import
+        // (`import type { APIClient as Client }`).
+        const isApiClientName = (identifier) => {
+          if (identifier.name === "APIClient") {
+            return true;
+          }
+          for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (variable) {
+              const def = variable.defs[0];
+              return (
+                def?.type === "ImportBinding" &&
+                def.node.type === "ImportSpecifier" &&
+                (def.node.imported.name ?? def.node.imported.value) === "APIClient"
+              );
+            }
+          }
+          return false;
+        };
         return {
           // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
           // (one report per chain, since the inner `as unknown` does not target APIClient).
-          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name='APIClient']"(
+          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.type='Identifier']"(
             node
           ) {
-            context.report({ node, messageId: "cast" });
+            if (isApiClientName(node.typeAnnotation.typeName)) {
+              context.report({ node, messageId: "cast" });
+            }
           },
         };
       },
