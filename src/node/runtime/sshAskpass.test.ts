@@ -153,7 +153,11 @@ describe("sshAskpass", () => {
 
         session.cleanup();
         expect(() => session.cleanup()).not.toThrow();
-        await expect(fs.promises.access(session.env.MUX_ASKPASS_DIR)).rejects.toThrow();
+        const dirRemoved = await fs.promises.access(session.env.MUX_ASKPASS_DIR).then(
+          () => false,
+          () => true
+        );
+        expect(dirRemoved).toBe(true);
       } finally {
         watch.mockRestore();
       }
