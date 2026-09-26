@@ -23,7 +23,7 @@ import {
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import {
   readPersistedState,
   syncPersistedStateFromBackend,
@@ -38,7 +38,7 @@ import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 // Helper to create test workspace metadata with default runtime config
 const createWorkspaceMetadata = (
@@ -247,10 +247,7 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() =>
       expect(
-        workspaceApi.onChat.mock.calls.some(
-          ([{ workspaceId }]: [{ workspaceId: string }, ...unknown[]]) =>
-            workspaceId === "ws-sync-load"
-        )
+        workspaceApi.onChat.mock.calls.some(([input]) => input?.workspaceId === "ws-sync-load")
       ).toBe(true)
     );
   });
@@ -2149,7 +2146,7 @@ async function setupWithProjectContext() {
   }
 
   render(
-    <APIProvider client={currentClientMock as APIClient}>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
@@ -2161,7 +2158,7 @@ async function setupWithProjectContext() {
   );
 
   // Inject client immediately to handle race conditions where effects run before store update.
-  getWorkspaceStoreRaw().setClient(currentClientMock as APIClient);
+  getWorkspaceStoreRaw().setClient(createTestApiClient(currentClientMock));
   await waitFor(() => expect(workspaceRef.current).toBeTruthy());
   await waitFor(() => expect(projectRef.current).toBeTruthy());
 
@@ -2169,9 +2166,9 @@ async function setupWithProjectContext() {
 }
 
 interface MockAPIOptions {
-  workspace?: RecursivePartial<APIClient["workspace"]>;
-  projects?: RecursivePartial<APIClient["projects"]>;
-  server?: RecursivePartial<APIClient["server"]>;
+  workspace?: TestApiOverrides<APIClient["workspace"]>;
+  projects?: TestApiOverrides<APIClient["projects"]>;
+  server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
   locationHash?: string;
   locationPath?: string;

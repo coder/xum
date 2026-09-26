@@ -1057,22 +1057,58 @@ const localPlugin = {
         };
       },
     },
-    // `x as unknown as APIClient` in tests hides typos and wrong return types in API doubles.
-    // createTestApiClient (src/browser/testUtils.ts) type-checks the partial double instead.
-    "no-unknown-cast-to-api-client": {
+    // Casting an API double to APIClient in tests hides typos and wrong return types: the
+    // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
+    // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
+    // type-checks the partial double instead.
+    "no-cast-to-api-client": {
       meta: {
         type: "problem",
-        docs: { description: "Disallow `as unknown as APIClient` in tests" },
+        docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
         messages: {
-          cast: "Use createTestApiClient() from @/browser/testUtils instead of `as unknown as APIClient`: it type-checks the double against the real procedure types.",
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient: it type-checks the double against the real procedure types.",
         },
       },
       create(context) {
+        // Whether a type name refers to APIClient, including an aliased import
+        // (`import type { APIClient as Client }`) or a local alias (`type Client = APIClient`).
+        const isApiClientName = (identifier, depth = 0) => {
+          if (identifier.name === "APIClient") {
+            return true;
+          }
+          if (depth > 5) {
+            return false;
+          }
+          for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
+            const variable = scope.set.get(identifier.name);
+            if (!variable) {
+              continue;
+            }
+            const def = variable.defs[0];
+            if (def?.type === "ImportBinding") {
+              return (
+                def.node.type === "ImportSpecifier" &&
+                (def.node.imported.name ?? def.node.imported.value) === "APIClient"
+              );
+            }
+            const aliased = def?.type === "Type" ? def.node.typeAnnotation : null;
+            return (
+              aliased?.type === "TSTypeReference" &&
+              aliased.typeName.type === "Identifier" &&
+              isApiClientName(aliased.typeName, depth + 1)
+            );
+          }
+          return false;
+        };
         return {
-          "TSAsExpression[expression.type='TSAsExpression'][expression.typeAnnotation.type='TSUnknownKeyword'][typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.name='APIClient']"(
+          // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
+          // (one report per chain, since the inner `as unknown` does not target APIClient).
+          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.type='Identifier']"(
             node
           ) {
-            context.report({ node, messageId: "cast" });
+            if (isApiClientName(node.typeAnnotation.typeName)) {
+              context.report({ node, messageId: "cast" });
+            }
           },
         };
       },
@@ -2245,7 +2281,7 @@ export default defineConfig([
     // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
     // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
     files: ["tests/**/*.{ts,tsx}"],
-    // Registered so repo-wide test rules (e.g. local/no-unknown-cast-to-api-client on
+    // Registered so repo-wide test rules (e.g. local/no-cast-to-api-client on
     // **/*.test.ts) resolve here too.
     plugins: {
       local: localPlugin,
@@ -2294,7 +2330,7 @@ export default defineConfig([
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
-      "local/no-unknown-cast-to-api-client": "error",
+      "local/no-cast-to-api-client": "error",
       "local/require-module-mock-restore": [
         "error",
         {

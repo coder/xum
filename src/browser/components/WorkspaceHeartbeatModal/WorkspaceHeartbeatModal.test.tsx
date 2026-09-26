@@ -7,7 +7,8 @@ import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
 import * as APIModule from "@/browser/contexts/API";
-import type { APIClient, UseAPIResult } from "@/browser/contexts/API";
+import type { UseAPIResult } from "@/browser/contexts/API";
+import { createTestApiClient, createTestConfig, type TestClientConfig } from "@/browser/testUtils";
 import * as WorkspaceHeartbeatHookModule from "@/browser/hooks/useWorkspaceHeartbeat";
 import type { HeartbeatFormSettings } from "@/browser/hooks/useWorkspaceHeartbeat";
 import {
@@ -69,10 +70,7 @@ interface WorkspaceHeartbeatTestAPI {
     };
   };
   config: {
-    getConfig: () => Promise<{
-      heartbeatDefaultIntervalMs?: number;
-      heartbeatDefaultPrompt?: string;
-    }>;
+    getConfig: () => Promise<TestClientConfig>;
   };
 }
 
@@ -89,7 +87,7 @@ function createHeartbeatSettings(
 
 function createConnectedUseAPIResult(api: WorkspaceHeartbeatTestAPI): ConnectedUseAPIResult {
   return {
-    api: api as APIClient,
+    api: createTestApiClient(api),
     status: "connected",
     error: null,
     authenticate: () => undefined,
@@ -209,10 +207,12 @@ describe("WorkspaceHeartbeatModal", () => {
       Promise.resolve({ success: true as const, data: undefined })
     );
     const getConfigMock = mock(() =>
-      Promise.resolve({
-        heartbeatDefaultIntervalMs: globalIntervalMs,
-        heartbeatDefaultPrompt: globalPrompt,
-      })
+      Promise.resolve(
+        createTestConfig({
+          heartbeatDefaultIntervalMs: globalIntervalMs,
+          heartbeatDefaultPrompt: globalPrompt,
+        })
+      )
     );
     const mockApi: WorkspaceHeartbeatTestAPI = {
       workspace: {
