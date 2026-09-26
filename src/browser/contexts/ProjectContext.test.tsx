@@ -93,7 +93,7 @@ describe("ProjectContext", () => {
     currentClientMock = {
       ...currentClientMock,
       config: {
-        onConfigChanged: onConfigChanged as unknown as APIClient["config"]["onConfigChanged"],
+        onConfigChanged,
       },
     };
 

@@ -803,9 +803,8 @@ const localPlugin = {
     // Casting an API double to APIClient in tests hides typos and wrong return types: the
     // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
     // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
-    // type-checks the partial double instead. The name predates the single-cast ban; it is
-    // kept so existing eslint-disable comments stay valid.
-    "no-unknown-cast-to-api-client": {
+    // type-checks the partial double instead.
+    "no-cast-to-api-client": {
       meta: {
         type: "problem",
         docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
@@ -1993,7 +1992,7 @@ export default defineConfig([
     // tests/ (IPC, e2e, runtime, UI harness) is type-checked by tsconfig.json; lint it with the
     // same type-aware base rules as src/. src/-only architecture rules stay scoped to src/.
     files: ["tests/**/*.{ts,tsx}"],
-    // Registered so repo-wide test rules (e.g. local/no-unknown-cast-to-api-client on
+    // Registered so repo-wide test rules (e.g. local/no-cast-to-api-client on
     // **/*.test.ts) resolve here too.
     plugins: {
       local: localPlugin,
@@ -2042,7 +2041,7 @@ export default defineConfig([
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
-      "local/no-unknown-cast-to-api-client": "error",
+      "local/no-cast-to-api-client": "error",
       "local/require-module-mock-restore": [
         "error",
         {
