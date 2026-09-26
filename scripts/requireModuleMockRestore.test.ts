@@ -135,3 +135,37 @@ test("a restore hook covers only installs inside its describe block", () => {
     `)
   ).toEqual([]);
 });
+
+test("helper installs belong to the suites that call them", () => {
+  expect(
+    reported(`
+      function install() { mock.module("a", () => ({})); }
+      describe("restores", () => {
+        beforeEach(install);
+        afterEach(() => { mock.module("a", () => real); });
+      });
+    `)
+  ).toEqual([]);
+  expect(
+    reported(`
+      function install() { mock.module("a", () => ({})); }
+      describe("earlier", () => { afterEach(() => { mock.module("a", () => real); }); });
+      describe("later", () => { beforeEach(() => install()); });
+    `)
+  ).toEqual(["a"]);
+});
+
+test("restores that never run do not count", () => {
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      describe.skip("skipped", () => { afterAll(() => { mock.module("a", () => real); }); });
+    `)
+  ).toEqual(["a"]);
+  expect(
+    reported(`
+      function registerCleanup() { restoreModulesAfterSuite([["a", real]]); }
+      beforeEach(() => { mock.module("a", () => ({})); });
+    `)
+  ).toEqual(["a"]);
+});

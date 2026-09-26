@@ -577,8 +577,11 @@ const localPlugin = {
         // `afterAll`/`afterEach` callback, or inside a same-file function whose every use is a
         // call from teardown code (or its registration as the hook callback itself). A helper
         // that setup code also calls is an installer. `restoreModulesAfterSuite` entries are
-        // restores too. A restore covers installs inside the `describe` block its hook belongs
-        // to; file-level installs run at load, before any suite, so any restore covers them.
+        // restores too. A restore covers installs in the `describe` block (or file) its hook
+        // runs in, including nested blocks; load-time installs run before every test, so any
+        // restore that runs covers them. Skipped suites and never-called helpers do not run.
+        // This is a lint heuristic for the repo's idioms, not a proof: mutating a restore list
+        // after the fact or passing helpers around dynamically is not modeled.
         const allowed = new Set(
           context.options[0]?.allow?.[
             path.relative(context.cwd, context.filename).split(path.sep).join("/")
@@ -588,8 +591,6 @@ const localPlugin = {
         const { sourceCode } = context;
         const mockCalls = [];
         const restoreListCalls = [];
-        // Identifiers passed straight to a restore hook, e.g. `afterEach(restoreMocks)`.
-        const hookReferences = new Set();
 
         const isFunctionNode = (node) =>
           node?.type === "ArrowFunctionExpression" ||
@@ -713,40 +714,136 @@ const localPlugin = {
           }
           return current.type === "Identifier" ? current.name : null;
         };
-        // Name of the call (e.g. "afterAll", "describe") a function is passed to, if any.
-        const getCallbackOwner = (fn) =>
-          fn.parent?.type === "CallExpression" && fn.parent.arguments.includes(fn)
-            ? getCalleeRootName(fn.parent.callee)
-            : null;
-        const enclosingFunctions = (node) =>
-          sourceCode.getAncestors(node).filter((ancestor) => isFunctionNode(ancestor));
-        // Innermost `describe` callback around a node, or null at file level.
-        const suiteOf = (node) =>
-          sourceCode
-            .getAncestors(node)
-            .findLast(
-              (ancestor) => isFunctionNode(ancestor) && getCallbackOwner(ancestor) === "describe"
-            ) ?? null;
-        const suiteContains = (suite, node) =>
-          suite == null || (suite.range[0] <= node.range[0] && node.range[1] <= suite.range[1]);
+        const SUITE_CALLS = new Set(["describe", "xdescribe"]);
+        const HOOK_CALLS = new Set(["beforeAll", "beforeEach", "afterAll", "afterEach"]);
+        const TEST_CALLS = new Set(["test", "it", "xtest", "xit"]);
+        // `describe.skip(...)`, `test.todo(...)`, `xit(...)`: the callback never runs.
+        const isSkippedCall = (call) => {
+          const root = getCalleeRootName(call.callee);
+          if (root?.startsWith("x")) {
+            return true;
+          }
+          for (
+            let callee = call.callee;
+            callee.type === "MemberExpression";
+            callee = callee.object
+          ) {
+            if (
+              !callee.computed &&
+              callee.property.type === "Identifier" &&
+              (callee.property.name === "skip" || callee.property.name === "todo")
+            ) {
+              return true;
+            }
+          }
+          return false;
+        };
+        const isFunctionContext = (node) => isFunctionNode(node) || node.type === "Program";
+        const enclosingContext = (node) =>
+          sourceCode.getAncestors(node).findLast((ancestor) => isFunctionContext(ancestor));
         // The function a variable names: `function f() {}` or `const f = () => {}`.
         const functionOfVariable = (variable) => {
-          const def = variable.defs[0];
+          const def = variable?.defs[0];
           if (def?.type === "FunctionName") {
             return def.node;
           }
           return def?.type === "Variable" && isFunctionNode(def.node.init) ? def.node.init : null;
         };
+        const variableOfFunction = (fn) => {
+          const id =
+            fn.type === "FunctionDeclaration"
+              ? fn.id
+              : fn.parent?.type === "VariableDeclarator"
+                ? fn.parent.id
+                : null;
+          return id?.type === "Identifier" ? findVariable(id) : null;
+        };
+        const suiteIsWithin = (inner, outer) =>
+          outer === null ||
+          (inner !== null && outer.range[0] <= inner.range[0] && inner.range[1] <= outer.range[1]);
+
+        // Where a function (or the Program) runs:
+        // - suites: the `describe` callbacks (null = the whole file) whose tests execute it; empty
+        //   when it never runs (skipped suites, dead helpers);
+        // - atLoad: it runs while the file evaluates, before any test;
+        // - teardown: it runs only from `afterAll`/`afterEach`.
+        // Named helpers take the union over their call sites, resolved by binding, so a helper
+        // that setup code also calls is not teardown and its installs belong to every suite that
+        // calls it.
+        const contextInfo = new Map();
+        const NEVER = { suites: new Set(), atLoad: false, teardown: false };
+        const infoOf = (fn) => {
+          const known = contextInfo.get(fn);
+          if (known) {
+            return known;
+          }
+          contextInfo.set(fn, NEVER); // cycle guard
+          const info = computeInfo(fn);
+          contextInfo.set(fn, info);
+          return info;
+        };
+        const computeInfo = (fn) => {
+          if (fn.type === "Program") {
+            return { suites: new Set([null]), atLoad: true, teardown: false };
+          }
+          const call =
+            fn.parent?.type === "CallExpression" && fn.parent.arguments.includes(fn)
+              ? fn.parent
+              : null;
+          const owner = call ? getCalleeRootName(call.callee) : null;
+          if (call && (SUITE_CALLS.has(owner) || HOOK_CALLS.has(owner) || TEST_CALLS.has(owner))) {
+            const outer = infoOf(enclosingContext(call));
+            if (isSkippedCall(call) || outer.suites.size === 0) {
+              return NEVER;
+            }
+            if (SUITE_CALLS.has(owner)) {
+              return { suites: new Set([fn]), atLoad: true, teardown: false };
+            }
+            return { suites: outer.suites, atLoad: false, teardown: RESTORE_HOOKS.has(owner) };
+          }
+          const variable = variableOfFunction(fn);
+          const reads = variable?.references.filter((reference) => reference.isRead()) ?? [];
+          if (reads.length === 0) {
+            // Anonymous callbacks and IIFEs run wherever their enclosing code runs; an unused
+            // named function never runs.
+            return variable ? NEVER : infoOf(enclosingContext(fn));
+          }
+          const suites = new Set();
+          let atLoad = false;
+          let teardown = true;
+          for (const reference of reads) {
+            const identifier = reference.identifier;
+            const parent = identifier.parent;
+            let site;
+            if (parent.type === "CallExpression" && parent.callee === identifier) {
+              site = infoOf(enclosingContext(parent));
+            } else if (
+              parent.type === "CallExpression" &&
+              parent.arguments.includes(identifier) &&
+              HOOK_CALLS.has(getCalleeRootName(parent.callee))
+            ) {
+              // `beforeEach(install)` / `afterEach(restore)`.
+              const outer = infoOf(enclosingContext(parent));
+              site = isSkippedCall(parent)
+                ? NEVER
+                : {
+                    suites: outer.suites,
+                    atLoad: false,
+                    teardown: RESTORE_HOOKS.has(getCalleeRootName(parent.callee)),
+                  };
+            } else {
+              // Passed around or stored: assume it runs where it is defined, not as teardown.
+              site = { ...infoOf(enclosingContext(fn)), teardown: false };
+            }
+            site.suites.forEach((suite) => suites.add(suite));
+            atLoad ||= site.atLoad;
+            teardown &&= site.teardown;
+          }
+          return { suites, atLoad, teardown };
+        };
 
         return {
           CallExpression(node) {
-            if (node.callee.type === "Identifier" && RESTORE_HOOKS.has(node.callee.name)) {
-              for (const argument of node.arguments) {
-                if (argument.type === "Identifier") {
-                  hookReferences.add(argument);
-                }
-              }
-            }
             if (
               node.callee.type === "Identifier" &&
               node.callee.name === "restoreModulesAfterSuite"
@@ -758,73 +855,7 @@ const localPlugin = {
               mockCalls.push(node);
             }
           },
-          "Program:exit"(program) {
-            // Teardown-only functions -> the suites whose teardown runs them.
-            const teardownSuites = new Map();
-            const candidates = [];
-            const collect = (scope) => {
-              for (const variable of scope.variables) {
-                const fn = functionOfVariable(variable);
-                if (fn != null) {
-                  candidates.push({ variable, fn });
-                }
-              }
-              scope.childScopes.forEach(collect);
-            };
-            collect(sourceCode.getScope(program));
-            const hookCallbacks = [];
-            const walkForHooks = (scope) => {
-              if (isFunctionNode(scope.block) && RESTORE_HOOKS.has(getCallbackOwner(scope.block))) {
-                hookCallbacks.push(scope.block);
-              }
-              scope.childScopes.forEach(walkForHooks);
-            };
-            walkForHooks(sourceCode.getScope(program));
-            for (const fn of hookCallbacks) {
-              teardownSuites.set(fn, new Set([suiteOf(fn)]));
-            }
-            // Fixpoint: a function joins once every read of its binding is a call from a
-            // teardown-only function or its registration as a restore hook callback.
-            let changed = true;
-            while (changed) {
-              changed = false;
-              for (const { variable, fn } of candidates) {
-                if (teardownSuites.has(fn)) {
-                  continue;
-                }
-                const reads = variable.references.filter((reference) => reference.isRead());
-                if (reads.length === 0) {
-                  continue;
-                }
-                const suites = new Set();
-                const onlyTeardown = reads.every((reference) => {
-                  const identifier = reference.identifier;
-                  if (hookReferences.has(identifier)) {
-                    suites.add(suiteOf(identifier));
-                    return true;
-                  }
-                  if (
-                    identifier.parent.type !== "CallExpression" ||
-                    identifier.parent.callee !== identifier
-                  ) {
-                    return false;
-                  }
-                  const caller = enclosingFunctions(identifier.parent).findLast((candidate) =>
-                    teardownSuites.has(candidate)
-                  );
-                  if (caller == null) {
-                    return false;
-                  }
-                  teardownSuites.get(caller).forEach((suite) => suites.add(suite));
-                  return true;
-                });
-                if (onlyTeardown) {
-                  teardownSuites.set(fn, suites);
-                  changed = true;
-                }
-              }
-            }
-
+          "Program:exit"() {
             const restores = [];
             for (const node of restoreListCalls) {
               const specifiers = new Set();
@@ -833,31 +864,35 @@ const localPlugin = {
                   (resolveSpecifiers(entry.elements[0]) ?? []).forEach((s) => specifiers.add(s));
                 }
               }
-              restores.push({ specifiers, suites: new Set([suiteOf(node)]) });
+              // It registers an `afterAll` in each suite its call runs in.
+              restores.push({ specifiers, suites: infoOf(enclosingContext(node)).suites });
             }
             const installs = [];
             for (const node of mockCalls) {
+              const info = infoOf(enclosingContext(node));
               const specifiers = resolveSpecifiers(node.arguments[0]);
-              const teardownFn = enclosingFunctions(node).findLast((fn) => teardownSuites.has(fn));
-              if (teardownFn != null) {
-                restores.push({
-                  specifiers: new Set(specifiers ?? []),
-                  suites: teardownSuites.get(teardownFn),
-                });
+              if (info.teardown) {
+                restores.push({ specifiers: new Set(specifiers ?? []), suites: info.suites });
               } else if (specifiers == null) {
                 context.report({ node, messageId: "dynamicSpecifier" });
-              } else {
-                installs.push({ node, specifiers });
+              } else if (info.suites.size > 0) {
+                installs.push({ node, specifiers, info });
               }
             }
-            for (const { node, specifiers } of installs) {
-              const fileLevel = suiteOf(node) == null;
+            for (const { node, specifiers, info } of installs) {
               for (const specifier of specifiers) {
-                const covered = restores.some(
-                  (restore) =>
-                    restore.specifiers.has(specifier) &&
-                    (fileLevel || [...restore.suites].some((suite) => suiteContains(suite, node)))
+                const matching = restores.filter(
+                  (restore) => restore.specifiers.has(specifier) && restore.suites.size > 0
                 );
+                // A load-time install precedes every test, so any restore that runs covers it.
+                // Otherwise each suite that installs needs a restore in it or an enclosing suite.
+                const covered = info.atLoad
+                  ? matching.length > 0
+                  : [...info.suites].every((suite) =>
+                      matching.some((restore) =>
+                        [...restore.suites].some((outer) => suiteIsWithin(suite, outer))
+                      )
+                    );
                 if (!covered && !allowed.has(specifier)) {
                   context.report({ node, messageId: "unrestored", data: { specifier } });
                 }
