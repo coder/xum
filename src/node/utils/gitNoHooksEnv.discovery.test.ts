@@ -554,6 +554,8 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
         `      head -c "$XUM_TEST_GIT_FAULT_STDERR_BYTES" /dev/zero | tr '\\0' x >&2`,
         "    fi",
         '    if [ "$XUM_TEST_GIT_FAULT_EXIT" = kill ]; then kill -9 $$; fi',
+        // Signals the test that this query started, then blocks until the tree is killed.
+        '    if [ "$XUM_TEST_GIT_FAULT_EXIT" = hang ]; then : > "$XUM_TEST_GIT_LOG.hung"; exec sleep 60; fi',
         '    exit "$XUM_TEST_GIT_FAULT_EXIT" ;;',
         "  esac",
         "fi",
@@ -579,6 +581,16 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
     /** The legacy outcome where it differs by design; "skip" where it is racy. */
     legacy?: (() => Outcome) | "skip";
   }> = [
+    // rev-parse stdout is discarded, so its size no longer matters. The legacy discovery capped it
+    // at 1 KiB and failed closed.
+    {
+      name: "rev-parse prints over 1 KiB then exits 0",
+      match: "rev-parse --git-dir",
+      exit: "0",
+      stdout: "x".repeat(2048),
+      expected: baseEnv,
+      legacy: () => ({ error: AUTOMATION }),
+    },
     // Only exit 128 means "not a repository".
     {
       name: "rev-parse exits 3",
@@ -665,6 +677,41 @@ describe.skipIf(process.platform === "win32")("injected git failures (POSIX)", (
       TEST_TIMEOUT_MS
     );
   }
+
+  // One abort covers the whole spawn, so an abort mid-discovery reads as the automation failure
+  // instead of the step it interrupted (the legacy discovery reported the worktree config step).
+  // The hung query keeps the output pipes open, so this also fails if the tree is not killed.
+  test(
+    "an abort during the worktree config query fails closed",
+    async () => {
+      const repo = await makeRepo(root.path, "abort-mid");
+      process.env.XUM_TEST_GIT_FAULT_MATCH = "--bool extensions.worktreeConfig";
+      process.env.XUM_TEST_GIT_FAULT_EXIT = "hang";
+      const abortOnceHung = async (impl: Discovery) => {
+        const hung = `${log}.hung`;
+        await fs.rm(hung, { force: true });
+        const controller = new AbortController();
+        let settled = false;
+        const outcome = discover(repo, false, controller.signal, impl).finally(() => {
+          settled = true;
+        });
+        while (!settled && !(await exists(hung))) await Bun.sleep(10);
+        controller.abort();
+        const abortedAt = Date.now();
+        const result = await outcome;
+        // Well under the 10 s timeout, which would also fail closed and hide an ignored abort.
+        expect(Date.now() - abortedAt).toBeLessThan(5_000);
+        return result;
+      };
+      expect(await abortOnceHung(gitNoRepoAutomationEnvForLocalRepo)).toEqual({
+        error: AUTOMATION,
+      });
+      expect(await abortOnceHung(legacyGitNoRepoAutomationEnvForLocalRepo)).toEqual({
+        error: WORKTREE,
+      });
+    },
+    TEST_TIMEOUT_MS
+  );
 
   test(
     "runs the expected git queries with LC_ALL=C after rev-parse",
