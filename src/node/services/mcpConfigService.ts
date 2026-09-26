@@ -166,7 +166,7 @@ export class MCPConfigService {
     // without re-deriving precedence. Plugin and managed entries stay untagged.
     const servers = Object.fromEntries(
       Object.entries(await this.mergeServerLayers(layers)).map(([name, info]) => {
-        const configLayer = Object.hasOwn(layers.project, name)
+        const configLayer: MCPServerInfo["configLayer"] = Object.hasOwn(layers.project, name)
           ? "project"
           : Object.hasOwn(layers.global, name)
             ? "global"
