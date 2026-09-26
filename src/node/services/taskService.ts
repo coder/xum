@@ -6517,15 +6517,15 @@ export class TaskService implements AgentTaskIntegration {
 
   /**
    * Reclaim a launch's checkout whose stale plugin overrides could not be sanitized. Nothing
-   * re-sanitizes a retained checkout before a later resume sends into it, so it must go — but
-   * only once no backend can re-admit its row: the row is unpublished first, in one config edit
-   * (edits run on fresh bytes under the cross-process registration lock), and only while it still
-   * names `expectedAttemptId`, the attempt this process owns and launched. The removal is also
-   * confirmed from the persisted bytes (belt and braces; a failed save rejects, #4444). The checkout
-   * and session dir are named after the task id, so no other task can reuse them once the row is
-   * gone. Anything short of a confirmed unpublication — no or another owner, a moved row, a lost
-   * or unverifiable write — retains everything; the failure is then recorded on the row.
-   * Returns whether the row was unpublished and the checkout reclaimed.
+   * re-sanitizes a retained checkout before a later resume sends into it, so it must go — but only
+   * once no backend can re-admit its row: the row is unpublished first, in one config edit (edits
+   * run on fresh bytes under the cross-process registration lock), and only while it still names
+   * `expectedAttemptId`, the attempt this process owns and launched. The removal is also confirmed
+   * from the persisted bytes (belt and braces; a failed save rejects, #4444). The checkout and
+   * session dir are named after the task id, so no other task can reuse them once the row is gone.
+   * Anything short of a confirmed unpublication — no or another owner, a moved row, a lost or
+   * unverifiable write — retains everything; the failure is then recorded on the row. Returns
+   * whether the row was unpublished and the checkout reclaimed.
    */
   private async reclaimUnsanitizedTaskCheckout(
     runtime: Runtime,

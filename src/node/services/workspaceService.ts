@@ -3213,11 +3213,10 @@ export class WorkspaceService
   }
 
   /**
-   * Roll back a just-persisted workspace registration and VERIFY it left the
-   * on-disk config. A removeWorkspace that rejects or whose write another writer
-   * replaced can leave the entry persisted — after a restart that entry would resurrect with the unsanitized overrides file
-   * this rollback exists to keep unreachable. Returns whether the entry is
-   * provably gone from disk.
+   * Roll back a just-persisted workspace registration and VERIFY it left the on-disk config. A
+   * removeWorkspace that rejects or whose write another writer replaced can leave the entry
+   * persisted — after a restart that entry would resurrect with the unsanitized overrides file this
+   * rollback exists to keep unreachable. Returns whether the entry is provably gone from disk.
    */
   private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -7687,8 +7686,8 @@ export class WorkspaceService
     if (granted == null) {
       return undefined;
     }
-    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a write another writer
-    // replaced. Report only what discovery and admission will actually read.
+    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
+    // write another writer replaced. Report only what discovery and admission will actually read.
     const persisted = getValidUnrelatedWorkspaceConsent(
       findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
         .unrelatedWorkspaceConsent

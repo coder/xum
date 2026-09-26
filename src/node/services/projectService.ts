@@ -823,9 +823,9 @@ export class ProjectService {
           createResult.success &&
           !this.config.loadConfigOrDefault().projects.has(normalizedPath)
         ) {
-          // editConfig rejects when the save fails (#4444); this check is belt and braces against a write another writer
-          // replaced. Without it a git-initialized project could report success, vanish
-          // after restart, and block retries on the leftover .git.
+          // editConfig rejects when the save fails (#4444); this check is belt and braces against a
+          // write another writer replaced. Without it a git-initialized project could report
+          // success, vanish after restart, and block retries on the leftover .git.
           await cleanupCreatedDirectory();
           return Err("Failed to save project configuration");
         }

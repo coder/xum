@@ -3060,14 +3060,13 @@ export class Config {
   }
 
   /**
-   * The corrupt-file gate an edit passes immediately before writing. If the load failed,
-   * writing would replace the corrupt file with defaults. Only proceed when the bytes on
-   * disk right now are the ones with a confirmed sidecar: no confirmed backup, a concurrent
-   * replacement since the load, or an unreadable file all reject the edit so callers do not
-   * treat the mutation as durable (a failed save rejects the same way). A missing file is
-   * safe to overwrite. This cannot fully close the cross-process race (that needs file locking, which editConfig has never had);
-   * it binds the approval to the current bytes and shrinks the window to the atomic write
-   * itself.
+   * The corrupt-file gate an edit passes immediately before writing. If the load failed, writing
+   * would replace the corrupt file with defaults. Only proceed when the bytes on disk right now are
+   * the ones with a confirmed sidecar: no confirmed backup, a concurrent replacement since the
+   * load, or an unreadable file all reject the edit so callers do not treat the mutation as durable
+   * (a failed save rejects the same way). A missing file is safe to overwrite. This cannot fully
+   * close the cross-process race (that needs file locking, which editConfig has never had); it
+   * binds the approval to the current bytes and shrinks the window to the atomic write itself.
    */
   private assertConfigWritable(): void {
     const failureState = configLoadFailureStates.get(this.configFile);
