@@ -4,6 +4,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
 import { Experimental_EvaluationMockModelV4 } from "ai/test";
 import type {
+  JSONValue,
   Experimental_EvaluationModelV4,
   Experimental_EvaluationModelV4Answer,
   Experimental_EvaluationModelV4CallOptions,
@@ -480,7 +481,10 @@ describe("EvaluationService.evaluate service tier (#4352)", () => {
         Promise.resolve({
           answers: VALID_ANSWERS,
           usage: { inputTokens: 10, outputTokens: 2 },
-          providerMetadata: { openai: { reasoningTokens: 1, serviceTier } },
+          providerMetadata: { openai: { reasoningTokens: 1, serviceTier } } as unknown as Record<
+            string,
+            Record<string, JSONValue>
+          >,
           warnings: [],
         })
       );

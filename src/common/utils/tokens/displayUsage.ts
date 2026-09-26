@@ -6,6 +6,7 @@
  */
 
 import { getModelStats, type ModelStats } from "./modelStats";
+import { normalizeOpenAIServiceTier, withServiceTierPricing } from "./serviceTierPricing";
 import type { ChatUsageDisplay } from "./usageAggregator";
 import type { AiSdkUsageLike } from "./usageHelpers";
 
@@ -146,8 +147,17 @@ export function createDisplayUsage(
   const outputWithoutReasoning =
     rawOutputTokens >= reasoningTokens ? rawOutputTokens - reasoningTokens : rawOutputTokens;
 
-  // Get model stats for cost calculation
-  const modelStats = getModelStats(metadataModelOverride ?? model);
+  // Get model stats for cost calculation, at the service tier the provider
+  // reported it billed (#4352); no reported tier keeps the base rates.
+  const pricingModel = metadataModelOverride ?? model;
+  const baseStats = getModelStats(pricingModel);
+  const serviceTier = normalizeOpenAIServiceTier(
+    (providerMetadata?.openai as { serviceTier?: unknown } | undefined)?.serviceTier
+  );
+  const modelStats =
+    baseStats !== null && serviceTier !== undefined
+      ? withServiceTierPricing(baseStats, pricingModel, serviceTier)
+      : baseStats;
 
   const costsIncluded =
     (providerMetadata?.mux as { costsIncluded?: boolean } | undefined)?.costsIncluded === true;

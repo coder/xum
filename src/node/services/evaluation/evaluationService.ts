@@ -25,6 +25,7 @@ import {
   type EvaluationRounding,
   type EvaluationState,
 } from "@/common/types/evaluation";
+import { isKnownOpenAIServiceTier } from "@/common/utils/tokens/serviceTierPricing";
 
 /**
  * Effect service around AI SDK `experimental_evaluate` for the workflow
@@ -110,12 +111,12 @@ export interface EvaluationService {
 
 /**
  * Audit of `createDisplayUsage` (src/common/utils/tokens/displayUsage.ts): the
- * provider-metadata paths it reads. Only finite numbers and booleans are kept
+ * provider-metadata paths it reads. Only finite numbers, booleans and known service-tier values are kept
  * so provider text can never ride along into persisted usage records.
  */
 const USAGE_PROVIDER_METADATA_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   anthropic: ["cacheCreationInputTokens"],
-  openai: ["reasoningTokens"],
+  openai: ["reasoningTokens", "serviceTier"],
   mux: ["costsIncluded"],
   xai: ["costInUsdTicks"],
 };
@@ -126,7 +127,7 @@ function projectUsageProviderMetadata(
   if (metadata == null) {
     return null;
   }
-  const projected: Record<string, Record<string, number | boolean>> = {};
+  const projected: Record<string, Record<string, number | boolean | string>> = {};
   for (const [namespace, keys] of Object.entries(USAGE_PROVIDER_METADATA_ALLOWLIST)) {
     const namespaceValue: unknown = metadata[namespace];
     if (namespaceValue == null || typeof namespaceValue !== "object") {
@@ -137,8 +138,17 @@ function projectUsageProviderMetadata(
       // Token counts must be whole and non-negative; `createDisplayUsage` does
       // not re-check them, so a malformed provider/proxy value is dropped here
       // rather than becoming a negative cache/reasoning count downstream.
-      if (isTokenCount(value) || typeof value === "boolean") {
-        (projected[namespace] ??= {})[key] = value;
+      // `serviceTier` is the one string kept: only a known enum value, never provider text (#4352).
+      const kept =
+        key === "serviceTier"
+          ? isKnownOpenAIServiceTier(value)
+            ? value
+            : undefined
+          : isTokenCount(value) || typeof value === "boolean"
+            ? value
+            : undefined;
+      if (kept !== undefined) {
+        (projected[namespace] ??= {})[key] = kept;
       }
     }
   }
