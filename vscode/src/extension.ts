@@ -130,6 +130,13 @@ function toUiWorkspace(workspace: WorkspaceWithContext): UiWorkspace {
     // Backend guarantees createdAt for new workspaces, but keep a stable fallback for legacy ones.
     createdAt: workspace.createdAt ?? new Date(0).toISOString(),
     unarchivedAt: workspace.unarchivedAt,
+    ai: {
+      agentId: workspace.agentId,
+      agentType: workspace.agentType,
+      parentWorkspaceId: workspace.parentWorkspaceId,
+      aiSettings: workspace.aiSettings,
+      aiSettingsByAgent: workspace.aiSettingsByAgent,
+    },
   };
 }
 

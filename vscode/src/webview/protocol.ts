@@ -6,8 +6,19 @@
  */
 
 import type { WorkspaceChatMessage } from "xum/common/orpc/types";
+import type { FrontendWorkspaceMetadata } from "xum/common/types/workspace";
 
 export type UiWorkspaceRuntimeType = "local" | "worktree" | "ssh";
+
+/**
+ * The workspace's persisted agent and AI settings: exactly the fields the webview needs to seed its
+ * composer (seedWorkspaceLocalStorageFromBackend) and apply the sub-agent agent lock (#4738).
+ * Deliberately narrow: no paths, prompts, runtime settings or other metadata.
+ */
+export type UiWorkspaceAiState = Pick<
+  FrontendWorkspaceMetadata,
+  "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
+>;
 
 export interface UiWorkspace {
   id: string;
@@ -23,6 +34,9 @@ export interface UiWorkspace {
 
   createdAt: string;
   unarchivedAt?: string | undefined;
+
+  /** Absent means the settings are unknown: the webview then never persists AI settings (#4755). */
+  ai?: UiWorkspaceAiState;
 }
 
 export interface UiConnectionStatus {

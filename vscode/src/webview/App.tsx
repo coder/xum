@@ -15,6 +15,7 @@ import { RouterProvider } from "xum/browser/contexts/RouterContext";
 import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
+import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
 import {
   Tooltip,
   TooltipContent,
@@ -29,7 +30,12 @@ import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 
-import type { ExtensionToWebviewMessage, UiConnectionStatus, UiWorkspace } from "./protocol";
+import type {
+  ExtensionToWebviewMessage,
+  UiConnectionStatus,
+  UiWorkspace,
+  UiWorkspaceAiState,
+} from "./protocol";
 import { WorkspacePicker } from "./WorkspacePicker";
 import { ChatComposer } from "./ChatComposer";
 import { VSCODE_CHAT_UI_SUPPORT } from "./chatUiCapabilities";
@@ -43,10 +49,14 @@ import type { VscodeBridge } from "./vscodeBridge";
 // (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
 // backend still enforces policy on send). A single AgentProvider covers both the transcript
 // (ProposePlanToolCall) and the composer.
-function WebviewChatProviders(props: { workspaceId: string | undefined; children: ReactNode }) {
+function WebviewChatProviders(props: {
+  workspaceId: string | undefined;
+  workspaceAi: UiWorkspaceAiState | undefined;
+  children: ReactNode;
+}) {
   return (
     <PolicyProvider>
-      <AgentProvider workspaceId={props.workspaceId}>
+      <AgentProvider workspaceId={props.workspaceId} workspaceMetaFallback={props.workspaceAi}>
         <TooltipProvider>{props.children}</TooltipProvider>
       </AgentProvider>
     </PolicyProvider>
@@ -258,6 +268,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           setConnectionStatus(msg.status);
           return;
         case "workspaces":
+          // Seed each workspace's persisted agent/AI settings into the composer's storage, with the
+          // desktop's own rules (#4738): a main workspace is snapshotted once per webview load, a
+          // sub-agent workspace follows its backend settings.
+          for (const workspace of msg.workspaces) {
+            if (!workspace.ai) continue;
+            const previousAi = workspacesRef.current.find((w) => w.id === workspace.id)?.ai;
+            seedWorkspaceLocalStorageFromBackend(
+              { id: workspace.id, ...workspace.ai },
+              previousAi ? { id: workspace.id, ...previousAi } : undefined
+            );
+          }
           workspacesRef.current = msg.workspaces;
           setWorkspaces(msg.workspaces);
           return;
@@ -516,6 +537,10 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
 
   // Only the latest propose_plan card fetches its plan from disk (current results omit the
   // content), matching ChatPane.
+  const selectedWorkspace = selectedWorkspaceId
+    ? workspaces.find((workspace) => workspace.id === selectedWorkspaceId)
+    : undefined;
+
   let latestProposePlanId: string | undefined;
   for (let i = displayedMessages.length - 1; i >= 0; i--) {
     const msg = displayedMessages[i];
@@ -535,7 +560,10 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           <SettingsProvider>
             <ProviderOptionsProvider>
               <ThemeProvider forcedTheme="dark">
-                <WebviewChatProviders workspaceId={selectedWorkspaceId ?? undefined}>
+                <WebviewChatProviders
+                  workspaceId={selectedWorkspaceId ?? undefined}
+                  workspaceAi={selectedWorkspace?.ai}
+                >
                   <div className="flex h-screen flex-col">
                     <div className="border-b border-border bg-background-secondary p-3">
                       <div className="flex items-center gap-2">
@@ -645,6 +673,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                         <ChatComposer
                           key={selectedWorkspaceId}
                           workspaceId={selectedWorkspaceId}
+                          aiSettingsKnown={selectedWorkspace?.ai != null}
                           disabled={!canChat || !transcriptCaughtUp}
                           disabledReason={
                             !canChat

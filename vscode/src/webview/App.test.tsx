@@ -5,7 +5,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
-import { getThinkingLevelKey } from "xum/common/constants/storage";
+import { getAgentIdKey, getThinkingLevelKey } from "xum/common/constants/storage";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -344,5 +344,90 @@ describe("vscode webview AI settings persistence", () => {
     const { bridge, view } = await renderSelected();
     const options = await sendMessage(bridge, view);
     expect(options.thinkingLevel).toBe("low");
+  });
+});
+
+// #4738: the extension sends each workspace's AI settings, so the webview uses (and may persist)
+// the workspace's real settings and honors the sub-agent agent lock.
+describe("vscode webview workspace AI settings", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  async function selectWorkspaceWith(workspace: UiWorkspace) {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({ type: "workspaces", workspaces: [workspace] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: workspace.id });
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: workspace.id,
+      event: { type: "caught-up" },
+    });
+    return { bridge, view };
+  }
+
+  async function send(bridge: TestBridge, view: ReturnType<typeof render>) {
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    const input = sends[0].input as { options?: Record<string, unknown> };
+    if (!input.options) throw new Error("sendMessage carried no options");
+    return input.options;
+  }
+
+  test("uses the workspace's own agent, model and thinking level, and lets them persist", async () => {
+    const { bridge, view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: {
+        agentId: "plan",
+        aiSettingsByAgent: {
+          plan: { model: "openai:gpt-5.6-terra", thinkingLevel: "high" },
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "medium" },
+        },
+      },
+    });
+
+    expect(view.getByRole("button", { name: "Plan" })).toBeDefined();
+    const options = await send(bridge, view);
+    expect(options).toMatchObject({
+      agentId: "plan",
+      model: "openai:gpt-5.6-terra",
+      thinkingLevel: "high",
+    });
+    // The settings came from the workspace, so saving them cannot overwrite anything.
+    expect(options.skipAiSettingsPersistence).toBeUndefined();
+  });
+
+  test("locks a sub-agent workspace to its assigned agent", async () => {
+    const { bridge, view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: { parentWorkspaceId: "ws-parent", agentId: "exec", agentType: "exec" },
+    });
+    // A stale local pick must not change the agent a child task runs with.
+    await act(async () => {
+      updatePersistedState(getAgentIdKey(WORKSPACE.id), "plan");
+      await Promise.resolve();
+    });
+
+    const toggle = view.getByRole("button", { name: "Exec" });
+    expect((toggle as HTMLButtonElement).disabled).toBe(true);
+    const options = await send(bridge, view);
+    expect(options.agentId).toBe("exec");
   });
 });

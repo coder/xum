@@ -13,6 +13,7 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -56,6 +57,11 @@ type AgentProviderProps =
   | {
       workspaceId?: string;
       projectPath?: string;
+      /**
+       * For hosts without WorkspaceProvider (the VS Code webview, #4738): the workspace's persisted
+       * agent identity, so the sub-agent lock still applies. Ignored when metadata is available.
+       */
+      workspaceMetaFallback?: Pick<FrontendWorkspaceMetadata, "parentWorkspaceId" | "agentId">;
       children: ReactNode;
     };
 
@@ -78,6 +84,7 @@ export function AgentProvider(props: AgentProviderProps) {
 function AgentProviderWithState(props: {
   workspaceId?: string;
   projectPath?: string;
+  workspaceMetaFallback?: Pick<FrontendWorkspaceMetadata, "parentWorkspaceId" | "agentId">;
   children: ReactNode;
 }) {
   const { api } = useAPI();
@@ -85,7 +92,11 @@ function AgentProviderWithState(props: {
   // treated like one with no metadata entry: agent selection stays unlocked. The desktop app always
   // mounts AgentProvider inside WorkspaceProvider, so its sub-agent lock is unchanged.
   const workspaceMetadata = useOptionalWorkspaceMetadata()?.workspaceMetadata;
-  const currentMeta = props.workspaceId ? workspaceMetadata?.get(props.workspaceId) : undefined;
+  const currentMeta = props.workspaceId
+    ? workspaceMetadata
+      ? workspaceMetadata.get(props.workspaceId)
+      : props.workspaceMetaFallback
+    : undefined;
 
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
   const isProjectScope = !props.workspaceId && Boolean(props.projectPath);
