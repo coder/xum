@@ -79,7 +79,7 @@ test("looped specifiers resolve through const arrays", () => {
     reported(`
       const PATHS = ["a", "b"];
       beforeEach(() => { for (const p of PATHS) mock.module(p, () => ({})); });
-      afterAll(() => { for (const p of PATHS) mock.module(p, () => real); });
+      afterAll(() => { for (const p of [...PATHS]) mock.module(p, () => real); });
     `)
   ).toEqual([]);
   expect(

@@ -651,8 +651,8 @@ const localPlugin = {
           );
         };
         // A `const` array still holds its literal elements only when every use reads it
-        // whole: looping over it or handing it to restoreModulesAfterSuite. Any other use
-        // (`entries.length = 0`, `.push`, a `[...entries]` copy sharing its tuples, passing it
+        // whole: looping over it, handing it to restoreModulesAfterSuite, or spreading it when
+        // it holds only literals. Any other use (`entries.length = 0`, `.push`, passing it
         // elsewhere, exporting it) may change what it holds by the time it is read.
         const isSealedArray = (variable) =>
           variable.defs[0].parent.parent?.type !== "ExportNamedDeclaration" &&
@@ -670,6 +670,11 @@ const localPlugin = {
             }
             const parent = node.parent;
             return (
+              // Copying an array of strings shares nothing mutable; copying tuples shares them.
+              (parent.type === "SpreadElement" &&
+                unwrapTypeAssertions(variable.defs[0].node.init)?.elements?.every(
+                  (element) => element?.type === "Literal"
+                )) ||
               (parent.type === "ForOfStatement" &&
                 parent.right === node &&
                 loopKeepsElements(parent)) ||
