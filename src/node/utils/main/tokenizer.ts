@@ -1,6 +1,6 @@
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
-import CRC32 from "crc-32";
+import { createHash, hash } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import { getAvailableTools, getToolSchemas } from "@/common/utils/tools/toolDefinitions";
 import type { CountTokensInput } from "./tokenizer.worker";
@@ -139,9 +139,28 @@ function resolveEncoding(modelName: ModelName): Promise<string> {
   return promise;
 }
 
+// ES2024 String method; the repo's TS lib (ES2023) does not declare it, but Node and Bun ship it.
+type MaybeWellFormedString = string & { isWellFormed(): boolean };
+
+// One-shot crypto.hash was measured faster than CRC32 (#4654) but only exists from Node 20.12;
+// the headless CLI still accepts any Node 20, so fall back to the streaming API there.
+const sha256Base64: (data: string | Buffer) => string =
+  typeof hash === "function"
+    ? (data) => hash("sha256", data, "base64")
+    : (data) => createHash("sha256").update(data).digest("base64");
+
 function buildCacheKey(modelName: ModelName, text: string): string {
-  const checksum = CRC32.str(text);
-  return `${modelName}:${checksum}:${text.length}`;
+  // The old `CRC32:length` key collided for distinct texts of equal length (17 in a 1.24M-row
+  // chat), so a text could reuse another text's count, and which one won depended on timing
+  // (#4654). A SHA-256 digest is collision-resistant, keeps each of the 250k LRU keys at a
+  // fixed 44 chars (keying by the text itself would retain whole chat contents), and the
+  // native one-shot hash measured faster than the JS CRC32 on that chat.
+  // crypto.hash UTF-8-encodes strings, which maps every lone surrogate to U+FFFD. Hash the
+  // raw UTF-16 code units for such (rare) texts so they cannot share a key with other texts.
+  const digest = (text as MaybeWellFormedString).isWellFormed()
+    ? sha256Base64(text)
+    : `u16:${sha256Base64(Buffer.from(text, "utf16le"))}`;
+  return `${modelName}:${digest}`;
 }
 
 async function countTokensInternal(modelName: ModelName, text: string): Promise<number> {
