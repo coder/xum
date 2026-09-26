@@ -391,7 +391,7 @@ describe("vscode webview workspace AI settings", () => {
     return input.options;
   }
 
-  test("uses the workspace's own agent, model and thinking level, and lets them persist", async () => {
+  test("uses the workspace's own agent, model and thinking level", async () => {
     const { bridge, view } = await selectWorkspaceWith({
       ...WORKSPACE,
       ai: {
@@ -410,14 +410,16 @@ describe("vscode webview workspace AI settings", () => {
       model: "openai:gpt-5.6-terra",
       thinkingLevel: "high",
     });
-    // The settings came from the workspace, so saving them cannot overwrite anything.
-    expect(options.skipAiSettingsPersistence).toBeUndefined();
+    // Persisting from the webview stays off even with known settings (#4778 review: saving needs the
+    // desktop's selection-intent, gateway-route and write-ordering handling).
+    expect(options.skipAiSettingsPersistence).toBe(true);
   });
 
   test("locks a sub-agent workspace to its assigned agent", async () => {
+    // agentId was restamped by a recovery send; agentType is the child's creation-time identity.
     const { bridge, view } = await selectWorkspaceWith({
       ...WORKSPACE,
-      ai: { parentWorkspaceId: "ws-parent", agentId: "exec", agentType: "exec" },
+      ai: { parentWorkspaceId: "ws-parent", agentId: "plan", agentType: "exec" },
     });
     // A stale local pick must not change the agent a child task runs with.
     await act(async () => {
@@ -429,5 +431,29 @@ describe("vscode webview workspace AI settings", () => {
     expect((toggle as HTMLButtonElement).disabled).toBe(true);
     const options = await send(bridge, view);
     expect(options.agentId).toBe("exec");
+  });
+
+  test("switching the agent restores that agent's own settings", async () => {
+    const { bridge, view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: {
+        agentId: "plan",
+        aiSettingsByAgent: {
+          plan: { model: "openai:gpt-5.6-terra", thinkingLevel: "high" },
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "low" },
+        },
+      },
+    });
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Plan" }));
+      await Promise.resolve();
+    });
+    const options = await send(bridge, view);
+    expect(options).toMatchObject({
+      agentId: "exec",
+      model: "anthropic:claude-opus-5-5",
+      thinkingLevel: "low",
+    });
   });
 });

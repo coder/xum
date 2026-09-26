@@ -16,6 +16,8 @@ import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
 import { AgentProvider } from "xum/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
 import { seedWorkspaceLocalStorageFromBackend } from "xum/browser/contexts/WorkspaceContext";
+import { WorkspaceModeAISync } from "xum/browser/components/WorkspaceModeAISync/WorkspaceModeAISync";
+import { resolvePersistedAgentId } from "xum/common/utils/agentIds";
 import {
   Tooltip,
   TooltipContent,
@@ -56,7 +58,22 @@ function WebviewChatProviders(props: {
 }) {
   return (
     <PolicyProvider>
-      <AgentProvider workspaceId={props.workspaceId} workspaceMetaFallback={props.workspaceAi}>
+      <AgentProvider
+        workspaceId={props.workspaceId}
+        workspaceMetaFallback={
+          props.workspaceAi
+            ? {
+                parentWorkspaceId: props.workspaceAi.parentWorkspaceId,
+                // Same identity resolution as the seeding: a child task's creation-time agentType
+                // wins over an agentId restamped by a recovery send.
+                agentId: resolvePersistedAgentId(props.workspaceAi, "") || undefined,
+              }
+            : undefined
+        }
+      >
+        {/* Desktop's per-agent settings sync: switching agents restores that agent's cached
+            model/thinking/reasoning (seeded from the workspace), exactly as in AIView. */}
+        {props.workspaceId ? <WorkspaceModeAISync workspaceId={props.workspaceId} /> : null}
         <TooltipProvider>{props.children}</TooltipProvider>
       </AgentProvider>
     </PolicyProvider>
@@ -673,7 +690,6 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                         <ChatComposer
                           key={selectedWorkspaceId}
                           workspaceId={selectedWorkspaceId}
-                          aiSettingsKnown={selectedWorkspace?.ai != null}
                           disabled={!canChat || !transcriptCaughtUp}
                           disabledReason={
                             !canChat

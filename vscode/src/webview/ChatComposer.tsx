@@ -8,8 +8,6 @@ import { getSendOptionsFromStorage } from "xum/browser/utils/messages/sendOption
 import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
-import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
-import { enforceThinkingPolicy } from "xum/common/utils/thinking/policy";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
@@ -104,8 +102,6 @@ function ChatComposerInner(props: {
   workspaceId: string;
   disabled: boolean;
   disabledReason?: string | undefined;
-  /** True once the workspace's own AI settings were loaded; only then may settings persist. */
-  aiSettingsKnown: boolean;
   aggregator: StreamingMessageAggregator | null;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
@@ -114,7 +110,6 @@ function ChatComposerInner(props: {
   const api = apiState.api;
 
   const { agentId, setAgentId, isAgentSelectionLocked } = useAgent();
-  const [thinkingLevel] = useThinkingLevel();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -200,24 +195,8 @@ function ChatComposerInner(props: {
     ensureModelInSettings(canonicalModel);
     setPreferredModel(canonicalModel);
 
-    // #4755: only persist once the workspace's own settings were loaded (#4738); otherwise the
-    // model change stays local, since saving it would also write an unloaded thinking default.
-    if (!api || !props.aiSettingsKnown) {
-      return;
-    }
-
-    api.workspace
-      .updateAgentAISettings({
-        workspaceId: props.workspaceId,
-        agentId,
-        aiSettings: {
-          model: canonicalModel,
-          thinkingLevel: enforceThinkingPolicy(canonicalModel, thinkingLevel),
-        },
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
+    // #4755: a model change stays local. Persisting from the webview would need the desktop's
+    // selection-intent, gateway-route and write-ordering handling, so it stays off (#4778 review).
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -277,11 +256,11 @@ function ChatComposerInner(props: {
         ...getSendOptionsFromStorage(props.workspaceId),
         // The effective agent: for a sub-agent workspace, the locked agent (#4738), not a local pick.
         agentId,
-        // #4755: until the workspace's own settings were loaded (#4738), these options are webview
-        // defaults; skip persistence so a send cannot overwrite the workspace's agent/model/thinking.
+        // #4755: never persist from the webview. Even with the workspace's settings seeded (#4738),
+        // saving needs the desktop's selection-intent/gateway-route handling (#4778 review).
         // The thinking level is sent as selected: the webview does not load the user's configured
         // per-model minimums, so only the backend can apply the authoritative floor.
-        ...(props.aiSettingsKnown ? {} : { skipAiSettingsPersistence: true }),
+        skipAiSettingsPersistence: true,
       };
 
       const result = await api.workspace.sendMessage(
@@ -436,8 +415,6 @@ export function ChatComposer(props: {
   workspaceId: string;
   disabled: boolean;
   disabledReason?: string | undefined;
-  /** True once the workspace's own AI settings were loaded; only then may settings persist. */
-  aiSettingsKnown: boolean;
   aggregator: StreamingMessageAggregator | null;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
@@ -449,7 +426,6 @@ export function ChatComposer(props: {
         workspaceId={props.workspaceId}
         disabled={props.disabled}
         disabledReason={props.disabledReason}
-        aiSettingsKnown={props.aiSettingsKnown}
         aggregator={props.aggregator}
         onSendComplete={props.onSendComplete}
         onNotice={props.onNotice}
