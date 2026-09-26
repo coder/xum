@@ -3294,17 +3294,6 @@ export const general = {
     input: z.string(),
     output: z.string(),
   },
-  /**
-   * Test endpoint: emits numbered ticks at an interval.
-   * Useful for verifying streaming works over HTTP and WebSocket.
-   */
-  tick: {
-    input: z.object({
-      count: z.number().int().min(1).max(100),
-      intervalMs: z.number().int().min(10).max(5000),
-    }),
-    output: eventIterator(z.object({ tick: z.number(), timestamp: z.number() })),
-  },
   restartApp: {
     input: z.void(),
     output: RestartAppResultSchema,

@@ -27,6 +27,7 @@ import type { RouterClient } from "@orpc/server";
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 import type { ProjectConfig } from "@/common/types/project";
 import { shouldExposeLaunchProject } from "@/cli/launchProject";
+import { pushLogEntry } from "@/node/services/logBuffer";
 
 // --- Test Server Factory ---
 
@@ -210,12 +211,6 @@ describe("oRPC Server Endpoints", () => {
   });
 
   describe("HTTP endpoint (/orpc)", () => {
-    test("ping returns pong response", async () => {
-      const client = createHttpClient(serverHandle.server.baseUrl);
-      const result = await client.general.ping("hello");
-      expect(result).toBe("Pong: hello");
-    });
-
     test("agentSkills.list and agentSkills.get work with projectPath", async () => {
       const client = createHttpClient(serverHandle.server.baseUrl);
 
@@ -240,161 +235,82 @@ describe("oRPC Server Endpoints", () => {
         await fs.rm(projectPath, { recursive: true, force: true });
       }
     });
-    test("ping with empty string", async () => {
-      const client = createHttpClient(serverHandle.server.baseUrl);
-      const result = await client.general.ping("");
-      expect(result).toBe("Pong: ");
-    });
-
-    test("tick streaming emits correct number of events", async () => {
-      const client = createHttpClient(serverHandle.server.baseUrl);
-      const ticks: Array<{ tick: number; timestamp: number }> = [];
-
-      const stream = await client.general.tick({ count: 3, intervalMs: 50 });
-      for await (const tick of stream) {
-        ticks.push(tick);
-      }
-
-      expect(ticks).toHaveLength(3);
-      expect(ticks.map((t) => t.tick)).toEqual([1, 2, 3]);
-
-      // Verify timestamps are increasing
-      for (let i = 1; i < ticks.length; i++) {
-        expect(ticks[i].timestamp).toBeGreaterThanOrEqual(ticks[i - 1].timestamp);
-      }
-    });
-
-    test("tick streaming with single tick", async () => {
-      const client = createHttpClient(serverHandle.server.baseUrl);
-      const ticks: Array<{ tick: number; timestamp: number }> = [];
-
-      const stream = await client.general.tick({ count: 1, intervalMs: 10 });
-      for await (const tick of stream) {
-        ticks.push(tick);
-      }
-
-      expect(ticks).toHaveLength(1);
-      expect(ticks[0].tick).toBe(1);
-    });
   });
 
-  describe("WebSocket endpoint (/orpc/ws)", () => {
-    test("ping returns pong response", async () => {
-      const { client, close } = await createWebSocketClient(serverHandle.server.wsUrl);
+  // Every transport must carry unary calls and event-iterator subscriptions the same way.
+  // The subscription is the real log feed the Output tab uses: its snapshot proves the
+  // subscription is live, and an entry pushed into the (in-process) server's log feed must
+  // then stream to the client. The probe goes into the in-memory feed only: logging or
+  // clearing through the logger would write to the real log file when no isolated
+  // XUM_ROOT is set.
+  const transports: Array<{
+    name: string;
+    connect: () => Promise<{ client: RouterClient<AppRouter>; close: () => void }>;
+  }> = [
+    {
+      name: "HTTP (/orpc)",
+      connect: () =>
+        Promise.resolve({
+          client: createHttpClient(serverHandle.server.baseUrl),
+          close: () => undefined,
+        }),
+    },
+    {
+      name: "WebSocket (/orpc/ws)",
+      connect: () => createWebSocketClient(serverHandle.server.wsUrl),
+    },
+  ];
+
+  describe.each(transports)("$name", ({ connect }) => {
+    test("sequential unary calls on one client round-trip their input", async () => {
+      const { client, close } = await connect();
       try {
-        const result = await client.general.ping("websocket-test");
-        expect(result).toBe("Pong: websocket-test");
+        expect(await client.general.ping("hello 🎉 world!")).toBe("Pong: hello 🎉 world!");
+        expect(await client.general.ping("")).toBe("Pong: ");
       } finally {
         close();
       }
     });
 
-    test("ping with special characters", async () => {
-      const { client, close } = await createWebSocketClient(serverHandle.server.wsUrl);
+    test("subscriptions stream live events until aborted", async () => {
+      const { client, close } = await connect();
+      const controller = new AbortController();
       try {
-        const result = await client.general.ping("hello 🎉 world!");
-        expect(result).toBe("Pong: hello 🎉 world!");
-      } finally {
-        close();
-      }
-    });
-
-    test("tick streaming emits correct number of events", async () => {
-      const { client, close } = await createWebSocketClient(serverHandle.server.wsUrl);
-      try {
-        const ticks: Array<{ tick: number; timestamp: number }> = [];
-
-        const stream = await client.general.tick({ count: 3, intervalMs: 50 });
-        for await (const tick of stream) {
-          ticks.push(tick);
+        const stream = await client.general.subscribeLogs(
+          { level: "debug" },
+          { signal: controller.signal }
+        );
+        const iterator = stream[Symbol.asyncIterator]();
+        const first = await iterator.next();
+        expect(first.done).toBe(false);
+        if (first.done || first.value.type !== "snapshot") {
+          throw new Error(`expected a snapshot first, got ${JSON.stringify(first.value)}`);
         }
 
-        expect(ticks).toHaveLength(3);
-        expect(ticks.map((t) => t.tick)).toEqual([1, 2, 3]);
-
-        // Verify timestamps are increasing
-        for (let i = 1; i < ticks.length; i++) {
-          expect(ticks[i].timestamp).toBeGreaterThanOrEqual(ticks[i - 1].timestamp);
+        const probe = `transport subscription probe ${Math.random().toString(36).slice(2)}`;
+        pushLogEntry({
+          timestamp: Date.now(),
+          level: "info",
+          message: probe,
+          location: "server.test",
+        });
+        // Other server log lines may arrive first; wait for the probe's append.
+        let next = await iterator.next();
+        while (
+          !next.done &&
+          !(
+            next.value.type === "append" &&
+            next.value.entries.some((e) => e.message.includes(probe))
+          )
+        ) {
+          next = await iterator.next();
         }
+        expect(next.done).toBe(false);
+
+        controller.abort();
+        await iterator.return?.();
       } finally {
-        close();
-      }
-    });
-
-    test("tick streaming with longer interval", async () => {
-      const { client, close } = await createWebSocketClient(serverHandle.server.wsUrl);
-      try {
-        const ticks: Array<{ tick: number; timestamp: number }> = [];
-        const startTime = Date.now();
-
-        const stream = await client.general.tick({ count: 2, intervalMs: 100 });
-        for await (const tick of stream) {
-          ticks.push(tick);
-        }
-
-        const elapsed = Date.now() - startTime;
-
-        expect(ticks).toHaveLength(2);
-        // Should take at least 100ms (1 interval between 2 ticks)
-        expect(elapsed).toBeGreaterThanOrEqual(90); // Allow small margin
-      } finally {
-        close();
-      }
-    });
-
-    test("multiple sequential requests on same connection", async () => {
-      const { client, close } = await createWebSocketClient(serverHandle.server.wsUrl);
-      try {
-        const result1 = await client.general.ping("first");
-        const result2 = await client.general.ping("second");
-        const result3 = await client.general.ping("third");
-
-        expect(result1).toBe("Pong: first");
-        expect(result2).toBe("Pong: second");
-        expect(result3).toBe("Pong: third");
-      } finally {
-        close();
-      }
-    });
-  });
-
-  describe("Cross-transport consistency", () => {
-    test("HTTP and WebSocket return same ping result", async () => {
-      const httpClient = createHttpClient(serverHandle.server.baseUrl);
-      const { client: wsClient, close } = await createWebSocketClient(serverHandle.server.wsUrl);
-
-      try {
-        const testInput = "consistency-test";
-        const httpResult = await httpClient.general.ping(testInput);
-        const wsResult = await wsClient.general.ping(testInput);
-
-        expect(httpResult).toBe(wsResult);
-      } finally {
-        close();
-      }
-    });
-
-    test("HTTP and WebSocket streaming produce same tick sequence", async () => {
-      const httpClient = createHttpClient(serverHandle.server.baseUrl);
-      const { client: wsClient, close } = await createWebSocketClient(serverHandle.server.wsUrl);
-
-      try {
-        const httpTicks: number[] = [];
-        const wsTicks: number[] = [];
-
-        const httpStream = await httpClient.general.tick({ count: 3, intervalMs: 10 });
-        for await (const tick of httpStream) {
-          httpTicks.push(tick.tick);
-        }
-
-        const wsStream = await wsClient.general.tick({ count: 3, intervalMs: 10 });
-        for await (const tick of wsStream) {
-          wsTicks.push(tick.tick);
-        }
-
-        expect(httpTicks).toEqual(wsTicks);
-        expect(httpTicks).toEqual([1, 2, 3]);
-      } finally {
+        controller.abort();
         close();
       }
     });
