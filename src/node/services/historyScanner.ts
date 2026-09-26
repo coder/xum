@@ -13,11 +13,14 @@ import {
   SESSION_HISTORY_RESET_PROBE_CHARS,
   SESSION_HISTORY_MAX_SCAN_ROWS,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
+  SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES,
 } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import { getContextWindowId, isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import {
   getContextBoundaryKind,
+  isDurableCompactionBoundaryMarker,
   isDurableContextBoundaryMarker,
 } from "@/common/utils/messages/compactionBoundary";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
@@ -30,6 +33,7 @@ import {
   type HistorySnapshot,
 } from "./historyCursor";
 import type { CompactionPendingBoundary as PendingBoundary } from "./compactionPendingState";
+import { log } from "./log";
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
 const resetTokenPattern = new RegExp(
@@ -256,6 +260,8 @@ type ProviderHistoryStart =
   | ({ kind: "start" } & LocatedHistoryBoundary)
   | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number };
 
+const COMPACTION_BOUNDARY_NEEDLE = Buffer.from(SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE);
+
 /** Provider-only location: bound row/probe carryover, not the amount of context scanned. */
 async function findProviderHistoryStart(
   handle: fs.FileHandle,
@@ -270,20 +276,57 @@ async function findProviderHistoryStart(
   let unreadableRunEnd: number | null = null;
   let oldestBoundary: LocatedHistoryBoundary | null = null;
   let boundaryCount = 0;
+  // Oversized rows are not buffered, so remember whether their raw bytes could hold the compact
+  // boundary marker. Segments arrive in reverse order: carry the start of the later segment so a
+  // marker split across two segments is still seen.
+  let boundaryMarkerSeen = false;
+  let boundaryMarkerCarry = Buffer.alloc(0);
   const add = (bytes: Buffer) => {
     addHistoryResetProbe(probe, bytes, true);
+    if (!boundaryMarkerSeen) {
+      const window =
+        boundaryMarkerCarry.length > 0 ? Buffer.concat([bytes, boundaryMarkerCarry]) : bytes;
+      boundaryMarkerSeen = window.includes(COMPACTION_BOUNDARY_NEEDLE);
+      boundaryMarkerCarry = Buffer.from(window.subarray(0, COMPACTION_BOUNDARY_NEEDLE.length - 1));
+    }
     size += bytes.length;
     if (size <= SESSION_HISTORY_MAX_LINE_BYTES) parts.push(bytes);
     else parts = [];
   };
-  const deliver = (start: number): LocatedHistoryBoundary | null => {
+  /**
+   * An oversized compaction boundary behaves exactly like a normal-size one (#4551): rotation
+   * already treats it as the epoch start, and skipping it here would bring the sealed epoch back
+   * from the archive. Re-read just that row and classify it unchanged, accepting only a durable
+   * compaction boundary; ordinary oversized rows and reset evidence keep today's handling (the
+   * classifier treats reset keys in oversized text as ambiguous, i.e. an unreadable floor).
+   */
+  const recoverOversizedBoundary = async (start: number): Promise<MuxMessage | null> => {
+    if (!boundaryMarkerSeen || probe.possibleReset) return null;
+    if (size > SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES) {
+      log.warn("Oversized compaction boundary row exceeds the recovery ceiling", {
+        offset: start,
+        bytes: size,
+      });
+      return null;
+    }
+    const row = Buffer.alloc(size);
+    const read = await handle.read(row, 0, size, start);
+    if (read.bytesRead !== size) throw new Error("History changed during provider read");
+    const candidate = classifyHistoryScanRow(row.toString("utf8"), probe);
+    if (!isDurableCompactionBoundaryMarker(candidate ?? undefined)) return null;
+    log.debug("Recovered an oversized compaction boundary row", { offset: start, bytes: size });
+    return candidate;
+  };
+  const deliver = async (start: number): Promise<LocatedHistoryBoundary | null> => {
     if (size === 0) {
       rowEnd = start;
+      boundaryMarkerSeen = false;
+      boundaryMarkerCarry = Buffer.alloc(0);
       return null;
     }
     const message =
       size > SESSION_HISTORY_MAX_LINE_BYTES
-        ? null
+        ? await recoverOversizedBoundary(start)
         : classifyHistoryScanRow(Buffer.concat(parts.reverse()).toString("utf8"), probe);
     if (message) unreadableRunEnd = null;
     else unreadableRunEnd ??= rowEnd;
@@ -319,6 +362,8 @@ async function findProviderHistoryStart(
     parts = [];
     size = 0;
     rowEnd = start;
+    boundaryMarkerSeen = false;
+    boundaryMarkerCarry = Buffer.alloc(0);
     return null;
   };
   for (let end = fileSize; end > 0; ) {
@@ -330,14 +375,14 @@ async function findProviderHistoryStart(
     for (let i = chunk.length - 1; i >= 0; i--) {
       if (chunk[i] !== 10) continue;
       add(chunk.subarray(i + 1, edge));
-      const location = deliver(start + i + 1);
+      const location = await deliver(start + i + 1);
       if (location !== null) return { kind: "start", ...location };
       edge = i;
     }
     add(chunk.subarray(0, edge));
     end = start;
   }
-  const location = deliver(0);
+  const location = await deliver(0);
   return location === null
     ? { kind: "exhausted", oldestBoundary, boundaryCount }
     : { kind: "start", ...location };

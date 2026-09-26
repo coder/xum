@@ -12,6 +12,7 @@ import {
   type AgentSessionHarnessOptions,
 } from "./agentSession.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 
 // NOTE: These tests validate crash-safe compaction follow-up recovery, including
 // legacy `mode` fallback, without repeating a full AgentSession fixture per case.
@@ -632,6 +633,43 @@ describe("AgentSession continue-message agentId fallback", () => {
     await session.runStartupRecovery();
 
     expect(dispatchedMessage).toBe("follow up after tail");
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  // #4551: a boundary written oversized (large inline attachment, or before summaries were
+  // bounded) must still anchor the epoch read, or its follow-up is stranded behind tail copies.
+  test("startup recovery dispatches from an oversized boundary trailed by tail copies", async () => {
+    let dispatchedMessage: string | undefined;
+    const followUp: CompactionFollowUpRequest = {
+      text: "follow up with image",
+      model: "openai:gpt-4o",
+      agentId: "exec",
+      fileParts: [
+        {
+          url: "data:image/png;base64," + "A".repeat(SESSION_HISTORY_MAX_LINE_BYTES * 1.5),
+          mediaType: "image/png",
+        },
+      ],
+    };
+    const { session } = await createSession([
+      createMuxMessage("older-boundary", "assistant", "Older summary", {
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      }),
+      createMuxMessage("before-compaction", "user", "earlier turn"),
+      rlmSummaryBoundaryMessage(followUp),
+      preservedTailCopy("tail-copy-1", "user", "original user message"),
+      preservedTailCopy("tail-copy-2", "assistant", "original assistant reply"),
+    ]);
+    const sendMessage = spyOn(session, "sendMessage").mockImplementation((message: string) => {
+      dispatchedMessage = message;
+      return Promise.resolve(Ok(undefined));
+    });
+
+    await session.runStartupRecovery();
+
+    expect(dispatchedMessage).toBe("follow up with image");
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 

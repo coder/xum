@@ -1631,6 +1631,19 @@ describe("HistoryService", () => {
             changed: false,
           };
         }),
+        {
+          // #4551: an oversized compaction boundary still seals what precedes it.
+          name: "active sealed reasoning behind an oversized boundary",
+          archive: [],
+          chat: [
+            {
+              ...createMuxMessage("target", "assistant", ""),
+              parts: [{ type: "reasoning" as const, text: "Sealed reasoning" }],
+            },
+            { ...boundary(), padding: "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES) },
+          ],
+          changed: false,
+        },
         ...[
           {
             name: "ordinary oversized row",
