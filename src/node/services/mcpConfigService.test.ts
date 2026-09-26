@@ -120,6 +120,53 @@ describe("MCPConfigService", () => {
     });
   });
 
+  test("listForApi reports the user config layer that owns each server entry", async () => {
+    // #4297: the workspace MCP modal attributes `disabled` to a layer. Project
+    // entries replace global ones by name, so the owning layer alone decides.
+    await fs.writeFile(
+      path.join(config.rootDir, "mcp.jsonc"),
+      JSON.stringify({
+        servers: {
+          "global-off": { command: "g", disabled: true },
+          "both-off": { command: "g", disabled: true },
+          "project-off": "g",
+        },
+      }),
+      "utf-8"
+    );
+    const projectPath = path.join(tempDir, "repo-layers");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({
+        servers: {
+          "project-off": { command: "p", disabled: true },
+          "both-off": { command: "p", disabled: true },
+        },
+      }),
+      "utf-8"
+    );
+    const layersOf = (servers: Record<string, MCPServerInfo>) =>
+      Object.fromEntries(Object.entries(servers).map(([name, info]) => [name, info.configLayer]));
+
+    // Untrusted projects never load the repo layer.
+    expect(layersOf(await configService.listForApi({ projectPath }))).toEqual({
+      "global-off": "global",
+      "both-off": "global",
+      "project-off": "global",
+    });
+
+    await config.editConfig((cfg) => ({
+      ...cfg,
+      projects: new Map([[projectPath, { trusted: true, workspaces: [] }]]),
+    }));
+    expect(layersOf(await configService.listForApi({ projectPath }))).toEqual({
+      "global-off": "global",
+      "both-off": "project",
+      "project-off": "project",
+    });
+  });
+
   test("prefers canonical repo overrides when both project paths exist", async () => {
     const projectPath = path.join(tempDir, "repo-canonical");
     await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });

@@ -44,6 +44,8 @@ export const MCPServerPluginProvenanceSchema = z.object({
   componentPolicy: z.object({ registryPath: z.string(), name: z.string() }).optional(),
 });
 
+const MCPConfigLayerSchema = z.enum(["global", "project"]);
+
 export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   z.object({
     transport: z.literal("stdio"),
@@ -54,6 +56,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("http"),
@@ -63,6 +66,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("sse"),
@@ -71,6 +75,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("auto"),
@@ -79,6 +84,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
 ]);
 

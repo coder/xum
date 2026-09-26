@@ -52,6 +52,11 @@ export interface MCPServerBaseInfo {
   toolAllowlist?: string[];
   /** Present when this server comes from an Agent Plugin. */
   plugin?: MCPServerPluginProvenance;
+  /**
+   * Display-only, set by the mcp.list API: the user config layer whose entry
+   * won (and so owns `disabled`). Never persisted or read by the runtime.
+   */
+  configLayer?: "global" | "project";
 }
 
 /** stdio server definition (local process). */
