@@ -470,3 +470,44 @@ describe("standalone PWA startup", () => {
     });
   });
 });
+
+describe("embedded router (VS Code webview)", () => {
+  afterEach(() => {
+    cleanup();
+    globalThis.window = undefined as unknown as Window & typeof globalThis;
+    globalThis.document = undefined as unknown as Document;
+  });
+
+  test("starts at / and keeps navigation in memory without touching the host URL or persisted route", async () => {
+    // A webview document URL is not an app route; the embedded host must neither route from it nor
+    // rewrite it (replaceState) or persist a route for a desktop relaunch.
+    installWindow("https://webview.example/index.html?id=panel-1");
+    let latestRouter: RouterContext | null = null;
+
+    function Observer() {
+      latestRouter = useRouter();
+      return <PathnameObserver />;
+    }
+
+    const view = render(
+      <RouterProvider embedded>
+        <Observer />
+      </RouterProvider>
+    );
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/");
+    });
+
+    act(() => {
+      latestRouter!.navigateToSettings("providers");
+    });
+
+    await waitFor(() => {
+      expect(view.getByTestId("pathname").textContent).toBe("/settings/providers");
+    });
+    expect(latestRouter!.currentSettingsSection).toBe("providers");
+    expect(window.location.pathname + window.location.search).toBe("/index.html?id=panel-1");
+    expect(window.localStorage.getItem(LAST_VISITED_ROUTE_KEY)).toBeNull();
+  });
+});

@@ -3,8 +3,6 @@ import "../../../tests/ui/dom";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
-import { RouterProvider } from "xum/browser/contexts/RouterContext";
-
 import { installDom } from "../../../tests/ui/dom";
 import { App } from "./App";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -41,13 +39,7 @@ describe("vscode webview transcript auto-scroll", () => {
   });
 
   test("uses the bottom sentinel as the only scroll anchor while locked, and releases it on user scroll", async () => {
-    // App does not mount its own router yet, and SettingsProvider requires one (#4700); supply
-    // it here so this test covers only the transcript scroll wiring. Remove with that fix.
-    const view = render(
-      <RouterProvider>
-        <App bridge={createBridge()} />
-      </RouterProvider>
-    );
+    const view = render(<App bridge={createBridge()} />);
 
     const sentinel = view.getByTestId("transcript-bottom-sentinel");
     const scrollport = sentinel.parentElement;
