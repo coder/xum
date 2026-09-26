@@ -91,6 +91,7 @@ interface CapturedRequest {
  */
 async function startDroppingFixture() {
   const requests: CapturedRequest[] = [];
+  let firstResponse: http.ServerResponse | null = null;
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -103,8 +104,8 @@ async function startDroppingFixture() {
       res.writeHead(200, { "content-type": "text/event-stream" });
       if (requests.length === 1) {
         res.write(messageStart() + textBlock(PREFIX_TEXT.match(/[^\n]*\n/g) ?? []));
-        // Let the client consume the deltas, then fail the stream mid-response.
-        setTimeout(() => res.destroy(), 200);
+        // Held open until the test has observed every prefix delta; see dropFirstResponse.
+        firstResponse = res;
         return;
       }
       res.end(messageStart() + textBlock([CONTINUATION_TEXT]) + messageEnd());
@@ -115,6 +116,11 @@ async function startDroppingFixture() {
   return {
     baseUrl: `http://127.0.0.1:${port}/v1`,
     requests,
+    /** Fails the first stream mid-response by destroying its socket. */
+    dropFirstResponse: () => {
+      if (!firstResponse) throw new Error("first provider request has not arrived yet");
+      firstResponse.destroy();
+    },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
 }
@@ -152,6 +158,16 @@ describeIntegration("Stream Error Recovery (No Amnesia)", () => {
             options: { model: MODEL, thinkingLevel: "off", agentId: "exec", toolPolicy },
           });
           expect(sendResult.success).toBe(true);
+
+          // Fail the stream only after the backend has delivered every prefix delta, so the
+          // error path has the whole prefix to persist (no grace timer).
+          const lastPrefixMarker = `${NONCE}-${PREFIX_MARKERS}:`;
+          const deadline = Date.now() + EVENT_TIMEOUT_MS;
+          while (!collector.getStreamContent().includes(lastPrefixMarker)) {
+            if (Date.now() > deadline) throw new Error("prefix deltas never arrived");
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          fixture.dropFirstResponse();
 
           const terminal = await Promise.race([
             collector.waitForEvent("stream-end", EVENT_TIMEOUT_MS),
