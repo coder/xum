@@ -554,36 +554,24 @@ export class AgentStatusService {
    * mid-stream — exactly when "what is the agent doing now" matters most.
    */
   private async buildTrailingTranscript(workspaceId: string): Promise<string> {
-    // Sidebar status is a provider request too: UI-only history rows (plan-review
-    // snapshot/resolve/reopen records, workflow display-only rows) must not leak
-    // into it. The window is counted in VISIBLE rows — filtering a count-capped read
-    // instead would let a burst of hidden records (resolving many threads) evict the
-    // recent conversation, and each hidden append would change the hash by evicting
-    // a visible row. Newest-first scan, stopped as soon as the window is full.
+    // Sidebar status is a provider request too, so it reads the same context the agent's model
+    // sees: getHistoryFromLatestBoundary starts at the latest compaction boundary (the summary
+    // row is kept, the conversation it replaced is not; #4421) or manual reset. It honors RAW
+    // reset floors, so a malformed reset row still discards everything before it (#4555).
+    // Sealed-history rotation keeps that read bounded by the active epoch.
     //
-    // A durable manual reset is a privacy floor: the user discarded everything before it,
-    // so a short post-reset conversation must not be topped up with pre-reset rows (the
-    // scan would otherwise continue into the archive). The reset marker row itself is
-    // structure, not conversation. Only WELL-FORMED reset markers stop this scan:
-    // iterateFullHistory skips unreadable rows, so a malformed reset row does not act as a
-    // floor here (the raw-aware provider reader, getHistoryFromLatestBoundary, also stops at
-    // compaction boundaries and reads the whole epoch, so it is not a drop-in replacement).
-    const newestFirst: MuxMessage[] = [];
-    const scanned = await this.historyService.iterateFullHistory(
-      workspaceId,
-      "backward",
-      (chunk) => {
-        for (const message of chunk) {
-          if (isDurableContextResetBoundaryMarker(message)) return false;
-          if (isModelHiddenMessage(message)) continue;
-          newestFirst.push(message);
-          if (newestFirst.length >= AGENT_STATUS_MAX_TRAILING_MESSAGES) return false;
-        }
-        return true;
-      }
-    );
-    if (!scanned.success) return "";
-    const committedMessages = newestFirst.reverse();
+    // UI-only rows (plan-review snapshot/resolve/reopen records, workflow display-only rows)
+    // must not leak into the request, and a readable reset marker is structure, not
+    // conversation. The window is counted in VISIBLE rows: counting before filtering would let
+    // a burst of hidden records (resolving many threads) evict the recent conversation, and
+    // each hidden append would change the hash by evicting a visible row.
+    const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) return "";
+    const committedMessages = history.data
+      .filter(
+        (message) => !isDurableContextResetBoundaryMarker(message) && !isModelHiddenMessage(message)
+      )
+      .slice(-AGENT_STATUS_MAX_TRAILING_MESSAGES);
     const partial = await this.historyService.readPartial(workspaceId);
 
     // Partial messages get an "(in progress)" role suffix so the model sees

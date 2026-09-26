@@ -1,8 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import type { ProjectsConfig, ProjectConfig, Workspace } from "@/common/types/project";
 import { Ok, Err } from "@/common/types/result";
@@ -430,6 +430,62 @@ describe("AgentStatusService", () => {
     expect(transcript).toContain("User: Fresh start after reset");
     expect(transcript).not.toContain("mux_plan_review");
     expect(transcript).not.toContain("PRE-RESET-SECRET");
+  });
+
+  test("a malformed reset row is still a floor for the status transcript (#4555)", async () => {
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u0", "user", "PRE-RESET-SECRET: my API token is hunter2")
+    );
+    // Raw reset evidence on a row that does not parse: provider requests treat it as a floor,
+    // so the sidebar status request must too.
+    appendFileSync(
+      join(historyHandle.config.sessionsDir, workspaceId, CHAT_FILE_NAME),
+      '{"metadata":{"contextBoundaryKind" : "reset"},broken\n'
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Fresh start after reset")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("User: Fresh start after reset");
+    expect(transcript).not.toContain("PRE-RESET-SECRET");
+  });
+
+  test("the status transcript starts at the latest compaction summary (#4421)", async () => {
+    // The status model sees the same context as the agent's model: the compaction summary and
+    // what follows it, not the conversation the summary replaced.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u0", "user", "PRE-COMPACTION-DETAIL: refactor the parser")
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("summary", "assistant", "Summary: the parser refactor is underway", {
+        timestamp: Date.now(),
+        compacted: "user",
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      })
+    );
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Now write the tests")
+    );
+
+    const service = createService();
+    await getInternals(service).runForWorkspace(workspaceId);
+
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    const transcript = generateSpy.mock.calls[0][0];
+    expect(transcript).toContain("Summary: the parser refactor is underway");
+    expect(transcript).toContain("User: Now write the tests");
+    expect(transcript).not.toContain("PRE-COMPACTION-DETAIL");
   });
 
   test("transcript tags in-flight tool calls 'running' and completed ones 'done'", async () => {
