@@ -79,7 +79,7 @@ test("looped specifiers resolve through const arrays", () => {
     reported(`
       const PATHS = ["a", "b"];
       beforeEach(() => { for (const p of PATHS) mock.module(p, () => ({})); });
-      afterAll(() => { for (const p of [...PATHS]) mock.module(p, () => real); });
+      afterAll(() => { for (const p of PATHS) mock.module(p, () => real); });
     `)
   ).toEqual([]);
   expect(
@@ -221,26 +221,19 @@ test("a restore list that is mutated or escapes proves nothing", () => {
     reported(`${importLine}
       const entries = [["a", real]];
       restoreModulesAfterSuite(entries);
-      clearLater(entries);
-      mock.module("a", () => ({}));
-    `)
-  ).toEqual(["a"]);
-  expect(
-    reported(`${importLine}
-      const entries = [["a", real]];
-      restoreModulesAfterSuite(entries);
       for (const entry of entries) entry[0] = "b";
       mock.module("a", () => ({}));
     `)
   ).toEqual(["a"]);
-  // Passing the list only to the restore helper (or copying it) keeps it trustworthy.
+  // A copy shares the tuples, so `copy[0][0] = "b"` rewrites the restore list too.
   expect(
     reported(`${importLine}
       const entries = [["a", real]];
-      restoreModulesAfterSuite([...entries]);
+      restoreModulesAfterSuite(entries);
+      const copy = [...entries];
       mock.module("a", () => ({}));
     `)
-  ).toEqual([]);
+  ).toEqual(["a"]);
 });
 
 test("a restore behind a filter restores nothing; a filtered install installs every candidate", () => {
@@ -263,6 +256,12 @@ test("a restore behind a filter restores nothing; a filtered install installs ev
       function restore() { mock.module("a", () => real); }
       beforeEach(() => { mock.module("a", () => ({})); });
       afterEach(() => { if (flag) restore(); });
+    `)
+  ).toEqual(["a"]);
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      afterAll(() => { for (const x of []) mock.module("a", () => real); });
     `)
   ).toEqual(["a"]);
   // Restoring once suffices: one sure call site makes a helper's restore count.
@@ -308,6 +307,15 @@ test("afterEach restores in a suite whose tests are all skipped never run", () =
       describe("aliased", () => { afterEach(() => { mock.module("a", () => real); }); t("x", () => {}); });
     `)
   ).toEqual([]);
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      describe("outer", () => {
+        afterEach(() => { mock.module("a", () => real); });
+        describe("inner", () => { test.skip("x", () => {}); });
+      });
+    `)
+  ).toEqual(["a"]);
   // bun still runs afterAll for such a suite.
   expect(
     reported(`

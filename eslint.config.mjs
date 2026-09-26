@@ -632,9 +632,8 @@ const localPlugin = {
             String(def.parent.source.value).endsWith("/moduleMocks")
           );
         };
-        // A loop leaves the elements alone when it destructures each one
-        // (`for (const [p, real] of entries)`) or never reaches into or hands off its variable
-        // except to mock.module; `for (const entry of entries) entry[0] = "b"` rewrites the list.
+        // A loop leaves the elements alone when it destructures them (`for (const [p, real] of
+        // entries)`) or only passes its variable to mock.module (unlike `entry[0] = "b"`).
         const loopKeepsElements = (loop) => {
           const declarator =
             loop.left.type === "VariableDeclaration" ? loop.left.declarations[0] : null;
@@ -652,8 +651,8 @@ const localPlugin = {
           );
         };
         // A `const` array still holds its literal elements only when every use reads it
-        // whole: looping over it, spreading it into a copy, or handing it to
-        // restoreModulesAfterSuite. Any other use (`entries.length = 0`, `.push`, passing it
+        // whole: looping over it or handing it to restoreModulesAfterSuite. Any other use
+        // (`entries.length = 0`, `.push`, a `[...entries]` copy sharing its tuples, passing it
         // elsewhere, exporting it) may change what it holds by the time it is read.
         const isSealedArray = (variable) =>
           variable.defs[0].parent.parent?.type !== "ExportNamedDeclaration" &&
@@ -674,7 +673,6 @@ const localPlugin = {
               (parent.type === "ForOfStatement" &&
                 parent.right === node &&
                 loopKeepsElements(parent)) ||
-              (parent.type === "SpreadElement" && parent.parent.type === "ArrayExpression") ||
               (parent.type === "CallExpression" &&
                 parent.arguments[0] === node &&
                 isRestoreListHelper(parent.callee))
@@ -835,8 +833,8 @@ const localPlugin = {
           "DoWhileStatement",
         ]);
         // Whether `node` can be skipped while its enclosing function runs: it sits in a branch
-        // (`if (p === "a") mock.module(p, ...)` in a loop), a return/throw precedes it, or a
-        // return/throw/break/continue sits in a loop around it.
+        // (`if (p === "a") mock.module(p, ...)` in a loop) or a loop that may not iterate, a
+        // return/throw precedes it, or a return/throw/break/continue sits in a loop around it.
         const runsConditionally = (node) => {
           const fn = enclosingContext(node);
           const loops = [];
@@ -852,6 +850,13 @@ const localPlugin = {
               return true;
             }
             if (LOOPS.has(parent.type)) {
+              // A loop body may run zero times unless it iterates a known non-empty array.
+              if (
+                parent.body === child &&
+                !(parent.type === "ForOfStatement" && resolveArrayElements(parent.right)?.length)
+              ) {
+                return true;
+              }
               loops.push(parent);
             }
           }
@@ -864,11 +869,9 @@ const localPlugin = {
           );
         };
 
-        // Whether bun surely skips every test of `suite` (a describe callback, or null for the
-        // file), so its `afterEach` hooks never run: its body registers at least one test and
-        // every test it registers is skip/todo (or `.each([])`), counting inline nested suites.
-        // Anything the rule cannot see (other calls that may register tests, describe callbacks
-        // passed by name, aliased test functions) means tests may run.
+        // Whether bun surely skips every test of `suite` (null = file), so its `afterEach` never
+        // runs: it has a test, all of them skip/todo/`.each([])` (inline nested suites included).
+        // Anything unseen (other calls, named describe callbacks, test aliases) may run tests.
         const isEmptyEach = (call) =>
           (call.callee.type === "MemberExpression" &&
             !call.callee.computed &&
@@ -894,6 +897,7 @@ const localPlugin = {
               if (!isSkippedCall(call) && (callback == null || !allTestsSkipped(callback))) {
                 return false;
               }
+              sawTest = true;
             } else if (!HOOK_CALLS.has(root) && root !== "mock") {
               return false;
             }
@@ -908,8 +912,7 @@ const localPlugin = {
         // - scoped: the suites whose hooks or tests run it (installs there need a restore in
         //   that suite or an enclosing one);
         // - teardown: it runs only from `afterAll`/`afterEach`;
-        // - sure: the suites it surely runs in, so restores there count. Conditional call
-        //   sites, values passed around, and `afterEach` of an all-skipped suite add none.
+        // - sure: the suites it surely runs in (restores count only there).
         // Named helpers take the union over their call sites, resolved by binding, so a helper
         // that setup code also calls is not teardown and its installs belong to every suite and
         // context that calls it. Restoring once suffices, so any sure site makes it sure.
