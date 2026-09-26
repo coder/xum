@@ -42,6 +42,9 @@ function SimpleAgentToggle(props: {
   disabled: boolean;
 }) {
   const isPlan = props.agentId === "plan";
+  // Seeded workspace settings can name a custom agent (e.g. a sub-agent's "explore"); show it as
+  // is rather than mislabeling it as Exec.
+  const label = isPlan ? "Plan" : props.agentId === "exec" ? "Exec" : props.agentId;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -56,7 +59,7 @@ function SimpleAgentToggle(props: {
               : "bg-exec-mode text-white hover:bg-exec-mode-hover"
           )}
         >
-          {isPlan ? "Plan" : "Exec"}
+          {label}
         </button>
       </TooltipTrigger>
       <TooltipContent align="center">

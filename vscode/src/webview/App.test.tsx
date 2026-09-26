@@ -456,4 +456,17 @@ describe("vscode webview workspace AI settings", () => {
       thinkingLevel: "low",
     });
   });
+
+  test("shows the actual custom agent instead of mislabeling it as Exec", async () => {
+    const { bridge, view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: { parentWorkspaceId: "ws-parent", agentId: "explore", agentType: "explore" },
+    });
+
+    const toggle = view.getByRole("button", { name: "explore" });
+    expect((toggle as HTMLButtonElement).disabled).toBe(true);
+    expect(view.queryByRole("button", { name: "Exec" })).toBeNull();
+    const options = await send(bridge, view);
+    expect(options.agentId).toBe("explore");
+  });
 });
