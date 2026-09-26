@@ -226,22 +226,18 @@ describe("vscode webview workspace selection", () => {
         { script: "echo webview", timeout_secs: 5, display_name: "Webview probe" },
         { success: true, output: "webview", exitCode: 0, wall_duration_ms: 3 }
       ),
-      toolMessage(
-        "m2",
-        2,
-        "propose_plan",
-        {},
-        { success: true, planPath: "/home/alice/plan.md", planContent: "# Webview plan" }
-      ),
+      // Current-format plan results omit planContent; only the latest plan fetches it from disk.
+      toolMessage("m2", 2, "propose_plan", {}, { success: true, planPath: "/home/alice/old.md" }),
+      toolMessage("m3", 3, "propose_plan", {}, { success: true, planPath: "/home/alice/plan.md" }),
       // A persisted failed turn renders through StreamErrorMessage.
       {
         type: "message",
-        id: "m3",
+        id: "m4",
         role: "assistant",
         parts: [],
         metadata: {
-          historySequence: 3,
-          timestamp: 3,
+          historySequence: 4,
+          timestamp: 4,
           error: "provider exploded",
           errorType: "unknown",
         },
@@ -249,7 +245,37 @@ describe("vscode webview workspace selection", () => {
     ]);
 
     expect(view.container.textContent).toContain("echo webview");
-    expect(view.container.textContent).toContain("Webview plan");
     expect(view.container.textContent).toContain("provider exploded");
+
+    const planFetches = bridge.orpcCalls("workspace.getPlanContent");
+    expect(planFetches).toHaveLength(1);
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: planFetches[0].requestId,
+      ok: true,
+      kind: "value",
+      value: { success: true, data: { content: "# Webview plan", path: "/home/alice/plan.md" } },
+    });
+    expect(view.container.textContent).toContain("Webview plan");
+  });
+
+  test("keeps the composer disabled until the history replay catches up", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+
+    // Sending before the transcript is complete would act on partial context.
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    expect(textarea.disabled).toBe(true);
+
+    await bridge.emit({
+      type: "chatEvent",
+      workspaceId: WORKSPACE.id,
+      event: { type: "caught-up" },
+    });
+    expect(view.container.querySelector("textarea")?.disabled).toBe(false);
   });
 });

@@ -130,6 +130,9 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   const [connectionStatus, setConnectionStatus] = useState<UiConnectionStatus | null>(null);
   const [workspaces, setWorkspaces] = useState<UiWorkspace[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
+  // Mirrors the replay's caught-up flag for rendering: the composer stays disabled until the
+  // history replay completes, so a send never acts on a partial transcript.
+  const [transcriptCaughtUp, setTranscriptCaughtUp] = useState(false);
 
   const activeWorkspaceIdRef = useRef<string | null>(null);
   activeWorkspaceIdRef.current = selectedWorkspaceId;
@@ -269,6 +272,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           chatReplayStateRef.current = msg.workspaceId
             ? createChatReplayState(msg.workspaceId)
             : null;
+          setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
           setNotices([]);
 
@@ -290,6 +294,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             workspace?.unarchivedAt
           );
           chatReplayStateRef.current = createChatReplayState(msg.workspaceId);
+          setTranscriptCaughtUp(false);
           setDisplayedMessages([]);
           setNotices([]);
           jumpToBottomRef.current();
@@ -321,6 +326,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             if (!replayState || replayState.workspaceId !== msg.workspaceId) {
               replayState = createChatReplayState(msg.workspaceId);
               chatReplayStateRef.current = replayState;
+              setTranscriptCaughtUp(false);
             }
 
             const flushReplayBuffer = () => {
@@ -339,6 +345,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
               replayState.pendingStreamEvents.length = 0;
 
               replayState.caughtUp = true;
+              setTranscriptCaughtUp(true);
               flushDisplayedMessages();
             };
 
@@ -507,6 +514,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     bridge.postMessage({ type: "openWorkspace", workspaceId: selectedWorkspaceId });
   };
 
+  // Only the latest propose_plan card fetches its plan from disk (current results omit the
+  // content), matching ChatPane.
+  let latestProposePlanId: string | undefined;
+  for (let i = displayedMessages.length - 1; i >= 0; i--) {
+    const msg = displayedMessages[i];
+    if (msg.type === "tool" && msg.toolName === "propose_plan") {
+      latestProposePlanId = msg.id;
+      break;
+    }
+  }
+
   return (
     // Shared providers (SettingsProvider, settings links in the model selector and tool cards) need
     // a router. The webview renders no routes, so an embedded in-memory router is enough: those
@@ -582,6 +600,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                                 key={msg.id}
                                 message={msg}
                                 workspaceId={selectedWorkspaceId}
+                                isLatestProposePlan={msg.id === latestProposePlanId}
                               />
                             ))}
                             <VscodeStreamingBarrier
@@ -626,9 +645,13 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                         <ChatComposer
                           key={selectedWorkspaceId}
                           workspaceId={selectedWorkspaceId}
-                          disabled={!canChat}
+                          disabled={!canChat || !transcriptCaughtUp}
                           disabledReason={
-                            canChat ? undefined : "Chat requires Xum server connection."
+                            !canChat
+                              ? "Chat requires Xum server connection."
+                              : !transcriptCaughtUp
+                                ? "Loading chat history..."
+                                : undefined
                           }
                           aggregator={aggregatorRef.current}
                           onSendComplete={jumpToBottom}

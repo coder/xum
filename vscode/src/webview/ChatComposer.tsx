@@ -225,6 +225,11 @@ function ChatComposerInner(props: {
   };
 
   const onSend = async () => {
+    // Re-check at dispatch: the composer can be disabled (e.g. history replay not caught up)
+    // after the keystroke or click that triggered this send.
+    if (props.disabled) {
+      return;
+    }
     const trimmed = input.trim();
     if (!trimmed) {
       return;
