@@ -4,6 +4,8 @@ import { generateText, jsonSchema, streamText, tool, type LanguageModel, type To
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
+import { Cause, Effect, Exit, Option } from "effect";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
@@ -4834,6 +4836,53 @@ describe("withAnthropicEvaluationEffort", () => {
     expect(bodies[0].thinking).toEqual({ type: "disabled" });
     expect(bodies[1]).not.toHaveProperty("thinking");
     expect(bodies[1].output_config).toMatchObject({ effort: "low" });
+  });
+});
+
+describe("withAnthropicEvaluationEffort billed usage (#4728)", () => {
+  it("keeps the usage of an answer the wrapped adapter rejects", async () => {
+    const answerFetch = Object.assign(
+      (): Promise<Response> =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "msg_1",
+              type: "message",
+              role: "assistant",
+              model: "claude-opus-5-5",
+              content: [{ type: "text", text: JSON.stringify({ q0: "c9" }) }],
+              stop_reason: "end_turn",
+              stop_sequence: null,
+              usage: { input_tokens: 70, output_tokens: 7 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        ),
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+    const model = withAnthropicEvaluationEffort(
+      createAnthropic({ apiKey: "test", fetch: answerFetch }).evaluationModel("claude-opus-5-5"),
+      "claude-opus-5-5"
+    );
+    const exit = await Effect.runPromiseExit(
+      makeEvaluationService().evaluate({
+        model,
+        state: "x",
+        questions: {
+          q: { type: "choice", instructions: "Pick one.", criteria: { a: "A", b: "B" } },
+        },
+      })
+    );
+    const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.isSome(error)).toBe(true);
+    if (!Option.isSome(error)) return;
+    expect(error.value).toMatchObject({ reason: "invalid-output", code: "invalid-response" });
+    expect(error.value.billedUsage?.usage).toEqual({
+      inputTokens: 70,
+      outputTokens: 7,
+      totalTokens: 77,
+    });
   });
 });
 

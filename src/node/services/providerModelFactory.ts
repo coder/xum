@@ -34,7 +34,10 @@ import {
   type EvaluationProviderName,
 } from "@/common/utils/ai/evaluationModels";
 import { computeConfigFingerprint } from "@/node/services/evaluation/evaluationDigest";
-import type { EvaluationModelInstance } from "@/node/services/evaluation/evaluationService";
+import {
+  installInnerBillingCapture,
+  type EvaluationModelInstance,
+} from "@/node/services/evaluation/evaluationService";
 import {
   CODEX_ENDPOINT,
   CODEX_OAUTH_ROUTED_HEADER,
@@ -759,6 +762,9 @@ export function withAnthropicEvaluationEffort(
   if (!anthropicRejectsDisabledThinking(modelId)) {
     return model;
   }
+  // The wrapper hides the SDK adapter's inner model, which evaluate() needs to
+  // capture the usage of an answer the adapter rejects (#4728); install it here.
+  installInnerBillingCapture(model);
   return {
     specificationVersion: model.specificationVersion,
     provider: model.provider,

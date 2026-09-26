@@ -203,8 +203,10 @@ const INNER_BILLING_CAPTURE = Symbol("xum.evaluationInnerBillingCapture");
  * each call reports its usage to the `evaluate()` scope it runs in
  * (AsyncLocalStorage, because pinned models are shared across concurrent calls).
  * Models without the field (TypeSafe, mocks, a future SDK) are left alone.
+ * Exported for wrappers that hide the field (withAnthropicEvaluationEffort):
+ * they install it on the model they wrap.
  */
-function installInnerBillingCapture(model: EvaluationModelInstance): void {
+export function installInnerBillingCapture(model: EvaluationModelInstance): void {
   const inner: unknown = (model as { model?: unknown }).model;
   if (inner === null || typeof inner !== "object") {
     return;
