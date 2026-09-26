@@ -31,8 +31,8 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Exported for tests", "exported for unit testing", "exposed only for tests",
   // "Exported for tests only", "visible for testing".
   /\b(?:exported|exposed|visible)\s+(?:only\s+)?for\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
-  // "Used for testing.", "(used by tests)", "Used in tests to reset ...".
-  /\bused\s+(?:only\s+)?(?:in|by|for)\s+(?:tests?|testing)\b/i,
+  // "Used for testing.", "(used by tests)", "Used in tests to reset ...", "used only by unit tests".
+  /\bused\s+(?:only\s+)?(?:in|by|for)\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
   // "Test seam", "test seams", "@VisibleForTesting".
   /\btest[- ]?seams?\b/i,
   /\bvisibleForTesting\b/i,
@@ -41,6 +41,44 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
 ];
 
 export const ALLOWLIST_PATH = "scripts/check-test-seam-comments.allowlist.json";
+
+/**
+ * The `knownDebt` keys (file#symbol) as of this guard landing. `knownDebt` must list exactly
+ * these keys, so the baseline can only shrink: fixing a seam removes its entry here and in the
+ * JSON file. Never add a key here; give a new seam a production caller or remove it instead.
+ */
+export const FROZEN_KNOWN_DEBT: readonly string[] = [
+  "src/browser/features/ChatInput/placeholderTips.ts#getPlaceholderTip",
+  "src/browser/hooks/useBoundedTranscriptReveal.ts#BoundedTranscriptRevealArgs.scheduleFrame",
+  "src/browser/utils/mcp/iconRefCache.ts#McpIconRefCache.size",
+  "src/cli/debug/refinements.ts#RefinementsCommandOptions.sessionDir",
+  "src/common/orpc/schemas/api.ts#debug",
+  "src/common/orpc/schemas/api.ts#debug.triggerStreamError",
+  "src/node/runtime/SSH2ConnectionPool.ts#AcquireConnectionOptions.sleep",
+  "src/node/runtime/SSH2ConnectionPool.ts#SSH2ConnectionPool.clearAllHealth",
+  "src/node/runtime/sshConnectionPool.ts#AcquireConnectionOptions.sleep",
+  "src/node/runtime/sshConnectionPool.ts#SSHConnectionPool.clearAllHealth",
+  "src/node/services/agentSession.ts#AgentSessionOptions.planSnapshotCaptureTimeoutMs",
+  "src/node/services/autoModelRouter.ts#AutoModelRouterDeps.createEvaluationModel",
+  "src/node/services/coderService.ts#CoderService.clearCache",
+  "src/node/services/contextManagement/sessionContextHost.ts#SessionContextHost.compactionMonitor",
+  "src/node/services/mcpServerIcon.ts#IconResolverDependencies",
+  "src/node/services/refinement/refineService.ts#RefineServiceOptions.applyLockTimeoutMs",
+  "src/node/services/refinement/refineService.ts#RefineServiceOptions.onStagedEditAttempted",
+  "src/node/services/refinement/refineService.ts#RefineServiceOptions.timeoutMs",
+  "src/node/services/refinement/refinementRollback.ts#RollbackRefinementOptions.testOnlyBeforeCommit",
+  "src/node/services/refinement/refinementRollback.ts#RollbackRefinementOptions.testOnlyBeforeRollbackJournal",
+  "src/node/services/refinement/refinementRollback.ts#RollbackRefinementOptions.testOnlyBeforeTargetLock",
+  "src/node/services/workflows/WorkflowRunStore.ts#KeyedFifoLock.waiterCount",
+  "src/node/services/workflows/WorkflowRunStore.ts#WorkflowRunStoreOptions.mutationLockWaitTimeoutMs",
+  "src/node/services/workspaceService.ts#WorkspaceService.debugTriggerStreamError",
+  "src/node/utils/concurrency/fileLock.ts#ProcessFileLockOptions.testOnlyReclaimSeam",
+  "src/node/utils/concurrency/fileLock.ts#ReclaimSeamPhase",
+  "src/node/utils/concurrency/processLiveness.ts#setSelfIdentityForTesting",
+  "src/node/utils/journal/journal.ts#JournalOptions.testOnlyBeforeAppendWrite",
+  "src/node/utils/main/bashPath.ts#resetBashPathCache",
+  "src/node/utils/network/pinnedHttpsFetch.ts#PinnedHttpsFetchTransport",
+];
 
 /**
  * Production source = src/**\/*.{ts,tsx} minus tests, test support, stories and
@@ -99,6 +137,12 @@ function firstMatch(body: string): string | undefined {
 
 function declarationName(node: ts.Node): string | undefined {
   if (ts.isVariableStatement(node)) return declarationName(node.declarationList);
+  // `export { a, b as c }` has no declaration name; key it by the exported names.
+  if (ts.isExportDeclaration(node) && node.exportClause && ts.isNamedExports(node.exportClause)) {
+    const names = node.exportClause.elements.map((element) => element.name.text);
+    return names.length > 0 ? names.join(",") : undefined;
+  }
+  if (ts.isExportAssignment(node)) return "default";
   if (ts.isVariableDeclarationList(node)) {
     const first = node.declarations[0];
     return first === undefined ? undefined : declarationName(first);
@@ -132,6 +176,40 @@ function symbolChain(owner: ts.Node): string {
   return names.length > 0 ? names.join(".") : "(file)";
 }
 
+interface OwnedComment {
+  range: ts.CommentRange;
+  owner: ts.Node;
+}
+
+/**
+ * Merges runs of `//` comments on consecutive lines into one range so a phrase split
+ * across them ("// Exported for" + "// tests.") still matches. A run starts only at a
+ * comment that begins its line; a trailing `code; // ...` comment stays on its own so
+ * the next line's block isn't attributed to that code. The run keeps its first owner.
+ */
+function coalesceLineComments(text: string, comments: OwnedComment[]): OwnedComment[] {
+  const sorted = [...comments].sort((a, b) => a.range.pos - b.range.pos);
+  const merged: OwnedComment[] = [];
+  const startsLine = (pos: number) =>
+    text.slice(text.lastIndexOf("\n", pos - 1) + 1, pos).trim() === "";
+  for (const comment of sorted) {
+    const previous = merged[merged.length - 1];
+    const isLine = comment.range.kind === ts.SyntaxKind.SingleLineCommentTrivia;
+    if (
+      previous !== undefined &&
+      isLine &&
+      previous.range.kind === ts.SyntaxKind.SingleLineCommentTrivia &&
+      startsLine(previous.range.pos) &&
+      /^[ \t]*\r?\n[ \t]*$/.test(text.slice(previous.range.end, comment.range.pos))
+    ) {
+      previous.range = { ...previous.range, end: comment.range.end };
+      continue;
+    }
+    merged.push({ range: { ...comment.range }, owner: comment.owner });
+  }
+  return merged;
+}
+
 /** Finds seam comments in one file. `file` is only used for reporting and TSX detection. */
 export function findSeamComments(file: string, text: string): SeamComment[] {
   // Cheap prefilter: most files never mention a seam phrase anywhere.
@@ -152,7 +230,7 @@ export function findSeamComments(file: string, text: string): SeamComment[] {
   visit(sourceFile);
 
   const found: SeamComment[] = [];
-  for (const { range, owner } of owners.values()) {
+  for (const { range, owner } of coalesceLineComments(text, [...owners.values()])) {
     const phrase = firstMatch(commentBody(text.slice(range.pos, range.end)));
     if (phrase === undefined) continue;
     found.push({
@@ -208,12 +286,19 @@ export interface CheckResult {
   unlisted: SeamComment[];
   stale: AllowlistEntry[];
   duplicates: AllowlistEntry[];
+  /** `knownDebt` entries missing from the frozen baseline (new debt). */
+  unfrozenDebt: AllowlistEntry[];
+  /** Frozen keys no longer in `knownDebt`; remove them from FROZEN_KNOWN_DEBT too. */
+  thawedDebt: string[];
 }
 
 export function checkSeamComments(
   comments: readonly SeamComment[],
-  allowlist: Allowlist
+  allowlist: Allowlist,
+  frozenDebt: readonly string[] = FROZEN_KNOWN_DEBT
 ): CheckResult {
+  const frozen = new Set(frozenDebt);
+  const debtKeys = new Set(allowlist.knownDebt.map(entryKey));
   const listed = new Map<string, AllowlistEntry>();
   const duplicates: AllowlistEntry[] = [];
   for (const entry of [...allowlist.allowed, ...allowlist.knownDebt]) {
@@ -225,6 +310,8 @@ export function checkSeamComments(
     unlisted: comments.filter((comment) => !listed.has(entryKey(comment))),
     stale: [...listed.values()].filter((entry) => !matchedKeys.has(entryKey(entry))),
     duplicates,
+    unfrozenDebt: allowlist.knownDebt.filter((entry) => !frozen.has(entryKey(entry))),
+    thawedDebt: [...frozen].filter((key) => !debtKeys.has(key)),
   };
 }
 
@@ -242,7 +329,10 @@ function main(): number {
   const allowlist = parseAllowlist(
     JSON.parse(readFileSync(path.join(root, ALLOWLIST_PATH), "utf8")) as unknown
   );
-  const { unlisted, stale, duplicates } = checkSeamComments(comments, allowlist);
+  const { unlisted, stale, duplicates, unfrozenDebt, thawedDebt } = checkSeamComments(
+    comments,
+    allowlist
+  );
 
   const tag = "check-test-seam-comments:";
   for (const comment of unlisted) {
@@ -274,7 +364,19 @@ function main(): number {
   for (const entry of duplicates) {
     console.error(`${tag} duplicate allowlist entry ${entryKey(entry)} in ${ALLOWLIST_PATH}`);
   }
-  return unlisted.length + stale.length + duplicates.length > 0 ? 1 : 0;
+  for (const entry of unfrozenDebt) {
+    console.error(
+      `${tag} new knownDebt entry ${entryKey(entry)}: knownDebt only shrinks; give the seam a production caller and list it under "allowed", or remove the seam`
+    );
+  }
+  for (const key of thawedDebt) {
+    console.error(
+      `${tag} ${key} left knownDebt; remove it from FROZEN_KNOWN_DEBT in scripts/check-test-seam-comments.ts too`
+    );
+  }
+  const failures =
+    unlisted.length + stale.length + duplicates.length + unfrozenDebt.length + thawedDebt.length;
+  return failures > 0 ? 1 : 0;
 }
 
 if (import.meta.main) {
