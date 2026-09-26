@@ -411,6 +411,22 @@ describe("EvaluationService.evaluate billed usage on rejected answers (#4728)", 
     expect(JSON.stringify(error)).not.toContain(SENTINEL);
   });
 
+  it("reports a derived total past the safe-integer range as unknown", async () => {
+    const { model } = mockModel(() =>
+      Promise.resolve({
+        answers: { ...VALID_ANSWERS, injection: { type: "choice" as const, choice: "definitely" } },
+        usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 },
+        warnings: [],
+      })
+    );
+    const error = expectFailure(await runExit(service.evaluate(call(model, QUESTIONS))));
+    expect(error.billedUsage?.usage).toEqual({
+      inputTokens: Number.MAX_SAFE_INTEGER,
+      outputTokens: 1,
+      totalTokens: null,
+    });
+  });
+
   it("keeps the usage of an answer the real OpenAI evaluation adapter rejects inside doEvaluate", async () => {
     // q0 is the choice question; "c9" is not one of its option codes, so the
     // provider-utils adapter throws before it would return usage.

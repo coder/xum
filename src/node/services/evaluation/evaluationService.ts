@@ -170,8 +170,11 @@ function projectBilledUsage(
   const outputTokens = projectTokenCount(usage?.outputTokens);
   // The SDK computes a total only for answers it accepted; for a rejected
   // response derive it, and only when both counts are known.
+  // The sum goes through the same projection, so an overflow past a safe integer is unknown.
   const derivedTotal =
-    inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null;
+    inputTokens !== null && outputTokens !== null
+      ? projectTokenCount(inputTokens + outputTokens)
+      : null;
   return {
     usage: {
       inputTokens,
