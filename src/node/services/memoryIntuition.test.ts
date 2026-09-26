@@ -1412,6 +1412,49 @@ describe("runMemoryIntuition", () => {
     },
     MEMORY_INTUITION_TIMEOUT_MS + 5000
   );
+
+  it("reports a deadline that expires during report verification as a timeout", async () => {
+    using f = await fixture({ "a.md": "alpha" });
+    let reported = false;
+    let entered!: () => void;
+    const verifying = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    // Pass the metadata probe, then hold the private verification read of the report.
+    const unregister = eventSpine.use("tool.execute", async (ctx, next) => {
+      if (ctx.toolName !== "memory" || ctx.host.workspaceId !== f.ctx.workspaceId) return next();
+      if (!reported) return next();
+      entered();
+      await new Promise<void>((resolve) =>
+        ctx.abortSignal?.addEventListener("abort", () => resolve())
+      );
+      await next();
+    });
+    const model = scriptedModel([[report([item("a.md", 0.9, "alpha")])]], () => {
+      reported = true;
+    });
+    const timer = spyOn(globalThis, "setTimeout");
+    try {
+      const pending = runMemoryIntuition({
+        ...f,
+        cue: "alpha",
+        modelString: "mock:test",
+        createModel: () => Promise.resolve(pinned(model)),
+        resolveAgentBody: body,
+        hooks: hookConfig(f),
+      });
+      await verifying;
+      const expire = timer.mock.calls.find(
+        ([, delay]) => delay === MEMORY_INTUITION_TIMEOUT_MS
+      )?.[0];
+      if (typeof expire !== "function") throw new Error("Expected intuition deadline");
+      expire();
+      expect(await pending).toMatchObject({ kind: "no_report", stats: { timedOut: true } });
+    } finally {
+      timer.mockRestore();
+      unregister();
+    }
+  });
 });
 
 interface Judged {
