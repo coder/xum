@@ -401,7 +401,7 @@ function ChatComposerInner(props: {
             <SimpleAgentToggle
               agentId={agentId}
               onChange={setAgentId}
-              disabled={isAgentSelectionLocked}
+              disabled={isAgentSelectionLocked === true}
             />
 
             <Tooltip>
