@@ -2221,6 +2221,14 @@ export function useWorkspaceMetadata(): WorkspaceMetadataContextValue {
 }
 
 /**
+ * Like useWorkspaceMetadata, but returns null outside WorkspaceProvider. For hosts that render
+ * chat components without the full workspace shell (the VS Code webview).
+ */
+export function useOptionalWorkspaceMetadata(): WorkspaceMetadataContextValue | null {
+  return useContext(WorkspaceMetadataContext) ?? null;
+}
+
+/**
  * Subscribe to workspace actions/selection/drafts only. This context value is
  * stable across metadata-Map changes, so sidebar-like components that don't
  * need the full Map can avoid re-renders.

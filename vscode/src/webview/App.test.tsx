@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../tests/ui/dom";
 import { App } from "./App";
+import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
 
 function createBridge(): VscodeBridge {
@@ -15,6 +16,105 @@ function createBridge(): VscodeBridge {
     onMessage: () => () => undefined,
     debugLog: () => undefined,
   };
+}
+
+// Records what the webview posts to the extension host and lets a test play the host's side.
+class TestBridge implements VscodeBridge {
+  traceId = "test";
+  startedAtMs = 0;
+  readonly sent: WebviewToExtensionMessage[] = [];
+  private readonly listeners = new Set<(data: unknown) => void>();
+
+  postMessage(payload: WebviewToExtensionMessage): void {
+    this.sent.push(payload);
+  }
+
+  onMessage(handler: (data: unknown) => void): () => void {
+    this.listeners.add(handler);
+    return () => {
+      this.listeners.delete(handler);
+    };
+  }
+
+  debugLog(): void {
+    // Not needed by these tests.
+  }
+
+  async emit(data: unknown): Promise<void> {
+    await act(async () => {
+      for (const listener of this.listeners) {
+        listener(data);
+      }
+      await Promise.resolve();
+    });
+  }
+
+  orpcCalls(path: string): Array<Extract<WebviewToExtensionMessage, { type: "orpcCall" }>> {
+    return this.sent.filter(
+      (message): message is Extract<WebviewToExtensionMessage, { type: "orpcCall" }> =>
+        message.type === "orpcCall" && message.path.join(".") === path
+    );
+  }
+}
+
+const WORKSPACE: UiWorkspace = {
+  id: "ws-1",
+  projectName: "xum",
+  workspaceName: "webview-fix",
+  projectPath: "/home/alice/xum",
+  streaming: false,
+  runtimeType: "worktree",
+  createdAt: "2026-09-26T00:00:00.000Z",
+};
+
+async function selectWorkspace(bridge: TestBridge, history: unknown[] = []): Promise<void> {
+  await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+  await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
+  await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+  for (const event of history) {
+    await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event });
+  }
+  await bridge.emit({ type: "chatEvent", workspaceId: WORKSPACE.id, event: { type: "caught-up" } });
+}
+
+function toolMessage(
+  id: string,
+  sequence: number,
+  toolName: string,
+  input: unknown,
+  output: unknown
+) {
+  return {
+    type: "message",
+    id,
+    role: "assistant",
+    parts: [
+      {
+        type: "dynamic-tool",
+        toolCallId: `${id}-call`,
+        toolName,
+        state: "output-available",
+        input,
+        output,
+      },
+    ],
+    metadata: { historySequence: sequence, timestamp: sequence },
+  };
+}
+
+// happy-dom does not route fireEvent.change through React's controlled-input tracking, so call
+// the textarea's React onChange directly (same workaround as SshPromptDialog.test.tsx).
+async function typeInto(textarea: HTMLTextAreaElement, value: string): Promise<void> {
+  const propsKey = Object.keys(textarea).find((key) => key.startsWith("__reactProps"));
+  if (!propsKey) throw new Error("textarea does not expose React props");
+  const props = (textarea as unknown as Record<string, { onChange?: (event: unknown) => void }>)[
+    propsKey
+  ];
+  if (!props.onChange) throw new Error("textarea has no onChange handler");
+  await act(async () => {
+    props.onChange?.({ target: { value }, currentTarget: { value } });
+    await Promise.resolve();
+  });
 }
 
 // Pins a scrollable geometry on the transcript scrollport; happy-dom has no layout, so every
@@ -68,5 +168,88 @@ describe("vscode webview transcript auto-scroll", () => {
     // ...so rows become anchor candidates again and the reading position is preserved.
     expect(content.style.overflowAnchor).toBe("");
     expect(sentinel.style.overflowAnchor).toBe("auto");
+  });
+});
+
+describe("vscode webview workspace selection", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("selecting a workspace renders the composer, and Send posts workspace.sendMessage through the bridge", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello from the webview");
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    expect(sends[0].input).toMatchObject({
+      workspaceId: WORKSPACE.id,
+      message: "hello from the webview",
+    });
+
+    await bridge.emit({
+      type: "orpcResponse",
+      requestId: sends[0].requestId,
+      ok: true,
+      kind: "value",
+      value: { success: true, data: undefined },
+    });
+    expect(view.container.textContent).not.toContain("Failed to send");
+  });
+
+  test("selecting a workspace whose history has bash and propose_plan calls and a stream error renders the transcript", async () => {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge, [
+      toolMessage(
+        "m1",
+        1,
+        "bash",
+        { script: "echo webview", timeout_secs: 5, display_name: "Webview probe" },
+        { success: true, output: "webview", exitCode: 0, wall_duration_ms: 3 }
+      ),
+      toolMessage(
+        "m2",
+        2,
+        "propose_plan",
+        {},
+        { success: true, planPath: "/home/alice/plan.md", planContent: "# Webview plan" }
+      ),
+      // A persisted failed turn renders through StreamErrorMessage.
+      {
+        type: "message",
+        id: "m3",
+        role: "assistant",
+        parts: [],
+        metadata: {
+          historySequence: 3,
+          timestamp: 3,
+          error: "provider exploded",
+          errorType: "unknown",
+        },
+      },
+    ]);
+
+    expect(view.container.textContent).toContain("echo webview");
+    expect(view.container.textContent).toContain("Webview plan");
+    expect(view.container.textContent).toContain("provider exploded");
   });
 });

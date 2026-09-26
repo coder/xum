@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Pencil } from "lucide-react";
 
@@ -12,6 +12,9 @@ import { APIProvider } from "xum/browser/contexts/API";
 import { ThemeProvider } from "xum/browser/contexts/ThemeContext";
 import { ChatHostContextProvider } from "xum/browser/contexts/ChatHostContext";
 import { RouterProvider } from "xum/browser/contexts/RouterContext";
+import { PolicyProvider } from "xum/browser/contexts/PolicyContext";
+import { AgentProvider } from "xum/browser/contexts/AgentContext";
+import { BackgroundBashProvider } from "xum/browser/contexts/BackgroundBashContext";
 import {
   Tooltip,
   TooltipContent,
@@ -35,6 +38,20 @@ import { DisplayedMessageRenderer } from "./DisplayedMessageRenderer";
 import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
 import type { VscodeBridge } from "./vscodeBridge";
+
+// Shared chat components need these providers; the webview has no desktop shell to supply them
+// (#4711). PolicyProvider falls back to "no policy" because the bridge rejects policy.* calls (the
+// backend still enforces policy on send). A single AgentProvider covers both the transcript
+// (ProposePlanToolCall) and the composer.
+function WebviewChatProviders(props: { workspaceId: string | undefined; children: ReactNode }) {
+  return (
+    <PolicyProvider>
+      <AgentProvider workspaceId={props.workspaceId}>
+        <TooltipProvider>{props.children}</TooltipProvider>
+      </AgentProvider>
+    </PolicyProvider>
+  );
+}
 
 interface Notice {
   id: string;
@@ -500,7 +517,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
           <SettingsProvider>
             <ProviderOptionsProvider>
               <ThemeProvider forcedTheme="dark">
-                <TooltipProvider>
+                <WebviewChatProviders workspaceId={selectedWorkspaceId ?? undefined}>
                   <div className="flex h-screen flex-col">
                     <div className="border-b border-border bg-background-secondary p-3">
                       <div className="flex items-center gap-2">
@@ -559,7 +576,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                     >
                       <div style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}>
                         {selectedWorkspaceId ? (
-                          <>
+                          <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
                             {displayedMessages.map((msg) => (
                               <DisplayedMessageRenderer
                                 key={msg.id}
@@ -572,7 +589,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                               aggregator={aggregatorRef.current}
                               className="mt-3"
                             />
-                          </>
+                          </BackgroundBashProvider>
                         ) : null}
 
                         {notices.map((notice) => (
@@ -622,7 +639,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                       )}
                     </div>
                   </div>
-                </TooltipProvider>
+                </WebviewChatProviders>
               </ThemeProvider>
             </ProviderOptionsProvider>
           </SettingsProvider>
