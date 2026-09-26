@@ -1477,21 +1477,23 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await editRow((ws) => {
         ws.taskStatus = "interrupted";
       });
-      // Backend B re-admits the row right before that path's report publication write.
-      let rotated = false;
+      // Backend B re-admits the row right before that path's report publication write. The
+      // test awaits B's write itself: a flag set when the write starts let the assertions run
+      // while it was still in flight (#4558: fsync on a slow CI disk outlasted the yields).
+      let rotation: Promise<void> | undefined;
       let waiterOutcome: string | undefined;
       const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
       spyOn(taskService, "editWorkspaceEntry").mockImplementation(async (id, updater, options) => {
         const probe = structuredClone(entryOf(config, childId));
-        if (id === childId && !rotated && probe != null) {
+        if (id === childId && rotation === undefined && probe != null) {
           updater(probe, config.loadConfigOrDefault());
           if (probe.taskStatus === "reported") {
-            rotated = true;
-            await editRow((ws) => {
+            rotation = editRow((ws) => {
               ws.taskStatus = "running";
               ws.taskAttemptId = foreign;
               ws.taskAttemptUnproven = true;
             });
+            await rotation;
             // A parent now awaits the task by its stable id: B's waiter.
             void taskService
               .waitForAgentReport(childId, { timeoutMs: 3_000, requestingWorkspaceId: rootId })
@@ -1508,7 +1510,13 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         return editOriginal(id, updater, options);
       });
       stack.endStream(0, { report: "done by A" }, true);
-      await until(() => rotated, "the publication write");
+      await until(() => rotation !== undefined, "the publication write");
+      await rotation;
+      await until(
+        () =>
+          !(svc.streamEndDecisionsByTaskId.get(childId) ?? []).some((d) => d.outcome === "pending"),
+        "the decision resolved"
+      );
       await yieldMacrotasks(20);
       expect(entryOf(config, childId)).toMatchObject({
         taskStatus: "running",
@@ -1760,19 +1768,19 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           Ok(undefined)
         );
         expect(completions).toHaveLength(1);
-        let rotated = false;
+        // Awaited before asserting, not flagged when it starts: see #4558.
+        let rotation: Promise<void> | undefined;
         const editOriginal = taskService.editWorkspaceEntry.bind(taskService);
         const editSpy = spyOn(taskService, "editWorkspaceEntry").mockImplementation(
           async (...args) => {
             const result = await editOriginal(...args);
             if (
               rotate &&
-              !rotated &&
+              rotation === undefined &&
               args[0] === childId &&
               entryOf(config, childId)?.taskRecoveryAttempts === 1
             ) {
-              rotated = true;
-              await otherBackend.editConfig((cfg) => {
+              rotation = otherBackend.editConfig((cfg) => {
                 for (const project of cfg.projects.values()) {
                   const ws = project.workspaces.find((w) => w.id === childId);
                   if (ws) {
@@ -1783,6 +1791,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
                 }
                 return cfg;
               });
+              await rotation;
             }
             return result;
           }
@@ -1791,7 +1800,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           // A's turn ends length-truncated (no agent_report): stream-end recovery prompts.
           stack.endStream(0, { finishReason: "length" }, true);
           if (rotate) {
-            await until(() => rotated, "B's admission after the budget write");
+            await until(() => rotation !== undefined, "B's admission after the budget write");
+            await rotation;
             await until(
               () => !stack.sessionHarness.session.isBusy(),
               "A's turn wound down without a successor turn"
