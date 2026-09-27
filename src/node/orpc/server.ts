@@ -35,6 +35,7 @@ import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authM
 import { VERSION } from "@/version";
 import { formatOrpcError } from "@/node/orpc/formatOrpcError";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH } from "@/node/orpc/wsPaths";
+import { createFlowControlledWebSocket } from "@/node/orpc/wsFlowControl";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
 import {
@@ -1758,7 +1759,10 @@ export async function createOrpcServer({
         writable: true,
       },
     });
-    void orpcWsHandler.upgrade(ws, { context: wsContext });
+    // Flow control bounds the socket's send backlog so a large replay cannot
+    // starve heartbeats or the keepalive pong (#4655). The keepalive above
+    // keeps using the raw ws; oRPC keys peers by this one wrapper instance.
+    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws), { context: wsContext });
   });
 
   // Start listening
