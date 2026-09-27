@@ -7,6 +7,7 @@
  * - Singleflighting concurrent connection attempts
  */
 
+import { assert } from "@/common/utils/assert";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -51,6 +52,8 @@ interface SSH2ConnectionEntry {
   proxyProcess?: ChildProcess;
   lastActivityAt: number;
   idleTimer?: ReturnType<typeof setTimeout>;
+  /** Exec/shell channels still open on this connection (see trackChannel). */
+  openChannels: number;
 }
 
 function waitForAbortable<T>(promise: Promise<T>, abortSignal?: AbortSignal): Promise<T> {
@@ -297,6 +300,7 @@ export class SSH2ConnectionPool {
   private health = new Map<string, ConnectionHealth>();
   private inflight = new Map<string, Promise<SSH2ConnectionEntry>>();
   private connections = new Map<string, SSH2ConnectionEntry>();
+  private idleTimeoutMs = IDLE_TIMEOUT_MS;
 
   async acquireConnection(
     config: SSHConnectionConfig,
@@ -413,6 +417,11 @@ export class SSH2ConnectionPool {
     this.inflight.clear();
   }
 
+  /** Shorten the idle window in tests (undefined restores the default). */
+  setIdleTimeoutMsForTests(ms: number | undefined): void {
+    this.idleTimeoutMs = ms ?? IDLE_TIMEOUT_MS;
+  }
+
   /**
    * Update last activity time and reset idle timer.
    * Called on each acquireConnection() to keep active connections alive.
@@ -427,7 +436,28 @@ export class SSH2ConnectionPool {
 
     entry.idleTimer = setTimeout(() => {
       this.closeIdleConnection(key, entry);
-    }, IDLE_TIMEOUT_MS);
+    }, this.idleTimeoutMs);
+  }
+
+  /**
+   * Keep `entry`'s connection open while `channel` runs. The idle timer only
+   * counts acquires, so without this a command or terminal that outlived the
+   * idle window was cut off mid-run (#4876). The idle window restarts when the
+   * last open channel closes.
+   */
+  trackChannel(
+    config: SSHConnectionConfig,
+    entry: SSH2ConnectionEntry,
+    channel: Pick<NodeJS.EventEmitter, "once">
+  ): void {
+    entry.openChannels++;
+    channel.once("close", () => {
+      entry.openChannels--;
+      assert(entry.openChannels >= 0, "SSH2 open channel count went negative");
+      if (entry.openChannels === 0) {
+        this.touchConnection(entry, makeConnectionKey(config));
+      }
+    });
   }
 
   /**
@@ -436,6 +466,12 @@ export class SSH2ConnectionPool {
   private closeIdleConnection(key: string, entry: SSH2ConnectionEntry): void {
     // Verify this is still the active connection for this key
     if (this.connections.get(key) !== entry) {
+      return;
+    }
+
+    // Busy, not idle: re-arm instead of killing running channels (#4876).
+    if (entry.openChannels > 0) {
+      this.touchConnection(entry, key);
       return;
     }
 
@@ -526,6 +562,7 @@ export class SSH2ConnectionPool {
             resolvedConfig: resolvedConfigWithIdentities,
             proxyProcess: proxy?.process,
             lastActivityAt: Date.now(),
+            openChannels: 0,
           };
 
           const cleanupProxy = () => {
@@ -679,7 +716,7 @@ export class SSH2ConnectionPool {
           this.connections.set(key, entry);
           entry.idleTimer = setTimeout(() => {
             this.closeIdleConnection(key, entry);
-          }, IDLE_TIMEOUT_MS);
+          }, this.idleTimeoutMs);
           return entry;
         };
 

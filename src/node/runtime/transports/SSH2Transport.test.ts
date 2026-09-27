@@ -118,6 +118,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
           // Simulate ssh2 never invoking the exec callback.
         },
       }),
+      openChannels: 0,
     } as never);
 
     const reportFailureSpy = spyOn(ssh2ConnectionPool, "reportFailure");
@@ -166,6 +167,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     const channel = new FakeClientChannel();
     acquireConnectionSpy.mockResolvedValue({
       client: createFakeClient(channel),
+      openChannels: 0,
     } as never);
 
     const transport = new SSH2Transport({ host: "remote.example.com" });
@@ -183,6 +185,7 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     const channel = new FakeClientChannel({ includeStderr: true });
     acquireConnectionSpy.mockResolvedValue({
       client: createFakeClient(channel),
+      openChannels: 0,
     } as never);
 
     const transport = new SSH2Transport({ host: "remote.example.com" });

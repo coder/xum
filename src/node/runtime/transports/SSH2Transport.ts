@@ -298,12 +298,12 @@ export class SSH2Transport implements SSHTransport {
     const connectTimeoutSec =
       options.timeout !== undefined ? Math.min(Math.ceil(options.timeout), 15) : 15;
 
-    let client;
+    let entry;
     try {
-      ({ client } = await ssh2ConnectionPool.acquireConnection(this.config, {
+      entry = await ssh2ConnectionPool.acquireConnection(this.config, {
         abortSignal: options.abortSignal,
         timeoutMs: connectTimeoutSec * 1000,
-      }));
+      });
     } catch (error) {
       // An abort (e.g. while waiting out a backoff) is not a transport failure.
       throw new RuntimeErrorClass(
@@ -313,6 +313,7 @@ export class SSH2Transport implements SSHTransport {
       );
     }
 
+    const { client } = entry;
     watchForConnectionClose(client);
 
     try {
@@ -381,6 +382,7 @@ export class SSH2Transport implements SSHTransport {
         }
       });
 
+      ssh2ConnectionPool.trackChannel(this.config, entry, channel);
       // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       const process = new SSH2ChildProcess(channel, () =>
         closedClients.has(client)
@@ -410,9 +412,9 @@ export class SSH2Transport implements SSHTransport {
   }
 
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
-    const { client } = await ssh2ConnectionPool.acquireConnection(this.config, { maxWaitMs: 0 });
+    const entry = await ssh2ConnectionPool.acquireConnection(this.config, { maxWaitMs: 0 });
     const channel = await new Promise<ClientChannel>((resolve, reject) => {
-      client.shell(
+      entry.client.shell(
         {
           term: "xterm-256color",
           cols: params.cols,
@@ -435,6 +437,7 @@ export class SSH2Transport implements SSHTransport {
     // expandTildeForSSH already returns a quoted string (e.g., "$HOME/path")
     // Do NOT wrap with shellQuotePath - that would double-quote it
     // Exit on cd failure to match OpenSSH transport behavior (cd ... && exec $SHELL -i)
+    ssh2ConnectionPool.trackChannel(this.config, entry, channel);
     const expandedPath = expandTildeForSSH(params.workspacePath);
     channel.write(`cd ${expandedPath} || exit 1\n`);
 

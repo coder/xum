@@ -141,6 +141,7 @@ describe("SSH2 channel failures after acquisition (#4835)", () => {
     });
     acquire = spyOn(ssh2ConnectionPool, "acquireConnection").mockResolvedValue({
       client,
+      openChannels: 0,
     } as never);
     reportFailure = spyOn(ssh2ConnectionPool, "reportFailure").mockImplementation(() => undefined);
   });
