@@ -15,7 +15,7 @@ import { normalizeAgentId } from "xum/common/utils/agentIds";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
-import { normalizeToCanonical } from "xum/common/utils/ai/models";
+import { normalizeSelectedModel, normalizeToCanonical } from "xum/common/utils/ai/models";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -151,15 +151,15 @@ function ChatComposerInner(props: {
   // workspace, or revoked by a policy refresh), and every send with it fails with policy_denied.
   // Fall back to the first allowed model for display and send, without writing it anywhere: the
   // webview does not persist AI settings, and the stored choice comes back if the policy allows it
-  // again. With no allowed model in the list, Send stays disabled. Either way, a status line says so.
-  // The check is route-aware, like the model list: the backend enforces policy after routing, so a
-  // canonical model that the policy allows only through a gateway route is still allowed.
-  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(storedModel);
+  // again. With no allowed model in the list, nothing changes and the backend decides. Either way,
+  // a status line says so. The check is route-aware, like the model list, because the backend
+  // enforces policy after routing; it uses the gateway-preserving identity so an explicitly pinned
+  // gateway model is checked on that gateway.
+  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(normalizeSelectedModel(preferredModel));
   const policyFallbackModel = storedModelAllowed
     ? null
     : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
   const baseModel = storedModelAllowed ? storedModel : (policyFallbackModel ?? storedModel);
-  const blockedByPolicy = !storedModelAllowed && policyFallbackModel === null;
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
@@ -217,8 +217,7 @@ function ChatComposerInner(props: {
     !isSending &&
     input.trim().length > 0 &&
     apiState.status === "connected" &&
-    Boolean(api) &&
-    !blockedByPolicy;
+    Boolean(api);
 
   const onModelChange = (model: string) => {
     const canonicalModel = normalizeToCanonical(model);
@@ -275,11 +274,6 @@ function ChatComposerInner(props: {
       setVimEnabled(next);
       setInput("");
       props.onNotice({ level: "info", message: `Vim mode ${next ? "enabled" : "disabled"}.` });
-      return;
-    }
-
-    // After local commands such as /vim, which make no provider request.
-    if (blockedByPolicy) {
       return;
     }
 
@@ -410,7 +404,7 @@ function ChatComposerInner(props: {
           <div role="status" className="text-content-secondary text-[11px]">
             {policyFallbackModel
               ? `Admin policy does not allow ${storedModel}; using ${policyFallbackModel}.`
-              : `Admin policy does not allow ${storedModel}, and no allowed model is available.`}
+              : `Admin policy does not allow ${storedModel}. Choose an allowed model.`}
           </div>
         )}
         <div className="w-full min-w-0" data-component="ModelSelectorGroup">
