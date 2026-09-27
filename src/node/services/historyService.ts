@@ -2371,13 +2371,24 @@ export class HistoryService {
     // (reading chat.jsonl first never opened the archive then), so its error is
     // rethrown only when chat.jsonl has no older row either.
     let archiveError: Error | undefined;
-    try {
-      await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
-    } catch (error) {
-      archiveError = error instanceof Error ? error : new Error(String(error));
-    }
+    const scanArchive = async () => {
+      archiveError = undefined;
+      try {
+        await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+      } catch (error) {
+        archiveError = error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    await scanArchive();
     if (!hasOlder) {
       await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
+    }
+    // A rotation by another backend can move an older row out of chat.jsonl after
+    // the archive read above. Rotation appends the sealed prefix to the archive
+    // before it rewrites chat.jsonl, so reading the archive once more after
+    // chat.jsonl sees that row. Only a "no" answer pays for the second read.
+    if (!hasOlder) {
+      await scanArchive();
     }
     if (!hasOlder && archiveError !== undefined) {
       throw archiveError;

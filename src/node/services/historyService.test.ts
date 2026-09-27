@@ -3140,6 +3140,39 @@ describe("HistoryService", () => {
     });
   });
 
+  describe("hasHistoryBeforeSequence during a concurrent rotation", () => {
+    it("finds an older row that moves from chat.jsonl into the archive between the reads", async () => {
+      const workspaceId = "ws-has-older-rotating";
+      const row = (id: string, historySequence: number) =>
+        messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+      const workspaceDir = path.join(config.sessionsDir, workspaceId);
+      const archivePath = path.join(workspaceDir, "chat-archive.jsonl");
+      const chatPath = path.join(workspaceDir, "chat.jsonl");
+      await writeHistoryLines(config, workspaceId, [row("c3", 3), row("c5", 5)]);
+      await fs.writeFile(archivePath, `${row("a7", 7)}\n`);
+
+      // Simulate another backend's rotation right after the archive was read: append the
+      // sealed row to the archive first, then rewrite chat.jsonl without it (rotation order).
+      const stat = fs.stat;
+      let archiveReads = 0;
+      const spy = spyOn(fs, "stat").mockImplementation((async (
+        ...args: Parameters<typeof fs.stat>
+      ) => {
+        if (args[0] === archivePath) archiveReads++;
+        if (args[0] === chatPath && archiveReads === 1) {
+          await fs.appendFile(archivePath, `${row("c3", 3)}\n`);
+          await fs.writeFile(chatPath, `${row("c5", 5)}\n`);
+        }
+        return stat(...args);
+      }) as typeof fs.stat);
+      try {
+        expect(await service.hasHistoryBeforeSequence(workspaceId, 5)).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   describe("hasHistoryBeforeSequence with an unreadable archive", () => {
     // A directory in place of chat-archive.jsonl makes every archive read fail (EISDIR).
     const workspaceId = "ws-has-older-bad-archive";
