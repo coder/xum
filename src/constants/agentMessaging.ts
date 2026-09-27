@@ -98,6 +98,11 @@ export function retiredAttemptMessage(claim: { runId: string; stepId: string }):
   return `This sub-agent's attempt was retired by workflow run ${claim.runId} (step ${claim.stepId}); start a new task instead.`;
 }
 
+/** Refusal for every task admission while a backend is removing the workspace (pendingRemoval). */
+export function pendingRemovalAdmissionMessage(marker: { pid: number }): string {
+  return `This workspace is being removed (by Xum process ${marker.pid}); nothing was sent.`;
+}
+
 /** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
 export const SEND_ADMISSION_STALE_MESSAGE =
   "Send refused: the target was stopped or interrupted while the message was being admitted.";

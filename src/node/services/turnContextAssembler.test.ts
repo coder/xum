@@ -19,6 +19,7 @@ import {
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
 import { extractToolInstructionsFromSources } from "./systemMessage";
@@ -545,6 +546,56 @@ describe("assemblePromptPayload", () => {
 });
 
 describe("buildPlanInstructions", () => {
+  test("fails instead of dropping the plan handoff when the last agent is unreadable", async () => {
+    using tempRoot = new DisposableTempDir("turn-context-plan-handoff-transport");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "mux-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const metadata: WorkspaceMetadata = {
+      id: "ws-handoff",
+      name: "workspace-handoff",
+      projectName: "project-handoff",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
+    await fs.mkdir(path.dirname(planPath), { recursive: true });
+    await fs.writeFile(planPath, "The approved plan.");
+
+    // #4438: an unreachable host while resolving the previous (plan) agent must not
+    // silently send exec without the plan.
+    class DroppedAgentsRuntime extends TestRuntime {
+      override stat(filePath: string, abortSignal?: AbortSignal) {
+        if (filePath.includes(`${path.sep}agents${path.sep}`)) {
+          return Promise.reject(new RuntimeError("Connection refused", "network"));
+        }
+        return super.stat(filePath, abortSignal);
+      }
+    }
+    const runtime = new DroppedAgentsRuntime(projectPath, xumHome);
+
+    const outcome = await buildPlanInstructions({
+      runtime,
+      metadata,
+      workspaceId: metadata.id,
+      workspacePath: projectPath,
+      effectiveMode: "exec",
+      effectiveAgentId: "exec",
+      agentIsPlanLike: false,
+      agentDiscoveryRuntime: runtime,
+      agentDiscoveryPath: projectPath,
+      additionalSystemInstructions: undefined,
+      shouldDisableTaskToolsForDepth: false,
+      taskDepth: 0,
+      taskSettings: DEFAULT_TASK_SETTINGS,
+      requestPayloadMessages: [
+        createMuxMessage("a1", "assistant", "Here is the plan.", { agentId: "plan" }),
+        createMuxMessage("u1", "user", "implement it"),
+      ],
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
   test("prepends runtime plan file guidance ahead of caller additional instructions", async () => {
     using tempRoot = new DisposableTempDir("turn-context-assembler");
 
@@ -761,6 +812,42 @@ describe("buildStreamSystemContext", () => {
     // A new turn (no snapshot) reads the files again: nothing is cached across turns.
     const nextTurn = await buildSystemContextForTest(buildArgs);
     expect(nextTurn.systemMessage).toContain("Prompt guidance v2.");
+  });
+
+  test("fails instead of dropping the skills index when skill discovery fails in transport", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-skills-transport");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+
+    // #4438: an unreachable host must fail the turn, not silently list no skills.
+    class DroppedSkillsRuntime extends TestRuntime {
+      override resolvePath(filePath: string): Promise<string> {
+        if (path.basename(filePath) === "skills") {
+          return Promise.reject(new RuntimeError("Connection refused", "network"));
+        }
+        return super.resolvePath(filePath);
+      }
+    }
+
+    const metadata = createWorkspaceMetadata({
+      id: "skills-transport-ws",
+      name: "skills-transport-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const outcome = await buildSystemContextForTest({
+      runtime: new DroppedSkillsRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
   });
 
   test("reads instruction files while agent discovery is still in flight", async () => {

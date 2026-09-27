@@ -393,18 +393,21 @@ export const router = (authToken?: string) => {
               tiers,
               evaluationModel,
             });
-            if (!decision.success) return decision;
             // Billed like the send path's evaluation (AgentSession), and before the tier is
-            // mapped: an unmapped verdict cost the same tokens.
-            yield* atomicPromise(() =>
-              context.sessionUsageService.recordHeadlessUsage(
-                input.workspaceId,
-                decision.data.evaluationModel,
-                decision.data.usage,
-                decision.data.providerMetadata,
-                { analyticsSource: "auto_model_routing_preview" }
-              )
-            );
+            // mapped: an unmapped verdict cost the same tokens, and so did a rejected one (#4774).
+            const billed = decision.success ? decision.data : decision.error;
+            if (decision.success || billed.usage != null) {
+              yield* atomicPromise(() =>
+                context.sessionUsageService.recordHeadlessUsage(
+                  input.workspaceId,
+                  evaluationModel,
+                  billed.usage,
+                  billed.providerMetadata,
+                  { analyticsSource: "auto_model_routing_preview" }
+                )
+              );
+            }
+            if (!decision.success) return Err(decision.error.reason);
             const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
             return Ok({
               ...decision.data,
@@ -1815,6 +1818,12 @@ export const router = (authToken?: string) => {
         .output(schemas.workspace.setUnrelatedWorkspaceConsent.output)
         .handler(({ context, input }) =>
           context.workspaceService.setUnrelatedWorkspaceConsent(input.workspaceId, input.enabled)
+        ),
+      setAgentMessageDispatchMode: t
+        .input(schemas.workspace.setAgentMessageDispatchMode.input)
+        .output(schemas.workspace.setAgentMessageDispatchMode.output)
+        .handler(({ context, input }) =>
+          context.workspaceService.setAgentMessageDispatchMode(input.workspaceId, input.mode)
         ),
       interruptStream: t
         .input(schemas.workspace.interruptStream.input)

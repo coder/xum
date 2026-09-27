@@ -48,6 +48,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { isDockerRuntime, isSSHRuntime } from "@/common/types/runtime";
 
 import type { HistoryService } from "./historyService";
+import { measurePersistedHistoryRowBytes } from "./historyRowBudget";
 import { log } from "./log";
 import { createPlanReviewRecordMessageId, createUserMessageId } from "./utils/messageIds";
 
@@ -184,24 +185,6 @@ export function hashPlanSnapshotContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
-/**
- * Size of `message` as HistoryService would persist it: message + workspaceId, with a
- * widest-case sequence stamp. Record text is JSON-escaped once in the envelope and again in the
- * JSONL row, so content under a raw cap (quotes, backslashes, control characters) can still
- * exceed the row limit — and the provider/replacement-row scanners treat such a row as an
- * unreadable run, so it must be refused before it is written.
- */
-function measurePersistedRowBytes(message: MuxMessage, workspaceId: string): number {
-  return Buffer.byteLength(
-    JSON.stringify({
-      ...message,
-      workspaceId,
-      metadata: { ...message.metadata, historySequence: Number.MAX_SAFE_INTEGER },
-    }),
-    "utf8"
-  );
-}
-
 /** Hidden record rows (snapshot/resolve/reopen): synthetic without uiVisible, never a human turn. */
 function buildPlanReviewRecordMessage(
   record: Exclude<PlanReviewRecord, PlanReviewFeedbackRecord>
@@ -320,7 +303,7 @@ export async function ensurePlanSnapshot(
       : {}),
     content,
   });
-  const rowBytes = measurePersistedRowBytes(candidate, args.workspaceId);
+  const rowBytes = measurePersistedHistoryRowBytes(candidate, args.workspaceId);
   if (rowBytes > SESSION_HISTORY_MAX_LINE_BYTES) {
     return Err({
       type: "plan_too_large",
@@ -566,7 +549,7 @@ export async function preparePlanReviewFeedback(
     typeof options.acpPromptId === "string" && options.acpPromptId.trim().length > 0
       ? options.acpPromptId.trim()
       : undefined;
-  const rowBytes = measurePersistedRowBytes(
+  const rowBytes = measurePersistedHistoryRowBytes(
     createMuxMessage(createUserMessageId(), "user", text, {
       timestamp: Date.now(),
       toolPolicy: options.toolPolicy,

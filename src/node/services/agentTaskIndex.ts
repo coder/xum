@@ -46,22 +46,34 @@ export function listAgentTaskWorkspaces(config: ProjectsConfig): AgentTaskWorksp
   return tasks;
 }
 
+/**
+ * Duplicate workspace ids (#4550): config neither rejects nor repairs them, so every id resolves
+ * to its FIRST row in config order, the row findWorkspaceEntry returns. Later duplicates are
+ * ignored here, including a later task row whose first occurrence is not a task. Otherwise the
+ * ancestor chains that fan out reports, tombstones and settlement receipts, and the subtrees that
+ * cascades walk, would follow a row that no lookup names. The rule is deterministic and keeps the
+ * duplicate rows on disk untouched.
+ */
 export function buildAgentTaskIndex(config: ProjectsConfig): AgentTaskIndex {
   const byId = new Map<string, AgentTaskWorkspaceEntry>();
   const childrenByParent = new Map<string, string[]>();
   const parentById = new Map<string, string>();
 
-  for (const task of listAgentTaskWorkspaces(config)) {
-    const taskId = task.id!;
-    byId.set(taskId, task);
-
-    const parent = task.parentWorkspaceId;
-    if (!parent) continue;
-
-    parentById.set(taskId, parent);
-    const list = childrenByParent.get(parent) ?? [];
-    list.push(taskId);
-    childrenByParent.set(parent, list);
+  const seenIds = new Set<string>();
+  for (const [projectPath, project] of config.projects) {
+    for (const workspace of project.workspaces) {
+      if (!workspace.id || seenIds.has(workspace.id)) continue;
+      seenIds.add(workspace.id);
+      if (!workspace.parentWorkspaceId) continue;
+      const task: AgentTaskWorkspaceEntry = { ...workspace, projectPath };
+      const taskId = workspace.id;
+      byId.set(taskId, task);
+      const parent = workspace.parentWorkspaceId;
+      parentById.set(taskId, parent);
+      const list = childrenByParent.get(parent) ?? [];
+      list.push(taskId);
+      childrenByParent.set(parent, list);
+    }
   }
 
   return { byId, childrenByParent, parentById };

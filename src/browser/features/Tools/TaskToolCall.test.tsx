@@ -866,6 +866,29 @@ describe("TaskSendMessageToolCall", () => {
     globalThis.document = originalDocument;
   });
 
+  // The card renders only the send-time result, so a queued label must say when the message
+  // dispatches instead of reading as still pending after delivery (#4736).
+  test.each([
+    ["tool-end", "Queued for next step"],
+    ["turn-end", "Queued until turn end"],
+    [undefined, "Queued for delivery"],
+  ] as const)("labels a queued send by its dispatch mode: %s", (queueDispatchMode, label) => {
+    const view = render(
+      <TooltipProvider>
+        <TaskSendMessageToolCall
+          args={taskSendMessageArgs}
+          status="completed"
+          result={{
+            status: "queued",
+            taskId: "child-task",
+            ...(queueDispatchMode != null ? { queueDispatchMode } : {}),
+          }}
+        />
+      </TooltipProvider>
+    );
+    expect(view.getByRole("status").textContent).toBe(label);
+  });
+
   test("shows the guidance and target when expanded", () => {
     const view = render(
       <TooltipProvider>
@@ -877,7 +900,6 @@ describe("TaskSendMessageToolCall", () => {
       </TooltipProvider>
     );
 
-    expect(view.getByRole("status").textContent).toBe("Queued");
     fireEvent.click(view.getByRole("button", { name: "Message to agent" }));
     expect(view.getByText("child-task")).toBeDefined();
     expect(view.getByText("Use the corrected API shape.")).toBeDefined();

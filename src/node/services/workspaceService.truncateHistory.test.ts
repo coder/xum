@@ -885,6 +885,46 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  // #4414 case 5: the boundary's guard is evaluated after replaceHistory's own history read.
+  test("an append-compaction-boundary replace refuses when its guard stops admitting during the read", async () => {
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "guarded-boundary";
+    try {
+      await config.addWorkspace("/tmp/guarded-boundary-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "guarded-boundary-project",
+        projectPath: "/tmp/guarded-boundary-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("plan-user", "user", "plan it", {})
+      );
+      let admits = true;
+      const realRead = historyService.getHistoryFromLatestBoundary.bind(historyService);
+      const readSpy = spyOn(historyService, "getHistoryFromLatestBoundary").mockImplementation(
+        async (...args) => {
+          const read = await realRead(...args);
+          admits = false; // Another backend re-admits the task while the epoch is read.
+          return read;
+        }
+      );
+      const replaced = await workspaceService.replaceHistory(
+        workspaceId,
+        createMuxMessage("plan-boundary", "assistant", "# Plan", { compacted: "user" }),
+        { mode: "append-compaction-boundary", admitsAppend: () => admits }
+      );
+      expect(readSpy).toHaveBeenCalled();
+      readSpy.mockRestore();
+      expect(replaced.success).toBe(false);
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && history.data.map((message) => message.id)).toEqual(["plan-user"]);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("context reset is a no-op when repeated without provider-eligible messages", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "context-reset-noop";

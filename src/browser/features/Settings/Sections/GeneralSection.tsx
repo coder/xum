@@ -289,6 +289,7 @@ export function GeneralSection() {
   const editorConfig = normalizeEditorConfig(rawEditorConfig);
   const [sshHost, setSshHost] = useState<string>("");
   const [sshHostLoaded, setSshHostLoaded] = useState(false);
+  const sshHostEditRef = useRef(0);
   const [defaultProjectDir, setDefaultProjectDir] = useState("");
   const [cloneDirLoaded, setCloneDirLoaded] = useState(false);
   // Track whether the initial load succeeded to prevent saving empty string
@@ -711,9 +712,18 @@ export function GeneralSection() {
 
   const handleSshHostChange = useCallback(
     (value: string) => {
+      const edit = ++sshHostEditRef.current;
       setSshHost(value);
+      if (!api) return;
       // Save to server (debounced effect would be better, but keeping it simple)
-      void api?.server.setSshHost({ sshHost: value || null });
+      api.server.setSshHost({ sshHost: value || null }).catch(async () => {
+        // A rejected save leaves the backend on its old host (#4748): show that instead of the
+        // unsaved value, unless the user has typed again since.
+        const saved = await api.server.getSshHost().catch(() => undefined);
+        if (saved !== undefined && edit === sshHostEditRef.current) {
+          setSshHost(saved ?? "");
+        }
+      });
     },
     [api]
   );

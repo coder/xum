@@ -1,6 +1,7 @@
 import * as path from "path";
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import * as fsPromises from "fs/promises";
+import { execSync } from "child_process";
 import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
@@ -21,6 +22,7 @@ import {
   createTestProject,
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
+  initGitRepo,
   projectWorkspace,
   saveLocalParentWorkspace,
   saveWorkspaces,
@@ -325,6 +327,112 @@ describe("TaskService", () => {
       Ok({ status: "removed", action: "remove", taskId: childTaskId })
     );
     expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  /** A reported child whose checkout is a real git repo, for the #4723 lossy-removal checks. */
+  async function createChildCheckoutHarness(parentWorkspaceId: string, childTaskId: string) {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const childPath = path.join(projectPath, "child");
+    await fsPromises.mkdir(childPath, { recursive: true });
+    initGitRepo(childPath);
+    const base = execSync("git rev-parse HEAD", { cwd: childPath, encoding: "utf-8" }).trim();
+    const child = projectWorkspace(projectPath, "child", childTaskId, {
+      parentWorkspaceId,
+      agentId: "exec",
+      agentType: "exec",
+      taskStatus: "reported",
+      taskBaseCommitSha: base,
+    });
+    const parent = projectWorkspace(projectPath, "parent", parentWorkspaceId);
+    await saveWorkspaces(config, projectPath, [parent, child], testTaskSettings());
+    const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { workspaceService } = createWorkspaceServiceMocks({ removeWhileTaskTreeLocked: remove });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const removeAsModel = (taskId: string) =>
+      taskService.removeInactiveDescendantAgentTask(parentWorkspaceId, taskId, {
+        lossyWorkPolicy: "refuse",
+      });
+    return { config, projectPath, childPath, remove, taskService, removeAsModel };
+  }
+
+  test("model-driven task removal refuses to discard a child's uncommitted work, but the user cascade still removes it", async () => {
+    const parentWorkspaceId = "parent-remove-dirty";
+    const childTaskId = "child-remove-dirty";
+    const { config, childPath, remove, taskService, removeAsModel } =
+      await createChildCheckoutHarness(parentWorkspaceId, childTaskId);
+    await fsPromises.writeFile(path.join(childPath, "notes.txt"), "unsaved\n");
+
+    // #3950/#4723: only the user can approve losing a child's work; the model gets the list.
+    const refusal = await removeAsModel(childTaskId);
+    assert(refusal.success && refusal.data.status === "error", "dirty removal must refuse");
+    expect(refusal.data.paths).toEqual(["notes.txt"]);
+    expect(remove).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)).toBeDefined();
+    // No tombstone: a refused child must not read as removed on a later call.
+    expect(await removeAsModel(childTaskId)).toMatchObject(Ok({ status: "error" }));
+
+    // The user-confirmed parent deletion cascade keeps force-removing descendants.
+    expect(
+      await taskService.withTaskTreeLifecycleLock(childTaskId, () =>
+        taskService.removeAcknowledgedDescendantsWhileTaskTreeLocked(parentWorkspaceId, [
+          childTaskId,
+        ])
+      )
+    ).toEqual(Ok(undefined));
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("model-driven task removal still removes clean and shared-checkout children", async () => {
+    const parentWorkspaceId = "parent-remove-clean";
+    const childTaskId = "child-remove-clean";
+    const { config, projectPath, remove, removeAsModel } = await createChildCheckoutHarness(
+      parentWorkspaceId,
+      childTaskId
+    );
+    expect(await removeAsModel(childTaskId)).toMatchObject(
+      Ok({ status: "removed", action: "remove", taskId: childTaskId })
+    );
+    expect(remove).toHaveBeenCalledTimes(1);
+
+    // An isolation "none" child shares the parent's checkout, which removal never deletes, so
+    // the parent's own uncommitted files must not block removing it.
+    const sharedTaskId = "child-remove-shared";
+    const parentPath = path.join(projectPath, "parent");
+    await fsPromises.mkdir(parentPath, { recursive: true });
+    initGitRepo(parentPath);
+    await fsPromises.writeFile(path.join(parentPath, "parent-work.txt"), "parent\n");
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)?.workspaces.push(
+        projectWorkspace(projectPath, "parent", sharedTaskId, {
+          name: "shared-child",
+          parentWorkspaceId,
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "reported",
+          taskIsolation: "none",
+        })
+      );
+      return cfg;
+    });
+    expect(await removeAsModel(sharedTaskId)).toMatchObject(
+      Ok({ status: "removed", taskId: sharedTaskId })
+    );
+    // Project-dir local runtimes run children in the project checkout and delete nothing either.
+    const localTaskId = "child-remove-local";
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)?.workspaces.push(
+        projectWorkspace(projectPath, "parent", localTaskId, {
+          name: "local-child",
+          parentWorkspaceId,
+          taskStatus: "reported",
+          runtimeConfig: { type: "local" },
+        })
+      );
+      return cfg;
+    });
+    expect(await removeAsModel(localTaskId)).toMatchObject(Ok({ status: "removed" }));
+    expect(remove).toHaveBeenCalledTimes(3);
   });
 
   test("task removal preserves an inactive child while its patch artifact is pending", async () => {

@@ -709,11 +709,19 @@ export const RestoreToInputEventSchema = z.object({
   text: z.string(),
   fileParts: z.array(FilePartSchema).optional(),
   reviews: z.array(ReviewNoteDataSchema).optional(),
+  /**
+   * Held inputs (see HeldInputsChangedEventSchema) that keep this restored input until a composer
+   * takes it (#4448). A composer that applies the restore acknowledges them with
+   * workspace.discardHeldInput; one that cannot (edit mode, not mounted, not subscribed) leaves
+   * them held, so the input is never lost with this one-shot event.
+   */
+  heldInputIds: z.array(z.string()).optional(),
 });
 
 /**
  * The session's held inputs (see AgentSession.heldInputs): manual queued messages refused at
- * dispatch because the task reported before they ran. Full list, oldest first; sent on every
+ * dispatch because the task reported before they ran, or returned by a restore that no composer
+ * has taken yet (`interrupted`). Full list, oldest first; sent on every
  * change and replayed on subscription while non-empty. The session keeps each full send and
  * re-sends or discards it only on explicit request (workspace.sendHeldInput/discardHeldInput),
  * so this carries display data only.
@@ -727,9 +735,11 @@ export const HeldInputsChangedEventSchema = z.object({
       /**
        * Why it was refused. `reported`: the turn before it was the task's terminal report.
        * `indeterminate`: it could not run and no report was confirmed (the report's outcome could
-       * not be established, or the attempt was otherwise closed/superseded).
+       * not be established, or the attempt was otherwise closed/superseded). `interrupted`: Stop,
+       * an edit or a failed queued send returned it from the queue and no composer took it (edit
+       * mode, not mounted, not subscribed).
        */
-      reason: z.enum(["reported", "indeterminate"]),
+      reason: z.enum(["reported", "indeterminate", "interrupted"]),
       /** The user's authored text (or slash command); empty for attachment/review-only input. */
       displayText: z.string(),
       attachmentCount: z.number().int().nonnegative(),

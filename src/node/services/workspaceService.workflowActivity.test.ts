@@ -1665,8 +1665,8 @@ describe("WorkspaceService activity list scoping", () => {
   });
 
   test("discardExtensionMetadataEntry keeps the entry when the workspace is still persisted", async () => {
-    // saveConfig swallows write failures, so config.removeWorkspace can
-    // resolve while the workspace is still persisted in config.json.
+    // config.removeWorkspace can resolve while the workspace is still
+    // persisted in config.json (a write another writer replaced).
     // Discarding then would write-tombstone a live id and suppress all of
     // its future activity writes for the rest of the process.
     const { config, historyService, cleanup } = await createTestHistoryService();

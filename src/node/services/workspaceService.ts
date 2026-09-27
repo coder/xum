@@ -191,6 +191,7 @@ import {
   type StagedWorkspaceAttachment,
 } from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { ContainerManager } from "@/node/multiProject/containerManager";
+import { PROJECT_METADATA_DIR_NAMES } from "@/common/compat/legacyMux";
 
 import type { PostCompactionExclusions } from "@/common/types/attachment";
 import type {
@@ -324,7 +325,11 @@ import type {
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
 import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
-import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
+import {
+  type AgentMessageDispatchMode,
+  getValidAgentMessageDispatchMode,
+  getValidUnrelatedWorkspaceConsent,
+} from "@/common/orpc/schemas/workspace";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -353,6 +358,11 @@ import {
 } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  getSelfIdentity,
+  judgeHolder,
+  parseProcessIdentity,
+} from "@/node/utils/concurrency/processLiveness";
 import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeReconciler,
@@ -369,6 +379,7 @@ import {
   type AgentTaskIntegration,
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
+  type RemovalAttemptBinding,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type TurnAdmissionToken,
@@ -752,11 +763,36 @@ type WorkspaceServiceMcpOverridesPort = Pick<
 >;
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
+/**
+ * Removal-owner tokens of this process's WorkspaceService instances (#4478). A pendingRemoval
+ * marker naming this pid is live only while its instance is listed here: any other same-pid
+ * marker was written by an earlier process that had our pid (judgeHolder's same-pid rule).
+ * Tests run two backends in one process, which this keeps distinct as well.
+ */
+const liveRemovalInstanceIds = new Set<string>();
+
+function registerRemovalInstance(): string {
+  const instanceId = crypto.randomUUID();
+  liveRemovalInstanceIds.add(instanceId);
+  return instanceId;
+}
+
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
+
+/**
+ * A failed rollback after a rejected registration write (#4745) is logged, never thrown: the
+ * caller must still fail with the original write error, not the cleanup's.
+ */
+function logRegistrationRollbackFailure(workspaceId: string, error: unknown): void {
+  log.error("Failed to roll back after the workspace registration write rejected", {
+    workspaceId,
+    error: getErrorMessage(error),
+  });
+}
 
 function normalizeRepoRootProjectPath(projectPath: string | null | undefined): string {
   const normalizedPath = projectPath?.replaceAll("\\", "/").trim() ?? "";
@@ -1931,6 +1967,16 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
  * TaskService and stay off; their parent owns them.
  */
+/**
+ * Whether a multi-project container link with this name would resolve as a workspace metadata
+ * directory (#4455). Case-insensitive volumes (macOS, Windows) fold case, and Windows trims
+ * trailing dots and spaces, so `.XUM` and `.xum.` alias `.xum` there too.
+ */
+function aliasesProjectMetadataDir(projectName: string): boolean {
+  const folded = projectName.replace(/[. ]+$/, "").toLowerCase();
+  return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
+}
+
 function mintUnrelatedWorkspaceConsent(): string {
   const generation = crypto.randomUUID();
   assert(
@@ -2490,6 +2536,9 @@ export class WorkspaceService
     return this.removingWorkspaces.has(workspaceId);
   }
 
+  /** Names this instance in the pendingRemoval markers it writes (see liveRemovalInstanceIds). */
+  private readonly removalInstanceId = registerRemovalInstance();
+
   constructor(
     private readonly config: Config,
     private readonly historyService: HistoryService,
@@ -2970,15 +3019,6 @@ export class WorkspaceService
   private readonly pendingPluginSanitizations = new Set<string>();
 
   /**
-   * Deferred-checkout creations whose default consent waits for the checkout's sanitization
-   * (materializeDeferredCheckout). The workspace is already announced then, so an explicit
-   * consent toggle removes the entry and the grant (re-checked inside the serialized config
-   * edit) can never reverse a choice the user already made. Process-local: a toggle handled by
-   * another backend sharing this root cannot cancel it (tracked with #4446).
-   */
-  private readonly pendingDefaultUnrelatedConsent = new Set<string>();
-
-  /**
    * Serializes persist + sanitize of a new host-local registration across
    * PROCESSES sharing this config root. pendingPluginSanitizations only
    * covers this process: two processes registering the same preserved
@@ -3209,34 +3249,65 @@ export class WorkspaceService
   }
 
   /**
-   * Roll back a just-persisted workspace registration and VERIFY it left the
-   * on-disk config. Config.saveConfig logs and swallows write failures, so
-   * removeWorkspace can resolve while the entry is still persisted — after a
-   * restart that entry would resurrect with the unsanitized overrides file
-   * this rollback exists to keep unreachable. Returns whether the entry is
-   * provably gone from disk.
+   * Roll back a just-persisted workspace registration and VERIFY it left the on-disk config. A
+   * removeWorkspace that rejects or whose write another writer replaced can leave the entry
+   * persisted — after a restart that entry would resurrect with the unsanitized overrides file this
+   * rollback exists to keep unreachable. Returns whether the entry is provably gone from disk.
    */
   private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      const persisted = this.config.loadConfigOrDefault();
-      const stillPresent = Array.from(persisted.projects.values()).some((project) =>
-        project.workspaces.some((workspace) => workspace.id === workspaceId)
-      );
+      // Strict: a lenient read of an unreadable file returns an empty default, which would
+      // falsely prove the entry gone and license deleting its checkout (#4775).
+      let stillPresent = true;
+      try {
+        const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+        stillPresent = Array.from(persisted.projects.values()).some((project) =>
+          project.workspaces.some((workspace) => workspace.id === workspaceId)
+        );
+      } catch {
+        // Not provably gone.
+      }
       if (!stillPresent) {
         return true;
       }
     }
-    log.error(
-      `Failed to roll back workspace ${workspaceId} after plugin-override sanitization aborted creation`
-    );
+    log.error(`Failed to roll back workspace ${workspaceId} after its creation aborted`);
     return false;
   }
 
   /**
-   * Undo a registration whose checkout could not be sanitized: the config entry, the
-   * worktree this creation made, and the in-memory state registered for it. Returns whether
-   * the entry is provably gone.
+   * Tear down what a creation set up before its config entry: the session, init record and
+   * abort controller, and (only when `entryGone`) the session dir. While the entry persists,
+   * the workspace still references that dir.
+   */
+  private async discardCreationState(
+    workspaceId: string,
+    initAbortController: AbortController,
+    entryGone: boolean
+  ): Promise<void> {
+    initAbortController.abort();
+    this.initAbortControllers.delete(workspaceId);
+    this.initStateManager.clearInMemoryState(workspaceId);
+    await this.disposeSession(workspaceId);
+    if (!entryGone) return;
+    // startInit persists its running status fire-and-forget. This delete queues behind that
+    // write on the per-workspace file lock, so the write cannot recreate the removed dir.
+    await this.initStateManager.deleteInitStatus(workspaceId);
+    await fsPromises
+      .rm(path.join(this.config.sessionsDir, workspaceId), { recursive: true, force: true })
+      .catch((error: unknown) => {
+        log.warn("Failed to remove the session dir of an aborted creation", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+  }
+
+  /**
+   * Undo a registration whose checkout could not be sanitized, or whose registration write
+   * rejected (#4745): the config entry, the worktree this creation made, and the state
+   * registered for it. Returns whether the entry is provably gone.
    */
   private async abortUnsanitizedCreation(args: {
     workspaceId: string;
@@ -3246,8 +3317,16 @@ export class WorkspaceService
     workspaceName: string;
     trusted: boolean;
     initAbortController: AbortController;
+    /**
+     * What to do with a worktree checkout; default "delete" (`branch -d` keeps unmerged branches).
+     * "force-delete" also removes a dirty or unpopulated checkout but runs `branch -D`;
+     * "force-delete-keep-branch" removes it the same way but never touches a branch this
+     * creation did not make (#4745, #4775).
+     */
+    checkout?: "delete" | "force-delete" | "force-delete-keep-branch";
   }): Promise<boolean> {
     const { workspaceId } = args;
+    const checkout = args.checkout ?? "delete";
     const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
     // WORKTREE runtimes created a fresh checkout; without deleting it,
     // retrying the same branch collides with the orphaned worktree and leaks
@@ -3256,16 +3335,27 @@ export class WorkspaceService
     // no-op by design, but we never call it here to keep that contract
     // explicit). Only after a successful config rollback: while the entry
     // persists, the checkout is still referenced.
-    if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
+    if (
+      rolledBack &&
+      !isWorktreeRuntime(args.runtimeConfig) &&
+      args.runtimeConfig.type !== "local"
+    ) {
+      // Devcontainer/remote deletes can reach state this creation did not make (#4775).
+      log.warn("Left the checkout of an aborted creation on a non-worktree runtime", {
+        workspaceId,
+        runtime: args.runtimeConfig.type,
+      });
+    } else if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
       const deleteResult = await args.runtime
         .deleteWorkspace(
           args.projectPath,
           // Worktree directories are named after the sanitized workspace
           // name (branch names may contain "/").
           args.workspaceName,
-          false,
+          checkout !== "delete",
           undefined,
-          args.trusted
+          args.trusted,
+          { keepBranch: checkout === "force-delete-keep-branch" }
         )
         .catch((error: unknown) => ({
           success: false as const,
@@ -3282,10 +3372,7 @@ export class WorkspaceService
     // (session, init record, abort controller) exactly like workspace
     // removal would; without this every aborted retry against the same bad
     // file leaks another unreachable session for the process lifetime.
-    args.initAbortController.abort();
-    this.initAbortControllers.delete(workspaceId);
-    this.initStateManager.clearInMemoryState(workspaceId);
-    await this.disposeSession(workspaceId);
+    await this.discardCreationState(workspaceId, args.initAbortController, rolledBack);
     return rolledBack;
   }
 
@@ -3367,6 +3454,9 @@ export class WorkspaceService
         if (line) initParams.initLogger.logStderr(line);
       }
       initParams.initLogger.logComplete(-1);
+      // No default consent (fail closed, #4455): the checkout is missing or incomplete, so the
+      // row keeps no consent and the caller's settlement clears the pending mark. The user can
+      // still opt in from the workspace's settings.
       return;
     }
     // Checkout populated and sanitized: only now may other task trees discover and message
@@ -3388,9 +3478,12 @@ export class WorkspaceService
     // Archive admission pairing for terminal startups: create() checks this guard in the same
     // synchronous block as its startup reservation, so whichever of {archive gate, terminal
     // entry} runs first is observed by the other (see archiveUnlocked's refuseLiveUserActivity
-    // gate and TerminalService.create).
-    terminalService.setWorkspaceArchiveGuard((workspaceId) =>
-      this.archivingWorkspaces.has(workspaceId)
+    // gate and TerminalService.create). Removal is covered too (#4478): it closes terminals
+    // before deleting the checkout, so a terminal still starting then must be refused or
+    // closed by TerminalService's post-spawn recheck, as the desktop-session guard does.
+    terminalService.setWorkspaceArchiveGuard(
+      (workspaceId) =>
+        this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)
     );
   }
 
@@ -3517,7 +3610,7 @@ export class WorkspaceService
    * durable staging/apply state does, via refine-apply.lock). Multi-instance
    * mode is a development escape hatch — concurrent turn traffic against one
    * workspace from two backends is unsupported beyond those durable-state
-   * locks.
+   * locks. See CONCURRENT BACKENDS in processLiveness.ts.
    */
   private acquireContextMutationAdmissionGuard(
     workspaceId: string,
@@ -4587,6 +4680,7 @@ export class WorkspaceService
   beginShutdown(): void {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.retireRemovalInstanceIfIdle();
     // Capture before disposal can remove transient instances from either registry.
     for (const session of [
       ...this.sessions.values(),
@@ -5547,6 +5641,9 @@ export class WorkspaceService
     this.initAbortControllers.set(workspaceId, initAbortController);
 
     const initLogger = this.createInitLogger(workspaceId);
+    // True once a retained owner (the deferred checkout's settlement) finalizes the pending
+    // default; otherwise the finally below does (#4455).
+    let pendingDefaultHandedOff = false;
 
     try {
       let finalBranchName = resolvedBranchName;
@@ -5683,7 +5780,7 @@ export class WorkspaceService
           // acquireRegistrationSanitizeLock).
           releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
         }
-        await this.config.editConfig((config) => {
+        const registration = this.config.editConfig((config) => {
           let projectConfig = config.projects.get(owningProjectPath);
           if (!projectConfig) {
             projectConfig = { workspaces: [] };
@@ -5704,8 +5801,34 @@ export class WorkspaceService
             // Mirror /fork: when /new is invoked with a start message, defer title
             // selection until the first message can drive LLM-based generation.
             ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+            // Default consent is granted once setup completes; marked in this same write so a
+            // toggle from any backend that sees the row cancels it (#4446).
+            ...(options?.skipDefaultUnrelatedWorkspaceConsent === true
+              ? {}
+              : { unrelatedWorkspaceConsentPending: true as const }),
           });
           return config;
+        });
+        const registeredRuntime: Runtime = runtime;
+        await registration.catch(async (error: unknown) => {
+          // #4745: nothing references this checkout yet; undo the creation, then fail with the
+          // write's own error.
+          await this.abortUnsanitizedCreation({
+            workspaceId,
+            runtime: registeredRuntime,
+            runtimeConfig: finalRuntimeConfig,
+            projectPath: owningProjectPath,
+            workspaceName: finalWorkspaceName,
+            trusted: projectConfig.trusted ?? false,
+            initAbortController,
+            // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
+            // is safe only on a branch this creation made.
+            checkout:
+              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
+          }).catch((rollbackError: unknown) =>
+            logRegistrationRollbackFailure(workspaceId, rollbackError)
+          );
+          throw error;
         });
 
         const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -5752,9 +5875,8 @@ export class WorkspaceService
           // Delegated target: stays off (see the option).
         } else if (pendingMaterialization !== undefined) {
           // Deferred checkout: its files (and their sanitization) arrive after the announcement,
-          // so the grant waits for materializeDeferredCheckout. Marked before announcing, so a
-          // toggle the user makes once the workspace appears cancels it.
-          this.pendingDefaultUnrelatedConsent.add(workspaceId);
+          // so the grant waits for materializeDeferredCheckout. The row's pending mark lets a
+          // toggle the user makes once the workspace appears cancel it.
         } else {
           // Registration is complete (sanitized when required) and nothing has been announced
           // yet: only now may other task trees discover and message this workspace.
@@ -5795,6 +5917,8 @@ export class WorkspaceService
           abortSignal: initAbortController.signal,
           trusted: projectConfig.trusted ?? false,
         };
+        // The deferred checkout's settlement grants or clears the pending default from here on.
+        pendingDefaultHandedOff = pendingMaterialization !== undefined;
         // Retained (not just fired) so archive can await the hook process's actual exit.
         this.retainInitSettlement(
           workspaceId,
@@ -5808,7 +5932,7 @@ export class WorkspaceService
                 pending: pendingMaterialization,
                 initAbortController,
                 // Removal, failed checkout or failed sanitization: the default never applies.
-              }).finally(() => this.pendingDefaultUnrelatedConsent.delete(workspaceId))
+              }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
             : runBackgroundInit(runtime, initParams, workspaceId, log)
         );
       } else {
@@ -5828,6 +5952,14 @@ export class WorkspaceService
       initLogger.logComplete(-1);
       const message = getErrorMessage(error);
       return Err(`Failed to create workspace: ${message}`);
+    } finally {
+      // Fail closed (#4455): one finalization for every exit that did not hand the pending default
+      // to the deferred checkout's settlement. That covers an Err after registration and a deferred
+      // checkout skipped because the workspace is being removed or its init was aborted. A no-op
+      // once the grant consumed the mark or a rollback removed the row.
+      if (!pendingDefaultHandedOff) {
+        await this.clearPendingDefaultUnrelatedConsent(workspaceId);
+      }
     }
   }
 
@@ -5874,6 +6006,17 @@ export class WorkspaceService
         if (projectConfig?.parentProjectPath) {
           return Err(
             `Sub-project ${project.projectName} cannot be added directly to a multi-project workspace. Add its parent project instead.`
+          );
+        }
+        // The container links each project under its name, and the workspace's MCP overrides
+        // are read from the container root, which is otherwise always fresh. A project named
+        // like the metadata directory would alias that overrides path into its checkout, whose
+        // tracked file could silently enable plugins once other trees can message this
+        // workspace. (Registration-time sanitization, which multi-project does not need
+        // otherwise, would refuse that symlinked path too; #4455.)
+        if (aliasesProjectMetadataDir(project.projectName)) {
+          return Err(
+            `Project ${project.projectName} cannot join a multi-project workspace: its name collides with the workspace metadata directory. Rename the project's folder first.`
           );
         }
       }
@@ -6004,9 +6147,12 @@ export class WorkspaceService
         runtime: ReturnType<typeof createRuntime>;
         workspacePath: string;
         trunkBranch: string;
+        createdBranch: boolean;
       }> = [];
 
-      const rollbackCreatedWorkspaces = async (): Promise<void> => {
+      // forced (#4745) removes dirty checkouts too, and keeps every branch this creation did not
+      // make: a delete otherwise runs `git branch -d`/`-D`, which could remove a user's branch.
+      const rollbackCreatedWorkspaces = async (forced = false): Promise<void> => {
         for (const createdWorkspace of [...createdWorkspaces].reverse()) {
           const trusted =
             configSnapshot.projects.get(stripTrailingSlashes(createdWorkspace.project.projectPath))
@@ -6017,9 +6163,10 @@ export class WorkspaceService
             await createdWorkspace.runtime.deleteWorkspace(
               createdWorkspace.project.projectPath,
               workspaceName,
-              false,
+              forced,
               initAbortController.signal,
-              trusted
+              trusted,
+              { keepBranch: forced && !createdWorkspace.createdBranch }
             );
           } catch (error: unknown) {
             log.error("Failed to roll back multi-project workspace creation", {
@@ -6086,6 +6233,7 @@ export class WorkspaceService
           runtime: projectRuntimeEntry.runtime,
           workspacePath: createResult.workspacePath,
           trunkBranch: projectTrunkBranch,
+          createdBranch: createResult.createdBranch === true,
         });
       }
 
@@ -6124,7 +6272,7 @@ export class WorkspaceService
       }
 
       const createdAt = new Date().toISOString();
-      await this.config.editConfig((config) => {
+      const registration = this.config.editConfig((config) => {
         const multiProjectConfig = config.projects.get(MULTI_PROJECT_CONFIG_KEY) ?? {
           workspaces: [],
           projectKind: "system",
@@ -6143,6 +6291,25 @@ export class WorkspaceService
         });
         config.projects.set(MULTI_PROJECT_CONFIG_KEY, multiProjectConfig);
         return config;
+      });
+      await registration.catch(async (error: unknown) => {
+        // #4745: undo this creation newest first (container, then worktrees), then fail with
+        // the write's own error. Checkouts go only once the entry is provably not persisted.
+        try {
+          const entryGone = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+          if (entryGone) {
+            await containerManager
+              .removeContainer(workspaceName)
+              .catch((cleanupError: unknown) =>
+                logRegistrationRollbackFailure(workspaceId, cleanupError)
+              );
+            await rollbackCreatedWorkspaces(true);
+          }
+          await this.discardCreationState(workspaceId, initAbortController, entryGone);
+        } catch (rollbackError: unknown) {
+          logRegistrationRollbackFailure(workspaceId, rollbackError);
+        }
+        throw error;
       });
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -6267,18 +6434,25 @@ export class WorkspaceService
   /**
    * @param options.beforeRemove - evaluated inside the task-tree lifecycle lock; returning false
    *   turns the call into a no-op. Lets callers that screened eligibility outside the lock confirm
-   *   it against live state within the same lock hold that performs the removal.
+   *   it against live state within the same lock hold that performs the removal. Returning
+   *   `{ expectedAttemptId }` binds the removal to the task attempt it confirmed: that lock is
+   *   in-process only, so the removal refuses if another backend rotated the attempt since.
    */
   async remove(
     workspaceId: string,
     force = false,
-    options?: { beforeRemove?: () => Promise<boolean>; acknowledgedDescendantIds?: string[] }
+    options?: {
+      beforeRemove?: () => Promise<boolean | RemovalAttemptBinding>;
+      acknowledgedDescendantIds?: string[];
+    }
   ): Promise<Result<void> & { descendants?: WorkspaceRemovalDescendant[] }> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () => {
       const operation = async () => {
-        if (options?.beforeRemove != null && !(await options.beforeRemove())) {
+        const decision = options?.beforeRemove == null ? true : await options.beforeRemove();
+        if (decision === false) {
           return Ok(undefined);
         }
+        const binding = decision === true ? undefined : decision;
         const failure = (error: string) => {
           const descendants =
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
@@ -6296,7 +6470,7 @@ export class WorkspaceService
               );
             if (!descendantsResult.success) return failure(descendantsResult.error);
           }
-          const result = await this.removeUnlocked(workspaceId, force);
+          const result = await this.removeUnlocked(workspaceId, force, binding);
           return result.success ? result : failure(result.error);
         } catch (error) {
           return failure(getErrorMessage(error));
@@ -6314,11 +6488,93 @@ export class WorkspaceService
    * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
    * under the task creation mutex, which the tree lock is ordered before).
    */
-  async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
-    return await this.removeUnlocked(workspaceId, force);
+  async removeWhileTaskTreeLocked(
+    workspaceId: string,
+    force = false,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>> {
+    return await this.removeUnlocked(workspaceId, force, binding);
   }
 
-  private async removeUnlocked(workspaceId: string, force = false): Promise<Result<void>> {
+  /**
+   * Close admission on the row durably before any destructive effect (#4478). Another backend's
+   * in-process locks cannot see this removal; its task admissions refuse on this marker instead,
+   * and they commit through the same cross-process config lock, so each side sees the other.
+   * Returns the marker's id (undefined when the row is already gone), or an error when the
+   * removal must not proceed: the row moved off the attempt the caller decided on, or another
+   * live (or not provably dead) process holds a marker.
+   */
+  private async claimPendingRemoval(
+    workspaceId: string,
+    binding: RemovalAttemptBinding | undefined
+  ): Promise<Result<string | undefined>> {
+    const removalId = crypto.randomUUID();
+    let outcome: Result<string | undefined> = Ok(undefined);
+    await this.config.editConfig((config) => {
+      const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+      if (row == null) return config;
+      if (binding != null && row.taskAttemptId !== binding.expectedAttemptId) {
+        outcome = Err(
+          `Workspace ${workspaceId} was not removed: it started attempt ` +
+            `${row.taskAttemptId ?? "none"} after the removal was decided.`
+        );
+        return config;
+      }
+      const held = row.pendingRemoval;
+      // This instance's own marker (a removal whose clean-up could not clear it) is retaken.
+      if (held != null && held.instanceId !== this.removalInstanceId) {
+        const verdict = judgeHolder(
+          { pid: held.pid, identity: parseProcessIdentity(held.identity) },
+          liveRemovalInstanceIds.has(held.instanceId)
+        );
+        if (!verdict.dead) {
+          outcome = Err(
+            `Workspace removal is already in progress in Xum process pid ${held.pid} ` +
+              `(${verdict.why}); retry once it finishes.`
+          );
+          return config;
+        }
+        log.info("Taking over the removal marker of a dead Xum process", {
+          workspaceId,
+          pid: held.pid,
+        });
+      }
+      row.pendingRemoval = {
+        removalId,
+        instanceId: this.removalInstanceId,
+        pid: process.pid,
+        identity: { ...getSelfIdentity() },
+        at: new Date().toISOString(),
+      };
+      outcome = Ok(removalId);
+      return config;
+    });
+    return outcome;
+  }
+
+  /** Reopen admission after a removal that left the workspace registered (CAS on the marker). */
+  private async releasePendingRemoval(workspaceId: string, removalId: string): Promise<void> {
+    try {
+      await this.config.editConfig((config) => {
+        const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+        if (row?.pendingRemoval?.removalId === removalId) delete row.pendingRemoval;
+        return config;
+      });
+    } catch (error) {
+      // The marker stays: this instance's next removal retakes it, and any removal takes it over
+      // once this process has exited. Until then task admissions refuse.
+      log.error("Failed to clear the removal marker after an aborted removal", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  private async removeUnlocked(
+    workspaceId: string,
+    force = false,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
@@ -6343,6 +6599,8 @@ export class WorkspaceService
     // handover) BEFORE the checkout deletion; an abort between the two rolls
     // it back so the intact workspace stays usable.
     let sealedForRemoval = false;
+    // This removal's pendingRemoval marker, once claimed (see claimPendingRemoval).
+    let pendingRemovalId: string | undefined;
 
     // If this workspace is mid-init, cancel the fire-and-forget init work (postCreateSetup,
     // sync/checkout, .xum/init hook, etc.) so removal doesn't leave orphaned background work.
@@ -6380,6 +6638,9 @@ export class WorkspaceService
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      const claim = await this.claimPendingRemoval(workspaceId, binding);
+      if (!claim.success) return Err(claim.error);
+      pendingRemovalId = claim.data;
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
@@ -6440,7 +6701,7 @@ export class WorkspaceService
       // Shared workspace memory (sub-agents write into their task-tree
       // owner's store): pin the owner on surviving descendants FIRST — their
       // parent chain is about to lose this node — verified by reading the
-      // config back because Config swallows write failures. A topology-only
+      // config back (belt and braces; a failed save rejects, #4444). A topology-only
       // edit from the persisted config, so it runs whether or not this
       // workspace's metadata can still be built (the phantom-cleanup path
       // below removes the config entry all the same, and a child left with a
@@ -6605,6 +6866,17 @@ export class WorkspaceService
           sealedForRemoval = true;
           tombstonePublished = true;
         }
+
+        // #4478: stop this process's users of the checkout BEFORE deleting it. MCP servers,
+        // terminals and background processes run with their cwd inside the checkout; stopping them
+        // only after the deletion (the later calls below, kept for the metadata-less path) left
+        // them running in a deleted tree. Same trade-off as the producer drains above: a
+        // force=false deletion that fails below keeps the workspace with these already stopped,
+        // which is recoverable (MCP servers restart on demand), unlike a process outliving its
+        // checkout.
+        await this.mcpServerManager?.stopServers(workspaceId);
+        this.terminalService?.closeWorkspaceSessions(workspaceId);
+        await this.backgroundProcessManager.cleanup(workspaceId);
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -7070,7 +7342,9 @@ export class WorkspaceService
 
       // Remove from config
       try {
-        await this.config.removeWorkspace(workspaceId);
+        await (pendingRemovalId != null
+          ? this.config.removeWorkspace(workspaceId, { removalId: pendingRemovalId })
+          : this.config.removeWorkspace(workspaceId));
       } catch (error) {
         // r62: the session directory and its durable removal tombstone are
         // already committed above. If deregistration fails here (e.g. the
@@ -7176,6 +7450,9 @@ export class WorkspaceService
           }
         }
         this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+        if (pendingRemovalId != null) {
+          await this.releasePendingRemoval(workspaceId, pendingRemovalId);
+        }
       }
       if (releaseOverridesLock !== undefined) {
         try {
@@ -7191,6 +7468,17 @@ export class WorkspaceService
         hold[Symbol.dispose]();
       }
       this.removingWorkspaces.delete(workspaceId);
+      this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * A shut-down instance with no removal in flight writes no more markers: drop it from the live
+   * set so a marker it left behind can be taken over by another service in this process.
+   */
+  private retireRemovalInstanceIfIdle(): void {
+    if (this.shuttingDown && this.removingWorkspaces.size === 0) {
+      liveRemovalInstanceIds.delete(this.removalInstanceId);
     }
   }
 
@@ -7375,6 +7663,7 @@ export class WorkspaceService
       | "setHeartbeatSettings"
       | "unsetHeartbeatSettings"
       | "setUnrelatedWorkspaceConsent"
+      | "setAgentMessageDispatchMode"
   ): Result<HeartbeatWorkspaceConfigEntry, string> {
     const normalizedWorkspaceId = workspaceId.trim();
     assert(normalizedWorkspaceId.length > 0, `${methodName} requires a non-empty workspaceId`);
@@ -7527,9 +7816,6 @@ export class WorkspaceService
       }
 
       const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
-      // An explicit choice (either value) supersedes a still-pending creation default; cleared
-      // before this edit is queued, so a deferred grant queued later re-checks and skips.
-      this.pendingDefaultUnrelatedConsent.delete(normalizedWorkspaceId);
       // Mutate inside the serialized editConfig transform against the FRESH entry (see
       // findFreshWorkspaceEntry): a stale snapshot write could resurrect a removed workspace.
       let outcome: Result<void, string> = Err("Workspace not found");
@@ -7544,6 +7830,9 @@ export class WorkspaceService
           return freshConfig;
         }
         outcome = Ok(undefined);
+        // An explicit choice (either value) supersedes a still-pending creation default, even
+        // one another backend sharing this root is about to grant (#4446).
+        delete entry.unrelatedWorkspaceConsentPending;
         if (!enabled) {
           // Absent is the only "off" representation on disk. A malformed value already reads
           // as off, but it is scrubbed here so the entry does not carry junk indefinitely.
@@ -7575,6 +7864,72 @@ export class WorkspaceService
   }
 
   /**
+   * Recipient-side delivery preference for agent messages that arrive while this workspace is
+   * busy (TaskService.sendAgentTreeMessage reads it at admission). "tool-end" is the default and
+   * is stored as an absent field; only "turn-end" is persisted. Like the consent switch, Ok means
+   * committed AND republished, so the UI only moves after the ack; recency is not bumped.
+   */
+  async setAgentMessageDispatchMode(
+    workspaceId: string,
+    mode: AgentMessageDispatchMode
+  ): Promise<Result<void, string>> {
+    try {
+      assert(
+        mode === "tool-end" || mode === "turn-end",
+        "setAgentMessageDispatchMode requires a known mode"
+      );
+      const resolved = this.resolveHeartbeatWorkspaceEntry(
+        workspaceId,
+        "setAgentMessageDispatchMode"
+      );
+      if (!resolved.success) {
+        return Err(resolved.error);
+      }
+
+      const { normalizedWorkspaceId, projectPath, workspacePath } = resolved.data;
+      let outcome: Result<void, string> = Err("Workspace not found");
+      await this.config.editConfig((freshConfig) => {
+        const entry = this.findFreshWorkspaceEntry(freshConfig, {
+          projectPath,
+          workspaceId: normalizedWorkspaceId,
+          workspacePath,
+        });
+        if (!entry) {
+          return freshConfig;
+        }
+        outcome = Ok(undefined);
+        if (mode === "tool-end") {
+          delete entry.agentMessageDispatchMode;
+        } else {
+          entry.agentMessageDispatchMode = mode;
+        }
+        return freshConfig;
+      });
+      if (!outcome.success) {
+        return Err(outcome.error);
+      }
+      // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
+      // write another writer replaced. editConfig leaves no cached snapshot, so it reads the file.
+      const persisted = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+        projectPath,
+        workspaceId: normalizedWorkspaceId,
+        workspacePath,
+      });
+      if (
+        (getValidAgentMessageDispatchMode(persisted?.agentMessageDispatchMode) ?? "tool-end") !==
+        mode
+      ) {
+        return Err("Failed to save agent message delivery: the config write did not persist.");
+      }
+      // Publish after every successful write, including no-ops (same reason as consent above).
+      await this.emitCurrentWorkspaceMetadata(normalizedWorkspaceId);
+      return Ok(undefined);
+    } catch (error) {
+      return Err(`Failed to update agent message delivery: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
    * Opts a newly created root workspace in to unrelated messaging. Callers run this only once
    * the registration is complete, i.e. after registration-time plugin-override sanitization:
    * consent makes the entry discoverable (task_list scope:"instance" reads config directly) and
@@ -7586,9 +7941,7 @@ export class WorkspaceService
   private async grantCreationUnrelatedWorkspaceConsent(
     projectPath: string,
     workspaceId: string,
-    workspacePath: string,
-    /** Re-checked inside the serialized edit; false skips the grant. */
-    shouldGrant: () => boolean = () => true
+    workspacePath: string
   ): Promise<string | undefined> {
     let granted: string | undefined;
     try {
@@ -7598,9 +7951,13 @@ export class WorkspaceService
           workspaceId,
           workspacePath,
         });
-        if (!entry || !shouldGrant()) {
+        // Only while the registration's pending mark survives: an explicit toggle cleared it.
+        // Report that choice as it stands (an opt-in from another backend stays on).
+        if (entry?.unrelatedWorkspaceConsentPending !== true) {
+          granted = getValidUnrelatedWorkspaceConsent(entry?.unrelatedWorkspaceConsent);
           return freshConfig;
         }
+        delete entry.unrelatedWorkspaceConsentPending;
         granted =
           getValidUnrelatedWorkspaceConsent(entry.unrelatedWorkspaceConsent) ??
           mintUnrelatedWorkspaceConsent();
@@ -7617,9 +7974,8 @@ export class WorkspaceService
     if (granted == null) {
       return undefined;
     }
-    // Config.saveConfig logs and swallows write failures, and editConfig's transform ran on an
-    // uncached read, so a failed save leaves loadConfigOrDefault() re-reading the unchanged
-    // file. Report only what discovery and admission will actually read (see #4444).
+    // editConfig rejects when the save fails (#4444); this re-read is belt and braces against a
+    // write another writer replaced. Report only what discovery and admission will actually read.
     const persisted = getValidUnrelatedWorkspaceConsent(
       findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
         .unrelatedWorkspaceConsent
@@ -7635,20 +7991,21 @@ export class WorkspaceService
 
   /**
    * Default consent for a deferred-checkout creation, once materializeDeferredCheckout has
-   * populated and sanitized it. Applies only while the creation is still pending (an explicit
-   * toggle cancels it), and publishes the metadata since the workspace is already announced.
+   * populated and sanitized it. Applies only while the row's pending mark survives (an explicit
+   * toggle clears it), and publishes the metadata since the workspace is already announced.
    */
   private async grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
     try {
       const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-      if (found == null || !this.pendingDefaultUnrelatedConsent.has(workspaceId)) {
+      // No early return on a missing mark: the grant then reports the consent as it stands, so an
+      // opt-in another backend made meanwhile is still published to this backend's UI.
+      if (found == null) {
         return;
       }
       const granted = await this.grantCreationUnrelatedWorkspaceConsent(
         found.projectPath,
         workspaceId,
-        found.workspace.path,
-        () => this.pendingDefaultUnrelatedConsent.has(workspaceId)
+        found.workspace.path
       );
       if (granted != null) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
@@ -7661,8 +8018,32 @@ export class WorkspaceService
         workspaceId,
         error: getErrorMessage(error),
       });
-    } finally {
-      this.pendingDefaultUnrelatedConsent.delete(workspaceId);
+    }
+  }
+
+  /**
+   * A deferred checkout that failed, was cancelled or was removed never gets its default: drop
+   * the row's pending mark (a no-op once the grant consumed it). Never throws: it runs in the
+   * deferred checkout's init settlement.
+   */
+  private async clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void> {
+    if (
+      findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+        .unrelatedWorkspaceConsentPending !== true
+    ) {
+      return;
+    }
+    try {
+      await this.config.editConfig((freshConfig) => {
+        const entry = findWorkspaceEntry(freshConfig, workspaceId)?.workspace;
+        if (entry) delete entry.unrelatedWorkspaceConsentPending;
+        return freshConfig;
+      });
+    } catch (error) {
+      log.warn("Failed to clear pending default unrelated-workspace consent", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -8089,6 +8470,8 @@ export class WorkspaceService
       let oldPath: string;
       let newPath: string;
       let runtimeForPlanFile: ReturnType<typeof createRuntime>;
+      // Moves the checkout back when the config rewrite below rejects (#4779).
+      let revertMove: () => Promise<void>;
 
       if (isMultiProject(oldMetadata)) {
         const projects = getProjects(oldMetadata);
@@ -8099,6 +8482,7 @@ export class WorkspaceService
           projectPath: string;
           oldWorkspacePath: string;
           newWorkspacePath: string;
+          branchRenamed: boolean;
         }> = [];
 
         const rollbackRenamedProjects = async (): Promise<void> => {
@@ -8118,7 +8502,8 @@ export class WorkspaceService
                 newName,
                 oldName,
                 undefined,
-                rollbackTrusted
+                rollbackTrusted,
+                { renameBranch: renamedProject.branchRenamed }
               );
 
               if (!rollbackResult.success) {
@@ -8179,6 +8564,7 @@ export class WorkspaceService
             projectPath: project.projectPath,
             oldWorkspacePath: renameResult.oldPath,
             newWorkspacePath: renameResult.newPath,
+            branchRenamed: renameResult.branchRenamed === true,
           });
         }
 
@@ -8196,16 +8582,7 @@ export class WorkspaceService
           newContainerExistedBeforeRename = false;
         }
 
-        try {
-          await containerManager.removeContainer(oldName);
-          await containerManager.createContainer(
-            newName,
-            renamedProjectWorkspaces.map((workspaceEntry) => ({
-              projectName: workspaceEntry.projectName,
-              workspacePath: workspaceEntry.newWorkspacePath,
-            }))
-          );
-        } catch (containerError: unknown) {
+        const revertMultiProjectMove = async (): Promise<void> => {
           await rollbackRenamedProjects();
 
           if (!newContainerExistedBeforeRename) {
@@ -8246,9 +8623,22 @@ export class WorkspaceService
           } catch (recreateErr: unknown) {
             log.error("Failed to recreate old container after rename failure", recreateErr);
           }
+        };
 
+        try {
+          await containerManager.removeContainer(oldName);
+          await containerManager.createContainer(
+            newName,
+            renamedProjectWorkspaces.map((workspaceEntry) => ({
+              projectName: workspaceEntry.projectName,
+              workspacePath: workspaceEntry.newWorkspacePath,
+            }))
+          );
+        } catch (containerError: unknown) {
+          await revertMultiProjectMove();
           return Err(`Failed to recreate container: ${getErrorMessage(containerError)}`);
         }
+        revertMove = revertMultiProjectMove;
 
         // Multi-project tasks/forks stored under a real project must keep their git-root path in
         // config so downstream artifact collection can resolve the owning repo after rename.
@@ -8296,9 +8686,20 @@ export class WorkspaceService
         oldPath = renameResult.oldPath;
         newPath = renameResult.newPath;
         runtimeForPlanFile = runtime;
+        const movedPath = newPath;
+        revertMove = async () => {
+          const revert = await createRuntime(oldMetadata.runtimeConfig, {
+            projectPath: configProjectPath,
+            workspaceName: newName,
+            workspacePath: movedPath,
+          }).renameWorkspace(configProjectPath, newName, oldName, undefined, trusted, {
+            renameBranch: renameResult.branchRenamed === true,
+          });
+          if (!revert.success) logRegistrationRollbackFailure(workspaceId, revert.error);
+        };
       }
 
-      await this.config.editConfig((config) => {
+      const registration = this.config.editConfig((config) => {
         const projectConfig = config.projects.get(configProjectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -8310,6 +8711,21 @@ export class WorkspaceService
           }
         }
         return config;
+      });
+      await registration.catch(async (error: unknown) => {
+        // #4779: move the checkout back so disk agrees with config, then fail with the write's own
+        // error. Only when a strict read shows the new path did not land; unsure means leave it.
+        try {
+          const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+          // Name too: a local-runtime rename returns the same path for old and new.
+          const landed = [...persisted.projects.values()].some((project) =>
+            project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
+          );
+          if (!landed) await revertMove();
+        } catch (rollbackError: unknown) {
+          logRegistrationRollbackFailure(workspaceId, rollbackError);
+        }
+        throw error;
       });
       // Checkout and config agree again: let MCP-settings writers proceed
       // instead of queueing behind plan-file moves and .code-workspace sync.
@@ -10185,20 +10601,29 @@ export class WorkspaceService
             error: restoreResult.error,
           });
           if (persistedUnarchivedAt) {
-            await this.config.editConfig((config) => {
-              const projectConfig = config.projects.get(projectPath);
-              const workspaceEntry =
-                projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
-                projectConfig?.workspaces.find((w) => w.path === workspacePath);
-              if (workspaceEntry && workspaceEntry.unarchivedAt === persistedUnarchivedAt) {
-                if (previousUnarchivedAt === undefined) {
-                  delete workspaceEntry.unarchivedAt;
-                } else {
-                  workspaceEntry.unarchivedAt = previousUnarchivedAt;
+            // Best effort (#4748): a failed rollback must not replace the restore error, and the
+            // UI still needs what disk now says.
+            await this.config
+              .editConfig((config) => {
+                const projectConfig = config.projects.get(projectPath);
+                const workspaceEntry =
+                  projectConfig?.workspaces.find((w) => w.id === workspaceId) ??
+                  projectConfig?.workspaces.find((w) => w.path === workspacePath);
+                if (workspaceEntry && workspaceEntry.unarchivedAt === persistedUnarchivedAt) {
+                  if (previousUnarchivedAt === undefined) {
+                    delete workspaceEntry.unarchivedAt;
+                  } else {
+                    workspaceEntry.unarchivedAt = previousUnarchivedAt;
+                  }
                 }
-              }
-              return config;
-            });
+                return config;
+              })
+              .catch((rollbackError: unknown) => {
+                log.warn("Failed to roll back unarchive after a failed snapshot restore", {
+                  workspaceId,
+                  error: getErrorMessage(rollbackError),
+                });
+              });
             await this.emitCurrentWorkspaceMetadata(workspaceId);
           }
           return Err(restoreResult.error);
@@ -10752,6 +11177,8 @@ export class WorkspaceService
     const agentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
     const extractedSettings = this.extractWorkspaceAISettingsFromSendOptions(options);
 
+    // Best-effort (#4444): a rejected config write must not fail the user's send, which
+    // itself never needs one; the write failure is logged where it happens.
     const persistResult = await this.persistWorkspaceAISettingsForAgent(
       workspaceId,
       agentId,
@@ -10763,7 +11190,7 @@ export class WorkspaceService
         ...(pinIntent != null ? { pinIntent } : {}),
         ...(pinsOnly === true ? { pinsOnly: true } : {}),
       }
-    );
+    ).catch((error: unknown): Result<boolean, string> => Err(getErrorMessage(error)));
     if (!persistResult.success) {
       log.debug("Failed to persist workspace AI settings from user message", {
         workspaceId,
@@ -11046,6 +11473,8 @@ export class WorkspaceService
       this.preflightForkCounts,
       sourceWorkspaceId
     );
+    // Set once the fork's ID exists; the finally below finalizes its pending default (#4455).
+    let forkWorkspaceId: string | undefined;
     try {
       const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
@@ -11151,6 +11580,7 @@ export class WorkspaceService
       });
 
       const newWorkspaceId = this.config.generateStableId();
+      forkWorkspaceId = newWorkspaceId;
 
       const session = this.getOrCreateSession(newWorkspaceId);
       this.initStateManager.startInit(newWorkspaceId, foundProjectPath);
@@ -11215,6 +11645,7 @@ export class WorkspaceService
         targetRuntime,
         sourceRuntimeConfigUpdate,
         sourceRuntimeConfigUpdated,
+        createdBranch: forkCreatedBranch,
       } = forkResult.data;
 
       // Per-workspace MCP enables live in the gitignored .xum/mcp.local.jsonc,
@@ -11379,7 +11810,9 @@ export class WorkspaceService
           resolvedName,
           true,
           undefined,
-          forkTrusted
+          forkTrusted,
+          // An explicit fork name can reuse an existing branch; never delete that (#4775).
+          { keepBranch: forkCreatedBranch !== true }
         );
         try {
           await fsPromises.rm(newSessionDir, { recursive: true, force: true });
@@ -11452,6 +11885,39 @@ export class WorkspaceService
           : {}),
       };
 
+      // Undo everything this fork made, newest first. Shared by a failed sanitization and a
+      // registration write that rejected (#4745). Returns whether the entry is provably gone.
+      const abortForkRegistration = async (): Promise<boolean> => {
+        // Background init is still running against this checkout: abort
+        // it and AWAIT termination before deleting the worktree, or the
+        // delete races init's writes/open handles and can fail, leaving
+        // an orphaned worktree that collides with the next fork attempt.
+        initAbortController.abort();
+        await initSettled;
+        const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
+        if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
+          // Matches the copy-failure cleanup above: the fork's checkout
+          // is known fresh, so force-delete is safe here.
+          await targetRuntime
+            .deleteWorkspace(
+              foundProjectPath,
+              resolvedName,
+              true,
+              undefined,
+              projectConfig.trusted ?? false,
+              { keepBranch: forkCreatedBranch !== true }
+            )
+            .catch((error: unknown) => {
+              log.warn("Failed to remove forked worktree after an aborted registration", {
+                newWorkspaceId,
+                error: getErrorMessage(error),
+              });
+            });
+        }
+        await this.discardCreationState(newWorkspaceId, initAbortController, rolledBack);
+        return rolledBack;
+      };
+
       // Same pre-announcement sanitization as create(): a worktree fork of a
       // trusted repo materializes tracked files, so a committed
       // .mux/mcp.local.jsonc can carry a stale canonical plugin: enable that
@@ -11472,44 +11938,24 @@ export class WorkspaceService
           // acquireRegistrationSanitizeLock).
           releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
         }
-        await this.config.addWorkspace(foundProjectPath, metadata);
+        // Marked in the registration write itself so a toggle from any backend cancels the
+        // default granted below (#4446).
+        await this.config
+          .addWorkspace(foundProjectPath, metadata, { unrelatedWorkspaceConsentPending: true })
+          .catch(async (error: unknown) => {
+            // #4745: fail with the write's own error once the fork is undone.
+            await abortForkRegistration().catch((rollbackError: unknown) =>
+              logRegistrationRollbackFailure(newWorkspaceId, rollbackError)
+            );
+            throw error;
+          });
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,
             workspacePath
           );
           if (sanitizeError !== undefined) {
-            // Background init is still running against this checkout: abort
-            // it and AWAIT termination before deleting the worktree, or the
-            // delete races init's writes/open handles and can fail, leaving
-            // an orphaned worktree that collides with the next fork attempt.
-            initAbortController.abort();
-            await initSettled;
-            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
-            if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
-              // Matches the copy-failure cleanup above: the fork's checkout
-              // is known fresh, so force-delete is safe here.
-              await targetRuntime
-                .deleteWorkspace(
-                  foundProjectPath,
-                  resolvedName,
-                  true,
-                  undefined,
-                  projectConfig.trusted ?? false
-                )
-                .catch((error: unknown) => {
-                  log.warn("Failed to remove forked worktree after sanitization abort", {
-                    newWorkspaceId,
-                    error: getErrorMessage(error),
-                  });
-                });
-            }
-            await this.disposeSession(newWorkspaceId);
-            await fsPromises
-              .rm(newSessionDir, { recursive: true, force: true })
-              .catch(() => undefined);
-            this.initAbortControllers.delete(newWorkspaceId);
-            this.initStateManager.clearInMemoryState(newWorkspaceId);
+            const rolledBack = await abortForkRegistration();
             initLogger.logComplete(-1);
             return Err(
               rolledBack
@@ -11581,6 +12027,12 @@ export class WorkspaceService
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to fork workspace: ${message}`);
+    } finally {
+      // Fail closed (#4455): a fork that fails after registering its row must not leave the
+      // default pending on it. A no-op once the grant consumed the mark or a rollback removed the row.
+      if (forkWorkspaceId != null) {
+        await this.clearPendingDefaultUnrelatedConsent(forkWorkspaceId);
+      }
     }
   }
 
@@ -12049,9 +12501,12 @@ export class WorkspaceService
    * the counter increment run in one synchronous block, mirroring executeBash: a discovery
    * admitted first holds the archive gate open until the caller disposes the admission, and one
    * entering after the gate armed (or against an archived workspace) is refused with undefined.
+   *
+   * Removal refuses new discoveries too (#4760). A discovery admitted before the removal
+   * started is not joined; that remaining window is tracked as a follow-up.
    */
   acquireMcpPromptDiscoveryAdmission(workspaceId: string): Disposable | undefined {
-    if (this.archivingWorkspaces.has(workspaceId)) {
+    if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
       return undefined;
     }
     const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
@@ -12243,6 +12698,12 @@ export class WorkspaceService
           type: "unknown",
           raw: "Workspace is being deleted. Please wait and try again.",
         });
+      }
+
+      // A task checkout left unsanitized by a failed launch (#4674): no turn may start MCP in it.
+      const unsanitized = this.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+      if (unsanitized) {
+        return Err({ type: unsanitized.code, message: unsanitized.message });
       }
 
       // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): these
@@ -12742,6 +13203,7 @@ export class WorkspaceService
             // invisible to queue clearing, so the session's turn-admission gates must
             // re-check it at dispatch.
             admissionStale: internal?.admissionStale,
+            skipOnSendCompaction: internal?.skipOnSendCompaction,
             turnAdmission: taskTurnAdmission,
             compactionAdmissionStale: () => compactionAdmissionStale(),
             refreshCompactionAdmission:
@@ -12907,6 +13369,7 @@ export class WorkspaceService
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
+        skipOnSendCompaction: internal?.skipOnSendCompaction,
         turnAdmission: taskTurnAdmission,
       });
       if (
@@ -13044,6 +13507,12 @@ export class WorkspaceService
           type: "unknown",
           raw: "Workspace is being deleted. Please wait and try again.",
         });
+      }
+
+      // A task checkout left unsanitized by a failed launch (#4674): no turn may start MCP in it.
+      const unsanitized = this.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+      if (unsanitized) {
+        return Err({ type: unsanitized.code, message: unsanitized.message });
       }
 
       // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): resume
@@ -14675,6 +15144,12 @@ export class WorkspaceService
     options?: {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
+      /**
+       * append-compaction-boundary only: the boundary is appended only while this returns true,
+       * checked under the history write lock right before the append (see
+       * HistoryService.appendToHistoryIf for the contract). A refusal returns Err.
+       */
+      admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>> {
     // The row is client-supplied (workspace.replaceChatHistory). Plan-review rows may only come
@@ -14915,9 +15390,20 @@ export class WorkspaceService
         }
       }
 
-      const appendResult = await this.historyService.appendToHistory(workspaceId, messageToAppend);
+      const admitsAppend = options?.admitsAppend;
+      assert(
+        admitsAppend == null || replaceMode === "append-compaction-boundary",
+        "replaceHistory: admitsAppend applies to append-compaction-boundary mode only"
+      );
+      const appendResult =
+        admitsAppend != null
+          ? await this.historyService.appendToHistoryIf(workspaceId, messageToAppend, admitsAppend)
+          : await this.historyService.appendToHistory(workspaceId, messageToAppend);
       if (!appendResult.success) {
         return Err(`Failed to append summary message: ${appendResult.error}`);
+      }
+      if (appendResult.data === "refused") {
+        return Err("History append refused: its precondition no longer holds.");
       }
 
       this.sessions.get(workspaceId)?.clearUsageState();
@@ -14971,8 +15457,8 @@ export class WorkspaceService
     try {
       // Deleting also write-tombstones the id for the rest of this process,
       // so verify deregistration actually landed before publishing it:
-      // saveConfig swallows write failures, meaning config.removeWorkspace
-      // can resolve while the workspace is still persisted in config.json —
+      // config.removeWorkspace can resolve while another writer has put the
+      // workspace back in config.json —
       // tombstoning a still-live id would suppress all of its future
       // activity writes. A failed verification (unreadable config) skips the
       // delete too; like a missed delete, the entry is reclaimed by a later

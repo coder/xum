@@ -192,6 +192,14 @@ export const QueuedFollowUp: AppStory = {
                     attachmentCount: 2,
                     reviewCount: 0,
                   },
+                  {
+                    // Returned by Stop while the composer could not take it (#4448).
+                    id: "held-interrupted",
+                    reason: "interrupted",
+                    displayText: "Run the migration once the lint pass is green.",
+                    attachmentCount: 0,
+                    reviewCount: 0,
+                  },
                 ],
               });
             }, 75);
@@ -255,7 +263,7 @@ export const QueuedFollowUp: AppStory = {
       const banners = [
         ...storyRoot.querySelectorAll<HTMLElement>('[data-component="HeldInputBanner"]'),
       ];
-      if (banners.length !== 2) throw new Error("Held input banners not rendered");
+      if (banners.length !== 3) throw new Error("Held input banners not rendered");
       for (const banner of banners) {
         if (banner.scrollWidth > banner.clientWidth) {
           throw new Error("Held input banner overflows horizontally");
@@ -281,7 +289,7 @@ export const QueuedFollowUp: AppStory = {
             (hint) => getComputedStyle(hint).display !== "none"
           ).length
       );
-      const expected = narrow ? [0, 0] : [2, 0];
+      const expected = narrow ? [0, 0, 0] : [2, 0, 0];
       if (visibleHints.join() !== expected.join()) {
         throw new Error(
           `Held input shortcut hints visible ${visibleHints.join()} (expected ${expected.join()}, narrow=${narrow})`
@@ -290,7 +298,8 @@ export const QueuedFollowUp: AppStory = {
       // Only a confirmed report may say the task reported.
       if (
         !banners[0].textContent?.includes("the task reported") ||
-        banners[1].textContent?.includes("reported")
+        banners[1].textContent?.includes("reported") ||
+        banners[2].textContent?.includes("reported")
       ) {
         throw new Error("Held input banner wording does not match its refusal reason");
       }

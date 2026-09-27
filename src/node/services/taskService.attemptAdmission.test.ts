@@ -14,7 +14,7 @@ import * as path from "path";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
-import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
+import { configFilePath, type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok, type Result } from "@/common/types/result";
 import {
   SEND_ADMISSION_STALE_MESSAGE,
@@ -1208,8 +1208,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         );
         spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(() => {
           if (failure === "sanitize failed, unpublish write lost") {
-            // The next config save (the unpublication) is swallowed, as saveConfigEffect does
-            // with a failed write: editConfig resolves, the bytes on disk still hold the row.
+            // The next config save (the unpublication) does not land (another writer replaced
+            // it): editConfig resolves, the bytes on disk still hold the row.
             spyOn(
               config as unknown as { saveConfig: (config: unknown) => Promise<void> },
               "saveConfig"
@@ -3669,6 +3669,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           getInitState: mock(() => undefined),
           waitForInit: mock(() => Promise.resolve()),
           clearInMemoryState: mock(() => undefined),
+          getUnsanitizedCheckoutError: mock(() => undefined),
         } as unknown as InitStateManager;
         const aiService = sessionHarness.aiService as unknown as AIService;
         const workspaceService = new WorkspaceService(
@@ -4225,6 +4226,104 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       } finally {
         readSpy.mockRestore();
       }
+    });
+
+    // #4311: A's owned settlement speaks only for the attempt the persisted row names right now.
+    test("an owned settlement never reads as terminal-no-report through an unreadable config", async () => {
+      const result = await runStopSettlement({ successorAdmitted: false });
+      expect(result.read).toMatchObject({ kind: "terminal-no-report" });
+      const file = configFilePath(result.config.rootDir);
+      const intact = await fsPromises.readFile(file, "utf-8");
+      await fsPromises.writeFile(file, "{ damaged");
+      try {
+        const read = await result.taskService.readAttemptOutcome(result.taskId, requesting);
+        expect(read.kind).toBe("indeterminate");
+      } finally {
+        await fsPromises.writeFile(file, intact);
+      }
+    });
+
+    // #4545: backend B executes under A's attempt (an unowned send binds to it, never rotates), so
+    // A's own settlement cannot see B's turn. A workflow claim and B's report on the same attempt
+    // are serialized by config: exactly one of them wins.
+    test.each(["claim first", "report first"] as const)(
+      "a workflow claim and another backend's report on the same attempt: exactly one wins (%s)",
+      async (order) => {
+        const taskId = order === "claim first" ? "late-report-claimed" : "late-report-first";
+        const run = { runId: "wfr_late", stepId: "summarize", inputHash: "hash-1" };
+        const { config } = await setupTree([
+          {
+            id: taskId,
+            overrides: {
+              taskStatus: "interrupted",
+              taskAttemptId: "att_00000000000000d0",
+              workflowTask: { runId: run.runId, stepId: run.stepId },
+            },
+          },
+        ]);
+        const { taskService } = createHarness(config);
+        expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+        const attemptA = entryOf(config, taskId)!.taskAttemptId!;
+        // Backend B (its own Config on the same root) admits a manual send: bound, unowned, to A.
+        const backendB = createTaskServiceStack(await createTestConfig(rootDir), {
+          historyService: fixture.historyService,
+          workspaceService: hostWithTurnEvents().workspaceService,
+        }).taskService;
+        admitted(
+          backendB.admitTaskWorkspaceTurn(taskId, { acceptanceOrigin: "manual" })
+        ).onAdmitted(Symbol("turn-B"));
+        const readReport = () =>
+          subagentReportArtifacts.readSubagentReportArtifactStrict(
+            path.join(config.sessionsDir, rootId),
+            taskId
+          );
+        if (order === "report first") {
+          await streamEnd(backendB, reportingStreamEnd(taskId, "late-report", "B's report"));
+          expect(entryOf(config, taskId)).toMatchObject({ taskStatus: "reported" });
+          expect((await taskService.claimRetiredAttempt(taskId, attemptA, run)).success).toBe(
+            false
+          );
+          expect(entryOf(config, taskId)?.taskAttemptRetiredBy).toBeUndefined();
+          expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("reported");
+          return;
+        }
+        // A task_await in B, registered while B's turn runs: A's Stop cannot reach it (process-local).
+        const waiterB = backendB
+          .waitForAgentReport(taskId, { timeoutMs: 5_000, requestingWorkspaceId: rootId })
+          .then(
+            () => "resolved",
+            (error: unknown) => `rejected: ${getErrorMessage(error)}`
+          );
+        // A is locally idle, so its Stop settles A and its workflow claims the attempt.
+        await taskService.stopDescendantAgentTask(rootId, taskId);
+        await settle();
+        expect((await taskService.claimRetiredAttempt(taskId, attemptA, run)).success).toBe(true);
+        // B's turn then ends on a report: it must not publish beside the replacement.
+        await streamEnd(backendB, reportingStreamEnd(taskId, "late-report", "B's report"));
+        expect(entryOf(config, taskId)).toMatchObject({
+          taskStatus: "interrupted",
+          taskAttemptId: attemptA,
+          taskAttemptRetiredBy: { attemptId: attemptA },
+        });
+        expect((await readReport()).kind).not.toBe("found");
+        // Same attempt, so B's waiter is this attempt's: it ends now instead of at its timeout.
+        expect(await waiterB).toContain("retired");
+      }
+    );
+
+    test("an owned settlement is not the outcome of a row that lost its attempt id", async () => {
+      const result = await runStopSettlement({ successorAdmitted: false });
+      expect(result.read).toMatchObject({ kind: "terminal-no-report" });
+      // Another writer (e.g. a backend that dropped the field) leaves the row without an id.
+      await result.otherBackend.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          const ws = project.workspaces.find((w) => w.id === result.taskId);
+          if (ws) delete ws.taskAttemptId;
+        }
+        return cfg;
+      });
+      const read = await result.taskService.readAttemptOutcome(result.taskId, requesting);
+      expect(read.kind).toBe("indeterminate");
     });
 
     test.each([false, true])(

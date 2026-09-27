@@ -2,7 +2,10 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
-import { DEFAULT_AUTO_COMPACTION_THRESHOLD } from "@/common/constants/ui";
+import {
+  DEFAULT_AUTO_COMPACTION_THRESHOLD,
+  FORCE_COMPACTION_BUFFER_PERCENT,
+} from "@/common/constants/ui";
 import { CompactionMonitor, type CompactionStatusEvent } from "./compactionMonitor";
 
 const BETA_SONNET_MODEL = "anthropic:claude-sonnet-4-5";
@@ -235,6 +238,53 @@ describe("CompactionMonitor", () => {
       })
     ).toBe(true);
     expect(statusEvents).toHaveLength(2);
+  });
+
+  test("pressure that stays high after an auto-compaction does not trigger another (#4421)", () => {
+    const { monitor, statusEvents } = createMonitor();
+    const check = (inputTokens: number) =>
+      monitor.checkMidStream({
+        model: BETA_SONNET_MODEL,
+        threshold: DEFAULT_AUTO_COMPACTION_THRESHOLD,
+        usage: createMidStreamUsage(inputTokens),
+        use1MContext: false,
+        providersConfig: null,
+      });
+
+    const forcePercent = DEFAULT_AUTO_COMPACTION_THRESHOLD * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
+    // 200K window: the force level in tokens, and a reading between threshold and force.
+    const forceTokens = forcePercent * 2_000;
+    const belowForceTokens = forceTokens - 2_000;
+    expect(belowForceTokens).toBeGreaterThan(DEFAULT_AUTO_COMPACTION_THRESHOLD * 200_000);
+
+    expect(check(150_000)).toBe(true);
+    // A request alone does not arm the guard: it may be refused, cancelled or fail.
+    monitor.noteAutoCompactionRequested(forcePercent);
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(true);
+    monitor.noteAutoCompactionCompleted();
+
+    // The follow-up stream after that compaction still reports the same pressure.
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(false);
+    expect(check(150_000)).toBe(false);
+    expect(statusEvents).toHaveLength(2);
+    expect(monitor.suppressRepeatedAutoCompaction("on-send", 75)).toBe(true);
+
+    // Falling under the level that triggered the compaction is relief, even above the threshold.
+    monitor.resetForNewStream();
+    expect(check(belowForceTokens)).toBe(false);
+    expect(check(150_000)).toBe(true);
+    expect(statusEvents).toHaveLength(3);
+
+    // A user turn also lifts the guard.
+    monitor.noteAutoCompactionRequested(forcePercent);
+    monitor.noteAutoCompactionCompleted();
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(false);
+    monitor.noteUserTurn();
+    monitor.resetForNewStream();
+    expect(check(150_000)).toBe(true);
   });
 
   test("checks enforce valid threshold bounds", () => {

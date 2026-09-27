@@ -7,6 +7,7 @@ import type {
   LanguageModelV2StreamPart,
   LanguageModelV2ToolResultOutput,
   LanguageModelV2Usage,
+  SharedV2ProviderMetadata,
 } from "@ai-sdk/provider";
 
 import { ServiceTierSchema } from "@/common/config/schemas/providersConfig";
@@ -50,6 +51,7 @@ export class CopilotResponsesLanguageModel implements LanguageModelV2 {
         content.some((part) => part.type === "tool-call")
       ),
       usage: mapUsage(responseBody.usage),
+      providerMetadata: mapServiceTierMetadata(responseBody),
       warnings: [],
       request: { body },
       response: {
@@ -485,6 +487,7 @@ function mapStreamEvent(event: string, data: JsonRecord, state: StreamState) {
           type: "finish",
           usage: mapUsage((data.response as JsonRecord | undefined)?.usage),
           finishReason: mapFinishReason(getRawFinishReason(data.response), state.sawFunctionCall),
+          providerMetadata: mapServiceTierMetadata(data.response as JsonRecord | undefined),
         },
       ] satisfies LanguageModelV2StreamPart[];
     case "response.failed":
@@ -623,6 +626,18 @@ function extractContent(responseBody: JsonRecord): LanguageModelV2Content[] {
   }
 
   return content;
+}
+
+/**
+ * The service tier the response reports it was served at, under the OpenAI metadata
+ * key cost accounting reads (#4352). Copilot forwards OpenAI service tiers, and a
+ * response can be served at a different tier than requested.
+ */
+function mapServiceTierMetadata(
+  response: JsonRecord | undefined
+): SharedV2ProviderMetadata | undefined {
+  const serviceTier = getString(response?.service_tier);
+  return serviceTier ? { openai: { serviceTier } } : undefined;
 }
 
 function mapUsage(rawUsage: unknown): LanguageModelV2Usage {

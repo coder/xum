@@ -73,6 +73,7 @@ import {
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
+  getReviewsKey,
 } from "@/common/constants/storage";
 import {
   prepareCompactionMessage,
@@ -220,6 +221,7 @@ import {
 } from "./useComposerAttachments";
 import { useComposerDraft } from "./useComposerDraft";
 import { useComposerSuggestions } from "./useComposerSuggestions";
+import { isRestoredDraftDurable } from "./restoredDraftDurability";
 import {
   commandBypassesTranscriptBarrier,
   isTranscriptMutationAllowed,
@@ -501,6 +503,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const onDetachAllReviewsForComposerClear =
     variant === "workspace" ? props.onDetachAllReviews : undefined;
   const onAddReviewForRestore = variant === "workspace" ? props.onAddReview : undefined;
+  const onAcceptRestoredHeldInputs =
+    variant === "workspace" ? props.onAcceptRestoredHeldInputs : undefined;
 
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
@@ -1434,6 +1438,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         fileParts?: FilePart[];
         reviews?: ReviewNoteDataForDisplay[];
         workspaceId?: string;
+        heldInputIds?: string[];
       }>;
 
       if (
@@ -1467,23 +1472,50 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           return;
         }
         const restoredAttachments = pendingChatAttachments(restoredPending, restoredIdPrefix);
-        setInput((current) =>
-          [restoredPending.content, current].filter((part) => part.trim().length > 0).join("\n\n")
-        );
+        // Merged from the stored draft, exactly as a functional setInput would, so the
+        // acknowledgement below can check that this exact value landed.
+        const mergedText = [restoredPending.content, readPersistedState(storageKeys.inputKey, "")]
+          .filter((part) => part.trim().length > 0)
+          .join("\n\n");
+        setInput(mergedText);
         if (restoredAttachments.length > 0) {
           setAttachments((current) => [...restoredAttachments, ...current]);
         }
+        // Ids the review store added; null when the notes went to the memory-only override.
+        let restoredReviewIds: string[] | null = [];
         if (restoredPending.reviews.length > 0) {
           if (draftReviews === null && onAddReviewForRestore) {
             // The draft's notes live in the review store: add the restored ones there too, as
             // new attached notes. A detached copy in the override would hide later store
             // changes, and a send in flight checks off only the notes it captured, not these.
             // Called here, not in a state updater, which may run more than once.
-            for (const review of restoredPending.reviews) onAddReviewForRestore(review);
+            restoredReviewIds = restoredPending.reviews.map(
+              (review) => onAddReviewForRestore(review).id
+            );
           } else {
             // An active override (e.g. a queued-message edit) owns the composer's notes.
             setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
+            restoredReviewIds = null;
           }
+        }
+        // The backend keeps this input as held input until a composer takes it (#4448). Release
+        // that copy only once every restored part is durable; otherwise the "Not sent" banner
+        // stays next to the composer's copy: a visible duplicate beats a loss. Edit mode (above)
+        // takes nothing.
+        const heldInputIds = customEvent.detail.heldInputIds ?? [];
+        if (
+          heldInputIds.length > 0 &&
+          workspaceIdForComposerClear != null &&
+          isRestoredDraftDurable({
+            inputKey: storageKeys.inputKey,
+            expectedText: mergedText,
+            attachmentsKey: storageKeys.attachmentsKey,
+            restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
+            reviewsKey: getReviewsKey(workspaceIdForComposerClear),
+            restoredReviewIds,
+          })
+        ) {
+          onAcceptRestoredHeldInputs?.(heldInputIds);
         }
         focusMessageInput();
       } else if (mode === "replace") {
@@ -1525,6 +1557,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     draftReviews,
     setDraftReviews,
     onAddReviewForRestore,
+    onAcceptRestoredHeldInputs,
+    storageKeys.inputKey,
+    storageKeys.attachmentsKey,
     focusMessageInput,
   ]);
 
@@ -2465,8 +2500,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // preferences when the stream starts, and the slider write reaches config.json
         // asynchronously. Wait for the backend to accept that write so a send right after a
         // slider change is not ordered ahead of it; a rejected save refuses the send visibly
-        // and leaves the draft untouched. (Config swallows disk-write failures for every
-        // preference today, so acceptance is ordering, not durability.)
+        // and leaves the draft untouched. (Since #4444 a failed disk write rejects too, so
+        // acceptance also means the preference landed.)
         const preferencePersisted = await runWithCatch(
           async () => {
             await waitForPreferencePersisted(

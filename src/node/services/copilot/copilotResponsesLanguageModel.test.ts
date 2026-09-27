@@ -506,6 +506,51 @@ describe("CopilotResponsesLanguageModel", () => {
     );
   });
 
+  // Copilot forwards OpenAI service tiers, so cost accounting needs the tier the
+  // response reports it was served at, under the key pricing reads (#4352).
+  it("reports the response's service tier as OpenAI provider metadata", async () => {
+    const tiered = { ...createCompletedResponse("stop"), service_tier: "priority" };
+    restoreFetchers.push(mockFetch(() => Promise.resolve(createJsonResponse(tiered))));
+    const generated = await createModel().doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(generated.providerMetadata).toEqual({ openai: { serviceTier: "priority" } });
+
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(
+          createSseResponse([
+            {
+              event: "response.completed",
+              data: {
+                type: "response.completed",
+                response: { finish_reason: "stop", service_tier: "flex" },
+              },
+            },
+          ])
+        )
+      )
+    );
+    const streamed = await createModel().doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Stream please" }] }],
+    });
+    const finish = (await collectStreamParts(streamed.stream)).find(
+      (part) => part.type === "finish"
+    );
+    expect(finish?.providerMetadata).toEqual({ openai: { serviceTier: "flex" } });
+
+    // No reported tier (or a non-string one) adds no metadata.
+    restoreFetchers.push(
+      mockFetch(() =>
+        Promise.resolve(createJsonResponse({ ...createCompletedResponse("stop"), service_tier: 7 }))
+      )
+    );
+    const untiered = await createModel().doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(untiered.providerMetadata).toBeUndefined();
+  });
+
   it("treats response.incomplete as a terminal finish event", async () => {
     restoreFetchers.push(
       mockFetch(() =>

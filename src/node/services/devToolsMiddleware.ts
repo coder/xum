@@ -21,6 +21,9 @@ import {
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
   consumeCapturedRequestHeaders,
+  closeCapturedRequestBody,
+  consumeRedactedRequestBody,
+  discardCapturedRequestBody,
   redactHeaders,
 } from "./devToolsHeaderCapture";
 import type { DevToolsService } from "./devToolsService";
@@ -392,6 +395,7 @@ export function createDevToolsMiddleware(
 
       const abortHandler = (): void => {
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        closeCapturedRequestBody(stepId);
         void finalizeStep({
           output: null,
           usage: null,
@@ -415,6 +419,7 @@ export function createDevToolsMiddleware(
       try {
         const result = await doGenerate();
         const capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
 
         await finalizeStep({
           output: extractGenerateOutput(result),
@@ -440,7 +445,8 @@ export function createDevToolsMiddleware(
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // No result means no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,
@@ -466,6 +472,7 @@ export function createDevToolsMiddleware(
       injectStepIdHeader(params, stepId);
 
       let finalized = false;
+      let doStreamSettled = false;
       let capturedRequestHeaders: Record<string, string> | null = null;
       let rawRequest: unknown = null;
       let responseHeaders: Record<string, string> | null = null;
@@ -542,6 +549,14 @@ export function createDevToolsMiddleware(
       };
 
       const abortHandler = (): void => {
+        // Before doStream() settles, a fetch that ignores the abort may never settle it, so
+        // drop the body and refuse later captures. Once it settled, the paths below already
+        // cleaned up; a closed mark here would never be cleared.
+        if (doStreamSettled) {
+          discardCapturedRequestBody(stepId);
+        } else {
+          closeCapturedRequestBody(stepId);
+        }
         void finalizeStep({
           output: buildOutput(),
           usage,
@@ -565,14 +580,18 @@ export function createDevToolsMiddleware(
       let streamResult: LanguageModelV4StreamResult;
       try {
         streamResult = await doStream();
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
+        discardCapturedRequestBody(stepId);
       } catch (error) {
+        doStreamSettled = true;
         capturedRequestHeaders = consumeCapturedRequestHeaders(stepId);
         await finalizeStep({
           output: null,
           usage: null,
           error: getErrorMessage(error),
-          rawRequest: null,
+          // A pre-stream rejection has no SDK body; use the redacted body the fetch wrapper captured.
+          rawRequest: consumeRedactedRequestBody(stepId),
           requestHeaders: capturedRequestHeaders,
           responseHeaders: null,
           rawResponse: null,

@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { isAllowedOrpcPath } from "./orpcAllowlist";
+import {
+  isAllowedOrpcPath,
+  redactWebviewOrpcResult,
+  sanitizeWebviewOrpcInput,
+} from "./orpcAllowlist";
 
 describe("isAllowedOrpcPath", () => {
   test("allows known procedures", () => {
@@ -32,5 +36,149 @@ describe("isAllowedOrpcPath", () => {
       .toBe(false);
     expect(isAllowedOrpcPath(["workspace", "send-message"]))
       .toBe(false);
+  });
+});
+
+describe("agents.list (#4751)", () => {
+  test("allows listing agent descriptors but not reading agent packages", () => {
+    expect(isAllowedOrpcPath(["agents", "list"])).toBe(true);
+    // agents.get returns full prompt bodies; it stays blocked.
+    expect(isAllowedOrpcPath(["agents", "get"])).toBe(false);
+  });
+
+  const known = new Set(["ws-1"]);
+
+  test("forwards only a known workspaceId and the disable flag", () => {
+    expect(
+      sanitizeWebviewOrpcInput(
+        ["agents", "list"],
+        {
+          workspaceId: "ws-1",
+          disableWorkspaceAgents: true,
+          projectPath: "/etc",
+          includeDisabled: true,
+        },
+        known
+      )
+    ).toEqual({ ok: true, input: { workspaceId: "ws-1", disableWorkspaceAgents: true } });
+  });
+
+  test("rejects unknown workspaces, free-form project paths and malformed input", () => {
+    for (const input of [
+      { workspaceId: "ws-other" },
+      { projectPath: "/home/alice/secret-project" },
+      {},
+      null,
+      "ws-1",
+    ]) {
+      expect(sanitizeWebviewOrpcInput(["agents", "list"], input, known).ok).toBe(false);
+    }
+  });
+
+  test("leaves other procedures' input unchanged", () => {
+    const input = { workspaceId: "anything", message: "hi" };
+    expect(sanitizeWebviewOrpcInput(["workspace", "sendMessage"], input, known)).toEqual({
+      ok: true,
+      input,
+    });
+  });
+});
+
+describe("policy (#4739)", () => {
+  test("allows reading the effective policy and its change signal only", () => {
+    expect(isAllowedOrpcPath(["policy", "get"])).toBe(true);
+    expect(isAllowedOrpcPath(["policy", "onChanged"])).toBe(true);
+    expect(isAllowedOrpcPath(["policy", "refresh"])).toBe(false);
+  });
+
+  test("strips provider forcedBaseUrl from policy.get and keeps everything else", () => {
+    const response = {
+      source: "governor",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [
+          {
+            id: "openai",
+            forcedBaseUrl: "https://user:token@gateway.corp.example/v1",
+            allowedModels: ["gpt-5.6-terra"],
+          },
+          { id: "anthropic", allowedModels: null },
+        ],
+        mcp: { allowUserDefined: { stdio: false, remote: true } },
+        runtimes: ["worktree"],
+      },
+    };
+    expect(redactWebviewOrpcResult(["policy", "get"], response)).toEqual({
+      ...response,
+      policy: {
+        ...response.policy,
+        providerAccess: [
+          { id: "openai", allowedModels: ["gpt-5.6-terra"] },
+          { id: "anthropic", allowedModels: null },
+        ],
+      },
+    });
+    // The input object is not mutated.
+    expect(response.policy.providerAccess[0].forcedBaseUrl).toBeDefined();
+  });
+
+  test("passes other results and policy-less responses through unchanged", () => {
+    const noPolicy = { source: "none", status: { state: "disabled" }, policy: null };
+    expect(redactWebviewOrpcResult(["policy", "get"], noPolicy)).toEqual(noPolicy);
+    const other = { forcedBaseUrl: "kept" };
+    expect(redactWebviewOrpcResult(["workspace", "getPlanContent"], other)).toBe(other);
+  });
+});
+
+describe("app and providers config (#4766)", () => {
+  test("allows reading the app config and its change signal only", () => {
+    expect(isAllowedOrpcPath(["config", "getConfig"])).toBe(true);
+    expect(isAllowedOrpcPath(["config", "onConfigChanged"])).toBe(true);
+    expect(isAllowedOrpcPath(["config", "saveConfig"])).toBe(false);
+    expect(isAllowedOrpcPath(["config", "updateRoutePreferences"])).toBe(false);
+  });
+
+  test("projects config.getConfig to the model-routing and thinking-floor fields", () => {
+    const config = {
+      routePriority: ["mux-gateway", "direct"],
+      routeOverrides: { "openai:gpt-5.6-terra": "direct" },
+      minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      muxGovernorUrl: "https://governor.corp.example",
+      heartbeatDefaultPrompt: "private prompt",
+      userPreferences: { name: "alice" },
+      taskSettings: { maxParallelAgentTasks: 3 },
+    };
+    expect(redactWebviewOrpcResult(["config", "getConfig"], config)).toEqual({
+      routePriority: ["mux-gateway", "direct"],
+      routeOverrides: { "openai:gpt-5.6-terra": "direct" },
+      minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+    });
+  });
+
+  test("strips URL and key-file fields from providers.getConfig and keeps everything else", () => {
+    const providers = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        baseUrl: "https://user:token@proxy.corp.example/v1",
+        baseUrlResolved: "https://proxy.corp.example/v1?key=secret",
+        apiKeyFile: "/home/alice/.secrets/openai",
+        models: ["gpt-5.6-terra"],
+      },
+      coder: {
+        apiKeySet: false,
+        isConfigured: true,
+        deploymentUrl: "https://coder.corp.example",
+        discoveredModels: ["openai/gpt-5.6-sol"],
+      },
+    };
+    expect(redactWebviewOrpcResult(["providers", "getConfig"], providers)).toEqual({
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true, models: ["gpt-5.6-terra"] },
+      coder: { apiKeySet: false, isConfigured: true, discoveredModels: ["openai/gpt-5.6-sol"] },
+    });
+    // The input object is not mutated.
+    expect(providers.openai.baseUrl).toBeDefined();
   });
 });

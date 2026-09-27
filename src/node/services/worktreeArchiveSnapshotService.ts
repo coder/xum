@@ -929,8 +929,10 @@ export class WorktreeArchiveSnapshotService {
   ): Promise<void> {
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);
     const stateDir = this.resolveSessionRelativePath(sessionDir, snapshot.stateDirPath);
-    await fsPromises.rm(stateDir, { recursive: true, force: true });
 
+    // Clear the pointer before deleting the artifacts (#4746): a rejected write must keep
+    // both, so config never points at a deleted snapshot. A failed delete afterwards only
+    // orphans the directory inside the session dir, which workspace removal deletes.
     await this.config.editConfig((config) => {
       const workspaceEntry = findWorkspaceEntryByIdOrPath(this.config, config, workspaceId);
       if (workspaceEntry) {
@@ -938,6 +940,16 @@ export class WorktreeArchiveSnapshotService {
       }
       return config;
     });
+
+    try {
+      await fsPromises.rm(stateDir, { recursive: true, force: true });
+    } catch (error) {
+      log.warn("Failed to delete worktree archive snapshot state; leaving it orphaned", {
+        workspaceId,
+        stateDir,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   private async cleanupFailedRestore(args: {

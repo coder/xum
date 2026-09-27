@@ -76,6 +76,11 @@ export class TerminalService {
   // In-flight create() reservations per workspace (see create): counted before any await so
   // archive admission gates observe startups that have not yet registered a session.
   private readonly pendingSessionCreations = new Map<string, number>();
+  // Bumped by closeWorkspaceSessions while startups are pending (#4760). A startup that sees
+  // a different value than it captured was superseded by an archive/removal close: removal's
+  // guard is cleared once it finishes, so the guard alone misses a startup spanning it.
+  // Entries are dropped when the workspace's last pending startup settles.
+  private readonly startupCloseEpochs = new Map<string, number>();
   // Injected by WorkspaceService: true while an archive admission gate is active for the
   // workspace. Checked synchronously with the startup reservation (see create) so a terminal
   // startup and an archive always observe each other.
@@ -250,24 +255,31 @@ export class TerminalService {
       params.workspaceId,
       (this.pendingSessionCreations.get(params.workspaceId) ?? 0) + 1
     );
+    const closeEpoch = this.startupCloseEpochs.get(params.workspaceId) ?? 0;
     try {
       if (this.workspaceArchiveGuard?.(params.workspaceId) === true) {
         throw new Error(
           `Workspace is being archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
         );
       }
-      return await this.createUnreserved(params);
+      return await this.createUnreserved(params, closeEpoch);
     } finally {
       const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
       if (remaining <= 0) {
         this.pendingSessionCreations.delete(params.workspaceId);
+        this.startupCloseEpochs.delete(params.workspaceId);
       } else {
         this.pendingSessionCreations.set(params.workspaceId, remaining);
       }
     }
   }
 
-  private async createUnreserved(params: TerminalCreateParams): Promise<TerminalSession> {
+  private async createUnreserved(
+    params: TerminalCreateParams,
+    closeEpoch: number
+  ): Promise<TerminalSession> {
+    const closedSinceStart = () =>
+      (this.startupCloseEpochs.get(params.workspaceId) ?? 0) !== closeEpoch;
     try {
       // 1. Resolve workspace
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -370,7 +382,8 @@ export class TerminalService {
       // spawned now would run hidden in the archived workspace.
       if (
         this.workspaceArchiveGuard?.(params.workspaceId) === true ||
-        this.isArchivedNow(params.workspaceId)
+        this.isArchivedNow(params.workspaceId) ||
+        closedSinceStart()
       ) {
         throw new Error(
           `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
@@ -394,7 +407,8 @@ export class TerminalService {
       // the archived workspace. Kill the just-spawned PTY instead of registering it.
       if (
         this.workspaceArchiveGuard?.(params.workspaceId) === true ||
-        this.isArchivedNow(params.workspaceId)
+        this.isArchivedNow(params.workspaceId) ||
+        closedSinceStart()
       ) {
         try {
           this.ptyService.closeSession(session.sessionId);
@@ -1298,6 +1312,9 @@ export class TerminalService {
    * Called when a workspace is archived or removed to prevent resource leaks.
    */
   closeWorkspaceSessions(workspaceId: string): void {
+    if ((this.pendingSessionCreations.get(workspaceId) ?? 0) > 0) {
+      this.startupCloseEpochs.set(workspaceId, (this.startupCloseEpochs.get(workspaceId) ?? 0) + 1);
+    }
     const sessionIds = this.getTrackedSessionIdsForWorkspace(workspaceId);
     this.terminateTrackedSessions(sessionIds);
   }

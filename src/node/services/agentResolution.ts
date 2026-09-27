@@ -26,7 +26,7 @@ import { resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import { getErrorMessage } from "@/common/utils/errors";
 import { type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import {
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
@@ -274,7 +274,10 @@ export async function resolveAgentForStream(
           break;
         }
         fallbackDefinition ??= { definition, discovery };
-      } catch {
+      } catch (error) {
+        // An unreachable host is not an absent agent: fail instead of trying the next
+        // context or falling back to exec (#4438).
+        if (isRuntimeTransportError(error)) throw error;
         // Parent-only project agents may be untracked and absent from child worktrees.
         // Try the next discovery context before moving to the next persisted agent id.
       }

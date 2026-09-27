@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
 import type { ProjectsConfig } from "@/common/types/project";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -14,6 +14,8 @@ import {
   resolveAgentBody,
 } from "./agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "./agentDefinitions/resolveAgentInheritanceChain";
+import * as agentDefinitionsService from "./agentDefinitions/agentDefinitionsService";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
 import { buildStreamSystemContext } from "./turnContextAssembler";
 
@@ -98,6 +100,71 @@ describe("getLegacyModeForAgentMetadata", () => {
     expect(getLegacyModeForAgentMetadata("exec", "exec")).toBe("exec");
     expect(getLegacyModeForAgentMetadata("plan", "plan")).toBe("plan");
     expect(getLegacyModeForAgentMetadata("compact", "compact")).toBe("compact");
+  });
+});
+
+describe("resolveAgentForStream transport failures (#4438)", () => {
+  async function resolveExploreChild(readFailure: Error) {
+    using tempDir = new DisposableTempDir("agent-resolution-transport");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const metadata = createSubagentMetadata({ projectPath, agentId: "", agentType: "explore" });
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: projectPath },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: projectPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "",
+                agentType: "explore",
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    const realRead = agentDefinitionsService.readAgentDefinition;
+    const read = spyOn(agentDefinitionsService, "readAgentDefinition").mockImplementation(
+      (runtime, workspacePath, agentId, options) =>
+        agentId === "explore"
+          ? Promise.reject(readFailure)
+          : realRead(runtime, workspacePath, agentId, options)
+    );
+    try {
+      return await resolveAgentForStream({
+        workspaceId: CHILD_WORKSPACE_ID,
+        metadata,
+        runtime: new LocalRuntime(projectPath),
+        workspacePath: projectPath,
+        requestedAgentId: "exec",
+        disableWorkspaceAgents: false,
+        callerToolPolicy: undefined,
+        cfg,
+        emitError: () => undefined,
+        isAdvisorExperimentEnabled: true,
+      }).catch((error: unknown) => error);
+    } finally {
+      read.mockRestore();
+    }
+  }
+
+  test("does not fall back to exec when the agent read fails in transport", async () => {
+    const outcome = await resolveExploreChild(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
+  test("still falls back to exec when the agent is missing", async () => {
+    const outcome = await resolveExploreChild(new Error("Agent definition not found: explore"));
+    expect(outcome).toMatchObject({ success: true, data: { effectiveAgentId: "exec" } });
   });
 });
 

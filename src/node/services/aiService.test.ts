@@ -22,6 +22,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
 import { createTaskTool } from "./tools/task";
@@ -1158,6 +1160,58 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(engineOptions.abortSignal?.aborted).toBe(true);
     expect(engineOptions.abortSignal?.reason).toBe("startup");
     expect(engineOptions.stopFence).toBe(stopFence);
+  });
+
+  describe("startup transport failures (#4438)", () => {
+    const transportError = () => new RuntimeError("ssh: Connection refused", "network");
+
+    async function runStartup(prepared: boolean, abortInsideBuild = false) {
+      using xumHome = new DisposableTempDir("ai-service-startup-transport");
+      const metadata = createLocalWorkspaceMetadata("startup-transport", xumHome.path);
+      const harness = createHarness(xumHome.path, metadata);
+      const controller = new AbortController();
+      spyOn(turnContextAssembler, "buildStreamSystemContext").mockImplementation(() => {
+        if (abortInsideBuild) controller.abort();
+        return Promise.reject(transportError());
+      });
+      const events: Array<{ errorType?: string }> = [];
+      harness.service.on("error", (event: { errorType?: string }) => events.push(event));
+      const onPreStartError = mock(() => undefined);
+      const options = {
+        workspaceId: metadata.id,
+        messages: [createMuxMessage("user-1", "user", "hello")],
+        modelString: "openai:gpt-5.2",
+        abortSignal: controller.signal,
+        onPreStartError,
+      };
+      const result = prepared
+        ? await harness.service.prepareStreamMessage(options)
+        : await harness.service.streamMessage(options);
+      const errorType = result.success ? undefined : result.error.type;
+      return { errorType, events, onPreStartError, harness };
+    }
+
+    it("fails the turn as a visible runtime_start_failed before any provider request", async () => {
+      const run = await runStartup(false);
+      expect(run.errorType).toBe("runtime_start_failed");
+      expect(run.events.map((event) => event.errorType)).toEqual(["runtime_start_failed"]);
+      expect(run.onPreStartError).toHaveBeenCalledTimes(1);
+      expect(run.harness.startStreamCalls).toHaveLength(0);
+    });
+
+    it("fails an admission-only preparation without emitting", async () => {
+      const run = await runStartup(true);
+      expect(run.errorType).toBe("runtime_start_failed");
+      expect(run.events).toHaveLength(0);
+      expect(run.onPreStartError).toHaveBeenCalledTimes(1);
+    });
+
+    it("ends an aborted turn as a Stop, not a failure", async () => {
+      // SSH2 reports aborted execs as "network" too.
+      const run = await runStartup(false, true);
+      expect(run.errorType).toBeUndefined();
+      expect(run.onPreStartError).not.toHaveBeenCalled();
+    });
   });
 
   it.each([false, true])(
@@ -4037,6 +4091,35 @@ describe("buildAppAttributionHeaders", () => {
 });
 
 describe("discoverAvailableSubagentsForToolContext", () => {
+  it("fails instead of publishing unverified metadata when inheritance is unreadable", async () => {
+    using project = new DisposableTempDir("available-subagents-transport");
+    using xumHome = new DisposableTempDir("available-subagents-transport-home");
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "custom.md"),
+      "---\nname: Custom\nbase: exec\n---\nBody\n"
+    );
+    // #4438: a transport failure must not fall back to the raw, unverified descriptor.
+    const resolve = spyOn(agentDefinitionsService, "resolveAgentFrontmatter").mockRejectedValue(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+    try {
+      const outcome = await discoverAvailableSubagentsForToolContext({
+        runtime: new LocalRuntime(project.path),
+        workspacePath: project.path,
+        cfg: new Config(xumHome.path).loadConfigOrDefault(),
+        roots: {
+          projectRoots: [agentsRoot],
+          globalRoot: path.join(project.path, "empty-global-agents"),
+        },
+      }).catch((error: unknown) => error);
+      expect(outcome).toMatchObject({ type: "network" });
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+
   it("includes derived agents that inherit subagent.runnable from base", async () => {
     using project = new DisposableTempDir("available-subagents");
     using xumHome = new DisposableTempDir("available-subagents-home");

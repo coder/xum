@@ -130,6 +130,10 @@ export const formatSendMessageError = (
         message: error.message,
         errorType: "unknown",
       };
+    case "task_checkout_unsanitized":
+      // Permanent until the task is removed (#4674): a non-retryable stream type, so a turn
+      // refused after its init wait schedules no auto-resume.
+      return { message: error.message, errorType: "runtime_not_ready" };
     case "history-changed":
       return { message: EDIT_HISTORY_CHANGED_MESSAGE, errorType: "unknown" };
     case "plan_review_feedback_edit_blocked":

@@ -1968,6 +1968,7 @@ interface ChatInputPaneProps {
 
 const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   const { reviews } = props;
+  const storeRaw = useWorkspaceStoreRaw();
 
   // Keep optional banners/warnings on one shared lane so the seam right above the textarea is
   // owned by a single component boundary. That lets hydration reserve only the volatile
@@ -2156,6 +2157,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
         onAddReview={reviews.addReview}
+        onAcceptRestoredHeldInputs={(heldInputIds) =>
+          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds)
+        }
         onDetachReview={reviews.detachReview}
         onDetachAllReviews={reviews.detachAllAttached}
         onCheckReview={reviews.checkReview}

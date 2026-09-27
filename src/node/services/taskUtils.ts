@@ -188,7 +188,8 @@ export function getTaskDepthFromConfig(
   const parentById = new Map<string, string | undefined>();
   for (const project of config.projects.values()) {
     for (const workspace of project.workspaces) {
-      if (!workspace.id) continue;
+      // First row wins for duplicate ids, as in findWorkspaceEntry (#4550).
+      if (!workspace.id || parentById.has(workspace.id)) continue;
       parentById.set(workspace.id, workspace.parentWorkspaceId);
     }
   }

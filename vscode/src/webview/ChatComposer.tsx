@@ -7,12 +7,16 @@ import { getSendOptionsFromStorage } from "xum/browser/utils/messages/sendOption
 
 import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
 import { useAPI } from "xum/browser/contexts/API";
-import { AgentProvider, useAgent } from "xum/browser/contexts/AgentContext";
-import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
+import { useAgent } from "xum/browser/contexts/AgentContext";
 import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
-import { usePersistedState } from "xum/browser/hooks/usePersistedState";
+import { useReasoningMode } from "xum/browser/hooks/useReasoningMode";
+import type { WorkspaceAISettingsCache } from "xum/browser/utils/workspaceModeAi";
+import { normalizeAgentId } from "xum/common/utils/agentIds";
+import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
+import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
-import { normalizeToCanonical } from "xum/common/utils/ai/models";
+import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
+import { normalizeSelectedModel, normalizeToCanonical } from "xum/common/utils/ai/models";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -27,9 +31,13 @@ import type { AgentId } from "xum/common/types/agentDefinition";
 import { calculateTokenMeterData } from "xum/common/utils/tokens/tokenMeterUtils";
 import { createDisplayUsage } from "xum/common/utils/tokens/displayUsage";
 import type { ChatUsageDisplay } from "xum/common/utils/tokens/usageAggregator";
-import { enforceThinkingPolicy } from "xum/common/utils/thinking/policy";
 import { cn } from "xum/common/lib/utils";
-import { VIM_ENABLED_KEY, getInputKey, getModelKey } from "xum/common/constants/storage";
+import {
+  VIM_ENABLED_KEY,
+  getInputKey,
+  getModelKey,
+  getWorkspaceAISettingsByAgentKey,
+} from "xum/common/constants/storage";
 
 const SEND_MESSAGE_TIMEOUT_MS = 30_000;
 
@@ -37,13 +45,22 @@ const SEND_MESSAGE_TIMEOUT_MS = 30_000;
  * Simple agent toggle for VS Code extension (no agent discovery).
  * Just toggles between Exec and Plan agents.
  */
-function SimpleAgentToggle(props: { agentId: AgentId; onChange: (agentId: AgentId) => void }) {
+function SimpleAgentToggle(props: {
+  agentId: AgentId;
+  onChange: (agentId: AgentId) => void;
+  /** Sub-agent workspaces keep the agent they were created with (#4738). */
+  disabled: boolean;
+}) {
   const isPlan = props.agentId === "plan";
+  // Seeded workspace settings can name a custom agent (e.g. a sub-agent's "explore"); show it as
+  // is rather than mislabeling it as Exec.
+  const label = isPlan ? "Plan" : props.agentId === "exec" ? "Exec" : props.agentId;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
           type="button"
+          disabled={props.disabled}
           onClick={() => props.onChange(isPlan ? "exec" : "plan")}
           className={cn(
             "rounded-sm px-1.5 py-0.5 text-[11px] font-medium transition-all duration-150",
@@ -52,7 +69,7 @@ function SimpleAgentToggle(props: { agentId: AgentId; onChange: (agentId: AgentI
               : "bg-exec-mode text-white hover:bg-exec-mode-hover"
           )}
         >
-          {isPlan ? "Plan" : "Exec"}
+          {label}
         </button>
       </TooltipTrigger>
       <TooltipContent align="center">
@@ -105,8 +122,9 @@ function ChatComposerInner(props: {
   const apiState = useAPI();
   const api = apiState.api;
 
-  const { agentId, setAgentId } = useAgent();
+  const { agentId, setAgentId, isAgentSelectionLocked } = useAgent();
   const [thinkingLevel] = useThinkingLevel();
+  const [reasoningMode] = useReasoningMode();
 
   const { options: providerOptions } = useProviderOptions();
   const use1M = providerOptions.anthropic?.use1MContext ?? false;
@@ -120,6 +138,7 @@ function ChatComposerInner(props: {
     ensureModelInSettings,
     defaultModel,
     setDefaultModel,
+    isAllowedByPolicyOnActiveRoute,
   } = useModelsFromSettings();
 
   const modelKey = getModelKey(props.workspaceId);
@@ -127,7 +146,27 @@ function ChatComposerInner(props: {
     listener: true,
   });
 
-  const baseModel = normalizeToCanonical(preferredModel);
+  const storedModel = normalizeToCanonical(preferredModel);
+
+  // #4808: the stored model can be one the admin policy excludes (persisted earlier, seeded from the
+  // workspace, or revoked by a policy refresh), and every send with it fails with policy_denied.
+  // Fall back to the first allowed model for display and send, without writing it anywhere: the
+  // webview does not persist AI settings, and the stored choice comes back if the policy allows it
+  // again. With no allowed model in the list, nothing changes and the backend decides. Either way,
+  // a status line says so. The check is route-aware, like the model list, because the backend
+  // enforces policy after routing; it uses the gateway-preserving identity so an explicitly pinned
+  // gateway model is checked on that gateway.
+  // The status line names this identity too, so a denied gateway pin is not shown as its canonical ID.
+  const storedSelection = normalizeSelectedModel(preferredModel);
+  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(storedSelection);
+  // Until the providers config arrives, the model list is not filtered by provider availability,
+  // so a fallback could pick a provider without credentials; substitute nothing until then.
+  const { config: providersConfig } = useProvidersConfig();
+  const policyFallbackModel =
+    storedModelAllowed || providersConfig === null
+      ? null
+      : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
+  const baseModel = storedModelAllowed ? storedModel : (policyFallbackModel ?? storedModel);
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
@@ -192,21 +231,23 @@ function ChatComposerInner(props: {
     ensureModelInSettings(canonicalModel);
     setPreferredModel(canonicalModel);
 
-    if (!api) {
-      return;
-    }
+    // Like the desktop composer, record the pick in the active agent's cache so
+    // WorkspaceModeAISync restores it (not the seeded model) after switching agents and back.
+    updatePersistedState<WorkspaceAISettingsCache>(
+      getWorkspaceAISettingsByAgentKey(props.workspaceId),
+      (prev) => ({
+        ...(prev && typeof prev === "object" ? prev : {}),
+        [normalizeAgentId(agentId, "exec")]: {
+          model: canonicalModel,
+          thinkingLevel,
+          reasoningMode,
+        },
+      }),
+      {}
+    );
 
-    const effectiveThinkingLevel = enforceThinkingPolicy(canonicalModel, thinkingLevel);
-
-    api.workspace
-      .updateAgentAISettings({
-        workspaceId: props.workspaceId,
-        agentId,
-        aiSettings: { model: canonicalModel, thinkingLevel: effectiveThinkingLevel },
-      })
-      .catch(() => {
-        // Best-effort only.
-      });
+    // #4755: a model change stays local. Persisting from the webview would need the desktop's
+    // selection-intent, gateway-route and write-ordering handling, so it stays off (#4778 review).
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -225,6 +266,11 @@ function ChatComposerInner(props: {
   };
 
   const onSend = async () => {
+    // Re-check at dispatch: the composer can be disabled (e.g. history replay not caught up)
+    // after the keystroke or click that triggered this send.
+    if (props.disabled) {
+      return;
+    }
     const trimmed = input.trim();
     if (!trimmed) {
       return;
@@ -257,7 +303,18 @@ function ChatComposerInner(props: {
     }, SEND_MESSAGE_TIMEOUT_MS);
 
     try {
-      const options = getSendOptionsFromStorage(props.workspaceId);
+      const options = {
+        ...getSendOptionsFromStorage(props.workspaceId),
+        // The effective agent: for a sub-agent workspace, the locked agent (#4738), not a local pick.
+        agentId,
+        // #4755: never persist from the webview. Even with the workspace's settings seeded (#4738),
+        // saving needs the desktop's selection-intent/gateway-route handling (#4778 review).
+        // The thinking level is sent as selected: the webview does not load the user's configured
+        // per-model minimums, so only the backend can apply the authoritative floor.
+        skipAiSettingsPersistence: true,
+        // Only when the stored model is policy-excluded; otherwise keep the stored model string.
+        ...(policyFallbackModel ? { model: policyFallbackModel } : {}),
+      };
 
       const result = await api.workspace.sendMessage(
         {
@@ -350,6 +407,13 @@ function ChatComposerInner(props: {
       />
 
       <div className="flex flex-col gap-2">
+        {storedModelAllowed ? null : (
+          <div role="status" className="text-content-secondary text-[11px]">
+            {policyFallbackModel
+              ? `Admin policy does not allow ${storedSelection}; using ${policyFallbackModel}.`
+              : `Admin policy does not allow ${storedSelection}. Choose an allowed model.`}
+          </div>
+        )}
         <div className="w-full min-w-0" data-component="ModelSelectorGroup">
           <ModelSelector
             value={baseModel}
@@ -373,7 +437,11 @@ function ChatComposerInner(props: {
               data={contextUsageData}
               autoCompaction={autoCompactionSettings}
             />
-            <SimpleAgentToggle agentId={agentId} onChange={setAgentId} />
+            <SimpleAgentToggle
+              agentId={agentId}
+              onChange={setAgentId}
+              disabled={isAgentSelectionLocked === true}
+            />
 
             <Tooltip>
               <TooltipTrigger asChild>
@@ -411,18 +479,17 @@ export function ChatComposer(props: {
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
+  // AgentProvider is mounted by App so the transcript shares it (#4711).
   return (
-    <AgentProvider workspaceId={props.workspaceId}>
-      <ThinkingProvider workspaceId={props.workspaceId}>
-        <ChatComposerInner
-          workspaceId={props.workspaceId}
-          disabled={props.disabled}
-          disabledReason={props.disabledReason}
-          aggregator={props.aggregator}
-          onSendComplete={props.onSendComplete}
-          onNotice={props.onNotice}
-        />
-      </ThinkingProvider>
-    </AgentProvider>
+    <ThinkingProvider workspaceId={props.workspaceId}>
+      <ChatComposerInner
+        workspaceId={props.workspaceId}
+        disabled={props.disabled}
+        disabledReason={props.disabledReason}
+        aggregator={props.aggregator}
+        onSendComplete={props.onSendComplete}
+        onNotice={props.onNotice}
+      />
+    </ThinkingProvider>
   );
 }

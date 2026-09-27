@@ -172,3 +172,24 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     expect(await stderrPromise).toBe("err\n");
   });
 });
+
+describe("SSH2Transport.acquireConnection failures (#4438)", () => {
+  test("surface as transport failures, but aborts pass through", async () => {
+    const transport = new SSH2Transport({ host: "example.test" });
+    const backoff = new Error("SSH connection to example.test is in backoff for 2s.");
+    const spy = spyOn(ssh2ConnectionPool, "acquireConnection").mockRejectedValue(backoff);
+    try {
+      const failure: unknown = await transport.acquireConnection().catch((e: unknown) => e);
+      expect(failure).toMatchObject({ type: "network", message: backoff.message });
+
+      const controller = new AbortController();
+      controller.abort();
+      const aborted: unknown = await transport
+        .acquireConnection({ abortSignal: controller.signal })
+        .catch((e: unknown) => e);
+      expect(aborted).toBe(backoff);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

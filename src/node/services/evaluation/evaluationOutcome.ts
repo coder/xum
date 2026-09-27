@@ -1,7 +1,10 @@
 import assert from "node:assert";
 import { Cause, Effect, Exit, Option } from "effect";
 import type { EvaluationErrorCode, EvaluationErrorReason } from "@/common/types/evaluation";
-import type { EvaluationError } from "@/node/services/evaluation/evaluationService";
+import type {
+  EvaluationBilledUsage,
+  EvaluationError,
+} from "@/node/services/evaluation/evaluationService";
 
 /**
  * Pure bridge from an `EvaluationService.evaluate` effect to a Promise-facing,
@@ -26,6 +29,8 @@ export type EvaluationOutcome<A> =
       readonly statusCode?: number;
       /** True when the effect died (bug or unclassified throw) instead of failing with an EvaluationError. */
       readonly defect: boolean;
+      /** Sanitized usage of a response that was billed before this typed failure (#4728). */
+      readonly billedUsage?: EvaluationBilledUsage;
     }
   | { readonly status: "interrupted" };
 
@@ -51,6 +56,12 @@ export function classifyEvaluationExit<A>(
     return { status: "completed", result: exit.value };
   }
 
+  // Dies win over a typed failure in the same cause (e.g. a finalizer that died after the
+  // provider failed): reporting only the typed error would hide the bug as `defect: false`.
+  if (Cause.hasDies(exit.cause)) {
+    return { status: "failed", reason: "provider-failure", code: "unknown", defect: true };
+  }
+
   const error = Cause.findErrorOption(exit.cause);
   if (Option.isSome(error)) {
     return {
@@ -59,6 +70,7 @@ export function classifyEvaluationExit<A>(
       code: error.value.code,
       ...(error.value.statusCode !== undefined ? { statusCode: error.value.statusCode } : {}),
       defect: false,
+      ...(error.value.billedUsage !== undefined ? { billedUsage: error.value.billedUsage } : {}),
     };
   }
 

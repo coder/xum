@@ -22,6 +22,7 @@ import {
   saveWorkspaces,
   streamEnd,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -1853,6 +1854,8 @@ describe("TaskService", () => {
         agentInitiated: true,
         promoteAheadOfHiddenTurnEnd: true,
         yieldToPreflightSends: true,
+        // Restricted wakes never become compaction follow-ups (#4721).
+        skipOnSendCompaction: true,
       })
     );
     // Keyed so reports arriving before the wake dispatches coalesce into one queued turn.
@@ -1874,6 +1877,157 @@ describe("TaskService", () => {
       expect.anything(),
       expect.objectContaining({ acceptanceOrigin: "automatic" })
     );
+  });
+
+  for (const [name, delegated] of [
+    ["waits for the turn to end when the parent holds agent messages", false],
+    // A delegated workspace turn would otherwise settle and publish its result before the owner
+    // saw its child's report, so the hold yields to the cut there.
+    ["still cuts a holding parent that runs a delegated workspace turn", true],
+  ] satisfies Array<[string, boolean]>)
+    test(`terminal report ${name}`, async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentWorkspaceId = "parent-hold-111";
+      const childTaskId = "task-hold-222";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+            aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+            agentMessageDispatchMode: "turn-end",
+          }),
+          {
+            path: path.join(projectPath, "child-task"),
+            id: childTaskId,
+            name: "agent_explore_child",
+            parentWorkspaceId,
+            agentType: "explore",
+            taskStatus: "running",
+            taskModelString: "openai:gpt-5.2",
+            taskThinkingLevel: "medium",
+          },
+        ],
+        testTaskSettings()
+      );
+      let parentStreaming = true;
+      const { aiService } = createAIServiceMocks(config, {
+        isStreaming: mock(
+          (workspaceId: string) => workspaceId === parentWorkspaceId && parentStreaming
+        ),
+      });
+      const liveTurn = Symbol("parent-turn");
+      const { workspaceService, sendMessage, resumeStream } = createWorkspaceServiceMocks({
+        getActiveTurnGeneration: mock(() => (parentStreaming ? liveTurn : undefined)),
+      });
+      const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+      const liveRegistration = spyOn(
+        workspaceTurnManagerFor(taskService),
+        "getLiveWorkspaceTurnRegistration"
+      ).mockImplementation((workspaceId) =>
+        delegated && workspaceId === parentWorkspaceId
+          ? { handleId: "wst_parent", ownerWorkspaceId: "grandparent", accepted: true }
+          : undefined
+      );
+
+      await streamEnd(taskService, {
+        type: "stream-end",
+        workspaceId: childTaskId,
+        messageId: "assistant-child-output",
+        metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+        parts: [{ type: "text", text: "Hello from child" }],
+      });
+      await flushTerminalAttentionDrains(taskService);
+      liveRegistration.mockRestore();
+
+      if (delegated) {
+        expect(sendMessage).toHaveBeenCalledWith(
+          parentWorkspaceId,
+          expect.stringContaining(BACKGROUND_WORK_WAKE_OPENINGS.subagentsCompleted),
+          expect.objectContaining({ queueDispatchMode: "tool-end" }),
+          expect.anything()
+        );
+        return;
+      }
+      // Mid-turn: no tool-end wake cuts the busy parent.
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(resumeStream).not.toHaveBeenCalled();
+
+      // At turn end the idle drain delivers the report.
+      parentStreaming = false;
+      taskService.scheduleTerminalAttentionDrain(parentWorkspaceId);
+      await flushTerminalAttentionDrains(taskService);
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(resumeStream).toHaveBeenCalledWith(
+        parentWorkspaceId,
+        expect.anything(),
+        expect.objectContaining({ acceptanceOrigin: "automatic" })
+      );
+    });
+
+  test("terminal report cut yields when hold is turned on before the wake is enqueued", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-late-hold-111";
+    const childTaskId = "task-late-hold-222";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        },
+      ],
+      testTaskSettings()
+    );
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((workspaceId: string) => workspaceId === parentWorkspaceId),
+    });
+    const liveTurn = Symbol("parent-turn");
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      getActiveTurnGeneration: mock(() => liveTurn),
+      waitForIdleAndNoQueuedMessages: mock(() => new Promise<void>(() => undefined)),
+    });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+      parts: [{ type: "text", text: "Hello from child" }],
+    });
+    await flushTerminalAttentionDrains(taskService, { passes: 1 });
+
+    // WorkspaceService re-checks this probe at the enqueue point, after the send's own awaits;
+    // with yieldToPreflightSends a stale probe yields instead of queueing the cut.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const internal = sendMessage.mock.calls[0]?.[3] as
+      | { admissionStale?: () => boolean; yieldToPreflightSends?: boolean }
+      | undefined;
+    assert(internal?.admissionStale, "the cut must carry a hold probe");
+    expect(internal.yieldToPreflightSends).toBe(true);
+    expect(internal.admissionStale()).toBe(false);
+    await config.editConfig((cfg) => {
+      const parent = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((candidate) => candidate.id === parentWorkspaceId);
+      assert(parent, "parent workspace must exist");
+      parent.agentMessageDispatchMode = "turn-end";
+      return cfg;
+    });
+    expect(internal.admissionStale()).toBe(true);
   });
 
   for (const [name, wakeWouldLead, replaceTurnAfterDelivery, expectCut] of [

@@ -4822,13 +4822,19 @@ export class MCPServerManager {
     // client that is in the middle of closing.
     this.workspaceServers.delete(workspaceId);
 
-    for (const instance of [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])]) {
-      try {
-        await instance.close();
-      } catch (error) {
-        log.warn("Failed to stop MCP server", { error, name: instance.name });
-      }
-    }
+    // Concurrently: a stdio close can wait out an exit grace before killing (#4760), and
+    // removal awaits this whole stop before deleting the checkout.
+    await Promise.all(
+      [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])].map(
+        async (instance) => {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop MCP server", { error, name: instance.name });
+          }
+        }
+      )
+    );
   }
 
   /**
@@ -6099,6 +6105,8 @@ export class MCPServerManager {
     {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
+      // Lets the transport's close() kill a server that ignores stdin EOF (#4760).
+      const processAbort = new AbortController();
       const execStream = await this.launchUnderOverrideFence(
         name,
         info,
@@ -6107,7 +6115,7 @@ export class MCPServerManager {
             cwd: launch.cwd ?? workspacePath,
             ...(launch.env !== undefined ? { env: launch.env } : {}),
             timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
-            abortSignal: launchSignal,
+            abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
           }),
         signal,
         // A host-local exec resolves once the process exists; an SSH exec
@@ -6119,6 +6127,9 @@ export class MCPServerManager {
       );
 
       const cleanupSpawnedExecStream = async () => {
+        // The launch fence stops forwarding the startup signal once it returns, so kill the
+        // process explicitly: closing stdio alone leaves a server that ignores EOF running.
+        processAbort.abort();
         try {
           await execStream.stdin.close();
         } catch (error) {
@@ -6145,7 +6156,7 @@ export class MCPServerManager {
         return null;
       }
 
-      const transport = new MCPStdioTransport(execStream);
+      const transport = new MCPStdioTransport(execStream, { kill: () => processAbort.abort() });
 
       const instanceRef: { current: MCPServerInstance | null } = { current: null };
       let transportClosed = false;

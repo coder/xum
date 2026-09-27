@@ -8,6 +8,7 @@
  */
 
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import { serviceTierCostRank } from "./serviceTierPricing";
 
 /**
  * Structural view of usage objects across AI SDK versions.
@@ -108,7 +109,10 @@ export function addUsage(
  * Accumulate provider metadata across steps for additive billing metadata.
  *
  * Anthropic cache creation tokens and xAI exact-cost ticks are reported per request/step
- * and must be summed. Other provider metadata is taken from the latest step.
+ * and must be summed. Other provider metadata is taken from the latest step, except the
+ * OpenAI service tier: stream totals are priced as one request, so the costliest tier any
+ * step reported wins. This rewrites a provider field, but only with a value a step actually
+ * reported; a turn downgraded midway is over-counted, never under-counted (#4352).
  */
 export function accumulateProviderMetadata(
   existing: Record<string, unknown> | undefined,
@@ -131,8 +135,13 @@ export function accumulateProviderMetadata(
   const stepXaiCostTicks =
     (step.xai as { costInUsdTicks?: number } | undefined)?.costInUsdTicks ?? 0;
   const totalXaiCostTicks = existingXaiCostTicks + stepXaiCostTicks;
+  const existingServiceTier = (existing.openai as { serviceTier?: unknown } | undefined)
+    ?.serviceTier;
+  const keepExistingServiceTier =
+    serviceTierCostRank(existingServiceTier) >
+    serviceTierCostRank((step.openai as { serviceTier?: unknown } | undefined)?.serviceTier);
 
-  if (totalCacheCreate === 0 && totalXaiCostTicks === 0) {
+  if (totalCacheCreate === 0 && totalXaiCostTicks === 0 && !keepExistingServiceTier) {
     return step;
   }
 
@@ -148,6 +157,12 @@ export function accumulateProviderMetadata(
       xai: {
         ...(step.xai as Record<string, unknown> | undefined),
         costInUsdTicks: totalXaiCostTicks,
+      },
+    }),
+    ...(keepExistingServiceTier && {
+      openai: {
+        ...(step.openai as Record<string, unknown> | undefined),
+        serviceTier: existingServiceTier,
       },
     }),
   };

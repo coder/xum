@@ -1,10 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
+import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
+import { Ok } from "@/common/types/result";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 import { CompactionHandler } from "./compactionHandler";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { createTestHistoryService } from "./testHistoryService";
@@ -17,6 +20,7 @@ describe("continuous compaction provider replay", () => {
     store = await createTestHistoryService();
   });
   afterEach(async () => {
+    mock.restore();
     await store.cleanup();
   });
 
@@ -246,4 +250,64 @@ describe("continuous compaction provider replay", () => {
       ]);
     });
   }
+
+  // #4551: a runaway summary must not push the boundary past the history line limit, where
+  // startup recovery (which reads the epoch when tail copies trail the boundary) cannot find it.
+  it("bounds a runaway summary so a pending follow-up survives restart behind tail copies", async () => {
+    const olderBoundary = createMuxMessage("older-boundary", "assistant", "Older summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const prompt = createMuxMessage("recent-user", "user", "Keep going");
+    const answer = createMuxMessage("recent-answer", "assistant", "Working on it");
+    for (const message of [olderBoundary, prompt, answer]) {
+      expect((await store.historyService.appendToHistory(workspaceId, message)).success).toBe(true);
+    }
+    const before = await store.historyService.getHistoryFromLatestBoundary(workspaceId);
+    assert(before.success, "Expected readable seeded history");
+    const handler = new CompactionHandler({
+      workspaceId,
+      historyService: store.historyService,
+      sessionDir: path.join(store.tempDir, "pending"),
+      emitter: new EventEmitter(),
+    });
+    const followUp = { text: "follow up after restart", model: "openai:gpt-4o", agentId: "exec" };
+    expect(
+      await handler.persistContinuousCompaction({
+        preparation: handler.beginPreparation(() => true),
+        publication: {
+          generation: await store.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        attachmentMessages: before.data,
+        shouldPersist: () => true,
+        messages: before.data,
+        text: "s".repeat(SESSION_HISTORY_MAX_LINE_BYTES + 64 * 1024),
+        model: "anthropic:test-model",
+        tail: [prompt, answer],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        pendingFollowUp: followUp,
+      })
+    ).toBe(true);
+
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config: store.config,
+      historyService: store.historyService,
+    });
+    try {
+      const dispatched: string[] = [];
+      spyOn(session, "sendMessage").mockImplementation((message: string) => {
+        dispatched.push(message);
+        return Promise.resolve(Ok(undefined));
+      });
+      await session.runStartupRecovery();
+      expect(dispatched).toEqual([followUp.text]);
+    } finally {
+      await session.dispose();
+    }
+  });
 });

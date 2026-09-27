@@ -227,7 +227,7 @@ describe("WorktreeManager.createWorkspace", () => {
           trusted: false,
           initLogger,
         });
-        expect(result).toEqual({ success: true, workspacePath });
+        expect(result).toEqual({ success: true, workspacePath, createdBranch: !existing });
         expect(checkoutStarted).toBe(true);
         expect(await fsPromises.readFile(path.join(workspacePath, "README.md"), "utf8")).toBe(
           expectedContent
@@ -463,6 +463,7 @@ describe("WorktreeManager.createWorkspace", () => {
         success: true,
         workspacePath,
         pendingMaterialization: { fastForwardFromOrigin: false },
+        createdBranch: false,
       });
       // Reserved but empty: registered with git, no files, no checkout activity yet.
       expect(
@@ -1299,6 +1300,7 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result).toEqual({
         success: true,
         workspacePath: fixture.manager.getWorkspacePath(fixture.projectPath, "feature-submodules"),
+        createdBranch: true,
       });
     } finally {
       await fixture.cleanup();
@@ -1604,6 +1606,50 @@ describe("WorktreeManager.renameWorkspace", () => {
       await fixture.cleanup();
     }
   }, 20_000);
+});
+
+describe("WorktreeManager.renameWorkspace undo (#4779)", () => {
+  const branchOf = (cwd: string) =>
+    execFileSync("git", ["branch", "--show-current"], { cwd, encoding: "utf8" }).trim();
+
+  it.each([
+    // Diverged: directory "foo" tracks branch "bar", renamed to "bar". The forward move leaves the
+    // branch alone, and deriving the undo from names alone would rename "bar" to "foo".
+    { label: "diverged", branchName: "bar", expectedRenamed: false },
+    { label: "name-tracking", branchName: "foo", expectedRenamed: true },
+  ])("$label: undo restores the branch the rename found", async (c) => {
+    const fixture = await createWorktreeManagerFixture();
+    try {
+      const { manager, projectPath, initLogger } = fixture;
+      const created = await manager.createWorkspace({
+        projectPath,
+        branchName: c.branchName,
+        directoryName: "foo",
+        trunkBranch: "main",
+        skipRemoteSync: true,
+        trusted: true,
+        initLogger,
+      });
+      expect(created.success).toBe(true);
+
+      const forward = await manager.renameWorkspace(projectPath, "foo", "bar", true);
+      if (!forward.success) throw new Error(forward.error);
+      expect(forward.branchRenamed).toBe(c.expectedRenamed);
+
+      const undo = await manager.renameWorkspace(projectPath, "bar", "foo", true, {
+        renameBranch: forward.branchRenamed,
+      });
+      if (!undo.success) throw new Error(undo.error);
+      expect(undo.newPath).toBe(forward.oldPath);
+      expect(branchOf(forward.oldPath)).toBe(c.branchName);
+      // The mapping follows too: a later ordinary rename still sees the original branch.
+      const later = await manager.renameWorkspace(projectPath, "foo", "baz", true);
+      if (!later.success) throw new Error(later.error);
+      expect(branchOf(later.newPath)).toBe(c.expectedRenamed ? "baz" : c.branchName);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
 });
 
 describe("WorktreeManager.deleteWorkspace", () => {

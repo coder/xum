@@ -10,6 +10,7 @@ import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryElig
 import {
   EVALUATION_DEFAULT_TIMEOUT_MS,
   EVALUATION_MAX_ATTEMPTS,
+  EVALUATION_MAX_TIMEOUT_MS,
   EVALUATION_MIN_TIMEOUT_MS,
 } from "@/constants/evaluation";
 import type { EvaluationOutcome } from "@/node/services/evaluation/evaluationOutcome";
@@ -152,6 +153,8 @@ function createFakeAdapter(options: FakeAdapterOptions = {}) {
     stepDigest: string;
     attempt: number;
   }> = [];
+  /** The exact usage payload each ledger call received. */
+  const usagePayloads: unknown[] = [];
   const pinnedByResolve: PinnedEvaluationModel[] = [];
   const adapter: WorkflowEvaluationPort = {
     async resolveSelection(spec, persisted) {
@@ -182,12 +185,13 @@ function createFakeAdapter(options: FakeAdapterOptions = {}) {
         ? completedOutcome()
         : await options.outcome({ ...record, index });
     }) as WorkflowEvaluationPort["dispatch"],
-    async recordUsage(pinned, _result, context) {
+    async recordUsage(pinned, result, context) {
       usageCalls.push({ modelString: pinned.modelString, ...context });
+      usagePayloads.push(result);
       await options.recordUsage?.();
     },
   };
-  return { adapter, resolveCalls, dispatchCalls, usageCalls, pinnedByResolve };
+  return { adapter, resolveCalls, dispatchCalls, usageCalls, usagePayloads, pinnedByResolve };
 }
 
 interface RunFixtureOptions {
@@ -572,6 +576,131 @@ describe("WorkflowRunner evaluate()", () => {
     ]);
   });
 
+  describe("billed-but-invalid answers (#4728)", () => {
+    const BILLED = {
+      usage: { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+      usageProviderMetadata: { openai: { reasoningTokens: 2 } },
+    };
+    const billedFailure = (): EvaluationOutcome<CallResult> => ({
+      status: "failed",
+      reason: "invalid-output",
+      code: "invalid-response",
+      defect: false,
+      billedUsage: BILLED,
+    });
+
+    test("ledgers the sanitized usage once, after the failed record and event are written", async () => {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      const atLedger: Array<{ stepStatus: string | undefined; lastEvent: unknown }> = [];
+      const fake = createFakeAdapter({
+        outcome: billedFailure,
+        recordUsage: async () => {
+          const run = await store.getRun(RUN_ID);
+          atLedger.push({
+            stepStatus: run.steps.find((step) => step.stepId === STEP_ID)?.status,
+            lastEvent: evaluationEvents(run).at(-1),
+          });
+        },
+      });
+
+      await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(
+        /invalid-output\/invalid-response .*attempt 1\)/
+      );
+
+      expect(fake.usageCalls).toEqual([
+        { modelString: SENTINEL_MODEL, runId: RUN_ID, stepDigest: STEP_DIGEST, attempt: 1 },
+      ]);
+      expect(fake.usagePayloads).toEqual([BILLED]);
+      expect(atLedger).toHaveLength(1);
+      expect(atLedger[0]?.stepStatus).toBe("failed");
+      expect(atLedger[0]?.lastEvent).toMatchObject({
+        status: "failed",
+        attempt: 1,
+        reason: "invalid-output",
+        code: "invalid-response",
+        usage: BILLED.usage,
+      });
+      const run = await store.getRun(RUN_ID);
+      expect(run.status).toBe("failed");
+      expectNoSentinels((await readStep(store))?.error);
+      for (const message of errorMessages(run)) expectNoSentinels(message);
+    });
+
+    test("ledgers a completed outcome whose answers fail the step's own validation", async () => {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      const fake = createFakeAdapter({
+        outcome: () =>
+          completedOutcome({
+            answers: {
+              ...ANSWERS,
+              injection: { type: "choice", choice: "not-an-option" },
+            } as unknown as CallResult["answers"],
+            ...BILLED,
+          }),
+      });
+
+      await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(
+        /invalid-output\/answer-validation .*attempt 1\)/
+      );
+
+      // Only the billing fields reach the ledger, never the rejected answers.
+      expect(fake.usagePayloads).toEqual([BILLED]);
+      expect((await readStep(store))?.status).toBe("failed");
+    });
+
+    test("a checkpoint retry after a billed failure ledgers each billed attempt exactly once", async () => {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      let fail = true;
+      const fake = createFakeAdapter({
+        outcome: () => (fail ? billedFailure() : completedOutcome()),
+      });
+
+      await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(/attempt 1\)/);
+      expect(canRetryWorkflowFromCheckpoint(await store.getRun(RUN_ID))).toBe(true);
+      fail = false;
+      await createRunner(store, fake.adapter).run(RUN_ID, { allowRetryFromFailedCheckpoint: true });
+
+      expect(fake.dispatchCalls).toHaveLength(2);
+      expect(fake.usageCalls.map((usageCall) => usageCall.attempt)).toEqual([1, 2]);
+      expect(fake.usagePayloads).toHaveLength(2);
+      expect(fake.usagePayloads[0]).toEqual(BILLED);
+      expect(fake.usagePayloads[1]).toMatchObject({ usage: USAGE });
+    });
+
+    test("a throwing ledger after a billed failure keeps the typed failure and the retry", async () => {
+      using tmp = new DisposableTempDir("workflow-eval");
+      const store = await createStore(tmp.path, { spec: { model: SENTINEL_MODEL } });
+      const warn = spyOn(log, "warn").mockImplementation(() => undefined);
+      try {
+        const fake = createFakeAdapter({
+          outcome: billedFailure,
+          recordUsage: async () => {
+            throw new Error(`ledger down ${SENTINEL_STATE}`);
+          },
+        });
+
+        await expect(createRunner(store, fake.adapter).run(RUN_ID)).rejects.toThrow(
+          /invalid-output\/invalid-response .*attempt 1\)/
+        );
+
+        const run = await store.getRun(RUN_ID);
+        expect(canRetryWorkflowFromCheckpoint(run)).toBe(true);
+        const ledgerWarnings = warn.mock.calls.filter(
+          ([, fields]) =>
+            (fields as { code?: string } | undefined)?.code === "evaluation-failed-usage-failed"
+        );
+        expect(ledgerWarnings).toHaveLength(1);
+        expect(ledgerWarnings[0]?.[1]).toMatchObject({ attempt: 1 });
+        expectNoSentinels(JSON.stringify(ledgerWarnings));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+  });
+
   test("resuming a started attempt reuses its admission as attempt 2", async () => {
     using tmp = new DisposableTempDir("workflow-eval");
     const store = await createStore(tmp.path);
@@ -593,6 +722,27 @@ describe("WorkflowRunner evaluate()", () => {
       status: "completed",
       startedAt: "2026-05-29T00:00:00.500Z",
       evaluation: { attempt: 2, selection: { modelString: SENTINEL_MODEL } },
+    });
+  });
+
+  test("resuming re-clamps an out-of-range persisted timeout", async () => {
+    using tmp = new DisposableTempDir("workflow-eval");
+    const store = await createStore(tmp.path);
+    const spec = { id: STEP_ID, title: SENTINEL_TITLE, questions: QUESTIONS };
+    await store.recordStepStarted(RUN_ID, {
+      stepId: STEP_ID,
+      inputHash: hashEvaluationStepInput(spec, STATE),
+      startedAt: "2026-05-29T00:00:00.500Z",
+      evaluation: { ...admissionFor({ attempt: 1 }), timeoutMs: EVALUATION_MAX_TIMEOUT_MS * 10 },
+    });
+    await store.appendStatus(RUN_ID, "interrupted", "2026-05-29T00:00:01.000Z");
+    const fake = createFakeAdapter();
+
+    await createRunner(store, fake.adapter).run(RUN_ID, { allowResumeFromInterrupted: true });
+
+    expect(await readStep(store)).toMatchObject({
+      status: "completed",
+      evaluation: { attempt: 2, timeoutMs: EVALUATION_MAX_TIMEOUT_MS },
     });
   });
 

@@ -71,6 +71,7 @@ import {
 } from "./compactionCancellation";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
@@ -116,6 +117,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import {
   normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingDecision,
   type AutoModelRoutingDimensions,
   type AutoModelRoutingRecord,
   type AutoModelRoutingTier,
@@ -283,7 +285,7 @@ import {
   runInlineAbandonedBranchSummary,
   type BranchSummaryAiService,
 } from "@/node/services/branchSummary";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { isErrnoWithCode } from "@/node/utils/fs";
@@ -879,6 +881,13 @@ interface SendMessageInternalOptions {
    */
   admissionStale?: () => boolean;
   /**
+   * Skip on-send compaction for this send (#4721). A durable compaction follow-up keeps only
+   * text + send options, so a synthetic wake's caller restrictions and in-memory guards would be
+   * replayed after the compaction turn even if manual input tightened the policy meanwhile. Such
+   * wakes run as their own turn instead; mid-stream forcing still protects the context limit.
+   */
+  skipOnSendCompaction?: boolean;
+  /**
    * Task-attempt obligation for this send (see TurnAdmissionToken): notified of the coordinator's
    * admission inside the synchronous prepare callback. Its staleness is already composed into
    * `admissionStale` by WorkspaceService.
@@ -1240,15 +1249,18 @@ export class AgentSession {
   private preparingQueuedInput?: {
     attempt: PreparationAttempt;
     read: () => QueuedInput | undefined;
+    /** The send behind `read`, kept as held input when Stop restores it (#4448). */
+    readSend: () => RefusedManualSend | undefined;
   };
 
   /**
    * Held input: the user's manual queued sends that the dequeue gate refused (the task reported
-   * before they ran), oldest first. The session keeps the full original send, so it is never
-   * handed to the renderer to own: the user explicitly re-sends it (sendHeldInput, an ordinary
-   * new manual send) or discards it. Held inputs are NOT queue entries — never batched with new
-   * sends, drained, force-sent or counted as dispatchable work, and untouched by Stop and
-   * clearQueue. Published as `held-inputs-changed` on every change and every onChat replay (the
+   * before they ran), or that a restore returned to the composer (`interrupted`: held until a
+   * composer takes the restore and discards them, #4448), oldest first. The session keeps the full
+   * original send, so it is never handed to the renderer to own: the user explicitly re-sends it
+   * (sendHeldInput, an ordinary new manual send) or discards it. Held inputs are NOT queue
+   * entries — never batched with new sends, drained, force-sent or counted as dispatchable work,
+   * and never removed by Stop or clearQueue. Published as `held-inputs-changed` on every change and every onChat replay (the
    * renderer only subscribes to the workspace it shows). In memory only: like a queued message, a
    * held input does not survive a backend restart.
    */
@@ -4539,7 +4551,18 @@ export class AgentSession {
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
-    if (!tokenBudgetActive && !isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
+    // Any real user turn, edits included, re-arms auto-compaction after one that brought no
+    // relief (#4421). Compaction follow-ups, guidance and wakes are synthetic or agent-initiated.
+    if (!agentInitiated && internal?.synthetic !== true && !isCompactionRequest) {
+      this.contextController.noteUserTurn();
+    }
+    if (
+      !tokenBudgetActive &&
+      !isCompactionRequest &&
+      !editMessageId &&
+      !hasPreTurnMessages &&
+      internal?.skipOnSendCompaction !== true
+    ) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
@@ -4668,7 +4691,11 @@ export class AgentSession {
           cancelSignal
         );
       } catch (error) {
-        return Err(createUnknownSendMessageError(getErrorMessage(error)));
+        return Err(
+          error instanceof UnsanitizedTaskCheckoutError
+            ? { type: error.code, message: error.message }
+            : createUnknownSendMessageError(getErrorMessage(error))
+        );
       }
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
@@ -6542,19 +6569,29 @@ export class AgentSession {
       evaluationModel,
       signal,
     });
-    if (!decision.success) {
-      return fallback({ status: "fallback", reason: decision.error });
-    }
     // The evaluation is a paid request outside StreamManager; bill it to the workspace
-    // before any fallback below, since the tokens were spent either way.
-    const billed = await this.sessionUsageService?.recordHeadlessUsage(
-      this.workspaceId,
-      decision.data.evaluationModel,
-      decision.data.usage,
-      decision.data.providerMetadata,
-      { analyticsSource: "auto_model_routing" }
-    );
-    this.deferEvaluatorGoalCharge(attempt, billed ? getTotalCost(billed.usage) : undefined);
+    // before any fallback, since the tokens were spent either way.
+    const billEvaluator = async (
+      usage: AutoModelRoutingDecision["usage"],
+      providerMetadata: Record<string, unknown> | undefined
+    ) => {
+      const billed = await this.sessionUsageService?.recordHeadlessUsage(
+        this.workspaceId,
+        evaluationModel,
+        usage,
+        providerMetadata,
+        { analyticsSource: "auto_model_routing" }
+      );
+      this.deferEvaluatorGoalCharge(attempt, billed ? getTotalCost(billed.usage) : undefined);
+    };
+    if (!decision.success) {
+      // A rejected answer still cost a provider response (#4774).
+      if (decision.error.usage != null) {
+        await billEvaluator(decision.error.usage, decision.error.providerMetadata);
+      }
+      return fallback({ status: "fallback", reason: decision.error.reason });
+    }
+    await billEvaluator(decision.data.usage, decision.data.providerMetadata);
     const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
     const provenance = {
       tierId: decision.data.tierId,
@@ -8912,6 +8949,7 @@ export class AgentSession {
         this.clearUsageState();
 
         if (completedCompactionRequest?.source === "auto-compaction") {
+          this.contextController.noteAutoCompactionCompleted();
           this.emitChatEvent({
             type: "auto-compaction-completed",
             newUsagePercent: 0,
@@ -9503,6 +9541,8 @@ export class AgentSession {
       onPreTurnRowsPersisted?: () => void;
       /** Caller staleness probe re-checked at this entry's dispatch admission. */
       admissionStale?: () => boolean;
+      /** See SendMessageInternalOptions.skipOnSendCompaction. */
+      skipOnSendCompaction?: boolean;
       /** Task-attempt obligation owned by the entry until its dispatch or removal. */
       turnAdmission?: TurnAdmissionToken;
       compactionAdmissionStale?: () => boolean;
@@ -10161,16 +10201,20 @@ export class AgentSession {
   restoreQueueToInput(): void {
     this.assertNotDisposed("restoreQueueToInput");
     const preparing = this.preparingQueuedInput;
-    const interrupted =
+    const restoresPreparing =
       preparing?.attempt.durability === "rollback-eligible" &&
       // Complete bytes may survive a failed flush without granting a durable acceptance receipt.
       preparing.attempt.inputPublication?.metadata?.historySequence === undefined &&
-      (preparing.attempt.compactionAdmissionStale() || preparing.attempt.failure != null)
-        ? preparing.read()
-        : undefined;
+      (preparing.attempt.compactionAdmissionStale() || preparing.attempt.failure != null);
+    const interrupted = restoresPreparing ? preparing.read() : undefined;
+    // Under the same condition as `interrupted`: a published send held here would be sent twice.
+    const interruptedSend = restoresPreparing ? preparing.readSend() : undefined;
     if (interrupted) this.preparingQueuedInput = undefined;
     const inputs = [interrupted, this.messageQueue.getInputForRestore()].filter(
       (input) => input != null
+    );
+    const restoredSends = [interruptedSend, ...this.messageQueue.getRestorableManualSends()].filter(
+      (send) => send != null
     );
     if (this.messageQueue.isEmpty() && inputs.length === 0) return;
 
@@ -10183,6 +10227,19 @@ export class AgentSession {
     for (const { send, refusal } of this.messageQueue.getTaskStaleManualSends()) {
       this.holdRefusedSend(send, refusal);
     }
+
+    // The restore below is a one-shot event: a composer in edit mode drops it, and nobody receives
+    // it while this workspace's composer is not mounted or not subscribed (#4448). So the restored
+    // input is also held until a composer takes it and releases these entries
+    // (discardHeldInput). Held before the clear is published, so no observer sees the input in
+    // neither; announced after the restore, so a composer that takes it can hide the entries
+    // before the renderer would show them.
+    const restoredHeld = restoredSends.map((send) => ({
+      id: randomUUID(),
+      send,
+      reason: "interrupted" as const,
+    }));
+    if (restoredHeld.length > 0) this.heldInputs = [...this.heldInputs, ...restoredHeld];
 
     // Clear everything: synthetic wake callbacks need cancellation so their durable
     // records do not retry after the user explicitly interrupted the workspace.
@@ -10199,8 +10256,10 @@ export class AgentSession {
           .join("\n"),
         fileParts: inputs.flatMap((input) => input.fileParts ?? []),
         reviews: reviews.length > 0 ? reviews : undefined,
+        ...(restoredHeld.length > 0 ? { heldInputIds: restoredHeld.map(({ id }) => id) } : {}),
       });
     }
+    if (restoredHeld.length > 0) this.emitChatEvent(this.heldInputsChangedEvent());
   }
 
   private heldInputsChangedEvent(): Extract<WorkspaceChatMessage, { type: "held-inputs-changed" }> {
@@ -10416,7 +10475,11 @@ export class AgentSession {
         receipt.successor = { kind: "admitted", turnGeneration: preparedTurn };
         attempt.queueCutEntryId = entryId;
       }
-      this.preparingQueuedInput = { attempt, read: candidate.inputForRestore };
+      this.preparingQueuedInput = {
+        attempt,
+        read: candidate.inputForRestore,
+        readSend: candidate.sendForRestore,
+      };
       attempt.acceptanceOrigin = internal?.acceptanceOrigin ?? "manual";
       attempt.onFailure = internal?.onAcceptedPreStreamFailure;
       this.dispatchingQueuedEntry = true;
@@ -11478,6 +11541,13 @@ export class AgentSession {
     if (!mcpServerManager) return [];
 
     const refs = dedupeMcpPromptRefs(sanitizeMcpPromptRefs(muxMetadata?.mcpPromptRefs));
+    // Runs before the turn's init wait: a send admitted before a failed launch recorded this
+    // checkout must not start MCP in it here (#4674).
+    const unsanitized =
+      refs.length > 0
+        ? this.initStateManager.getUnsanitizedCheckoutError(this.workspaceId)
+        : undefined;
+    if (unsanitized) throw unsanitized;
     const snapshots = await Promise.all(
       refs.map(async (ref): Promise<MuxMessage | null> => {
         try {
@@ -11621,7 +11691,9 @@ export class AgentSession {
           }
         );
       } catch (error) {
-        if (ref.source === "slash") {
+        // Inline refs skip unknown skills, but an unreachable host is not an unknown
+        // skill: refuse the send like a failed slash invocation (#4438).
+        if (ref.source === "slash" || isRuntimeTransportError(error)) {
           throw error;
         }
         continue;

@@ -203,3 +203,149 @@ test("code that never runs is not checked", () => {
     `)
   ).toEqual([]);
 });
+
+// #4660: the rule stays sound in the conservative direction. Installs over-approximate and
+// restores under-approximate, so a restore that might not run, or might not cover every
+// specifier, restores nothing.
+test("a restore list that is mutated or escapes proves nothing", () => {
+  const importLine = `import { restoreModulesAfterSuite } from "../tests/ui/moduleMocks";`;
+  expect(
+    reported(`${importLine}
+      const entries = [["a", real]];
+      restoreModulesAfterSuite(entries);
+      entries.length = 0;
+      mock.module("a", () => ({}));
+    `)
+  ).toEqual(["a"]);
+  expect(
+    reported(`${importLine}
+      const entries = [["a", real]];
+      restoreModulesAfterSuite(entries);
+      clearLater(entries);
+      mock.module("a", () => ({}));
+    `)
+  ).toEqual(["a"]);
+  expect(
+    reported(`${importLine}
+      const entries = [["a", real]];
+      restoreModulesAfterSuite(entries);
+      for (const entry of entries) entry[0] = "b";
+      mock.module("a", () => ({}));
+    `)
+  ).toEqual(["a"]);
+  // Passing the list only to the restore helper (or copying it) keeps it trustworthy.
+  expect(
+    reported(`${importLine}
+      const entries = [["a", real]];
+      restoreModulesAfterSuite([...entries]);
+      mock.module("a", () => ({}));
+    `)
+  ).toEqual([]);
+});
+
+test("a restore behind a filter restores nothing; a filtered install installs every candidate", () => {
+  expect(
+    reported(`
+      const PATHS = ["a", "b"];
+      beforeEach(() => { for (const p of PATHS) mock.module(p, () => ({})); });
+      afterAll(() => { for (const p of PATHS) if (p === "a") mock.module(p, () => real); });
+    `)
+  ).toEqual(["a", "b"]);
+  expect(
+    reported(`
+      const PATHS = ["a", "b"];
+      beforeEach(() => { for (const p of PATHS) { if (p !== "a") continue; mock.module(p, () => real); } });
+      afterAll(() => { mock.module("a", () => real); });
+    `)
+  ).toEqual(["b"]);
+  expect(
+    reported(`
+      function restore() { mock.module("a", () => real); }
+      beforeEach(() => { mock.module("a", () => ({})); });
+      afterEach(() => { if (flag) restore(); });
+    `)
+  ).toEqual(["a"]);
+  // Restoring once suffices: one sure call site makes a helper's restore count.
+  expect(
+    reported(`
+      function restore() { mock.module("a", () => real); }
+      mock.module("a", () => ({}));
+      afterAll(restore);
+      if (flag) afterAll(restore);
+      describe("skipped", () => { afterEach(restore); test.skip("x", () => {}); });
+    `)
+  ).toEqual([]);
+});
+
+test("afterEach restores in a suite whose tests are all skipped never run", () => {
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      describe("skipped tests", () => {
+        afterEach(() => { mock.module("a", () => real); });
+        test.skip("x", () => {});
+      });
+    `)
+  ).toEqual(["a"]);
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      afterEach(() => { mock.module("a", () => real); });
+      test.each([])("x %p", () => {});
+    `)
+  ).toEqual(["a"]);
+  // Tests the rule cannot see may run, so their afterEach restores count.
+  expect(
+    reported(`
+      import { test as t } from "bun:test";
+      mock.module("a", () => ({}));
+      function nested() { test("x", () => {}); }
+      describe("outer", () => {
+        afterEach(() => { mock.module("a", () => real); });
+        describe("inner", nested);
+      });
+      describe("one-arg", () => { afterEach(() => { mock.module("a", () => real); }); test(() => {}); });
+      describe("aliased", () => { afterEach(() => { mock.module("a", () => real); }); t("x", () => {}); });
+    `)
+  ).toEqual([]);
+  // bun still runs afterAll for such a suite.
+  expect(
+    reported(`
+      mock.module("a", () => ({}));
+      describe("skipped tests", () => {
+        afterAll(() => { mock.module("a", () => real); });
+        test.skip("x", () => {});
+      });
+    `)
+  ).toEqual([]);
+});
+
+test("a helper called at load and from a scoped hook needs coverage in both contexts", () => {
+  expect(
+    reported(`
+      function install() { mock.module("a", () => ({})); }
+      install();
+      describe("earlier", () => { afterEach(() => { mock.module("a", () => real); }); });
+      describe("later", () => { beforeEach(install); });
+    `)
+  ).toEqual(["a"]);
+});
+
+test("a helper passed around dynamically needs a file-scope restore", () => {
+  expect(
+    reported(`
+      function install() { mock.module("a", () => ({})); }
+      describe("suite", () => {
+        afterEach(() => { mock.module("a", () => real); });
+        test("t", () => { runLater(install); });
+      });
+    `)
+  ).toEqual(["a"]);
+  expect(
+    reported(`
+      function install() { mock.module("a", () => ({})); }
+      describe("suite", () => { test("t", () => { runLater(install); }); });
+      afterAll(() => { mock.module("a", () => real); });
+    `)
+  ).toEqual([]);
+});

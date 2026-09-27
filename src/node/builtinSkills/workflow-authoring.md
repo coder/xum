@@ -399,11 +399,11 @@ const screening = evaluate(
   }
 );
 screening.answers.injection.choice; // "not_detected" | "suspected" | "uncertain"
-screening.answers.severity.score; // 0..4 (levels are 0-based)
+screening.answers.severity.score; // continuous in 0..4 (levels are 0-based; may be fractional)
 screening.answers.asksForSecrets.probability; // 0..1
 ```
 
-Question types (1–32 questions per call): `choice` (`criteria`: option name → description or `null`; 1–255 options), `score` (`criteria`: ordered level descriptions or `null`; 2–10 levels), `boolean`. Answers are `{ type: "choice", choice, probabilities? }`, `{ type: "score", score, probabilities? }` and `{ type: "boolean", probability }`; only answers validated against the step's own questions reach workflow code. The result also carries `rounding` — `null`, or `{ probabilityDecimals?, scoreDecimals? }` giving the decimals the provider rounded probabilities and scores to, each independently — `model: { modelString, responseModelId }`, `usage` (token counts or `null` when unknown) and `state: { sha256, bytes }` — the SHA-256 and UTF-8 byte length of the _canonical JSON_ of `state` (object keys sorted, JSON quoting and escaping included: a string state `abc` digests the five bytes `"abc"`), not of the raw ingested text — useful for identifying the screened input in outputs without repeating it; recompute it the same way when correlating. Optional `timeoutMs` (5 s–300 s, default 60 s) covers preparation and the request; `providerOptions` are passed through to the SDK and are part of the replay key. The `{ state, questions }` payload is capped at 256 KiB and nesting depth 16 before any request is sent.
+Question types (1–32 questions per call): `choice` (`criteria`: option name → description or `null`; 1–255 options), `score` (`criteria`: ordered level descriptions or `null`; 2–10 levels), `boolean`. Answers are `{ type: "choice", choice, probabilities? }`, `{ type: "score", score, probabilities? }` and `{ type: "boolean", probability }`. A `score` is continuous in `[0, levels − 1]`: when the provider returns a distribution over levels it is that distribution's probability-weighted mean, so it can be fractional. Only answers validated against the step's own questions reach workflow code. The result also carries `rounding` — `null`, or `{ probabilityDecimals?, scoreDecimals? }` giving the decimals the provider rounded probabilities and scores to, each independently — `model: { modelString, responseModelId }`, `usage: { inputTokens, outputTokens, totalTokens }` (always present; each count is a number, or `null` when the provider did not report it) and `state: { sha256, bytes }` — the SHA-256 and UTF-8 byte length of the _canonical JSON_ of `state` (object keys sorted, JSON quoting and escaping included: a string state `abc` digests the five bytes `"abc"`), not of the raw ingested text — useful for identifying the screened input in outputs without repeating it; recompute it the same way when correlating. Optional `timeoutMs` (5 s–300 s, default 60 s) covers preparation and the request; `providerOptions` are passed through to the SDK and are part of the replay key. The `{ state, questions }` payload is capped at 256 KiB and nesting depth 16 before any request is sent.
 
 Model selection: the per-call `model` wins, then `xum workflow run --evaluation-model`, then the persisted default `evaluationDefaults.model` (the `config.updateEvaluationDefaults` API; a Settings card for it is planned). Only direct API-key routes of `typesafe` (TypeSafe AI's native evaluator, `typesafe:jev-latest`; key from the `typesafe` entry in providers.jsonc or `TYPESAFE_API_KEY`), `openai`, `anthropic` and `google` are supported; gateway, OAuth and custom-provider routes are rejected at call time rather than re-routed. There is no fallback to chat or agent models: with no model configured the step fails with `invalid-input/no-model`.
 
@@ -422,7 +422,9 @@ The complete screening example ships with this skill: `agent_skill_read_file({ n
 
 ```sh
 REPO="owner/repo"; N=123   # N must be a positive integer
-gh label create needs-human-review -R "$REPO" --force   # once per repository: --add-label does not create labels
+# --add-label does not create labels; create it once, without recoloring an existing one
+gh label list -R "$REPO" --search needs-human-review --json name --jq '.[].name' | grep -qx needs-human-review \
+  || gh label create needs-human-review -R "$REPO"
 gh issue view "$N" -R "$REPO" --json title,body \
   | jq --arg repo "$REPO" --argjson n "$N" '{repo: $repo, issueNumber: $n, title: .title, body: .body}' \
   | xum workflow run skill://workflow-authoring/screen-github-issue.js --args-stdin \

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Data, Effect } from "effect";
 import {
   APICallError,
@@ -24,6 +25,7 @@ import {
   type EvaluationRounding,
   type EvaluationState,
 } from "@/common/types/evaluation";
+import { isKnownOpenAIServiceTier } from "@/common/utils/tokens/serviceTierPricing";
 
 /**
  * Effect service around AI SDK `experimental_evaluate` for the workflow
@@ -43,10 +45,21 @@ import {
  *   Effect interruption, never as an `EvaluationError`.
  * - No SDK-internal retries (`maxRetries: 0`): every billable call is one
  *   visible attempt owned by the caller's retry policy.
- * - Untrusted text confinement: `EvaluationError` carries class identity and
- *   `statusCode` only; SDK messages and response bodies are dropped at
- *   classification.
+ * - Untrusted text confinement: `EvaluationError` carries class identity,
+ *   `statusCode` and, for a received response, its sanitized usage only; SDK
+ *   messages and response bodies are dropped at classification.
  */
+
+/**
+ * The billing of a response the provider returned (and charged for) before it
+ * was rejected: exactly the sanitized fields the success path records, never
+ * answers or text. Provider token counts come from the billing envelope, which
+ * does not depend on the answer content that failed validation (#4728).
+ */
+export type EvaluationBilledUsage = Pick<
+  EvaluationCallResult<EvaluationQuestions>,
+  "usage" | "usageProviderMetadata"
+>;
 
 /** Typed failure of `EvaluationService.evaluate`; no free-text fields by design. */
 export class EvaluationError extends Data.TaggedError("EvaluationError")<{
@@ -54,6 +67,8 @@ export class EvaluationError extends Data.TaggedError("EvaluationError")<{
   readonly code: EvaluationErrorCode;
   /** HTTP status from `APICallError`, when the provider answered at all. */
   readonly statusCode?: number;
+  /** Present when a provider response was received (and billed) before the rejection. */
+  readonly billedUsage?: EvaluationBilledUsage;
 }> {}
 
 export type EvaluationModelInstance = Experimental_EvaluationModelV4;
@@ -96,12 +111,12 @@ export interface EvaluationService {
 
 /**
  * Audit of `createDisplayUsage` (src/common/utils/tokens/displayUsage.ts): the
- * provider-metadata paths it reads. Only finite numbers and booleans are kept
+ * provider-metadata paths it reads. Only finite numbers, booleans and known service-tier values are kept
  * so provider text can never ride along into persisted usage records.
  */
 const USAGE_PROVIDER_METADATA_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
   anthropic: ["cacheCreationInputTokens"],
-  openai: ["reasoningTokens"],
+  openai: ["reasoningTokens", "serviceTier"],
   mux: ["costsIncluded"],
   xai: ["costInUsdTicks"],
 };
@@ -112,7 +127,7 @@ function projectUsageProviderMetadata(
   if (metadata == null) {
     return null;
   }
-  const projected: Record<string, Record<string, number | boolean>> = {};
+  const projected: Record<string, Record<string, number | boolean | string>> = {};
   for (const [namespace, keys] of Object.entries(USAGE_PROVIDER_METADATA_ALLOWLIST)) {
     const namespaceValue: unknown = metadata[namespace];
     if (namespaceValue == null || typeof namespaceValue !== "object") {
@@ -123,8 +138,17 @@ function projectUsageProviderMetadata(
       // Token counts must be whole and non-negative; `createDisplayUsage` does
       // not re-check them, so a malformed provider/proxy value is dropped here
       // rather than becoming a negative cache/reasoning count downstream.
-      if (isTokenCount(value) || typeof value === "boolean") {
-        (projected[namespace] ??= {})[key] = value;
+      // `serviceTier` is the one string kept: only a known enum value, never provider text (#4352).
+      const kept =
+        key === "serviceTier"
+          ? isKnownOpenAIServiceTier(value)
+            ? value
+            : undefined
+          : isTokenCount(value) || typeof value === "boolean"
+            ? value
+            : undefined;
+      if (kept !== undefined) {
+        (projected[namespace] ??= {})[key] = kept;
       }
     }
   }
@@ -143,6 +167,130 @@ function isTokenCount(value: unknown): value is number {
  */
 function projectTokenCount(value: number | undefined): number | null {
   return isTokenCount(value) ? value : null;
+}
+
+/** The one projection of provider billing, shared by success and rejection paths. */
+function projectBilledUsage(
+  usage:
+    | { inputTokens?: number | undefined; outputTokens?: number | undefined; totalTokens?: number }
+    | undefined,
+  providerMetadata: SharedV4ProviderMetadata | undefined
+): EvaluationBilledUsage {
+  const inputTokens = projectTokenCount(usage?.inputTokens);
+  const outputTokens = projectTokenCount(usage?.outputTokens);
+  // The SDK computes a total only for answers it accepted; for a rejected
+  // response derive it, and only when both counts are known.
+  // The sum goes through the same projection, so an overflow past a safe integer is unknown.
+  const derivedTotal =
+    inputTokens !== null && outputTokens !== null
+      ? projectTokenCount(inputTokens + outputTokens)
+      : null;
+  return {
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens:
+        usage?.totalTokens !== undefined ? projectTokenCount(usage.totalTokens) : derivedTotal,
+    },
+    usageProviderMetadata: projectUsageProviderMetadata(providerMetadata),
+  };
+}
+
+/** Billing of the provider response the current `evaluate()` call received, if any. */
+interface BillingScope {
+  billed?: EvaluationBilledUsage;
+}
+
+const billingScope = new AsyncLocalStorage<BillingScope>();
+const INNER_BILLING_CAPTURE = Symbol("xum.evaluationInnerBillingCapture");
+
+/**
+ * provider-utils' `EvaluationLanguageModel` (behind the OpenAI, Anthropic and
+ * Google `.evaluationModel()`) validates answers inside `doEvaluate` and throws
+ * before returning usage, so a billed response it rejects would never reach the
+ * ledger (#4728). It keeps the wrapped LanguageModelV4 on `model`, an SDK
+ * internal pinned by a contract test. Wrap that instance's `doGenerate` once;
+ * each call reports its usage to the `evaluate()` scope it runs in
+ * (AsyncLocalStorage, because pinned models are shared across concurrent calls).
+ * Models without the field (TypeSafe, mocks, a future SDK) are left alone.
+ * Exported for wrappers that hide the field (withAnthropicEvaluationEffort):
+ * they install it on the model they wrap.
+ */
+export function installInnerBillingCapture(model: EvaluationModelInstance): void {
+  const inner: unknown = (model as { model?: unknown }).model;
+  if (inner === null || typeof inner !== "object") {
+    return;
+  }
+  const target = inner as { doGenerate?: unknown; [INNER_BILLING_CAPTURE]?: true };
+  if (target[INNER_BILLING_CAPTURE] === true || typeof target.doGenerate !== "function") {
+    return;
+  }
+  const doGenerate = target.doGenerate as (options: unknown) => PromiseLike<{
+    usage?: { inputTokens?: { total?: number }; outputTokens?: { total?: number } };
+    providerMetadata?: SharedV4ProviderMetadata;
+  }>;
+  target.doGenerate = async (options: unknown) => {
+    const result = await doGenerate.call(inner, options);
+    const scope = billingScope.getStore();
+    if (scope !== undefined) {
+      // Same mapping as the adapter's own success return (`usage.*.total`).
+      const usage = result.usage;
+      scope.billed = projectBilledUsage(
+        { inputTokens: usage?.inputTokens?.total, outputTokens: usage?.outputTokens?.total },
+        result.providerMetadata
+      );
+    }
+    return result;
+  };
+  target[INNER_BILLING_CAPTURE] = true;
+}
+
+/**
+ * Per-call view of the model that records what `doEvaluate` returned, so the
+ * SDK's own answer validation (which throws after this returns) cannot drop it.
+ */
+function withBillingCapture(
+  model: EvaluationModelInstance,
+  scope: BillingScope
+): EvaluationModelInstance {
+  return {
+    specificationVersion: model.specificationVersion,
+    provider: model.provider,
+    modelId: model.modelId,
+    supportedQuestionTypes: model.supportedQuestionTypes,
+    doEvaluate: async (options) => {
+      const result = await model.doEvaluate(options);
+      scope.billed = projectBilledUsage(result.usage, result.providerMetadata);
+      return result;
+    },
+  };
+}
+
+/** One call's billing capture: evaluate with `model` inside `run`, then read `billed`. */
+export interface EvaluationBillingCapture {
+  readonly model: EvaluationModelInstance;
+  run<T>(fn: () => T): T;
+  /** Billing of the response this call received, if any; set even when the answer was rejected. */
+  readonly billed: EvaluationBilledUsage | undefined;
+}
+
+/**
+ * Both captures (#4728) for one call. Exported for callers that need the raw SDK
+ * result instead of `evaluate()`'s projection: auto model routing reads TypeSafe
+ * confidence and choice probabilities, and still bills rejected answers (#4774).
+ */
+export function createEvaluationBillingCapture(
+  model: EvaluationModelInstance
+): EvaluationBillingCapture {
+  installInnerBillingCapture(model);
+  const scope: BillingScope = {};
+  return {
+    model: withBillingCapture(model, scope),
+    run: (fn) => billingScope.run(scope, fn),
+    get billed() {
+      return scope.billed;
+    },
+  };
 }
 
 /**
@@ -223,22 +371,45 @@ export function makeEvaluationService(): EvaluationService {
   return {
     evaluate: <const Q extends EvaluationQuestions>(call: EvaluationCall<Q>) =>
       Effect.gen(function* () {
+        const capture = createEvaluationBillingCapture(call.model);
         const result = yield* Effect.tryPromise({
           // The fiber's own signal is handed to the SDK, so interrupting the
           // effect aborts the in-flight provider request; the resulting
           // rejection is discarded by the runtime as interruption, not mapped
           // into an EvaluationError.
-          try: (signal) =>
-            experimental_evaluate({
-              model: call.model,
-              state: call.state,
-              questions: call.questions,
-              providerOptions: call.providerOptions,
-              abortSignal: signal,
-              maxRetries: 0,
-            }),
-          catch: classifyEvaluationError,
+          try: (signal) => {
+            // experimental_evaluate logs provider warnings unless this global is false, and a
+            // warning can echo the evaluated state. Set it here instead of relying on
+            // streamManager having been imported first (#4363).
+            globalThis.AI_SDK_LOG_WARNINGS = false;
+            return capture.run(() =>
+              experimental_evaluate({
+                model: capture.model,
+                state: call.state,
+                questions: call.questions,
+                providerOptions: call.providerOptions,
+                abortSignal: signal,
+                maxRetries: 0,
+              })
+            );
+          },
+          // A response received before the throw was billed; keep its usage.
+          catch: (error) => {
+            const classified = classifyEvaluationError(error);
+            const billed = capture.billed;
+            return billed === undefined
+              ? classified
+              : new EvaluationError({
+                  reason: classified.reason,
+                  code: classified.code,
+                  ...(classified.statusCode !== undefined
+                    ? { statusCode: classified.statusCode }
+                    : {}),
+                  billedUsage: billed,
+                });
+          },
         });
+        const billed = projectBilledUsage(result.usage, result.providerMetadata);
 
         // Provider-reported rounding is untrusted output too: parse it into the
         // bounded shape first so a non-object or extra fields can neither reach
@@ -248,6 +419,7 @@ export function makeEvaluationService(): EvaluationService {
           return yield* new EvaluationError({
             reason: "invalid-output",
             code: "answer-validation",
+            billedUsage: billed,
           });
         }
 
@@ -258,18 +430,14 @@ export function makeEvaluationService(): EvaluationService {
           return yield* new EvaluationError({
             reason: "invalid-output",
             code: "answer-validation",
+            billedUsage: billed,
           });
         }
 
         return {
           answers: validated.answers,
           rounding,
-          usage: {
-            inputTokens: projectTokenCount(result.usage.inputTokens),
-            outputTokens: projectTokenCount(result.usage.outputTokens),
-            totalTokens: projectTokenCount(result.usage.totalTokens),
-          },
-          usageProviderMetadata: projectUsageProviderMetadata(result.providerMetadata),
+          ...billed,
           responseModelId: projectResponseModelId(result.response.modelId, call.model.modelId),
           warningsCount: result.warnings.length,
         } satisfies EvaluationCallResult<Q>;

@@ -1009,7 +1009,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           branchName,
           false,
           expect.any(AbortSignal),
-          true
+          true,
+          { keepBranch: false }
         );
         expect(deleteWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(deleteWorkspaceBMock).toHaveBeenCalledWith(
@@ -1017,7 +1018,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           branchName,
           false,
           expect.any(AbortSignal),
-          true
+          true,
+          { keepBranch: false }
         );
         expect(initWorkspaceMock).not.toHaveBeenCalled();
         expect(removeContainerSpy).not.toHaveBeenCalled();
@@ -1206,6 +1208,43 @@ describe("WorkspaceService multi-project lifecycle", () => {
       }
     });
   });
+  // Case-insensitive volumes and Windows name trimming alias these to .mux/.xum as well.
+  test.each([".mux", ".XUM", ".Mux."])(
+    "createMultiProject refuses a project named like the workspace metadata directory (%s, #4455)",
+    async (projectName) => {
+      await withTempMuxRoot(async (rootDir) => {
+        // Its container link would alias the container's own overrides file into its checkout.
+        const dotfilesPath = path.join(rootDir, projectName);
+        const projectBPath = path.join(rootDir, "project-b");
+        const config = new Config(rootDir);
+        await config.editConfig((snapshot) => {
+          snapshot.projects.set(dotfilesPath, { workspaces: [], trusted: true });
+          snapshot.projects.set(projectBPath, { workspaces: [], trusted: true });
+          return snapshot;
+        });
+        const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime");
+        try {
+          const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+          const result = await workspaceService.createMultiProject(
+            [
+              { projectPath: dotfilesPath, projectName },
+              { projectPath: projectBPath, projectName: "project-b" },
+            ],
+            "feature-metadata-alias",
+            "main"
+          );
+          expect(result.success).toBe(false);
+          if (result.success) {
+            return;
+          }
+          expect(result.error).toContain("collides with the workspace metadata directory");
+          expect(createRuntimeSpy).not.toHaveBeenCalled();
+        } finally {
+          createRuntimeSpy.mockRestore();
+        }
+      });
+    }
+  );
   test("remove() deletes all project workspaces and the shared container for multi-project workspaces", async () => {
     await withTempMuxRoot(async (rootDir) => {
       const workspaceId = "ws-multi-remove";
@@ -1773,7 +1812,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(renameWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(removeContainerSpy).not.toHaveBeenCalled();
@@ -1962,7 +2002,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(renameWorkspaceBMock).toHaveBeenCalledTimes(2);
         expect(renameWorkspaceBMock).toHaveBeenNthCalledWith(
@@ -1979,7 +2020,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(removeContainerSpy).toHaveBeenCalledWith(oldName);
         expect(createContainerSpy).toHaveBeenCalledTimes(1);

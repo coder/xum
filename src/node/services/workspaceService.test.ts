@@ -1062,10 +1062,10 @@ describe("WorkspaceService registration-time plugin override sanitization", () =
     expect(pruned).toEqual(["ws-new:plugin:"]);
   });
 
-  test("rollback verification detects a swallowed config write failure", async () => {
-    // Config.saveConfig logs and swallows write errors, so removeWorkspace
-    // can resolve while the entry survives on disk; the rollback must verify
-    // absence rather than trust the resolved promise.
+  test("rollback verification detects a config write that did not land", async () => {
+    // A removeWorkspace whose write another writer replaced resolves while the
+    // entry survives on disk; the rollback must verify absence rather than
+    // trust the resolved promise.
     const service = await makeService([{ id: "ws-stuck", path: "/tmp/proj" }]);
     const removeSpy = spyOn(harness.config, "removeWorkspace").mockResolvedValue(undefined);
     const access = service as unknown as SanitizeAccess;

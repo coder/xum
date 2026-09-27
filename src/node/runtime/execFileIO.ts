@@ -15,6 +15,21 @@ import { streamToString } from "./streamUtils";
 type StartExec = (abortSignal: AbortSignal) => Promise<ExecStream>;
 
 /**
+ * Whether a non-zero exit is the transport's own failure (e.g. OpenSSH exit
+ * 255) rather than the command's. Such failures become RuntimeError
+ * "network" so callers never read an unreachable host as a missing file.
+ */
+export type ClassifyTransportExit = (exitCode: number, stderr: string) => boolean;
+
+function nonZeroExitErrorType(
+  exitCode: number,
+  stderr: string,
+  classifyExit: ClassifyTransportExit | undefined
+): "network" | "file_io" {
+  return classifyExit?.(exitCode, stderr) === true ? "network" : "file_io";
+}
+
+/**
  * Shell command for ReadFileOptions.requireRegularFile on exec-backed runtimes.
  * `quotedPath` must already be shell-safe (quoteForRemote / an env-var reference).
  *
@@ -54,7 +69,8 @@ export function buildRegularFileReadCommand(quotedPath: string): string {
 export function readFileViaExec(
   filePath: string,
   startExec: StartExec,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  classifyExit?: ClassifyTransportExit
 ): ReadableStream<Uint8Array> {
   // Internal controller so CANCELLING the returned stream kills the remote
   // cat: the eager pump below has no other path to the exec, and without
@@ -92,7 +108,10 @@ export function readFileViaExec(
         const code = await exitCodePromise;
         if (code !== 0) {
           const stderr = await streamToString(stream.stderr);
-          throw new RuntimeError(`Failed to read file ${filePath}: ${stderr}`, "file_io");
+          throw new RuntimeError(
+            `Failed to read file ${filePath}: ${stderr}`,
+            nonZeroExitErrorType(code, stderr, classifyExit)
+          );
         }
 
         controller.close();
@@ -221,7 +240,8 @@ export const STAT_VIA_EXEC_COMMAND = "LC_ALL=C stat -L -c '%s %Y %F'";
  */
 export async function statViaExec(
   filePath: string,
-  startExec: () => Promise<ExecStream>
+  startExec: () => Promise<ExecStream>,
+  classifyExit?: ClassifyTransportExit
 ): Promise<FileStat> {
   const stream = await startExec();
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -231,7 +251,10 @@ export async function statViaExec(
   ]);
 
   if (exitCode !== 0) {
-    throw new RuntimeError(`Failed to stat ${filePath}: ${stderr}`, "file_io");
+    throw new RuntimeError(
+      `Failed to stat ${filePath}: ${stderr}`,
+      nonZeroExitErrorType(exitCode, stderr, classifyExit)
+    );
   }
 
   const parts = stdout.trim().split(" ");

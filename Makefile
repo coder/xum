@@ -379,9 +379,15 @@ static-check: lint typecheck fmt-check check-startup-imports check-react-compile
 
 static-check-full: static-check check-bench-agent test-bench-scripts check-docs-links ## Run the full CI static check suite
 
+# Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
+# adapter against the same Harbor API the scheduled benchmark runs.
+TB_HARBOR_VERSION := 0.6.4
+
 # pytest is not a repo dependency; uv (installed in CI's static-check job) supplies it.
-test-bench-scripts: ## Test the Terminal-Bench result checker with offline fixtures
+test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter with offline fixtures
 	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
+	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
+	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
@@ -667,7 +673,7 @@ benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.
 	@# Force the Daytona SDK to the cursor-pagination API while keeping Harbor stable.
 	@# Harbor removed --task-name, so keep smoke-test task filtering on the current dataset filter flag.
-	@HARBOR_PACKAGE=$${TB_HARBOR_PACKAGE:-harbor[daytona]==0.6.4}; \
+	@HARBOR_PACKAGE=$${TB_HARBOR_PACKAGE:-harbor[daytona]==$(TB_HARBOR_VERSION)}; \
 	HARBOR_DAYTONA_PACKAGE=$${TB_HARBOR_DAYTONA_PACKAGE:-daytona>=0.180.0,<2}; \
 	TB_DATASET=$${TB_DATASET:-terminal-bench@2.0}; \
 	TB_TIMEOUT=$${TB_TIMEOUT:-1800}; \

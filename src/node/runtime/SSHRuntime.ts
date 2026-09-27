@@ -31,7 +31,7 @@ import type {
   WorkspaceForkResult,
   InitLogger,
 } from "./Runtime";
-import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
 import { RemoteRuntime, type SpawnResult } from "./RemoteRuntime";
 import { log } from "@/node/services/log";
 import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
@@ -1100,6 +1100,10 @@ export class SSHRuntime extends RemoteRuntime {
     return cdCommandForSSH(cwd);
   }
 
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return this.transport.isConnectionFailure(exitCode, stderr);
+  }
+
   protected async spawnRemoteProcess(
     fullCommand: string,
     options: ExecOptions & { deadlineMs?: number }
@@ -1167,6 +1171,11 @@ export class SSHRuntime extends RemoteRuntime {
 
       if (result.exitCode !== 0) {
         const message = result.stderr || result.stdout || "Unknown error";
+        // An unreachable host says nothing about the path; callers must not
+        // skip the root as if it were absent (#4438).
+        if (this.transport.isConnectionFailure(result.exitCode, result.stderr)) {
+          throw new RuntimeError(`Failed to resolve SSH path: ${message}`, "network");
+        }
         throw new Error(`Failed to resolve SSH path: ${message}`);
       }
 

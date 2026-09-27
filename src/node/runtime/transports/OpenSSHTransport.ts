@@ -8,6 +8,8 @@ import {
   type SSHConnectionConfig,
 } from "../sshConnectionPool";
 import type { SpawnResult } from "../RemoteRuntime";
+import { RuntimeError } from "../Runtime";
+import { getErrorMessage } from "@/common/utils/errors";
 import type {
   SSHTransport,
   SSHTransportAcquireOptions,
@@ -32,6 +34,17 @@ function summarizeFailureStderr(stderr: string, exitCode: number): string {
   return `${trimmed.slice(0, MAX_REPORTED_FAILURE_STDERR_CHARS)}…`;
 }
 
+/**
+ * Pool acquisition failures (backoff, unhealthy host, failed probe) mean the
+ * host is unreachable, not that a remote file is missing: report them as
+ * transport failures like SSH2Transport does (#4438). Aborts stay as-is.
+ * The message is preserved so existing string checks keep working.
+ */
+function toAcquisitionError(error: unknown, abortSignal: AbortSignal | undefined): unknown {
+  if (abortSignal?.aborted === true || error instanceof RuntimeError) return error;
+  return new RuntimeError(getErrorMessage(error), "network", error);
+}
+
 function getShardedControlPath(config: SSHConnectionConfig): string {
   const baseControlPath = sshConnectionPool.getControlPath(config);
   const nextShard = nextShardByConnection.get(baseControlPath) ?? 0;
@@ -51,24 +64,32 @@ export class OpenSSHTransport implements SSHTransport {
   }
 
   async acquireConnection(options?: SSHTransportAcquireOptions): Promise<void> {
-    await sshConnectionPool.acquireConnection(this.config, {
-      abortSignal: options?.abortSignal,
-      timeoutMs: options?.timeoutMs,
-      maxWaitMs: options?.maxWaitMs,
-      onWait: options?.onWait,
-    });
+    try {
+      await sshConnectionPool.acquireConnection(this.config, {
+        abortSignal: options?.abortSignal,
+        timeoutMs: options?.timeoutMs,
+        maxWaitMs: options?.maxWaitMs,
+        onWait: options?.onWait,
+      });
+    } catch (error) {
+      throw toAcquisitionError(error, options?.abortSignal);
+    }
   }
 
   async spawnRemoteProcess(fullCommand: string, options: SpawnOptions): Promise<SpawnResult> {
     const remainingWaitMs =
       options.deadlineMs != null ? Math.max(0, options.deadlineMs - Date.now()) : undefined;
     const controlPath = getShardedControlPath(this.config);
-    await sshConnectionPool.acquireConnection(this.config, {
-      abortSignal: options.abortSignal,
-      timeoutMs: remainingWaitMs,
-      maxWaitMs: remainingWaitMs,
-      controlPath,
-    });
+    try {
+      await sshConnectionPool.acquireConnection(this.config, {
+        abortSignal: options.abortSignal,
+        timeoutMs: remainingWaitMs,
+        maxWaitMs: remainingWaitMs,
+        controlPath,
+      });
+    } catch (error) {
+      throw toAcquisitionError(error, options.abortSignal);
+    }
 
     // Shard short-lived SSH execs across a few deterministic ControlPaths so the host no longer
     // funnels all multiplexed sessions through one implicit master socket.

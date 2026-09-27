@@ -262,9 +262,11 @@ export async function acquireProcessFileLock(
           throw error;
         }
       }
-      await reclaimStaleFileLock(lockPath, label, options.testOnlyReclaimSeam);
+      const blocker = await reclaimStaleFileLock(lockPath, label, options.testOnlyReclaimSeam);
       if (Date.now() >= deadline) {
-        throw new Error(`Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms`);
+        throw new Error(
+          `Timed out acquiring ${label} ${lockPath} after ${timeoutMs}ms.${describeBlocker(blocker)}`
+        );
       }
       await new Promise((resolve) =>
         setTimeout(resolve, FILE_LOCK_RETRY_MS + Math.random() * FILE_LOCK_RETRY_MS)
@@ -317,17 +319,49 @@ async function assertLockOwned(lockPath: string, token: string, label: string): 
   }
 }
 
+/** Why an observed lock was not reclaimed; the timeout error reports the last one. */
+interface Blocker {
+  /** Absent for a malformed token (no owner to name). */
+  holder?: HolderEvidence;
+  why: string;
+  /** What is held, when not the lock itself (its reclaim guard). */
+  subject?: string;
+}
+
 /**
- * True when the lock's owner is judged dead by the shared rule (see
- * processLiveness.judgeHolder). A live or indeterminate owner is never
- * stale, regardless of age. Only a malformed token falls back to the lease.
+ * Judge the lock's owner by the shared rule (see processLiveness.judgeHolder):
+ * dead ⇒ undefined (reclaimable), otherwise the blocker. A live or
+ * indeterminate owner is never stale, regardless of age. Only a malformed
+ * token falls back to the lease.
  */
-async function isLockStale(lockPath: string, observed: string): Promise<boolean> {
+async function judgeLockToken(lockPath: string, observed: string): Promise<Blocker | undefined> {
   const holder = parseLockToken(observed);
   if (holder === null) {
-    return await lockLeaseExpired(lockPath);
+    return (await lockLeaseExpired(lockPath))
+      ? undefined
+      : { why: "its content is malformed and younger than the stale-lock lease" };
   }
-  return judgeHolder(holder, liveTokens.has(observed)).dead;
+  const verdict = judgeHolder(holder, liveTokens.has(observed));
+  return verdict.dead ? undefined : { holder, why: verdict.why };
+}
+
+/**
+ * The timeout's actionable tail, in the shape of crossProcessLock's
+ * describeBlocker (#4480): who holds the lock and why it was not taken over,
+ * so the user can stop the right process.
+ */
+function describeBlocker(blocker: Blocker | undefined): string {
+  if (blocker === undefined) return "";
+  const holder = blocker.holder;
+  const subject = blocker.subject ?? "The lock";
+  if (holder === undefined) return ` ${subject} was not taken over because ${blocker.why}.`;
+  const birth = holder.identity?.birth ?? holder.legacyBirth ?? null;
+  const hostname = holder.identity?.hostname ?? null;
+  return (
+    ` ${subject} is held by pid ${holder.pid} (started ${birth ?? "at an unknown time"}` +
+    `${hostname != null ? ` on ${hostname}` : ""}) and was not taken over because ` +
+    `${blocker.why}. Stop that process to free the lock.`
+  );
 }
 
 /** True when the lockfile's mtime is older than the stale-lock lease. */
@@ -358,7 +392,7 @@ async function withReclaimGuard(
   lockPath: string,
   label: string,
   fn: () => Promise<void>
-): Promise<void> {
+): Promise<Blocker | undefined> {
   const guardPath = `${lockPath}.reclaim`;
   const { token, nonce } = makeOwnershipToken();
   const tempPath = `${guardPath}.tmp-${process.pid}-${nonce}`;
@@ -371,38 +405,49 @@ async function withReclaimGuard(
         throw error;
       }
       const observed = await fs.readFile(guardPath, "utf-8").catch(() => null);
-      if (observed !== null && (await isLockStale(guardPath, observed))) {
+      if (observed === null) return undefined; // Just freed: the caller's poll loop retries.
+      const guardBlocker = await judgeLockToken(guardPath, observed);
+      if (guardBlocker === undefined) {
         await fs.unlink(guardPath).catch(() => undefined);
+        return undefined;
       }
-      return; // Guard busy (or just freed): the caller's poll loop retries.
+      // Guard busy: the caller's poll loop retries. A guard that stays held blocks every
+      // takeover, so its holder is what a timeout must name (#4480).
+      return { ...guardBlocker, subject: `Its reclaim guard ${guardPath}` };
     }
     try {
       await fn();
     } finally {
       await releaseFileLock(guardPath, token, `${label} reclaim guard`);
     }
+    return undefined;
   } finally {
     liveTokens.delete(token);
     await fs.unlink(tempPath).catch(() => undefined);
   }
 }
 
-/** Reclaim the lock if its recorded owner is provably gone (see module doc). */
+/**
+ * Reclaim the lock if its recorded owner is provably gone (see module doc).
+ * Returns why it was not reclaimed when its owner was judged live or
+ * indeterminate; undefined otherwise (gone, or reclaim attempted).
+ */
 async function reclaimStaleFileLock(
   lockPath: string,
   label: string,
   testOnlySeam?: (phase: ReclaimSeamPhase) => Promise<void>
-): Promise<void> {
+): Promise<Blocker | undefined> {
   let observed: string;
   try {
     observed = await fs.readFile(lockPath, "utf-8");
   } catch {
-    return; // Already released or reclaimed; retry acquisition.
+    return undefined; // Already released or reclaimed; retry acquisition.
   }
-  if (!(await isLockStale(lockPath, observed))) {
-    return;
+  const blocker = await judgeLockToken(lockPath, observed);
+  if (blocker !== undefined) {
+    return blocker;
   }
-  await withReclaimGuard(lockPath, label, async () => {
+  return await withReclaimGuard(lockPath, label, async () => {
     if (testOnlySeam !== undefined) {
       await testOnlySeam("post-guard");
     }

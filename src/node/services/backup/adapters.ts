@@ -724,10 +724,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
             // window's hold: taking its own would wait on itself.
             registration === null ? {} : { withinRegistrationLock: registration }
           );
-          // saveConfig logs and swallows write failures, so a resolved edit does not prove
-          // the preferences landed. Compared through the backup projection because every
-          // key a restore can change is portable, so a lost write is visible there, while
-          // machine-local keys the load path normalizes differently stay out of the check.
+          // editConfig rejects when the save fails (#4444); re-reading is belt and braces against a
+          // write another writer replaced. Compared through the backup projection because every key
+          // a restore can change is portable, so a lost write is visible there, while machine-local
+          // keys the load path normalizes differently stay out of the check.
           const stored = options.config.loadConfigOrDefault().userPreferences;
           if (
             merged !== undefined &&

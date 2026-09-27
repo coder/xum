@@ -231,7 +231,7 @@ export class WorktreeManager {
         (await this.supportsNativeHookRunner(params.abortSignal));
       if (params.deferMaterialization && nativeHookRunner) {
         await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
-        return { success: true, workspacePath, pendingMaterialization: pending };
+        return { success: true, workspacePath, pendingMaterialization: pending, createdBranch };
       }
 
       await this.materializeWorkspace(
@@ -250,7 +250,7 @@ export class WorktreeManager {
       );
 
       await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
-      return { success: true, workspacePath };
+      return { success: true, workspacePath, createdBranch };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       if (!isAbortError(error, params.abortSignal)) {
@@ -645,9 +645,11 @@ export class WorktreeManager {
     projectPath: string,
     oldName: string,
     newName: string,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed: boolean }
+    | { success: false; error: string }
   > {
     // Clean up stale lock before git operations on main repo
     cleanStaleLock(projectPath);
@@ -675,10 +677,12 @@ export class WorktreeManager {
 
       // Rename the tracked branch only when workspace identity still follows the old workspace
       // name. Diverged workspaces keep their original branch and must not rename unrelated refs.
+      // An undo passes renameBranch instead: the names alone cannot tell whether the rename it
+      // reverses moved the branch (a diverged branch may equal the new name, #4779).
       const originalBranchName =
         (await this.getPersistedWorkspaceBranchName(projectPath, oldName)) ?? oldName;
       let renamedBranchName = originalBranchName;
-      if (originalBranchName === oldName) {
+      if (options?.renameBranch ?? originalBranchName === oldName) {
         try {
           using branchProc = execFileAsync(
             "git",
@@ -693,7 +697,12 @@ export class WorktreeManager {
       }
 
       await this.updateWorkspaceBranchMapping(projectPath, oldName, newName, renamedBranchName);
-      return { success: true, oldPath, newPath };
+      return {
+        success: true,
+        oldPath,
+        newPath,
+        branchRenamed: renamedBranchName !== originalBranchName,
+      };
     } catch (error) {
       return { success: false, error: `Failed to rename workspace: ${getErrorMessage(error)}` };
     }
@@ -791,7 +800,8 @@ export class WorktreeManager {
     projectPath: string,
     workspaceName: string,
     force: boolean,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Clean up stale lock before git operations on main repo
     cleanStaleLock(projectPath);
@@ -838,7 +848,7 @@ export class WorktreeManager {
       if (pruneWorktrees) {
         await this.pruneWorktreesBestEffort(projectPath, noHooksEnv);
       }
-      await this.deleteWorkspaceBranchIfSafe(branchDeleteArgs);
+      if (!options?.keepBranch) await this.deleteWorkspaceBranchIfSafe(branchDeleteArgs);
       await this.deletePersistedWorkspaceBranchMapping(projectPath, workspaceName);
       return { success: true as const, deletedPath };
     };
@@ -1274,6 +1284,7 @@ export class WorktreeManager {
         success: true,
         workspacePath: createResult.workspacePath,
         sourceBranch,
+        createdBranch: createResult.createdBranch,
       };
     } catch (error) {
       return {

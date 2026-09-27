@@ -23,7 +23,11 @@ import type {
   UiConnectionStatus,
   UiWorkspace,
 } from "./webview/protocol";
-import { isAllowedOrpcPath } from "./orpcAllowlist";
+import {
+  isAllowedOrpcPath,
+  redactWebviewOrpcResult,
+  sanitizeWebviewOrpcInput,
+} from "./orpcAllowlist";
 import { parseWebviewToExtensionMessage } from "./parseWebviewToExtensionMessage";
 import { openWorkspace } from "./workspaceOpener";
 
@@ -130,6 +134,13 @@ function toUiWorkspace(workspace: WorkspaceWithContext): UiWorkspace {
     // Backend guarantees createdAt for new workspaces, but keep a stable fallback for legacy ones.
     createdAt: workspace.createdAt ?? new Date(0).toISOString(),
     unarchivedAt: workspace.unarchivedAt,
+    ai: {
+      agentId: workspace.agentId,
+      agentType: workspace.agentType,
+      parentWorkspaceId: workspace.parentWorkspaceId,
+      aiSettings: workspace.aiSettings,
+      aiSettingsByAgent: workspace.aiSettingsByAgent,
+    },
   };
 }
 
@@ -1569,6 +1580,21 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
+      const sanitized = sanitizeWebviewOrpcInput(
+        args.path,
+        args.input,
+        new Set(this.workspacesById.keys())
+      );
+      if (!sanitized.ok) {
+        this.postMessage({
+          type: "orpcResponse",
+          requestId: args.requestId,
+          ok: false,
+          error: sanitized.error,
+        });
+        return;
+      }
+
       if (this.connectionStatus.mode !== "api") {
         this.postMessage({
           type: "orpcResponse",
@@ -1610,7 +1636,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         return;
       }
 
-      const result = await procedure(args.input, {
+      const result = await procedure(sanitized.input, {
         signal: controller.signal,
         lastEventId: args.lastEventId,
       });
@@ -1645,7 +1671,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         requestId: args.requestId,
         ok: true,
         kind: "value",
-        value: result,
+        value: redactWebviewOrpcResult(args.path, result),
       });
     } catch (error) {
       if (controller.signal.aborted) {

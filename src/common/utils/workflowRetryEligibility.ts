@@ -56,6 +56,13 @@ export function canRetryWorkflowFromCheckpoint(run: WorkflowRunRecord | null | u
  * runner raised; the run's latest error is that text, optionally prefixed by
  * the error name when the sandbox rethrew it. Only those two exact forms
  * count: an author-thrown error that merely embeds the message does not.
+ *
+ * Known limitations (accepted in #4363, not bugs to patch here):
+ * - A first attempt that fails before admission writes no step record, so it is not
+ *   checkpoint-retryable; nothing was admitted or billed, and a fresh run is the remedy.
+ *   Changing that needs a persisted, runner-decided failure classification.
+ * - Only this run's own steps are inspected: a child run's failed `evaluate()` does not make
+ *   the parent's nested-workflow step retryable from checkpoint.
  */
 function findFailedEvaluationAdmission(
   run: WorkflowRunRecord,

@@ -13,6 +13,7 @@ import { UserMessage } from "xum/browser/features/Messages/UserMessage";
 export function DisplayedMessageRenderer(props: {
   message: DisplayedMessage;
   workspaceId: string | null;
+  isLatestProposePlan?: boolean;
 }): JSX.Element | null {
   const message = props.message;
 
@@ -45,7 +46,13 @@ export function DisplayedMessageRenderer(props: {
     }
 
     case "tool":
-      return <ToolMessage message={message} workspaceId={props.workspaceId ?? undefined} />;
+      return (
+        <ToolMessage
+          message={message}
+          workspaceId={props.workspaceId ?? undefined}
+          isLatestProposePlan={props.isLatestProposePlan}
+        />
+      );
 
     case "compaction-boundary":
       // The webview does not render compaction boundaries.

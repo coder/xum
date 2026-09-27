@@ -1178,7 +1178,7 @@ describe("backup adapters", () => {
     });
 
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "light" } } };
-    // A swallowed write failure: the edit callback runs, editConfig resolves, and the
+    // A write that did not land: the edit callback runs, editConfig resolves, and the
     // stored config never changes.
     spyOn(config, "editConfig").mockImplementation((edit) => {
       edit(config.state);

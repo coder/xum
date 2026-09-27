@@ -37,6 +37,9 @@ import type { TelemetryService } from "@/node/services/telemetryService";
 import { MAX_EDITED_FILES } from "@/common/constants/attachments";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { log } from "@/node/services/log";
+import { fitCompactionSummaryToHistoryRow, type FittedCompactionSummary } from "./historyRowBudget";
+import { countTokens } from "@/node/utils/main/tokenizer";
+import { getErrorMessage } from "@/common/utils/errors";
 import { computeRecencyFromMessages } from "@/common/utils/recency";
 import {
   extractEditedFileDiffs,
@@ -401,11 +404,8 @@ export class CompactionHandler {
       "heartbeat reset boundary must compute a positive compaction epoch"
     );
 
-    const summaryMessage = createMuxMessage(
-      createCompactionSummaryMessageId(),
-      "assistant",
-      boundaryText,
-      {
+    const summaryMessage = this.fitBoundarySummary(
+      createMuxMessage(createCompactionSummaryMessageId(), "assistant", boundaryText, {
         timestamp: Date.now(),
         synthetic: true,
         uiVisible: true,
@@ -416,8 +416,8 @@ export class CompactionHandler {
           type: "compaction-summary",
           pendingFollowUp,
         },
-      }
-    );
+      })
+    ).message;
 
     assert(
       summaryMessage.metadata?.compacted === "heartbeat",
@@ -654,7 +654,7 @@ export class CompactionHandler {
     });
 
     // Notify that compaction completed (clears idle compaction pending state)
-    this.onCompactionComplete?.(result.data);
+    this.onCompactionComplete?.(result.data.completion);
 
     // Report the idle-compaction success only after the summary is actually persisted,
     // so the idle loop's failure streak is reset on real success (not just stream end).
@@ -662,7 +662,26 @@ export class CompactionHandler {
 
     // Emit a sanitized stream-end so UI can close streaming state without
     // re-introducing stale provider metadata from the pre-compaction row.
-    this.emitChatEvent(this.sanitizeCompactionStreamEndEvent(event));
+    // When the boundary truncated the summary, carry the persisted text: a renderer that missed
+    // stream-start rebuilds the message from these parts and must not restore it (#4551).
+    const persistedTextParts = result.data.summaryParts.filter((part) => part.type === "text");
+    const truncated = persistedTextParts.map((part) => part.text).join("") !== summary;
+    const streamEnd = this.sanitizeCompactionStreamEndEvent(
+      truncated
+        ? {
+            ...event,
+            parts: [...event.parts.filter((part) => part.type !== "text"), ...persistedTextParts],
+          }
+        : event
+    );
+    if (truncated) {
+      const { contextUsage: _fullSummaryEstimate, ...rest } = streamEnd.metadata;
+      streamEnd.metadata = {
+        ...rest,
+        ...(result.data.summaryContextUsage && { contextUsage: result.data.summaryContextUsage }),
+      };
+    }
+    this.emitChatEvent(streamEnd);
     return true;
   }
 
@@ -709,7 +728,9 @@ export class CompactionHandler {
     usage: LanguageModelV2Usage | undefined,
     contextUsage: LanguageModelV2Usage | undefined,
     providerMetadata: Record<string, unknown> | undefined,
-    contextProviderMetadata: Record<string, unknown> | undefined
+    contextProviderMetadata: Record<string, unknown> | undefined,
+    /** Token count of the summary the boundary kept, when the row budget cut it (#4551). */
+    keptSummaryTokens?: number
   ): LanguageModelV2Usage | undefined {
     // totalUsage and contextUsage resolve independently with separate timeout/error
     // paths, so usage can be missing while contextUsage is still available.
@@ -724,10 +745,15 @@ export class CompactionHandler {
       this.getOpenAIReasoningTokens(providerMetadata) ??
       0;
     const reasoningTokens = usageForEstimate?.reasoningTokens ?? providerReasoningTokens;
-    const summaryTokens = Math.max(0, totalSummaryOutputTokens - reasoningTokens);
-    if (summaryTokens <= 0) {
+    const generatedSummaryTokens = Math.max(0, totalSummaryOutputTokens - reasoningTokens);
+    if (generatedSummaryTokens <= 0) {
       return undefined;
     }
+    // Tokens the boundary truncated away are not in the next request's context.
+    const summaryTokens =
+      keptSummaryTokens === undefined
+        ? generatedSummaryTokens
+        : Math.min(generatedSummaryTokens, keptSummaryTokens);
 
     const systemTokens = systemMessageTokens ?? 0;
     const estimatedInputTokens = systemTokens + summaryTokens;
@@ -791,6 +817,26 @@ export class CompactionHandler {
     return null;
   }
 
+  /**
+   * Keep every boundary this handler writes within the history line limit when possible (#4551).
+   * Applied where the message is built, so the persisted row, the emitted chat event and the
+   * provider view all carry the same (possibly truncated) summary.
+   */
+  private fitBoundarySummary(message: MuxMessage): FittedCompactionSummary {
+    const fitted = fitCompactionSummaryToHistoryRow(message, this.workspaceId);
+    if (fitted.truncated || fitted.rowExceedsLimit) {
+      log.warn("Compaction boundary summary did not fit the history line budget", {
+        workspaceId: this.workspaceId,
+        messageId: message.id,
+        rowBytes: fitted.rowBytes,
+        summaryOriginalBytes: fitted.truncated?.originalBytes,
+        summaryKeptBytes: fitted.truncated?.keptBytes,
+        rowExceedsLimit: fitted.rowExceedsLimit,
+      });
+    }
+    return fitted;
+  }
+
   /** The rolling summarizer already paid for this text; applying it must not start another turn. */
   buildContinuousCompactionRows(params: {
     boundaryMessageId?: string;
@@ -846,9 +892,13 @@ export class CompactionHandler {
   ): Promise<boolean> {
     const shouldPersist = params.shouldPersist;
     const previousBoundaryHistorySequence = getLatestBoundaryHistorySequence(params.messages);
-    const { boundary, copies } = params.prepared
+    const built = params.prepared
       ? structuredClone(params.prepared)
       : this.buildContinuousCompactionRows(params);
+    // Bound here, not in the builder: a journaled boundary gets its pending follow-up only
+    // after it was built, and the follow-up counts toward the row size.
+    const boundary = this.fitBoundarySummary(built.boundary).message;
+    const copies = built.copies;
     const inputTokens =
       params.systemMessageTokens +
       params.attachmentTokens +
@@ -925,7 +975,17 @@ export class CompactionHandler {
     compactionRequestMessageId: string,
     isIdleCompaction = false,
     pendingFollowUp?: CompactionFollowUpRequest
-  ): Promise<Result<CompactionCompletionMetadata, string>> {
+  ): Promise<
+    Result<
+      {
+        completion: CompactionCompletionMetadata;
+        /** Persisted boundary content; differs from the stream when the row budget cut it. */
+        summaryParts: MuxMessage["parts"];
+        summaryContextUsage: LanguageModelV2Usage | undefined;
+      },
+      string
+    >
+  > {
     assert(summary.trim().length > 0, "performCompaction requires a non-empty summary");
     assert(metadata.model.trim().length > 0, "Compaction summary requires a model");
     assert(
@@ -986,7 +1046,7 @@ export class CompactionHandler {
       metadata.contextProviderMetadata
     );
 
-    const summaryMessage = createMuxMessage(
+    const builtSummaryMessage = createMuxMessage(
       persistedStreamSummary?.id ?? createCompactionSummaryMessageId(),
       "assistant",
       summary,
@@ -1012,10 +1072,38 @@ export class CompactionHandler {
       }
     );
     if (persistedSummaryHistorySequence !== undefined) {
-      summaryMessage.metadata = {
-        ...(summaryMessage.metadata ?? {}),
+      builtSummaryMessage.metadata = {
+        ...(builtSummaryMessage.metadata ?? {}),
         historySequence: persistedSummaryHistorySequence,
       };
+    }
+    const fitted = this.fitBoundarySummary(builtSummaryMessage);
+    const summaryMessage = fitted.message;
+    if (fitted.truncated && summaryMessage.metadata?.contextUsage) {
+      // The meter and next-send budget read this estimate: count the kept text itself (a byte
+      // ratio misjudges token-dense prefixes). If counting fails, keep the full estimate.
+      const keptText = summaryMessage.parts
+        .filter((part) => part.type === "text")
+        .map((part) => part.text)
+        .join("");
+      let keptSummaryTokens: number | undefined;
+      try {
+        // Count with the request-pinned identity, as StreamManager does for custom providers.
+        keptSummaryTokens = await countTokens(metadata.metadataModel ?? metadata.model, keptText);
+      } catch (error) {
+        log.warn("Failed to count truncated compaction summary tokens", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+      summaryMessage.metadata.contextUsage = this.computePostCompactionContextEstimate(
+        metadata.systemMessageTokens,
+        metadata.usage,
+        metadata.contextUsage,
+        metadata.providerMetadata,
+        metadata.contextProviderMetadata,
+        keptSummaryTokens
+      );
     }
 
     assert(
@@ -1094,13 +1182,17 @@ export class CompactionHandler {
     }
 
     return Ok({
-      workspaceId: this.workspaceId,
-      summaryMessageId: summaryMessage.id,
-      summaryHistorySequence: persistedSequence,
-      compactionEpoch: nextCompactionEpoch,
-      previousBoundaryHistorySequence,
-      compactionRequestMessageId,
-      preservedTailMessageCount: preservedTailCopies.length,
+      completion: {
+        workspaceId: this.workspaceId,
+        summaryMessageId: summaryMessage.id,
+        summaryHistorySequence: persistedSequence,
+        compactionEpoch: nextCompactionEpoch,
+        previousBoundaryHistorySequence,
+        compactionRequestMessageId,
+        preservedTailMessageCount: preservedTailCopies.length,
+      },
+      summaryParts: persisted.parts,
+      summaryContextUsage: persisted.metadata?.contextUsage,
     });
   }
 

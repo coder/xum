@@ -2006,6 +2006,36 @@ describe("WorkspaceService unarchive snapshot restore", () => {
     expect(result).toEqual(Err("restore failed"));
   });
 
+  test("unarchive() keeps the restore error when the rollback write also fails (#4748)", async () => {
+    let restoreAttempted = false;
+    workspaceService.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => {
+        restoreAttempted = true;
+        return Promise.resolve(Err("restore failed"));
+      }),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+    // Only the rollback write (the first edit after the failed restore) fails.
+    const realEdit = harness.config.editConfig.bind(harness.config);
+    spyOn(harness.config, "editConfig").mockImplementation((fn, options) =>
+      restoreAttempted ? Promise.reject(new Error("rollback write failed")) : realEdit(fn, options)
+    );
+    const published: Array<string | undefined> = [];
+    workspaceService.on("metadata", (event: { metadata: { unarchivedAt?: string } | null }) =>
+      published.push(event.metadata?.unarchivedAt)
+    );
+
+    const result = await workspaceService.unarchive(workspaceId);
+
+    // The caller needs the restore failure, and the UI must learn what disk now says.
+    expect(result).toEqual(Err("restore failed"));
+    const entry = harness.config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+    expect(entry?.unarchivedAt).toBeDefined();
+    expect(published.at(-1)).toBe(entry?.unarchivedAt);
+  });
+
   test("unarchive() rolls back legacy path-only entries when snapshot restore fails", async () => {
     const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
     workspaceService.setWorktreeArchiveSnapshotService({

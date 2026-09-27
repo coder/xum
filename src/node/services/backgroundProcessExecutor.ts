@@ -36,6 +36,7 @@ import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { getErrorMessage } from "@/common/utils/errors";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 
 /**
  * Quote a path for shell commands.
@@ -67,6 +68,8 @@ export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
  */
 const FALLBACK_CWD = process.platform === "win32" ? (process.env.TEMP ?? "C:\\") : "/tmp";
 const BACKGROUND_CWD_ENV = "XUM_INTERNAL_BACKGROUND_CWD";
+// Upper bound on waiting for a killed migrated process to report its exit.
+const MIGRATED_PROCESS_EXIT_JOIN_MS = 5_000;
 
 /** Helper to extract error message for logging */
 function errorMsg(error: unknown): string {
@@ -602,6 +605,8 @@ export interface MigrateOptions {
   existingOutput: string[];
   /** Human-readable name for the process */
   displayName?: string;
+  /** Kills the running process tree (the foreground exec's abort); see MigratedBackgroundHandle.terminate */
+  kill?: () => void;
 }
 
 /**
@@ -648,7 +653,7 @@ export async function migrateToBackground(
     await fs.writeFile(outputPath, options.existingOutput.join("\n") + "\n");
 
     // Create handle that will continue writing to file
-    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath);
+    const handle = new MigratedBackgroundHandle(execStream, outputDir, outputPath, options.kill);
 
     // Start consuming remaining output in background
     handle.startConsuming();
@@ -678,7 +683,8 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   constructor(
     private readonly execStream: ExecStream,
     public readonly outputDir: string,
-    private readonly outputPath: string
+    private readonly outputPath: string,
+    private readonly kill?: () => void
   ) {}
 
   /**
@@ -763,8 +769,15 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   }
 
   async terminate(): Promise<void> {
-    // ExecStream doesn't expose a kill method directly
-    // Cancel the streams to stop reading (process continues but we stop tracking)
+    // ExecStream has no kill method, so the foreground exec's abort is passed in. Workspace
+    // removal terminates processes before deleting the checkout (#4760), so kill the process
+    // and join its exit (bounded: a remote exec may never report one) before returning.
+    if (this.kill) {
+      this.kill();
+      await raceWithAbortAndTimeout(this.execStream.exitCode, {
+        timeoutMs: MIGRATED_PROCESS_EXIT_JOIN_MS,
+      }).catch(() => undefined);
+    }
     try {
       await this.execStream.stdout.cancel();
       await this.execStream.stderr.cancel();

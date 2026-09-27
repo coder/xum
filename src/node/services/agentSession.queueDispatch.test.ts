@@ -142,6 +142,16 @@ describe("AgentSession queued message tool-call dispatch", () => {
         expect(
           h.events.filter((event) => event.type === "restore-to-input").map((event) => event.text)
         ).toEqual([phase === "failed flush" ? "later input" : "first input\nlater input"]);
+        // #4448: exactly the restored input is held until a composer takes it. A send whose
+        // bytes survived the failed flush is not held: Send would deliver it twice.
+        expect(h.session.getHeldInputs().map((held) => [held.reason, held.send.message])).toEqual(
+          phase === "failed flush"
+            ? [["interrupted", "later input"]]
+            : [
+                ["interrupted", "first input"],
+                ["interrupted", "later input"],
+              ]
+        );
         const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
         expect(history.success && history.data.filter((row) => row.role === "user")).toHaveLength(
           phase === "failed flush" ? 1 : 0
@@ -510,7 +520,19 @@ describe("AgentSession queued message tool-call dispatch", () => {
             text: `${restoreAt === "raw command" ? "/init" : "first\nsecond"}\nlater input`,
             fileParts: [...fileParts, ...laterFileParts],
             reviews,
+            heldInputIds: h.session.getHeldInputs().map((held) => held.id),
           },
+        ]);
+        // The dequeued send and the later entry are each held with their own send (#4448).
+        expect(
+          h.session.getHeldInputs().map((held) => ({
+            reason: held.reason,
+            message: held.send.message,
+            fileParts: held.send.options.fileParts,
+          }))
+        ).toEqual([
+          { reason: "interrupted", message: "first\nsecond", fileParts },
+          { reason: "interrupted", message: "later input", fileParts: laterFileParts },
         ]);
         expect(await h.historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
         expect(stream).not.toHaveBeenCalled();
@@ -524,6 +546,51 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }
     }
   );
+
+  // #4448: restore-to-input is a one-shot event the composer may not take (edit mode, not
+  // mounted, not subscribed), so the backend keeps the input until a composer acknowledges it.
+  test("a restore keeps the user's input as held input until a composer releases it", async () => {
+    const h = await createAgentSessionHarness({
+      workspaceId: "queue-restore-held",
+      captureEvents: true,
+    });
+    try {
+      h.session.queueMessage("queued follow-up", { model: TEST_MODEL, agentId: "exec" });
+      h.session.queueMessage(
+        "background wake",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true, acceptanceOrigin: "automatic" }
+      );
+      const firstNewEvent = h.events.length;
+
+      h.session.restoreQueueToInput();
+
+      const held = h.session.getHeldInputs();
+      expect(held.map((input) => [input.reason, input.send.displayText])).toEqual([
+        ["interrupted", "queued follow-up"],
+      ]);
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      // The restore names the held input and precedes the held list, so a composer that takes it
+      // hides it before the renderer would show a banner; the queue clear comes first of all.
+      const events = h.events.slice(firstNewEvent);
+      expect(events.map((event) => event.type)).toEqual([
+        "queued-message-changed",
+        "restore-to-input",
+        "held-inputs-changed",
+      ]);
+      expect(events[1]).toMatchObject({ text: "queued follow-up", heldInputIds: [held[0].id] });
+      expect(events[2]).toMatchObject({
+        heldInputs: [{ id: held[0].id, reason: "interrupted", displayText: "queued follow-up" }],
+      });
+      expect(h.session.hasPendingUserInput()).toBe(true);
+
+      expect(h.session.discardHeldInput(held[0].id)).toBe("discarded");
+      expect(h.session.hasPendingUserInput()).toBe(false);
+    } finally {
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
 
   test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
     const successor = Promise.withResolvers<void>();
@@ -2034,6 +2101,10 @@ describe("AgentSession queued message tool-call dispatch", () => {
       }),
       checkMidStream: () => false,
       resetForNewStream: () => undefined,
+      noteUserTurn: () => undefined,
+      noteAutoCompactionRequested: () => undefined,
+      noteAutoCompactionCompleted: () => undefined,
+      suppressRepeatedAutoCompaction: () => false,
     } as unknown as CompactionMonitor;
 
     try {

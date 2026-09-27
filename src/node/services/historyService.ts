@@ -6,6 +6,7 @@ import {
 import {
   SESSION_HISTORY_MAX_SCAN_BYTES,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
 } from "@/common/constants/contextBudget";
 import {
   hasRawResetMarker,
@@ -14,6 +15,7 @@ import {
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
+  readProviderHistorySuffix,
   readCompactionPendingHistoryBoundary,
   readCompactionPendingHistoryObservation,
   readHistoryControlEvidenceFromLatestBoundary,
@@ -1655,7 +1657,8 @@ export class HistoryService {
   private static readonly REVERSE_READ_CHUNK_SIZE = 256 * 1024;
   /** String-search needles for context boundary lines. */
   private static readonly BOUNDARY_NEEDLES = [
-    '"compactionBoundary":true',
+    // Shared with the provider scanner so rotation and provider reads recognize the same rows.
+    SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
     `"contextBoundaryKind":"${CONTEXT_BOUNDARY_KINDS.RESET}"`,
   ] as const;
 
@@ -2546,6 +2549,37 @@ export class HistoryService {
       const message = getErrorMessage(error);
       return Err(`Failed to read history from boundary: ${message}`);
     }
+  }
+
+  /**
+   * A suffix of getHistoryFromLatestBoundary(workspaceId) holding at least `minMatching` rows
+   * that satisfy `matches` (or the whole read when it has fewer), so trailing-window readers
+   * (sidebar status) do not parse the whole active epoch under the lock (#4720).
+   */
+  async getHistorySuffixFromLatestBoundary(
+    workspaceId: string,
+    minMatching: number,
+    matches: (message: MuxMessage) => boolean
+  ): Promise<Result<MuxMessage[]>> {
+    // No ensureSealedHistoryRotatedUnlocked: the bounded read needs rotation neither for
+    // correctness nor for boundedness, and a background tick must stay read-only instead of
+    // paying a one-time full-file scan under the cross-process write lock. Boundary writes,
+    // replay and provider requests still rotate.
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history suffix from boundary",
+      async () =>
+        Ok(
+          await readProviderHistorySuffix(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            minMatching,
+            matches
+          )
+        )
+    );
   }
 
   /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */
@@ -4240,6 +4274,31 @@ export class HistoryService {
   }
 
   /**
+   * Guarded append: append `message` only while `admits()` returns true, evaluated under the same
+   * write lock (the in-process mutex plus the cross-process lockfile every backend on this Xum
+   * home takes) right before the write. Any backend's history mutation thus lands wholly before
+   * the check or wholly after this append (#4414). `admits` must be a synchronous, pure read of
+   * state outside history (e.g. a strict config read): it runs holding this workspace's history
+   * lock, so calling back into HistoryService deadlocks. A refusal is an expected outcome.
+   */
+  async appendToHistoryIf(
+    workspaceId: string,
+    message: MuxMessage,
+    admits: () => boolean
+  ): Promise<Result<"appended" | "refused">> {
+    return this.withRecoveredHistoryWriteResultLock<"appended" | "refused">(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        if (!admits()) return Ok("refused");
+        const appended = await this.appendToHistoryUnderWriteLock(workspaceId, message);
+        if (!appended.success) return Err(appended.error);
+        return Ok("appended");
+      }
+    );
+  }
+
+  /**
    * Update an existing message in history by historySequence
    * Reads the active chat.jsonl, replaces the matching message, and rewrites the file.
    *
@@ -4801,6 +4860,20 @@ export class HistoryService {
         this.sequenceCounters.set(workspaceId, seq + 1);
         appended.set(copy, persistedCopy);
         messages.push(persistedCopy);
+      }
+
+      // The only place that sees the boundary's final bytes (#4551): history scanners skip rows
+      // over the line limit, so say so when a large pending follow-up keeps the row oversized.
+      const boundaryRowBytes = Buffer.byteLength(
+        JSON.stringify({ ...persistedSummary, workspaceId }),
+        "utf8"
+      );
+      if (boundaryRowBytes > SESSION_HISTORY_MAX_LINE_BYTES) {
+        log.warn("Compaction boundary row exceeds the history line limit", {
+          workspaceId,
+          messageId: persistedSummary.id,
+          rowBytes: boundaryRowBytes,
+        });
       }
 
       // Final admission or rename can fail: keep caller rows retryable until the boundary is

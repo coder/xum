@@ -262,6 +262,8 @@ export interface WorkspaceCreationResult {
   error?: string;
   /** Set when deferMaterialization left populating the checkout to materializeWorkspace(). */
   pendingMaterialization?: PendingMaterialization;
+  /** This creation made the branch, so undoing the creation may delete it (#4745). */
+  createdBranch?: boolean;
 }
 
 /**
@@ -331,6 +333,8 @@ export interface WorkspaceForkResult {
   workspacePath?: string;
   /** Branch that was forked from */
   sourceBranch?: string;
+  /** This fork made the new branch, so undoing the fork may delete it (#4775). */
+  createdBranch?: boolean;
   /** Error message (if failed) */
   error?: string;
   /** Runtime config for the forked workspace (if different from source) */
@@ -619,6 +623,8 @@ export interface Runtime {
    * @param oldName Current workspace name
    * @param newName New workspace name
    * @param abortSignal Optional abort signal for cancellation
+   * @param options.renameBranch Undoing an earlier rename (#4779): rename the tracked branch back
+   *   exactly when that rename reported `branchRenamed`, instead of re-deriving it from names.
    * @returns Promise resolving to Result with old/new paths on success, or error message
    */
   renameWorkspace(
@@ -626,9 +632,11 @@ export interface Runtime {
     oldName: string,
     newName: string,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   >;
 
   /**
@@ -652,7 +660,9 @@ export interface Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }>;
 
   /**
@@ -703,10 +713,22 @@ export interface Runtime {
    * Returns empty record for runtimes that don't need env forwarding (local, ssh).
    */
   getContainerEnv?(): Record<string, string>;
+
+  /**
+   * Whether a failed exec's exit came from the transport itself (host
+   * unreachable) rather than the command, e.g. OpenSSH exit 255. Callers that
+   * build their own exec probes use it so an unreachable host never reads as
+   * "absent" (#4438). Runtimes without such a transport omit it.
+   */
+  isTransportFailureExit?(exitCode: number, stderr: string): boolean;
 }
 
 /**
- * Error thrown by runtime implementations
+ * Error thrown by runtime implementations.
+ *
+ * `type: "network"` means a transport failure: the remote host could not be
+ * reached or the channel failed, so the state of the file or command is
+ * unknown. Callers must never read it as "file missing" (#4438).
  */
 export class RuntimeError extends Error {
   constructor(
@@ -724,4 +746,15 @@ export class RuntimeError extends Error {
     super(message, cause !== undefined ? { cause } : undefined);
     this.name = "RuntimeError";
   }
+}
+
+/**
+ * True when a runtime operation failed in transport (see RuntimeError), so a
+ * fallback chain must stop instead of treating the target as absent.
+ *
+ * SSH2 also reports aborted execs as "network": callers that own an abort
+ * signal check it first, as they already do for missing-candidate fallbacks.
+ */
+export function isRuntimeTransportError(error: unknown): error is RuntimeError {
+  return error instanceof RuntimeError && error.type === "network";
 }

@@ -17,6 +17,7 @@ import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
 import { log } from "../log";
+import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { ContinuousStrategy } from "./strategies/continuous";
 import { SummarizeStrategy } from "./strategies/summarize";
 import { resolveContextStrategy } from "./selection";
@@ -187,6 +188,16 @@ export class SessionContextController {
       input.stream.contextBudgetFlushTurn
       ? (step: SettledStepBudget) => this.tokenBudget.onContextBudgetStepSettled(step)
       : undefined;
+  }
+
+  /** A real user turn re-arms auto-compaction after one that brought no relief (#4421). */
+  noteUserTurn(): void {
+    this.compactionMonitor.noteUserTurn();
+  }
+
+  /** An auto-compaction boundary was published: arm the no-relief guard (#4421). */
+  noteAutoCompactionCompleted(): void {
+    this.compactionMonitor.noteAutoCompactionCompleted();
   }
 
   onStreamStarting(): void {
@@ -361,6 +372,10 @@ export class SessionContextController {
     });
 
     if (shouldInterruptForCompaction) {
+      // The no-relief guard (#4421) arms only if this compaction completes.
+      this.compactionMonitor.noteAutoCompactionRequested(
+        threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
+      );
       await this.summarize.interruptForCompaction();
     }
   }
@@ -436,8 +451,19 @@ export class SessionContextController {
     // An explicit replacement instead publishes its witness before compaction can hide debt.
     if (
       shouldCompactBeforeSend &&
-      (input.replacement || !(await this.host.isCompactionRecoveryBlocked()))
+      (input.replacement || !(await this.host.isCompactionRecoveryBlocked())) &&
+      !this.compactionMonitor.suppressRepeatedAutoCompaction(
+        "on-send",
+        compactionResult.usagePercentage
+      )
     ) {
+      // Relief means a live reading under the level that triggered this compaction; the guard
+      // (#4421) arms only if the compaction completes.
+      this.compactionMonitor.noteAutoCompactionRequested(
+        continuousContext.enabled
+          ? threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
+          : compactionResult.thresholdPercentage
+      );
       this.reset("legacy-fallback");
       const followUpFileParts = input.fileParts?.map((part) => ({
         url: part.url,

@@ -258,6 +258,14 @@ export function getIsoNow(): string {
   return new Date().toISOString();
 }
 
+/**
+ * A removal bound to the task attempt its caller confirmed (#4478): WorkspaceService.remove
+ * refuses when the row names another attempt by the time it closes admission.
+ */
+export interface RemovalAttemptBinding {
+  expectedAttemptId: string | undefined;
+}
+
 export interface ArchiveWorkspaceOptions {
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
@@ -358,6 +366,11 @@ export interface SendMessageInternalOptions {
    */
   admissionStale?: () => boolean;
   /**
+   * Synthetic wakes whose caller restrictions or in-memory guards a durable compaction follow-up
+   * cannot preserve skip on-send compaction (see AgentSession SendMessageInternalOptions).
+   */
+  skipOnSendCompaction?: boolean;
+  /**
    * Obligation minted by TaskService for a send it fenced itself (task launch). When absent on a
    * send into an agent-task workspace, WorkspaceService asks TaskService for one at the session
    * handoff (admitTaskWorkspaceTurn) so every task-workspace send is accounted for.
@@ -441,6 +454,8 @@ export interface WorkspaceTurnHost {
     options?: {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
+      /** See WorkspaceService.replaceHistory. */
+      admitsAppend?: () => boolean;
     }
   ): Promise<Result<void>>;
   waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void>;
@@ -674,9 +689,13 @@ export interface WorkspaceLifecycleHost {
   remove(
     workspaceId: string,
     force?: boolean,
-    options?: { beforeRemove?: () => Promise<boolean> }
+    options?: { beforeRemove?: () => Promise<boolean | RemovalAttemptBinding> }
   ): Promise<Result<void>>;
-  removeWhileTaskTreeLocked(workspaceId: string, force?: boolean): Promise<Result<void>>;
+  removeWhileTaskTreeLocked(
+    workspaceId: string,
+    force?: boolean,
+    binding?: RemovalAttemptBinding
+  ): Promise<Result<void>>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */
   deferWorkspaceCleanup(run: () => Promise<void>): void;
 }

@@ -1,9 +1,15 @@
 import { describe, expect, it } from "bun:test";
+import { Effect } from "effect";
 import {
   MEMORY_INTUITION_EVAL_MAX_CHUNKS,
   MEMORY_INTUITION_MAX_EXCERPT_CHARS,
 } from "@/common/constants/memory";
-import { chunkMemoryText, pickChunks } from "./memoryIntuitionEvaluation";
+import {
+  EvaluationError,
+  type EvaluationModelInstance,
+  type EvaluationService,
+} from "./evaluation/evaluationService";
+import { chunkMemoryText, pickChunks, runEvaluationRecall } from "./memoryIntuitionEvaluation";
 
 describe("chunkMemoryText", () => {
   it("splits paragraphs and top-level bullets, keeping nested bullets and dropping bare headings", () => {
@@ -98,5 +104,47 @@ describe("pickChunks", () => {
     expect(picked.filter((chunk) => chunk.path === "/big").map((chunk) => chunk.text)).toEqual(
       big.slice(0, MEMORY_INTUITION_EVAL_MAX_CHUNKS - 1)
     );
+  });
+});
+
+describe("runEvaluationRecall usage", () => {
+  it("records the billed usage of a rejected evaluation answer (#4728)", async () => {
+    const billedUsage = {
+      usage: { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+      usageProviderMetadata: { openai: { reasoningTokens: 2 } },
+    };
+    const service: EvaluationService = {
+      evaluate: () =>
+        Effect.fail(
+          new EvaluationError({ reason: "invalid-output", code: "invalid-response", billedUsage })
+        ),
+    };
+    const usages: unknown[][] = [];
+    const outcome = await runEvaluationRecall({
+      model: Object.create(null) as EvaluationModelInstance,
+      evaluationService: service,
+      cue: "cue",
+      entries: [
+        { path: "/memories/project/a.md", scope: "project", relPath: "a.md", description: "a" },
+      ],
+      readMemoryView: () => Promise.reject(new Error("not reached")),
+      scoreText: () => 0,
+      signal: new AbortController().signal,
+      deadlineAt: Date.now() + 60_000,
+      stats: {
+        indexEntriesConsidered: 0,
+        indexEntriesOmitted: 0,
+        filesRead: 0,
+        bytesRead: 0,
+        steps: 0,
+        elapsedMs: 0,
+        timedOut: false,
+      },
+      onUsage: (...args) => usages.push(args),
+    });
+    expect(outcome.kind).toBe("error");
+    expect(usages).toEqual([
+      [{ inputTokens: 40, outputTokens: 4, totalTokens: 44 }, { openai: { reasoningTokens: 2 } }],
+    ]);
   });
 });

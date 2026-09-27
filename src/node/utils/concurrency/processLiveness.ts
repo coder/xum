@@ -7,6 +7,31 @@
  * or replaced container, rebooted host) is retired and cannot resume before
  * a new one accesses the root. Concurrent cross-domain sharing is
  * unsupported, not prevented.
+ *
+ * CONCURRENT BACKENDS (#4311, #4414, #4446, #4545): two full backends can share one root, the
+ * desktop app beside a `xum server` that started first (the desktop then skips only its API
+ * server) or any pair under XUM_ALLOW_MULTIPLE_INSTANCES=1. One rule governs them:
+ *   A backend turns in-memory knowledge into a durable claim only about state it owns. It
+ *   re-checks the claim's precondition against durable state under the lock that serializes the
+ *   claim's write. It never judges a durable record whose liveness lives in another backend's
+ *   memory; when it would need that knowledge, it leaves the record alone, answers
+ *   "indeterminate", or refuses.
+ * Serialized across backends: config.json edits (editConfig CAS), history appends (the history
+ * write lock), and the crossProcessLock/fileLock kits (including the workspace-turn live-owner
+ * locks and refine-apply.lock). Per process: streams, Stop, owned attempts and settlement
+ * ledgers, send/rename/remove/busy guards, and delegated-turn reservations, so peer admission and
+ * instance discovery honor another backend's delegated turn only as a courtesy (the airtight
+ * version needs a cross-process admission registry, #4476).
+ * Driving one workspace or task from two backends at once is unsupported. Under that misuse two
+ * guarantees still hold for the attempt-fenced orchestration writes (report publication, settlement
+ * receipts, the plan-handoff boundary, task-state transitions): a superseded attempt's writes never
+ * land on its successor, and for a retired attempt a workflow accepts either the late report or the
+ * replacement, never both. Not fenced: the effects of an execution that is already running (its
+ * stream, tool calls, file changes and history rows continue until that backend stops it). Not
+ * guaranteed: a backend's startup recovery re-queues or re-drives `starting`/`running`/
+ * `awaiting_report` sub-agent tasks that a live backend still runs (a duplicate execution);
+ * UIs do not observe the other backend's writes until they resubscribe; mixed Xum versions on one
+ * root (#4480).
  */
 
 import { spawnSync } from "node:child_process";

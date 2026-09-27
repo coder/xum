@@ -48,6 +48,31 @@ def _write_executable(path: Path, content: str) -> None:
     path.chmod(0o755)
 
 
+def _hermetic_git_env(home: Path) -> dict[str, str]:
+    """Return os.environ with Git isolated from the host's configuration.
+
+    mux-run.sh inspects every Git config scope (`git config --list`), so a
+    developer's global or system config (for example `include.path`,
+    `core.pager` or `filter.lfs.*`) would trip its trust guards before the
+    repository config a test plants. Inherited GIT_* variables can also inject
+    config (GIT_CONFIG_COUNT/KEY_n/VALUE_n) or redirect the repository
+    (GIT_DIR), so drop them all.
+    """
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    home.mkdir()
+    env.update(
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+    )
+    return env
+
+
 def _run_mux_runner_smoke(
     tmp_path: Path,
     *,
@@ -75,11 +100,13 @@ def _run_mux_runner_smoke(
     app_root.mkdir()
     project_path.mkdir()
     fake_bin.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(project_path)], check=True)
+    env = _hermetic_git_env(tmp_path / "home")
+    subprocess.run(["git", "init", "-q", str(project_path)], check=True, env=env)
     if repo_git_config is not None:
         subprocess.run(
             ["git", "-C", str(project_path), "config", *repo_git_config],
             check=True,
+            env=env,
         )
     if repo_git_config_bytes is not None:
         with (project_path / ".git/config").open("ab") as config_file:
@@ -149,7 +176,6 @@ exit 99
 """,
     )
 
-    env = os.environ.copy()
     env.update(
         {
             "BUN_INSTALL": str(fake_bun_root),

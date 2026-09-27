@@ -7,7 +7,7 @@ import { tmpdir } from "os";
 import path from "path";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
-import type { Config } from "@/node/config";
+import { configFilePath, type Config } from "@/node/config";
 import { createTestProject, projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
 import type { SessionTimingService } from "./sessionTimingService";
 import type { SessionUsageService } from "./sessionUsageService";
@@ -19,6 +19,8 @@ import { isWorkspaceRemovalTombstoned } from "./workspaceRemoval";
 import { MemoryService } from "./memoryService";
 import { MemoryMetaService } from "./memoryMeta";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import type { TerminalService } from "@/node/services/terminalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as removeManagedGitWorktreeModule from "@/node/worktree/removeManagedGitWorktree";
 import type { WorkspaceServiceHarness } from "./workspaceService.testHarness";
@@ -450,6 +452,86 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
+  // #4478: MCP servers, terminals and background processes run with their cwd in the checkout, so
+  // this process stops them before the checkout is deleted, never after.
+  test("stops this process's MCP servers, terminals and background processes before deleting the checkout", async () => {
+    const calls: string[] = [];
+    const { deleteWorkspace, createRuntimeSpy } = mockDeleteWorkspace();
+    deleteWorkspace.mockImplementation(() => {
+      calls.push("deleteWorkspace");
+      return Promise.resolve({ success: true as const, deletedPath: sharedPath });
+    });
+    try {
+      await using harness = await createChildHarness(undefined);
+      // The terminal admission guard must refuse new terminals while the removal runs: a
+      // terminal starting after the close below would otherwise outlive the checkout.
+      let terminalGuard: ((id: string) => boolean) | undefined;
+      let terminalGuardDuringRemoval: boolean | undefined;
+      harness.service.setMCPServerManager({
+        stopServers: mock((id: string) => {
+          calls.push(`stopServers:${id}`);
+          terminalGuardDuringRemoval ??= terminalGuard?.(id);
+          return Promise.resolve();
+        }),
+      } as unknown as MCPServerManager);
+      harness.service.setTerminalService({
+        setWorkspaceArchiveGuard: mock((guard: (id: string) => boolean) => {
+          terminalGuard = guard;
+        }),
+        closeWorkspaceSessions: mock((id: string) => {
+          calls.push(`closeWorkspaceSessions:${id}`);
+        }),
+      } as unknown as TerminalService);
+      const cleanup = harness.backgroundProcessManager.cleanup.bind(
+        harness.backgroundProcessManager
+      );
+      spyOn(harness.backgroundProcessManager, "cleanup").mockImplementation((id: string) => {
+        calls.push(`backgroundCleanup:${id}`);
+        return cleanup(id);
+      });
+
+      const result = await harness.service.remove(workspaceId, true);
+
+      expect(result.success).toBe(true);
+      const deletedAt = calls.indexOf("deleteWorkspace");
+      expect(deletedAt).toBeGreaterThan(-1);
+      for (const stop of [
+        `stopServers:${workspaceId}`,
+        `closeWorkspaceSessions:${workspaceId}`,
+        `backgroundCleanup:${workspaceId}`,
+      ]) {
+        expect(calls.slice(0, deletedAt)).toContain(stop);
+      }
+      expect(terminalGuardDuringRemoval).toBe(true);
+      expect(terminalGuard?.(workspaceId)).toBe(false);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
+  // #4760: MCP prompt discovery starts stdio servers in the checkout, so a removal refuses
+  // new discoveries while it runs.
+  test("refuses MCP prompt discovery while a removal runs", async () => {
+    const { createRuntimeSpy } = mockDeleteWorkspace();
+    try {
+      await using harness = await createChildHarness(undefined);
+      let admittedDuringRemoval: Disposable | undefined | "unset" = "unset";
+      harness.service.setMCPServerManager({
+        stopServers: mock((id: string) => {
+          admittedDuringRemoval = harness.service.acquireMcpPromptDiscoveryAdmission(id);
+          return Promise.resolve();
+        }),
+      } as unknown as MCPServerManager);
+
+      const result = await harness.service.remove(workspaceId, true);
+
+      expect(result.success).toBe(true);
+      expect(admittedDuringRemoval).toBeUndefined();
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
   async function createParentHarness(
     childTaskStatus: "running" | "queued" | "reported"
@@ -648,7 +730,7 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       }),
     ]);
     if (!options.persistPins) {
-      // Config swallows write failures: a pin that does not land must be
+      // A pin write that does not land must be
       // caught by the removal's verified read-back, so the no-persist variant
       // drops every memory-owner pin from the edits it writes.
       const editConfig = config.editConfig.bind(config);
@@ -733,13 +815,19 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
       const midMetadata = await config.getWorkspaceMetadataById("ws-mid");
       if (midMetadata == null) throw new Error("ws-mid metadata is missing");
       spyOn(aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(midMetadata));
+      const readConfigFile = async () =>
+        (
+          JSON.parse(await fsPromises.readFile(configFilePath(config.rootDir), "utf-8")) as {
+            projects: unknown;
+          }
+        ).projects;
+      const configBefore = await readConfigFile();
       const loadConfigOrDefault = spyOn(config, "loadConfigOrDefault").mockImplementation(
         (options?: { throwOnError?: boolean }) => {
           if (options?.throwOnError === true) throw new Error("config.json unreadable (EIO)");
           return { projects: new Map() };
         }
       );
-      const editConfig = spyOn(config, "editConfig");
       const removeWorkspace = spyOn(config, "removeWorkspace");
       try {
         const refused = await harness.service.remove("ws-mid");
@@ -750,7 +838,9 @@ describe("WorkspaceService remove shared memory owner pinning", () => {
         }
         expect(deleteWorkspace).not.toHaveBeenCalled();
         expect(removeWorkspace).not.toHaveBeenCalled();
-        expect(editConfig).not.toHaveBeenCalled();
+        // The only config writes were the removal's admission marker and its release (#4478,
+        // made on the bytes under the config lock); nothing was pinned from the fallback read.
+        expect(await readConfigFile()).toEqual(configBefore);
 
         // Forced removal accepts the loss and proceeds.
         const forced = await harness.service.remove("ws-mid", true);

@@ -156,6 +156,39 @@ function overridesOnHostFilesystem(config: RuntimeConfig | undefined): boolean {
 }
 
 /**
+ * Seconds after which a devcontainer-side override `rm`/`mv` kills itself.
+ * Those children run in the container, so the host cannot reliably reap them:
+ * a crashed Xum (or a detached `devcontainer exec` CLI) leaves them running,
+ * and a late one could delete a document a successor saved under the lock it
+ * took over (#4481). Removing a few small files takes milliseconds; 5 s keeps
+ * slack for a slow overlay filesystem, stays below the host's own 10 s exec
+ * timeout (so the host sees the container's verdict), and is well below a
+ * realistic takeover: a restarted Xum (or a sibling backend) must notice the
+ * dead holder AND save that workspace's MCP settings.
+ */
+const CONTAINER_MUTATION_KILL_AFTER_S = 5;
+
+/**
+ * Bound a container-side mutation's lifetime from inside the container. Runs
+ * `command` as its own process group (`set -m`) with a watchdog that SIGKILLs
+ * the whole group after `killAfterSeconds`, so no step of a compound command
+ * can run later. Needs only bash (which DevcontainerRuntime.exec already
+ * requires), `sleep`, and bash's `kill`/`wait` builtins: coreutils `timeout`
+ * is not guaranteed in devcontainer images, and busybox variants differ in
+ * syntax. Braced so a failed `cd … &&` prefix skips the whole block.
+ */
+export function boundContainerMutation(
+  command: string,
+  killAfterSeconds = CONTAINER_MUTATION_KILL_AFTER_S
+): string {
+  assert(
+    Number.isInteger(killAfterSeconds) && killAfterSeconds > 0,
+    "killAfterSeconds must be a positive integer"
+  );
+  return `{ set -m; ( ${command} ) & w=$!; ( sleep ${killAfterSeconds}; kill -KILL -- -$w ) 2>/dev/null & k=$!; wait $w; rc=$?; kill -KILL -- -$k 2>/dev/null; exit $rc; }`;
+}
+
+/**
  * Filesystem identity of a runtime config: two workspaces can share a checkout
  * only when this matches AND their paths match. Ignores non-identity fields
  * (e.g. Coder's `existingWorkspace` flag, which forkWorkspace flips on the
@@ -1506,7 +1539,23 @@ export class WorkspaceMcpOverridesService {
       return;
     }
     const paths = MCP_OVERRIDES_GITIGNORE_PATTERNS.map((filePath) => `"${filePath}"`).join(" ");
-    const result = await execBuffered(runtime, `rm -f ${paths}`, {
+    const rm = `rm -f ${paths}`;
+    // Devcontainers stay on exec: a host unlink would follow a symlink the
+    // container swapped in between the guard and the unlink (#4696). The
+    // container-side child is bounded instead (#4481); the host's timeout
+    // below also kills the local `devcontainer exec` process tree.
+    // The bound can kill `rm` between operands, so there the canonical
+    // document goes last (lowest read precedence first), as on the host path.
+    const command =
+      runtimeConfig !== undefined && isDevcontainerRuntime(runtimeConfig)
+        ? boundContainerMutation(
+            `rm -f ${[...MCP_OVERRIDES_GITIGNORE_PATTERNS]
+              .reverse()
+              .map((filePath) => `"${filePath}"`)
+              .join(" ")}`
+          )
+        : rm;
+    const result = await execBuffered(runtime, command, {
       cwd: workspacePath,
       timeout: 10,
     });
@@ -1533,8 +1582,10 @@ export class WorkspaceMcpOverridesService {
     workspacePath: string,
     filePath: string,
     expectedContent: string,
-    hostLocal: boolean
+    runtimeConfig: RuntimeConfig | undefined
   ): Promise<void> {
+    const hostLocal = runtimeConfig !== undefined && isHostLocalRuntimeConfig(runtimeConfig);
+    const inContainer = runtimeConfig !== undefined && isDevcontainerRuntime(runtimeConfig);
     // Host paths are joined with the platform separator (backslashes on
     // Windows) while the candidates are spelled with `/`.
     const normalizedFilePath = filePath.replaceAll("\\", "/");
@@ -1576,7 +1627,12 @@ export class WorkspaceMcpOverridesService {
       return;
     }
     const run = async (command: string): Promise<void> => {
-      const result = await execBuffered(runtime, command, { cwd: workspacePath, timeout: 10 });
+      // Bounded in a devcontainer, like removeOverridesFile.
+      const result = await execBuffered(
+        runtime,
+        inContainer ? boundContainerMutation(command) : command,
+        { cwd: workspacePath, timeout: 10 }
+      );
       if (result.exitCode !== 0) {
         throw new Error(
           `Failed to roll back the migrated override document: ${result.stderr.trim() || `${command.split(" ")[0]} exited with code ${result.exitCode}`}`
@@ -2056,7 +2112,7 @@ export class WorkspaceMcpOverridesService {
               workspacePath,
               canonicalPath,
               content,
-              target.runtimeConfig !== undefined && isHostLocalRuntimeConfig(target.runtimeConfig)
+              target.runtimeConfig
             ).catch((rollbackError: unknown) =>
               log.warn("[MCP] Could not roll back a legacy migration whose epoch signal failed", {
                 workspaceId,

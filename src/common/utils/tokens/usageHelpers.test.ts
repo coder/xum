@@ -212,6 +212,23 @@ describe("accumulateProviderMetadata", () => {
     expect(accumulateProviderMetadata(existing, step)).toBe(step);
   });
 
+  test("keeps the costliest reported OpenAI service tier across steps (#4352)", () => {
+    // A ramp downgrade mid-turn: the aggregate must not price earlier Fast steps at Standard.
+    const downgraded = accumulateProviderMetadata(
+      { openai: { serviceTier: "priority", responseId: "resp_1" } },
+      { openai: { serviceTier: "default", responseId: "resp_2" } }
+    );
+    expect(downgraded).toEqual({ openai: { serviceTier: "priority", responseId: "resp_2" } });
+
+    const upgradedFromFlex = { openai: { serviceTier: "default", responseId: "resp_4" } };
+    expect(
+      accumulateProviderMetadata(
+        { openai: { serviceTier: "flex", responseId: "resp_3" } },
+        upgradedFromFlex
+      )
+    ).toBe(upgradedFromFlex);
+  });
+
   test("sums cache creation tokens when both have them", () => {
     const existing = { anthropic: { cacheCreationInputTokens: 100 } };
     const step = { anthropic: { cacheCreationInputTokens: 50 } };

@@ -74,7 +74,9 @@ export interface ChatInputWorkspaceVariant {
   /** Reviews currently attached to chat (from useReviews hook) */
   attachedReviews?: Review[];
   /** Add a review to the workspace's review store, attached to chat input */
-  onAddReview?: (data: ReviewNoteData) => void;
+  onAddReview?: (data: ReviewNoteData) => Review;
+  /** The composer applied a restore naming these backend held inputs; release them (#4448) */
+  onAcceptRestoredHeldInputs?: (heldInputIds: string[]) => void;
   /** Detach a review from chat input (sets status to pending) */
   onDetachReview?: (reviewId: string) => void;
   /** Detach all attached reviews from chat input */

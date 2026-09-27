@@ -24,6 +24,11 @@ export interface MultiProjectRuntimeEntry {
   projectPath: string;
   projectName: string;
   runtime: Runtime;
+  /**
+   * The operation that built this runtime made this project's branch, so its rollback may
+   * delete it even when the caller keeps branches it cannot attribute (#4775).
+   */
+  createdBranch?: boolean;
 }
 
 export class MultiProjectRuntime implements Runtime {
@@ -195,18 +200,23 @@ export class MultiProjectRuntime implements Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     const errors: string[] = [];
 
     for (const projectRuntime of this.projectRuntimes) {
       try {
+        // A fork rollback must not delete branches it did not create, but should delete the
+        // ones it did, or a retry reuses their stale tips (#4775).
+        const keepBranch = options?.keepBranch === true && projectRuntime.createdBranch !== true;
         const deleteResult = await projectRuntime.runtime.deleteWorkspace(
           projectRuntime.projectPath,
           workspaceName,
           force,
           abortSignal,
-          trusted
+          trusted,
+          options ? { ...options, keepBranch } : undefined
         );
 
         if (!deleteResult.success) {
@@ -399,6 +409,10 @@ export class MultiProjectRuntime implements Runtime {
 
   normalizePath(targetPath: string, basePath: string): string {
     return this.primaryRuntime.normalizePath(targetPath, basePath);
+  }
+
+  isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return this.primaryRuntime.isTransportFailureExit?.(exitCode, stderr) ?? false;
   }
 
   exec(command: string, options: ExecOptions): Promise<ExecStream> {

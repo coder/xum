@@ -23,6 +23,7 @@ import {
 } from "@/node/services/subagentAttemptSettlements";
 import { readSubagentFailureArtifact } from "@/node/services/subagentFailureArtifacts";
 import type { TaskService } from "@/node/services/taskService";
+import { getTaskDepthFromConfig } from "@/node/services/taskUtils";
 import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS } from "@/node/services/taskService";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import {
@@ -646,8 +647,9 @@ describe("TaskService settlement receipt producers (G2)", () => {
     ]);
     const { taskService, svc } = createHarness(config);
     const attemptId = await ownEligibleAttempt(config, taskService, taskId);
-    // Duplicate workspace ids with different parents: the row lookup finds one parent while the
-    // task index (last duplicate wins) walks another. Simulated by a divergent parentById.
+    // The row lookup finds one parent while the task index walks another (duplicate ids no longer
+    // cause this, #4550; the guard stays for any other divergence). Simulated by a divergent
+    // parentById.
     const realIndex = taskService.buildAgentTaskIndex.bind(taskService);
     const indexSpy = spyOn(taskService, "buildAgentTaskIndex").mockImplementation((cfg) => {
       const index = realIndex(cfg);
@@ -664,6 +666,97 @@ describe("TaskService settlement receipt producers (G2)", () => {
       phase: "closing",
     });
     await expectNoReceipt(config, taskId, attemptId);
+  });
+
+  // #4550: persisted config can hold duplicate workspace ids. Receipt fan-out (the task index's
+  // parent chain) must resolve every id to the same row the row lookup returns: the first.
+  test("duplicate ancestor ids: receipt fan-out follows the first row, like the row lookup", async () => {
+    const taskId = "duplicateancestor";
+    const strayRootId = "stray-root-receipts";
+    const { config, projectPath } = await setupTree([
+      {
+        id: taskId,
+        overrides: {
+          taskStatus: "interrupted",
+          taskAttemptId: PREDECESSOR,
+          taskDesktopOwnerWorkspaceId: rootId,
+        },
+      },
+    ]);
+    // A later duplicate of the mid row names another parent (a corrupt, hand-edited or merged
+    // config). Written and read back through the real Config.
+    await config.editConfig((cfg) => {
+      const workspaces = cfg.projects.get(projectPath)!.workspaces;
+      const mid = workspaces.find((workspace) => workspace.id === midId)!;
+      workspaces.push(
+        projectWorkspace(projectPath, "stray-root", strayRootId, {
+          runtimeConfig: { type: "local" },
+        }),
+        { ...mid, parentWorkspaceId: strayRootId }
+      );
+      return cfg;
+    });
+    expect(
+      config
+        .loadConfigOrDefault()
+        .projects.get(projectPath)!
+        .workspaces.filter((workspace) => workspace.id === midId)
+    ).toHaveLength(2);
+    const { taskService, svc } = createHarness(config);
+    expect(
+      taskService.buildAgentTaskIndex(config.loadConfigOrDefault()).parentById.get(midId)
+    ).toBe(rootId);
+    const attemptId = await ownEligibleAttempt(config, taskService, taskId);
+
+    await svc.releaseSharedDesktopTaskOnUserStop(taskId, svc.resolveStreamAttemptAtEvent(taskId));
+
+    expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      attemptId,
+      phase: "settled",
+    });
+    for (const owner of OWNERS) {
+      expect(
+        (
+          await readSubagentAttemptSettlementReceiptStrict(
+            ownerDir(config, owner),
+            taskId,
+            attemptId
+          )
+        ).kind
+      ).toBe("found");
+    }
+    expect(
+      await readSubagentAttemptSettlementReceiptStrict(
+        ownerDir(config, strayRootId),
+        taskId,
+        attemptId
+      )
+    ).toEqual({ kind: "not_found" });
+  });
+
+  test("duplicate task ids: a row whose first occurrence is not a task is not indexed as one", async () => {
+    const { config, projectPath } = await setupTree([]);
+    const shadowedId = "shadowed-root";
+    // The first row is an ordinary root workspace; a later duplicate claims to be mid's child.
+    await config.editConfig((cfg) => {
+      const workspaces = cfg.projects.get(projectPath)!.workspaces;
+      workspaces.push(
+        projectWorkspace(projectPath, "shadowed", shadowedId, { runtimeConfig: { type: "local" } }),
+        projectWorkspace(projectPath, "shadowed-dup", shadowedId, {
+          parentWorkspaceId: midId,
+          agentId: "explore",
+          runtimeConfig: { type: "local" },
+        })
+      );
+      return cfg;
+    });
+    const { taskService } = createHarness(config);
+    const index = taskService.buildAgentTaskIndex(config.loadConfigOrDefault());
+    expect(index.byId.has(shadowedId)).toBe(false);
+    expect(index.parentById.has(shadowedId)).toBe(false);
+    expect(index.childrenByParent.get(midId) ?? []).not.toContain(shadowedId);
+    // The nesting-depth walk resolves it the same way: a root, not mid's child.
+    expect(getTaskDepthFromConfig(config.loadConfigOrDefault(), shadowedId)).toBe(0);
   });
 
   test("idle Stop rejects its own waiters, never a successor's registered during the receipt write", async () => {

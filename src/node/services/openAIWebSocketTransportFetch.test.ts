@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   consumeCapturedRequestHeaders,
+  consumeRedactedRequestBody,
   DEVTOOLS_RUN_METADATA_ID_HEADER,
   DEVTOOLS_STEP_ID_HEADER,
 } from "./devToolsHeaderCapture";
@@ -179,6 +180,28 @@ describe("createOpenAIWebSocketTransportFetch", () => {
     expect(webSocketHeaders.get(DEVTOOLS_RUN_METADATA_ID_HEADER)).toBeNull();
     const captured = consumeCapturedRequestHeaders("step-ws-1");
     expect(captured).toEqual({ authorization: "[REDACTED]" });
+  });
+
+  test("captures the body of a Request input for failed-step debug evidence", async () => {
+    const transport = createOpenAIWebSocketTransportFetch({
+      enabled: true,
+      baseFetch: createTestFetch(() => Promise.resolve(new Response("base"))),
+      createWebSocketFetch: () =>
+        createTestWebSocketFetch(() => Promise.resolve(new Response("ws"))),
+    });
+
+    await transport.fetch(
+      new Request("https://api.openai.com/v1/responses", {
+        method: "POST",
+        headers: { [DEVTOOLS_STEP_ID_HEADER]: "step-ws-request" },
+        body: JSON.stringify({ stream: true, api_key: "sk-request-secret" }),
+      })
+    );
+
+    expect(consumeRedactedRequestBody("step-ws-request")).toEqual({
+      stream: true,
+      api_key: "[REDACTED]",
+    });
   });
 
   test("enabled transport keeps non-streaming Responses posts on the base fetch", async () => {

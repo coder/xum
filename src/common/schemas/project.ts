@@ -1,6 +1,8 @@
 import { RuntimeConfigSchema } from "@/common/orpc/schemas/runtime";
 import { WorkspaceMCPOverridesSchema } from "@/common/orpc/schemas/mcp";
 import {
+  AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
+  AgentMessageDispatchModeSchema,
   BestOfGroupSchema,
   ProjectRefSchema,
   UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
@@ -57,6 +59,25 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
+/** A backend's in-flight workspace removal (#4478); see WorkspaceConfigSchema.pendingRemoval. */
+export const PendingRemovalSchema = z.object({
+  removalId: z.string(),
+  // The owning WorkspaceService instance and its process, judged by processLiveness's
+  // judgeHolder so a crashed removal's marker can be taken over.
+  instanceId: z.string(),
+  // A pid judgeHolder can probe; anything else is dropped as malformed at load.
+  pid: z.number().int().positive(),
+  identity: z.object({
+    birth: z.string().nullable(),
+    bootId: z.string().nullable(),
+    pidNs: z.string().nullable(),
+    machineId: z.string().nullable(),
+    platform: z.string().nullable(),
+    hostname: z.string().nullable(),
+  }),
+  at: z.string(),
+});
+
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
@@ -104,6 +125,13 @@ export const WorkspaceConfigSchema = z.object({
   }),
   unrelatedWorkspaceConsent: z.string().optional().meta({
     description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  unrelatedWorkspaceConsentPending: z.literal(true).optional().meta({
+    description:
+      "Set in the same write that registers a new root workspace that gets default unrelated-messaging consent once its setup completes. The grant runs only while this is set and consumes it; an explicit consent toggle (from any backend sharing this root) clears it, so the default can never reverse a choice already made (#4446).",
+  }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
   }),
   parentWorkspaceId: z.string().optional().meta({
     description:
@@ -156,6 +184,10 @@ export const WorkspaceConfigSchema = z.object({
     }),
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
+  }),
+  taskCheckoutUnsanitized: z.boolean().optional().meta({
+    description:
+      "The task's launch could not sanitize its checkout's plugin overrides and the checkout was retained. MCP and sends refuse the task until it is removed; persisted so a restart keeps refusing (#4674).",
   }),
   taskTimeoutFinalizationTokens: z.array(z.string().min(1)).optional().meta({
     description:
@@ -301,6 +333,10 @@ export const WorkspaceConfigSchema = z.object({
       description:
         "Monotonic workflow claim that retired this attempt for replacement. Never cleared; every later admission of the task refuses while it is set.",
     }),
+  pendingRemoval: PendingRemovalSchema.optional().meta({
+    description:
+      "Set by a backend's workspace removal before any destructive effect. Every task admission refuses while it is set; a failed removal clears it, and a removal whose owner process is dead is taken over by the next removal.",
+  }),
   taskTerminalFailure: z.object({ attemptId: z.string(), errorType: z.string() }).optional().meta({
     description:
       "The attempt a terminal stream failure (e.g. model_refusal) ended, written with its interrupted status. Applies only while taskAttemptId still names that attempt.",

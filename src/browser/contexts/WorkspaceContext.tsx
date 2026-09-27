@@ -180,9 +180,15 @@ function migrateLocalGatewayPrefsToBackend(
  *
  * This keeps a workspace's model/thinking consistent across devices/browsers.
  */
-function seedWorkspaceLocalStorageFromBackend(
-  metadata: FrontendWorkspaceMetadata,
-  previous?: FrontendWorkspaceMetadata
+/** The metadata fields the seeding reads; the VS Code webview only receives these (#4738). */
+export type WorkspaceAiSeedSource = Pick<
+  FrontendWorkspaceMetadata,
+  "id" | "agentId" | "agentType" | "parentWorkspaceId" | "aiSettings" | "aiSettingsByAgent"
+>;
+
+export function seedWorkspaceLocalStorageFromBackend(
+  metadata: WorkspaceAiSeedSource,
+  previous?: WorkspaceAiSeedSource
 ): void {
   // Snapshot all main-workspace choices on client load, not on navigation.
   // Later metadata must not overwrite unsent choices; reload to restore backend settings.
@@ -2218,6 +2224,14 @@ export function useWorkspaceMetadata(): WorkspaceMetadataContextValue {
     throw new Error("useWorkspaceMetadata must be used within WorkspaceProvider");
   }
   return context;
+}
+
+/**
+ * Like useWorkspaceMetadata, but returns null outside WorkspaceProvider. For hosts that render
+ * chat components without the full workspace shell (the VS Code webview).
+ */
+export function useOptionalWorkspaceMetadata(): WorkspaceMetadataContextValue | null {
+  return useContext(WorkspaceMetadataContext) ?? null;
 }
 
 /**

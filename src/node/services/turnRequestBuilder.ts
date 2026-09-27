@@ -164,6 +164,7 @@ import type {
 
 import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
@@ -867,6 +868,67 @@ export class TurnRequestBuilder {
     opts: StreamMessageOptions,
     context: TurnRequestBuildContext
   ): Promise<PreparedTurnRequestOutcome> {
+    try {
+      return await this.prepareOrThrow(opts, context);
+    } catch (error) {
+      // #4438: a transport failure while loading instructions, agents or skills
+      // means the remote could not be read, not that the files are missing. Fail
+      // the turn as retryable, like an unreachable host at ensureReady, before any
+      // provider request or assistant row exists.
+      if (!isRuntimeTransportError(error)) throw error;
+      // A canceled remote read is a Stop, not a failure: SSH2 reports aborted
+      // execs as "network", so end the turn as aborted like other startup cancels.
+      if (context.abortSignal.aborted) {
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(
+              context.syntheticMessageId,
+              context.abortSignal
+            )
+          ),
+        };
+      }
+      const errorMessage = `Remote workspace unreachable while loading startup files: ${getErrorMessage(error)}`;
+      context.startupState.logSlowStreamStartup?.({
+        outcome: "runtime_unreachable",
+        errorMessage,
+      });
+      return this.finishWithPreStartError(opts, context, "runtime_start_failed", errorMessage);
+    }
+  }
+
+  /**
+   * Fail a turn before any provider request or assistant row exists. The error
+   * event is what makes it visible: AgentSession renders a runtime_* failure
+   * only when it arrives as a pre-start error.
+   */
+  private finishWithPreStartError(
+    opts: Pick<StreamMessageOptions, "workspaceId" | "acpPromptId" | "onPreStartError">,
+    context: TurnRequestBuildContext,
+    errorType: "runtime_not_ready" | "runtime_start_failed",
+    errorMessage: string
+  ): Extract<PreparedTurnRequestOutcome, { type: "finished" }> {
+    // Emit error event so frontend receives it via stream subscription.
+    // This mirrors the context_exceeded pattern - the fire-and-forget sendMessage
+    // call in useCreationWorkspace.ts won't see the returned Err, but will receive
+    // this event through the workspace chat subscription.
+    const errorEvent = createErrorEvent(opts.workspaceId, {
+      // Generate message ID for the error event (frontend needs this for synthetic message)
+      messageId: createAssistantMessageId(),
+      error: errorMessage,
+      errorType,
+      acpPromptId: opts.acpPromptId,
+    });
+    if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
+    opts.onPreStartError?.(errorEvent);
+    return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
+  }
+
+  private async prepareOrThrow(
+    opts: StreamMessageOptions,
+    context: TurnRequestBuildContext
+  ): Promise<PreparedTurnRequestOutcome> {
     const resources: { model?: LanguageModel; cleanupTemp?: () => Promise<void> } = {};
     let retained = false;
     let transferred = false;
@@ -1357,6 +1419,15 @@ export class TurnRequestBuilder {
     const waitForInitStartedAt = Date.now();
     await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
     recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
+    // Metadata was read before the wait: a checkout whose launch sanitize failed meanwhile
+    // must not reach MCP startup below (#4674).
+    const unsanitized = this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+    if (unsanitized) {
+      return {
+        type: "finished",
+        result: Err({ type: unsanitized.code, message: unsanitized.message }),
+      };
+    }
     if (combinedAbortSignal.aborted) {
       return {
         type: "finished",
@@ -1389,41 +1460,19 @@ export class TurnRequestBuilder {
     });
     recordStartupPhaseTiming("ensureReadyMs", ensureReadyStartedAt);
     if (!readyResult.ready) {
-      // Generate message ID for the error event (frontend needs this for synthetic message)
-      const errorMessageId = createAssistantMessageId();
       const runtimeType = metadata.runtimeConfig?.type ?? "local";
       const runtimeLabel = runtimeType === "docker" ? "Container" : "Runtime";
       const errorMessage = readyResult.error || `${runtimeLabel} unavailable.`;
-
       const errorType = readyResult.errorType;
 
-      // Emit error event so frontend receives it via stream subscription.
-      // This mirrors the context_exceeded pattern - the fire-and-forget sendMessage
-      // call in useCreationWorkspace.ts won't see the returned Err, but will receive
-      // this event through the workspace chat subscription.
-      const errorEvent = createErrorEvent(workspaceId, {
-        messageId: errorMessageId,
-        error: errorMessage,
-        errorType,
-        acpPromptId,
-      });
-      if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
-      onPreStartError?.(errorEvent);
-
+      const finished = this.finishWithPreStartError(opts, context, errorType, errorMessage);
       logSlowStreamStartup({
         outcome: "runtime_not_ready",
         runtimeType,
         errorType,
         errorMessage,
       });
-
-      return {
-        type: "finished",
-        result: Err({
-          type: errorType,
-          message: errorMessage,
-        }),
-      };
+      return finished;
     }
 
     // Memory context (memory experiment): resolved only after ensureReady so

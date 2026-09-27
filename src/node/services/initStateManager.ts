@@ -6,6 +6,7 @@ import { log } from "@/node/services/log";
 import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { clamp } from "@/common/utils/clamp";
+import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
 
 /**
  * Output line with timestamp for replay timing.
@@ -90,7 +91,15 @@ export class InitStateManager extends EventEmitter {
     }
   >();
 
-  constructor(config: Config) {
+  /**
+   * Task checkouts whose launch sanitize failed (#4674). Terminal for the task id: removal may
+   * leave the checkout behind, so clearInMemoryState keeps it; a retained row's persisted marker
+   * covers restarts. MCP discovery and turns check it after waitForInit, which itself never
+   * throws (tools and inspection proceed).
+   */
+  private readonly unsanitizedCheckouts = new Set<string>();
+
+  constructor(private readonly config: Config) {
     super();
     this.store = new EventStore(
       config,
@@ -453,6 +462,27 @@ export class InitStateManager extends EventEmitter {
       promiseEntry.resolveHookPhase();
       this.initPromises.delete(workspaceId);
     }
+  }
+
+  /** Record a task checkout whose launch sanitize failed, before its init completes (#4674). */
+  markCheckoutUnsanitized(workspaceId: string): void {
+    this.unsanitizedCheckouts.add(workspaceId);
+  }
+
+  getUnsanitizedCheckoutError(workspaceId: string): UnsanitizedTaskCheckoutError | undefined {
+    return this.unsanitizedCheckouts.has(workspaceId) || this.hasPersistedMarker(workspaceId)
+      ? new UnsanitizedTaskCheckoutError(workspaceId)
+      : undefined;
+  }
+
+  /** The row's persisted marker (written with the launch failure) survives a restart. */
+  private hasPersistedMarker(workspaceId: string): boolean {
+    // Stat-keyed snapshot: cheap on the send and discovery paths.
+    for (const project of this.config.loadConfigOrDefault().projects.values()) {
+      const row = project.workspaces.find((workspace) => workspace.id === workspaceId);
+      if (row) return row.taskCheckoutUnsanitized === true;
+    }
+    return false;
   }
 
   /**

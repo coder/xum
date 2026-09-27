@@ -75,7 +75,11 @@ import {
   type WorktreeArchiveBehavior,
 } from "@/common/config/worktreeArchiveBehavior";
 import { PlatformPaths } from "@/common/utils/paths";
-import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
+import { PendingRemovalSchema } from "@/common/schemas/project";
+import {
+  getValidAgentMessageDispatchMode,
+  getValidUnrelatedWorkspaceConsent,
+} from "@/common/orpc/schemas/workspace";
 import {
   HEARTBEAT_CONTEXT_MODE_VALUES,
   HEARTBEAT_DEFAULT_INTERVAL_MS,
@@ -732,18 +736,33 @@ function normalizePersistedWorkspace(
     taskExperiments.programmaticToolCalling !== true;
   const hasMalformedTaskAttemptId =
     persisted.taskAttemptId !== undefined && !isTaskAttemptId(persisted.taskAttemptId);
+  // A malformed removal marker (hand edit, corruption) is dropped rather than kept: every task
+  // admission refuses while one is set, and the removal could not judge its owner, so the
+  // workspace could neither be used nor removed.
+  const hasMalformedPendingRemoval =
+    persisted.pendingRemoval !== undefined &&
+    !PendingRemovalSchema.safeParse(persisted.pendingRemoval).success;
+  // Only `true` is meaningful; any other value (hand edit, corruption) reads as absent, so one
+  // bad row cannot fail output validation of the whole project list.
+  const hasMalformedConsentPending =
+    Object.hasOwn(persisted, "unrelatedWorkspaceConsentPending") &&
+    persisted.unrelatedWorkspaceConsentPending !== true;
   if (
     !hasLegacyWorkflowSchedule &&
     !hasBestOf &&
     !hasLegacyPtcExclusive &&
-    !hasMalformedTaskAttemptId
+    !hasMalformedTaskAttemptId &&
+    !hasMalformedPendingRemoval &&
+    !hasMalformedConsentPending
   ) {
     return workspace;
   }
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+  if (hasMalformedPendingRemoval) delete nextWorkspace.pendingRemoval;
   if (hasMalformedTaskAttemptId) healMalformedTaskAttemptId(nextWorkspace);
+  if (hasMalformedConsentPending) delete nextWorkspace.unrelatedWorkspaceConsentPending;
 
   if (hasLegacyPtcExclusive) {
     // Spreading the typed field copies ALL persisted keys at runtime —
@@ -2139,7 +2158,8 @@ export class Config {
   }
 
   /**
-   * Write the full config snapshot to disk (atomic write, log-and-swallow errors).
+   * Write the full config snapshot to disk (atomic write). Rejects when the file was not
+   * replaced, so editConfig never reports an unsaved edit as durable (#4444).
    *
    * PRIVATE on purpose: this is editConfig's write primitive only. Direct external
    * callers used to write stale full snapshots outside the editConfig queue, which
@@ -2148,18 +2168,19 @@ export class Config {
    * as a permanent sidebar ghost. All mutations must go through editConfig so each
    * write is derived from a fresh serialized read.
    *
-   * Kept as a Promise facade (tests spy on it with Promise mocks to simulate
-   * swallowed writes); saveConfigEffect below holds the actual pipeline.
+   * Kept as a Promise facade (tests spy on it with Promise mocks to simulate a write
+   * that did not land); saveConfigEffect below holds the actual pipeline.
    */
   private saveConfig(config: ProjectsConfig): Promise<void> {
     return Effect.runPromise(this.saveConfigEffect(config));
   }
 
   /**
-   * Never fails: the whole pipeline folds every failure and defect into the same
-   * log-and-swallow the old try/catch applied (total catch discipline).
+   * Fails when config.json was not replaced (#4444). Every failure (serialization or the
+   * atomic write) happens before the rename, so a failure means the previous bytes are
+   * still on disk; nothing after the write can fail.
    */
-  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void> {
+  private saveConfigEffect(config: ProjectsConfig): Effect.Effect<void, unknown> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -2483,11 +2504,15 @@ export class Config {
         }
       }
     }).pipe(
-      // Mirror the old whole-pipeline try/catch: fold both the typed write failure and
-      // any defect thrown by the synchronous serialization above into the same
-      // log-and-swallow, so this pipeline never fails.
-      Effect.catch((error) => Effect.sync(() => log.error("Error saving config:", error))),
-      Effect.catchDefect((error) => Effect.sync(() => log.error("Error saving config:", error)))
+      // A defect thrown by the synchronous serialization above is a failed save too.
+      Effect.catchDefect((defect) => Effect.fail(defect)),
+      Effect.tapError((error) =>
+        Effect.sync(() => {
+          // Readers must see the unchanged file, however this edit obtained its input.
+          self.configSnapshot = undefined;
+          log.error("Error saving config:", error);
+        })
+      )
     );
   }
 
@@ -2993,8 +3018,9 @@ export class Config {
       // process registered meanwhile, whether or not this edit touched the project set.
       yield* Effect.tryPromise({ try: () => lock.assertStillOwned(), catch: (error) => error });
       // Route through the saveConfig Promise facade (not saveConfigEffect) so test
-      // spies on saveConfig keep intercepting the serialized write.
-      yield* Effect.promise(async () => self.saveConfig(newConfig));
+      // spies on saveConfig keep intercepting the serialized write. A failed save rejects
+      // the edit and skips the change notification below (#4444).
+      yield* Effect.tryPromise({ try: () => self.saveConfig(newConfig), catch: (error) => error });
       // Backend-initiated config edits (for example gateway auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.
       self.notifyConfigChanged();
@@ -3050,15 +3076,13 @@ export class Config {
   }
 
   /**
-   * The corrupt-file gate an edit passes immediately before writing. If the load failed,
-   * writing would replace the corrupt file with defaults. Only proceed when the bytes on
-   * disk right now are the ones with a confirmed sidecar: no confirmed backup, a concurrent
-   * replacement since the load, or an unreadable file all reject the edit so callers do not
-   * treat the mutation as durable (unlike saveConfig's log-and-swallow of unexpected I/O
-   * errors, this skip is deliberate). A missing file is safe to overwrite. This cannot fully
-   * close the cross-process race (that needs file locking, which editConfig has never had);
-   * it binds the approval to the current bytes and shrinks the window to the atomic write
-   * itself.
+   * The corrupt-file gate an edit passes immediately before writing. If the load failed, writing
+   * would replace the corrupt file with defaults. Only proceed when the bytes on disk right now are
+   * the ones with a confirmed sidecar: no confirmed backup, a concurrent replacement since the
+   * load, or an unreadable file all reject the edit so callers do not treat the mutation as durable
+   * (a failed save rejects the same way). A missing file is safe to overwrite. This cannot fully
+   * close the cross-process race (that needs file locking, which editConfig has never had); it
+   * binds the approval to the current bytes and shrinks the window to the atomic write itself.
    */
   private assertConfigWritable(): void {
     const failureState = configLoadFailureStates.get(this.configFile);
@@ -3650,6 +3674,9 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+                workspace.agentMessageDispatchMode
+              ),
               // Display defaults stay ephemeral: no raw Exec bucket means no saved Exec choice.
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
@@ -3952,6 +3979,9 @@ export class Config {
               unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
                 workspace.unrelatedWorkspaceConsent
               ),
+              agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+                workspace.agentMessageDispatchMode
+              ),
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
                 (workspace.aiSettings
@@ -4031,6 +4061,9 @@ export class Config {
             unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
               workspace.unrelatedWorkspaceConsent
             ),
+            agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+              workspace.agentMessageDispatchMode
+            ),
             aiSettingsByAgent:
               workspace.aiSettingsByAgent ??
               (workspace.aiSettings
@@ -4074,21 +4107,30 @@ export class Config {
     // path match with a different id is a replacement workspace that must not inherit
     // the removed workspace's migrated settings.
     if (pendingWorkspaceMigrations.length > 0 && options?.persistMigrations !== false) {
-      await this.editConfig((freshConfig) => {
-        for (const migration of pendingWorkspaceMigrations) {
-          const project = freshConfig.projects.get(migration.projectPath);
-          const entry = migration.persistedWorkspaceId
-            ? project?.workspaces.find(
-                (candidate) => candidate.id === migration.persistedWorkspaceId
-              )
-            : project?.workspaces.find(
-                (candidate) => candidate.path === migration.workspacePath && !candidate.id
-              );
-          if (!entry) continue; // workspace removed concurrently — do not resurrect
-          migration.apply(entry);
-        }
-        return freshConfig;
-      });
+      // Best-effort (#4444): startup and every workspace list read land here, so a failed
+      // write must not turn the read into a rejection. Migrations re-apply on every load,
+      // and the next successful write persists them.
+      try {
+        await this.editConfig((freshConfig) => {
+          for (const migration of pendingWorkspaceMigrations) {
+            const project = freshConfig.projects.get(migration.projectPath);
+            const entry = migration.persistedWorkspaceId
+              ? project?.workspaces.find(
+                  (candidate) => candidate.id === migration.persistedWorkspaceId
+                )
+              : project?.workspaces.find(
+                  (candidate) => candidate.path === migration.workspacePath && !candidate.id
+                );
+            if (!entry) continue; // workspace removed concurrently — do not resurrect
+            migration.apply(entry);
+          }
+          return freshConfig;
+        });
+      } catch (error) {
+        log.warn("Failed to persist workspace migrations; they re-apply on the next load", {
+          error,
+        });
+      }
     }
 
     // Filtered rows still inherit family identity from archived ancestors in the registry.
@@ -4135,7 +4177,9 @@ export class Config {
    */
   async addWorkspace(
     projectPath: string,
-    metadata: WorkspaceMetadata & { namedWorkspacePath?: string }
+    metadata: WorkspaceMetadata & { namedWorkspacePath?: string },
+    /** Written only on a new row, in its registration write (see the schema field). */
+    options: { unrelatedWorkspaceConsentPending?: true } = {}
   ): Promise<void> {
     await this.editConfig((config) => {
       let project = config.projects.get(projectPath);
@@ -4172,6 +4216,9 @@ export class Config {
         // re-add of an existing consented entry does not silently revoke it.
         unrelatedWorkspaceConsent: getValidUnrelatedWorkspaceConsent(
           metadata.unrelatedWorkspaceConsent
+        ),
+        agentMessageDispatchMode: getValidAgentMessageDispatchMode(
+          metadata.agentMessageDispatchMode
         ),
         parentWorkspaceId: metadata.parentWorkspaceId,
         agentType: metadata.agentType,
@@ -4210,10 +4257,17 @@ export class Config {
           taskAttemptUnproven: existing.taskAttemptUnproven,
           taskAttemptRetiredBy: existing.taskAttemptRetiredBy,
           taskTerminalFailure: existing.taskTerminalFailure,
+          pendingRemoval: existing.pendingRemoval,
+          unrelatedWorkspaceConsentPending: existing.unrelatedWorkspaceConsentPending,
         };
       } else {
         // Add new workspace
-        project.workspaces.push(workspaceEntry);
+        project.workspaces.push({
+          ...workspaceEntry,
+          ...(options.unrelatedWorkspaceConsentPending === true
+            ? { unrelatedWorkspaceConsentPending: true as const }
+            : {}),
+        });
       }
 
       return config;
@@ -4224,9 +4278,20 @@ export class Config {
    * Remove a workspace from config.json
    *
    * @param workspaceId ID of the workspace to remove
+   * @param options.removalId - the removal's pendingRemoval marker: the row is removed only while
+   *   it still carries that marker (throws otherwise), so a removal whose marker another backend
+   *   took over cannot deregister the workspace under it.
    */
-  async removeWorkspace(workspaceId: string): Promise<void> {
+  async removeWorkspace(workspaceId: string, options?: { removalId?: string }): Promise<void> {
     await this.editConfig((config) => {
+      if (options?.removalId != null) {
+        const row = [...config.projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === workspaceId);
+        if (row != null && row.pendingRemoval?.removalId !== options.removalId) {
+          throw new Error(`Workspace ${workspaceId} is no longer held by this removal`);
+        }
+      }
       let workspaceFound = false;
 
       for (const [_projectPath, project] of config.projects) {

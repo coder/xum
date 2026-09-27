@@ -4,6 +4,8 @@ import { generateText, jsonSchema, streamText, tool, type LanguageModel, type To
 import type { Experimental_EvaluationModelV4 } from "@ai-sdk/provider";
 import { xai } from "@ai-sdk/xai";
 import { z } from "zod";
+import { Cause, Effect, Exit, Option } from "effect";
+import { makeEvaluationService } from "@/node/services/evaluation/evaluationService";
 import { writeFile } from "node:fs/promises";
 import * as fs from "fs";
 import * as os from "os";
@@ -3250,6 +3252,109 @@ describe("ProviderModelFactory Coder", () => {
     }
   );
 
+  // @ai-sdk/openai's Chat Completions adapter drops the response's
+  // service_tier, so usage through an openai-compat instance priced at base
+  // rates even when the upstream billed Fast (#4786). Only a tier the upstream
+  // reports counts: compatible upstreams may ignore the requested tier.
+  it.each([
+    ["priority", "priority"],
+    [undefined, undefined],
+  ])(
+    "reports the upstream service tier %p through a Coder openai-compat instance",
+    async (reportedTier, expectedTier) => {
+      const tierField = reportedTier == null ? {} : { service_tier: reportedTier };
+      const base = { id: "c1", created: 1, model: "team-astra", ...tierField };
+      const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(req) {
+          const body = (await req.json()) as { stream?: boolean };
+          if (!body.stream) {
+            return Response.json({
+              ...base,
+              object: "chat.completion",
+              choices: [
+                { index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" },
+              ],
+              usage,
+            });
+          }
+          const chunks = [
+            { choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] },
+            { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage },
+          ].map(
+            (chunk) =>
+              `data: ${JSON.stringify({ ...base, object: "chat.completion.chunk", ...chunk })}\n\n`
+          );
+          return new Response(`${chunks.join("")}data: [DONE]\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      });
+      const deploymentUrl = server.url.origin;
+      try {
+        await withTempConfig(async (config, factory, oauth) => {
+          saveCoderConfig(config, {
+            deploymentUrl,
+            coderOauth: {
+              type: "oauth",
+              sessionId: "session_factory",
+              deploymentUrl,
+              access: "at_factory",
+              refresh: "rt_factory",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+            additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+          });
+          oauth.coderOauthService = stubCoderOauthService("at_factory", deploymentUrl);
+          const result = await factory.createModel("coder:chat-proxy/team-astra");
+          if (!result.success) throw new Error(result.error.type);
+          const providerOptions = { openai: { serviceTier: "priority" as const } };
+
+          const generated = await generateText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions,
+            maxRetries: 0,
+          });
+          expect(generated.text).toBe("hi");
+          expect(generated.providerMetadata?.openai?.serviceTier).toBe(expectedTier);
+
+          const streamed = streamText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions,
+            maxRetries: 0,
+          });
+          expect(await streamed.text).toBe("hi");
+          expect((await streamed.providerMetadata)?.openai?.serviceTier).toBe(expectedTier);
+
+          // Raw chunks are requested internally only; a caller that did not ask
+          // for them must not receive them (streamText hides them on its own).
+          const model = result.data;
+          if (typeof model === "string" || model.specificationVersion !== "v4") {
+            throw new Error("expected a v4 language model");
+          }
+          const { stream } = await model.doStream({
+            prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          });
+          const partTypes: string[] = [];
+          const reader = stream.getReader();
+          for (let next = await reader.read(); !next.done; next = await reader.read()) {
+            partTypes.push(next.value.type);
+          }
+          expect(partTypes).toContain("finish");
+          expect(partTypes).not.toContain("raw");
+        });
+      } finally {
+        await server.stop(true);
+      }
+    }
+  );
+
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
@@ -4837,6 +4942,53 @@ describe("withAnthropicEvaluationEffort", () => {
   });
 });
 
+describe("withAnthropicEvaluationEffort billed usage (#4728)", () => {
+  it("keeps the usage of an answer the wrapped adapter rejects", async () => {
+    const answerFetch = Object.assign(
+      (): Promise<Response> =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "msg_1",
+              type: "message",
+              role: "assistant",
+              model: "claude-opus-5-5",
+              content: [{ type: "text", text: JSON.stringify({ q0: "c9" }) }],
+              stop_reason: "end_turn",
+              stop_sequence: null,
+              usage: { input_tokens: 70, output_tokens: 7 },
+            }),
+            { headers: { "content-type": "application/json" } }
+          )
+        ),
+      { preconnect: fetch.preconnect.bind(fetch) }
+    );
+    const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+    const model = withAnthropicEvaluationEffort(
+      createAnthropic({ apiKey: "test", fetch: answerFetch }).evaluationModel("claude-opus-5-5"),
+      "claude-opus-5-5"
+    );
+    const exit = await Effect.runPromiseExit(
+      makeEvaluationService().evaluate({
+        model,
+        state: "x",
+        questions: {
+          q: { type: "choice", instructions: "Pick one.", criteria: { a: "A", b: "B" } },
+        },
+      })
+    );
+    const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
+    expect(Option.isSome(error)).toBe(true);
+    if (!Option.isSome(error)) return;
+    expect(error.value).toMatchObject({ reason: "invalid-output", code: "invalid-response" });
+    expect(error.value.billedUsage?.usage).toEqual({
+      inputTokens: 70,
+      outputTokens: 7,
+      totalTokens: 77,
+    });
+  });
+});
+
 describe("ProviderModelFactory.createEvaluationModel", () => {
   // Credential resolution reads provider env vars; the host may export real
   // keys/base URLs, so every case runs against the temp providers.jsonc only.
@@ -5171,6 +5323,38 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
       process.env.JEV_API_KEY = "env-key";
       expectResolved(await factory.createEvaluationModel("typesafe:jev-latest"));
     });
+  });
+
+  it("sends google evaluation requests to the trimmed configured base URL", async () => {
+    await withEvaluationFixture(
+      { google: { apiKey: "sk-google", baseUrl: "  https://proxy.example/google/v1beta  " } },
+      async (_c, factory, fetchSpy) => {
+        const pinned = expectResolved(
+          await factory.createEvaluationModel("google:gemini-2.5-flash")
+        );
+        const urls: string[] = [];
+        fetchSpy.mockImplementation(
+          Object.assign(
+            (input: Parameters<typeof fetch>[0]) => {
+              urls.push(input instanceof Request ? input.url : String(input));
+              return Promise.reject(new Error("captured"));
+            },
+            { preconnect: () => undefined }
+          )
+        );
+        await pinned.model
+          .doEvaluate({
+            state: "hello",
+            questions: { q: { type: "boolean", instructions: "Is it a greeting?" } },
+          })
+          .then(
+            () => undefined,
+            () => undefined
+          );
+        expect(urls).toHaveLength(1);
+        expect(urls[0]).toStartWith("https://proxy.example/google/v1beta/");
+      }
+    );
   });
 
   it("sends typesafe requests to the API default or the configured base URL", async () => {

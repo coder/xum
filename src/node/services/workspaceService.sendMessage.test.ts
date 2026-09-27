@@ -150,6 +150,31 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   );
 
+  test("a failed settings write does not fail the send (#4444)", async () => {
+    // Remembering the model is a preference; the send itself never needs a config write.
+    persistSettings.mockRestore();
+    fakeSession.isBusy.mockReturnValue(false);
+    const editSpy = spyOn(harness.config, "editConfig").mockRejectedValue(
+      new Error("EACCES: permission denied")
+    );
+    const options = { model: "openai:gpt-5.2", agentId: "plan", thinkingLevel: "high" as const };
+
+    const result = await workspaceService.sendMessage("test-workspace", "hello", options);
+
+    expect(result.success).toBe(true);
+    expect(editSpy).toHaveBeenCalled();
+    expect(fakeSession.sendMessage).toHaveBeenCalledWith(
+      "hello",
+      expect.objectContaining({ model: options.model, agentId: "plan" }),
+      expect.anything()
+    );
+    const remembered = harness.config
+      .loadConfigOrDefault()
+      .projects.get("/tmp/test/project")
+      ?.workspaces.find((workspace) => workspace.id === "test-workspace")?.aiSettingsByAgent;
+    expect(remembered?.plan).toBeUndefined();
+  });
+
   test("leaves budgeted-goal pricing rejections to AgentSession instead of rejecting early", async () => {
     // The session is a fake, so this only proves the forward. Input preservation is owned by
     // agentSession.budgetGate.test.ts "manual rejected send preserves the user message + emits a stream-error event".

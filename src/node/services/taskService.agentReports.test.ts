@@ -41,6 +41,7 @@ import {
   streamEnd,
   stubStableIds,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -3495,6 +3496,8 @@ describe("TaskService", () => {
         startStreamInBackground: true,
         queueDedupeKey: "agent-report:child-progress:progress-1",
         promoteAheadOfHiddenTurnEnd: true,
+        // The report text is the message and its supersession probe is in memory (#4721).
+        skipOnSendCompaction: true,
       })
     );
     expect(sendMessage.mock.calls[0]?.[1]).toContain('"status": "in_progress"');
@@ -3518,6 +3521,98 @@ describe("TaskService", () => {
     expect(
       await readSubagentReportArtifact(path.join(config.sessionsDir, parentId), childId)
     ).toBeNull();
+  });
+
+  for (const [name, parentHold, expectedMode] of [
+    ["a parent that holds agent messages waits for its turn to end", "turn-end", "turn-end"],
+    ["a parent with the default preference is cut at the next step", undefined, "tool-end"],
+  ] satisfies Array<[string, "turn-end" | undefined, "turn-end" | "tool-end"]>) {
+    test(`agent_report wake: ${name}`, async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const parentId = "parent-progress-hold";
+      const childId = "child-progress-hold";
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", parentId, {
+            ...(parentHold != null ? { agentMessageDispatchMode: parentHold } : {}),
+          }),
+          projectWorkspace(projectPath, "child", childId, {
+            name: "agent_review_child",
+            parentWorkspaceId: parentId,
+            agentType: "review",
+            taskStatus: "running",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+      await taskService.reportAgentProgress(childId, "progress-1", {
+        reportMarkdown: "Found a correctness issue.",
+      });
+
+      // Only a tool-end queue entry cuts the parent's busy turn; a turn-end entry dispatches
+      // when that turn ends.
+      expect(sendMessage).toHaveBeenCalledWith(
+        parentId,
+        expect.stringContaining("Found a correctness issue."),
+        expect.objectContaining({ queueDispatchMode: expectedMode }),
+        expect.anything()
+      );
+    });
+  }
+
+  test("agent_report wake applies a hold preference enabled during its preflight", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-progress-late-hold";
+    const childId = "child-progress-late-hold";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_review_child",
+          parentWorkspaceId: parentId,
+          agentType: "review",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // The user turns hold on while the wake awaits its workspace-turn lookup.
+    spyOn(
+      workspaceTurnManagerFor(taskService),
+      "getActiveWorkspaceTurnMuxMetadataForWorkspace"
+    ).mockImplementation(async () => {
+      await config.editConfig((cfg) => {
+        const parent = cfg.projects
+          .get(projectPath)
+          ?.workspaces.find((candidate) => candidate.id === parentId);
+        assert(parent, "parent workspace must exist");
+        parent.agentMessageDispatchMode = "turn-end";
+        return cfg;
+      });
+      return undefined;
+    });
+
+    await taskService.reportAgentProgress(childId, "progress-1", {
+      reportMarkdown: "Found a correctness issue.",
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      parentId,
+      expect.any(String),
+      expect.objectContaining({ queueDispatchMode: "turn-end" }),
+      expect.anything()
+    );
   });
 
   test("agent_report refuses an update whose run ended before the wake was sent", async () => {

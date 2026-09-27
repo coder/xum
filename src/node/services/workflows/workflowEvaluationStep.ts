@@ -26,6 +26,7 @@ import {
   EVALUATION_MIN_TIMEOUT_MS,
 } from "@/constants/evaluation";
 import { sha256Hex } from "@/node/services/evaluation/evaluationDigest";
+import type { EvaluationBilledUsage } from "@/node/services/evaluation/evaluationService";
 import { log } from "@/node/services/log";
 import type { EvaluationSelection, WorkflowEvaluationAdapter } from "./WorkflowEvaluationAdapter";
 import type { WorkflowRunStore } from "./WorkflowRunStore";
@@ -107,6 +108,7 @@ export const EVALUATION_POST_COMMIT_EVENT_FAILED_CODE = "evaluation-post-commit-
 export const EVALUATION_POST_COMMIT_USAGE_FAILED_CODE = "evaluation-post-commit-usage-failed";
 export const EVALUATION_CACHED_EVENT_FAILED_CODE = "evaluation-cached-event-failed";
 export const EVALUATION_FAILED_EVENT_FAILED_CODE = "evaluation-failed-event-failed";
+export const EVALUATION_FAILED_USAGE_FAILED_CODE = "evaluation-failed-usage-failed";
 
 export function evaluationStepDigest(stepId: string): string {
   return sha256Hex(stepId).slice(0, 12);
@@ -242,7 +244,9 @@ export async function runWorkflowEvaluationStep(
     persisted = admission;
     attempt = persisted.attempt + 1;
   }
-  const timeoutMs = persisted?.timeoutMs ?? clampTimeoutMs(spec.timeoutMs);
+  // Re-clamp a persisted timeout too: a hand-edited or older record must not stretch the
+  // attempt budget past the host's bounds (self-healing, like other persisted state).
+  const timeoutMs = clampTimeoutMs(persisted?.timeoutMs ?? spec.timeoutMs);
   const attemptDeadlineAt = enteredAt + timeoutMs;
   const startedAt = existing?.startedAt ?? clock.nowIso();
 
@@ -327,6 +331,9 @@ export async function runWorkflowEvaluationStep(
     startedAt,
     evaluation: admission,
   });
+  // Deliberately unguarded (#4363 item 5 declined): this append is the last lease-fenced
+  // write before a billable dispatch. Swallowing its rejection could let a runner that just
+  // lost the lease dispatch a duplicate request; failing the run here bills nothing.
   await journal.appendEvent({
     type: "evaluation",
     at: clock.nowIso(),
@@ -393,10 +400,52 @@ export async function runWorkflowEvaluationStep(
   if (outcome.status === "interrupted") {
     throw interrupted();
   }
+  // A response the provider returned and we then rejected was still billed (#4728).
+  // Ledger after the durable failed record, like the success tail below: a crash
+  // in between under-counts, and a checkpoint retry is a new attempt with its own
+  // dispatch, so each billed response gets exactly one row.
+  const failBilled = async (
+    reason: EvaluationStepFailureReason,
+    code: EvaluationStepFailureCode,
+    billedUsage: EvaluationBilledUsage | undefined,
+    statusCode?: number,
+    defect?: boolean
+  ): Promise<never> => {
+    const error = new WorkflowEvaluationStepError(reason, code, stepDigest, attempt, statusCode);
+    await recordFailure(context, {
+      spec,
+      inputHash,
+      startedAt,
+      admission,
+      error,
+      defect,
+      ...(billedUsage !== undefined ? { usage: billedUsage.usage } : {}),
+    });
+    if (billedUsage !== undefined) {
+      try {
+        await adapter.recordUsage(rechecked.pinned, billedUsage, {
+          runId: context.runId,
+          stepDigest,
+          attempt,
+        });
+      } catch (ledgerError) {
+        // The typed failure is what checkpoint retry matches; the ledger must not replace it.
+        log.warn("Workflow evaluation usage accounting threw after the failed record", {
+          code: EVALUATION_FAILED_USAGE_FAILED_CODE,
+          runId: context.runId,
+          stepDigest,
+          attempt,
+          errorName: ledgerError instanceof Error ? ledgerError.name : typeof ledgerError,
+        });
+      }
+    }
+    throw error;
+  };
   if (outcome.status === "failed") {
-    return await failPostAdmission(
+    return await failBilled(
       outcome.reason,
       outcome.code,
+      outcome.billedUsage,
       outcome.statusCode,
       outcome.defect
     );
@@ -411,7 +460,10 @@ export async function runWorkflowEvaluationStep(
     outcome.result.rounding
   );
   if (!validated.ok) {
-    return await failPostAdmission("invalid-output", "answer-validation");
+    return await failBilled("invalid-output", "answer-validation", {
+      usage: outcome.result.usage,
+      usageProviderMetadata: outcome.result.usageProviderMetadata,
+    });
   }
   const result: EvaluationStepResult = {
     answers: validated.answers,
@@ -663,6 +715,8 @@ async function recordFailure(
     admission: EvaluationAdmission | undefined;
     error: WorkflowEvaluationStepError;
     defect?: boolean;
+    /** Token counts of a billed response that was rejected (#4728). */
+    usage?: EvaluationStepResult["usage"];
   }
 ): Promise<void> {
   const { spec, error } = input;
@@ -690,6 +744,7 @@ async function recordFailure(
       code: error.code,
       ...(error.statusCode !== undefined ? { statusCode: error.statusCode } : {}),
       ...(input.defect ? { defect: true } : {}),
+      ...(input.usage !== undefined ? { usage: input.usage } : {}),
     });
   } catch (appendError) {
     // The failed record is durable and its `error` text is what checkpoint

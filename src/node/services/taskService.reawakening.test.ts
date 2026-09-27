@@ -597,8 +597,8 @@ describe("TaskService", () => {
     };
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
-    // Settlement's terminal mirror write is SWALLOWED (Config.saveConfig logs and drops write
-    // errors), so the on-disk mirror keeps claiming "running". Releasing the latch on the
+    // Settlement's terminal mirror write does not land (another writer replaced it), so the
+    // on-disk mirror keeps claiming "running". Releasing the latch on the
     // unverified write must therefore be accompanied by removing the live registration in the
     // same tick — otherwise a peer admission probe in the pre-caller-delete window sees the
     // stale running mirror plus the accepted handle and escapes the stop.
@@ -802,7 +802,7 @@ describe("TaskService", () => {
     expect(
       await taskService.sendAgentTreeMessage("child-a", "tree-root", "after the stop")
     ).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
     );
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
@@ -838,7 +838,7 @@ describe("TaskService", () => {
     );
 
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
-      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "tool-end" })
     );
     const [, , options, internalArg] = sendMessage.mock.calls[0] as [
       string,

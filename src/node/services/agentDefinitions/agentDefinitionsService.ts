@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -13,7 +13,11 @@ import { resolveAgentVisibility } from "./agentVisibility";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
-import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import {
+  execBuffered,
+  readFileString,
+  throwIfTransportFailure,
+} from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 
 import {
@@ -295,6 +299,7 @@ async function listAgentFilesFromRuntime(
     `fi`;
 
   const result = await execBuffered(runtime, command, { cwd: options.cwd, timeout: 10 });
+  throwIfTransportFailure(runtime, result, `Failed to read agents directory ${root}`);
   if (result.exitCode !== 0) {
     log.warn(`Failed to read agents directory ${root}: ${result.stderr || result.stdout}`);
     return [];
@@ -358,7 +363,8 @@ async function readAgentDescriptorFromFile(
     let stat;
     try {
       stat = await runtime.stat(filePath);
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) throw error;
       return null;
     }
 
@@ -375,6 +381,7 @@ async function readAgentDescriptorFromFile(
     try {
       content = await readFileString(runtime, filePath);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to read agent definition ${filePath}: ${getErrorMessage(err)}`);
       return null;
     }
@@ -468,6 +475,7 @@ export async function discoverAgentDefinitions(
     try {
       resolvedRoot = await scan.runtime.resolvePath(scan.root);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to resolve agents root ${scan.root}: ${getErrorMessage(err)}`);
       continue;
     }
@@ -688,7 +696,10 @@ async function loadAgentDefinition(
     let resolvedRoot: string;
     try {
       resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
-    } catch {
+    } catch (error) {
+      // An unreachable host is not a missing root: never fall through to a
+      // lower scope or the built-in agent on a transport failure (#4438).
+      if (isRuntimeTransportError(error)) throw error;
       continue;
     }
 
@@ -755,8 +766,9 @@ async function loadAgentDefinition(
 
       return validated.data;
     } catch (error) {
-      // An aborted read is not a missing candidate: stop probing instead of falling through.
-      if (abortSignal?.aborted) throw error;
+      // An aborted or transport-failed read is not a missing candidate: stop
+      // probing instead of falling through to a lower scope (#4438).
+      if (abortSignal?.aborted || isRuntimeTransportError(error)) throw error;
       continue;
     }
   }
