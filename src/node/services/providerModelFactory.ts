@@ -9,7 +9,12 @@ export {
 import assert from "node:assert";
 import { Effect } from "effect";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type { LanguageModelV4, LanguageModelV4CallOptions } from "@ai-sdk/provider";
+import type {
+  LanguageModelV4,
+  LanguageModelV4CallOptions,
+  LanguageModelV4StreamPart,
+  SharedV4ProviderMetadata,
+} from "@ai-sdk/provider";
 import { createTypeSafeAi } from "@ai-sdk/typesafe-ai";
 import type { XaiProviderOptions } from "@ai-sdk/xai";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
@@ -468,6 +473,66 @@ export function clampGpt6ChatCompletionsToolReasoning(
         ),
     },
   });
+}
+
+/**
+ * @ai-sdk/openai's Chat Completions adapter never copies the response's
+ * service_tier into providerMetadata, so usage through a Coder openai-compat
+ * instance priced at base rates even when the upstream billed Fast (#4786).
+ * Read the tier the upstream reported (response body, or raw stream chunks
+ * requested internally and hidden from callers that did not ask for them) and
+ * surface it the way the Responses adapter does. Never infer a tier from the
+ * request: compatible upstreams may ignore OpenAI tiers, so an unreported tier
+ * keeps base pricing.
+ */
+function reportChatCompletionsServiceTier(model: LanguageModelV4): LanguageModelV4 {
+  const withTier = <T extends { providerMetadata?: SharedV4ProviderMetadata }>(
+    part: T,
+    serviceTier: string | undefined
+  ): T =>
+    serviceTier == null
+      ? part
+      : {
+          ...part,
+          providerMetadata: {
+            ...part.providerMetadata,
+            openai: { ...part.providerMetadata?.openai, serviceTier },
+          },
+        };
+  return wrapLanguageModel({
+    model,
+    middleware: {
+      specificationVersion: "v4",
+      wrapGenerate: async ({ doGenerate }) => {
+        const result = await doGenerate();
+        return withTier(result, readReportedServiceTier(result.response?.body));
+      },
+      wrapStream: async ({ params, model: inner }) => {
+        const result = await inner.doStream({ ...params, includeRawChunks: true });
+        let serviceTier: string | undefined;
+        return {
+          ...result,
+          stream: result.stream.pipeThrough(
+            new TransformStream<LanguageModelV4StreamPart, LanguageModelV4StreamPart>({
+              transform(part, controller) {
+                if (part.type === "raw") {
+                  serviceTier = readReportedServiceTier(part.rawValue) ?? serviceTier;
+                  if (params.includeRawChunks !== true) return;
+                }
+                controller.enqueue(part.type === "finish" ? withTier(part, serviceTier) : part);
+              },
+            })
+          ),
+        };
+      },
+    },
+  });
+}
+
+function readReportedServiceTier(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const tier = (value as { service_tier?: unknown }).service_tier;
+  return typeof tier === "string" && tier !== "" ? tier : undefined;
 }
 
 type FetchWithBunExtensions = typeof fetch & {
@@ -2677,7 +2742,7 @@ export class ProviderModelFactory {
             wire === "openai-responses"
               ? coderModel
               : clampGpt6ChatCompletionsToolReasoning(
-                  coderModel,
+                  reportChatCompletionsServiceTier(coderModel),
                   resolveModelForMetadata(`coder:${modelId}`, providersConfig)
                 )
           );

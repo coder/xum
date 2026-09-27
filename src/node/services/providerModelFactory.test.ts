@@ -3252,6 +3252,109 @@ describe("ProviderModelFactory Coder", () => {
     }
   );
 
+  // @ai-sdk/openai's Chat Completions adapter drops the response's
+  // service_tier, so usage through an openai-compat instance priced at base
+  // rates even when the upstream billed Fast (#4786). Only a tier the upstream
+  // reports counts: compatible upstreams may ignore the requested tier.
+  it.each([
+    ["priority", "priority"],
+    [undefined, undefined],
+  ])(
+    "reports the upstream service tier %p through a Coder openai-compat instance",
+    async (reportedTier, expectedTier) => {
+      const tierField = reportedTier == null ? {} : { service_tier: reportedTier };
+      const base = { id: "c1", created: 1, model: "team-astra", ...tierField };
+      const usage = { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 };
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(req) {
+          const body = (await req.json()) as { stream?: boolean };
+          if (!body.stream) {
+            return Response.json({
+              ...base,
+              object: "chat.completion",
+              choices: [
+                { index: 0, message: { role: "assistant", content: "hi" }, finish_reason: "stop" },
+              ],
+              usage,
+            });
+          }
+          const chunks = [
+            { choices: [{ index: 0, delta: { role: "assistant", content: "hi" } }] },
+            { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage },
+          ].map(
+            (chunk) =>
+              `data: ${JSON.stringify({ ...base, object: "chat.completion.chunk", ...chunk })}\n\n`
+          );
+          return new Response(`${chunks.join("")}data: [DONE]\n\n`, {
+            headers: { "content-type": "text/event-stream" },
+          });
+        },
+      });
+      const deploymentUrl = server.url.origin;
+      try {
+        await withTempConfig(async (config, factory, oauth) => {
+          saveCoderConfig(config, {
+            deploymentUrl,
+            coderOauth: {
+              type: "oauth",
+              sessionId: "session_factory",
+              deploymentUrl,
+              access: "at_factory",
+              refresh: "rt_factory",
+              expires: Date.now() + 3_600_000,
+              clientId: "c",
+              clientSecret: "s",
+            },
+            additionalProviders: [{ name: "chat-proxy", type: "openai-compat" }],
+          });
+          oauth.coderOauthService = stubCoderOauthService("at_factory", deploymentUrl);
+          const result = await factory.createModel("coder:chat-proxy/team-astra");
+          if (!result.success) throw new Error(result.error.type);
+          const providerOptions = { openai: { serviceTier: "priority" as const } };
+
+          const generated = await generateText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions,
+            maxRetries: 0,
+          });
+          expect(generated.text).toBe("hi");
+          expect(generated.providerMetadata?.openai?.serviceTier).toBe(expectedTier);
+
+          const streamed = streamText({
+            model: result.data,
+            prompt: "hello",
+            providerOptions,
+            maxRetries: 0,
+          });
+          expect(await streamed.text).toBe("hi");
+          expect((await streamed.providerMetadata)?.openai?.serviceTier).toBe(expectedTier);
+
+          // Raw chunks are requested internally only; a caller that did not ask
+          // for them must not receive them (streamText hides them on its own).
+          const model = result.data;
+          if (typeof model === "string" || model.specificationVersion !== "v4") {
+            throw new Error("expected a v4 language model");
+          }
+          const { stream } = await model.doStream({
+            prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+          });
+          const partTypes: string[] = [];
+          const reader = stream.getReader();
+          for (let next = await reader.read(); !next.done; next = await reader.read()) {
+            partTypes.push(next.value.type);
+          }
+          expect(partTypes).toContain("finish");
+          expect(partTypes).not.toContain("raw");
+        });
+      } finally {
+        await server.stop(true);
+      }
+    }
+  );
+
   it("does not pin OpenAI tiers on OAuth or non-OpenAI Coder upstreams", async () => {
     await withTempConfig(async (config, factory, oauth, store) => {
       saveCoderConfig(config, { additionalProviders: [{ name: "openai", type: "anthropic" }] });
