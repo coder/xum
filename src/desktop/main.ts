@@ -529,6 +529,18 @@ function createMenu() {
         { role: "close" },
         { type: "separator" },
         {
+          id: "open-server-window",
+          label: "Open Server Window",
+          // No accelerator, for the same reason as Return to Local below: the renderer owns
+          // Ctrl/Cmd+Shift+O (KEYBINDS.OPEN_SERVER_WINDOW) and runs the same flow. The flow lives
+          // in the local renderer so failures land on Settings → Remote Connection.
+          click: () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            openXumFromTray();
+            mainWindow.webContents.send(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested);
+          },
+        },
+        {
           id: "return-to-local",
           label: "Return to Local",
           // No accelerator: menu accelerators are global on macOS (registerAccelerator: false is

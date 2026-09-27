@@ -522,6 +522,10 @@ export const KEYBINDS = {
   // macOS: Cmd+, Win/Linux: Ctrl+,
   OPEN_SETTINGS: { key: ",", ctrl: true },
 
+  /** Open a window for the xum server running on this Xum root (desktop only, #4846) */
+  // macOS: Cmd+Shift+O, Win/Linux: Ctrl+Shift+O
+  OPEN_SERVER_WINDOW: { key: "O", ctrl: true, shift: true },
+
   /** Open analytics dashboard */
   // macOS: Cmd+Shift+Y, Win/Linux: Ctrl+Shift+Y
   // "Y" for analYtics — Ctrl+. is reserved for CYCLE_AGENT

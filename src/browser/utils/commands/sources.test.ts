@@ -23,6 +23,7 @@ import {
 } from "@/browser/features/Settings/Sections/pluginsSectionIntents";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { CommandIds } from "@/browser/utils/commandIds";
+import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
   const userProjects = new Map<string, ProjectConfig>();
@@ -1697,4 +1698,42 @@ test("plugin component action is gated and only targets present managed installs
   } finally {
     unsubscribe();
   }
+});
+
+describe("Open Server Window palette action", () => {
+  const makeBridge = (result: OpenLocalServerResult) =>
+    ({
+      getState: () => Promise.resolve({ status: "disconnected" as const, serverUrl: null }),
+      connect: () => Promise.resolve(),
+      disconnect: () => Promise.resolve(),
+      onStateChanged: () => () => undefined,
+      openLocalServer: mock(() => Promise.resolve(result)),
+      onOpenServerWindowRequested: () => () => undefined,
+    }) satisfies RemoteConnectionApi;
+
+  test("is only offered in the desktop window, which has the remote connection bridge", () => {
+    const ids = (over: Partial<Parameters<typeof buildCoreSources>[0]>) =>
+      getActions({ onOpenSettings: mock(), ...over }).map((action) => action.id);
+    expect(ids({})).not.toContain(CommandIds.openServerWindow());
+    expect(ids({ remoteConnection: makeBridge({ status: "shown" }) })).toContain(
+      CommandIds.openServerWindow()
+    );
+  });
+
+  test("shows Remote Connection settings only when the server window could not be shown", async () => {
+    for (const [result, expectedSettingsCalls] of [
+      [{ status: "shown" }, 0],
+      [{ status: "unavailable" }, 1],
+    ] satisfies Array<[OpenLocalServerResult, number]>) {
+      const onOpenSettings = mock();
+      const remoteConnection = makeBridge(result);
+      const action = getActions({ onOpenSettings, remoteConnection }).find(
+        (candidate) => candidate.id === CommandIds.openServerWindow()
+      );
+      await action!.run();
+      expect(remoteConnection.openLocalServer).toHaveBeenCalledTimes(1);
+      expect(onOpenSettings).toHaveBeenCalledTimes(expectedSettingsCalls);
+      if (expectedSettingsCalls) expect(onOpenSettings).toHaveBeenCalledWith("remote-connection");
+    }
+  });
 });

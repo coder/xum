@@ -39,6 +39,7 @@ function createRemoteBridge() {
       publish({ serverUrl: null, status: "disconnected", error: LOCAL_SERVER_NOT_FOUND });
       return Promise.resolve({ status: "unavailable" });
     }),
+    onOpenServerWindowRequested: fn(() => () => undefined),
     onStateChanged: fn((listener: (next: RemoteConnectionState) => void) => {
       listeners.add(listener);
       return () => {

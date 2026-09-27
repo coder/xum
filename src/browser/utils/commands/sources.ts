@@ -87,6 +87,8 @@ import {
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
+import { openServerWindow } from "@/browser/utils/openServerWindow";
+import type { RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 export interface BuildSourcesParams {
   api: APIClient | null;
@@ -161,6 +163,8 @@ export interface BuildSourcesParams {
   onSetTheme: (theme: ThemePreference) => void;
   onOpenSettings?: (section?: string, options?: OpenSettingsOptions) => void;
   onOpenAbout?: () => void;
+  /** Desktop-only bridge (window.api.remoteConnection); absent in browser mode and server windows. */
+  remoteConnection?: RemoteConnectionApi;
 
   // Layout slots
   layoutPresets?: LayoutPresetsConfig | null;
@@ -1747,6 +1751,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
   // Settings
   if (p.onOpenSettings) {
     const openSettings = p.onOpenSettings;
+    const remoteConnection = p.remoteConnection;
     actions.push(() => [
       {
         id: CommandIds.settingsOpen(),
@@ -1790,6 +1795,19 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         // generic Providers list.
         run: () => openSettings("providers", { expandProvider: "coder", startCoderLogin: true }),
       },
+      ...(remoteConnection
+        ? [
+            {
+              id: CommandIds.openServerWindow(),
+              title: "Open Server Window",
+              subtitle: "Open a window connected to the running xum server",
+              section: section.settings,
+              keywords: ["server", "remote", "connect", "window", "xum server"],
+              shortcutHint: formatKeybind(KEYBINDS.OPEN_SERVER_WINDOW),
+              run: () => openServerWindow(remoteConnection, openSettings),
+            },
+          ]
+        : []),
       ...(p.agentPluginsEnabled
         ? ([
             {

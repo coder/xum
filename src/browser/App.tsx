@@ -17,6 +17,7 @@ import {
 } from "./hooks/usePersistedState";
 import { useResizableSidebar } from "./hooks/useResizableSidebar";
 import { matchesKeybind, KEYBINDS } from "./utils/ui/keybinds";
+import { openServerWindow } from "./utils/openServerWindow";
 import { applyFastModeServiceTierChange, getFastModeProvider } from "./utils/fastModeServiceTier";
 import { handleLayoutSlotHotkeys } from "./utils/ui/layoutSlotHotkeys";
 import { buildSortedWorkspacesByProject } from "./utils/ui/workspaceFiltering";
@@ -1010,6 +1011,7 @@ function AppInner() {
     onSetTheme: setThemePreference,
     onOpenSettings: openSettings,
     onOpenAbout: openAboutDialog,
+    remoteConnection: window.api?.remoteConnection,
     supportedUpdateChannels,
     layoutPresets,
     onApplyLayoutSlot: (workspaceId, slot) => {
@@ -1100,6 +1102,10 @@ function AppInner() {
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SETTINGS)) {
         e.preventDefault();
         openSettings();
+      } else if (matchesKeybind(e, KEYBINDS.OPEN_SERVER_WINDOW) && window.api?.remoteConnection) {
+        // Desktop-only: browser mode and server windows have no remote connection bridge.
+        e.preventDefault();
+        openServerWindow(window.api.remoteConnection, openSettings).catch(() => undefined);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_ANALYTICS)) {
         e.preventDefault();
         if (isAnalyticsOpen) {
@@ -1132,6 +1138,15 @@ function AppInner() {
     navigateFromAnalytics,
     navigate,
   ]);
+  // The native menu's Open Server Window item forwards here, so it shares the shortcut's flow.
+  useEffect(() => {
+    const bridge = window.api?.remoteConnection;
+    if (!bridge) return;
+    return bridge.onOpenServerWindowRequested(() => {
+      openServerWindow(bridge, openSettings).catch(() => undefined);
+    });
+  }, [openSettings]);
+
   // Mouse back/forward buttons (buttons 3 and 4)
   useEffect(() => {
     const handleMouseNavigation = (e: MouseEvent) => {

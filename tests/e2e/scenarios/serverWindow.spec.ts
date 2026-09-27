@@ -168,3 +168,41 @@ test("opens the running xum server next to the local window", async ({
     expect(output.some((text) => text.includes(token))).toBe(false);
   }
 });
+
+test("Ctrl/Cmd+Shift+O opens the server window, or Remote Connection settings when none runs", async ({
+  app,
+  page,
+  workspace,
+}, testInfo) => {
+  test.setTimeout(180_000);
+  const root = workspace.configRoot;
+  await page.waitForFunction(() => Boolean(window.api?.remoteConnection));
+  // The shortcut handler mounts with the app shell.
+  await expect(page.getByRole("navigation", { name: "Projects" })).toBeVisible({ timeout: 30_000 });
+
+  // No server yet: the shortcut lands on Settings → Remote Connection, which explains why.
+  await page.keyboard.press("ControlOrMeta+Shift+O");
+  const section = page.getByRole("region", { name: "Remote connection" });
+  await expect(section.getByRole("alert")).toContainText("No running xum server", {
+    timeout: 15_000,
+  });
+
+  const port = await getFreePort();
+  const server = await startXumServer({
+    root,
+    port,
+    token: randomBytes(32).toString("hex"),
+    logPath: testInfo.outputPath("xum-server.log"),
+  });
+  try {
+    const opened = app.waitForEvent("window");
+    await page.keyboard.press("ControlOrMeta+Shift+O");
+    const serverPage = await opened;
+    await expect
+      .poll(() => serverPage.evaluate(() => location.origin), { timeout: 30_000 })
+      .toBe(`http://127.0.0.1:${port}`);
+    await expect(section.getByRole("status")).toContainText("Connected");
+  } finally {
+    await server.stop();
+  }
+});

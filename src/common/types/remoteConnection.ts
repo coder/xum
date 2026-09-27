@@ -8,6 +8,8 @@ export interface RemoteConnectionApi {
   onStateChanged(callback: (state: RemoteConnectionState) => void): () => void;
   /** Open or focus a window for the xum server holding this root's server.lock. */
   openLocalServer(): Promise<OpenLocalServerResult>;
+  /** The native menu asks the local window to run its Open Server Window flow. */
+  onOpenServerWindowRequested(callback: () => void): () => void;
 }
 
 /** Never carries the server token. On "unavailable", RemoteConnectionState.error explains why. */

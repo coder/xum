@@ -70,6 +70,11 @@ const remoteConnection: RemoteConnectionApi = {
     ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
     return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.stateChanged, listener);
   },
+  onOpenServerWindowRequested: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested, listener);
+    return () => ipcRenderer.off(REMOTE_CONNECTION_CHANNELS.openServerWindowRequested, listener);
+  },
 };
 
 contextBridge.exposeInMainWorld("api", {
