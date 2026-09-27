@@ -16,6 +16,8 @@ import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
+import { createMuxMessage } from "@/common/types/message";
+import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
@@ -2868,6 +2870,61 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
     useSnapshotService();
 
     expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  // #4901: the reference scan reads chat-archive.jsonl, then chat.jsonl. A sealed-history
+  // rotation between those reads moves rows into a file already read, so they must be one
+  // snapshot under the history locks.
+  test("a history rotation during the reference scan does not hide a referenced upload", async () => {
+    const bytes = Buffer.from("referenced before a rotation");
+    const stagedPath = await stagePreMirrorUpload(bytes);
+    const chatPath = path.join(harness.config.sessionsDir, workspaceId, "chat.jsonl");
+    // Real history rows, so a boundary append really rotates the reference into the archive.
+    await fsPromises.rm(chatPath);
+    await harness.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("m1", "user", `Attached \`${stagedPath}\``)
+    );
+    useSnapshotService();
+
+    let rotation: Promise<unknown> | undefined;
+    let probe: Promise<void> | undefined;
+    const originalOpen = fsPromises.open;
+    const openSpy = spyOn(fsPromises, "open").mockImplementation((async (...args) => {
+      if (rotation == null && args[0] === chatPath) {
+        // Is the scan holding the in-process history lock? Queue a probe behind it.
+        let lockFree = false;
+        probe = workspaceFileLocks.withLock(workspaceId, () => {
+          lockFree = true;
+          return Promise.resolve();
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        rotation = harness.historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage("b1", "assistant", "summary", {
+            compacted: "user",
+            compactionBoundary: true,
+            compactionEpoch: 1,
+          })
+        );
+        // Unlocked scan: let the rotation finish between the two reads. Locked scan: waiting
+        // would deadlock; the rotation runs once the scan releases the lock.
+        if (lockFree) {
+          await rotation;
+        }
+      }
+      return originalOpen(...args);
+    }) as typeof fsPromises.open);
+    try {
+      expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+    } finally {
+      openSpy.mockRestore();
+    }
+    expect(rotation).toBeDefined();
+    await Promise.all([probe, rotation]);
     expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
 
     expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);

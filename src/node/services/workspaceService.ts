@@ -1388,31 +1388,45 @@ function rollUpAncestorWorkspaceIds(params: {
  * Staged paths referenced by the session's history files. Throws on an unreadable file unless
  * `onUnreadable` is given, in which case that file is reported and its readable siblings still
  * count.
+ *
+ * The three reads run under `workspaceId`'s history locks so they form one snapshot (#4901):
+ * otherwise a sealed-history rotation between them moves rows from chat.jsonl into an archive
+ * that was already read. Callers pass the ID of the workspace that owns `sessionDir` and must
+ * not hold its history locks (the in-process lock is not re-entrant). Only the reads run under
+ * the lock; callers copy files after it is released.
  */
-async function collectReferencedStagedAttachmentPaths(
-  sessionDir: string,
-  onUnreadable?: (fileName: string, error: unknown) => void
-): Promise<string[]> {
-  const paths = new Set<string>();
-  for (const fileName of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME, "partial.json"] as const) {
-    try {
-      // Streamed: every snapshot archive scans the full append-only history.
-      for (const stagedPath of await extractStagedAttachmentPathsFromFile(
-        path.join(sessionDir, fileName)
-      )) {
-        paths.add(stagedPath);
+async function collectReferencedStagedAttachmentPaths(input: {
+  historyService: HistoryService;
+  workspaceId: string;
+  sessionDir: string;
+  onUnreadable?: (fileName: string, error: unknown) => void;
+}): Promise<string[]> {
+  assert(
+    path.basename(input.sessionDir) === input.workspaceId,
+    "history scan locks must belong to the scanned session dir"
+  );
+  return input.historyService.withHistoryScanLocks(input.workspaceId, async () => {
+    const paths = new Set<string>();
+    for (const fileName of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME, "partial.json"] as const) {
+      try {
+        // Streamed: every snapshot archive scans the full append-only history.
+        for (const stagedPath of await extractStagedAttachmentPathsFromFile(
+          path.join(input.sessionDir, fileName)
+        )) {
+          paths.add(stagedPath);
+        }
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          continue;
+        }
+        if (input.onUnreadable == null) {
+          throw error;
+        }
+        input.onUnreadable(fileName, error);
       }
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) {
-        continue;
-      }
-      if (onUnreadable == null) {
-        throw error;
-      }
-      onUnreadable(fileName, error);
     }
-  }
-  return [...paths];
+    return [...paths];
+  });
 }
 
 async function archiveChildSessionArtifactsIntoParentSessionDir(params: {
@@ -12254,8 +12268,13 @@ export class WorkspaceService
           targetWorkspaceId: newWorkspaceId,
         });
 
-        const referencedStagedAttachmentPaths =
-          await collectReferencedStagedAttachmentPaths(newSessionDir);
+        // The fork's own copied history (after truncation and the partial snapshot), so the
+        // fork's history locks, not the source's.
+        const referencedStagedAttachmentPaths = await collectReferencedStagedAttachmentPaths({
+          historyService: this.historyService,
+          workspaceId: newWorkspaceId,
+          sessionDir: newSessionDir,
+        });
         if (referencedStagedAttachmentPaths.length > 0) {
           const sourceWorkspacePath = resolveWorkspaceExecutionPath(
             sourceMetadata,
@@ -13127,15 +13146,17 @@ export class WorkspaceService
     try {
       const sessionDir = path.join(this.config.sessionsDir, workspaceId);
       // One damaged history file must not hide references in its readable siblings.
-      const stagedPaths = await collectReferencedStagedAttachmentPaths(
+      const stagedPaths = await collectReferencedStagedAttachmentPaths({
+        historyService: this.historyService,
+        workspaceId,
         sessionDir,
-        (fileName, error) =>
+        onUnreadable: (fileName, error) =>
           log.warn("Skipping unreadable history file for staged attachment backfill", {
             workspaceId,
             fileName,
             error: getErrorMessage(error),
-          })
-      );
+          }),
+      });
       if (stagedPaths.length === 0) {
         return;
       }
