@@ -684,6 +684,44 @@ describe("vscode webview app and providers config", () => {
     expect(view.queryByText("MED")).toBeNull();
   });
 
+  test("falls back to a policy-allowed model of a configured provider (#4808 review)", async () => {
+    updatePersistedState(getModelKey(WORKSPACE.id), "openai:gpt-5.6-terra");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    // Anthropic is allowed and listed first, but only Google has credentials.
+    await bridge.answer("policy.get", {
+      source: "governor",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [
+          { id: "anthropic", allowedModels: null },
+          { id: "google", allowedModels: null },
+        ],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    });
+    // ProvidersConfigStore is an app-wide singleton with no reset; later files in this process do
+    // not read it, and the next test here only counts fetches.
+    await bridge.answer("providers.getConfig", {
+      google: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
+      options: Record<string, unknown>;
+    };
+    expect(String(input.options.model)).toStartWith("google:");
+  });
+
   test("loads the config again when the connection recovers from file mode", async () => {
     const bridge = new TestBridge();
     render(<App bridge={bridge} />);
