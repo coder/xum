@@ -689,16 +689,20 @@ export class TerminalService {
     // This open's share of the lease until it is kept or released below.
     let openLease: WorkspaceUseLease | undefined;
     try {
-      // #4902: held before the path is read, and on every open (it probes the gate), so a
-      // rename, removal or archive can neither slip in between nor run meanwhile. Throws while
-      // one runs: no terminal may open there.
-      openLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "terminal");
+      // #4902: held before the path is read, and on every open (it probes the gate), so another
+      // backend's rename, removal or archive can neither slip in between nor run meanwhile.
+      // Throws while one runs: no terminal may open there.
+      const leases = workspaceUseLeasesFor(this.config);
+      openLease = await leases.hold(workspaceId, "terminal");
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
 
       if (!workspace) {
         throw new Error(`Workspace not found: ${workspaceId}`);
       }
+      // This backend's own rename or removal ignores its terminal leases, so it may have taken
+      // the gate during the read: probe again (a nested hold) now that the path is known.
+      await (await leases.hold(workspaceId, "terminal")).release();
 
       // Persisted archived state (not just an in-progress archive): a stale renderer can
       // request a terminal for an already-archived workspace whose checkout may already be

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
+import * as fsPromises from "node:fs/promises";
 import * as path from "path";
 import * as readline from "node:readline";
 
@@ -27,6 +28,7 @@ import {
 } from "@/node/services/workspaceService.testHarness";
 import {
   workspaceUseLeasesFor,
+  workspaceUseLockDir,
   type WorkspaceUseKind,
   type WorkspaceUseLease,
 } from "@/node/services/workspaceUseLeases";
@@ -518,6 +520,19 @@ describe("structural workspace mutations across two backends on one root", () =>
       "Workspace not found"
     );
     expect(heldCount(b, "editor")).toBe(0);
+  });
+
+  test("an editor open for an unknown workspace publishes no lease", async () => {
+    const unknownId = "unknown-editor-workspace";
+    expect(
+      errorOf(await b.workspaceService.recordExternalEditorOpenForLaunch(unknownId))
+    ).toContain("Workspace not found");
+    expect(
+      await fsPromises.access(workspaceUseLockDir(b.config.rootDir, unknownId)).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
   });
 
   test("every editor open probes the gate, even after an earlier open of the workspace", async () => {

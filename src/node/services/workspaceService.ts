@@ -9925,12 +9925,17 @@ export class WorkspaceService
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
       );
     }
+    // Also a path-safety boundary: the marker path joins the raw ID beneath the sessions
+    // directory, so an unknown (possibly traversal-crafted, e.g. "../../.ssh") ID must never
+    // reach the filesystem, and it publishes no lease either (lease directories are not pruned).
+    if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
+      return Err(`Workspace not found: ${workspaceId}`);
+    }
     // #4883: like a native terminal (see TerminalService.nativeTerminalUseLeases), an editor's
     // lifetime cannot be tracked, so this backend holds an "editor" use lease from the first
     // open until it archives or removes the workspace (releaseExternalAppUseLeases) or exits.
-    // #4902: every open takes a share before the row is read (it probes the gate), so a
-    // rename, removal or archive can neither slip in between nor run meanwhile. The lease path
-    // is a digest of the ID, so an unknown ID is safe here.
+    // #4902: every open takes a share before the row is read again below (it probes the gate),
+    // so a rename, removal or archive can neither slip in between nor run meanwhile.
     let lease: WorkspaceUseLease;
     try {
       lease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "editor");
@@ -9940,9 +9945,6 @@ export class WorkspaceService
     const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     if (workspaceEntry == null) {
       await lease.release();
-      // Also a path-safety boundary: the marker path joins the raw ID beneath the sessions
-      // directory, so an unknown (possibly traversal-crafted, e.g. "../../.ssh") ID must
-      // never reach the filesystem.
       return Err(`Workspace not found: ${workspaceId}`);
     }
     // Persisted archived state (not just an in-progress archive): a stale renderer can request

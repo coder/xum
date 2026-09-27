@@ -1428,6 +1428,36 @@ describe("TerminalService.openNative", () => {
       }
     });
 
+    it("refuses when this backend's own rename takes the gate while the open reads the path", async () => {
+      let releaseGate: (() => Promise<void>) | undefined;
+      const config = {
+        ...configWithLeaseWorkspace,
+        getAllWorkspaceMetadata: mock(async () => {
+          // A read made while the open holds its lease: the own rename ignores that lease.
+          const leases = workspaceUseLeasesFor(config);
+          if (releaseGate == null && leases.heldCount(workspaceId, "terminal") > 0) {
+            releaseGate = await leases.acquireMutationGate([workspaceId], {
+              ...gateOptions,
+              ignoreOwnKinds: new Map([[workspaceId, new Set(["terminal" as const])]]),
+            });
+          }
+          return configWithLeaseWorkspace.getAllWorkspaceMetadata();
+        }),
+      } as unknown as Config;
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+      try {
+        let error: unknown;
+        await service.openNative(workspaceId).catch((caught: unknown) => (error = caught));
+        expect(releaseGate).toBeDefined();
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect(workspaceUseLeasesFor(config).heldCount(workspaceId)).toBe(0);
+      } finally {
+        await releaseGate?.();
+        await service.releaseNativeTerminalUseLease(workspaceId);
+      }
+    });
+
     it("probes the gate on every open, even after an earlier open of the workspace", async () => {
       service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
       await service.openNative(workspaceId);
