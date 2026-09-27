@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import * as path from "path";
@@ -34,6 +34,7 @@ import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBeh
 const rootId = "root-archive";
 const childId = "child-archive";
 const grandchildId = "grandchild-archive";
+const lateChildId = "late-child-archive";
 
 const exists = (p: string) =>
   fsPromises.access(p).then(
@@ -153,6 +154,36 @@ describe("parent archive cascades over its sub-agent tree across two backends", 
       expect(findWorkspaceInConfig(a.config, id)?.archivedAt).toBeUndefined();
       expect(await exists(checkouts.get(id)!)).toBe(true);
     }
+  });
+
+  test("a sub-agent the other backend commits after the tree was listed refuses the parent's archive", async () => {
+    await setArchiveBehavior("keep");
+    // B's task creation commits after A listed the tree (A's next step reads the parent).
+    const aiService = (
+      a.workspaceService as unknown as {
+        aiService: { getWorkspaceMetadata: (id: string) => Promise<unknown> };
+      }
+    ).aiService;
+    const getMetadata = aiService.getWorkspaceMetadata.bind(aiService);
+    spyOn(aiService, "getWorkspaceMetadata").mockImplementationOnce(async (id) => {
+      await b.config.editConfig((config) => {
+        [...config.projects.values()][0].workspaces.push({
+          ...findWorkspaceInConfig(b.config, childId)!,
+          id: lateChildId,
+          name: lateChildId,
+          parentWorkspaceId: rootId,
+        });
+        return config;
+      });
+      return getMetadata(id);
+    });
+
+    const result = await a.workspaceService.archive(rootId);
+
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toContain(lateChildId);
+    expect(findWorkspaceInConfig(a.config, rootId)?.archivedAt).toBeUndefined();
+    expect(findWorkspaceInConfig(a.config, lateChildId)?.archivedAt).toBeUndefined();
   });
 
   test("a delete-mode archive of an idle tree archives every row and deletes every checkout", async () => {
