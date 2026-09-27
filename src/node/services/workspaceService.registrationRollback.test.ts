@@ -363,14 +363,15 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     return source.data.id;
   };
 
-  test("multi-project fork with a name matching existing branches keeps them", async () => {
+  test("multi-project fork keeps an existing branch and removes the ones it made", async () => {
     const sourceId = await createMultiSource();
-    const repos = [projectPath, otherProjectPath];
-    const tips = repos.map((repo) => branchWithOwnCommit(repo, "multi-fork"));
+    const tip = branchWithOwnCommit(projectPath, "multi-fork");
 
     await expectFailsWithSaveError(() => service.fork(sourceId, "multi-fork"));
-    expect(repos.map((repo) => git(repo, "rev-parse", "multi-fork"))).toEqual(tips);
-    for (const repo of repos) {
+    expect(git(projectPath, "rev-parse", "multi-fork")).toBe(tip);
+    // A branch left behind would make a retry reuse its stale tip.
+    expect(git(otherProjectPath, "branch", "--list", "multi-fork")).toBe("");
+    for (const repo of [projectPath, otherProjectPath]) {
       expect(worktreePaths(repo).map((p) => path.basename(p))).not.toContain("multi-fork");
     }
   });
