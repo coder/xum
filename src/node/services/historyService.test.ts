@@ -3140,6 +3140,33 @@ describe("HistoryService", () => {
     });
   });
 
+  describe("hasHistoryBeforeSequence with an unreadable archive", () => {
+    // A directory in place of chat-archive.jsonl makes every archive read fail (EISDIR).
+    const workspaceId = "ws-has-older-bad-archive";
+    const row = (id: string, historySequence: number) =>
+      messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
+
+    it("still answers from chat.jsonl when it holds an older row", async () => {
+      await writeHistoryLines(config, workspaceId, [row("c3", 3), row("c5", 5)]);
+      await fs.mkdir(path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"));
+
+      expect(await service.hasHistoryBeforeSequence(workspaceId, 5)).toBe(true);
+    });
+
+    it("fails when chat.jsonl cannot answer without the archive", async () => {
+      await writeHistoryLines(config, workspaceId, [row("c5", 5), row("c6", 6)]);
+      await fs.mkdir(path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"));
+
+      let rejected = false;
+      try {
+        await service.hasHistoryBeforeSequence(workspaceId, 5);
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+    });
+  });
+
   describe("getMessagesForCompactionEpoch", () => {
     it("returns evidence rows between the previous boundary and the new summary", async () => {
       const workspaceId = "ws-compaction-epoch";

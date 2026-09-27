@@ -2367,9 +2367,20 @@ export class HistoryService {
     // newest rows are usually already older than the replayed active epoch, so
     // its last chunk answers; chat.jsonl rows are mostly >= the replay's oldest
     // sequence and would be parsed in full before reaching the archive.
-    const completed = await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
-    if (completed && !hasOlder) {
+    // An unreadable archive must not fail a check that chat.jsonl alone answers
+    // (reading chat.jsonl first never opened the archive then), so its error is
+    // rethrown only when chat.jsonl has no older row either.
+    let archiveError: unknown;
+    try {
+      await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+    } catch (error) {
+      archiveError = error ?? new Error("chat-archive.jsonl read failed");
+    }
+    if (!hasOlder) {
       await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
+    }
+    if (!hasOlder && archiveError !== undefined) {
+      throw archiveError;
     }
 
     return hasOlder;
