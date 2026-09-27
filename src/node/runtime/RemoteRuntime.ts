@@ -30,7 +30,7 @@ import type {
   EnsureReadyResult,
   ReadFileOptions,
 } from "./Runtime";
-import { RuntimeError } from "./Runtime";
+import { RuntimeError, isRuntimeTransportError } from "./Runtime";
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { log } from "@/node/services/log";
@@ -199,10 +199,16 @@ export abstract class RemoteRuntime implements Runtime {
 
       childProcess.on("error", (err) => {
         spawnResult.onError?.(err);
+        // A transport-classified child failure (an SSH2 channel or connection
+        // lost after acquisition, #4835) stays "network" so callers never read
+        // it as a missing file. Check abort/timeout FIRST: our own kill can
+        // surface the same way, and that says nothing about the transport.
+        const isTransport =
+          isRuntimeTransportError(err) && !aborted && !timedOut && !options.abortSignal?.aborted;
         reject(
           new RuntimeError(
             `Failed to execute ${this.commandPrefix} command: ${err.message}`,
-            "exec",
+            isTransport ? "network" : "exec",
             err
           )
         );
@@ -210,6 +216,12 @@ export abstract class RemoteRuntime implements Runtime {
     });
 
     const duration = exitCode.then(() => performance.now() - startTime);
+    // A failed child rejects both promises, and callers may read neither
+    // (duration) or only after draining stdout (exitCode). Mark them handled so
+    // the rejection reaches awaiting callers without an unhandled-rejection
+    // crash in server mode.
+    exitCode.catch(() => undefined);
+    duration.catch(() => undefined);
 
     // Handle abort signal
     if (options.abortSignal) {

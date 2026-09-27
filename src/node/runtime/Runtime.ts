@@ -752,8 +752,8 @@ export class RuntimeError extends Error {
  * True when a runtime operation failed in transport (see RuntimeError), so a
  * fallback chain must stop instead of treating the target as absent.
  *
- * SSH2 also reports aborted execs as "network": callers that own an abort
- * signal check it first, as they already do for missing-candidate fallbacks.
+ * Callers that own an abort signal still check it first, as they already do
+ * for missing-candidate fallbacks: an abort can race a real transport failure.
  */
 export function isRuntimeTransportError(error: unknown): error is RuntimeError {
   return error instanceof RuntimeError && error.type === "network";

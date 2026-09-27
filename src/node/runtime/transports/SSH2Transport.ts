@@ -18,6 +18,21 @@ import type {
   PtySessionParams,
 } from "./SSHTransport";
 
+/**
+ * Pooled ssh2 clients whose connection has closed. ssh2 emits the client's
+ * "close" BEFORE it closes the channels still open on it, so a channel close
+ * can tell a dead connection from a normal remote close. One listener per
+ * client (not per exec) keeps concurrent execs under the listener limit.
+ */
+const watchedClients = new WeakSet<object>();
+const closedClients = new WeakSet<object>();
+
+function watchForConnectionClose(client: EventEmitter): void {
+  if (watchedClients.has(client)) return;
+  watchedClients.add(client);
+  client.once("close", () => closedClients.add(client));
+}
+
 class SSH2ChildProcess extends EventEmitter {
   readonly stdout: NodeJS.ReadableStream;
   readonly stderr: NodeJS.ReadableStream;
@@ -28,7 +43,10 @@ class SSH2ChildProcess extends EventEmitter {
   killed = false;
   pid = 0;
 
-  constructor(private readonly channel: ClientChannel) {
+  constructor(
+    private readonly channel: ClientChannel,
+    isConnectionClosed: () => boolean
+  ) {
     super();
 
     const stdoutPipe = new PassThrough();
@@ -63,6 +81,18 @@ class SSH2ChildProcess extends EventEmitter {
       if (closeTimer) {
         clearTimeout(closeTimer);
         closeTimer = null;
+      }
+
+      // When the TCP connection dies, ssh2 closes every open channel with EOF
+      // and no exit status. Reporting that as exit 0 turned a mid-exec drop into
+      // a successful, truncated result (an empty read; a stat that parses as
+      // garbage, i.e. "missing"). Surface it as a transport failure (#4835).
+      if (this.exitCode === null && this.signalCode === null && isConnectionClosed()) {
+        this.emit(
+          "error",
+          new RuntimeErrorClass("SSH2 connection closed before the command exited", "network")
+        );
+        return;
       }
 
       this.emit("close", this.exitCode ?? 0, this.signalCode);
@@ -107,7 +137,19 @@ class SSH2ChildProcess extends EventEmitter {
     });
 
     channel.on("error", (err: Error) => {
-      this.emit("error", err);
+      // An errored channel is dead: end our pipes so stdout readers finish
+      // instead of waiting out the exec timeout, and report one terminal event
+      // (no later "close" that would mark the connection healthy again). The
+      // channel was acquired, so its failure is a transport failure, never a
+      // missing path (#4835); RemoteRuntime keeps aborts/timeouts out of that.
+      closeEmitted = true;
+      if (closeTimer) clearTimeout(closeTimer);
+      stdoutPipe.end();
+      stderrPipe.end();
+      this.emit(
+        "error",
+        new RuntimeErrorClass(`SSH2 channel failed: ${err.message}`, "network", err)
+      );
     });
   }
 
@@ -263,12 +305,15 @@ export class SSH2Transport implements SSHTransport {
         timeoutMs: connectTimeoutSec * 1000,
       }));
     } catch (error) {
+      // An abort (e.g. while waiting out a backoff) is not a transport failure.
       throw new RuntimeErrorClass(
         `SSH2 connection failed: ${getErrorMessage(error)}`,
-        "network",
+        options.abortSignal?.aborted === true ? "exec" : "network",
         error instanceof Error ? error : undefined
       );
     }
+
+    watchForConnectionClose(client);
 
     try {
       const channel = await new Promise<ClientChannel>((resolve, reject) => {
@@ -337,7 +382,9 @@ export class SSH2Transport implements SSHTransport {
       });
 
       // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-      const process = new SSH2ChildProcess(channel) as unknown as ChildProcess;
+      const process = new SSH2ChildProcess(channel, () =>
+        closedClients.has(client)
+      ) as unknown as ChildProcess;
       return {
         process,
         onExit: () => {
@@ -356,7 +403,7 @@ export class SSH2Transport implements SSHTransport {
       }
       throw new RuntimeErrorClass(
         `SSH2 command failed: ${errorMessage}`,
-        "network",
+        wasAborted ? "exec" : "network",
         error instanceof Error ? error : undefined
       );
     }

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { PassThrough, Readable } from "stream";
+import { isRuntimeTransportError } from "../Runtime";
 import { ssh2ConnectionPool } from "../SSH2ConnectionPool";
 import { SSH2Transport } from "./SSH2Transport";
 
@@ -53,7 +54,7 @@ class FakeClientChannel extends EventEmitter {
 }
 
 function createFakeClient(channel: FakeClientChannel) {
-  return {
+  return Object.assign(new EventEmitter(), {
     exec(
       _command: string,
       optionsOrCallback:
@@ -64,7 +65,7 @@ function createFakeClient(channel: FakeClientChannel) {
       const callback = typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
       callback?.(undefined, channel);
     },
-  };
+  });
 }
 
 function rejectAfter(timeoutMs: number): Promise<never> {
@@ -112,11 +113,11 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
 
   test("aborts while waiting for ssh2 exec channel", async () => {
     acquireConnectionSpy.mockResolvedValue({
-      client: {
+      client: Object.assign(new EventEmitter(), {
         exec() {
           // Simulate ssh2 never invoking the exec callback.
         },
-      },
+      }),
     } as never);
 
     const reportFailureSpy = spyOn(ssh2ConnectionPool, "reportFailure");
@@ -134,9 +135,31 @@ describe("SSH2Transport.spawnRemoteProcess", () => {
     } catch (error) {
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message).toContain("Operation aborted");
+      expect(isRuntimeTransportError(error)).toBe(false);
     }
     expect(reportFailureSpy).not.toHaveBeenCalled();
     reportFailureSpy.mockRestore();
+  });
+
+  test("an abort while acquiring the connection is not a transport failure", async () => {
+    // e.g. the user presses Stop while the pool waits out a backoff (#4835).
+    const controller = new AbortController();
+    acquireConnectionSpy.mockImplementation(() => {
+      controller.abort();
+      return Promise.reject(new Error("Operation aborted"));
+    });
+    const transport = new SSH2Transport({ host: "remote.example.com" });
+    const aborted: unknown = await transport
+      .spawnRemoteProcess("echo ok", { abortSignal: controller.signal })
+      .catch((e: unknown) => e);
+    expect(aborted).toBeInstanceOf(Error);
+    expect(isRuntimeTransportError(aborted)).toBe(false);
+
+    acquireConnectionSpy.mockRejectedValue(new Error("connect ECONNREFUSED"));
+    const refused: unknown = await transport
+      .spawnRemoteProcess("echo ok", {})
+      .catch((e: unknown) => e);
+    expect(isRuntimeTransportError(refused)).toBe(true);
   });
 
   test("forcePTY closes the synthetic stderr stream when ssh2 omits channel.stderr", async () => {
