@@ -37,7 +37,7 @@ const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
 // Host file lock serializing background spawns per workspace across backends (#4873).
 // A regular file inside the workspace records root: record scanners only read directories.
-const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
+export const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
 // Held from the name probe until the new record's meta.json is written (one local spawn).
 const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
@@ -1383,27 +1383,87 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Allocate a unique process ID and reserve it in the same synchronous step.
+   * Claim a unique process name for foreground-to-background migration.
    *
-   * Foreground-to-background migration awaits between choosing its ID and registering the
-   * migrated process; without a reservation, two concurrent same-name migrations would both
-   * be handed the same ID and share one output directory and manager entry — the first exit
-   * would then write the shared exit marker and settle the survivor's records, blinding
-   * archive gating after an unclean restart. Callers release on success only after the
-   * process is registered (the processes map then holds the name) and on failure only once
-   * the process's exit settles, so an unverifiable survivor keeps its name reserved for the
-   * session.
+   * Migrated records live under `<bgOutputDir>/<workspaceId>/<processId>`. Two backends on one
+   * XUM_ROOT (desktop + `xum server`) have separate managers, so an in-memory reservation
+   * alone let both migrate a same-named command into one directory and share its
+   * output.log/exit marker (#4878). The claim therefore holds the same per-workspace host file
+   * lock as spawn() and only picks a name whose directory does not exist yet. A fresh
+   * directory also never inherits a previous session's exit marker, which would make the live
+   * migrated command read as exited to name probes and crash-orphan archive gating.
+   *
+   * The caller keeps the claim (lock) until migrateToBackground() has created the directory,
+   * after which every other backend's probe reads the name as held, then disposes it. The
+   * in-memory name reservation is released separately via releaseName(): on success once the
+   * process is registered (the processes map then holds the name), on failure only once the
+   * process's exit settles, so an unverifiable survivor keeps its name for the session.
    */
-  reserveUniqueProcessId(baseId: string): { processId: string; release: () => void } {
-    const processId = this.generateUniqueProcessId(baseId);
+  async claimMigrationProcessId(
+    workspaceId: string,
+    displayName: string
+  ): Promise<
+    | ({ success: true; processId: string; releaseName: () => void } & AsyncDisposable)
+    | { success: false; error: string }
+  > {
+    assert(workspaceId.length > 0, "claimMigrationProcessId requires workspaceId");
+    const workspaceDir = nodePath.join(this.bgOutputDir, workspaceId);
+    let lock: AsyncDisposable;
+    try {
+      lock = await acquireProcessFileLock({
+        lockPath: nodePath.join(workspaceDir, SPAWN_NAME_LOCK_FILENAME),
+        timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+        label: "background migration lock",
+      });
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+      };
+    }
+    // Each candidate is reserved in the same tick it is chosen (see reservedProcessIds), so a
+    // concurrent spawn() in this manager cannot pick it during the directory probes below.
+    let processId = this.generateUniqueProcessId(displayName);
     this.reservedProcessIds.add(processId);
-    let released = false;
-    return {
-      processId,
-      release: () => {
-        if (released) return;
-        released = true;
+    try {
+      let suffix = 2;
+      for (;;) {
+        try {
+          await fsPromises.lstat(nodePath.join(workspaceDir, processId));
+        } catch (error) {
+          if (isErrnoWithCode(error, "ENOENT")) break; // Free.
+          throw error; // Unprobeable: fail closed instead of guessing or looping.
+        }
         this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    } catch (error) {
+      this.reservedProcessIds.delete(processId);
+      await lock[Symbol.asyncDispose]();
+      return {
+        success: false,
+        error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+      };
+    }
+    const claimedId = processId;
+    let nameReleased = false;
+    let unlocked = false;
+    return {
+      success: true,
+      processId: claimedId,
+      releaseName: () => {
+        if (nameReleased) return;
+        nameReleased = true;
+        this.reservedProcessIds.delete(claimedId);
+      },
+      [Symbol.asyncDispose]: async () => {
+        if (unlocked) return;
+        unlocked = true;
+        await lock[Symbol.asyncDispose]();
       },
     };
   }

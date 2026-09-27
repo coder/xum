@@ -26,7 +26,11 @@ function isForegroundSuccess(
   return result.success && !("backgroundProcessId" in result);
 }
 
-import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import {
+  BackgroundProcessManager,
+  SPAWN_NAME_LOCK_FILENAME,
+} from "@/node/services/backgroundProcessManager";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
@@ -2175,6 +2179,156 @@ describe("bash tool - background execution", () => {
 
     tempDir[Symbol.dispose]();
   }, 15000);
+
+  // #4878: two backends (desktop + `xum server` on one XUM_ROOT) have separate managers but
+  // share the migrated-record root, so migration names must be claimed across processes.
+  describe("foreground-to-background migration across backends", () => {
+    async function waitForFile(filePath: string): Promise<void> {
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(filePath) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(fs.existsSync(filePath)).toBe(true);
+    }
+
+    function startForeground(
+      manager: BackgroundProcessManager,
+      tempDir: TestTempDir,
+      script: string,
+      displayName: string
+    ): Promise<BashToolResult> {
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.backgroundProcessManager = manager;
+      return createBashTool(config).execute!(
+        { script, timeout_secs: 60, run_in_background: false, display_name: displayName },
+        mockToolCallOptions
+      ) as Promise<BashToolResult>;
+    }
+
+    async function migratedOutputDir(
+      manager: BackgroundProcessManager,
+      result: BashToolResult
+    ): Promise<string> {
+      expect(result.success).toBe(true);
+      const processId = "backgroundProcessId" in result ? result.backgroundProcessId : undefined;
+      expect(processId).toBeDefined();
+      const proc = (await manager.list("test-workspace")).find((p) => p.id === processId);
+      expect(proc).toBeDefined();
+      return proc!.outputDir;
+    }
+
+    it("gives same-name migrations from two backends distinct record directories", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-two-backends");
+      const bgRoot = path.join(tempDir.path, "bg-root");
+      const managers = [new BackgroundProcessManager(bgRoot), new BackgroundProcessManager(bgRoot)];
+      try {
+        const results = managers.map((manager, i) =>
+          startForeground(
+            manager,
+            tempDir,
+            `touch "${path.join(tempDir.path, `started-${i}`)}"; sleep 30`,
+            "dev"
+          )
+        );
+        await Promise.all(
+          managers.map((_, i) => waitForFile(path.join(tempDir.path, `started-${i}`)))
+        );
+        for (const manager of managers) {
+          expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        }
+        const settled = await Promise.all(results);
+        const dirs = await Promise.all(managers.map((m, i) => migratedOutputDir(m, settled[i])));
+        expect(dirs[0]).not.toBe(dirs[1]);
+      } finally {
+        await Promise.all(managers.map((m) => m.cleanup("test-workspace")));
+        tempDir[Symbol.dispose]();
+      }
+    }, 20000);
+
+    it("reports a command that exits while the name lock is contended as completed", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-exit-during-claim");
+      const bgRoot = path.join(tempDir.path, "bg-root");
+      const manager = new BackgroundProcessManager(bgRoot);
+      const started = path.join(tempDir.path, "started");
+      const go = path.join(tempDir.path, "go");
+      const pidFile = path.join(tempDir.path, "pid");
+      try {
+        const resultPromise = startForeground(
+          manager,
+          tempDir,
+          `echo $$ > "${pidFile}"; touch "${started}"; while [ ! -f "${go}" ]; do sleep 0.05; done; echo done; exit 3`,
+          "exits-during-claim"
+        );
+        await waitForFile(started);
+        // Another backend holds the spawn-name lock while this one sends its command to the
+        // background; the command exits before the lock frees up.
+        const otherBackendLock = await acquireProcessFileLock({
+          lockPath: path.join(bgRoot, "test-workspace", SPAWN_NAME_LOCK_FILENAME),
+          timeoutMs: 5000,
+          label: "test: other backend's spawn lock",
+        });
+        try {
+          expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          fs.writeFileSync(go, "");
+          const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+          const deadline = Date.now() + 5000;
+          for (;;) {
+            try {
+              process.kill(pid, 0);
+            } catch {
+              break;
+            }
+            expect(Date.now()).toBeLessThan(deadline);
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+        } finally {
+          await otherBackendLock[Symbol.asyncDispose]();
+        }
+
+        // The command finished before it could be migrated, so the real exit is reported.
+        const result = await resultPromise;
+        expect("backgroundProcessId" in result).toBe(false);
+        expect(result.exitCode).toBe(3);
+        expect(await manager.list("test-workspace")).toEqual([]);
+      } finally {
+        await manager.cleanup("test-workspace");
+        tempDir[Symbol.dispose]();
+      }
+    }, 20000);
+
+    it("does not inherit a previous session's exit marker", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-stale-marker");
+      const bgRoot = path.join(tempDir.path, "bg-root");
+      const staleDir = path.join(bgRoot, "test-workspace", "stale-job");
+      fs.mkdirSync(staleDir, { recursive: true });
+      fs.writeFileSync(path.join(staleDir, "exit_code"), "0");
+      fs.writeFileSync(
+        path.join(staleDir, "meta.json"),
+        JSON.stringify({ id: "stale-job", pid: 0, script: "old", startTime: 1, status: "exited" })
+      );
+      const manager = new BackgroundProcessManager(bgRoot);
+      const started = path.join(tempDir.path, "started");
+      try {
+        const resultPromise = startForeground(
+          manager,
+          tempDir,
+          `touch "${started}"; sleep 30`,
+          "stale-job"
+        );
+        await waitForFile(started);
+        expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        const outputDir = await migratedOutputDir(manager, await resultPromise);
+        // A stale marker would make the live migrated command read as exited to the other
+        // backend's name probe and to crash-orphan archive gating.
+        expect(fs.existsSync(path.join(outputDir, "exit_code"))).toBe(false);
+      } finally {
+        await manager.cleanup("test-workspace");
+        tempDir[Symbol.dispose]();
+      }
+    }, 20000);
+  });
 
   it("should arm monitor for background mode and echo monitor config", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");

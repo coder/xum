@@ -1392,6 +1392,19 @@ ${scriptWithEnv}`;
         // If the process already exited, drain the foreground streams for reliable output
         // instead of backgrounding based on timing.
         if (shouldBackground) {
+          // Claim the migrated record's name across backends BEFORE the exit check below
+          // (#4878): the claim may wait on another backend's spawn lock, and a command that
+          // exits during that wait must take the normal completion path, not be reported as
+          // backgrounded (or as a failed migration). The lock stays held until the migrated
+          // record directory exists (end of this block).
+          const claim =
+            config.backgroundProcessManager && config.workspaceId
+              ? await config.backgroundProcessManager.claimMigrationProcessId(
+                  config.workspaceId,
+                  safeDisplayName
+                )
+              : null;
+          await using claimLock = claim?.success ? claim : null;
           const didExit =
             exitCodeResolved ||
             (await Promise.race([
@@ -1402,6 +1415,10 @@ ${scriptWithEnv}`;
             ]));
 
           if (didExit) {
+            // Nothing was written under the claimed name. Release it before draining, which
+            // can outlast the exit (e.g. a grandchild holding stdout open).
+            claimLock?.releaseName();
+            await claimLock?.[Symbol.asyncDispose]();
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
@@ -1430,14 +1447,10 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
-            let migrationError = "background process manager unavailable";
-            if (config.backgroundProcessManager && config.workspaceId) {
-              // Allocate-and-reserve atomically: the migration awaits below would otherwise
-              // let a concurrent same-name migration receive the same ID and share this
-              // process's output directory and manager entry (see reserveUniqueProcessId).
-              const reservation =
-                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
-              const processId = reservation.processId;
+            let migrationError =
+              claim?.success === false ? claim.error : "background process manager unavailable";
+            if (config.backgroundProcessManager && config.workspaceId && claimLock) {
+              const processId = claimLock.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1474,7 +1487,7 @@ ${scriptWithEnv}`;
                   safeDisplayName
                 );
                 // The processes map now holds the name; the reservation has done its job.
-                reservation.release();
+                claimLock.releaseName();
 
                 return withNotice({
                   success: true,
@@ -1489,7 +1502,9 @@ ${scriptWithEnv}`;
               // name reserved until the aborted process's exit actually settles; if it never
               // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
-              void execStream.exitCode.catch(() => undefined).finally(() => reservation.release());
+              void execStream.exitCode
+                .catch(() => undefined)
+                .finally(() => claimLock.releaseName());
             }
 
             // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
