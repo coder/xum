@@ -117,8 +117,8 @@ describe("instructionFiles", () => {
     it("should propagate projectName for project scope", async () => {
       await fs.writeFile(path.join(tempDir, "AGENTS.md"), "project content");
 
-      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE, "my-project");
-      expect(result?.scope).toBe(INSTRUCTION_SCOPE.WORKSPACE);
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.PROJECT, "my-project");
+      expect(result?.scope).toBe(INSTRUCTION_SCOPE.PROJECT);
       expect(result?.projectName).toBe("my-project");
       expect(result?.files[0]?.projectName).toBe("my-project");
     });
