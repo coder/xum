@@ -6,7 +6,10 @@ import * as path from "node:path";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { SecretsStore } from "@/node/config/secretsStore";
 import type { ExperimentsService } from "./experimentsService";
+import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
@@ -376,6 +379,81 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(result.success ? "" : result.error).toContain("EACCES");
     // Unreadable is not proof the entry is gone, so nothing is deleted.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("feature-c");
+  });
+
+  // #4818: an Err after the registration write must not leave a workspace the caller was told
+  // does not exist (it would be listed, and after the consent grant, messageable).
+  test.each([
+    { label: "a branch it made", existingBranch: false },
+    { label: "an existing branch", existingBranch: true },
+  ])(
+    "create failing after registration on $label rolls it back and keeps the error",
+    async ({ existingBranch }) => {
+      const tip = existingBranch ? branchWithOwnCommit(projectPath, "after-reg") : undefined;
+      const workspaceId = "ddddddddd1";
+      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+
+      const result = await createWorktree("after-reg");
+      expect(result.success ? "" : result.error).toContain("Failed to retrieve workspace metadata");
+      await expectNoCreationLeftovers(workspaceId, "after-reg", [projectPath]);
+      if (tip === undefined) {
+        expect(git(projectPath, "branch", "--list", "after-reg")).toBe("");
+      } else {
+        expect(git(projectPath, "rev-parse", "after-reg")).toBe(tip);
+      }
+      expect((await createWorktree("after-reg")).success).toBe(true);
+    }
+  );
+
+  test("create failing after the consent grant removes the announced, consented row", async () => {
+    const workspaceId = "ddddddddd2";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    const realGetEffectiveSecrets = SecretsStore.prototype.getEffectiveSecrets;
+    let secretsCalls = 0;
+    // The second read comes after the grant and the announcement, before background init.
+    spyOn(SecretsStore.prototype, "getEffectiveSecrets").mockImplementation(function (
+      this: SecretsStore,
+      projectPathArg: string
+    ) {
+      if (++secretsCalls === 2) throw new Error("secrets store unavailable");
+      return realGetEffectiveSecrets.call(this, projectPathArg);
+    });
+    const announced: Array<FrontendWorkspaceMetadata | null> = [];
+    service.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
+      if (event.workspaceId === workspaceId) {
+        announced.push(event.metadata as FrontendWorkspaceMetadata | null);
+      }
+    });
+
+    const result = await createWorktree("after-grant");
+    expect(result.success ? "" : result.error).toContain("secrets store unavailable");
+    expect(announced[0]?.unrelatedWorkspaceConsent).toBeString();
+    expect(announced.at(-1)).toBeNull();
+    await expectNoCreationLeftovers(workspaceId, "after-grant", [projectPath]);
+    expect(git(projectPath, "branch", "--list", "after-grant")).toBe("");
+  });
+
+  test("fork failing after registration rolls it back, leaving the source intact", async () => {
+    const source = await createWorktree("source");
+    if (!source.success) throw new Error(source.error);
+    const sourceId = source.data.metadata.id;
+    const goals = new WorkspaceGoalService(
+      harness.config,
+      harness.historyService,
+      harness.extensionMetadata
+    );
+    service.setWorkspaceGoalService(goals);
+    spyOn(goals, "inheritFromFork").mockRejectedValueOnce(new Error("goal store unavailable"));
+    const forkId = "ddddddddd3";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+
+    const result = await service.fork(sourceId, "fork-after-reg");
+    expect(result.success ? "" : result.error).toContain("goal store unavailable");
+    await expectNoCreationLeftovers(forkId, "fork-after-reg", [projectPath]);
+    expect(git(projectPath, "branch", "--list", "fork-after-reg")).toBe("");
+    expect(persistedWorkspaceIds()).toEqual([sourceId]);
+    expect((await service.fork(sourceId, "fork-after-reg")).success).toBe(true);
   });
 
   // #4775 item 7: MultiProjectRuntime.deleteWorkspace must forward keepBranch to every project.
