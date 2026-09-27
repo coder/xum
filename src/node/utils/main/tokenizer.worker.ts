@@ -10,6 +10,11 @@ export interface CountTokensInput {
   input: string;
 }
 
+export interface CountTokensBatchInput {
+  modelName: ModelName;
+  inputs: string[];
+}
+
 const tokenizerCache = new Map<ModelName, Tokenizer>();
 
 function getTokenizer(modelName: ModelName): Tokenizer {
@@ -41,6 +46,13 @@ export function countTokens({ modelName, input }: CountTokensInput): number {
   return tokenizer.encode(input, [], []).length;
 }
 
+// The main thread sends many texts per message: one message per text cost a postMessage round
+// trip each, which dominated counting on huge chats (#4653).
+export function countTokensBatch({ modelName, inputs }: CountTokensBatchInput): number[] {
+  assert(Array.isArray(inputs), "countTokensBatch expects an array of inputs");
+  return inputs.map((input) => countTokens({ modelName, input }));
+}
+
 export function encodingName(modelName: ModelName): string {
   const model = models[modelName];
   assert(model, `Unknown tokenizer model '${modelName}'`);
@@ -54,8 +66,8 @@ if (parentPort) {
       let result: unknown;
 
       switch (message.taskName) {
-        case "countTokens":
-          result = countTokens(message.data as CountTokensInput);
+        case "countTokensBatch":
+          result = countTokensBatch(message.data as CountTokensBatchInput);
           break;
         case "encodingName":
           result = encodingName(message.data as ModelName);

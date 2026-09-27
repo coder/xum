@@ -3,7 +3,7 @@ import assert from "@/common/utils/assert";
 import { createHash, hash } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import { getAvailableTools, getToolSchemas } from "@/common/utils/tools/toolDefinitions";
-import type { CountTokensInput } from "./tokenizer.worker";
+import type { CountTokensBatchInput } from "./tokenizer.worker";
 import { models, type ModelName } from "ai-tokenizer";
 import { run } from "./workerPool";
 import { TOKENIZER_MODEL_OVERRIDES, DEFAULT_WARM_MODELS } from "@/common/constants/knownModels";
@@ -163,6 +163,85 @@ function buildCacheKey(modelName: ModelName, text: string): string {
   return `${modelName}:${digest}`;
 }
 
+// Uncached texts are sent to the worker in batches, because one message per text cost a
+// postMessage round trip plus a reply handler each, which dominated counting on a 1.24M-row chat
+// (#4653). A batch flushes at 64 texts or 64K chars, or at the next microtask so a lone count is
+// not delayed. A 512-text cap lost worker pipelining on ordinary chats (+11/+19 ms at p50/p90 of
+// real sessions); 64 texts / 64K chars kept those at the noise floor and was as fast on the huge
+// chat, since the worker starts counting the first batch while later ones are still being built.
+const MAX_BATCH_TEXTS = 64;
+const MAX_BATCH_CHARS = 64 * 1024;
+
+interface OpenBatch {
+  modelName: ModelName;
+  inputs: string[];
+  pending: Array<{ key: string; resolve: (count: number) => void; reject: (e: unknown) => void }>;
+  chars: number;
+}
+
+let openBatch: OpenBatch | null = null;
+
+function flushOpenBatch(): void {
+  const batch = openBatch;
+  assert(batch !== null && batch.inputs.length > 0, "flushOpenBatch requires a non-empty batch");
+  openBatch = null;
+
+  const payload: CountTokensBatchInput = { modelName: batch.modelName, inputs: batch.inputs };
+  // The chain ends in a handler that settles every text, so it can never reject unhandled.
+  run<number[]>("countTokensBatch", payload)
+    .then((counts: unknown) => {
+      // Validate every count before settling any, so a bad reply rejects the whole batch.
+      assert(
+        Array.isArray(counts) && counts.length === batch.pending.length,
+        "Tokenizer worker must return one count per batched input"
+      );
+      for (const count of counts) {
+        assert(
+          typeof count === "number" && Number.isInteger(count) && count >= 0,
+          "Tokenizer must return a non-negative integer token count"
+        );
+      }
+      batch.pending.forEach((entry, index) => {
+        const count = counts[index] as number;
+        tokenCountCache.set(entry.key, count);
+        inFlightCounts.delete(entry.key);
+        entry.resolve(count);
+      });
+    })
+    .catch((error: unknown) => {
+      // Drop in-flight entries so a failed batch does not poison later counts of the same text.
+      for (const entry of batch.pending) {
+        inFlightCounts.delete(entry.key);
+        entry.reject(error);
+      }
+    });
+}
+
+function enqueueCount(modelName: ModelName, key: string, text: string): Promise<number> {
+  if (openBatch !== null && openBatch.modelName !== modelName) {
+    flushOpenBatch();
+  }
+  if (openBatch === null) {
+    const batch: OpenBatch = { modelName, inputs: [], pending: [], chars: 0 };
+    openBatch = batch;
+    queueMicrotask(() => {
+      if (openBatch === batch) {
+        flushOpenBatch();
+      }
+    });
+  }
+  const batch = openBatch;
+  const promise = new Promise<number>((resolve, reject) => {
+    batch.pending.push({ key, resolve, reject });
+  });
+  batch.inputs.push(text);
+  batch.chars += text.length;
+  if (batch.inputs.length >= MAX_BATCH_TEXTS || batch.chars >= MAX_BATCH_CHARS) {
+    flushOpenBatch();
+  }
+  return promise;
+}
+
 async function countTokensInternal(modelName: ModelName, text: string): Promise<number> {
   assert(typeof text === "string", "Tokenizer countTokens expects string input");
   if (text.length === 0) {
@@ -177,21 +256,7 @@ async function countTokensInternal(modelName: ModelName, text: string): Promise<
 
   let pending = inFlightCounts.get(key);
   if (!pending) {
-    const payload: CountTokensInput = { modelName, input: text };
-    pending = run<number>("countTokens", payload)
-      .then((value: unknown) => {
-        assert(
-          typeof value === "number" && Number.isFinite(value) && value >= 0,
-          "Tokenizer must return a non-negative finite token count"
-        );
-        tokenCountCache.set(key, value);
-        inFlightCounts.delete(key);
-        return value;
-      })
-      .catch((error) => {
-        inFlightCounts.delete(key);
-        throw error;
-      });
+    pending = enqueueCount(modelName, key, text);
     inFlightCounts.set(key, pending);
   }
   return pending;
