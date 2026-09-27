@@ -150,9 +150,12 @@ export class WorkspaceUseLeases {
           throw error;
         }
       }
-      // Gates published: now scan the uses (see the protocol above).
+      // Gates published: now scan the uses (see the protocol above). This backend's own lease
+      // files are judged by their counts, read under the transition lock: a hold that published
+      // its file and probed the gate before it existed has not counted itself yet, and would
+      // otherwise be missed. Once the lock is free, every later transition sees the gate.
       for (const id of ids) {
-        await this.assertUnused(id, options);
+        await this.transitions.withLock(id, () => this.assertUnused(id, options));
       }
       return await fn();
     } finally {

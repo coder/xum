@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import {
   workspaceMutationLockPath,
   workspaceUseLockDir,
 } from "@/node/services/workspaceUseLeases";
+import * as lockKit from "@/node/utils/main/crossProcessLock";
 import {
   acquireCrossProcessLock,
   inspectCrossProcessLock,
@@ -32,6 +33,7 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
     b = new WorkspaceUseLeases(rootDir);
   });
   afterEach(async () => {
+    mock.restore();
     await fsPromises.rm(rootDir, { recursive: true, force: true });
   });
 
@@ -275,6 +277,43 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
       ).toBe(1);
       await refusal(a.withMutationGate([workspaceId], idle, () => Promise.resolve()));
       await terminal.release();
+    });
+
+    test("this backend's hold that probed the gate just before the mutation started is not missed", async () => {
+      // A's own hold has published its lease file and found no gate, but has not counted itself
+      // yet when A's mutation publishes its gate. The mutation must not run beside that activity.
+      const probe = lockKit.inspectCrossProcessLock;
+      const acquire = lockKit.acquireCrossProcessLock;
+      let probed!: () => void;
+      const holdProbed = new Promise<void>((resolve) => (probed = resolve));
+      let resume!: () => void;
+      const holdResumes = new Promise<void>((resolve) => (resume = resolve));
+      spyOn(lockKit, "inspectCrossProcessLock").mockImplementationOnce(async (lockPath) => {
+        const state = await probe(lockPath);
+        probed();
+        await holdResumes;
+        return state;
+      });
+      spyOn(lockKit, "acquireCrossProcessLock").mockImplementation(async (options) => {
+        const release = await acquire(options);
+        // The hold resumes only after everything the mutator does synchronously next.
+        if (options.lockPath === workspaceMutationLockPath(rootDir, workspaceId)) {
+          setImmediate(resume);
+        }
+        return release;
+      });
+      const hold = a.hold(workspaceId, "turn");
+      await holdProbed;
+
+      let ran = false;
+      const mutation = a.withMutationGate([workspaceId], idle, () => {
+        ran = true;
+        return Promise.resolve();
+      });
+      const lease = await hold;
+      await refusal(mutation);
+      expect(ran).toBe(false);
+      await lease.release();
     });
 
     test("a dead backend's lease does not refuse and is left on disk", async () => {
