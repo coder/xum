@@ -4,6 +4,7 @@ import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoo
 import {
   acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
+  inspectCrossProcessLock,
 } from "@/node/utils/main/crossProcessLock";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -690,6 +691,38 @@ export class WorkspaceTurnManager {
     }
   }
 
+  /**
+   * Settlements still publishing, by handle id (#4801): a terminal handle write inside one of
+   * them leaves the live-owner lock held (the release becomes owed) until the execution mirror is
+   * written too. Releasing between the two writes lets another backend revive the handle (mirror
+   * "running", handle "running"), after which this settlement's terminal mirror write pairs an
+   * active handle with an inactive mirror.
+   */
+  private readonly turnOwnerLockReleaseDeferrals = new Map<string, number>();
+  private readonly turnOwnerLockReleasesOwed = new Set<string>();
+
+  /** Holds the handle's lock until disposal, even across a terminal handle write (see above). */
+  private deferTurnOwnerLockRelease(handleId: string): AsyncDisposable {
+    this.turnOwnerLockReleaseDeferrals.set(
+      handleId,
+      (this.turnOwnerLockReleaseDeferrals.get(handleId) ?? 0) + 1
+    );
+    return {
+      [Symbol.asyncDispose]: async () => {
+        const remaining = (this.turnOwnerLockReleaseDeferrals.get(handleId) ?? 1) - 1;
+        if (remaining > 0) {
+          this.turnOwnerLockReleaseDeferrals.set(handleId, remaining);
+          return;
+        }
+        this.turnOwnerLockReleaseDeferrals.delete(handleId);
+        // Still owed only if no active write (a revival in this process) followed the terminal one.
+        if (this.turnOwnerLockReleasesOwed.delete(handleId)) {
+          await this.releaseTurnOwnerLock(handleId);
+        }
+      },
+    };
+  }
+
   private async releaseTurnOwnerLock(handleId: string): Promise<void> {
     const release = this.turnOwnerLocks.get(handleId);
     if (release == null) return;
@@ -721,7 +754,10 @@ export class WorkspaceTurnManager {
    * consent means reachability, and in-process admission still refuses while it exists.
    */
   private async afterHandleWrite(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
-    if (isActiveWorkspaceTurnTaskStatus(record.status)) return;
+    if (isActiveWorkspaceTurnTaskStatus(record.status)) {
+      this.turnOwnerLockReleasesOwed.delete(record.handleId);
+      return;
+    }
     try {
       if (record.createdWorkspace && !record.disposableWorkspace) {
         await (this.creationConsentFinalizers.delete(record.handleId)
@@ -729,7 +765,11 @@ export class WorkspaceTurnManager {
           : this.workspaceService.clearPendingDefaultUnrelatedConsent(record.workspaceId));
       }
     } finally {
-      await this.releaseTurnOwnerLock(record.handleId);
+      if (this.turnOwnerLockReleaseDeferrals.has(record.handleId)) {
+        this.turnOwnerLockReleasesOwed.add(record.handleId);
+      } else {
+        await this.releaseTurnOwnerLock(record.handleId);
+      }
     }
   }
 
@@ -2598,8 +2638,6 @@ export class WorkspaceTurnManager {
           ) {
             this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
           }
-          // Another backend's settlement won and could not release this backend's lock (#4446).
-          await this.releaseTurnOwnerLock(current.handleId);
           this.settleWorkspaceTurnWaiters(
             current.handleId,
             current.status === "completed"
@@ -2614,11 +2652,17 @@ export class WorkspaceTurnManager {
                   ),
                 }
           );
-          await this.updateAgentTaskExecutionState(
-            current.workspaceId,
-            current.handleId,
-            current.status
-          );
+          try {
+            await this.updateAgentTaskExecutionState(
+              current.workspaceId,
+              current.handleId,
+              current.status
+            );
+          } finally {
+            // Another backend's settlement won and could not release this backend's lock (#4446).
+            // Released only after the mirror publishes (#4801, see deferTurnOwnerLockRelease).
+            await this.releaseTurnOwnerLock(current.handleId);
+          }
           this.taskHost.markTaskForegroundRelevant(current.handleId);
           return { pendingNotify: null, winningStatus: current.status };
         }
@@ -2699,6 +2743,7 @@ export class WorkspaceTurnManager {
             refreshForContinuation: true,
           });
         }
+        await using _publishing = this.deferTurnOwnerLockRelease(nextRecord.handleId);
         await this.taskHandleStore.upsertWorkspaceTurn(nextRecord);
         await this.updateAgentTaskExecutionState(
           nextRecord.workspaceId,
@@ -3481,6 +3526,7 @@ export class WorkspaceTurnManager {
         };
         // Keep explicit stop's latch/mirror ordering in this lock, not the central helper.
         this.assertWorkspaceTurnSettlementCause({ kind: "explicit-interrupt" });
+        await using _publishing = this.deferTurnOwnerLockRelease(record.handleId);
         await this.taskHandleStore.upsertWorkspaceTurn(next);
         interruptedRecord = next;
         // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
@@ -4293,7 +4339,7 @@ export class WorkspaceTurnManager {
       }
       if (
         !(await this.isLiveWorkspaceTurn(record)) &&
-        (await this.settleStaleWorkspaceTurn(record)) !== "foreign-live"
+        (await this.settleStaleWorkspaceTurn(record)) !== "keep"
       ) {
         continue;
       }
@@ -4369,16 +4415,23 @@ export class WorkspaceTurnManager {
     return await this.hasActiveWorkspaceTurnDeferredBlockers(record);
   }
 
-  /** "foreign-live": another live backend runs the handle, so callers must keep it active. */
+  /**
+   * "keep": callers must keep the record active. It is live in this backend, or another live
+   * backend holds its live-owner lock (#4446), including when this backend returns early before
+   * settling anything: dropping it there undercounted another backend's live turn (#4801).
+   * undefined: this call settled the record, it is inactive, or an early return found its lock
+   * held by this backend, absent or dead. Those keep the old skip, so a stale handle never counts
+   * as active (a new turn would otherwise queue behind it until a later call settles it).
+   */
   private async settleStaleWorkspaceTurn(
     record: WorkspaceTurnTaskHandleRecord
-  ): Promise<"foreign-live" | undefined> {
+  ): Promise<"keep" | undefined> {
     if (!isActiveWorkspaceTurnTaskStatus(record.status)) {
       return;
     }
     // Admission exclusion also covers sends whose user row is not durable yet.
     const admission = this.workspaceService.acquireIdleTurnExclusion(record.workspaceId);
-    if (!admission.success) return;
+    if (!admission.success) return await this.keepIfOwnedElsewhere(record.handleId);
     let admissionHold: Disposable | undefined = admission.data;
     let recoveryLock: AsyncDisposable | undefined;
     await using recoveryScope = {
@@ -4394,14 +4447,13 @@ export class WorkspaceTurnManager {
     // Lock order: admission, stream start, then handle settlement.
     recoveryLock = await this.streamManager?.acquireStreamStartLock(record.workspaceId);
     // Preparing input stays visible until registration. Existing streams include finalization.
-    if (
-      this.streamManager?.getStreamInfo(record.workspaceId, true) != null ||
-      (await this.isLiveWorkspaceTurn(record))
-    )
-      return;
+    if (this.streamManager?.getStreamInfo(record.workspaceId, true) != null) {
+      return await this.keepIfOwnedElsewhere(record.handleId);
+    }
+    if (await this.isLiveWorkspaceTurn(record)) return "keep";
     // Not live in THIS backend's memory proves nothing about another backend that runs the turn
     // (#4446): settle only a handle whose live-owner lock this manager holds or can take now.
-    if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return "foreign-live";
+    if ((await this.acquireTurnOwnerLock(record.handleId)) !== "held") return "keep";
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
@@ -4418,7 +4470,7 @@ export class WorkspaceTurnManager {
     }
 
     // Recovery reads can overlap a continuation start. Check live work again before the fallback.
-    if (await this.isLiveWorkspaceTurn(record)) return;
+    if (await this.isLiveWorkspaceTurn(record)) return "keep";
     // No runtime work remains. A missing history row must not keep a deferred handle active forever.
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
@@ -4438,6 +4490,18 @@ export class WorkspaceTurnManager {
     });
   }
 
+  /**
+   * Read-only: "keep" when another live backend holds the handle's live-owner lock (an unreadable
+   * lock counts as held, fail closed). Never takes the lock: the caller is not settling.
+   */
+  private async keepIfOwnedElsewhere(handleId: string): Promise<"keep" | undefined> {
+    if (this.turnOwnerLocks.has(handleId)) return undefined;
+    const lock = await inspectCrossProcessLock(
+      workspaceTurnOwnerLockPath(this.config.rootDir, handleId)
+    );
+    return lock.state === "held" ? "keep" : undefined;
+  }
+
   async countActiveWorkspaceTurns(
     records?: readonly WorkspaceTurnTaskHandleRecord[]
   ): Promise<number> {
@@ -4455,7 +4519,7 @@ export class WorkspaceTurnManager {
       }
       if (
         !(await this.isLiveWorkspaceTurn(record)) &&
-        (await this.settleStaleWorkspaceTurn(record)) !== "foreign-live"
+        (await this.settleStaleWorkspaceTurn(record)) !== "keep"
       ) {
         continue;
       }
@@ -4483,7 +4547,7 @@ export class WorkspaceTurnManager {
       if (isActiveWorkspaceTurnTaskStatus(record.status)) {
         if (
           !(await this.isLiveWorkspaceTurn(record)) &&
-          (await this.settleStaleWorkspaceTurn(record)) !== "foreign-live"
+          (await this.settleStaleWorkspaceTurn(record)) !== "keep"
         ) {
           continue;
         }

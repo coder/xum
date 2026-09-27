@@ -13,6 +13,7 @@ import {
 } from "@/node/services/agentTaskIndex";
 import { buildParentAiSettingsFallbacks } from "@/node/services/agentTaskReawakenAi";
 import type { InitStateManager } from "@/node/services/initStateManager";
+import type { StreamManager } from "@/node/services/streamManager";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
@@ -187,6 +188,7 @@ export function createWorkspaceTurnManagerHarness(
     aiService?: AIService;
     workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
+    streamManager?: StreamManager;
   }
 ): {
   historyService: HistoryService;
@@ -215,7 +217,8 @@ export function createWorkspaceTurnManagerHarness(
     workspaceService,
     initStateManager,
     taskHost,
-    terminalAttentionStore
+    terminalAttentionStore,
+    overrides?.streamManager
   );
 
   return {

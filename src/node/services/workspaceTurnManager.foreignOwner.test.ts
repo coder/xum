@@ -3,6 +3,7 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import {
+  isActiveWorkspaceTurnTaskStatus,
   TaskHandleStore,
   type WorkspaceTurnTaskHandleRecord,
 } from "@/node/services/taskHandleStore";
@@ -20,8 +21,12 @@ import {
   createAIServiceMocks,
   createTaskServiceStack,
   createTestConfig,
+  createWorkspaceServiceMocks,
+  findWorkspaceInConfig,
   projectWorkspace,
+  saveLocalParentWorkspace,
   saveWorkspaces,
+  stubStableIds,
   testTaskSettings,
   workspaceTurnManagerFor,
   workspaceTurnRecord,
@@ -29,6 +34,9 @@ import {
   workspaceTurnStreamEndEvent,
 } from "@/node/services/taskService.testHarness";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { StreamManager } from "@/node/services/streamManager";
+import { Err } from "@/common/types/result";
+import type { Config } from "@/node/config";
 
 /**
  * #4446: a workspace-turn handle's liveness lives in the memory of the backend that runs it. With
@@ -271,5 +279,205 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
       status: "interrupted",
     });
     expect(await exists(lockPath)).toBe(false);
+  });
+  describe("counts keep another backend's live handle through this backend's early returns (#4801)", () => {
+    test("while this backend refuses idle admission for the workspace", async () => {
+      const { parentId } = await startWorkspaceTurnForTest(rootDir);
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir),
+        {
+          workspaceService: createWorkspaceServiceMocks({
+            acquireIdleTurnExclusion: mock(() => Err(new Error("admission in flight"))),
+          }).workspaceService,
+        }
+      );
+
+      expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(1);
+      expect(await backendB.listActiveWorkspaceTurnTaskIdsForOwner(parentId)).toEqual([
+        "wst_handle",
+      ]);
+    });
+
+    test("while this backend has its own stream in the workspace", async () => {
+      const { parentId } = await startWorkspaceTurnForTest(rootDir);
+      // A user message sent from backend B into the same workspace streams there.
+      const streamManagerB = {
+        acquireStreamStartLock: () => Promise.resolve(undefined),
+        getStreamInfo: () => ({ messageId: "msg_b" }),
+      } as unknown as StreamManager;
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir),
+        { streamManager: streamManagerB }
+      );
+
+      expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(1);
+      expect(await backendB.listActiveWorkspaceTurnTaskIdsForOwner(parentId)).toEqual([
+        "wst_handle",
+      ]);
+    });
+
+    test("a dead owner's handle is still skipped, and left for a later settlement", async () => {
+      const { config, parentId } = await startWorkspaceTurnForTest(rootDir);
+      await markTurnOwnerDead("wst_handle");
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir),
+        {
+          workspaceService: createWorkspaceServiceMocks({
+            acquireIdleTurnExclusion: mock(() => Err(new Error("admission in flight"))),
+          }).workspaceService,
+        }
+      );
+
+      // A stale handle must not count as active (a new turn would queue behind it).
+      expect(await internals(backendB).countActiveWorkspaceTurns()).toBe(0);
+      expect(
+        await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+      ).toMatchObject({ status: "running" });
+    });
+  });
+
+  describe("another backend cannot revive a handle while its settlement publishes (#4801)", () => {
+    const CHILD_ID = "childworkspace";
+
+    /** Backend A runs a delegated turn in an existing agent child, so the execution mirror is live. */
+    async function startAgentChildTurn(): Promise<{
+      config: Config;
+      parentId: string;
+      backendA: WorkspaceTurnManager;
+    }> {
+      const config = await createTestConfig(rootDir);
+      stubStableIds(config, ["handle", "turn"]);
+      const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          path: path.join(projectPath, "agent-child"),
+          id: CHILD_ID,
+          name: "agent_explore_child",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          parentWorkspaceId: parentId,
+          agentType: "explore",
+          taskStatus: "reported",
+          reportedAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+        });
+        return cfg;
+      });
+      const { taskService: backendA } = createWorkspaceTurnManagerHarness(config);
+      const created = await backendA.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        prompt: "Follow up",
+        title: "Follow-up",
+        allowAgentWorkspace: true,
+        workspace: { mode: "existing", workspaceId: CHILD_ID },
+      });
+      expect(created.success).toBe(true);
+      expect(findWorkspaceInConfig(config, CHILD_ID)).toMatchObject({
+        taskExecutionId: "wst_handle",
+        taskExecutionStatus: "running",
+      });
+      return { config, parentId, backendA };
+    }
+
+    const reviveOf = (manager: WorkspaceTurnManager) =>
+      (
+        manager as unknown as {
+          reviveRetryingWorkspaceTurn: (
+            record: WorkspaceTurnTaskHandleRecord
+          ) => Promise<WorkspaceTurnTaskHandleRecord | null>;
+        }
+      ).reviveRetryingWorkspaceTurn.bind(manager);
+
+    /**
+     * Pause A inside its terminal mirror write (its handle record is already terminal) and let
+     * backend B try to revive the handle there, then let A finish.
+     */
+    function reviveFromBInsideMirrorWrite(
+      config: Config,
+      parentId: string,
+      backendA: WorkspaceTurnManager,
+      backendB: WorkspaceTurnManager
+    ): void {
+      const realUpdate = backendA.updateAgentTaskExecutionState.bind(backendA);
+      spyOn(backendA, "updateAgentTaskExecutionState").mockImplementationOnce(
+        async (workspaceId, handleId, status) => {
+          const settled = await new TaskHandleStore(config).getWorkspaceTurn(parentId, handleId);
+          expect(settled?.status).toBe(status!);
+          await reviveOf(backendB)(settled!);
+          return realUpdate(workspaceId, handleId, status);
+        }
+      );
+    }
+
+    async function expectHandleAndMirrorAgree(config: Config, parentId: string): Promise<void> {
+      const handle = await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle");
+      const mirror = findWorkspaceInConfig(config, CHILD_ID)?.taskExecutionStatus;
+      expect({
+        handleActive: isActiveWorkspaceTurnTaskStatus(handle!.status),
+        mirrorActive: mirror != null && isActiveWorkspaceTurnTaskStatus(mirror),
+      }).toEqual({ handleActive: false, mirrorActive: false });
+    }
+
+    test("stream-end settlement", async () => {
+      const { config, parentId, backendA } = await startAgentChildTurn();
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir)
+      );
+      reviveFromBInsideMirrorWrite(config, parentId, backendA, backendB);
+
+      await finalizeWorkspaceTurnStreamEndForTest(
+        backendA,
+        workspaceTurnStreamEndEvent(parentId, "msg_final", "done")
+      );
+
+      await expectHandleAndMirrorAgree(config, parentId);
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+    });
+
+    test("explicit interrupt", async () => {
+      const { config, parentId, backendA } = await startAgentChildTurn();
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir)
+      );
+      reviveFromBInsideMirrorWrite(config, parentId, backendA, backendB);
+
+      expect((await backendA.interruptWorkspaceTurn(parentId, "wst_handle")).success).toBe(true);
+
+      await expectHandleAndMirrorAgree(config, parentId);
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+    });
+
+    test("settlement that finds another backend's terminal record", async () => {
+      const { config, parentId, backendA } = await startAgentChildTurn();
+      const store = new TaskHandleStore(config);
+      const running = await store.getWorkspaceTurn(parentId, "wst_handle");
+      await store.upsertWorkspaceTurn({
+        ...running!,
+        status: "interrupted",
+        updatedAt: new Date(Date.parse(running!.updatedAt) + 1000).toISOString(),
+        error: "Workspace turn interrupted",
+      });
+      const { taskService: backendB } = createWorkspaceTurnManagerHarness(
+        await createTestConfig(rootDir)
+      );
+      reviveFromBInsideMirrorWrite(config, parentId, backendA, backendB);
+
+      await finalizeWorkspaceTurnStreamEndForTest(
+        backendA,
+        workspaceTurnStreamEndEvent(parentId, "msg_final", "done")
+      );
+
+      await expectHandleAndMirrorAgree(config, parentId);
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+    });
+
+    test("a failing mirror write still releases the lock", async () => {
+      const { parentId, backendA } = await startAgentChildTurn();
+      spyOn(backendA, "updateAgentTaskExecutionState").mockRejectedValueOnce(
+        new Error("config write failed")
+      );
+
+      await backendA.interruptWorkspaceTurn(parentId, "wst_handle").catch(() => undefined);
+      expect(await exists(workspaceTurnOwnerLockPath(rootDir, "wst_handle"))).toBe(false);
+    });
   });
 });
