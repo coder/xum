@@ -182,7 +182,7 @@ function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse
   // nested objects conservatively) without parsing or retaining the row.
   // Keep only token-sized raw overlap plus a three-stage recognizer.
   // Junk of arbitrary size may separate intact tokens in unreadable rows;
-  // valid rows isolate their own evidence in deliver() and reset this state.
+  // the locator resets this state after every readable row (settle()).
   const raw = segment.toString("latin1");
   const previousLength = state.resetProbe.length;
   const probe = reverse ? raw + state.resetProbe : state.resetProbe + raw;
