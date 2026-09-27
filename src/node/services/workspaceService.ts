@@ -13087,9 +13087,12 @@ export class WorkspaceService
       if (!isWorktreeRuntime(metadata.runtimeConfig)) {
         continue;
       }
-      try {
-        await fsPromises.access(this.getStagedAttachmentRehydrationMarkerPath(metadata.id));
-      } catch {
+      // Only a regular file counts: anything else is corrupted state that clearing cannot remove,
+      // and treating it as pending would re-run rehydration on every start.
+      const marker = await fsPromises
+        .lstat(this.getStagedAttachmentRehydrationMarkerPath(metadata.id))
+        .catch(() => null);
+      if (marker?.isFile() !== true) {
         continue;
       }
       // Unarchive shares this lock, so it cannot interleave with a live restore.

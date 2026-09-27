@@ -2618,6 +2618,19 @@ describe("WorkspaceService recovers interrupted staged attachment rehydration", 
     expect(await exists(path.join(repo, stagedPath))).toBe(false);
   });
 
+  test("a directory at the marker path does not trigger startup rehydration", async () => {
+    useRestore(() => Promise.resolve(Ok("restored" as const)));
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+    await fsPromises.rm(path.join(repo, stagedPath));
+    await fsPromises.mkdir(
+      path.join(harness.config.sessionsDir, workspaceId, "staged-attachments-rehydrate-pending")
+    );
+
+    await harness.service.initialize();
+
+    expect(await exists(path.join(repo, stagedPath))).toBe(false);
+  });
+
   test("startup does not resurrect an upload deleted after a completed unarchive", async () => {
     useRestore(() => Promise.resolve(Ok("restored" as const)));
     expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
