@@ -184,7 +184,8 @@ function billedFailureFields(
   if (inputTokens === null || outputTokens === null) return {};
   const metadata = billed.usageProviderMetadata;
   return {
-    usage: { inputTokens, outputTokens, totalTokens: totalTokens ?? inputTokens + outputTokens },
+    // A null total is one the projection refused (past the safe-integer range); never re-add it.
+    usage: { inputTokens, outputTokens, ...(totalTokens !== null ? { totalTokens } : {}) },
     ...(metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)
       ? { providerMetadata: { ...metadata } }
       : {}),

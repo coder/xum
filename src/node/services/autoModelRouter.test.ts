@@ -237,6 +237,25 @@ describe("AutoModelRouter.classify", () => {
     });
   });
 
+  it("omits a billed total that overflows the safe-integer range", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.resolve(
+          verdict("impossible", {
+            usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 },
+          })
+        ),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.usage).toEqual({ inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 });
+  });
+
   it("keeps the billed usage of an answer the real OpenAI evaluation adapter rejects", async () => {
     // "c9" is not one of the tier option codes, so provider-utils throws inside
     // doEvaluate before it would return usage.
