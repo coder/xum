@@ -1,8 +1,9 @@
 import * as http from "node:http";
 import type { IncomingMessage } from "node:http";
 import { EventEmitter } from "node:events";
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { log } from "@/node/services/log";
 import { BrowserBridgeServer } from "./BrowserBridgeServer";
 import type { BrowserBridgeTokenPayload } from "./BrowserBridgeTokenManager";
 import type { PageState } from "./BrowserSessionStateHub";
@@ -326,8 +327,11 @@ describe("BrowserBridgeServer", () => {
       getSessionConnection: mock(() => Promise.resolve(null)),
     });
 
+    const warnSpy = spyOn(log, "warn");
+
     try {
-      for (const url of ["/", "/?token=bad-token"]) {
+      // An empty first `token` hides a real one from searchParams.get (#4853).
+      for (const url of ["/", "/?token=bad-token", "/?token=&token=SECRET-dup"]) {
         const ws = createMockClientSocket();
         const bridgeServerPrivate = bridgeServer as unknown as BrowserBridgeServerPrivate;
         await bridgeServerPrivate.handleUpgradedConnection(
@@ -336,7 +340,13 @@ describe("BrowserBridgeServer", () => {
         );
         expect(ws.close).toHaveBeenCalledWith(4001, "invalid token");
       }
+      expect(warnSpy).toHaveBeenCalledWith(
+        "BrowserBridgeServer: rejecting upgrade with missing token",
+        { path: "/" }
+      );
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain("SECRET-dup");
     } finally {
+      warnSpy.mockRestore();
       await bridgeServer.stop();
     }
   });
@@ -578,6 +588,8 @@ describe("BrowserBridgeServer", () => {
       callback(ws as unknown as WebSocket);
     };
 
+    const errorSpy = spyOn(log, "error");
+
     try {
       bridgeServer.handleUpgrade(
         { url: `/?token=${VALID_TOKEN}` } as IncomingMessage,
@@ -587,8 +599,41 @@ describe("BrowserBridgeServer", () => {
       await Promise.resolve();
       await Promise.resolve();
       expect(ws.close).toHaveBeenCalledWith(4002, "session unavailable");
+      // The upgrade URL carries the bridge token; the failure log must not (#4853).
+      expect(errorSpy).toHaveBeenCalledWith(
+        "BrowserBridgeServer: bridge setup failed",
+        expect.objectContaining({ path: "/" })
+      );
+      expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(VALID_TOKEN);
     } finally {
+      errorSpy.mockRestore();
       await bridgeServer.stop();
+    }
+  });
+
+  test("does not log the token of an upgrade rejected while stopping", async () => {
+    const bridgeServer = createBridgeServer();
+    const socket = { write: mock(() => true), destroy: mock(() => undefined) };
+    const debugSpy = spyOn(log, "debug");
+
+    try {
+      // stop() sets the stopping flag synchronously, before its first await.
+      const stopPromise = bridgeServer.stop();
+      bridgeServer.handleUpgrade(
+        { url: `/browser/ws?token=${VALID_TOKEN}` } as IncomingMessage,
+        socket as never,
+        Buffer.alloc(0)
+      );
+      await stopPromise;
+
+      expect(socket.destroy).toHaveBeenCalled();
+      expect(debugSpy).toHaveBeenCalledWith(
+        "BrowserBridgeServer: rejecting upgrade while stopping",
+        { path: "/browser/ws" }
+      );
+      expect(JSON.stringify(debugSpy.mock.calls)).not.toContain(VALID_TOKEN);
+    } finally {
+      debugSpy.mockRestore();
     }
   });
 

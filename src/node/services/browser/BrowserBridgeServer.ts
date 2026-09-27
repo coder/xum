@@ -181,7 +181,10 @@ export class BrowserBridgeServer {
   public handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): void {
     this.ensureReady();
     if (this.isStopping) {
-      log.debug("BrowserBridgeServer: rejecting upgrade while stopping", { url: request.url });
+      // Log only the path: the upgrade URL carries the bridge token as `?token=` (#4853).
+      log.debug("BrowserBridgeServer: rejecting upgrade while stopping", {
+        path: request.url?.split("?", 1)[0],
+      });
       rejectUpgrade(socket);
       return;
     }
@@ -189,7 +192,7 @@ export class BrowserBridgeServer {
     this.wss.handleUpgrade(request, socket, head, (ws) => {
       this.handleUpgradedConnection(ws, request).catch((error: unknown) => {
         log.error("BrowserBridgeServer: bridge setup failed", {
-          url: request.url,
+          path: request.url?.split("?", 1)[0],
           error,
         });
         closeWebSocket(ws, MISSING_SESSION_CLOSE_CODE, "session unavailable");
@@ -255,7 +258,10 @@ export class BrowserBridgeServer {
     const requestUrl = new URL(request.url ?? "/", `http://${STREAM_HOST}`);
     const token = requestUrl.searchParams.get("token");
     if (!token) {
-      log.warn("BrowserBridgeServer: rejecting upgrade with missing token", { url: request.url });
+      // Path only: `?token=&token=<real>` reaches this branch with a token in the URL (#4853).
+      log.warn("BrowserBridgeServer: rejecting upgrade with missing token", {
+        path: requestUrl.pathname,
+      });
       closeWebSocket(ws, INVALID_TOKEN_CLOSE_CODE, "invalid token");
       return;
     }

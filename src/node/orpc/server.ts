@@ -1654,7 +1654,8 @@ export async function createOrpcServer({
         log.warn("Blocked cross-origin WebSocket upgrade request", {
           origin: getFirstHeaderValue(req, "origin"),
           expectedOrigins,
-          url: req.url,
+          // Never log req.url: browser clients send the auth token as `?token=` (#4853).
+          path: routePathname,
         });
 
         try {

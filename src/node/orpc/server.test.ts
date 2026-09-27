@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
@@ -6,7 +6,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
-import { createOrpcServer, DESKTOP_WS_PATH } from "./server";
+import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
 
@@ -1684,6 +1685,35 @@ describe("createOrpcServer", () => {
       await expectWebSocketOriginCase(wsCase);
     });
   }
+
+  test("does not log the auth token of a blocked cross-origin WebSocket upgrade", async () => {
+    // Browser clients authenticate the oRPC WebSocket with `?token=` (#4853).
+    const secret = "SECRET-auth-token-4853";
+    const warnSpy = spyOn(log, "warn");
+
+    try {
+      await withTestOrpcServer(async (server) => {
+        const ws = new WebSocket(`${server.wsUrl}?token=${secret}`, {
+          headers: { origin: "https://evil.example.com" },
+        });
+
+        try {
+          await waitForWebSocketRejection(ws);
+        } finally {
+          ws.terminate();
+        }
+      });
+
+      const blockedCalls = warnSpy.mock.calls.filter(
+        ([message]) => message === "Blocked cross-origin WebSocket upgrade request"
+      );
+      expect(blockedCalls).toHaveLength(1);
+      expect(blockedCalls[0]?.[1]).toMatchObject({ path: ORPC_WS_PATH });
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(secret);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 
   test("returns restrictive CORS preflight headers for same-origin requests", async () => {
     const stubContext: Partial<ORPCContext> = {};
