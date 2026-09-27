@@ -124,9 +124,9 @@ describe("one-pass skip-0 provider read", () => {
     }
   });
 
-  // Skip > 0 keeps the two-pass reader, whose tail now decodes per row instead of one
-  // toString+split of the whole tail. Invalid UTF-8 right before or after a newline must not
-  // swallow the newline and merge rows, and a final row without a newline must still be read.
+  // Skip > 0 keeps the two-pass reader, whose tail decodes per row. Invalid UTF-8 right before or
+  // after a newline must not swallow the newline and merge rows, and a final row without a newline
+  // must still be read.
   test("per-row tail decoding equals decoding the whole tail", async () => {
     const workspaceId = "one-pass-decode";
     const boundary = (id: string, epoch: number) =>

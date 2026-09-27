@@ -55,7 +55,7 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
     return `${await stamp(paths.chat)}|${await stamp(paths.archive)}`;
   }
   async function full(workspaceId: string): Promise<MuxMessage[]> {
-    // The service read may rotate a legacy layout, but for skip 0 it now shares the suffix scan
+    // The service read may rotate a legacy layout, but for skip 0 it shares the suffix scan
     // (#4655), so the oracle is the independent two-pass reader over the same (rotated) files.
     const result = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!result.success) throw new Error(result.error);
