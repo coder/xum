@@ -4822,13 +4822,19 @@ export class MCPServerManager {
     // client that is in the middle of closing.
     this.workspaceServers.delete(workspaceId);
 
-    for (const instance of [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])]) {
-      try {
-        await instance.close();
-      } catch (error) {
-        log.warn("Failed to stop MCP server", { error, name: instance.name });
-      }
-    }
+    // Concurrently: a stdio close can wait out an exit grace before killing (#4760), and
+    // removal awaits this whole stop before deleting the checkout.
+    await Promise.all(
+      [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])].map(
+        async (instance) => {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop MCP server", { error, name: instance.name });
+          }
+        }
+      )
+    );
   }
 
   /**

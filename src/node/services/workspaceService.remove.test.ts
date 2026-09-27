@@ -527,6 +527,15 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       using spanning = harness.service.acquireMcpPromptDiscoveryAdmission(workspaceId);
       expect(spanning?.removalStarted).toBe(false);
 
+      // A removal refused by an early gate leaves the workspace and its servers alone.
+      let refuse = true;
+      harness.service.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({ hasDescendantAgentTasks: () => refuse })
+      );
+      expect((await harness.service.remove(workspaceId, true)).success).toBe(false);
+      expect(spanning?.removalStarted).toBe(false);
+      refuse = false;
+
       const result = await harness.service.remove(workspaceId, true);
 
       expect(result.success).toBe(true);
