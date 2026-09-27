@@ -2502,6 +2502,102 @@ describe("WorkspaceService unarchive rehydrates staged attachments", () => {
   });
 });
 
+// #4850: a crash after snapshot restore recreated the checkout but before rehydration finished
+// leaves the workspace unarchived, so a later unarchive() exits early and never rehydrates.
+describe("WorkspaceService recovers interrupted staged attachment rehydration", () => {
+  const workspaceId = "ws-rehydrate-recovery";
+  const projectPath = "/tmp/project";
+
+  let harness: WorkspaceServiceHarness;
+  let repo: string;
+  let stagedPath: string;
+  const bytes = Buffer.from("staged before archive");
+
+  function exists(filePath: string): Promise<boolean> {
+    return fsPromises
+      .access(filePath)
+      .then(() => true)
+      .catch(() => false);
+  }
+
+  beforeEach(async () => {
+    repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "ws-rehydrate-recovery-"));
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: os.tmpdir() };
+    const metadata: FrontendWorkspaceMetadata = {
+      id: workspaceId,
+      name: path.basename(repo),
+      projectName: "proj",
+      projectPath,
+      runtimeConfig,
+      namedWorkspacePath: repo,
+    };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
+      }),
+    });
+    await saveWorkspaces(harness.config, projectPath, [
+      {
+        path: repo,
+        id: workspaceId,
+        name: path.basename(repo),
+        archivedAt: "2020-01-01T00:00:00.000Z",
+        runtimeConfig,
+      },
+    ]);
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(repo),
+      workspacePath: repo,
+      sessionDir: path.join(harness.config.sessionsDir, workspaceId),
+      filename: "notes.md",
+      mediaType: "text/markdown",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    if (!staged.success) throw new Error(staged.error);
+    stagedPath = staged.data.stagedPath;
+    // The snapshot archive removed the checkout; restore recreates it from git state only.
+    await fsPromises.rm(path.join(repo, ".xum"), { recursive: true, force: true });
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+    await fsPromises.rm(repo, { recursive: true, force: true });
+  });
+
+  function useRestore(restore: () => Promise<Result<"restored" | "skipped">>) {
+    harness.service.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(restore),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+  }
+
+  test("startup rehydrates after a crash between restore and rehydration", async () => {
+    // The process dies right after restore returns: nothing after it in unarchive() runs.
+    useRestore(() => Promise.reject(new Error("simulated crash after restore")));
+    await harness.service.unarchive(workspaceId).catch(() => undefined);
+    expect(await exists(path.join(repo, stagedPath))).toBe(false);
+
+    await harness.service.initialize();
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("startup does not resurrect an upload deleted after a completed unarchive", async () => {
+    useRestore(() => Promise.resolve(Ok("restored" as const)));
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+    await fsPromises.rm(path.join(repo, stagedPath));
+
+    await harness.service.initialize();
+
+    expect(await exists(path.join(repo, stagedPath))).toBe(false);
+  });
+});
+
 // #4845: uploads staged before the session mirror existed have only a checkout copy, which a
 // snapshot archive deletes with the worktree. Archive must copy referenced ones into the mirror
 // before capture so unarchive can rehydrate them.

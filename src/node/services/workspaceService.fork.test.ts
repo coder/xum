@@ -23,6 +23,8 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator";
 import * as runtimeExecHelpers from "@/node/utils/runtime/helpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
 import {
   createMockAIService,
   createWorkspaceServiceForTest,
@@ -614,6 +616,108 @@ describe("WorkspaceService fork", () => {
       generateStableIdSpy.mockRestore();
     }
   });
+
+  // #4850: once the source checkout lost its git-excluded copy (for example after a snapshot
+  // unarchive that did not rehydrate), the mirror is the only copy; the fork's agent still needs
+  // the file at its checkout path.
+  async function forkWithMirrorOnlyAttachment(
+    prepareTarget: (targetCheckout: string) => Promise<void>
+  ) {
+    const sourceWorkspaceId = "source-workspace";
+    const newWorkspaceId = "forked-workspace";
+    const sourceProjectPath = path.join(tempDir, "project");
+    const sourceCheckout = path.join(tempDir, "source-checkout");
+    const targetCheckout = path.join(tempDir, "fork-checkout");
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: tempDir };
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig,
+      namedWorkspacePath: sourceCheckout,
+    };
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await fsPromises.mkdir(sourceCheckout, { recursive: true });
+    await fsPromises.mkdir(targetCheckout, { recursive: true });
+    await prepareTarget(targetCheckout);
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      const project = current.projects.get(sourceProjectPath);
+      if (!project) throw new Error("Expected test project config to exist");
+      project.trusted = true;
+      return current;
+    });
+
+    const bytes = Buffer.from("mirror only");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(sourceCheckout),
+      workspacePath: sourceCheckout,
+      sessionDir: path.join(config.sessionsDir, sourceWorkspaceId),
+      filename: "notes.md",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    if (!staged.success) throw new Error(staged.error);
+    await fsPromises.rm(path.join(sourceCheckout, ".xum"), { recursive: true });
+    await historyService.appendToHistory(
+      sourceWorkspaceId,
+      createMuxMessage("user-1", "user", `Attached \`${staged.data.stagedPath}\``)
+    );
+
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      }),
+    });
+    const spies = [
+      spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId),
+      spyOn(runtimeFactory, "createRuntime").mockReturnValue(new LocalRuntime(sourceCheckout)),
+      spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined),
+      spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined),
+      spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+        Ok({
+          workspacePath: targetCheckout,
+          trunkBranch: "main",
+          forkedRuntimeConfig: runtimeConfig,
+          targetRuntime: new LocalRuntime(targetCheckout),
+          forkedFromSource: true,
+          sourceRuntimeConfigUpdated: false,
+        })
+      ),
+    ];
+
+    try {
+      const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
+      expect(result.success).toBe(true);
+      return { targetCheckout, stagedPath: staged.data.stagedPath, bytes };
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  }
+
+  test("worktree fork materializes a staged attachment from the source mirror", async () => {
+    const { targetCheckout, stagedPath, bytes } = await forkWithMirrorOnlyAttachment(() =>
+      Promise.resolve()
+    );
+
+    expect(await fsPromises.readFile(path.join(targetCheckout, stagedPath))).toEqual(bytes);
+  });
+
+  test("worktree fork never writes a mirrored attachment through a symlinked .xum", async () => {
+    const outside = path.join(tempDir, "outside");
+    await fsPromises.mkdir(outside);
+    // The forked checkout is repo-controlled: a tracked `.xum` symlink must not redirect writes.
+    await forkWithMirrorOnlyAttachment((targetCheckout) =>
+      fsPromises.symlink(outside, path.join(targetCheckout, ".xum"))
+    );
+
+    expect(await fsPromises.readdir(outside)).toEqual([]);
+  });
+
   test("fork snapshots persisted partials without mutating the source workspace", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
