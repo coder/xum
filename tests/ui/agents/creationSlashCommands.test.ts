@@ -145,7 +145,6 @@ describeIntegration("Creation slash commands", () => {
 
     try {
       const projectScopeId = getProjectScopeId(projectPath);
-      // Creation sends read these keys, so the first request routes the model only.
       await waitFor(
         () => {
           expect(readPersistedState(getAutoModelRoutingKey(projectScopeId), false)).toBe(true);

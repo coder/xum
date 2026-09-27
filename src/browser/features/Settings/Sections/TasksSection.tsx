@@ -323,7 +323,6 @@ interface AiDefaultsControlsProps {
   hiddenModelsForSelector: string[];
   inheritLabel?: string;
   showThinkingResetButton?: boolean;
-  /** Auto rows (auto-model-routing experiment); omitted where the agent's turns never route. */
   modelAutoRouting?: { active: boolean; onSelect: () => void };
   thinkingAutoRouting?: { active: boolean; onSelect: () => void };
   onModelChange: (value: string) => void;
@@ -382,7 +381,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
             variant="box"
             inheritOption={{
               label: inheritLabel,
-              // Auto keeps the inherited level as its fallback; only one row reads as selected.
+              // Inherit remains the fallback, but only Auto reads as selected.
               selected:
                 props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
               onSelect: () => props.onThinkingChange(INHERIT),
@@ -695,7 +694,7 @@ export function TasksSection() {
   const setAgentModel = (agentId: string, value: string) => {
     setAgentAiDefaults((prev) =>
       updateAgentDefaultEntry(prev, agentId, (updated) => {
-        // A concrete pick, Inherit, or Reset all leave Auto for this dimension.
+        // Any non-Auto model selection exits Auto.
         delete updated.autoModelRouting;
         if (value === INHERIT || value.trim().length === 0) {
           delete updated.modelString;
@@ -733,9 +732,8 @@ export function TasksSection() {
     );
   };
 
-  // Auto rows only where turns can route: UI agents and unknown ids (possibly UI
-  // agents elsewhere, so a stored flag stays visible and clearable). Delegated,
-  // internal, and the Exec delegated profile never classify prompts.
+  // Unknown IDs may be UI agents defined elsewhere, so keep stored Auto flags clearable.
+  // Delegated and internal agents never route prompts.
   const getAutoRoutingProps = (
     agentId: string,
     entry: AgentAiDefaultsEntry | undefined

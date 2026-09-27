@@ -27,8 +27,7 @@ export const Tasks: Story = {
       setup={() =>
         setupSettingsStory({
           taskSettings: { maxParallelAgentTasks: 2, maxTaskNestingDepth: 4 },
-          // Plan defaults to Auto for both dimensions; Exec routes the model with a concrete
-          // fallback. Folded into this story to stay inside the Pixel snapshot budget.
+          // Reuse this story because the Pixel snapshot budget has no headroom.
           experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
           agentAiDefaults: {
             plan: { autoModelRouting: true, autoThinkingLevel: true },
@@ -81,8 +80,7 @@ export const Tasks: Story = {
   },
 };
 
-// Pixel's named phone viewport width. The test-runner ignores viewport globals and plays at
-// desktop size, so the decorator forces this width.
+// The test runner ignores viewport globals, so the decorator enforces Pixel's 390px phone width.
 const PHONE_VIEWPORT_WIDTH = 390;
 
 function PhoneWidthDecorator(Story: ComponentType) {
@@ -96,8 +94,7 @@ function PhoneWidthDecorator(Story: ComponentType) {
   );
 }
 
-// Play-only narrow-layout contract: the snapshot budget has no headroom, and the forced
-// phone width is asserted here instead of captured.
+// The snapshot budget has no headroom, so play assertions enforce the narrow layout.
 export const TasksPhone: Story = {
   render: Tasks.render,
   globals: { viewport: { value: "mobile1", isRotated: false } },
@@ -109,7 +106,6 @@ export const TasksPhone: Story = {
     const frame = canvasElement.querySelector("[data-phone-frame]");
     if (!(frame instanceof HTMLElement)) throw new Error("Phone frame did not render");
     const frameRight = frame.getBoundingClientRect().right;
-    // The Auto trigger and its Reset button must share the narrow card row without overflow.
     await waitFor(async () => {
       const autoTriggers = findAutoModelTriggers(canvasElement);
       await expect(autoTriggers).toHaveLength(2);

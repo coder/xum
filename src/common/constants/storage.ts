@@ -234,11 +234,8 @@ export function getAutoThinkingLevelKey(workspaceId: string): string {
 }
 
 /**
- * Get the localStorage key for a workspace's explicit per-agent Auto routing picks
- * ({ [agentId]: { model?: boolean; thinkingLevel?: boolean } }). They outrank the
- * agent's configured Auto default on agent switches. Kept apart from the per-agent
- * AI settings cache because hydration rewrites that cache from backend metadata,
- * which carries no routing state.
+ * Explicit routing picks stay separate from the metadata-hydrated per-agent AI settings
+ * cache, which carries no routing state.
  */
 export function getAutoRoutingChoiceByAgentKey(workspaceId: string): string {
   return `autoRoutingChoiceByAgent:${workspaceId}`;

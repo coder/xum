@@ -1106,8 +1106,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingReasoningMode: existingReasoning,
       agentBaseById,
     });
-    // The creation scope keeps no routing picks or per-agent buckets, so configured
-    // Auto defaults apply on every agent switch and turn Auto on during sync.
+    // Agent resolution in creation scopes uses configured defaults because they keep no
+    // per-agent routing choices or settings buckets.
     const autoRoutingOutcome = resolveAutoRoutingForAgent({
       agentId: normalizedAgentId,
       agentAiDefaults,

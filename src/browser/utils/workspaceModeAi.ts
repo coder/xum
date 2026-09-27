@@ -43,7 +43,7 @@ export function resolveConfiguredAiDefaults(
   modelString?: string;
   thinkingLevel?: ThinkingLevel;
   reasoningMode?: OpenAIReasoningMode;
-  /** Present only when the nearest config layer deciding the dimension chose Auto. */
+  // Each Auto flag is true only when the nearest config layer deciding that dimension chose Auto.
   autoModelRouting?: true;
   autoThinkingLevel?: true;
 } {
@@ -58,10 +58,8 @@ export function resolveConfiguredAiDefaults(
   });
   const fromConfig = (source: AiSettingSource | undefined) => source?.tier === "config";
 
-  // Auto is decided by the closest declared layer that sets either the Auto
-  // flag or a concrete value for the dimension, so a child's concrete pick
-  // blocks an ancestor's Auto. The implicit exec fallback is not in the chain:
-  // it contributes reasoningMode only.
+  // The nearest declared layer setting Auto or a concrete value decides each dimension.
+  // The implicit exec fallback contributes only reasoningMode.
   const chainIds = [normalizedAgentId, ...ancestors.map((ancestor) => ancestor.agentId)];
   const resolveConfiguredAuto = (
     flag: "autoModelRouting" | "autoThinkingLevel",
@@ -87,22 +85,15 @@ export function resolveConfiguredAiDefaults(
   };
 }
 
-/** Browser-local per-agent record of explicit composer routing picks (true = Auto, false = concrete). */
 export type AutoRoutingChoiceByAgent = Partial<
   Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
 >;
 
-/** Per dimension: true/false sets the scope's Auto flag; undefined leaves it unchanged. */
 export type AutoRoutingOutcome = Record<AutoRoutingDimension, boolean | undefined>;
 
 /**
- * Auto routing state an agent resolution applies to a composer scope.
- * Precedence per dimension: the workspace's explicit routing pick for the agent,
- * then the configured default. Explicit agent switches always settle the flag;
- * background sync only turns Auto on for a configured default the workspace has
- * no pick or per-agent bucket value for (the same condition under which a
- * configured concrete value applies), and never turns it off so a user's Auto
- * survives Settings edits.
+ * Explicit switches prefer workspace picks over configured defaults. Background sync only
+ * enables configured Auto when no pick or per-agent bucket exists, and never disables existing Auto.
  */
 export function resolveAutoRoutingForAgent(args: {
   agentId: string;
@@ -114,7 +105,7 @@ export function resolveAutoRoutingForAgent(args: {
   workspaceByAgent?: WorkspaceAISettingsCache;
 }): AutoRoutingOutcome {
   if (!args.experimentEnabled) {
-    // Saved routing preferences stay stored but inert while the experiment is off.
+    // Keep per-agent choices stored but inactive while the experiment is off.
     const outcome = args.explicitSwitch ? false : undefined;
     return { model: outcome, thinkingLevel: outcome };
   }

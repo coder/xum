@@ -332,7 +332,6 @@ describe("WorkspaceModeAISync", () => {
       thinkingLevel: readPersistedState(getAutoThinkingLevelKey(workspaceId), false),
     });
 
-    // Mirrors the composer: user picks resolve the active agent from its persisted key.
     function renderAt(workspaceId: string, agentId: string) {
       updatePersistedState(getAgentIdKey(workspaceId), agentId);
       return renderSync({ workspaceId, agentId });
@@ -357,7 +356,6 @@ describe("WorkspaceModeAISync", () => {
       await waitFor(() => {
         expect(readAuto(workspaceId)).toEqual({ model: true, thinkingLevel: true });
       });
-      // The concrete default stays the routing fallback.
       expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
 
       switchTo(rerender, workspaceId, "plan");

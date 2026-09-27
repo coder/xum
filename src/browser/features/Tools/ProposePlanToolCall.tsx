@@ -587,8 +587,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     if (settings.existingReasoning !== settings.resolvedReasoningMode) {
       updatePersistedState(getReasoningModeKey(args.workspaceId), settings.resolvedReasoningMode);
     }
-    // After the concrete setters (which leave Auto): later composer sends follow the target
-    // agent's routing, while the immediate "Implement the plan" send below stays unrouted.
+    // Persist routing for later composer sends; the immediate action below disables routing.
     applyAutoRoutingOutcome(args.workspaceId, settings.autoRouting);
   };
 

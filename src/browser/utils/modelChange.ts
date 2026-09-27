@@ -93,17 +93,14 @@ export function setWorkspaceModelWithOrigin(
 ): void {
   recordWorkspaceModelChange(workspaceId, model, origin);
   updatePersistedState(getModelKey(workspaceId), model);
-  // An explicit concrete pick (user or agent, e.g. an accepted plan's model) leaves Auto;
-  // sync-driven mode defaults keep the user's routing choice. Agent switches then apply
-  // the target agent's routing via applyAutoRoutingOutcome.
   if (origin === "user") {
     setAutoRoutingChoice(workspaceId, "model", false);
   } else if (origin === "agent") {
+    // Clear the previous flag until the caller applies the target agent's resolved routing.
     updatePersistedState(getAutoModelRoutingKey(workspaceId), false);
   }
 }
 
-/** The composer dimensions Auto can take over, each with its own persisted flag. */
 export type AutoRoutingDimension = "model" | "thinkingLevel";
 
 const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (scopeId: string) => string> = {
@@ -111,17 +108,11 @@ const AUTO_ROUTING_KEY_BY_DIMENSION: Record<AutoRoutingDimension, (scopeId: stri
   thinkingLevel: getAutoThinkingLevelKey,
 };
 
-/** Persisted-state key of one Auto dimension's flag; the palette reads and writes it outside React. */
 export function getAutoRoutingKey(scopeId: string, dimension: AutoRoutingDimension): string {
   return AUTO_ROUTING_KEY_BY_DIMENSION[dimension](scopeId);
 }
 
-/**
- * Remembers a user's explicit routing pick (Auto or a concrete value) for the workspace's
- * active agent so later agent switches restore it over the agent's configured default.
- * Creation drafts and other non-workspace scopes (all `__`-prefixed) keep no picks: their
- * composer follows configured defaults, and the creation transfer records deviations.
- */
+/** Records workspace routing picks per agent; non-workspace scopes keep only scope-wide Auto. */
 function recordAutoRoutingChoice(
   scopeId: string,
   dimension: AutoRoutingDimension,
@@ -151,7 +142,6 @@ export function recordAutoRoutingChoiceForAgent(
   );
 }
 
-/** A user-driven Auto toggle or concrete pick for one dimension of a composer scope. */
 export function setAutoRoutingChoice(
   scopeId: string,
   dimension: AutoRoutingDimension,
@@ -161,11 +151,7 @@ export function setAutoRoutingChoice(
   recordAutoRoutingChoice(scopeId, dimension, active);
 }
 
-/**
- * Applies an agent resolution's routing outcome. Call after the concrete model/thinking
- * setters: an explicit ("agent") concrete write leaves Auto, and the outcome decides
- * whether the target agent routes (its workspace pick, else its configured default).
- */
+/** Apply after agent-origin writes clear Auto so the target agent's resolved choice wins. */
 export function applyAutoRoutingOutcome(scopeId: string, outcome: AutoRoutingOutcome): void {
   for (const dimension of ["model", "thinkingLevel"] as const) {
     const active = outcome[dimension];
@@ -175,11 +161,7 @@ export function applyAutoRoutingOutcome(scopeId: string, outcome: AutoRoutingOut
   }
 }
 
-/**
- * Thinking counterpart of setWorkspaceModelWithOrigin for agent-resolved levels: an explicit
- * agent switch leaves thinking Auto until applyAutoRoutingOutcome applies the target agent's
- * routing; sync-driven defaults keep the user's routing choice.
- */
+/** Agent switches clear Auto before the resolved routing outcome is applied; sync preserves it. */
 export function setWorkspaceThinkingLevelWithOrigin(
   workspaceId: string,
   level: ThinkingLevel,

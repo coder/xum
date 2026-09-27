@@ -959,7 +959,6 @@ describe("TasksSection Auto routing defaults", () => {
     await view.findAllByText("Plan");
     const plan = getCard(view, "Plan");
 
-    // Auto with an inherited fallback still offers Reset, and never shows Inherit as selected.
     const menu = openReasoningMenu(plan);
     expect(
       within(menu).getByRole("option", { name: "Inherit" }).getAttribute("aria-selected")

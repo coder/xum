@@ -30,10 +30,8 @@ export interface SendMessageOptionsWithBase extends SendMessageOptions {
 }
 
 /**
- * Composer Auto selection for one dimension (auto-model-routing experiment),
- * workspace-scoped and forced off while the experiment is disabled so a stale
- * persisted true cannot reach the backend. The setter is for user picks only:
- * it also records the pick as the workspace's routing choice for the active agent.
+ * Ignores persisted Auto while the experiment is disabled. In workspace scopes, user
+ * updates also record the active agent's routing choice.
  */
 export function useAutoRoutingSelection(
   workspaceId: string,

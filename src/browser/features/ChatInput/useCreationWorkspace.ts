@@ -117,7 +117,6 @@ interface UseCreationWorkspaceOptions {
   dynamicWorkflowsEnabled?: boolean;
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
-  /** Agent id -> base id, for resolving the new workspace agent's configured Auto defaults. */
   agentBaseById?: ReadonlyMap<string, string | undefined>;
 }
 
@@ -145,11 +144,8 @@ function syncCreationPreferences(
       : normalizeAgentId(globalDefaultAgentId, WORKSPACE_DEFAULTS.agentId);
   updatePersistedState(getAgentIdKey(workspaceId), effectiveAgentId);
 
-  // The creation composer's Auto choices are keyed to the project scope; the new
-  // workspace's composer must keep reading Auto rather than the fallback model/level.
-  // Only a state that differs from the agent's configured Auto default is an explicit
-  // creation pick worth keeping as the workspace's routing choice; recording a
-  // default-derived state would freeze it against later Settings changes.
+  // Preserve only creation choices that differ from configured defaults; recording
+  // defaults would prevent later Settings changes from taking effect.
   const configuredDefaults = resolveConfiguredAiDefaults(
     effectiveAgentId,
     readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {}),
