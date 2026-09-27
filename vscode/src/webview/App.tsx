@@ -268,14 +268,17 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
   pushNoticeRef.current = pushNotice;
 
   const canChat = Boolean(connectionStatus?.mode === "api" && selectedWorkspaceId);
-  const isApiConnected = connectionStatus?.mode === "api";
+  // Identifies the server connection: switching servers keeps mode "api" but changes the URL.
+  const apiConnectionKey =
+    connectionStatus?.mode === "api" ? (connectionStatus.baseUrl ?? "api") : null;
 
   // #4766: the model list, model routing and thinking floors read the shared providers and app
   // config stores, which the desktop connects in AppLoader. Connect them while the host has a
-  // server connection (it rejects calls in file mode), so a recovery fetches them again. The host
+  // server connection (it rejects calls in file mode), and reconnect them for each server, so a
+  // recovery or a switch to another server fetches them again. The host
   // redacts both results (see redactWebviewOrpcResult).
   useEffect(() => {
-    if (!isApiConnected) {
+    if (apiConnectionKey === null) {
       return;
     }
     const providersConfigStore = getProvidersConfigStore();
@@ -286,7 +289,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
       providersConfigStore.setClient(null);
       appConfigStore.setClient(null);
     };
-  }, [apiClient, isApiConnected]);
+  }, [apiClient, apiConnectionKey]);
 
   useEffect(() => {
     const unsubscribe = bridge.onMessage((raw) => {

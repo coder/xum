@@ -15,6 +15,7 @@ import { normalizeAgentId } from "xum/common/utils/agentIds";
 import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
+import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
 import { normalizeSelectedModel, normalizeToCanonical } from "xum/common/utils/ai/models";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
@@ -158,9 +159,13 @@ function ChatComposerInner(props: {
   // The status line names this identity too, so a denied gateway pin is not shown as its canonical ID.
   const storedSelection = normalizeSelectedModel(preferredModel);
   const storedModelAllowed = isAllowedByPolicyOnActiveRoute(storedSelection);
-  const policyFallbackModel = storedModelAllowed
-    ? null
-    : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
+  // Until the providers config arrives, the model list is not filtered by provider availability,
+  // so a fallback could pick a provider without credentials; substitute nothing until then.
+  const { config: providersConfig } = useProvidersConfig();
+  const policyFallbackModel =
+    storedModelAllowed || providersConfig === null
+      ? null
+      : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
   const baseModel = storedModelAllowed ? storedModel : (policyFallbackModel ?? storedModel);
 
   const inputKey = getInputKey(props.workspaceId);
