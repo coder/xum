@@ -705,15 +705,21 @@ export interface TaskRetiresClaim {
  * #4782: a child committed under a parent that another backend is removing (or has removed) would
  * outlive it as an orphaned row. Checked inside every task-creation config write; the removal
  * checks for descendants after its marker claim (WorkspaceService.removeUnlocked), so either the
- * child's write sees the marker or the removal sees the child.
+ * child's write sees the marker or the removal sees the child. `requireRow` refuses a parent row
+ * that disappeared since preparation found it by id; callers pass false when preparation did not
+ * (a legacy id-less row resolves only through session metadata, never by id here).
  */
 function assertParentAdmitsChild(
   config: Parameters<typeof findWorkspaceEntry>[0],
-  parentWorkspaceId: string
+  parentWorkspaceId: string,
+  options: { requireRow: boolean }
 ): void {
   const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
   if (parent == null) {
-    throw new Error(`Task.create: parent workspace ${parentWorkspaceId} was removed`);
+    if (options.requireRow) {
+      throw new Error(`Task.create: parent workspace ${parentWorkspaceId} was removed`);
+    }
+    return;
   }
   if (parent.pendingRemoval != null) {
     throw new Error(
@@ -6312,7 +6318,9 @@ export class TaskService implements AgentTaskIntegration {
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {
-        assertParentAdmitsChild(config, plan.parentWorkspaceId);
+        // Marker only: the reservation materializes no checkout, and its preparation runs in this
+        // same call, so a vanished parent row is not told apart from a legacy id-less one here.
+        assertParentAdmitsChild(config, plan.parentWorkspaceId, { requireRow: false });
         const runtime = createRuntimeForWorkspace({
           runtimeConfig: plan.taskRuntimeConfig,
           projectPath: plan.parentMeta.projectPath,
@@ -7673,7 +7681,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         await reserveDesktop(async () => {
           await this.config.editConfig((config) => {
-            assertParentAdmitsChild(config, parentWorkspaceId);
+            assertParentAdmitsChild(config, parentWorkspaceId, { requireRow: parentEntry != null });
             let projectConfig = config.projects.get(configProjectPath);
             if (!projectConfig) {
               projectConfig = { workspaces: [] };
@@ -8021,7 +8029,7 @@ export class TaskService implements AgentTaskIntegration {
 
       // Persist workspace entry before starting work so it's durable across crashes.
       await this.config.editConfig((config) => {
-        assertParentAdmitsChild(config, parentWorkspaceId);
+        assertParentAdmitsChild(config, parentWorkspaceId, { requireRow: parentEntry != null });
         let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };

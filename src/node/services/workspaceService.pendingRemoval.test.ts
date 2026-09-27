@@ -306,6 +306,44 @@ describe("workspace removal across two backends on one root", () => {
     expect((await removal).success).toBe(true);
   });
 
+  test("a batch creation under a parent that has no config row by id (legacy) still commits", async () => {
+    await a.config.editConfig((config) => {
+      config.taskSettings = testTaskSettings(1);
+      return config;
+    });
+    await editRow(taskId, (row) => {
+      row.taskStatus = "running";
+    });
+    spyOn(runtimeFactory, "createRuntime").mockImplementation((...args) =>
+      Object.assign(realCreateRuntime(...args), { deleteWorkspace })
+    );
+    // An upgraded, id-less row resolves only through its session metadata, never by id.
+    const legacyParentId = "legacy-parent";
+    const aiService = (
+      b.taskService as unknown as {
+        aiService: { getWorkspaceMetadata: (id: string) => Promise<unknown> };
+      }
+    ).aiService;
+    const getWorkspaceMetadata = aiService.getWorkspaceMetadata.bind(aiService);
+    spyOn(aiService, "getWorkspaceMetadata").mockImplementation(async (id: string) => {
+      if (id !== legacyParentId) return getWorkspaceMetadata(id);
+      const root = (await b.config.getWorkspaceMetadataById(rootId))!;
+      return Ok({ ...root, id: legacyParentId });
+    });
+
+    const created = await b.taskService.createMany([
+      {
+        parentWorkspaceId: legacyParentId,
+        kind: "agent",
+        agentId: "explore",
+        prompt: "child work",
+        title: "child",
+      },
+    ]);
+
+    expect(created.success ? "created" : created.error).toBe("created");
+  });
+
   test("a removal refuses when the other backend created a child just before it closed admission", async () => {
     const leasesA = workspaceUseLeasesFor(a.config);
     const acquireMutationGate = leasesA.acquireMutationGate.bind(leasesA);
