@@ -8,6 +8,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
 import type { ExperimentsService } from "./experimentsService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import type { InitStateManager } from "./initStateManager";
 import type { WorkspaceService } from "./workspaceService";
 import {
@@ -273,6 +275,29 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
     expect((await service.rename(id, "after")).success).toBe(true);
     expect((await harness.config.getWorkspaceMetadataById(id))?.name).toBe("after");
+  });
+
+  // #4826: not a registration rollback, but it needs the same real-checkout rename. The rename
+  // itself has committed when the plan move runs, so a transport failure there must still publish
+  // the new name and then report the stranded plan instead of claiming a clean rename.
+  test("rename that cannot move the plan in transport reports it after publishing the rename", async () => {
+    const created = await createWorktree("plan-before");
+    if (!created.success) throw new Error(created.error);
+    const { id } = created.data.metadata;
+    spyOn(runtimeHelpers, "movePlanFile").mockRejectedValue(
+      new RuntimeError("ssh: connect to host dev port 22: Connection refused", "network")
+    );
+    const emittedNames: string[] = [];
+    service.on("metadata", (event: { workspaceId: string; metadata: { name: string } | null }) => {
+      if (event.workspaceId === id && event.metadata) emittedNames.push(event.metadata.name);
+    });
+
+    const result = await service.rename(id, "plan-after");
+
+    expect(result.success).toBe(false);
+    expect(result.success ? "" : result.error).toContain("Connection refused");
+    expect((await harness.config.getWorkspaceMetadataById(id))?.name).toBe("plan-after");
+    expect(emittedNames).toContain("plan-after");
   });
 
   test("multi-project rename moves every checkout and the container back", async () => {

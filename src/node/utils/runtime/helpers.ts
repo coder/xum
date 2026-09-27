@@ -1,5 +1,6 @@
 import {
   RuntimeError,
+  isRuntimeTransportError,
   type Runtime,
   type ExecOptions,
   type ReadFileOptions,
@@ -171,7 +172,10 @@ export async function readPlanFile(
   try {
     const content = await readFileString(runtime, planPath, undefined, planReadOptions);
     return { content, exists: true, path: resolvedPath };
-  } catch {
+  } catch (error) {
+    // An unreachable runtime is not a missing plan (#4826): callers must fail
+    // visibly, not act as if no plan exists or fall back to a stale legacy one.
+    if (isRuntimeTransportError(error)) throw error;
     // Fall back to legacy path
     try {
       const content = await readFileString(runtime, legacyPath, undefined, planReadOptions);
@@ -195,7 +199,8 @@ export async function readPlanFile(
         // Migration failed, but we have the content
       }
       return { content, exists: true, path: resolvedPath };
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) throw error;
       // File doesn't exist at either location
       return { content: "", exists: false, path: resolvedPath };
     }
@@ -204,7 +209,9 @@ export async function readPlanFile(
 
 /**
  * Move a plan file from one workspace name to another (e.g., during rename).
- * Silently succeeds if source file doesn't exist.
+ * Silently succeeds if source file doesn't exist. Throws when the source could
+ * not be probed in transport or the move itself failed, so a caller never
+ * reports a moved plan that stayed behind (#4826).
  */
 export async function movePlanFile(
   runtime: Runtime,
@@ -218,16 +225,25 @@ export async function movePlanFile(
 
   try {
     await runtime.stat(oldPath);
-    await execBuffered(runtime, 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"', {
-      cwd: "/tmp",
-      pathEnv: {
-        XUM_OLD_PLAN: oldPath,
-        XUM_NEW_PLAN: newPath,
-      },
-      timeout: 5,
-    });
-  } catch {
+  } catch (error) {
+    if (isRuntimeTransportError(error)) throw error;
     // No plan file to move, that's fine
+    return;
+  }
+  const result = await execBuffered(runtime, 'mv "$XUM_OLD_PLAN" "$XUM_NEW_PLAN"', {
+    cwd: "/tmp",
+    pathEnv: {
+      XUM_OLD_PLAN: oldPath,
+      XUM_NEW_PLAN: newPath,
+    },
+    timeout: 5,
+  });
+  throwIfTransportFailure(runtime, result, "Failed to move plan file");
+  if (result.exitCode !== 0) {
+    throw new RuntimeError(
+      `Failed to move plan file ${oldPath}: ${result.stderr.trim() || `exit ${result.exitCode}`}`,
+      "file_io"
+    );
   }
 }
 
@@ -235,7 +251,9 @@ export async function movePlanFile(
  * Copy a plan file across runtimes (e.g., during fork where source/target may be
  * different containers). Uses separate runtime handles to avoid the identity mutation
  * bug where DockerRuntime.forkWorkspace() changes this.containerName to the target.
- * Silently succeeds if no regular source file exists at either location.
+ * Silently succeeds if no regular source file exists at either location. Throws
+ * when a source read fails in transport or the target write fails, so a fork
+ * never proceeds without a plan it could not copy (#4826).
  */
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
@@ -252,16 +270,19 @@ export async function copyPlanFileAcrossRuntimes(
   const targetPath = getPlanFilePath(targetWorkspaceName, projectName, targetXumHome);
 
   for (const candidatePath of [sourcePath, legacySourcePath]) {
+    let content: string;
     try {
       // Same guard as readPlanFile: every fork reads this user/agent-writable path, so a FIFO
       // there must be skipped (as missing) instead of parking a reader per fork.
-      const content = await readFileString(sourceRuntime, candidatePath, undefined, {
+      content = await readFileString(sourceRuntime, candidatePath, undefined, {
         requireRegularFile: true,
       });
-      await writeFileString(targetRuntime, targetPath, content);
-      return;
-    } catch {
-      // Try next candidate
+    } catch (error) {
+      // An unreadable canonical plan must not be replaced by a stale legacy copy.
+      if (isRuntimeTransportError(error)) throw error;
+      continue; // Missing (or not a regular file): try the next candidate.
     }
+    await writeFileString(targetRuntime, targetPath, content);
+    return;
   }
 }

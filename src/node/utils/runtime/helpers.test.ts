@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExecOptions, ExecStream, FileStat, Runtime } from "@/node/runtime/Runtime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
 import { copyPlanFileAcrossRuntimes, movePlanFile, readPlanFile } from "./helpers";
@@ -17,6 +18,10 @@ interface MockRuntimeState {
   writes: Array<{ path: string; content: string }>;
   execCalls: Array<{ command: string; options: ExecOptions }>;
   resolvedPaths: Map<string, string>;
+  /** Reads/stats of these paths fail in transport (an unreachable SSH host). */
+  transportFailPaths: Set<string>;
+  /** Exit code every exec reports; 255 is the OpenSSH transport-failure exit. */
+  execExitCode: number;
 }
 
 function createRuntimeState(
@@ -30,6 +35,8 @@ function createRuntimeState(
     writes: [],
     execCalls: [],
     resolvedPaths: new Map(),
+    transportFailPaths: new Set(),
+    execExitCode: 0,
   };
 }
 
@@ -72,6 +79,9 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
     getXumHome: () => state.xumHome,
     readFile: (path: string) => {
       state.readAttempts.push(path);
+      if (state.transportFailPaths.has(path)) {
+        throw new RuntimeError(`ssh: connect to host failed (${path})`, "network");
+      }
       const content = state.files.get(path);
       if (content === undefined) {
         throw new Error(`ENOENT: ${path}`);
@@ -95,9 +105,12 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
     },
     exec: (command: string, options: ExecOptions) => {
       state.execCalls.push({ command, options });
-      return Promise.resolve(createExecStream());
+      return Promise.resolve(createExecStream("", "", state.execExitCode));
     },
     stat: (path: string) => {
+      if (state.transportFailPaths.has(path)) {
+        return Promise.reject(new RuntimeError(`ssh: connect to host failed (${path})`, "network"));
+      }
       const content = state.files.get(path);
       if (content === undefined) {
         return Promise.reject(new Error(`ENOENT: ${path}`));
@@ -111,6 +124,7 @@ function createMockRuntime(state: MockRuntimeState): Runtime {
       }
       return Promise.resolve(path);
     },
+    isTransportFailureExit: (exitCode: number) => exitCode === 255,
   } as unknown as Runtime;
 }
 
@@ -438,6 +452,132 @@ describe("movePlanFile", () => {
         },
         timeout: 5,
       },
+    });
+  });
+});
+
+// #4826: an unreachable runtime is not a missing plan. Each helper must fail
+// loudly instead of reading as "no plan file", and a move/copy must never
+// report success (or touch the target) when the source could not be read.
+describe("plan-file helpers on transport failures", () => {
+  const workspaceName = "workspace-a1b2";
+  const projectName = "demo-project";
+  const workspaceId = "legacy-workspace-id";
+  const xumHome = "~/.mux";
+  const planPath = getPlanFilePath(workspaceName, projectName, xumHome);
+  const legacyPath = getLegacyPlanFilePath(workspaceId, xumHome);
+
+  it("readPlanFile rethrows a transport failure on the canonical path", async () => {
+    const state = createRuntimeState(xumHome, { [legacyPath]: "# stale legacy plan\n" });
+    state.transportFailPaths.add(planPath);
+
+    const attempt = readPlanFile(createMockRuntime(state), workspaceName, projectName, workspaceId);
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(attempt).rejects.toThrow("ssh: connect to host failed");
+    // Neither the legacy fallback nor its migration may run past the failure.
+    expect(state.readAttempts).toEqual([planPath]);
+    expect(state.execCalls).toHaveLength(0);
+  });
+
+  it("readPlanFile rethrows a transport failure on the legacy path", async () => {
+    const state = createRuntimeState(xumHome);
+    state.transportFailPaths.add(legacyPath);
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      readPlanFile(createMockRuntime(state), workspaceName, projectName, workspaceId)
+    ).rejects.toThrow("ssh: connect to host failed");
+  });
+
+  it("readPlanFile still reports a truly missing plan as absent", async () => {
+    const state = createRuntimeState(xumHome);
+
+    const result = await readPlanFile(
+      createMockRuntime(state),
+      workspaceName,
+      projectName,
+      workspaceId
+    );
+
+    expect(result).toEqual({ content: "", exists: false, path: planPath });
+  });
+
+  describe("movePlanFile", () => {
+    const newPlanPath = getPlanFilePath("renamed-workspace", projectName, xumHome);
+
+    it("rethrows a transport failure on the source probe without moving", async () => {
+      const state = createRuntimeState(xumHome);
+      state.transportFailPaths.add(planPath);
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
+      ).rejects.toThrow("ssh: connect to host failed");
+      expect(state.execCalls).toHaveLength(0);
+    });
+
+    it("fails when the move itself fails in transport", async () => {
+      const state = createRuntimeState(xumHome, { [planPath]: "# plan\n" });
+      state.execExitCode = 255;
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName)
+      ).rejects.toThrow("Failed to move plan file");
+    });
+
+    it("still succeeds as a no-op when there is no plan", async () => {
+      const state = createRuntimeState(xumHome);
+
+      await movePlanFile(createMockRuntime(state), workspaceName, "renamed-workspace", projectName);
+
+      expect(state.execCalls).toHaveLength(0);
+      expect(state.files.has(newPlanPath)).toBe(false);
+    });
+  });
+
+  describe("copyPlanFileAcrossRuntimes", () => {
+    const targetXumHome = "~/.xum";
+    const targetPlanPath = getPlanFilePath("fork-workspace", projectName, targetXumHome);
+
+    it("rethrows a source transport failure without writing the target", async () => {
+      const sourceState = createRuntimeState(xumHome, { [legacyPath]: "# stale legacy plan\n" });
+      sourceState.transportFailPaths.add(planPath);
+      const targetState = createRuntimeState(targetXumHome);
+
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        copyPlanFileAcrossRuntimes(
+          createMockRuntime(sourceState),
+          createMockRuntime(targetState),
+          workspaceName,
+          workspaceId,
+          "fork-workspace",
+          projectName
+        )
+      ).rejects.toThrow("ssh: connect to host failed");
+      // The stale legacy plan must not be copied in place of the unreadable one.
+      expect(sourceState.readAttempts).toEqual([planPath]);
+      expect(targetState.writes).toEqual([]);
+    });
+
+    it("still succeeds without writing when no source plan exists", async () => {
+      const sourceState = createRuntimeState(xumHome);
+      const targetState = createRuntimeState(targetXumHome);
+
+      await copyPlanFileAcrossRuntimes(
+        createMockRuntime(sourceState),
+        createMockRuntime(targetState),
+        workspaceName,
+        workspaceId,
+        "fork-workspace",
+        projectName
+      );
+
+      expect(sourceState.readAttempts).toEqual([planPath, legacyPath]);
+      expect(targetState.writes).toEqual([]);
+      expect(targetState.files.has(targetPlanPath)).toBe(false);
     });
   });
 });

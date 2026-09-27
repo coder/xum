@@ -8740,8 +8740,17 @@ export class WorkspaceService
         });
       });
 
-      // Rename plan file if it exists (uses workspace name, not ID)
-      await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
+      // Rename plan file if it exists (uses workspace name, not ID). The checkout and config are
+      // already renamed, so a failed move (e.g. an unreachable SSH host) must not skip the
+      // metadata updates below; it is reported once they are done (#4826). movePlanFile never
+      // deletes the source on failure, so the plan stays at its old name.
+      let planMoveError: string | undefined;
+      try {
+        await movePlanFile(runtimeForPlanFile, oldName, newName, oldMetadata.projectName);
+      } catch (error: unknown) {
+        planMoveError = getErrorMessage(error);
+        log.warn("Failed to move plan file after rename", { workspaceId, error: planMoveError });
+      }
 
       const allMetadataUpdated = await this.config.getAllWorkspaceMetadata();
       const updatedMetadata = allMetadataUpdated.find((m) => m.id === workspaceId);
@@ -8771,6 +8780,11 @@ export class WorkspaceService
 
       await this.syncCodeWorkspaceFiles(updatedMetadata);
 
+      if (planMoveError !== undefined) {
+        return Err(
+          `Workspace renamed to "${newName}", but its plan file could not be moved from "${oldName}": ${planMoveError}`
+        );
+      }
       return Ok({ newWorkspaceId: workspaceId });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -11803,6 +11817,18 @@ export class WorkspaceService
         // Persist an explicit empty usage file so later reads do not rebuild
         // historical costs from the copied messages.
         await resetForkedSessionUsage(this.sessionUsageService, newWorkspaceId, newSessionDir);
+
+        // Copy plan file using explicit source/target runtimes for cross-runtime safety. Inside
+        // this try: a plan the source runtime could not read (or the target could not store)
+        // fails the fork through the same cleanup, instead of a fork missing its plan (#4826).
+        await copyPlanFileAcrossRuntimes(
+          freshSourceRuntime,
+          targetRuntime,
+          sourceMetadata.name,
+          sourceWorkspaceId,
+          resolvedName,
+          projectName
+        );
       } catch (copyError) {
         const forkTrusted = projectConfig.trusted ?? false;
         await targetRuntime.deleteWorkspace(
@@ -11823,16 +11849,6 @@ export class WorkspaceService
         const message = getErrorMessage(copyError);
         return Err(`Failed to copy fork state: ${message}`);
       }
-
-      // Copy plan file using explicit source/target runtimes for cross-runtime safety.
-      await copyPlanFileAcrossRuntimes(
-        freshSourceRuntime,
-        targetRuntime,
-        sourceMetadata.name,
-        sourceWorkspaceId,
-        resolvedName,
-        projectName
-      );
 
       if (sourceRuntimeConfigUpdate) {
         await this.config.updateWorkspaceMetadata(sourceWorkspaceId, {

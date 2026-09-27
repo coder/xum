@@ -5,7 +5,7 @@ import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { RuntimeError } from "@/node/runtime/Runtime";
+import { RuntimeError, isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 import { setTodosForSessionDir } from "./todo";
 
@@ -47,6 +47,14 @@ export const createProposePlanTool: ToolFactory = (config) => {
           requireRegularFile: true,
         });
       } catch (err) {
+        // An unreachable runtime is not a missing plan (#4826): "write your plan"
+        // would invite the agent to overwrite a plan it simply could not reach.
+        if (isRuntimeTransportError(err)) {
+          return {
+            success: false as const,
+            error: `Could not read the plan file at ${planPath} because the workspace runtime is unreachable: ${err.message}`,
+          };
+        }
         if (err instanceof RuntimeError) {
           return {
             success: false as const,

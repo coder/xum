@@ -19,6 +19,7 @@ import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
 import { createMuxMessage } from "@/common/types/message";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import * as forkOrchestratorModule from "@/node/services/utils/forkOrchestrator";
 import * as runtimeExecHelpers from "@/node/utils/runtime/helpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -426,6 +427,71 @@ describe("WorkspaceService fork", () => {
         .find((entry) => entry.id === newWorkspaceId);
       expect(forkEntry?.unrelatedWorkspaceConsentPending).toBeUndefined();
       expect(forkEntry?.unrelatedWorkspaceConsent).toBeUndefined();
+    } finally {
+      mock.restore();
+    }
+  });
+
+  // #4826: a plan the source runtime could not read must fail the fork through the
+  // same cleanup as other fork-state copies, not yield a fork silently missing its plan.
+  test("a plan copy that fails in transport fails and cleans up the fork", async () => {
+    const sourceWorkspaceId = "source-workspace";
+    const newWorkspaceId = "forked-workspace";
+    const sourceProjectPath = path.join(tempDir, "project");
+    const forkedWorkspacePath = path.join(sourceProjectPath, "fork-child");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+    };
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      current.projects.get(sourceProjectPath)!.trusted = true;
+      return current;
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      }),
+    });
+    const deleteWorkspace = mock(() => Promise.resolve({ success: true as const }));
+    const targetRuntime = {
+      getWorkspacePath: mock(() => forkedWorkspacePath),
+      deleteWorkspace,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>;
+    spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue(
+      {} as ReturnType<typeof runtimeFactory.createRuntime>
+    );
+    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+    spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockRejectedValue(
+      new RuntimeError("ssh: connect to host dev port 22: Connection refused", "network")
+    );
+    spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+      Ok({
+        workspacePath: forkedWorkspacePath,
+        trunkBranch: "main",
+        forkedRuntimeConfig: { type: "local" },
+        targetRuntime,
+        forkedFromSource: true,
+        sourceRuntimeConfigUpdated: false,
+      })
+    );
+
+    try {
+      const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("expected the fork to fail");
+      expect(result.error).toContain("Connection refused");
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
     } finally {
       mock.restore();
     }

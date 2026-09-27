@@ -7,6 +7,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import type { ProjectRef } from "@/common/types/workspace";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
+import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import {
   WorkspaceGoalChildWorkspaceError,
   WorkspaceGoalTransitionError,
@@ -44,12 +45,23 @@ export async function getWorkspacePlanContent(context: ORPCContext, workspaceId:
   const metadata = await context.workspaceService.getInfo(workspaceId);
   if (!metadata)
     return { success: false as const, error: "Workspace not found: " + (workspaceId ?? "<none>") };
-  const result = await readPlanFile(
-    createRuntimeForWorkspace(metadata),
-    metadata.name,
-    metadata.projectName,
-    workspaceId
-  );
+  let result: Awaited<ReturnType<typeof readPlanFile>>;
+  try {
+    result = await readPlanFile(
+      createRuntimeForWorkspace(metadata),
+      metadata.name,
+      metadata.projectName,
+      workspaceId
+    );
+  } catch (error) {
+    // An unreachable runtime is not a missing plan (#4826); report it through the same
+    // error channel so every plan viewer shows why, instead of "Plan file not found".
+    if (!isRuntimeTransportError(error)) throw error;
+    return {
+      success: false as const,
+      error: `Could not read the plan file because the workspace runtime is unreachable: ${error.message}`,
+    };
+  }
   return result.exists
     ? { success: true as const, data: { content: result.content, path: result.path } }
     : { success: false as const, error: "Plan file not found at " + result.path };
