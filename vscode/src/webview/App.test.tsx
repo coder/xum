@@ -470,3 +470,32 @@ describe("vscode webview workspace AI settings", () => {
     expect(options.agentId).toBe("explore");
   });
 });
+
+// #4751: the extension host only answers agents.list for workspaces it has listed.
+describe("vscode webview agent lookup", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("waits for the workspace list before looking up a restored selection's agents", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    // A fresh extension host posts the restored selection before the workspace list.
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    expect(bridge.orpcCalls("agents.list")).toHaveLength(0);
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
+    const lookups = bridge.orpcCalls("agents.list");
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+  });
+});

@@ -66,22 +66,6 @@ export function isAllowedOrpcPath(path: string[]): boolean {
   }
 }
 
-/**
- * Workspace IDs the extension has sent to the webview: the workspace list plus the selected ID.
- * On a fresh extension host the restored selection is posted before the list refresh finishes, and
- * the webview's agent lookup for it must not be rejected in that window.
- */
-export function webviewKnownWorkspaceIds(
-  listedWorkspaceIds: Iterable<string>,
-  selectedWorkspaceId: string | null
-): Set<string> {
-  const known = new Set(listedWorkspaceIds);
-  if (selectedWorkspaceId) {
-    known.add(selectedWorkspaceId);
-  }
-  return known;
-}
-
 export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; error: string };
 
 /**

@@ -578,7 +578,11 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
             <ProviderOptionsProvider>
               <ThemeProvider forcedTheme="dark">
                 <WebviewChatProviders
-                  workspaceId={selectedWorkspaceId ?? undefined}
+                  // Scope agent state (and its agents.list lookup) to the selected workspace only
+                  // once the extension has listed it: on a fresh extension host the restored
+                  // selection arrives before the list, and the host rejects lookups for workspaces
+                  // it has not sent (#4751).
+                  workspaceId={selectedWorkspace ? selectedWorkspace.id : undefined}
                   workspaceAi={selectedWorkspace?.ai}
                 >
                   <div className="flex h-screen flex-col">
