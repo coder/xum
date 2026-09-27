@@ -1748,9 +1748,16 @@ describe("TaskService", () => {
     { route: "parent guidance", target: "target", code: "send_failed" },
     { route: "sibling family message", target: "target", code: "send_failed" },
     { route: "sibling peer message", target: "target", code: "refused" },
+    // Legacy entries may omit `name` (config then derives it from the path basename).
+    {
+      route: "parent guidance (unnamed legacy entry)",
+      target: "target",
+      code: "send_failed",
+      unnamedTarget: true,
+    },
   ] as const)(
     "$route to a recipient whose checkout is missing refuses before persisting",
-    async ({ route, target, code }) => {
+    async ({ route, target, code, ...options }) => {
       const config = await createTestConfig(rootDir);
       const projectPath = path.join(rootDir, "repo");
       const running = { parentWorkspaceId: "parent", taskStatus: "running" as const };
@@ -1760,15 +1767,21 @@ describe("TaskService", () => {
         [
           projectWorkspace(projectPath, "parent", "parent"),
           projectWorkspace(projectPath, "sender", "sender", running),
-          projectWorkspace(projectPath, "target", "target", {
-            ...running,
-            agentId: "exec",
-            agentType: "exec",
-            taskModelString: "openai:gpt-5.2",
-          }),
+          {
+            ...projectWorkspace(projectPath, "target", "target", {
+              ...running,
+              agentId: "exec",
+              agentType: "exec",
+              taskModelString: "openai:gpt-5.2",
+            }),
+            ...("unnamedTarget" in options ? { name: undefined } : {}),
+          },
         ],
         testTaskSettings()
       );
+      if ("unnamedTarget" in options) {
+        expect(findWorkspaceInConfig(config, "target")?.name).toBeUndefined();
+      }
       await fsPromises.rm(path.join(projectPath, target, ".git"), { recursive: true, force: true });
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService, historyService } = createTaskServiceHarness(config, {
@@ -1780,7 +1793,7 @@ describe("TaskService", () => {
       const result =
         route === "child to parent"
           ? await taskService.sendMessageToParentFromAgentTask("sender", message, "tool-end")
-          : route === "parent guidance"
+          : route.startsWith("parent guidance")
             ? await taskService.sendMessageToDescendantAgentTask(
                 "parent",
                 "target",

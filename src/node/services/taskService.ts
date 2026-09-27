@@ -1845,7 +1845,12 @@ async function getMissingHostLocalCheckoutError(entry: {
   workspace: WorkspaceConfigEntry;
 }): Promise<string | null> {
   const { workspace } = entry;
-  const name = coerceNonEmptyString(workspace.name);
+  // Legacy entries may omit `name`; config metadata loading then falls back to the path basename,
+  // so probe the same name instead of skipping the guard (single-project probes use the persisted
+  // path either way).
+  const name =
+    coerceNonEmptyString(workspace.name) ??
+    coerceNonEmptyString(path.basename(coerceNonEmptyString(workspace.path) ?? ""));
   const runtimeConfig = workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
   if (name == null || !isWorktreeRuntime(runtimeConfig)) {
     return null;
@@ -12539,6 +12544,14 @@ export class TaskService implements AgentTaskIntegration {
       const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
       if (!parentEntry) {
         throw new Error("agent_report could not find the parent workspace");
+      }
+      // Like task_message_parent (#4824): a parent whose checkout is missing could never run the
+      // wake turn, so refuse before the report row is persisted.
+      const parentCheckoutError = await getMissingHostLocalCheckoutError(parentEntry);
+      if (parentCheckoutError != null) {
+        throw new Error(
+          `agent_report cannot wake the parent: its checkout is unavailable (${parentCheckoutError})`
+        );
       }
 
       const agentType = coerceNonEmptyString(childEntry.workspace.agentType) ?? "agent";
