@@ -85,10 +85,12 @@ export function resolveConfiguredAiDefaults(
   };
 }
 
+/** Explicit composer picks per agent: true = Auto, false = a concrete value. */
 export type AutoRoutingChoiceByAgent = Partial<
   Record<string, Partial<Record<AutoRoutingDimension, boolean>>>
 >;
 
+/** undefined leaves the scope's Auto flag unchanged. */
 export type AutoRoutingOutcome = Record<AutoRoutingDimension, boolean | undefined>;
 
 /**
