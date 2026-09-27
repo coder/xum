@@ -117,6 +117,7 @@ import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { AutoModelRouter } from "@/node/services/autoModelRouter";
 import {
   normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingDecision,
   type AutoModelRoutingDimensions,
   type AutoModelRoutingRecord,
   type AutoModelRoutingTier,
@@ -6550,19 +6551,29 @@ export class AgentSession {
       evaluationModel,
       signal,
     });
-    if (!decision.success) {
-      return fallback({ status: "fallback", reason: decision.error });
-    }
     // The evaluation is a paid request outside StreamManager; bill it to the workspace
-    // before any fallback below, since the tokens were spent either way.
-    const billed = await this.sessionUsageService?.recordHeadlessUsage(
-      this.workspaceId,
-      decision.data.evaluationModel,
-      decision.data.usage,
-      decision.data.providerMetadata,
-      { analyticsSource: "auto_model_routing" }
-    );
-    this.deferEvaluatorGoalCharge(attempt, billed ? getTotalCost(billed.usage) : undefined);
+    // before any fallback, since the tokens were spent either way.
+    const billEvaluator = async (
+      usage: AutoModelRoutingDecision["usage"],
+      providerMetadata: Record<string, unknown> | undefined
+    ) => {
+      const billed = await this.sessionUsageService?.recordHeadlessUsage(
+        this.workspaceId,
+        evaluationModel,
+        usage,
+        providerMetadata,
+        { analyticsSource: "auto_model_routing" }
+      );
+      this.deferEvaluatorGoalCharge(attempt, billed ? getTotalCost(billed.usage) : undefined);
+    };
+    if (!decision.success) {
+      // A rejected answer still cost a provider response (#4774).
+      if (decision.error.usage != null) {
+        await billEvaluator(decision.error.usage, decision.error.providerMetadata);
+      }
+      return fallback({ status: "fallback", reason: decision.error.reason });
+    }
+    await billEvaluator(decision.data.usage, decision.data.providerMetadata);
     const chosen = tiers.find((tier) => tier.id === decision.data.tierId);
     const provenance = {
       tierId: decision.data.tierId,

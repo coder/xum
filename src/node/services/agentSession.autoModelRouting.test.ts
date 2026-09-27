@@ -12,6 +12,7 @@ import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type {
   AutoModelRouter,
   AutoModelRouterClassifyInput,
+  AutoModelRouterFailure,
 } from "@/node/services/autoModelRouter";
 import type {
   AutoModelRoutingDecision,
@@ -69,7 +70,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
     experimentEnabled: boolean;
     classify?: (
       input: AutoModelRouterClassifyInput
-    ) => Promise<Result<AutoModelRoutingDecision, string>>;
+    ) => Promise<Result<AutoModelRoutingDecision, AutoModelRouterFailure>>;
     tiers?: TierInput[];
     /** Saved evaluation model; absent means the normalized default. */
     evaluationModel?: string;
@@ -327,7 +328,7 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
   it("keeps the composer model when the classifier fails and records the reason", async () => {
     const { session, streamMessage, classify } = await createHarness({
       experimentEnabled: true,
-      classify: () => Promise.resolve(Err("Classifier returned HTTP 429")),
+      classify: () => Promise.resolve(Err({ reason: "Classifier returned HTTP 429" })),
     });
 
     const result = await session.sendMessage("hello", {
@@ -1407,6 +1408,51 @@ describe("AgentSession.sendMessage (auto model routing)", () => {
       usage,
       providerMetadata,
       { analyticsSource: "auto_model_routing" }
+    );
+  });
+
+  it("bills and goal-charges a rejected verdict the provider already billed (#4774)", async () => {
+    const evaluatorUsage = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
+    const providerMetadata = { openai: { reasoningTokens: 2 } };
+    const harness = await createHarness({
+      experimentEnabled: true,
+      unpricedModels: [],
+      evaluatorCostUsd: 0.0042,
+      classify: () =>
+        Promise.resolve(
+          Err({
+            reason: "Evaluation failed (AI_InvalidResponseDataError)",
+            usage: evaluatorUsage,
+            providerMetadata,
+          })
+        ),
+    });
+    const { session, streamMessage, recordHeadlessUsage, recordStreamAccounting } = harness;
+    await session.sendMessage("Refactor the scheduler", {
+      model: COMPOSER_MODEL,
+      agentId: "exec",
+      autoModelRouting: true,
+    });
+    expect(recordHeadlessUsage).toHaveBeenCalledWith(
+      "ws-auto-routing",
+      DEFAULT_AUTO_MODEL_ROUTING_EVALUATION_MODEL,
+      evaluatorUsage,
+      providerMetadata,
+      { analyticsSource: "auto_model_routing" }
+    );
+    expect(streamMessage.mock.calls[0]?.[0]?.autoModelRouting).toMatchObject({
+      status: "fallback",
+      model: COMPOSER_MODEL,
+      reason: "Evaluation failed (AI_InvalidResponseDataError)",
+    });
+
+    const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+    await endTurn(harness, COMPOSER_MODEL, usage);
+    const responseCost = getTotalCost(createDisplayUsage(usage, COMPOSER_MODEL)) ?? 0;
+    expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
+    expect((recordStreamAccounting.mock.calls[0]?.[0] as { costUsd: number }).costUsd).toBeCloseTo(
+      responseCost + 0.0042,
+      10
     );
   });
 

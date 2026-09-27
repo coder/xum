@@ -3,6 +3,7 @@ import type {
   Experimental_EvaluationModelV4,
   Experimental_EvaluationModelV4Result,
 } from "@ai-sdk/provider";
+import { createOpenAI } from "@ai-sdk/openai";
 import { APICallError } from "ai";
 import { Effect } from "effect";
 import * as fs from "fs";
@@ -67,11 +68,13 @@ function providersStore(providers: Record<string, unknown> | null) {
  */
 function createRouter(options: {
   doEvaluate?: DoEvaluate;
+  /** A real provider evaluation model instead of the fake; `doEvaluate` is then unused. */
+  model?: Experimental_EvaluationModelV4;
   policyService?: EvaluationModelFactoryDeps["policyService"];
 }) {
   const doEvaluate = mock<DoEvaluate>(options.doEvaluate ?? (() => Promise.resolve(verdict())));
   const buildModel = spyOn(evaluationModelFactory, "createEvaluationModel").mockImplementation(() =>
-    Effect.succeed(Ok(fakeEvaluationModel(doEvaluate)))
+    Effect.succeed(Ok(options.model ?? fakeEvaluationModel(doEvaluate)))
   );
   const router = new AutoModelRouter({
     providersConfigStore: providersStore({}),
@@ -163,8 +166,10 @@ describe("AutoModelRouter.classify", () => {
     });
     expect(result.success).toBe(false);
     if (result.success) return;
-    expect(result.error).toContain("Evaluation failed");
-    expect(result.error).not.toContain("sk-secret");
+    expect(result.error.reason).toContain("Evaluation failed");
+    expect(JSON.stringify(result.error)).not.toContain("sk-secret");
+    // No response arrived, so nothing was billed.
+    expect(result.error.usage).toBeUndefined();
   });
 
   it("reduces a provider HTTP failure to its status code", async () => {
@@ -185,7 +190,7 @@ describe("AutoModelRouter.classify", () => {
       tiers: TIERS,
       evaluationModel: EVALUATION_MODEL,
     });
-    expect(result).toEqual(Err("Evaluation request failed with HTTP 429"));
+    expect(result).toEqual(Err({ reason: "Evaluation request failed with HTTP 429" }));
   });
 
   it("passes the evaluator's usage and provider metadata through for cost accounting", async () => {
@@ -203,6 +208,73 @@ describe("AutoModelRouter.classify", () => {
     expect(result.data.usage).toMatchObject({ inputTokens: 40, outputTokens: 3 });
     expect(result.data.providerMetadata).toEqual({
       [TYPESAFE_PROVIDER_KEY]: { confidence: { difficulty: 0.6 } },
+    });
+  });
+
+  // #4774: the provider billed these responses even though the answer was rejected.
+  it("keeps the billed usage of a verdict outside the tiers", async () => {
+    const { router } = createRouter({
+      doEvaluate: () =>
+        Promise.resolve(
+          verdict("impossible", {
+            usage: { inputTokens: 40, outputTokens: 4 },
+            providerMetadata: { openai: { reasoningTokens: 2, responseId: "resp_secret" } },
+          })
+        ),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: EVALUATION_MODEL,
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toEqual({
+      reason: expect.stringContaining("Evaluation failed") as unknown as string,
+      usage: { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+      // Only the allowlisted usage metadata survives, as for other evaluations.
+      providerMetadata: { openai: { reasoningTokens: 2 } },
+    });
+  });
+
+  it("keeps the billed usage of an answer the real OpenAI evaluation adapter rejects", async () => {
+    // "c9" is not one of the tier option codes, so provider-utils throws inside
+    // doEvaluate before it would return usage.
+    const fetch = (() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            id: "resp_test",
+            created_at: 0,
+            model: "gpt-5-nano",
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                id: "msg_test",
+                content: [
+                  { type: "output_text", text: JSON.stringify({ q0: "c9" }), annotations: [] },
+                ],
+              },
+            ],
+            usage: { input_tokens: 120, output_tokens: 30 },
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        )
+      )) as unknown as typeof globalThis.fetch;
+    const { router } = createRouter({
+      model: createOpenAI({ apiKey: "test", fetch }).evaluationModel("gpt-5-nano"),
+    });
+    const result = await router.classify({
+      prompt: "x",
+      tiers: TIERS,
+      evaluationModel: "openai:gpt-5-nano",
+    });
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toEqual({
+      reason: expect.stringContaining("Evaluation failed") as unknown as string,
+      usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
     });
   });
 
@@ -238,10 +310,9 @@ describe("AutoModelRouter.classify", () => {
       tiers: TIERS,
       evaluationModel: EVALUATION_MODEL,
     });
-    expect(result).toEqual({
-      success: false,
-      error: `No API key configured for ${TYPESAFE_PROVIDER_KEY} in providers.jsonc`,
-    });
+    expect(result).toEqual(
+      Err({ reason: `No API key configured for ${TYPESAFE_PROVIDER_KEY} in providers.jsonc` })
+    );
     expect(router.getEvaluationStatus(EVALUATION_MODEL)).toEqual({
       evaluationModel: EVALUATION_MODEL,
       available: false,

@@ -6,10 +6,10 @@ import * as os from "os";
 import * as path from "path";
 import { Context, Effect } from "effect";
 import { Config } from "@/node/config";
-import { Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
-import type { AutoModelRouter } from "@/node/services/autoModelRouter";
+import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
 
 import type { ORPCContext } from "./context";
 import { inFlightProcedureCount } from "./inFlightProcedures";
@@ -24,8 +24,8 @@ describe("config.previewAutoModelRouting", () => {
   };
   const EVALUATOR_USAGE = { inputTokens: 40, outputTokens: 3, totalTokens: 43 };
 
-  function createPreviewClient(verdict: AutoModelRoutingDecision) {
-    const classifyEffect = mock((_input: unknown) => Effect.succeed(Ok(verdict)));
+  function createPreviewClient(outcome: Result<AutoModelRoutingDecision, AutoModelRouterFailure>) {
+    const classifyEffect = mock((_input: unknown) => Effect.succeed(outcome));
     const recordHeadlessUsage = mock((..._args: unknown[]) => Promise.resolve(undefined));
     const context = {
       config: {
@@ -48,13 +48,15 @@ describe("config.previewAutoModelRouting", () => {
   }
 
   test("bills the evaluator's usage to the named workspace like the send path", async () => {
-    const { client, recordHeadlessUsage } = createPreviewClient({
-      tierId: "hard",
-      confidence: 0.8,
-      evaluationModel: "typesafe:jev-latest",
-      usage: EVALUATOR_USAGE,
-      providerMetadata: { typesafe: { requestId: "req-1" } },
-    });
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "hard",
+        confidence: 0.8,
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+        providerMetadata: { typesafe: { requestId: "req-1" } },
+      })
+    );
     const result = await client.config.previewAutoModelRouting({
       prompt: "Refactor the scheduler",
       workspaceId: "ws-live",
@@ -80,11 +82,13 @@ describe("config.previewAutoModelRouting", () => {
   });
 
   test("a verdict naming a tier the panel no longer has still bills its usage", async () => {
-    const { client, recordHeadlessUsage } = createPreviewClient({
-      tierId: "extreme",
-      evaluationModel: "typesafe:jev-latest",
-      usage: EVALUATOR_USAGE,
-    });
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "extreme",
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+      })
+    );
     const result = await client.config.previewAutoModelRouting({
       prompt: "Refactor the scheduler",
       workspaceId: "ws-live",
@@ -94,12 +98,35 @@ describe("config.previewAutoModelRouting", () => {
     expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
   });
 
-  test("refuses a workspace it does not know before calling the evaluator", async () => {
-    const { client, classifyEffect, recordHeadlessUsage } = createPreviewClient({
-      tierId: "hard",
-      evaluationModel: "typesafe:jev-latest",
-      usage: EVALUATOR_USAGE,
+  test("bills a rejected verdict the provider already billed (#4774)", async () => {
+    const { client, recordHeadlessUsage } = createPreviewClient(
+      Err({ reason: "Evaluation failed (AI_InvalidResponseDataError)", usage: EVALUATOR_USAGE })
+    );
+    const result = await client.config.previewAutoModelRouting({
+      prompt: "Refactor the scheduler",
+      workspaceId: "ws-live",
+      config: PREVIEW_TIERS,
     });
+    expect(result).toEqual(Err("Evaluation failed (AI_InvalidResponseDataError)"));
+    expect(recordHeadlessUsage.mock.calls).toEqual([
+      [
+        "ws-live",
+        "typesafe:jev-latest",
+        EVALUATOR_USAGE,
+        undefined,
+        { analyticsSource: "auto_model_routing_preview" },
+      ],
+    ]);
+  });
+
+  test("refuses a workspace it does not know before calling the evaluator", async () => {
+    const { client, classifyEffect, recordHeadlessUsage } = createPreviewClient(
+      Ok({
+        tierId: "hard",
+        evaluationModel: "typesafe:jev-latest",
+        usage: EVALUATOR_USAGE,
+      })
+    );
     const result = await client.config.previewAutoModelRouting({
       prompt: "Refactor the scheduler",
       workspaceId: "ws-removed",

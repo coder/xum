@@ -256,6 +256,33 @@ function withBillingCapture(
   };
 }
 
+/** One call's billing capture: evaluate with `model` inside `run`, then read `billed`. */
+export interface EvaluationBillingCapture {
+  readonly model: EvaluationModelInstance;
+  run<T>(fn: () => T): T;
+  /** Billing of the response this call received, if any; set even when the answer was rejected. */
+  readonly billed: EvaluationBilledUsage | undefined;
+}
+
+/**
+ * Both captures (#4728) for one call. Exported for callers that need the raw SDK
+ * result instead of `evaluate()`'s projection: auto model routing reads TypeSafe
+ * confidence and choice probabilities, and still bills rejected answers (#4774).
+ */
+export function createEvaluationBillingCapture(
+  model: EvaluationModelInstance
+): EvaluationBillingCapture {
+  installInnerBillingCapture(model);
+  const scope: BillingScope = {};
+  return {
+    model: withBillingCapture(model, scope),
+    run: (fn) => billingScope.run(scope, fn),
+    get billed() {
+      return scope.billed;
+    },
+  };
+}
+
 /**
  * Map an SDK/provider throwable to class identity. Uses the SDK's marker-based
  * `isInstance` checks (never `instanceof`, which breaks across bundled copies).
@@ -334,9 +361,7 @@ export function makeEvaluationService(): EvaluationService {
   return {
     evaluate: <const Q extends EvaluationQuestions>(call: EvaluationCall<Q>) =>
       Effect.gen(function* () {
-        installInnerBillingCapture(call.model);
-        const scope: BillingScope = {};
-        const model = withBillingCapture(call.model, scope);
+        const capture = createEvaluationBillingCapture(call.model);
         const result = yield* Effect.tryPromise({
           // The fiber's own signal is handed to the SDK, so interrupting the
           // effect aborts the in-flight provider request; the resulting
@@ -347,9 +372,9 @@ export function makeEvaluationService(): EvaluationService {
             // warning can echo the evaluated state. Set it here instead of relying on
             // streamManager having been imported first (#4363).
             globalThis.AI_SDK_LOG_WARNINGS = false;
-            return billingScope.run(scope, () =>
+            return capture.run(() =>
               experimental_evaluate({
-                model,
+                model: capture.model,
                 state: call.state,
                 questions: call.questions,
                 providerOptions: call.providerOptions,
@@ -361,7 +386,8 @@ export function makeEvaluationService(): EvaluationService {
           // A response received before the throw was billed; keep its usage.
           catch: (error) => {
             const classified = classifyEvaluationError(error);
-            return scope.billed === undefined
+            const billed = capture.billed;
+            return billed === undefined
               ? classified
               : new EvaluationError({
                   reason: classified.reason,
@@ -369,7 +395,7 @@ export function makeEvaluationService(): EvaluationService {
                   ...(classified.statusCode !== undefined
                     ? { statusCode: classified.statusCode }
                     : {}),
-                  billedUsage: scope.billed,
+                  billedUsage: billed,
                 });
           },
         });

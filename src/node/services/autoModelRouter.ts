@@ -19,6 +19,10 @@ import {
   resolveEvaluationModelTarget,
   type EvaluationModelFactoryDeps,
 } from "@/node/services/evaluationModelFactory";
+import {
+  createEvaluationBillingCapture,
+  type EvaluationBilledUsage,
+} from "@/node/services/evaluation/evaluationService";
 import { log } from "@/node/services/log";
 
 const QUESTION_ID = "difficulty";
@@ -34,6 +38,16 @@ export interface AutoModelRouterClassifyInput {
   /** The user's `provider:model` evaluation model from the routing config. */
   evaluationModel: string;
   signal?: AbortSignal;
+}
+
+/**
+ * Why classification failed. `usage`/`providerMetadata` are set when the provider answered
+ * (and billed) but the answer was rejected, so the caller still charges it (#4774).
+ */
+export interface AutoModelRouterFailure {
+  reason: string;
+  usage?: NonNullable<AutoModelRoutingDecision["usage"]>;
+  providerMetadata?: Record<string, unknown>;
 }
 
 /**
@@ -56,18 +70,22 @@ export class AutoModelRouter {
       : { evaluationModel, available: false, reason: target.error.message };
   }
 
-  classify(input: AutoModelRouterClassifyInput): Promise<Result<AutoModelRoutingDecision, string>> {
+  classify(
+    input: AutoModelRouterClassifyInput
+  ): Promise<Result<AutoModelRoutingDecision, AutoModelRouterFailure>> {
     return Effect.runPromise(this.classifyEffect(input));
   }
 
   classifyEffect(
     input: AutoModelRouterClassifyInput
-  ): Effect.Effect<Result<AutoModelRoutingDecision, string>> {
+  ): Effect.Effect<Result<AutoModelRoutingDecision, AutoModelRouterFailure>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
       if (input.tiers.length < AUTO_MODEL_ROUTING_MIN_TIERS) {
-        return Err(`Auto model routing needs at least ${AUTO_MODEL_ROUTING_MIN_TIERS} tiers`);
+        return Err({
+          reason: `Auto model routing needs at least ${AUTO_MODEL_ROUTING_MIN_TIERS} tiers`,
+        });
       }
       const model = yield* createEvaluationModel(input.evaluationModel, self.deps);
       if (!model.success) return self.fail(model.error.message);
@@ -77,28 +95,32 @@ export class AutoModelRouter {
         .map((text) => text.slice(0, AUTO_MODEL_ROUTING_RECENT_MESSAGE_MAX_CHARS));
       const timeoutSignal = AbortSignal.timeout(AUTO_MODEL_ROUTING_CLASSIFIER_TIMEOUT_MS);
       const startedAt = Date.now();
+      // The SDK validates the choice after the provider already billed the response.
+      const capture = createEvaluationBillingCapture(model.data);
       const evaluation = yield* Effect.tryPromise({
         try: () =>
-          experimental_evaluate({
-            model: model.data,
-            state: {
-              prompt: input.prompt.slice(0, AUTO_MODEL_ROUTING_MAX_PROMPT_CHARS),
-              ...(recentUserMessages.length > 0 ? { recentUserMessages } : {}),
-            },
-            questions: {
-              [QUESTION_ID]: {
-                type: "choice",
-                instructions: QUESTION_INSTRUCTIONS,
-                criteria: Object.fromEntries(
-                  input.tiers.map((tier) => [tier.id, tier.description])
-                ),
+          capture.run(() =>
+            experimental_evaluate({
+              model: capture.model,
+              state: {
+                prompt: input.prompt.slice(0, AUTO_MODEL_ROUTING_MAX_PROMPT_CHARS),
+                ...(recentUserMessages.length > 0 ? { recentUserMessages } : {}),
               },
-            },
-            maxRetries: 0,
-            abortSignal: input.signal
-              ? AbortSignal.any([input.signal, timeoutSignal])
-              : timeoutSignal,
-          }),
+              questions: {
+                [QUESTION_ID]: {
+                  type: "choice",
+                  instructions: QUESTION_INSTRUCTIONS,
+                  criteria: Object.fromEntries(
+                    input.tiers.map((tier) => [tier.id, tier.description])
+                  ),
+                },
+              },
+              maxRetries: 0,
+              abortSignal: input.signal
+                ? AbortSignal.any([input.signal, timeoutSignal])
+                : timeoutSignal,
+            })
+          ),
         catch: (error) => error,
       }).pipe(
         Effect.map((result) => Ok(result)),
@@ -111,7 +133,8 @@ export class AutoModelRouter {
         return self.fail(
           timeoutSignal.aborted
             ? `Evaluation timed out after ${AUTO_MODEL_ROUTING_CLASSIFIER_TIMEOUT_MS}ms`
-            : describeEvaluationError(evaluation.error)
+            : describeEvaluationError(evaluation.error),
+          capture.billed
         );
       }
 
@@ -140,12 +163,32 @@ export class AutoModelRouter {
     });
   }
 
-  private fail(reason: string): Result<AutoModelRoutingDecision, string> {
+  private fail(
+    reason: string,
+    billed?: EvaluationBilledUsage
+  ): Result<AutoModelRoutingDecision, AutoModelRouterFailure> {
     log.warn("Auto model routing evaluation failed; falling back to the composer's choices", {
       reason,
     });
-    return Err(reason);
+    return Err({ reason, ...billedFailureFields(billed) });
   }
+}
+
+function billedFailureFields(
+  billed: EvaluationBilledUsage | undefined
+): Omit<AutoModelRouterFailure, "reason"> {
+  if (billed === undefined) return {};
+  const { inputTokens, outputTokens, totalTokens } = billed.usage;
+  // Unknown counts are skipped, as for intuition evaluations: recording them as zero would
+  // under-count spend.
+  if (inputTokens === null || outputTokens === null) return {};
+  const metadata = billed.usageProviderMetadata;
+  return {
+    usage: { inputTokens, outputTokens, totalTokens: totalTokens ?? inputTokens + outputTokens },
+    ...(metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)
+      ? { providerMetadata: { ...metadata } }
+      : {}),
+  };
 }
 
 function hasTokenCounts(usage: NonNullable<AutoModelRoutingDecision["usage"]>): boolean {
