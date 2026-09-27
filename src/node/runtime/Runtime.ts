@@ -333,6 +333,8 @@ export interface WorkspaceForkResult {
   workspacePath?: string;
   /** Branch that was forked from */
   sourceBranch?: string;
+  /** This fork made the new branch, so undoing the fork may delete it (#4775). */
+  createdBranch?: boolean;
   /** Error message (if failed) */
   error?: string;
   /** Runtime config for the forked workspace (if different from source) */
@@ -658,7 +660,9 @@ export interface Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }>;
 
   /**

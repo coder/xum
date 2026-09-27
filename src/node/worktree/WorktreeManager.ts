@@ -800,7 +800,8 @@ export class WorktreeManager {
     projectPath: string,
     workspaceName: string,
     force: boolean,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Clean up stale lock before git operations on main repo
     cleanStaleLock(projectPath);
@@ -847,7 +848,7 @@ export class WorktreeManager {
       if (pruneWorktrees) {
         await this.pruneWorktreesBestEffort(projectPath, noHooksEnv);
       }
-      await this.deleteWorkspaceBranchIfSafe(branchDeleteArgs);
+      if (!options?.keepBranch) await this.deleteWorkspaceBranchIfSafe(branchDeleteArgs);
       await this.deletePersistedWorkspaceBranchMapping(projectPath, workspaceName);
       return { success: true as const, deletedPath };
     };
@@ -1283,6 +1284,7 @@ export class WorktreeManager {
         success: true,
         workspacePath: createResult.workspacePath,
         sourceBranch,
+        createdBranch: createResult.createdBranch,
       };
     } catch (error) {
       return {

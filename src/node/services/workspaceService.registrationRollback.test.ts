@@ -192,6 +192,9 @@ describe("WorkspaceService registration rollback (#4745)", () => {
 
       await expectFailsWithSaveError(() => createWorktree("existing", awaitMaterialization));
       expect(git(projectPath, "rev-parse", "existing")).toBe(tip);
+      // Only the checkout goes (#4775), so the retry on the same branch is unobstructed.
+      expect(worktreePaths(projectPath)).toHaveLength(1);
+      expect((await createWorktree("existing", awaitMaterialization)).success).toBe(true);
     }
   );
 
@@ -225,6 +228,7 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     );
     expect(git(projectPath, "branch", "--list", "multi-x")).not.toBe("");
     expect(git(otherProjectPath, "branch", "--list", "multi-x")).toBe("");
+    expect(worktreePaths(projectPath)).toHaveLength(1);
     expect(worktreePaths(otherProjectPath)).toHaveLength(1);
   });
 
@@ -320,5 +324,25 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(result.success ? "" : result.error).toContain("EACCES");
     // Unreadable config is not proof the rename did not land, so the move stays.
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("keep-after");
+  });
+
+  test("fork with a name matching an existing branch keeps that branch", async () => {
+    const source = await createWorktree("source");
+    if (!source.success) throw new Error(source.error);
+    git(projectPath, "branch", "fork-b");
+    const tip = git(projectPath, "rev-parse", "fork-b");
+
+    await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "fork-b"));
+    expect(git(projectPath, "rev-parse", "fork-b")).toBe(tip);
+    expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("fork-b");
+  });
+
+  test("create keeps its checkout when the config cannot be read back", async () => {
+    const publish = failConfigPublish({ corruptConfig: true });
+    const result = await createWorktree("feature-c").finally(() => publish.mockRestore());
+
+    expect(result.success ? "" : result.error).toContain("EACCES");
+    // Unreadable is not proof the entry is gone, so nothing is deleted.
+    expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("feature-c");
   });
 });

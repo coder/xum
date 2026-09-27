@@ -3255,10 +3255,17 @@ export class WorkspaceService
   private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      const persisted = this.config.loadConfigOrDefault();
-      const stillPresent = Array.from(persisted.projects.values()).some((project) =>
-        project.workspaces.some((workspace) => workspace.id === workspaceId)
-      );
+      // Strict: a lenient read of an unreadable file returns an empty default, which would
+      // falsely prove the entry gone and license deleting its checkout (#4775).
+      let stillPresent = true;
+      try {
+        const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+        stillPresent = Array.from(persisted.projects.values()).some((project) =>
+          project.workspaces.some((workspace) => workspace.id === workspaceId)
+        );
+      } catch {
+        // Not provably gone.
+      }
       if (!stillPresent) {
         return true;
       }
@@ -3310,10 +3317,11 @@ export class WorkspaceService
     initAbortController: AbortController;
     /**
      * What to do with a worktree checkout; default "delete" (`branch -d` keeps unmerged branches).
-     * "force-delete" also removes a dirty or unpopulated checkout but runs `branch -D`; "keep"
-     * is for a branch this creation did not make, which any delete could remove (#4745).
+     * "force-delete" also removes a dirty or unpopulated checkout but runs `branch -D`;
+     * "force-delete-keep-branch" removes it the same way but never touches a branch this
+     * creation did not make (#4745, #4775).
      */
-    checkout?: "delete" | "force-delete" | "keep";
+    checkout?: "delete" | "force-delete" | "force-delete-keep-branch";
   }): Promise<boolean> {
     const { workspaceId } = args;
     const checkout = args.checkout ?? "delete";
@@ -3325,10 +3333,15 @@ export class WorkspaceService
     // no-op by design, but we never call it here to keep that contract
     // explicit). Only after a successful config rollback: while the entry
     // persists, the checkout is still referenced.
-    if (rolledBack && isWorktreeRuntime(args.runtimeConfig) && checkout === "keep") {
-      log.warn("Kept the worktree of an aborted creation on a branch it did not create", {
+    if (
+      rolledBack &&
+      !isWorktreeRuntime(args.runtimeConfig) &&
+      args.runtimeConfig.type !== "local"
+    ) {
+      // Devcontainer/remote deletes can reach state this creation did not make (#4775).
+      log.warn("Left the checkout of an aborted creation on a non-worktree runtime", {
         workspaceId,
-        workspaceName: args.workspaceName,
+        runtime: args.runtimeConfig.type,
       });
     } else if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
       const deleteResult = await args.runtime
@@ -3337,9 +3350,10 @@ export class WorkspaceService
           // Worktree directories are named after the sanitized workspace
           // name (branch names may contain "/").
           args.workspaceName,
-          checkout === "force-delete",
+          checkout !== "delete",
           undefined,
-          args.trusted
+          args.trusted,
+          { keepBranch: checkout === "force-delete-keep-branch" }
         )
         .catch((error: unknown) => ({
           success: false as const,
@@ -5796,7 +5810,8 @@ export class WorkspaceService
             initAbortController,
             // Force is what removes an unpopulated or hook-dirtied checkout, and its `branch -D`
             // is safe only on a branch this creation made.
-            checkout: createResult!.createdBranch === true ? "force-delete" : "keep",
+            checkout:
+              createResult!.createdBranch === true ? "force-delete" : "force-delete-keep-branch",
           }).catch((rollbackError: unknown) =>
             logRegistrationRollbackFailure(workspaceId, rollbackError)
           );
@@ -6102,11 +6117,10 @@ export class WorkspaceService
         createdBranch: boolean;
       }> = [];
 
-      // ownedOnly (#4745) force-deletes only checkouts on branches this creation made and keeps the
-      // rest: any delete runs `git branch -d`/`-D`, which could remove a user's branch.
-      const rollbackCreatedWorkspaces = async (ownedOnly = false): Promise<void> => {
+      // forced (#4745) removes dirty checkouts too, and keeps every branch this creation did not
+      // make: a delete otherwise runs `git branch -d`/`-D`, which could remove a user's branch.
+      const rollbackCreatedWorkspaces = async (forced = false): Promise<void> => {
         for (const createdWorkspace of [...createdWorkspaces].reverse()) {
-          if (ownedOnly && !createdWorkspace.createdBranch) continue;
           const trusted =
             configSnapshot.projects.get(stripTrailingSlashes(createdWorkspace.project.projectPath))
               ?.trusted ?? false;
@@ -6116,9 +6130,10 @@ export class WorkspaceService
             await createdWorkspace.runtime.deleteWorkspace(
               createdWorkspace.project.projectPath,
               workspaceName,
-              ownedOnly,
+              forced,
               initAbortController.signal,
-              trusted
+              trusted,
+              { keepBranch: forced && !createdWorkspace.createdBranch }
             );
           } catch (error: unknown) {
             log.error("Failed to roll back multi-project workspace creation", {
@@ -11567,6 +11582,7 @@ export class WorkspaceService
         targetRuntime,
         sourceRuntimeConfigUpdate,
         sourceRuntimeConfigUpdated,
+        createdBranch: forkCreatedBranch,
       } = forkResult.data;
 
       // Per-workspace MCP enables live in the gitignored .xum/mcp.local.jsonc,
@@ -11731,7 +11747,9 @@ export class WorkspaceService
           resolvedName,
           true,
           undefined,
-          forkTrusted
+          forkTrusted,
+          // An explicit fork name can reuse an existing branch; never delete that (#4775).
+          { keepBranch: forkCreatedBranch !== true }
         );
         try {
           await fsPromises.rm(newSessionDir, { recursive: true, force: true });
@@ -11823,7 +11841,8 @@ export class WorkspaceService
               resolvedName,
               true,
               undefined,
-              projectConfig.trusted ?? false
+              projectConfig.trusted ?? false,
+              { keepBranch: forkCreatedBranch !== true }
             )
             .catch((error: unknown) => {
               log.warn("Failed to remove forked worktree after an aborted registration", {

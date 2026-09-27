@@ -80,6 +80,8 @@ interface OrchestrateForkSuccess {
   targetRuntime: Runtime;
   /** Whether the fork succeeded (false = fell back to createWorkspace) */
   forkedFromSource: boolean;
+  /** The runtime reported making the new branch (see WorkspaceForkResult.createdBranch). */
+  createdBranch?: boolean;
   /** Resolved runtime config update for the source workspace (persisted by caller). */
   sourceRuntimeConfigUpdate?: RuntimeConfig;
   /** Whether source runtime config was updated (caller should emit metadata) */
@@ -583,6 +585,7 @@ export async function orchestrateFork(
     forkedRuntimeConfig: normalizedForkedRuntimeConfig,
     targetRuntime,
     forkedFromSource,
+    createdBranch: forkResult.success ? forkResult.createdBranch : undefined,
     ...(sourceRuntimeConfigUpdate ? { sourceRuntimeConfigUpdate } : {}),
     sourceRuntimeConfigUpdated,
   });
