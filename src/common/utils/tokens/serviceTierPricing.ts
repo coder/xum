@@ -45,6 +45,9 @@ const KNOWN_OPENAI_SERVICE_TIERS: ReadonlySet<string> = new Set([
   "priority",
   "fast",
   "scale",
+  // Access-controlled Ultrafast (gpt-5.6-sol) has no published rate, so it prices
+  // as "unknown"; it is still an SDK enum value, not provider free text.
+  "ultrafast",
 ]);
 
 /** A reported tier value that is safe to persist verbatim (no provider free text). */
