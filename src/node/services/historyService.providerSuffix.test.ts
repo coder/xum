@@ -1,14 +1,18 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { isDurableContextResetBoundaryMarker } from "@/common/utils/messages/compactionBoundary";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import {
-  buildPlanReviewMetadata,
-  formatPlanReviewEnvelope,
-} from "@/common/utils/planReview/planReviewEnvelope";
+  deepEqualAnyDepth,
+  generateRows,
+  json,
+  mulberry32,
+  OVERSIZED,
+  rowsToBytes,
+  type GeneratedRow,
+} from "./historyScanner.generator.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 
 // The sidebar status (#4720) keeps `filter(pred).slice(-N)` of this suffix, so its window equals
@@ -17,121 +21,6 @@ import { createTestHistoryService } from "./testHistoryService";
 // getHistoryFromLatestBoundary.
 const statusRow = (m: MuxMessage) =>
   !isDurableContextResetBoundaryMarker(m) && !isModelHiddenMessage(m);
-const OVERSIZED = SESSION_HISTORY_MAX_LINE_BYTES + 4096;
-
-function mulberry32(seed: number) {
-  return () => {
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-const json = (m: MuxMessage) => JSON.stringify(m);
-const rollover = {
-  type: "context-window-rollover",
-  rolloverId: "r",
-  reason: "on-send",
-  previousWindowId: "w:0",
-  flushOpportunity: false,
-  contextTokens: 100,
-  maxTokens: 200,
-};
-function toolRow(id: string, output: unknown): string {
-  const message = createMuxMessage(id, "assistant", "running a tool");
-  message.parts.push({
-    type: "dynamic-tool",
-    toolCallId: `${id}-call`,
-    toolName: "bash",
-    state: "output-available",
-    input: { script: "ls" },
-    output,
-  });
-  return json(message);
-}
-function hiddenRow(id: string): string {
-  const record = { v: 1 as const, kind: "resolve" as const, recordId: id, threadId: "t" };
-  return json(
-    createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
-      synthetic: true,
-      muxMetadata: buildPlanReviewMetadata(record),
-    })
-  );
-}
-
-/** Rows in file order (oldest first), without newlines. */
-function generateRows(random: () => number, withOversized: boolean): string[] {
-  const rows: string[] = [];
-  const count = Math.floor(random() * 160);
-  for (let i = 0; i < count; i++) {
-    const id = `m${i}`;
-    const r = random();
-    if (r < 0.4) {
-      const text = random() < 0.2 ? `héllo — 日本語 🎉 ${i}` : `message ${i}`;
-      const pad = random() < 0.03 ? "x".repeat(20_000 + Math.floor(random() * 50_000)) : "";
-      const row = json(createMuxMessage(id, random() < 0.5 ? "user" : "assistant", text + pad));
-      rows.push(random() < 0.05 ? `${row}\r` : row);
-    } else if (r < 0.5) rows.push(toolRow(id, { success: true, output: "file ".repeat(20) }));
-    else if (r < 0.62) rows.push(hiddenRow(id));
-    else if (r < 0.66) {
-      const durable = random() < 0.6;
-      rows.push(
-        json(
-          createMuxMessage(id, "assistant", "summary", {
-            compactionBoundary: true,
-            compacted: true,
-            ...(durable ? { compactionEpoch: i + 1 } : {}),
-          })
-        )
-      );
-    } else if (r < 0.68)
-      rows.push(json(createMuxMessage(id, "assistant", "", { contextBoundaryKind: "reset" })));
-    else if (r < 0.7)
-      rows.push(
-        json(
-          createMuxMessage(id, "assistant", "", {
-            contextBoundaryKind: "reset",
-            muxMetadata: rollover,
-          } as MuxMessage["metadata"])
-        )
-      );
-    else if (r < 0.72) rows.push('{"metadata":{"contextBoundaryKind" : "reset"},broken');
-    else if (r < 0.75) {
-      const fragments = [
-        ['"contextBoundaryKind"', ":", '"reset"'],
-        ['{"metadata":{"contextBoundaryKind"', ': "reset"},broken'],
-        ['junk "contextBoundaryKind" junk', 'more : junk "reset" }'],
-      ];
-      rows.push(...fragments[Math.floor(random() * fragments.length)]);
-    } else if (r < 0.8)
-      rows.push(["not json", "{", "[]", "null", "", "   "][Math.floor(random() * 6)]);
-    else if (r < 0.82) rows.push('junk "contextBoundaryKind" junk');
-    else rows.push(json(createMuxMessage(id, "user", `plain ${i}`)));
-    if (withOversized && random() < 0.02) {
-      const big = "y".repeat(OVERSIZED);
-      const shapes = [
-        json(createMuxMessage(`${id}-big`, "user", big)),
-        // Raw reset tokens inside a readable oversized row: the locator floors at it.
-        toolRow(`${id}-big`, { note: big, nested: { contextBoundaryKind: "reset" } }),
-        // A value token only: chains with an older key-bearing junk row into a floor.
-        json(
-          createMuxMessage(`${id}-big`, "user", big, { note: "reset" } as MuxMessage["metadata"])
-        ),
-        // An oversized compaction boundary the locator re-reads and accepts as the start (#4551).
-        json(
-          createMuxMessage(`${id}-big`, "assistant", big, {
-            compactionBoundary: true,
-            compacted: true,
-            compactionEpoch: i + 1,
-          })
-        ),
-      ];
-      rows.push(shapes[Math.floor(random() * shapes.length)]);
-    }
-  }
-  return rows;
-}
 
 describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
   let h: Awaited<ReturnType<typeof createTestHistoryService>>;
@@ -146,11 +35,15 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
     chat: path.join(h.config.sessionsDir, workspaceId, "chat.jsonl"),
     archive: path.join(h.config.sessionsDir, workspaceId, "chat-archive.jsonl"),
   });
-  async function writeLayout(workspaceId: string, archive: string[] | null, chat: string[] | null) {
+  async function writeLayout(
+    workspaceId: string,
+    archive: GeneratedRow[] | null,
+    chat: GeneratedRow[] | null
+  ) {
     const paths = pathsFor(workspaceId);
     await fs.mkdir(path.dirname(paths.chat), { recursive: true });
-    if (archive) await fs.writeFile(paths.archive, archive.map((row) => `${row}\n`).join(""));
-    if (chat) await fs.writeFile(paths.chat, chat.map((row) => `${row}\n`).join(""));
+    if (archive) await fs.writeFile(paths.archive, rowsToBytes(archive));
+    if (chat) await fs.writeFile(paths.chat, rowsToBytes(chat));
   }
   async function stamps(workspaceId: string): Promise<string> {
     const paths = pathsFor(workspaceId);
@@ -178,19 +71,22 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
   function check(label: string, fullRead: MuxMessage[], tail: MuxMessage[], window: number) {
     const problems: string[] = [];
     if (tail.length > fullRead.length) problems.push(`${label}: longer than the full read`);
-    else if (!Bun.deepEquals(tail, fullRead.slice(fullRead.length - tail.length)))
+    else if (!deepEqualAnyDepth(tail, fullRead.slice(fullRead.length - tail.length)))
       problems.push(`${label}: not a suffix of the full read`);
     if (tail.filter(statusRow).length < window && tail.length !== fullRead.length)
       problems.push(`${label}: short window without reading everything`);
     return problems;
   }
 
-  test("matches the full provider read on generated layouts, before and after rotation", async () => {
-    const windows = [1, 2, 3, 5, 80];
+  async function checkGeneratedLayouts(
+    seeds: number,
+    windows: number[],
+    adversarial: boolean
+  ): Promise<string[]> {
     const problems: string[] = [];
-    for (let seed = 1; seed <= 240; seed++) {
+    for (let seed = 1; seed <= seeds; seed++) {
       const random = mulberry32(seed);
-      const rows = generateRows(random, seed % 20 === 0);
+      const rows = generateRows(random, { oversized: seed % 20 === 0, adversarial });
       const layout = random();
       const split = Math.floor(random() * (rows.length + 1));
       const workspaceId = `suffix-${seed}`;
@@ -214,8 +110,21 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
         problems.push(...check(`seed ${seed} N=${window} rotated`, rotated, tail, window));
       }
     }
-    expect(problems).toEqual([]);
+    return problems;
+  }
+
+  test("matches the full provider read on generated layouts, before and after rotation", async () => {
+    expect(await checkGeneratedLayouts(240, [1, 2, 3, 5, 80], false)).toEqual([]);
   }, 60_000);
+
+  // Reset encodings split across unreadable rows, readable rows that merely mention resets,
+  // escaped boundary keys, stringify-throwing nesting, line-size and chunk edges, and invalid
+  // UTF-8 (#4655). A window no epoch can fill never stops early, so check() requires that read
+  // to equal the full read exactly.
+  test("matches the full provider read on adversarial layouts", async () => {
+    const windows = [1, 2, 3, 5, 80, Number.MAX_SAFE_INTEGER];
+    expect(await checkGeneratedLayouts(240, windows, true)).toEqual([]);
+  }, 120_000);
 
   test("does not stop at an unreadable row a fragmented reset floors", async () => {
     // Oldest to newest: the junk row's key and the oversized row's `:"reset"` complete a raw
