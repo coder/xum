@@ -1205,9 +1205,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(run.onPreStartError).toHaveBeenCalledTimes(1);
     });
 
-    it("does not report an aborted turn as runtime_start_failed", async () => {
+    it("ends an aborted turn as a Stop, not a failure", async () => {
+      // SSH2 reports aborted execs as "network" too.
       const run = await runStartup(false, true);
-      expect(run.errorType).not.toBe("runtime_start_failed");
+      expect(run.errorType).toBeUndefined();
       expect(run.onPreStartError).not.toHaveBeenCalled();
     });
   });

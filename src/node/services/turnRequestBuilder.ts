@@ -875,7 +875,20 @@ export class TurnRequestBuilder {
       // means the remote could not be read, not that the files are missing. Fail
       // the turn as retryable, like an unreachable host at ensureReady, before any
       // provider request or assistant row exists.
-      if (context.abortSignal.aborted || !isRuntimeTransportError(error)) throw error;
+      if (!isRuntimeTransportError(error)) throw error;
+      // A canceled remote read is a Stop, not a failure: SSH2 reports aborted
+      // execs as "network", so end the turn as aborted like other startup cancels.
+      if (context.abortSignal.aborted) {
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(
+              context.syntheticMessageId,
+              context.abortSignal
+            )
+          ),
+        };
+      }
       const errorMessage = `Remote workspace unreachable while loading startup files: ${getErrorMessage(error)}`;
       context.startupState.logSlowStreamStartup?.({
         outcome: "runtime_unreachable",
