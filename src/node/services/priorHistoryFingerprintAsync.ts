@@ -25,9 +25,13 @@ function comparePriorHistoryRows(left: PriorHistoryRow, right: PriorHistoryRow):
  * - yields to the event loop while collecting and while hashing rows;
  * - skips the sort when rows are already in comparator order (the normal case: history is
  *   stored in sequence order), because sorting 1.24M entries is itself a long block. Skipping is
- *   exact: Array.prototype.sort is stable, so sorting an array whose adjacent pairs all compare
- *   <= 0 leaves it unchanged. Any other outcome (including NaN comparisons) sorts exactly like
- *   the reference, on the same rows in the same input order;
+ *   exact only for a consistent comparator: Array.prototype.sort is stable, so sorting an array
+ *   whose adjacent pairs all compare <= 0 leaves it unchanged. A sequence that is not a finite
+ *   number (persisted metadata is not schema-checked on read, so NaN, Infinity or a string can
+ *   appear) makes the subtraction NaN, which `||` turns into the id tiebreak, and the comparator
+ *   stops being consistent: adjacent pairs can look ordered while the reference's sort still
+ *   moves rows. Such histories, and any unordered one, sort exactly like the reference, on the
+ *   same rows in the same input order;
  * - serializes parts only while hashing and feeds FNV-1a the entry's pieces in order instead of
  *   one concatenated string (FNV-1a streams UTF-16 code units, so the hash is identical), so it
  *   never holds every row's serialized parts at once.
@@ -42,8 +46,11 @@ export async function computePriorHistoryFingerprintAsync(
   const rows: PriorHistoryRow[] = [];
   let inComparatorOrder = true;
 
-  for (const message of messages) {
-    if (yielder.isDue()) await yielder.yield();
+  for (let index = 0; index < messages.length; index += 1) {
+    // Each row here costs a few property reads, so a clock read per row would dominate this
+    // loop (1M rows, bun: ~40 ms vs ~8 ms). Checking every 1024 rows stays far inside the budget.
+    if ((index & 1023) === 0 && yielder.isDue()) await yielder.yield();
+    const message = messages[index];
     const historySequence = message.metadata?.historySequence;
     // Same filter as the reference, deliberately not isNonNegativeInteger: any change here
     // changes which rows the cursor fingerprint covers.
@@ -51,7 +58,11 @@ export async function computePriorHistoryFingerprintAsync(
       continue;
     }
     const row = { historySequence, message };
-    if (rows.length > 0 && !(comparePriorHistoryRows(rows[rows.length - 1], row) <= 0)) {
+    // Number.isFinite does not coerce, so it also rejects a persisted string sequence.
+    if (
+      !Number.isFinite(historySequence) ||
+      (rows.length > 0 && !(comparePriorHistoryRows(rows[rows.length - 1], row) <= 0))
+    ) {
       inComparatorOrder = false;
     }
     rows.push(row);

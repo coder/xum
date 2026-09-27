@@ -4,8 +4,9 @@ import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stableStringify } from "@/common/utils/stableStringify";
 
 // Exported (with updateFnv1a) for the server's non-blocking twin of
-// computePriorHistoryFingerprint (src/node/services/priorHistoryFingerprintAsync.ts), which
-// cannot live here because it yields through node:timers.
+// computePriorHistoryFingerprint (src/node/services/priorHistoryFingerprintAsync.ts). The twin
+// lives next to its only (server) caller because the renderer also imports this module (via
+// editTruncation) and the twin yields through node:timers.
 export const FNV_OFFSET_BASIS = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
 export const MISSING_TIMESTAMP = -1;
