@@ -1192,7 +1192,13 @@ describe("WorkspaceTurnManager", () => {
     expect(nested.success ? "" : nested.error).toMatch(/owner workspace was archived/);
     // The refused nested creation had already materialized its workspace; without an ownership
     // handle the archived owner could never manage it, so it must be removed, not leaked.
-    expect(harness.removeWhileTaskTreeLocked).toHaveBeenCalledWith("grandchildworkspace", true);
+    // The mocked create() does not report a branch it made, so the removal keeps the branch.
+    expect(harness.removeWhileTaskTreeLocked).toHaveBeenCalledWith(
+      "grandchildworkspace",
+      true,
+      undefined,
+      { keepBranch: true }
+    );
     const nestedHandles = await harness.taskService.listWorkspaceTurnTasks("childworkspace", {
       statuses: ["queued", "starting", "running"],
     });

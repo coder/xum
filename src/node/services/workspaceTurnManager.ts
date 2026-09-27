@@ -1212,6 +1212,7 @@ export class WorkspaceTurnManager {
     let targetTaskExperiments: TaskCreateArgs["experiments"];
     let targetIsAgentWorkspace = false;
     let createdWorkspace = false;
+    let createdTargetBranch = false;
     let queuedForExistingWorkspace = false;
     let maySupersedeTaskId: string | undefined;
     let persistedHandle = false;
@@ -1228,8 +1229,11 @@ export class WorkspaceTurnManager {
         if (persistedHandle) return;
         this.creationConsentFinalizers.delete(handleId);
         if (createdWorkspace) {
+          // Forced removal runs `branch -D`: keep a branch this creation only reused.
           const cleanup = await this.workspaceService
-            .removeWhileTaskTreeLocked(targetWorkspaceId, true)
+            .removeWhileTaskTreeLocked(targetWorkspaceId, true, undefined, {
+              keepBranch: !createdTargetBranch,
+            })
             .catch((error: unknown) => Err(getErrorMessage(error)));
           if (!cleanup.success) {
             log.error("createWorkspaceTurn: failed to remove the workspace of a failed creation", {
@@ -1495,6 +1499,7 @@ export class WorkspaceTurnManager {
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
+      createdTargetBranch = createResult.data.createdBranch === true;
       if (args.workspace?.disposable !== true) this.creationConsentFinalizers.add(handleId);
       if (requestedAgentId != null && ownerContext != null) {
         // Post-create stage: re-validate against the TARGET checkout — project-local agent

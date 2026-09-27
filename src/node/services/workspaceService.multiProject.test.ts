@@ -1311,14 +1311,16 @@ describe("WorkspaceService multi-project lifecycle", () => {
           workspaceName,
           true,
           undefined,
-          true
+          true,
+          undefined
         );
         expect(deleteWorkspaceBMock).toHaveBeenCalledWith(
           projectBPath,
           workspaceName,
           true,
           undefined,
-          true
+          true,
+          undefined
         );
         expect(removeContainerSpy).toHaveBeenCalledWith(workspaceName);
         expect(removeWorkspaceMock).toHaveBeenCalledWith(workspaceId);

@@ -1,3 +1,4 @@
+import { execFileSync } from "child_process";
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
@@ -19,6 +20,7 @@ import {
   createAIServiceMocks,
   createTestConfig,
   createWorkspaceServiceMocks,
+  initGitRepo,
   saveLocalParentWorkspace,
   stubStableIds,
   workspaceTurnSnapshot,
@@ -43,7 +45,9 @@ describe("delegated target default consent (#4453)", () => {
   ) {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, options.stableIds ?? ["handle", "turn", TARGET, "handle2", "turn2"]);
-    const real = createWorkspaceServiceForTest({ config });
+    const { aiService } = createAIServiceMocks(config);
+    // Shared so removal resolves the target's metadata (and so its runtime) from config.
+    const real = createWorkspaceServiceForTest({ config, aiService });
     const host = createWorkspaceServiceMocks({
       create: mock(async (...args: Parameters<WorkspaceHost["create"]>) => {
         const result = await real.create(...args);
@@ -56,11 +60,11 @@ describe("delegated target default consent (#4453)", () => {
       clearPendingDefaultUnrelatedConsent: mock((id: string) =>
         real.clearPendingDefaultUnrelatedConsent(id)
       ),
-      removeWhileTaskTreeLocked: mock((id: string, force?: boolean) =>
-        real.removeWhileTaskTreeLocked(id, force)
+      removeWhileTaskTreeLocked: mock(
+        (...args: Parameters<WorkspaceHost["removeWhileTaskTreeLocked"]>) =>
+          real.removeWhileTaskTreeLocked(...args)
       ),
     });
-    const { aiService } = createAIServiceMocks(config);
     const { taskService: manager } = createWorkspaceTurnManagerHarness(config, {
       aiService,
       workspaceService: host.workspaceService,
@@ -266,6 +270,43 @@ describe("delegated target default consent (#4453)", () => {
       expect(await fsPromises.stat(lock).catch(() => null)).toBeNull();
     });
   }
+
+  // The forced removal runs `git branch -D`: only a branch this creation made may go.
+  test.each([
+    { label: "keeps a branch it reused", existing: true },
+    { label: "deletes a branch it made", existing: false },
+  ])("an exit before the handle record on a worktree target $label", async ({ existing }) => {
+    const a = await setUp();
+    initGitRepo(a.projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: a.projectPath, encoding: "utf8" }).trim();
+    // One commit ahead of main, so only `git branch -D` would delete it.
+    if (existing) {
+      git("branch", "reused", git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "own work"));
+    }
+    const srcBaseDir = path.join(rootDir, "src");
+    await a.config.editConfig((cfg) => {
+      const parent = findWorkspaceEntry(cfg, a.parentId)?.workspace;
+      if (parent) parent.runtimeConfig = { type: "worktree", srcBaseDir };
+      return cfg;
+    });
+    const branch = existing ? "reused" : "fresh";
+    const tipBefore = existing ? git("rev-parse", branch) : undefined;
+
+    const created = await a.manager.createWorkspaceTurn({
+      ownerWorkspaceId: a.parentId,
+      prompt: "Summarize",
+      title: "Workspace turn",
+      workspace: { mode: "new", branchName: branch, trunkBranch: "main" },
+      modelString: "::",
+    });
+
+    expect(created.success).toBe(false);
+    expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).toBeNull();
+    expect(git("worktree", "list")).not.toContain(path.join(srcBaseDir, "repo", branch));
+    expect(git("branch", "--list", branch) === "").toBe(!existing);
+    if (tipBefore !== undefined) expect(git("rev-parse", branch)).toBe(tipBefore);
+  });
 
   test("a failed grant write still settles the turn and leaves the target off", async () => {
     const { config, real, manager, parentId } = await setUp();

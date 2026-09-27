@@ -266,6 +266,11 @@ export interface RemovalAttemptBinding {
   expectedAttemptId: string | undefined;
 }
 
+/** keepBranch: remove only the checkout, e.g. undoing a creation that reused a branch (#4819). */
+export interface RemovalCheckoutOptions {
+  keepBranch?: boolean;
+}
+
 export interface ArchiveWorkspaceOptions {
   /**
    * Refuse to archive when the effective worktree archive behavior would delete the checkout
@@ -694,7 +699,8 @@ export interface WorkspaceLifecycleHost {
   removeWhileTaskTreeLocked(
     workspaceId: string,
     force?: boolean,
-    binding?: RemovalAttemptBinding
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
   ): Promise<Result<void>>;
   /** Own cleanup outside the originating session callback and inside bounded app shutdown. */
   deferWorkspaceCleanup(run: () => Promise<void>): void;
@@ -714,7 +720,7 @@ export interface WorkspaceProvisioningHost {
       awaitMaterialization?: boolean;
       defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
     }
-  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>>;
   /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
   grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
   clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;

@@ -633,7 +633,14 @@ describe("WorkspaceService init cancellation", () => {
       const result = await workspaceService.remove(workspaceId, true);
       expect(result.success).toBe(true);
       // trusted defaults to false (untrusted project), so deleteWorkspace gets (path, name, force, undefined, false)
-      expect(deleteWorkspaceMock).toHaveBeenCalledWith(projectPath, "ws", true, undefined, false);
+      expect(deleteWorkspaceMock).toHaveBeenCalledWith(
+        projectPath,
+        "ws",
+        true,
+        undefined,
+        false,
+        undefined
+      );
       expect(config.findWorkspace(workspaceId)).toBeNull();
     } finally {
       createRuntimeSpy.mockRestore();

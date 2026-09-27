@@ -380,6 +380,7 @@ import {
   type ArchiveWorkspaceOptions,
   type QueueCutReceipt,
   type RemovalAttemptBinding,
+  type RemovalCheckoutOptions,
   type SendMessageInternalOptions,
   type TurnAcceptanceOrigin,
   type TurnAdmissionToken,
@@ -5512,7 +5513,7 @@ export class WorkspaceService
        */
       defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
     }
-  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+  ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; createdBranch?: boolean }>> {
     const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
     // A deferred checkout grants from materializeDeferredCheckout, which would bypass the caller.
     assert(
@@ -5957,7 +5958,11 @@ export class WorkspaceService
       eventSpine.emit("workspace.created", { workspaceId });
       // The caller now owns the pending default (see the option).
       if (defaultConsent === "caller-finalizes") pendingDefaultHandedOff = true;
-      return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
+      return Ok({
+        metadata: this.enrichFrontendMetadata(completeMetadata),
+        // Lets a caller that undoes this creation keep a branch it merely reused (#4819).
+        createdBranch: createResult!.createdBranch === true,
+      });
     } catch (error) {
       initLogger.logComplete(-1);
       const message = getErrorMessage(error);
@@ -6501,9 +6506,10 @@ export class WorkspaceService
   async removeWhileTaskTreeLocked(
     workspaceId: string,
     force = false,
-    binding?: RemovalAttemptBinding
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
   ): Promise<Result<void>> {
-    return await this.removeUnlocked(workspaceId, force, binding);
+    return await this.removeUnlocked(workspaceId, force, binding, options);
   }
 
   /**
@@ -6583,7 +6589,8 @@ export class WorkspaceService
   private async removeUnlocked(
     workspaceId: string,
     force = false,
-    binding?: RemovalAttemptBinding
+    binding?: RemovalAttemptBinding,
+    options?: RemovalCheckoutOptions
   ): Promise<Result<void>> {
     if (this.shuttingDown) return Err("Server is shutting down");
     // Idempotent: if already removing, return success to prevent race conditions
@@ -6989,7 +6996,8 @@ export class WorkspaceService
                 metadata.name,
                 force,
                 undefined,
-                projectRemoval.trusted
+                projectRemoval.trusted,
+                options
               );
 
               if (!deleteResult.success) {
@@ -7101,7 +7109,8 @@ export class WorkspaceService
             metadata.name, // use branch name
             force,
             undefined, // abortSignal
-            trusted
+            trusted,
+            options
           );
 
           if (!deleteResult.success) {
