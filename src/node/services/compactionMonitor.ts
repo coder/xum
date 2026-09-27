@@ -179,7 +179,10 @@ export class CompactionMonitor {
 
   /** Records the level that triggered an auto-compaction; it does not arm the guard yet. */
   noteAutoCompactionRequested(triggerPercent: number): void {
-    assert(Number.isFinite(triggerPercent), "noteAutoCompactionRequested requires a finite percent");
+    assert(
+      Number.isFinite(triggerPercent),
+      "noteAutoCompactionRequested requires a finite percent"
+    );
     this.requestedTriggerPercent = triggerPercent;
   }
 
