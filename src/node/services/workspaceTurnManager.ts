@@ -1,3 +1,4 @@
+import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import {
@@ -740,19 +741,31 @@ export class WorkspaceTurnManager {
    * Never throws: startup must not fail.
    */
   async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
-    try {
-      for (const project of this.config.loadConfigOrDefault().projects.values()) {
-        for (const workspace of project.workspaces) {
-          const tagged = workspace.tags?.[WORKSPACE_TURN_TASK_TAGS.handle];
-          if (workspace.unrelatedWorkspaceConsentPending !== true) continue;
-          if (tagged == null || !isWorkspaceTurnTaskId(tagged)) continue;
-          const handleId: string = tagged;
-          const workspaceId = workspace.id;
-          if (workspaceId == null) continue;
+    for (const project of this.config.loadConfigOrDefault().projects.values()) {
+      for (const workspace of project.workspaces) {
+        const tags = workspace.tags ?? {};
+        const handleId = tags[WORKSPACE_TURN_TASK_TAGS.handle] ?? "";
+        const ownerId = tags[WORKSPACE_TURN_TASK_TAGS.ownerWorkspaceId] ?? "";
+        const workspaceId = workspace.id;
+        if (workspace.unrelatedWorkspaceConsentPending !== true || workspaceId == null) continue;
+        if (!isWorkspaceTurnTaskId(handleId) || ownerId === "") continue;
+        try {
           await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
             // Checked first: acquireTurnOwnerLock also answers "held" for this manager's own.
             if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
               return;
+            }
+            // Tags are caller-supplied (workspace.create accepts any), so the handle must be real:
+            // its creator locked it before create(), and the lock outlives the creator until the
+            // record settles. Without a lock only a record that created this target counts.
+            const lockPath = workspaceTurnOwnerLockPath(this.config.rootDir, handleId);
+            const locked = await fsPromises.access(lockPath).then(
+              () => true,
+              () => false
+            );
+            if (!locked) {
+              const record = await this.taskHandleStore.getWorkspaceTurn(ownerId, handleId);
+              if (record?.createdWorkspace !== true || record.workspaceId !== workspaceId) return;
             }
             if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
             try {
@@ -761,12 +774,13 @@ export class WorkspaceTurnManager {
               await this.releaseTurnOwnerLock(handleId);
             }
           });
+        } catch (error: unknown) {
+          log.warn("Failed to clear an orphaned delegated consent default", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
         }
       }
-    } catch (error: unknown) {
-      log.warn("Failed to clear orphaned delegated consent defaults", {
-        error: getErrorMessage(error),
-      });
     }
   }
 

@@ -1,6 +1,5 @@
 import * as path from "path";
 import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
-import cjsFs from "fs";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
@@ -28,12 +27,7 @@ import {
 
 const TARGET = "aaaaaaaaaa";
 
-/**
- * #4453: a delegated task(kind:"workspace") target gets default unrelated-messaging consent once,
- * when its creating turn settles in the creating process. Each backend is a real
- * WorkspaceTurnManager over a real WorkspaceService (create, grant, clear, toggle) on its own Config
- * for the same root; only the turn's stream is driven by hand.
- */
+/** #4453. Each backend: real WorkspaceTurnManager + WorkspaceService on its own Config, one root. */
 describe("delegated target default consent (#4453)", () => {
   let rootDir: string;
   beforeEach(async () => {
@@ -78,11 +72,9 @@ describe("delegated target default consent (#4453)", () => {
 
   function targetRow(config: Config) {
     const row = findWorkspaceEntry(config.loadConfigOrDefault(), TARGET)?.workspace;
-    return {
-      exists: row != null,
-      consent: getValidUnrelatedWorkspaceConsent(row?.unrelatedWorkspaceConsent),
-      pending: row?.unrelatedWorkspaceConsentPending,
-    };
+    expect(row).toBeDefined();
+    const consent = getValidUnrelatedWorkspaceConsent(row?.unrelatedWorkspaceConsent);
+    return { consent, pending: row?.unrelatedWorkspaceConsentPending };
   }
 
   const createTurn = (
@@ -98,6 +90,16 @@ describe("delegated target default consent (#4453)", () => {
       workspace,
       ...(modelString != null ? { modelString } : {}),
     });
+
+  const start = async (...args: Parameters<typeof createTurn>) =>
+    expect((await createTurn(...args)).success).toBe(true);
+
+  /** The owner process died: its lock record names a token no live process holds. */
+  async function markCreatorDead() {
+    const lockPath = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
+    const lock = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
+    await fsPromises.writeFile(lockPath, JSON.stringify({ ...lock, token: "dead-owner" }));
+  }
 
   const endTurn = (
     manager: WorkspaceTurnManager,
@@ -130,8 +132,8 @@ describe("delegated target default consent (#4453)", () => {
   for (const [outcome, settle] of Object.entries(settleBy)) {
     test(`unreachable while the creating turn runs, opted in once it ends (${outcome})`, async () => {
       const { config, manager, parentId } = await setUp();
-      expect((await createTurn(manager, parentId, { mode: "new" })).success).toBe(true);
-      expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: true });
+      await start(manager, parentId, { mode: "new" });
+      expect(targetRow(config)).toEqual({ consent: undefined, pending: true });
 
       await settle(manager, parentId);
 
@@ -143,10 +145,8 @@ describe("delegated target default consent (#4453)", () => {
 
   test("a disposable target is never marked or opted in", async () => {
     const { config, manager, parentId } = await setUp();
-    expect((await createTurn(manager, parentId, { mode: "new", disposable: true })).success).toBe(
-      true
-    );
-    expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: undefined });
+    await start(manager, parentId, { mode: "new", disposable: true });
+    expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
     await endTurn(manager, parentId);
     expect(targetRow(config).consent).toBeUndefined();
   });
@@ -154,45 +154,38 @@ describe("delegated target default consent (#4453)", () => {
   for (const toggler of ["this backend", "another backend"] as const) {
     test(`a toggle during the creating turn wins (${toggler})`, async () => {
       const { config, real, manager, parentId } = await setUp();
-      expect((await createTurn(manager, parentId, { mode: "new" })).success).toBe(true);
-      const toggling =
-        toggler === "this backend"
-          ? real
-          : createWorkspaceServiceForTest({ config: await createTestConfig(rootDir) });
+      await start(manager, parentId, { mode: "new" });
+      const toggling = toggler === "this backend" ? real : (await backend()).real;
 
       expect((await toggling.setUnrelatedWorkspaceConsent(TARGET, false)).success).toBe(true);
       await endTurn(manager, parentId);
-      expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: undefined });
+      expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
     });
   }
 
   test("an opt-in during the turn keeps its generation, and mode existing never re-grants", async () => {
     const { config, real, manager, parentId } = await setUp();
-    expect((await createTurn(manager, parentId, { mode: "new" })).success).toBe(true);
+    await start(manager, parentId, { mode: "new" });
     await real.setUnrelatedWorkspaceConsent(TARGET, true);
     const minted = targetRow(config).consent;
     await endTurn(manager, parentId);
-    expect(targetRow(config)).toEqual({ exists: true, consent: minted, pending: undefined });
+    expect(targetRow(config)).toEqual({ consent: minted, pending: undefined });
 
     await real.setUnrelatedWorkspaceConsent(TARGET, false);
-    expect(
-      (await createTurn(manager, parentId, { mode: "existing", workspaceId: TARGET })).success
-    ).toBe(true);
+    await start(manager, parentId, { mode: "existing", workspaceId: TARGET });
     await endTurn(manager, parentId, "handle2", "turn2");
-    expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: undefined });
+    expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
   });
 
   test("another backend's stale settlement of a dead creator clears, never grants", async () => {
     const { config, manager, parentId } = await setUp();
-    expect((await createTurn(manager, parentId, { mode: "new" })).success).toBe(true);
-    const lockPath = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
-    const lock = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
-    await fsPromises.writeFile(lockPath, JSON.stringify({ ...lock, token: "dead-owner" }));
+    await start(manager, parentId, { mode: "new" });
+    await markCreatorDead();
     const b = await backend();
 
     expect(await b.manager.countActiveWorkspaceTurns()).toBe(0);
 
-    expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: undefined });
+    expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
   });
 
   const exitsBeforeRecord = {
@@ -219,73 +212,60 @@ describe("delegated target default consent (#4453)", () => {
 
       expect(created.success).toBe(false);
       expect(created.success ? "" : created.error).toContain(modelString ?? "archived");
-      expect(targetRow(a.config)).toEqual({ exists: true, consent: undefined, pending: undefined });
-      expect(
-        await fsPromises.access(workspaceTurnOwnerLockPath(rootDir, "wst_handle")).then(
-          () => true,
-          () => false
-        )
-      ).toBe(false);
+      expect(targetRow(a.config)).toEqual({ consent: undefined, pending: undefined });
+      const lock = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
+      expect(await fsPromises.stat(lock).catch(() => null)).toBeNull();
     });
   }
 
   test("a failed grant write still settles the turn and leaves the target off", async () => {
     const { config, real, manager, parentId } = await setUp();
-    expect((await createTurn(manager, parentId, { mode: "new" })).success).toBe(true);
-    // Only the grant's config.json publication fails (#4444: editConfig rejects).
+    await start(manager, parentId, { mode: "new" });
+    // Only the grant's config write fails (#4444: editConfig rejects when the save fails).
     const grant = real.grantPendingDefaultUnrelatedWorkspaceConsent.bind(real);
-    spyOn(real, "grantPendingDefaultUnrelatedWorkspaceConsent").mockImplementation(async (id) => {
-      const realRename = cjsFs.rename.bind(cjsFs);
-      const publish = spyOn(cjsFs, "rename").mockImplementation(((
-        from: cjsFs.PathLike,
-        to: cjsFs.PathLike,
-        callback: cjsFs.NoParamCallback
-      ) => {
-        if (path.basename(String(to)) !== "config.json") return realRename(from, to, callback);
-        callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
-      }) as typeof cjsFs.rename);
-      try {
-        await grant(id);
-      } finally {
-        publish.mockRestore();
-      }
+    spyOn(real, "grantPendingDefaultUnrelatedWorkspaceConsent").mockImplementation((id) => {
+      spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+      return grant(id);
     });
 
     await endTurn(manager, parentId);
 
     expect(await workspaceTurnSnapshot(manager, parentId)).toMatchObject({ status: "completed" });
-    expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: true });
+    expect(targetRow(config)).toEqual({ consent: undefined, pending: true });
 
     // The next startup's resolver clears it (the lock was released with the settlement).
     await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
-    expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: undefined });
+    expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
+  });
+
+  test("the startup resolver ignores a caller-supplied handle tag with no lock or record", async () => {
+    const { config, parentId } = await setUp();
+    const tags = { "mux.taskHandleId": "wst_forged", "mux.taskOwnerWorkspaceId": parentId };
+    await config.editConfig((cfg) => {
+      const row = { path: rootDir, id: TARGET, name: "forged", tags };
+      cfg.projects.set(rootDir, {
+        workspaces: [{ ...row, unrelatedWorkspaceConsentPending: true }],
+      });
+      return cfg;
+    });
+
+    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    expect(targetRow(config).pending).toBe(true);
   });
 
   for (const creator of ["alive", "dead"] as const) {
     test(`the startup resolver clears a mark only when its creator is dead (${creator})`, async () => {
-      let resume!: () => void;
-      let reached!: () => void;
-      const paused = new Promise<void>((resolve) => (resume = resolve));
-      const created = new Promise<void>((resolve) => (reached = resolve));
-      const a = await setUp({
-        afterCreate: async () => {
-          reached();
-          await paused;
-        },
-      });
+      const [created, paused] = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+      const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
       const creating = createTurn(a.manager, a.parentId, { mode: "new" });
-      await created; // The row exists with its mark; the handle record does not yet.
-      if (creator === "dead") {
-        const lockPath = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
-        const lock = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
-        await fsPromises.writeFile(lockPath, JSON.stringify({ ...lock, token: "dead-owner" }));
-      }
+      await created.promise; // The row exists with its mark; the handle record does not yet.
+      if (creator === "dead") await markCreatorDead();
 
       await a.manager.clearOrphanedDelegatedConsentDefaults();
       await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
       expect(targetRow(a.config).pending).toBe(creator === "alive" ? true : undefined);
 
-      resume();
+      paused.resolve();
       expect((await creating).success).toBe(true);
       await endTurn(a.manager, a.parentId);
       expect(targetRow(a.config).consent === undefined).toBe(creator === "dead");
