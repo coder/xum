@@ -2089,6 +2089,9 @@ export class StreamingMessageAggregator {
 
     this.clearPendingStreamLifecycleState();
     this.lastAbortReason = null;
+    if (data.replay !== true) {
+      this.dropPreStreamErrorRowsFrom(data.historySequence);
+    }
 
     // NOTE: We do NOT clear agentStatus or currentTodos here.
     // They are cleared when a new user message arrives (see handleMessage),
@@ -2193,6 +2196,28 @@ export class StreamingMessageAggregator {
 
     this.messages.set(data.messageId, streamingMessage);
     this.markMessageDirty(data.messageId);
+  }
+
+  /**
+   * A new stream's persisted row claims `historySequence`, so every pre-stream error row at or
+   * above it is from an attempt the server never recorded (e.g. a failed auto-retry before the
+   * one that started): drop it, as handleMuxMessage drops rows a new user message supersedes.
+   * Without this, an error fabricated at max + 1 sorts after the successful reply and revives
+   * the "Stream interrupted" barrier (#4832). Later errors are fabricated after this stream's
+   * row, so they still show.
+   */
+  private dropPreStreamErrorRowsFrom(historySequence: number): void {
+    let dropped = false;
+    for (const [messageId, message] of Array.from(this.messages.entries())) {
+      if (
+        this.locallyFabricatedRows.has(message) &&
+        message.metadata?.error != null &&
+        (message.metadata.historySequence ?? 0) >= historySequence
+      ) {
+        dropped = this.deleteMessage(messageId) || dropped;
+      }
+    }
+    if (dropped) this.invalidateCache();
   }
 
   handleStreamDelta(data: StreamDeltaEvent): void {
