@@ -42,11 +42,12 @@ export class WorkspaceBusyError extends Error {}
 
 export interface WorkspaceMutationGateOptions {
   /**
-   * This backend's own lease kinds that do not block the mutation, because the mutator ends or
-   * tolerates them itself (remove closes its own terminals, for example). Other backends' leases
-   * always block: this backend cannot stop them.
+   * Per workspace, this backend's own lease kinds that do not block the mutation, because the
+   * mutator ends or tolerates them itself (remove closes its own terminals, for example). Keyed by
+   * workspace: a mutator usually ends activity only in the workspace it mutates, not in sub-agents
+   * sharing its checkout. Other backends' leases always block: this backend cannot stop them.
    */
-  ignoreOwnKinds?: ReadonlySet<WorkspaceUseKind>;
+  ignoreOwnKinds?: ReadonlyMap<string, ReadonlySet<WorkspaceUseKind>>;
   /**
    * Background processes leave their own cross-process evidence (spawn records), so the gate asks
    * instead of leasing: true when any runs in the workspace, in this or any other process.
@@ -194,7 +195,7 @@ export class WorkspaceUseLeases {
   ): Promise<void> {
     // The held entries themselves, so no kind can be left out of the check.
     for (const [kind, file] of this.held.get(workspaceId) ?? []) {
-      if (options.ignoreOwnKinds?.has(kind) === true) continue;
+      if (options.ignoreOwnKinds?.get(workspaceId)?.has(kind) === true) continue;
       if (file.count > 0) {
         throw new WorkspaceBusyError(
           `Workspace ${workspaceId} has a running ${kind} in this Xum process; ` +

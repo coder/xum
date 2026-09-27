@@ -155,6 +155,30 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(renameWorkspace).not.toHaveBeenCalled();
   });
 
+  test("a checkout-deleting archive refuses this backend's own terminal in a sub-agent sharing the checkout", async () => {
+    await a.config.editConfig((config) => {
+      config.projects.get(projectPath)!.workspaces.push({
+        ...projectWorkspace(projectPath, "root", sharedChildId, { name: "shared" }),
+        parentWorkspaceId: rootId,
+        taskIsolation: "none",
+        taskStatus: "reported",
+        runtimeConfig: { type: "worktree", srcBaseDir },
+      });
+      return config;
+    });
+    // Archive ends only the archived workspace's own terminals, not the sub-agent's.
+    await hold(a, sharedChildId, "terminal");
+
+    const refused = errorOf(
+      await a.workspaceService.archive(rootId, undefined, {
+        worktreeArchiveBehaviorOverride: "delete",
+      })
+    );
+    expect(refused).toContain("running terminal in this Xum process");
+    expect(refused).toContain(sharedChildId);
+    expect(rowOf(a.config, rootId)?.archivedAt).toBeUndefined();
+  });
+
   test("rename refuses this backend's own turn (#4478) but not its own terminal", async () => {
     await hold(a, rootId, "turn");
     expect(errorOf(await a.workspaceService.rename(rootId, "renamed"))).toContain(

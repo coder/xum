@@ -9960,8 +9960,9 @@ export class WorkspaceService
    * deleting the checkout disturbs their activity as well. Never waits: resolves to the gate's
    * release, or to the refusal message while any of them is in use.
    *
-   * `own` says which of this backend's own activities the mutator ends or tolerates itself; other
-   * backends' activity always refuses.
+   * `own` says which of this backend's own activities in the mutated workspace itself the mutator
+   * ends or tolerates; it never ends them in the shared sub-agents, so their own activity refuses
+   * like other backends' activity always does.
    */
   private async acquireStructuralMutationGate(
     workspaceId: string,
@@ -9988,9 +9989,9 @@ export class WorkspaceService
     try {
       return Ok(
         await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
-          ignoreOwnKinds: own.ignoreKinds,
+          ignoreOwnKinds: new Map([[workspaceId, own.ignoreKinds]]),
           hasRunningBackgroundProcesses: (id) =>
-            own.backgroundProcesses === "refuse"
+            own.backgroundProcesses === "refuse" || id !== workspaceId
               ? this.hasRunningBackgroundBashProcesses(id)
               : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
                   extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
@@ -10913,6 +10914,14 @@ export class WorkspaceService
   async deleteWorktree(workspaceId: string): Promise<Result<void>> {
     let releaseMutationGate: (() => Promise<void>) | undefined;
     try {
+      // #4476: refuse while another backend uses the workspace or its shared sub-agents. Taken
+      // before the archived check below, so an unarchive by another backend in between is seen.
+      const gate = await this.acquireStructuralMutationGate(workspaceId, {
+        ignoreKinds: new Set(),
+        backgroundProcesses: "allow",
+      });
+      if (!gate.success) return Err(`Cannot delete the managed worktree: ${gate.error}`);
+      releaseMutationGate = gate.data;
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspaceMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
       if (!workspaceMetadata) {
@@ -10931,13 +10940,6 @@ export class WorkspaceService
         return Err("Deleting a managed worktree is only supported for worktree runtimes");
       }
 
-      // #4476: refuse while another backend uses the workspace or its shared sub-agents.
-      const gate = await this.acquireStructuralMutationGate(workspaceId, {
-        ignoreKinds: new Set(),
-        backgroundProcesses: "allow",
-      });
-      if (!gate.success) return Err(`Cannot delete the managed worktree: ${gate.error}`);
-      releaseMutationGate = gate.data;
       const managedPath = workspaceMetadata.namedWorkspacePath;
       await removeManagedGitWorktree(workspaceMetadata.projectPath, managedPath);
       await this.emitCurrentWorkspaceMetadata(workspaceId);

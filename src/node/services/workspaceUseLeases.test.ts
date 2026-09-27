@@ -266,7 +266,10 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
     test("this backend's own leases refuse unless the mutator ignores that kind", async () => {
       const turn = await a.hold(workspaceId, "turn");
       const terminal = await a.hold(workspaceId, "terminal");
-      const ignoreTerminals = { ...idle, ignoreOwnKinds: new Set(["terminal"] as const) };
+      const ignoreTerminals = {
+        ...idle,
+        ignoreOwnKinds: new Map([[workspaceId, new Set(["terminal"] as const)]]),
+      };
       expect(
         (await refusal(a.withMutationGate([workspaceId], ignoreTerminals, () => Promise.resolve())))
           .message
@@ -322,7 +325,10 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
       const finished = new Promise<void>((resolve) => (finish = resolve));
       let entered!: () => void;
       const inside = new Promise<void>((resolve) => (entered = resolve));
-      const ignoreTerminals = { ...idle, ignoreOwnKinds: new Set(["terminal"] as const) };
+      const ignoreTerminals = {
+        ...idle,
+        ignoreOwnKinds: new Map([[workspaceId, new Set(["terminal"] as const)]]),
+      };
       const mutation = a.withMutationGate([workspaceId], ignoreTerminals, async () => {
         entered();
         await finished;
