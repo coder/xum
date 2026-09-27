@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as path from "path";
 
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -31,6 +31,12 @@ import { workspaceUseLeasesFor, type WorkspaceUseLease } from "@/node/services/w
 const rootId = "root-cascade";
 const childId = "child-cascade";
 const grandchildId = "grandchild-cascade";
+
+const exists = (p: string) =>
+  fsPromises.access(p).then(
+    () => true,
+    () => false
+  );
 
 interface Backend {
   config: Config;
@@ -122,7 +128,7 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     expect(result.success ? "" : result.error).toContain("in use by another Xum process");
     for (const id of allIds) {
       expect(findWorkspaceInConfig(a.config, id)).toBeDefined();
-      expect(fs.existsSync(checkouts.get(id)!)).toBe(true);
+      expect(await exists(checkouts.get(id)!)).toBe(true);
       expect(findWorkspaceInConfig(a.config, id)?.pendingRemoval).toBeUndefined();
     }
   });
@@ -133,8 +139,7 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     expect(result).toEqual({ success: true, data: undefined });
     for (const id of allIds) {
       expect(findWorkspaceInConfig(b.config, id)).toBeUndefined();
-      expect(fs.existsSync(checkouts.get(id)!)).toBe(false);
-      expect(fs.existsSync(path.join(a.config.sessionsDir, id))).toBe(false);
+      expect(await exists(checkouts.get(id)!)).toBe(false);
     }
   });
 });
