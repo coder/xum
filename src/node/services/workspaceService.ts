@@ -1967,6 +1967,16 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
  * TaskService and stay off; their parent owns them.
  */
+/**
+ * Whether a multi-project container link with this name would resolve as a workspace metadata
+ * directory (#4455). Case-insensitive volumes (macOS, Windows) fold case, and Windows trims
+ * trailing dots and spaces, so `.XUM` and `.xum.` alias `.xum` there too.
+ */
+function aliasesProjectMetadataDir(projectName: string): boolean {
+  const folded = projectName.replace(/[. ]+$/, "").toLowerCase();
+  return PROJECT_METADATA_DIR_NAMES.some((dirName) => dirName === folded);
+}
+
 function mintUnrelatedWorkspaceConsent(): string {
   const generation = crypto.randomUUID();
   assert(
@@ -6004,7 +6014,7 @@ export class WorkspaceService
         // tracked file could silently enable plugins once other trees can message this
         // workspace. (Registration-time sanitization, which multi-project does not need
         // otherwise, would refuse that symlinked path too; #4455.)
-        if ((PROJECT_METADATA_DIR_NAMES as readonly string[]).includes(project.projectName)) {
+        if (aliasesProjectMetadataDir(project.projectName)) {
           return Err(
             `Project ${project.projectName} cannot join a multi-project workspace: its name collides with the workspace metadata directory. Rename the project's folder first.`
           );
