@@ -669,6 +669,11 @@ interface TaskLaunchPlan {
   /** Attempt id the reservation commit (or the queue drain's launch CAS) published for this plan. */
   attemptId?: string;
   /**
+   * createMany only: the parent row was found by id when the reservation was revalidated, so the
+   * commit refuses if it is gone by then (see assertParentAdmitsChild).
+   */
+  requireParentRow?: boolean;
+  /**
    * Flipped by the launch fence immediately before the send is admitted. A launch failure that
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
    */
@@ -6095,6 +6100,7 @@ export class TaskService implements AgentTaskIntegration {
       plans.push({
         taskId,
         parentWorkspaceId: plan.parentWorkspaceId,
+        requireParentRow: findWorkspaceEntry(cfg, plan.parentWorkspaceId) != null,
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
@@ -6318,9 +6324,9 @@ export class TaskService implements AgentTaskIntegration {
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {
-        // Marker only: the reservation materializes no checkout, and its preparation runs in this
-        // same call, so a vanished parent row is not told apart from a legacy id-less one here.
-        assertParentAdmitsChild(config, plan.parentWorkspaceId, { requireRow: false });
+        assertParentAdmitsChild(config, plan.parentWorkspaceId, {
+          requireRow: plan.requireParentRow === true,
+        });
         const runtime = createRuntimeForWorkspace({
           runtimeConfig: plan.taskRuntimeConfig,
           projectPath: plan.parentMeta.projectPath,

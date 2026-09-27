@@ -265,8 +265,10 @@ describe("workspace removal across two backends on one root", () => {
   });
 
   // #4782 item 2: a child created under a workspace being removed would outlive its parent.
-  test("the other backend cannot create a child task under a workspace being removed", async () => {
-    const leafRootId = "root-without-children";
+  const leafRootId = "root-without-children";
+
+  /** A second root with no children, and a full task queue, so a child's config write is its only effect. */
+  async function prepareChildlessRootWithQueuedCreation(): Promise<void> {
     await a.config.editConfig((config) => {
       const project = [...config.projects.values()][0];
       project.workspaces.push({
@@ -275,7 +277,6 @@ describe("workspace removal across two backends on one root", () => {
         }),
         path: `${rowOf(a.config, rootId)!.path}-2`,
       });
-      // Queue the child (persist-only), so its config write is the only effect.
       config.taskSettings = testTaskSettings(1);
       return config;
     });
@@ -285,6 +286,16 @@ describe("workspace removal across two backends on one root", () => {
     spyOn(runtimeFactory, "createRuntime").mockImplementation((...args) =>
       Object.assign(realCreateRuntime(...args), { deleteWorkspace })
     );
+  }
+
+  function childrenOf(config: Config, parentId: string): WorkspaceConfigEntry[] {
+    return [...config.loadConfigOrDefault().projects.values()].flatMap((project) =>
+      project.workspaces.filter((row) => row.parentWorkspaceId === parentId)
+    );
+  }
+
+  test("the other backend cannot create a child task under a workspace being removed", async () => {
+    await prepareChildlessRootWithQueuedCreation();
     const paused = pauseRemovalAfterMarker(a);
     const removal = a.workspaceService.remove(leafRootId, true);
     await paused.reached;
@@ -298,12 +309,33 @@ describe("workspace removal across two backends on one root", () => {
     });
 
     expect(created.success ? "created" : created.error).toContain("removed");
-    const children = [...b.config.loadConfigOrDefault().projects.values()].flatMap((project) =>
-      project.workspaces.filter((row) => row.parentWorkspaceId === leafRootId)
-    );
-    expect(children).toEqual([]);
+    expect(childrenOf(b.config, leafRootId)).toEqual([]);
     paused.release();
     expect((await removal).success).toBe(true);
+  });
+
+  test("a batch creation refuses when the other backend finished removing the parent during its checkpoint", async () => {
+    await prepareChildlessRootWithQueuedCreation();
+
+    const created = await b.taskService.createMany(
+      [
+        {
+          parentWorkspaceId: leafRootId,
+          kind: "agent",
+          agentId: "explore",
+          prompt: "go",
+          title: "T",
+        },
+      ],
+      {
+        onTaskReserved: async () => {
+          expect((await a.workspaceService.remove(leafRootId, true)).success).toBe(true);
+        },
+      }
+    );
+
+    expect(created.success ? "created" : created.error).toContain("removed");
+    expect(childrenOf(b.config, leafRootId)).toEqual([]);
   });
 
   test("a batch creation under a parent that has no config row by id (legacy) still commits", async () => {
