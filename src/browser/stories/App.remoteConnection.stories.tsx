@@ -1,5 +1,5 @@
 import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { REMOTE_CONNECTION_URL_KEY } from "@/browser/features/Settings/Sections/RemoteConnectionSection";
@@ -234,6 +234,8 @@ export const HttpWarningPhone: AppStory = {
 };
 
 export const LocalServer: AppStory = {
+  // An interaction contract: its states are text in the section the Desktop story already captures.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   render: () => <AppWithMocks setup={setupRemoteSettings} />,
   play: async ({ canvasElement }) => {
     const section = await openRemoteSettings(canvasElement);
