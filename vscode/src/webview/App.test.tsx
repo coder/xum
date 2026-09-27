@@ -457,6 +457,41 @@ describe("vscode webview workspace AI settings", () => {
     });
   });
 
+  test("keeps a model picked for one agent after switching agents and back", async () => {
+    const { bridge, view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: {
+        agentId: "plan",
+        aiSettingsByAgent: {
+          plan: { model: "openai:gpt-5.6-terra", thinkingLevel: "high" },
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "low" },
+        },
+      },
+    });
+
+    // Pick Sonnet 5 for Plan from the model dropdown (the list shows every suggested model).
+    await act(async () => {
+      fireEvent.click(view.getByRole("combobox"));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(view.getByText("Sonnet 5"));
+      await Promise.resolve();
+    });
+    for (const name of ["Plan", "Exec"]) {
+      await act(async () => {
+        fireEvent.click(view.getByRole("button", { name }));
+        await Promise.resolve();
+      });
+    }
+
+    const options = await send(bridge, view);
+    expect(options.agentId).toBe("plan");
+    expect(String(options.model)).toContain("sonnet");
+    // The pick stays local (#4755): no AI-settings write reaches the workspace.
+    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+  });
+
   test("shows the actual custom agent instead of mislabeling it as Exec", async () => {
     const { bridge, view } = await selectWorkspaceWith({
       ...WORKSPACE,
