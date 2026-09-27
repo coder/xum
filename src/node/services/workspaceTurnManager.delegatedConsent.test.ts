@@ -56,18 +56,22 @@ describe("delegated target default consent (#4453)", () => {
       clearPendingDefaultUnrelatedConsent: mock((id: string) =>
         real.clearPendingDefaultUnrelatedConsent(id)
       ),
+      removeWhileTaskTreeLocked: mock((id: string, force?: boolean) =>
+        real.removeWhileTaskTreeLocked(id, force)
+      ),
     });
+    const { aiService } = createAIServiceMocks(config);
     const { taskService: manager } = createWorkspaceTurnManagerHarness(config, {
-      aiService: createAIServiceMocks(config).aiService,
+      aiService,
       workspaceService: host.workspaceService,
     });
-    return { config, real, manager };
+    return { config, real, manager, aiService };
   }
 
   async function setUp(options: Parameters<typeof backend>[0] = {}) {
     const a = await backend(options);
-    const { parentId } = await saveLocalParentWorkspace(a.config, rootDir);
-    return { ...a, parentId };
+    const { parentId, projectPath } = await saveLocalParentWorkspace(a.config, rootDir);
+    return { ...a, parentId, projectPath };
   }
 
   function targetRow(config: Config) {
@@ -188,31 +192,76 @@ describe("delegated target default consent (#4453)", () => {
     expect(targetRow(config)).toEqual({ consent: undefined, pending: undefined });
   });
 
-  const exitsBeforeRecord = {
-    "an invalid explicit model": {
-      afterCreate: undefined,
-      modelString: "::",
+  const archive = (config: Config, workspaceId: string) =>
+    config.editConfig((cfg) => {
+      const row = findWorkspaceEntry(cfg, workspaceId)?.workspace;
+      if (row) row.archivedAt = new Date().toISOString();
+      return cfg;
+    });
+  const exitsBeforeRecord: Record<
+    string,
+    {
+      afterCreate?: (a: Awaited<ReturnType<typeof setUp>>) => unknown;
+      extra?: Partial<Parameters<WorkspaceTurnManager["createWorkspaceTurn"]>[0]>;
+      error: string;
+    }
+  > = {
+    "an invalid explicit model": { extra: { modelString: "::" }, error: "::" },
+    "an AI-settings resolution that throws": {
+      afterCreate: ({ aiService }) =>
+        spyOn(aiService, "getProvidersConfig").mockImplementation(() => {
+          throw new Error("providers unreadable");
+        }),
+      error: "providers unreadable",
+    },
+    "a reawaken snapshot for a new target": {
+      extra: {
+        agentTaskAi: {
+          snapshot: {
+            agentId: "exec",
+            taskModelString: "anthropic:claude-opus-4-6",
+            canonicalModel: "anthropic:claude-opus-4-6",
+            thinkingLevel: "high",
+            reasoningMode: "standard",
+          },
+          inputsKey: "inputs",
+          contextKey: "context",
+        },
+      },
+      error: TARGET,
     },
     "the target archived during creation": {
-      afterCreate: (config: Config) =>
-        config.editConfig((cfg) => {
-          const row = findWorkspaceEntry(cfg, TARGET)?.workspace;
-          if (row) row.archivedAt = new Date().toISOString();
-          return cfg;
-        }),
-      modelString: undefined,
+      afterCreate: ({ config }) => archive(config, TARGET),
+      error: "target workspace was archived",
+    },
+    "the owner archived during creation": {
+      afterCreate: ({ config, parentId }) => archive(config, parentId),
+      error: "owner workspace was archived",
     },
   };
-  for (const [exit, { afterCreate, modelString }] of Object.entries(exitsBeforeRecord)) {
-    test(`an exit before the handle record persists clears the mark (${exit})`, async () => {
-      const late: { config?: Config } = {};
-      const a = await setUp({ afterCreate: async () => void (await afterCreate?.(late.config!)) });
-      late.config = a.config;
-      const created = await createTurn(a.manager, a.parentId, { mode: "new" }, modelString);
+  // #4819: without a handle record nothing owns the target (a mode "existing" retry is
+  // invalid_scope), so each exit removes it; #4453: and still releases the live-owner lock.
+  for (const [exit, { afterCreate, extra, error }] of Object.entries(exitsBeforeRecord)) {
+    test(`an exit before the handle record persists removes the target (${exit})`, async () => {
+      const late: { a?: Awaited<ReturnType<typeof setUp>> } = {};
+      const a = await setUp({ afterCreate: async () => void (await afterCreate?.(late.a!)) });
+      late.a = a;
+      const created = await a.manager
+        .createWorkspaceTurn({
+          ownerWorkspaceId: a.parentId,
+          prompt: "Summarize",
+          title: "Workspace turn",
+          workspace: { mode: "new" },
+          ...extra,
+        })
+        .catch((thrown: unknown) => ({ success: false as const, error: String(thrown) }));
 
       expect(created.success).toBe(false);
-      expect(created.success ? "" : created.error).toContain(modelString ?? "archived");
-      expect(targetRow(a.config)).toEqual({ consent: undefined, pending: undefined });
+      expect(created.success ? "" : created.error).toContain(error);
+      expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), TARGET)).toBeNull();
+      expect(findWorkspaceEntry(a.config.loadConfigOrDefault(), a.parentId)).not.toBeNull();
+      // The local target shares the parent's directory; removal must leave it.
+      expect(await fsPromises.stat(a.projectPath).then(() => true)).toBe(true);
       const lock = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
       expect(await fsPromises.stat(lock).catch(() => null)).toBeNull();
     });
