@@ -6,12 +6,10 @@ import {
   getModelKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { modelSelectionEqualityKey } from "@/common/utils/ai/models";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
-import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
 import {
   readPersistedState,
   readPersistedString,
@@ -119,7 +117,6 @@ function recordAutoRoutingChoice(
   auto: boolean
 ): void {
   if (scopeId.length === 0 || scopeId.startsWith("__")) return;
-  if (isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING) !== true) return;
   const agentId = normalizeAgentId(
     readPersistedState<string>(getAgentIdKey(scopeId), WORKSPACE_DEFAULTS.agentId),
     WORKSPACE_DEFAULTS.agentId

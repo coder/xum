@@ -851,6 +851,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           draftId: props.pendingDraftId,
           userModel: preferredModel,
           agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+          autoRoutingEnabled: autoModelRoutingEnabled,
         }
       : {
           // Dummy values for workspace variant (never used)

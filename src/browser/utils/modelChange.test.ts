@@ -4,9 +4,14 @@ import { GlobalWindow } from "happy-dom";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   consumeWorkspaceModelChange,
+  setAutoRoutingChoice,
   setWorkspaceModelWithOrigin,
 } from "@/browser/utils/modelChange";
-import { getAutoModelRoutingKey } from "@/common/constants/storage";
+import {
+  getAgentIdKey,
+  getAutoModelRoutingKey,
+  getAutoRoutingChoiceByAgentKey,
+} from "@/common/constants/storage";
 
 let workspaceCounter = 0;
 
@@ -43,6 +48,18 @@ describe("modelChange", () => {
     updatePersistedState(autoKey, true);
     setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
     expect(readPersistedState(autoKey, false)).toBe(false);
+  });
+
+  test("records workspace routing picks per agent without a local experiment override", () => {
+    const workspaceId = nextWorkspaceId();
+    updatePersistedState(getAgentIdKey(workspaceId), "plan");
+
+    setAutoRoutingChoice(workspaceId, "thinkingLevel", true);
+    setWorkspaceModelWithOrigin(workspaceId, "openai:gpt-5.2-codex", "user");
+
+    expect(readPersistedState(getAutoRoutingChoiceByAgentKey(workspaceId), {})).toEqual({
+      plan: { thinkingLevel: true, model: false },
+    });
   });
 
   test("does not record explicit entries for no-op model changes", () => {

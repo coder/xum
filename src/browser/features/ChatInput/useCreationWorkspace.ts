@@ -22,8 +22,6 @@ import {
   type AutoRoutingDimension,
 } from "@/browser/utils/modelChange";
 import { resolveConfiguredAiDefaults } from "@/browser/utils/workspaceModeAi";
-import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
@@ -118,12 +116,14 @@ interface UseCreationWorkspaceOptions {
   /** User's currently selected model (for name generation fallback) */
   userModel?: string;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
+  autoRoutingEnabled?: boolean;
 }
 
 function syncCreationPreferences(
   projectPath: string,
   workspaceId: string,
-  agentBaseById: ReadonlyMap<string, string | undefined> | undefined
+  agentBaseById: ReadonlyMap<string, string | undefined> | undefined,
+  autoRoutingEnabled: boolean
 ): void {
   const projectScopeId = getProjectScopeId(projectPath);
 
@@ -165,10 +165,8 @@ function syncCreationPreferences(
       routingChoice[dimension] = creationAuto;
     }
   }
-  if (
-    Object.keys(routingChoice).length > 0 &&
-    isExperimentEnabled(EXPERIMENT_IDS.AUTO_MODEL_ROUTING) === true
-  ) {
+  // Without the experiment the composer offers no Auto, so a mismatch is not a pick.
+  if (autoRoutingEnabled && Object.keys(routingChoice).length > 0) {
     recordAutoRoutingChoiceForAgent(workspaceId, effectiveAgentId, routingChoice);
   }
 
@@ -360,6 +358,7 @@ export function useCreationWorkspace({
   dynamicWorkflowsEnabled = false,
   userModel,
   agentBaseById,
+  autoRoutingEnabled = false,
 }: UseCreationWorkspaceOptions): UseCreationWorkspaceReturn {
   const workspaceContext = useOptionalWorkspaceContext();
   const promoteWorkspaceDraft = workspaceContext?.promoteWorkspaceDraft;
@@ -732,7 +731,12 @@ export function useCreationWorkspace({
         };
 
         // Sync preferences before switching (keeps workspace settings consistent).
-        syncCreationPreferences(projectPath, metadata.id, agentBaseByIdRef.current);
+        syncCreationPreferences(
+          projectPath,
+          metadata.id,
+          agentBaseByIdRef.current,
+          autoRoutingEnabled
+        );
 
         // Switch to the workspace immediately after creation unless the user navigated away
         // from the draft that initiated the creation (avoid yanking focus to the new workspace).
@@ -976,6 +980,7 @@ export function useCreationWorkspace({
       message,
       subProjectPath,
       dynamicWorkflowsEnabled,
+      autoRoutingEnabled,
       draftId,
       promoteWorkspaceDraft,
       deleteWorkspaceDraft,
