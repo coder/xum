@@ -801,6 +801,13 @@ const DESCENDANT_WORKSPACE_REMOVE_ERROR =
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
+// #4476: removal stops this backend's own stream, terminals, MCP servers, init hook and background
+// processes itself (it waits for the init). So it ignores those, and its own in-flight one-off
+// commands (#4857): removal never waited for them, and removingWorkspaces refuses new ones.
+const REMOVAL_OWN_ACTIVITY_POLICY = {
+  ignoreKinds: new Set<WorkspaceUseKind>(["turn", "terminal", "editor", "mcp", "init", "exec"]),
+  backgroundProcesses: "allow",
+} as const;
 
 /**
  * A failed rollback after a rejected registration write (#4745) is logged, never thrown: the
@@ -6657,22 +6664,50 @@ export class WorkspaceService
             this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId);
           return { ...Err(error), ...(descendants?.length ? { descendants } : {}) };
         };
+        let releaseTreeGate: (() => Promise<void>) | undefined;
         try {
           if (options?.acknowledgedDescendantIds != null) {
             if (this.agentTaskIntegration == null) {
               return failure("Task lifecycle service is unavailable.");
             }
+            // #4477: gate the parent and every descendant in one sorted acquisition before the
+            // first removal, so a descendant that either backend is using refuses the whole
+            // delete with nothing removed. Held until the parent is gone: no backend can start
+            // using any of them meanwhile. A descendant another backend adds later is outside
+            // the acknowledged scope, which refuses it.
+            const gatedIds = new Set([
+              workspaceId,
+              ...this.agentTaskIntegration
+                .listWorkspaceRemovalDescendants(workspaceId)
+                .map((descendant) => descendant.workspaceId),
+            ]);
+            const gate = await this.acquireStructuralMutationGate(
+              [...gatedIds],
+              REMOVAL_OWN_ACTIVITY_POLICY
+            );
+            if (!gate.success) return failure(`Cannot remove workspace: ${gate.error}`);
+            releaseTreeGate = gate.data;
             const descendantsResult =
               await this.agentTaskIntegration.removeAcknowledgedDescendantsWhileTaskTreeLocked(
                 workspaceId,
-                options.acknowledgedDescendantIds
+                options.acknowledgedDescendantIds,
+                gatedIds
               );
             if (!descendantsResult.success) return failure(descendantsResult.error);
           }
-          const result = await this.removeUnlocked(workspaceId, force, binding);
+          const result = await this.removeUnlocked(workspaceId, force, binding, {
+            mutationGateHeld: releaseTreeGate != null,
+          });
           return result.success ? result : failure(result.error);
         } catch (error) {
           return failure(getErrorMessage(error));
+        } finally {
+          await releaseTreeGate?.().catch((error: unknown) => {
+            log.error("Failed to release the sub-agent tree's mutation gate", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
         }
       };
       // Defer the project-list refresh until the complete descendant cascade ends.
@@ -6838,16 +6873,16 @@ export class WorkspaceService
     // Try to remove from runtime (filesystem)
     try {
       // #4476: refuse while another backend uses the workspace (or its shared sub-agents), before
-      // any effect. This backend's own stream, terminals, MCP servers, init hook and background
-      // processes keep today's handling: removal stops them (it waits for the init below). So do
-      // its own in-flight one-off commands (#4857): removal never waited for them, and
-      // removingWorkspaces refuses new ones.
-      const gate = await this.acquireStructuralMutationGate(workspaceId, {
-        ignoreKinds: new Set(["turn", "terminal", "editor", "mcp", "init", "exec"]),
-        backgroundProcesses: "allow",
-      });
-      if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
-      releaseMutationGate = gate.data;
+      // any effect (own activity: see REMOVAL_OWN_ACTIVITY_POLICY). A parent removal already
+      // holds the gate of its whole tree (#4477, see remove()).
+      if (options?.mutationGateHeld !== true) {
+        const gate = await this.acquireStructuralMutationGate(
+          workspaceId,
+          REMOVAL_OWN_ACTIVITY_POLICY
+        );
+        if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
+        releaseMutationGate = gate.data;
+      }
       // #4914: the marker, the deregistration and other backends' task commits all find the row
       // by id, so persist a legacy id-less row's id first (the read-time migration that workspace
       // listing persists). Refuse if it still has none: the removal could not be fenced.
@@ -10171,8 +10206,13 @@ export class WorkspaceService
    * ends or tolerates; it never ends them in the shared sub-agents, so their own activity refuses
    * like other backends' activity always does.
    */
+  /**
+   * @param workspaceId - the workspace the mutation targets, or every workspace of a tree that
+   *   one operation mutates (#4477: a parent removal gates its whole sub-agent tree at once, so a
+   *   busy descendant refuses before anything is removed). `own` applies to each target alone.
+   */
   private async acquireStructuralMutationGate(
-    workspaceId: string,
+    workspaceId: string | readonly string[],
     own: {
       ignoreKinds: ReadonlySet<WorkspaceUseKind>;
       // "refuse": also this backend's tracked background processes; "allow": only processes this
@@ -10180,11 +10220,13 @@ export class WorkspaceService
       backgroundProcesses: "refuse" | "allow";
     }
   ): Promise<Result<() => Promise<void>>> {
-    const workspaceIds = [workspaceId];
+    const targets = new Set(typeof workspaceId === "string" ? [workspaceId] : workspaceId);
+    const workspaceIds = [...targets];
     const config = this.config.loadConfigOrDefault();
-    const row = findWorkspaceEntry(config, workspaceId)?.workspace;
-    // A shared sub-agent's own mutations never move or delete the checkout it borrows.
-    if (row != null && row.taskIsolation !== "none") {
+    for (const target of targets) {
+      const row = findWorkspaceEntry(config, target)?.workspace;
+      // A shared sub-agent's own mutations never move or delete the checkout it borrows.
+      if (row == null || row.taskIsolation === "none") continue;
       for (const project of config.projects.values()) {
         for (const ws of project.workspaces) {
           if (ws.taskIsolation === "none" && ws.path === row.path && ws.id != null) {
@@ -10196,9 +10238,9 @@ export class WorkspaceService
     let release: () => Promise<void>;
     try {
       release = await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
-        ignoreOwnKinds: new Map([[workspaceId, own.ignoreKinds]]),
+        ignoreOwnKinds: new Map([...targets].map((id) => [id, own.ignoreKinds])),
         hasRunningBackgroundProcesses: (id) =>
-          own.backgroundProcesses === "refuse" || id !== workspaceId
+          own.backgroundProcesses === "refuse" || !targets.has(id)
             ? this.hasRunningBackgroundBashProcesses(id)
             : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
                 extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
@@ -10212,17 +10254,20 @@ export class WorkspaceService
     // open of either that is already past its gate probe: it would still launch at the path it
     // read. Opens are counted before their probe, and every later probe sees this gate, so no
     // open can join the count once it reads zero here.
-    const openInFlight =
-      own.ignoreKinds.has("terminal") &&
-      this.terminalService?.hasPendingNativeTerminalOpen(workspaceId) === true
-        ? "a native terminal"
-        : own.ignoreKinds.has("editor") &&
-            (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0
-          ? "an external editor"
-          : null;
-    if (openInFlight != null) {
-      await release();
-      return Err(`${openInFlight} is being opened for it in this Xum process; try again`);
+    for (const target of targets) {
+      const openInFlight =
+        own.ignoreKinds.has("terminal") &&
+        this.terminalService?.hasPendingNativeTerminalOpen(target) === true
+          ? "a native terminal"
+          : own.ignoreKinds.has("editor") &&
+              (this.pendingExternalEditorRecordings.get(target) ?? 0) > 0
+            ? "an external editor"
+            : null;
+      if (openInFlight != null) {
+        await release();
+        const subject = targets.size > 1 ? `workspace ${target}` : "it";
+        return Err(`${openInFlight} is being opened for ${subject} in this Xum process; try again`);
+      }
     }
     return Ok(release);
   }

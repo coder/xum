@@ -305,6 +305,8 @@ export class AgentReportWaitTimeoutError extends Error {
 /** "refuse" is for model-driven task_remove (#4723); user-confirmed and automatic removals omit it. */
 export interface SubagentRemovalOptions {
   lossyWorkPolicy?: "refuse";
+  /** The caller holds the sub-agent's mutation gate (a parent removal gates its tree, #4477). */
+  mutationGateHeld?: boolean;
 }
 
 interface TaskParentAiMeta {
@@ -13816,9 +13818,12 @@ export class TaskService implements AgentTaskIntegration {
       }
       // Bound to the attempt checked inactive above (#4478): another backend can reawaken the task
       // during the awaits since, and the removal must then refuse instead of deleting its checkout.
-      const result = await this.workspaceService.removeWhileTaskTreeLocked(taskId, true, {
-        expectedAttemptId: entry.workspace.taskAttemptId,
-      });
+      const result = await this.workspaceService.removeWhileTaskTreeLocked(
+        taskId,
+        true,
+        { expectedAttemptId: entry.workspace.taskAttemptId },
+        { mutationGateHeld: options?.mutationGateHeld === true }
+      );
       return Ok(
         result.success
           ? { status: "removed", action: "remove", ...target }
@@ -13920,7 +13925,8 @@ export class TaskService implements AgentTaskIntegration {
 
   async removeAcknowledgedDescendantsWhileTaskTreeLocked(
     workspaceId: string,
-    acknowledgedIds: string[]
+    acknowledgedIds: string[],
+    gatedIds?: ReadonlySet<string>
   ): Promise<Result<void>> {
     const descendants = this.listWorkspaceRemovalDescendants(workspaceId);
     const acknowledged = new Set(acknowledgedIds);
@@ -13948,7 +13954,8 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const result = await this.removeInactiveDescendantAgentTaskWhileTaskTreeLocked(
           workspaceId,
-          descendant.workspaceId
+          descendant.workspaceId,
+          { mutationGateHeld: gatedIds?.has(descendant.workspaceId) === true }
         );
         if (!result.success) return failure(result.error);
         if (result.data.status !== "removed" && result.data.status !== "already_removed") {

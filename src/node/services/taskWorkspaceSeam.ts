@@ -269,6 +269,11 @@ export interface RemovalAttemptBinding {
 /** keepBranch: remove only the checkout, e.g. undoing a creation that reused a branch (#4819). */
 export interface RemovalCheckoutOptions {
   keepBranch?: boolean;
+  /**
+   * The caller already holds this workspace's structural mutation gate: a parent removal gates
+   * its whole sub-agent tree before removing any of it (#4477).
+   */
+  mutationGateHeld?: boolean;
 }
 
 export interface ArchiveWorkspaceOptions {
@@ -770,9 +775,11 @@ export interface AgentTaskIntegration {
   withTaskTreeLifecycleLock<T>(workspaceId: string, operation: () => Promise<T>): Promise<T>;
   hasDescendantAgentTasks(workspaceId: string): boolean;
   listWorkspaceRemovalDescendants(workspaceId: string): WorkspaceRemovalDescendant[];
+  /** gatedIds: workspaces whose mutation gate the caller holds (#4477). */
   removeAcknowledgedDescendantsWhileTaskTreeLocked(
     workspaceId: string,
-    acknowledgedIds: string[]
+    acknowledgedIds: string[],
+    gatedIds?: ReadonlySet<string>
   ): Promise<Result<void>>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
