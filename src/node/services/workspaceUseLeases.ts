@@ -120,10 +120,41 @@ export class WorkspaceUseLeases {
     options: WorkspaceMutationGateOptions,
     fn: () => Promise<T>
   ): Promise<T> {
-    assert(workspaceIds.length > 0, "withMutationGate requires at least one workspace");
+    const release = await this.acquireMutationGate(workspaceIds, options);
+    try {
+      return await fn();
+    } finally {
+      await release();
+    }
+  }
+
+  /**
+   * withMutationGate() for mutators whose protected section is not one callback (rename and
+   * archive release their other locks in an existing finally): the caller must await the
+   * returned release once the mutation settles.
+   */
+  async acquireMutationGate(
+    workspaceIds: readonly string[],
+    options: WorkspaceMutationGateOptions
+  ): Promise<() => Promise<void>> {
+    assert(workspaceIds.length > 0, "acquireMutationGate requires at least one workspace");
     // Sorted, so two mutators over overlapping sets take the gates in one order.
     const ids = [...new Set(workspaceIds)].sort();
     const releases: Array<() => Promise<void>> = [];
+    // Every gate is released even if one release fails; the first failure is rethrown.
+    const releaseAll = async () => {
+      const results = [];
+      for (const release of [...releases].reverse()) {
+        results.push(
+          await release().then(
+            () => undefined,
+            (error: unknown) => ({ error })
+          )
+        );
+      }
+      const failed = results.find((result) => result != null);
+      if (failed != null) throw failed.error;
+    };
     try {
       for (const id of ids) {
         try {
@@ -149,12 +180,12 @@ export class WorkspaceUseLeases {
       for (const id of ids) {
         await this.transitions.withLock(id, () => this.assertUnused(id, options));
       }
-      return await fn();
-    } finally {
-      for (const release of releases.reverse()) {
-        await release();
-      }
+    } catch (error) {
+      await releaseAll();
+      throw error;
     }
+    let released: Promise<void> | undefined;
+    return () => (released ??= releaseAll());
   }
 
   private async assertUnused(

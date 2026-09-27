@@ -17,37 +17,38 @@ function hasNamedWorkspacePath(
 
 export const isWorktreeRuntime = isCommonWorktreeRuntime;
 
+/**
+ * Whether archiving with this behavior deletes the workspace's managed worktree (the hook below).
+ * Archive takes the cross-process mutation gate exactly when this holds (#4476).
+ */
+export function archiveDeletesManagedWorktree(
+  workspaceMetadata: WorkspaceMetadata,
+  behavior: WorktreeArchiveBehavior
+): boolean {
+  return (
+    isWorktreeRuntime(workspaceMetadata.runtimeConfig) &&
+    // isolation:none tasks point at an ancestor's checkout, so treating their path as a managed
+    // child worktree would delete the parent's live workspace.
+    workspaceMetadata.taskIsolation !== "none" &&
+    shouldDeleteWorktreeOnArchive(behavior) &&
+    // Snapshot archives skip the clean-up for multi-project workspaces.
+    !(
+      behavior === "snapshot" &&
+      Array.isArray(workspaceMetadata.projects) &&
+      workspaceMetadata.projects.length > 1
+    )
+  );
+}
+
 export function createWorktreeArchiveHook(options: {
   getWorktreeArchiveBehavior: () => WorktreeArchiveBehavior;
 }): AfterArchiveHook {
   return async ({ workspaceMetadata, worktreeArchiveBehavior }): Promise<Result<void>> => {
-    const runtimeConfig = workspaceMetadata.runtimeConfig;
-    if (!isWorktreeRuntime(runtimeConfig)) {
-      return Ok(undefined);
-    }
-
-    // isolation:none tasks point at an ancestor's checkout, so treating their path as a managed
-    // child worktree would delete the parent's live workspace.
-    if (workspaceMetadata.taskIsolation === "none") {
-      return Ok(undefined);
-    }
-
     // Prefer the archive operation's behavior snapshot: deciding deletion on a fresh config
     // read would let a keep→delete settings flip mid-archive delete a checkout that was never
     // snapshotted (the snapshot decision was made with the earlier value).
     const behavior = worktreeArchiveBehavior ?? options.getWorktreeArchiveBehavior();
-    if (!shouldDeleteWorktreeOnArchive(behavior)) {
-      return Ok(undefined);
-    }
-
-    if (
-      behavior === "snapshot" &&
-      Array.isArray(workspaceMetadata.projects) &&
-      workspaceMetadata.projects.length > 1
-    ) {
-      log.debug("Skipping snapshot worktree cleanup for multi-project archive", {
-        workspaceId: workspaceMetadata.id,
-      });
+    if (!archiveDeletesManagedWorktree(workspaceMetadata, behavior)) {
       return Ok(undefined);
     }
 

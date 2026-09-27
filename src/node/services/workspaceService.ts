@@ -176,7 +176,15 @@ import {
   probeDevcontainerStatuses,
   stopDevcontainer,
 } from "@/node/runtime/devcontainerCli";
-import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
+import {
+  archiveDeletesManagedWorktree,
+  isWorktreeRuntime,
+} from "@/node/runtime/worktreeLifecycleHooks";
+import {
+  WorkspaceBusyError,
+  workspaceUseLeasesFor,
+  type WorkspaceUseKind,
+} from "@/node/services/workspaceUseLeases";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
@@ -6692,11 +6700,21 @@ export class WorkspaceService
     // success. Scoped to this workspace; taken before any disk mutation and
     // released once removal has settled (finally below).
     let releaseOverridesLock: (() => Promise<void>) | undefined;
+    let releaseMutationGate: (() => Promise<void>) | undefined;
     // Try to remove from runtime (filesystem)
     try {
       if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
+      // #4476: refuse while another backend uses the workspace (or its shared sub-agents), before
+      // any effect. This backend's own stream, terminals and background processes keep today's
+      // handling: removal stops them below.
+      const gate = await this.acquireStructuralMutationGate(workspaceId, {
+        ignoreKinds: new Set(["turn", "terminal"]),
+        backgroundProcesses: "allow",
+      });
+      if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
+      releaseMutationGate = gate.data;
       const claim = await this.claimPendingRemoval(workspaceId, binding);
       if (!claim.success) return Err(claim.error);
       pendingRemovalId = claim.data;
@@ -7534,6 +7552,12 @@ export class WorkspaceService
           });
         }
       }
+      await releaseMutationGate?.().catch((error: unknown) => {
+        log.warn("Failed to release the mutation gate after workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
       for (const hold of admissionHolds) {
         hold[Symbol.dispose]();
       }
@@ -8478,6 +8502,7 @@ export class WorkspaceService
 
   async rename(workspaceId: string, newName: string): Promise<Result<{ newWorkspaceId: string }>> {
     let releaseOverridesLock: (() => Promise<void>) | undefined;
+    let releaseMutationGate: (() => Promise<void>) | undefined;
     try {
       if (this.shuttingDown) return Err("Server is shutting down");
       if (this.aiService.isStreaming(workspaceId)) {
@@ -8524,6 +8549,17 @@ export class WorkspaceService
         return Err("Failed to find workspace in config");
       }
       const { projectPath: configProjectPath } = workspace;
+
+      // #4476: the move must not pull the checkout from under a turn, terminal or background
+      // process of another backend (or of a shared sub-agent), nor under this backend's own turn
+      // or background process (#4478; the isStreaming check above misses preparation and shared
+      // children). Own terminals stay open, as before: their shells follow the moved directory.
+      const gate = await this.acquireStructuralMutationGate(workspaceId, {
+        ignoreKinds: new Set(["terminal"]),
+        backgroundProcesses: "refuse",
+      });
+      if (!gate.success) return Err(`Cannot rename workspace: ${gate.error}`);
+      releaseMutationGate = gate.data;
       const configSnapshot = this.config.loadConfigOrDefault();
 
       // Hold THIS workspace's MCP-overrides lock across the checkout move AND
@@ -8871,6 +8907,12 @@ export class WorkspaceService
       // a release failure skip clearing the renaming flag below.
       await releaseOverridesLock?.().catch((error: unknown) => {
         log.warn("Failed to release MCP-overrides lock after rename", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+      await releaseMutationGate?.().catch((error: unknown) => {
+        log.warn("Failed to release the mutation gate after rename", {
           workspaceId,
           error: getErrorMessage(error),
         });
@@ -9911,6 +9953,57 @@ export class WorkspaceService
   }
 
   /**
+   * Take the cross-process mutation gate for a structural mutation (#4476): rename, remove,
+   * archive that deletes the checkout, unarchive snapshot restore, worktree deletion. Another
+   * backend may use this workspace at the same time, and only its leases can tell. The gate
+   * covers every shared-checkout (isolation "none") sub-agent of the workspace too: moving or
+   * deleting the checkout disturbs their activity as well. Never waits: resolves to the gate's
+   * release, or to the refusal message while any of them is in use.
+   *
+   * `own` says which of this backend's own activities the mutator ends or tolerates itself; other
+   * backends' activity always refuses.
+   */
+  private async acquireStructuralMutationGate(
+    workspaceId: string,
+    own: {
+      ignoreKinds: ReadonlySet<WorkspaceUseKind>;
+      // "refuse": also this backend's tracked background processes; "allow": only processes this
+      // backend does not track (another backend's, or survivors of a crashed one).
+      backgroundProcesses: "refuse" | "allow";
+    }
+  ): Promise<Result<() => Promise<void>>> {
+    const workspaceIds = [workspaceId];
+    const config = this.config.loadConfigOrDefault();
+    const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+    // A shared sub-agent's own mutations never move or delete the checkout it borrows.
+    if (row != null && row.taskIsolation !== "none") {
+      for (const project of config.projects.values()) {
+        for (const ws of project.workspaces) {
+          if (ws.taskIsolation === "none" && ws.path === row.path && ws.id != null) {
+            workspaceIds.push(ws.id);
+          }
+        }
+      }
+    }
+    try {
+      return Ok(
+        await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
+          ignoreOwnKinds: own.ignoreKinds,
+          hasRunningBackgroundProcesses: (id) =>
+            own.backgroundProcesses === "refuse"
+              ? this.hasRunningBackgroundBashProcesses(id)
+              : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
+                  extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
+                }),
+        })
+      );
+    } catch (error) {
+      if (error instanceof WorkspaceBusyError) return Err(error.message);
+      throw error;
+    }
+  }
+
+  /**
    * Devcontainer background spawn records live inside the container under
    * `<workspaceFolder>/.xum/tmp/mux-bashes/<workspaceId>` (DevcontainerRuntime.tempDir()),
    * which the standard workspace bind mount makes host-visible at the same path beneath the
@@ -10139,6 +10232,7 @@ export class WorkspaceService
     if (this.shuttingDown) return Err("Server is shutting down");
     this.archivingWorkspaces.add(workspaceId);
     let admissionHold: Disposable | undefined;
+    let releaseMutationGate: (() => Promise<void>) | undefined;
 
     try {
       // Fail-closed live-activity gate for model-facing callers. This check and the
@@ -10377,6 +10471,22 @@ export class WorkspaceService
         );
       }
 
+      // #4476: an archive that deletes the checkout (snapshot or delete behavior) refuses while
+      // another backend uses the workspace or its shared sub-agents. Keep-mode archive is not a
+      // structural mutation. This backend's own stream and terminals keep today's handling
+      // (stopped below), and so do its own background processes.
+      if (
+        beforeArchiveMetadata != null &&
+        archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior)
+      ) {
+        const gate = await this.acquireStructuralMutationGate(workspaceId, {
+          ignoreKinds: new Set(["turn", "terminal"]),
+          backgroundProcesses: "allow",
+        });
+        if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
+        releaseMutationGate = gate.data;
+      }
+
       if (needsSnapshotCapture && beforeArchiveMetadata) {
         const initialArchiveConfirmationResult = await this.getArchiveUntrackedFilesConfirmation({
           workspaceId,
@@ -10580,6 +10690,12 @@ export class WorkspaceService
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
     } finally {
+      await releaseMutationGate?.().catch((error: unknown) => {
+        log.warn("Failed to release the mutation gate after archive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
       admissionHold?.[Symbol.dispose]();
       this.archivingWorkspaces.delete(workspaceId);
     }
@@ -10608,12 +10724,27 @@ export class WorkspaceService
   }
 
   private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
+    let releaseMutationGate: (() => Promise<void>) | undefined;
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
         return Err("Workspace not found");
       }
       const { projectPath, workspacePath } = workspace;
+
+      // #4476: restoring a snapshot rewrites the checkout, so it refuses (before unarchiving)
+      // while another backend uses the workspace or its shared sub-agents.
+      if (
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .worktreeArchiveSnapshot != null
+      ) {
+        const gate = await this.acquireStructuralMutationGate(workspaceId, {
+          ignoreKinds: new Set(),
+          backgroundProcesses: "allow",
+        });
+        if (!gate.success) return Err(`Cannot unarchive workspace: ${gate.error}`);
+        releaseMutationGate = gate.data;
+      }
 
       let didUnarchive = false;
       let previousUnarchivedAt: string | undefined;
@@ -10769,10 +10900,18 @@ export class WorkspaceService
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to unarchive workspace: ${message}`);
+    } finally {
+      await releaseMutationGate?.().catch((error: unknown) => {
+        log.warn("Failed to release the mutation gate after unarchive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
     }
   }
 
   async deleteWorktree(workspaceId: string): Promise<Result<void>> {
+    let releaseMutationGate: (() => Promise<void>) | undefined;
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspaceMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
@@ -10792,6 +10931,13 @@ export class WorkspaceService
         return Err("Deleting a managed worktree is only supported for worktree runtimes");
       }
 
+      // #4476: refuse while another backend uses the workspace or its shared sub-agents.
+      const gate = await this.acquireStructuralMutationGate(workspaceId, {
+        ignoreKinds: new Set(),
+        backgroundProcesses: "allow",
+      });
+      if (!gate.success) return Err(`Cannot delete the managed worktree: ${gate.error}`);
+      releaseMutationGate = gate.data;
       const managedPath = workspaceMetadata.namedWorkspacePath;
       await removeManagedGitWorktree(workspaceMetadata.projectPath, managedPath);
       await this.emitCurrentWorkspaceMetadata(workspaceId);
@@ -10799,6 +10945,13 @@ export class WorkspaceService
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to delete managed worktree: ${message}`);
+    } finally {
+      await releaseMutationGate?.().catch((error: unknown) => {
+        log.warn("Failed to release the mutation gate after worktree deletion", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
     }
   }
 
