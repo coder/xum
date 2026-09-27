@@ -32,7 +32,7 @@ import {
  * file per holder, and the kind in the name lets a refusal say what is running without a new
  * record schema. The path is unique to this instance, so acquiring it never contends.
  */
-// "unarchive" is held only across a keep-mode unarchive's commit (#4871).
+// "unarchive" is held by a keep-mode unarchive from before its commit until it finishes (#4871).
 export type WorkspaceUseKind =
   | "turn"
   | "terminal"
