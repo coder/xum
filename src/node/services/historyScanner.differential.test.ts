@@ -11,6 +11,7 @@ import {
   generateRows,
   json,
   mulberry32,
+  OVERSIZED,
   rowsToBytes,
   type GeneratedRow,
 } from "./historyScanner.generator.testHarness";
@@ -206,4 +207,95 @@ describe("findProviderHistoryStart differential oracle", () => {
     expect(reference.rows.map((row) => row.message?.id ?? null)).toEqual(["c", "deep", "b", null]);
     expect(difference(production, reference)).toBeNull();
   }, 30_000);
+});
+
+// The plain-row fast path shares its separator class with the raw reset marker check, so changing
+// that class moves both production sides at once and only this frozen copy notices. A readable row
+// with a duplicate key is where the class decides the outcome: a reset split by separators is
+// ambiguous reset evidence (a floor), while any other character keeps the row readable.
+describe("findProviderHistoryStart separator class", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-locator-separators-"));
+  });
+  afterAll(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  // Control-only (DEL, NEL), whitespace-only (em space, no-break space) and BOM separators, then
+  // format and private-use characters that are not separators.
+  test.each([
+    ["007F", "start"],
+    ["0085", "start"],
+    ["2003", "start"],
+    ["00A0", "start"],
+    ["FEFF", "start"],
+    ["200B", "exhausted"],
+    ["00AD", "exhausted"],
+    ["E000", "exhausted"],
+  ] as const)("matches the frozen locator for U+%s inside a reset value", async (code, kind) => {
+    const readable = (id: string) => json(createMuxMessage(id, "user", id));
+    const character = String.fromCharCode(Number.parseInt(code, 16));
+    const row = `{"id":"x","role":"user","parts":[],"metadata":{"contextBoundaryKind":"re${character}set"},"id":"dup"}`;
+    const file = path.join(dir, `${code}.jsonl`);
+    await fs.writeFile(file, rowsToBytes([readable("a"), row, readable("b")]));
+    await using handle = await fs.open(file, "r");
+    const { size } = await handle.stat();
+    const production = await observe(findProviderHistoryStart, handle, size, 0, false, null);
+    const reference = await observe(
+      referenceFindProviderHistoryStart,
+      handle,
+      size,
+      0,
+      false,
+      null
+    );
+    expect(reference.result).toMatchObject({ kind });
+    expect(difference(production, reference)).toBeNull();
+  });
+});
+
+// The fast path defers a row's reset-probe calls and replays them (or, once the row turns
+// oversized, flushes them) in arrival order. The probe recognizes key, colon and value only in
+// reverse order, so feeding the segments in any other order loses a reset whose tokens sit in
+// different scan chunks. Junk between the tokens keeps the raw marker check from masking the probe.
+describe("findProviderHistoryStart deferred reset probe", () => {
+  let dir: string;
+  beforeAll(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "history-locator-probe-order-"));
+  });
+  afterAll(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  // [label, row bytes, key offset, value offset]; the newest row, so scan chunks align with its end.
+  test.each([
+    ["row across two scan chunks", SESSION_HISTORY_SCAN_CHUNK_BYTES + 34_000, 100, 90_000],
+    // The flush on turning oversized covers the last SESSION_HISTORY_MAX_LINE_BYTES or so.
+    ["row that turns oversized", OVERSIZED + 300_000, 500_000, 1_000_000],
+  ] as const)("matches the frozen locator for a %s", async (_label, bytes, keyAt, valueAt) => {
+    const key = '"contextBoundaryKind"';
+    const value = ':"reset"';
+    const row =
+      "q".repeat(keyAt) +
+      key +
+      "q".repeat(valueAt - keyAt - key.length) +
+      value +
+      "q".repeat(bytes - valueAt - value.length);
+    const file = path.join(dir, `${bytes}.jsonl`);
+    await fs.writeFile(file, rowsToBytes([json(createMuxMessage("a", "user", "a")), row]));
+    await using handle = await fs.open(file, "r");
+    const { size } = await handle.stat();
+    const production = await observe(findProviderHistoryStart, handle, size, 0, false, null);
+    const reference = await observe(
+      referenceFindProviderHistoryStart,
+      handle,
+      size,
+      0,
+      false,
+      null
+    );
+    expect(reference.result).toMatchObject({ kind: "start" });
+    expect(difference(production, reference)).toBeNull();
+  });
 });

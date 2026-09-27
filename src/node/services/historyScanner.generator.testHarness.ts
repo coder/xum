@@ -153,10 +153,10 @@ const hex4 = (character: string) => character.charCodeAt(0).toString(16).padStar
 const perCharU = [...SESSION_HISTORY_RESET_NEEDLE].map((c) => "\\u" + hex4(c)).join("");
 
 /**
- * Raw spellings of the reset marker the probes must recognize (or deliberately near-miss), from
- * historyReplacementRows.test.ts and historyService.providerPrivacy.test.ts.
+ * Raw spellings of the reset marker the probes must recognize, from historyReplacementRows.test.ts
+ * and historyService.providerPrivacy.test.ts.
  */
-const RESET_ENCODINGS = [
+export const RESET_ENCODINGS = [
   SESSION_HISTORY_RESET_NEEDLE,
   '"contextBoundaryKind" : "reset"',
   '"contextBoundaryKind"\\x20\\u003A"res\\x65t"',
@@ -174,13 +174,14 @@ const RESET_ENCODINGS = [
   '\\u00\\u002022contextBoundaryKind":"reset"',
   "😀" + perCharU + "\\u00",
   "\ufeff" + SESSION_HISTORY_RESET_NEEDLE,
-  // Near misses: a key or value alone, and the tokens in the wrong order.
-  '"contextBoundaryKind"',
-  '"reset" : "contextBoundaryKind"',
 ];
+/** Near misses: a key or value alone, and the tokens in the wrong order. */
+const RESET_NEAR_MISSES = ['"contextBoundaryKind"', '"reset" : "contextBoundaryKind"'];
+// Same order as the original single list, so seeded layouts keep drawing the same encodings.
+const ENCODING_CHOICES = [...RESET_ENCODINGS, ...RESET_NEAR_MISSES];
 
 /** historyReplacementRows.test.ts's per-character mixer, driven by the layout's seed. */
-function mixedResetEncoding(random: () => number): string {
+export function mixedResetEncoding(random: () => number): string {
   let text = "";
   for (const character of SESSION_HISTORY_RESET_NEEDLE) {
     const code = character.charCodeAt(0).toString(16);
@@ -237,7 +238,7 @@ function adversarialRows(
   oversized: boolean
 ): GeneratedRow[] {
   const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)];
-  const encoding = () => (random() < 0.25 ? mixedResetEncoding(random) : pick(RESET_ENCODINGS));
+  const encoding = () => (random() < 0.25 ? mixedResetEncoding(random) : pick(ENCODING_CHOICES));
   // Valid JSON string content with some characters \u-escaped (random hex case); JSON.parse
   // decodes it, so an escaped key in metadata is a real key.
   const escapeSome = (text: string) =>

@@ -86,8 +86,13 @@ function compactResetProbe(text: string): string {
   return stripEscapedResetSeparators(stripRawResetSeparators(text));
 }
 
+// Raw characters the reset recognizers treat as removable separators. Defined once: the plain-row
+// gate below (RESET_OR_BOUNDARY_CANDIDATE) is only sound while it uses exactly this class.
+const RESET_SEPARATOR = String.raw`[\s\p{Cc}]`;
+const RESET_SEPARATORS = new RegExp(RESET_SEPARATOR, "gu");
+
 function stripRawResetSeparators(text: string): string {
-  return text.replace(/[\s\p{Cc}]/gu, "");
+  return text.replace(RESET_SEPARATORS, "");
 }
 function stripEscapedResetSeparators(text: string): string {
   return text.replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
@@ -209,7 +214,8 @@ export function createUnreadableHistoryResetProbe() {
   };
 }
 
-function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
+// Exported for tests: historyScanner.plainRow.test.ts checks readPlainHistoryRow against it.
+export function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
   let rowReset = hasRawResetMarker(text);
   probe.possibleReset ||= rowReset;
   try {
@@ -228,6 +234,111 @@ function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMess
     probe.possibleReset = false;
     return normalizePersistedMessage(raw);
   } catch {
+    return null;
+  }
+}
+
+// Any backslash that may start a \u / \x escape (separators allowed before the letter, as
+// stripRawResetSeparators removes them first), the letters of "reset" joined only by separators,
+// or the compaction boundary key. See readPlainHistoryRow for why this set suffices.
+const RESET_OR_BOUNDARY_CANDIDATE = (() => {
+  const separators = `${RESET_SEPARATOR}*`;
+  return new RegExp(
+    [String.raw`\\${separators}[uUxX]`, [..."reset"].join(separators), "compactionBoundary"].join(
+      "|"
+    ),
+    "u"
+  );
+})();
+
+// Rows with more `[` plus `{` bytes than this take the full classifier path: nesting depth is at
+// most that count, and JSON.stringify must provably not throw for plain rows (see below).
+const PLAIN_ROW_MAX_BRACKETS = 1024;
+
+/**
+ * Startup check for the bracket guard. JSON.parse is iterative, but JSON.stringify recurses: V8
+ * on the Node main thread throws around depth 3-5k, Bun/JSC far deeper. If this runtime cannot
+ * stringify PLAIN_ROW_MAX_BRACKETS levels (alternating objects and arrays), disable the plain-row
+ * fast path so every row keeps the full classifier.
+ */
+const plainRowFastPathEnabled = (() => {
+  let nested: unknown = [];
+  for (let depth = 1; depth < PLAIN_ROW_MAX_BRACKETS; depth++)
+    nested = depth % 2 === 0 ? [nested] : { a: nested };
+  try {
+    JSON.stringify(nested);
+    return true;
+  } catch (error) {
+    log.warn("Disabled the provider history plain-row fast path: shallow JSON.stringify failed", {
+      depth: PLAIN_ROW_MAX_BRACKETS,
+      error: String(error),
+    });
+    return false;
+  }
+})();
+
+/** True when the row's `[` plus `{` bytes exceed PLAIN_ROW_MAX_BRACKETS. */
+function exceedsPlainRowBrackets(segments: readonly Buffer[], size: number): boolean {
+  if (size <= PLAIN_ROW_MAX_BRACKETS) return false;
+  let count = 0;
+  for (const segment of segments) {
+    for (const bracket of [0x5b, 0x7b]) {
+      for (let i = segment.indexOf(bracket); i !== -1; i = segment.indexOf(bracket, i + 1))
+        if (++count > PLAIN_ROW_MAX_BRACKETS) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Fast path of the provider locator for a row of at most SESSION_HISTORY_MAX_LINE_BYTES: returns
+ * the message classifyHistoryScanRow would return when the row provably carries no reset or
+ * boundary evidence, and null otherwise (the caller then runs the reset probe and the full
+ * classifier). `segments` are the row's bytes in any order, `text` their utf8 decoding in file
+ * order, `size` their total length.
+ *
+ * SAFETY (provider privacy, #4655): for rows this returns non-null, skipping the probe and the
+ * full classifier cannot change what the locator returns or delivers:
+ * 1. The caller defers the row's addHistoryResetProbe calls and replays them in arrival order
+ *    only when this returns null (or at once when the row turns oversized), so the probe sees
+ *    the exact call sequence it saw before. Nothing reads the probe between a row's add() and its
+ *    delivery; recoverOversizedBoundary reads it only after that flush.
+ * 2. For a row the full path classifies readable, the probe state is unobservable: the
+ *    classifier forces possibleReset = false and the locator clears the probe after a readable
+ *    row. The only outputs are the message, unreadableRunEnd = null and the boundary checks.
+ * 3. No candidate match implies hasRawResetMarker(text) is false: with no backslash followed
+ *    (after optional separators) by u/U/x/X, stripEscapedResetSeparators and decodeResetEscapes
+ *    are identities on stripRawResetSeparators(text), and the needle contains "reset", which then
+ *    needs r, e, s, e, t joined only by separator characters (the same RESET_SEPARATOR class).
+ * 4. The needle in JSON.stringify(parsed) needs a parsed string exactly "reset". Without \u
+ *    escapes JSON.parse forms letters only from literal letters, so the text would contain a
+ *    literal "reset", which the candidate regex excludes.
+ * 5. JSON.stringify of parsed data throws only on nesting deeper than the stack allows (its
+ *    output is at most 6x a 1 MiB row). Depth is at most the bracket count, capped at
+ *    PLAIN_ROW_MAX_BRACKETS, and the startup check proved that depth safe in this runtime.
+ * 6. So rowReset stays false (hasAmbiguousResetKeys is never consulted) and the classifier returns
+ *    normalizePersistedMessage of the same parse, as below. normalize (legacy rename,
+ *    idleCompacted, tool payload depth) never adds compactionBoundary or contextBoundaryKind, and
+ *    without \u escapes a parsed key needs its literal text, so the message is neither a durable
+ *    boundary nor a manual reset, and the locator takes the same branches with the same message.
+ * Unreadable rows and rows with reset or boundary evidence, escapes, deep nesting or oversize all
+ * keep the full path. If this gate ever needs more cases, narrow it (send more rows to the full
+ * path) instead of adding mechanism.
+ */
+// Exported for tests: historyScanner.plainRow.test.ts checks it against classifyHistoryScanRow.
+export function readPlainHistoryRow(
+  text: string,
+  segments: readonly Buffer[],
+  size: number
+): MuxMessage | null {
+  if (!plainRowFastPathEnabled || RESET_OR_BOUNDARY_CANDIDATE.test(text)) return null;
+  if (exceedsPlainRowBrackets(segments, size)) return null;
+  try {
+    const raw: unknown = JSON.parse(text);
+    if (!isReadableHistoryMessage(raw)) return null;
+    return normalizePersistedMessage(raw);
+  } catch {
+    // Same as classifyHistoryScanRow: a parse or normalize failure makes the row unreadable.
     return null;
   }
 }
@@ -301,8 +412,14 @@ export async function findProviderHistoryStart(
   // marker split across two segments is still seen.
   let boundaryMarkerSeen = false;
   let boundaryMarkerCarry = Buffer.alloc(0);
+  // `parts` holds the row's segments in arrival (reverse file) order while the row fits
+  // SESSION_HISTORY_MAX_LINE_BYTES. Their reset-probe calls are deferred (readPlainHistoryRow,
+  // point 1): replayed in arrival order by readBufferedRow when the fast path declines, or flushed
+  // here the moment the row turns oversized, after which segments stream into the probe as before.
+  const feedProbe = (segments: readonly Buffer[]) => {
+    for (const segment of segments) addHistoryResetProbe(probe, segment, true);
+  };
   const add = (bytes: Buffer) => {
-    addHistoryResetProbe(probe, bytes, true);
     if (!boundaryMarkerSeen) {
       const window =
         boundaryMarkerCarry.length > 0 ? Buffer.concat([bytes, boundaryMarkerCarry]) : bytes;
@@ -310,8 +427,13 @@ export async function findProviderHistoryStart(
       boundaryMarkerCarry = Buffer.from(window.subarray(0, COMPACTION_BOUNDARY_NEEDLE.length - 1));
     }
     size += bytes.length;
-    if (size <= SESSION_HISTORY_MAX_LINE_BYTES) parts.push(bytes);
-    else parts = [];
+    if (size <= SESSION_HISTORY_MAX_LINE_BYTES) {
+      parts.push(bytes);
+      return;
+    }
+    feedProbe(parts);
+    parts = [];
+    addHistoryResetProbe(probe, bytes, true);
   };
   /**
    * An oversized compaction boundary behaves exactly like a normal-size one (#4551): rotation
@@ -337,19 +459,19 @@ export async function findProviderHistoryStart(
     log.debug("Recovered an oversized compaction boundary row", { offset: start, bytes: size });
     return candidate;
   };
-  const deliver = async (
-    start: number
-  ): Promise<LocatedHistoryBoundary | typeof STOPPED | null> => {
-    if (size === 0) {
-      rowEnd = start;
-      boundaryMarkerSeen = false;
-      boundaryMarkerCarry = Buffer.alloc(0);
-      return null;
-    }
-    const message =
-      size > SESSION_HISTORY_MAX_LINE_BYTES
-        ? await recoverOversizedBoundary(start)
-        : classifyHistoryScanRow(Buffer.concat(parts.reverse()).toString("utf8"), probe);
+  const readBufferedRow = (): MuxMessage | null => {
+    // Single-segment rows (all but rows crossing a chunk edge) need no concat; keep `parts` in
+    // arrival order for the probe replay below.
+    const text = (parts.length === 1 ? parts[0] : Buffer.concat([...parts].reverse())).toString(
+      "utf8"
+    );
+    const plain = readPlainHistoryRow(text, parts, size);
+    if (plain) return plain;
+    feedProbe(parts);
+    return classifyHistoryScanRow(text, probe);
+  };
+  type Delivered = LocatedHistoryBoundary | typeof STOPPED | null;
+  const settle = (start: number, message: MuxMessage | null): Delivered => {
     const stopRequested = visit?.({ start, size, message }) === true;
     if (message) unreadableRunEnd = null;
     else unreadableRunEnd ??= rowEnd;
@@ -405,16 +527,30 @@ export async function findProviderHistoryStart(
     boundaryMarkerCarry = Buffer.alloc(0);
     return null;
   };
+  /** Synchronous for rows up to the line limit: only an oversized row may re-read the file. */
+  const deliver = (start: number): Delivered | Promise<Delivered> => {
+    if (size === 0) {
+      rowEnd = start;
+      boundaryMarkerSeen = false;
+      boundaryMarkerCarry = Buffer.alloc(0);
+      return null;
+    }
+    if (size > SESSION_HISTORY_MAX_LINE_BYTES)
+      return recoverOversizedBoundary(start).then((message) => settle(start, message));
+    return settle(start, readBufferedRow());
+  };
   for (let end = fileSize; end > 0; ) {
     const start = Math.max(0, end - SESSION_HISTORY_SCAN_CHUNK_BYTES);
     const chunk = Buffer.alloc(end - start);
     const read = await handle.read(chunk, 0, chunk.length, start);
     if (read.bytesRead !== chunk.length) throw new Error("History changed during provider read");
     let edge = chunk.length;
-    for (let i = chunk.length - 1; i >= 0; i--) {
-      if (chunk[i] !== 10) continue;
+    // Native newline search. Stop explicitly at index 0: a negative offset would search from the
+    // end of the chunk again.
+    for (let i = chunk.lastIndexOf(10); i >= 0; i = i > 0 ? chunk.lastIndexOf(10, i - 1) : -1) {
       add(chunk.subarray(i + 1, edge));
-      const location = await deliver(start + i + 1);
+      const delivered = deliver(start + i + 1);
+      const location = delivered instanceof Promise ? await delivered : delivered;
       if (location === STOPPED) return { kind: "stopped" };
       if (location !== null) return { kind: "start", ...location };
       edge = i;
@@ -422,7 +558,8 @@ export async function findProviderHistoryStart(
     add(chunk.subarray(0, edge));
     end = start;
   }
-  const location = await deliver(0);
+  const delivered = deliver(0);
+  const location = delivered instanceof Promise ? await delivered : delivered;
   if (location === STOPPED) return { kind: "stopped" };
   return location === null
     ? { kind: "exhausted", oldestBoundary, boundaryCount }
