@@ -1009,7 +1009,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           branchName,
           false,
           expect.any(AbortSignal),
-          true
+          true,
+          { keepBranch: false }
         );
         expect(deleteWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(deleteWorkspaceBMock).toHaveBeenCalledWith(
@@ -1017,7 +1018,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           branchName,
           false,
           expect.any(AbortSignal),
-          true
+          true,
+          { keepBranch: false }
         );
         expect(initWorkspaceMock).not.toHaveBeenCalled();
         expect(removeContainerSpy).not.toHaveBeenCalled();
