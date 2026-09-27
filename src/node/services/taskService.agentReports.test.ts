@@ -41,6 +41,7 @@ import {
   streamEnd,
   stubStableIds,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -3562,6 +3563,55 @@ describe("TaskService", () => {
       );
     });
   }
+
+  test("agent_report wake applies a hold preference enabled during its preflight", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentId = "parent-progress-late-hold";
+    const childId = "child-progress-late-hold";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentId),
+        projectWorkspace(projectPath, "child", childId, {
+          name: "agent_review_child",
+          parentWorkspaceId: parentId,
+          agentType: "review",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // The user turns hold on while the wake awaits its workspace-turn lookup.
+    spyOn(
+      workspaceTurnManagerFor(taskService),
+      "getActiveWorkspaceTurnMuxMetadataForWorkspace"
+    ).mockImplementation(async () => {
+      await config.editConfig((cfg) => {
+        const parent = cfg.projects
+          .get(projectPath)
+          ?.workspaces.find((candidate) => candidate.id === parentId);
+        assert(parent, "parent workspace must exist");
+        parent.agentMessageDispatchMode = "turn-end";
+        return cfg;
+      });
+      return undefined;
+    });
+
+    await taskService.reportAgentProgress(childId, "progress-1", {
+      reportMarkdown: "Found a correctness issue.",
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith(
+      parentId,
+      expect.any(String),
+      expect.objectContaining({ queueDispatchMode: "turn-end" }),
+      expect.anything()
+    );
+  });
 
   test("agent_report refuses an update whose run ended before the wake was sent", async () => {
     const config = await createTestConfig(rootDir);

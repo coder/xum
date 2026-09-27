@@ -11692,11 +11692,16 @@ export class TaskService implements AgentTaskIntegration {
     // restrictions that are not in history yet, and promotion never overtakes it, so a wake queued
     // behind it would run after it with older grants. A queued tool-end entry already cuts this
     // turn, and the turn it starts sees the report. Both cases defer to the idle drain.
-    // An owner that holds agent messages until its turn ends is never cut (#4737): the idle drain
+    // An owner that holds agent messages until its turn ends is not cut (#4737): the idle drain
     // delivers the report when the turn ends. Re-read with the other checks so a preference
-    // change acknowledged during the awaits below applies.
+    // change acknowledged during the awaits below applies. Exception: an owner running a
+    // delegated workspace turn keeps the cut, because without a same-turn continuation that turn
+    // would settle and publish its result before the owner saw its child's report.
+    const holdsReportUntilTurnEnd = (): boolean =>
+      this.resolveRecipientDispatchMode(ownerWorkspaceId, undefined) === "turn-end" &&
+      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(ownerWorkspaceId) == null;
     const liveTurnStillCuttable = (): boolean =>
-      this.resolveRecipientDispatchMode(ownerWorkspaceId, undefined) === "tool-end" &&
+      !holdsReportUntilTurnEnd() &&
       this.aiService.isStreaming(ownerWorkspaceId) &&
       !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
       this.workspaceService.promotedToolEndWouldLeadQueue(ownerWorkspaceId);
@@ -12502,7 +12507,7 @@ export class TaskService implements AgentTaskIntegration {
         queueDedupeKey: `${dedupePrefix}${toolCallId}`,
         // Reports are agent messages too (#4737): a parent that holds agent messages until its
         // turn ends gets this update at turn end instead of being cut at the next step.
-        queueDispatchMode: this.resolveRecipientDispatchMode(parentWorkspaceId, undefined),
+        resolveRecipientHold: true,
         // Only the queue head's dispatch mode can cut the parent's stream. A child's earlier
         // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
         // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.
@@ -12558,6 +12563,11 @@ export class TaskService implements AgentTaskIntegration {
       strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
     };
     queueDispatchMode?: TaskMessageQueueDispatchMode;
+    /**
+     * Apply the parent's agent-message hold preference to queueDispatchMode, read after this
+     * helper's awaits so a preference acknowledged meanwhile still applies.
+     */
+    resolveRecipientHold?: boolean;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
     /** Invoked once the wake turn is durably accepted. */
@@ -12610,6 +12620,10 @@ export class TaskService implements AgentTaskIntegration {
       );
     };
 
+    const queueDispatchMode =
+      params.resolveRecipientHold === true
+        ? this.resolveRecipientDispatchMode(parentWorkspaceId, params.queueDispatchMode)
+        : params.queueDispatchMode;
     const sendResult = await this.workspaceService.sendMessage(
       parentWorkspaceId,
       params.content,
@@ -12618,9 +12632,7 @@ export class TaskService implements AgentTaskIntegration {
         agentId: resumeOptions.agentId,
         thinkingLevel: resumeOptions.thinkingLevel,
         reasoningMode: resumeOptions.reasoningMode,
-        ...(params.queueDispatchMode != null
-          ? { queueDispatchMode: params.queueDispatchMode }
-          : {}),
+        ...(queueDispatchMode != null ? { queueDispatchMode } : {}),
         ...(params.sendRestrictions?.toolPolicy != null
           ? { toolPolicy: params.sendRestrictions.toolPolicy }
           : {}),

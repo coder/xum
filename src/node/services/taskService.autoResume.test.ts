@@ -22,6 +22,7 @@ import {
   saveWorkspaces,
   streamEnd,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   collectFullHistory,
@@ -1876,7 +1877,12 @@ describe("TaskService", () => {
     );
   });
 
-  test("terminal report waits for the turn to end when the parent holds agent messages", async () => {
+  for (const [name, delegated] of [
+    ["waits for the turn to end when the parent holds agent messages", false],
+    // A delegated workspace turn would otherwise settle and publish its result before the owner
+    // saw its child's report, so the hold yields to the cut there.
+    ["still cuts a holding parent that runs a delegated workspace turn", true],
+  ] satisfies Array<[string, boolean]>) test(`terminal report ${name}`, async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const parentWorkspaceId = "parent-hold-111";
@@ -1913,6 +1919,14 @@ describe("TaskService", () => {
       getActiveTurnGeneration: mock(() => (parentStreaming ? liveTurn : undefined)),
     });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+    const liveRegistration = spyOn(
+      workspaceTurnManagerFor(taskService),
+      "getLiveWorkspaceTurnRegistration"
+    ).mockImplementation((workspaceId) =>
+      delegated && workspaceId === parentWorkspaceId
+        ? { handleId: "wst_parent", ownerWorkspaceId: "grandparent", accepted: true }
+        : undefined
+    );
 
     await streamEnd(taskService, {
       type: "stream-end",
@@ -1922,7 +1936,17 @@ describe("TaskService", () => {
       parts: [{ type: "text", text: "Hello from child" }],
     });
     await flushTerminalAttentionDrains(taskService);
+    liveRegistration.mockRestore();
 
+    if (delegated) {
+      expect(sendMessage).toHaveBeenCalledWith(
+        parentWorkspaceId,
+        expect.stringContaining(BACKGROUND_WORK_WAKE_OPENINGS.subagentsCompleted),
+        expect.objectContaining({ queueDispatchMode: "tool-end" }),
+        expect.anything()
+      );
+      return;
+    }
     // Mid-turn: no tool-end wake cuts the busy parent.
     expect(sendMessage).not.toHaveBeenCalled();
     expect(resumeStream).not.toHaveBeenCalled();
