@@ -1010,6 +1010,19 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
   });
 
+  /** Replace the first `access`/`writeFile` call on the editor marker only; others run for real. */
+  function failOnceForMarker(method: "access" | "writeFile", replacement: () => Promise<void>) {
+    const real = fsPromises[method] as (...args: unknown[]) => Promise<void>;
+    let replaced = false;
+    return spyOn(fsPromises, method).mockImplementation(((...args: unknown[]) => {
+      if (!replaced && String(args[0]) === externalEditorMarkerPath) {
+        replaced = true;
+        return replacement();
+      }
+      return real(...args);
+    }) as never);
+  }
+
   test("a failed marker persistence does not leave stale ancestry for the next attempt", async () => {
     await fsPromises.rm(externalEditorMarkerPath, { force: true });
 
@@ -1017,10 +1030,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // batch records markerPreexisted: true) and the write. The failed attempt must discard
     // that batch; otherwise the retry below would join it and its rollback would preserve a
     // marker no launch ever backed.
-    const accessSpy = spyOn(fsPromises, "access").mockImplementationOnce(() =>
+    // Only the marker's I/O fails: the editor use lease (#4883) writes its own lock files first.
+    const accessSpy = failOnceForMarker("access", () =>
       Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }))
     );
-    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementationOnce(() =>
+    const writeSpy = failOnceForMarker("writeFile", () =>
       Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
     );
     try {
@@ -1048,7 +1062,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const writeGate = new Promise<void>((resolve) => {
       releaseWrite = resolve;
     });
-    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementationOnce(async () => {
+    const writeSpy = failOnceForMarker("writeFile", async () => {
       await writeGate;
     });
     try {

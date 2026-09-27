@@ -3946,7 +3946,6 @@ export class WorkspaceService
 
     // Archiving hides workspace UI; do not leave terminal PTYs running headless.
     this.terminalService?.closeWorkspaceSessions(workspaceId);
-    await this.releaseExternalAppUseLeases(workspaceId);
 
     // Cached MCP servers outlive the stream that started them, and stdio ones run inside the
     // checkout a snapshot archive is about to delete. Removal-style stop (no
@@ -9683,16 +9682,19 @@ export class WorkspaceService
     const editorLease = this.externalEditorUseLeases.get(workspaceId);
     this.externalEditorUseLeases.delete(workspaceId);
     const releases = [
-      editorLease?.release(),
-      this.terminalService?.releaseNativeTerminalUseLease(workspaceId),
+      () => editorLease?.release(),
+      () => this.terminalService?.releaseNativeTerminalUseLease(workspaceId),
     ];
+    // Never throws: archive and removal have already committed when this runs.
     for (const release of releases) {
-      await release?.catch((error: unknown) => {
+      try {
+        await release();
+      } catch (error) {
         log.warn("Failed to release an external app use lease", {
           workspaceId,
           error: getErrorMessage(error),
         });
-      });
+      }
     }
   }
 
@@ -10731,6 +10733,10 @@ export class WorkspaceService
         }
         return config;
       });
+      // Only now that the archive is durable (#4883): a snapshot capture that asked for
+      // confirmation or failed returned above with the native terminals and editors still
+      // counted as in use.
+      await this.releaseExternalAppUseLeases(workspaceId);
 
       // Startup housekeeping may still be recovering this chat in a transient session whose
       // stream has not started yet, so the stream stop cannot see it. Disposing it once
