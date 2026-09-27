@@ -3,11 +3,14 @@ import assert from "@/common/utils/assert";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { stableStringify } from "@/common/utils/stableStringify";
 
-const FNV_OFFSET_BASIS = 0x811c9dc5;
+// Exported (with updateFnv1a) for the server's non-blocking twin of
+// computePriorHistoryFingerprint (src/node/services/priorHistoryFingerprintAsync.ts), which
+// cannot live here because it yields through node:timers.
+export const FNV_OFFSET_BASIS = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
-const MISSING_TIMESTAMP = -1;
+export const MISSING_TIMESTAMP = -1;
 
-function updateFnv1a(hash: number, value: string): number {
+export function updateFnv1a(hash: number, value: string): number {
   let next = hash >>> 0;
   for (let index = 0; index < value.length; index += 1) {
     next ^= value.charCodeAt(index);
@@ -20,6 +23,9 @@ function updateFnv1a(hash: number, value: string): number {
  * Build a deterministic fingerprint for persisted history rows strictly older than
  * the provided cursor sequence. Reconnect since-mode uses this to detect deletes/
  * rewrites below the cursor and safely fall back to full replay.
+ *
+ * This is the reference implementation: the server's onChat replay uses the yielding
+ * computePriorHistoryFingerprintAsync, whose tests require an identical result for every input.
  */
 export function computePriorHistoryFingerprint(
   messages: readonly MuxMessage[],

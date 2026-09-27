@@ -3,6 +3,7 @@ import type { ContinuousCompactionPublication } from "./continuousCompactionJour
 import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventLoopYielder } from "@/node/utils/concurrency/eventLoopYielder";
+import { computePriorHistoryFingerprintAsync } from "./priorHistoryFingerprintAsync";
 import { STARTUP_RECOVERY_PROBE_TIMEOUT_MS } from "@/constants/startupRecovery";
 import type { AIService } from "./aiService";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -78,7 +79,6 @@ import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/type
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
-import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
 import { createOnChatReplayTimer, logOnChatReplayTiming } from "@/node/services/onChatReplayTiming";
 import type {
   HeldInput,
@@ -3243,8 +3243,9 @@ export class AgentSession {
           // Defensively verify rows below the cursor are unchanged. Without this,
           // deleting or rewriting an older row while disconnected could leave stale
           // client state when since-mode append replay skips those older sequences.
-          const priorHistoryFingerprint = replayTimer.timeSync("fingerprint", () =>
-            computePriorHistoryFingerprint(history, historyCursor.historySequence)
+          // Async so hashing a large epoch yields instead of blocking the event loop (#4655).
+          const priorHistoryFingerprint = await replayTimer.time("fingerprint", () =>
+            computePriorHistoryFingerprintAsync(history, historyCursor.historySequence)
           );
           anchorFingerprint = {
             historySequence: historyCursor.historySequence,
@@ -3350,8 +3351,8 @@ export class AgentSession {
           const priorHistoryFingerprint =
             anchorFingerprint?.historySequence === historySequence
               ? anchorFingerprint.value
-              : replayTimer.timeSync("fingerprint", () =>
-                  computePriorHistoryFingerprint(history, historySequence)
+              : await replayTimer.time("fingerprint", () =>
+                  computePriorHistoryFingerprintAsync(history, historySequence)
                 );
 
           serverCursor = {
