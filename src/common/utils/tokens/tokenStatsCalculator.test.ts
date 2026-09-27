@@ -83,6 +83,33 @@ describe("calculateTokenStats", () => {
     expect((failure as Error).message).toBe("worker died");
     expect(calls).toBe(messages.length);
   });
+
+  // #4653: counts are collected per yield slice and concatenated, so a slice flattened out of
+  // order or a dropped final slice would hand counts to the wrong consumers.
+  test("per-consumer totals stay correct when counts span several yield slices", async () => {
+    const tokenizer: tokenizerModule.Tokenizer = {
+      encoding: "test",
+      countTokens: (text) => Promise.resolve(text.startsWith("assistant") ? 1000 : 1),
+    };
+    spyOn(tokenizerModule, "getTokenizerForModel").mockResolvedValue(tokenizer);
+    // A slice ends on every third message; 11 messages leave a partial final slice. Assistant
+    // messages (every fourth) fall at different offsets in each slice, so reordering slices
+    // moves counts between consumers.
+    let isDueCalls = 0;
+    spyOn(EventLoopYielder.prototype, "isDue").mockImplementation(() => ++isDueCalls % 3 === 0);
+    const messages = Array.from({ length: 11 }, (_, i) => {
+      const role = i % 4 === 0 ? "assistant" : "user";
+      return createMuxMessage(`m${i}`, role, `${role} ${i}`);
+    });
+
+    const stats = await calculateTokenStats(messages, "anthropic:claude-sonnet-4-5", null, {
+      enableAgentReport: false,
+    });
+
+    const tokensFor = (name: string) => stats.consumers.find((c) => c.name === name)?.tokens;
+    expect(tokensFor("Assistant")).toBe(3 * 1000);
+    expect(tokensFor("User")).toBe(8);
+  });
 });
 
 describe("createDisplayUsage", () => {
