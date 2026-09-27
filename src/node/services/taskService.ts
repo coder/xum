@@ -9312,6 +9312,8 @@ export class TaskService implements AgentTaskIntegration {
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
       const unrelatedRoot = relation === "target_unrelated" && !targetIsAgentTask;
+      // Process-local courtesy: another backend's delegated turn is invisible here (#4446; see
+      // CONCURRENT BACKENDS in processLiveness.ts).
       const delegatedRootUnavailable = (): boolean =>
         unrelatedRoot &&
         this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null;
@@ -14257,7 +14259,11 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  /** An on-demand root-workspace address book, separate from either ownership graph. */
+  /**
+   * An on-demand root-workspace address book, separate from either ownership graph. Activity and
+   * delegated-turn state come from this backend's memory; another backend's live work is not
+   * reflected (see CONCURRENT BACKENDS in processLiveness.ts).
+   */
   listInstanceWorkspaces(
     callerWorkspaceId: string,
     options: { query?: string | null; limit?: number | null; offset?: number | null }

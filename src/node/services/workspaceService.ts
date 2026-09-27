@@ -3596,7 +3596,7 @@ export class WorkspaceService
    * durable staging/apply state does, via refine-apply.lock). Multi-instance
    * mode is a development escape hatch — concurrent turn traffic against one
    * workspace from two backends is unsupported beyond those durable-state
-   * locks.
+   * locks. See CONCURRENT BACKENDS in processLiveness.ts.
    */
   private acquireContextMutationAdmissionGuard(
     workspaceId: string,

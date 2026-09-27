@@ -26,7 +26,8 @@ import writeFileAtomic from "@/node/utils/writeFileAtomic";
  * (#4545; driving one task from two backends is unsupported, and a Stop in one backend does not
  * stop the other's turn). Consumers must read the report artifact first: a receipt followed by a
  * report is "reported". Once a workflow claim retires the attempt, a late report is refused, so a
- * step accepts either that report or the replacement, never both.
+ * step accepts either that report or the replacement, never both (see CONCURRENT BACKENDS in
+ * processLiveness.ts).
  *
  * Producers are TaskService's settlement paths (persistOwnedAttemptSettlement and the stop-record
  * release). The only reader so far is the lineage proof at reawaken/reactivation; the classifier
