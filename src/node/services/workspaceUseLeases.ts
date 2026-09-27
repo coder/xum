@@ -34,14 +34,6 @@ import {
  */
 export type WorkspaceUseKind = "turn" | "terminal" | "init" | "mcp" | "exec";
 
-const WORKSPACE_USE_KINDS: readonly WorkspaceUseKind[] = [
-  "turn",
-  "terminal",
-  "init",
-  "mcp",
-  "exec",
-];
-
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
 export class WorkspaceMutationInProgressError extends Error {}
 
@@ -169,9 +161,10 @@ export class WorkspaceUseLeases {
     workspaceId: string,
     options: WorkspaceMutationGateOptions
   ): Promise<void> {
-    for (const kind of WORKSPACE_USE_KINDS) {
+    // The held entries themselves, so no kind can be left out of the check.
+    for (const [kind, file] of this.held.get(workspaceId) ?? []) {
       if (options.ignoreOwnKinds?.has(kind) === true) continue;
-      if (this.heldCount(workspaceId, kind) > 0) {
+      if (file.count > 0) {
         throw new WorkspaceBusyError(
           `Workspace ${workspaceId} has a running ${kind} in this Xum process; ` +
             "try again when it finishes."
@@ -221,32 +214,38 @@ export class WorkspaceUseLeases {
   async hold(workspaceId: string, kind: WorkspaceUseKind): Promise<WorkspaceUseLease> {
     await this.transitions.withLock(workspaceId, async () => {
       const existing = this.held.get(workspaceId)?.get(kind);
-      if (existing != null) {
-        assert(existing.count > 0, "a tracked use lease file must have holders");
-        existing.count++;
-        return;
+      assert(existing == null || existing.count > 0, "a tracked use lease file must have holders");
+      let release: (() => Promise<void>) | undefined;
+      if (existing == null) {
+        const lockPath = path.join(
+          workspaceUseLockDir(this.rootDir, workspaceId),
+          `${this.instanceToken}.${kind}.lock`
+        );
+        release = await acquireCrossProcessLock({
+          lockPath,
+          acquireTimeoutMs: 0,
+          staleMs: USE_LOCK_STALE_MS,
+          timeoutMessage: `Workspace use lease ${lockPath} is unexpectedly held.`,
+        });
       }
-      const lockPath = path.join(
-        workspaceUseLockDir(this.rootDir, workspaceId),
-        `${this.instanceToken}.${kind}.lock`
-      );
-      const release = await acquireCrossProcessLock({
-        lockPath,
-        acquireTimeoutMs: 0,
-        staleMs: USE_LOCK_STALE_MS,
-        timeoutMessage: `Workspace use lease ${lockPath} is unexpectedly held.`,
-      });
-      // Publish first, probe second: see the protocol above.
+      // Publish first, probe second: see the protocol above. A nested hold (file already
+      // published) probes too: a mutator that ignores this kind of this backend's own activity
+      // (remove closing its terminals) must not see a new one admitted behind its scan.
       const gate = await inspectCrossProcessLock(
         workspaceMutationLockPath(this.rootDir, workspaceId)
       );
       if (gate.state === "held") {
-        await release();
+        await release?.();
         throw new WorkspaceMutationInProgressError(
           `Workspace ${workspaceId} is being renamed, removed or archived by ${gate.holder}; ` +
             `try again when it finishes (${gate.why}).`
         );
       }
+      if (existing != null) {
+        existing.count++;
+        return;
+      }
+      assert(release != null, "a first hold publishes its lease file");
       const files = this.held.get(workspaceId) ?? new Map<WorkspaceUseKind, HeldFile>();
       files.set(kind, { count: 1, release });
       this.held.set(workspaceId, files);

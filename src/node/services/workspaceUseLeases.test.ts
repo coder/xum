@@ -316,6 +316,29 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
       await lease.release();
     });
 
+    test("a nested hold of a kind the mutator ignores refuses while the mutation runs", async () => {
+      const terminal = await a.hold(workspaceId, "terminal");
+      let finish!: () => void;
+      const finished = new Promise<void>((resolve) => (finish = resolve));
+      let entered!: () => void;
+      const inside = new Promise<void>((resolve) => (entered = resolve));
+      const ignoreTerminals = { ...idle, ignoreOwnKinds: new Set(["terminal"] as const) };
+      const mutation = a.withMutationGate([workspaceId], ignoreTerminals, async () => {
+        entered();
+        await finished;
+      });
+      await inside;
+
+      let refused: unknown;
+      await a.hold(workspaceId, "terminal").catch((error: unknown) => (refused = error));
+      expect(refused).toBeInstanceOf(WorkspaceMutationInProgressError);
+      expect(a.heldCount(workspaceId, "terminal")).toBe(1);
+
+      finish();
+      await mutation;
+      await terminal.release();
+    });
+
     test("a dead backend's lease does not refuse and is left on disk", async () => {
       await b.hold(workspaceId, "turn");
       const [file] = await leaseFiles();
