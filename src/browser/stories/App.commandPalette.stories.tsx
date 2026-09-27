@@ -13,7 +13,7 @@
  */
 
 import { expect, userEvent, within } from "@storybook/test";
-import { PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { collapseRightSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
@@ -290,6 +290,8 @@ const REMOVE_REFUSAL =
  * structural-mutation gate): the refusal must reach the user instead of only the log.
  */
 export const RemoveCurrentWorkspaceRefused: AppStory = {
+  // Behavior contract only: the popover auto-dismisses, and the snapshot budget is full.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   render: () => (
     <AppWithMocks
       setup={() => {
