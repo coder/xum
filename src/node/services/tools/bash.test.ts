@@ -2020,7 +2020,10 @@ describe("bash tool - background execution", () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
     const tempDir = new TestTempDir("test-bash-bg");
-    const config = createTestToolConfig(tempDir.path);
+    // Unique workspace: host-local records under /tmp/mux-bashes outlive the test, and an
+    // existing record directory is never reused, so a fixed workspace would get "name (2)".
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
     config.backgroundProcessManager = manager;
 
     const tool = createBashTool(config);
@@ -2040,6 +2043,7 @@ describe("bash tool - background execution", () => {
     }
 
     await manager.terminateAll();
+    fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
   });
 
@@ -2047,7 +2051,9 @@ describe("bash tool - background execution", () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
     const tempDir = new TestTempDir("test-bash-bg");
-    const config = createTestToolConfig(tempDir.path);
+    // Unique workspace for the exact-name assertion (see the timeout test above).
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
     config.backgroundProcessManager = manager;
 
     const tool = createBashTool(config);
@@ -2070,6 +2076,8 @@ describe("bash tool - background execution", () => {
       throw new Error("Expected background process ID in result");
     }
 
+    await manager.terminateAll();
+    fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
   });
 
