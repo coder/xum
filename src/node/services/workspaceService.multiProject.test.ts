@@ -1773,7 +1773,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(renameWorkspaceBMock).toHaveBeenCalledTimes(1);
         expect(removeContainerSpy).not.toHaveBeenCalled();
@@ -1962,7 +1963,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(renameWorkspaceBMock).toHaveBeenCalledTimes(2);
         expect(renameWorkspaceBMock).toHaveBeenNthCalledWith(
@@ -1979,7 +1981,8 @@ describe("WorkspaceService multi-project lifecycle", () => {
           newName,
           oldName,
           undefined,
-          true
+          true,
+          { renameBranch: false }
         );
         expect(removeContainerSpy).toHaveBeenCalledWith(oldName);
         expect(createContainerSpy).toHaveBeenCalledTimes(1);

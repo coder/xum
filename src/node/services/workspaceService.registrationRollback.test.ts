@@ -288,6 +288,27 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect((await service.rename(id, "multi-after")).success).toBe(true);
   });
 
+  test("local multi-project rename moves the container back though its path is unchanged", async () => {
+    // A multi-project task/fork on the local runtime lives under a real project at the project
+    // path; LocalRuntime reports that path as both old and new, so only the name shows the move.
+    const containers = path.join(harness.config.srcDir, "_workspaces");
+    await fs.mkdir(path.join(containers, "local-before"), { recursive: true });
+    await harness.config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.workspaces.push({
+        id: "ddddddddd1",
+        name: "local-before",
+        path: projectPath,
+        runtimeConfig: { type: "local" },
+        projects: projects(),
+      });
+      return cfg;
+    });
+
+    await expectFailsWithSaveError(() => service.rename("ddddddddd1", "local-after"));
+    expect(await exists(path.join(containers, "local-before"))).toBe(true);
+    expect(await exists(path.join(containers, "local-after"))).toBe(false);
+  });
+
   test("rename leaves the moved checkout when the config cannot be read back", async () => {
     const created = await createWorktree("keep-before");
     if (!created.success) throw new Error(created.error);

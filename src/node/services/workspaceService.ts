@@ -8508,8 +8508,9 @@ export class WorkspaceService
         // error. Only when a strict read shows the new path did not land; unsure means leave it.
         try {
           const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+          // Name too: a local-runtime rename returns the same path for old and new.
           const landed = [...persisted.projects.values()].some((project) =>
-            project.workspaces.some((entry) => entry.path === newPath)
+            project.workspaces.some((entry) => entry.path === newPath && entry.name === newName)
           );
           if (!landed) await revertMove();
         } catch (rollbackError: unknown) {
