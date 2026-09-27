@@ -6380,8 +6380,29 @@ export class WorkspaceService
         );
         throw error;
       });
+      // The row is persisted from here on, so another backend may already use the workspace
+      // (#4476): keep it rather than delete the checkouts under that activity.
+      const abortRegistrationUnlessInUse = async (): Promise<boolean> => {
+        const gate = await this.acquireStructuralMutationGate(workspaceId, {
+          ignoreKinds: new Set(),
+          backgroundProcesses: "refuse",
+        });
+        if (!gate.success) {
+          log.warn("Kept a half-created multi-project workspace that is in use", {
+            workspaceId,
+            error: gate.error,
+          });
+          await this.discardCreationState(workspaceId, initAbortController, false);
+          return false;
+        }
+        try {
+          return await abortRegistration();
+        } finally {
+          await gate.data();
+        }
+      };
       rollBackRegistration = (error) =>
-        this.rollBackFailedRegistration(workspaceId, abortRegistration, error);
+        this.rollBackFailedRegistration(workspaceId, abortRegistrationUnlessInUse, error);
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const completeMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);

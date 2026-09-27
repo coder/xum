@@ -12,6 +12,7 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import type { InitStateManager } from "./initStateManager";
+import { WorkspaceUseLeases, type WorkspaceUseLease } from "./workspaceUseLeases";
 import type { WorkspaceService } from "./workspaceService";
 import {
   createWorkspaceServiceHarness,
@@ -499,6 +500,39 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(git(projectPath, "rev-parse", "multi-after")).toBe(tip);
     expect(git(otherProjectPath, "branch", "--list", "multi-after")).toBe("");
     expect((await create()).success).toBe(true);
+  });
+
+  test("createMultiProject keeps a failed registration another backend already uses", async () => {
+    const workspaceId = "ddddddddd6";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    // Another backend starts a turn in the persisted row before the metadata read fails.
+    const foreignLeases = new WorkspaceUseLeases(harness.config.rootDir);
+    let foreignTurn: WorkspaceUseLease | undefined;
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockImplementationOnce(async () => {
+      foreignTurn = await foreignLeases.hold(workspaceId, "turn");
+      return [];
+    });
+
+    try {
+      const result = await service.createMultiProject(
+        projects(),
+        "multi-busy-reg",
+        "main",
+        undefined,
+        {
+          type: "worktree",
+          srcBaseDir,
+        }
+      );
+      expect(result.success ? "" : result.error).toContain("could not be rolled back");
+      expect(persistedWorkspaceIds()).toContain(workspaceId);
+      for (const repo of [projectPath, otherProjectPath]) {
+        expect(worktreePaths(repo).map((p) => path.basename(p))).toContain("multi-busy-reg");
+      }
+      expect(await exists(path.join(srcBaseDir, "_workspaces", "multi-busy-reg"))).toBe(true);
+    } finally {
+      await foreignTurn?.release();
+    }
   });
 
   // #4775 item 7: MultiProjectRuntime.deleteWorkspace must forward keepBranch to every project.
