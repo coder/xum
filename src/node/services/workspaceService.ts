@@ -191,6 +191,7 @@ import {
   type StagedWorkspaceAttachment,
 } from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { ContainerManager } from "@/node/multiProject/containerManager";
+import { PROJECT_METADATA_DIR_NAMES } from "@/common/compat/legacyMux";
 
 import type { PostCompactionExclusions } from "@/common/types/attachment";
 import type {
@@ -3443,6 +3444,9 @@ export class WorkspaceService
         if (line) initParams.initLogger.logStderr(line);
       }
       initParams.initLogger.logComplete(-1);
+      // No default consent (fail closed, #4455): the checkout is missing or incomplete, so the
+      // row keeps no consent and the caller's settlement clears the pending mark. The user can
+      // still opt in from the workspace's settings.
       return;
     }
     // Checkout populated and sanitized: only now may other task trees discover and message
@@ -5627,6 +5631,9 @@ export class WorkspaceService
     this.initAbortControllers.set(workspaceId, initAbortController);
 
     const initLogger = this.createInitLogger(workspaceId);
+    // True once a retained owner (the deferred checkout's settlement) finalizes the pending
+    // default; otherwise the finally below does (#4455).
+    let pendingDefaultHandedOff = false;
 
     try {
       let finalBranchName = resolvedBranchName;
@@ -5900,6 +5907,8 @@ export class WorkspaceService
           abortSignal: initAbortController.signal,
           trusted: projectConfig.trusted ?? false,
         };
+        // The deferred checkout's settlement grants or clears the pending default from here on.
+        pendingDefaultHandedOff = pendingMaterialization !== undefined;
         // Retained (not just fired) so archive can await the hook process's actual exit.
         this.retainInitSettlement(
           workspaceId,
@@ -5933,6 +5942,14 @@ export class WorkspaceService
       initLogger.logComplete(-1);
       const message = getErrorMessage(error);
       return Err(`Failed to create workspace: ${message}`);
+    } finally {
+      // Fail closed (#4455): one finalization for every exit that did not hand the pending default
+      // to the deferred checkout's settlement. That covers an Err after registration and a deferred
+      // checkout skipped because the workspace is being removed or its init was aborted. A no-op
+      // once the grant consumed the mark or a rollback removed the row.
+      if (!pendingDefaultHandedOff) {
+        await this.clearPendingDefaultUnrelatedConsent(workspaceId);
+      }
     }
   }
 
@@ -5979,6 +5996,17 @@ export class WorkspaceService
         if (projectConfig?.parentProjectPath) {
           return Err(
             `Sub-project ${project.projectName} cannot be added directly to a multi-project workspace. Add its parent project instead.`
+          );
+        }
+        // The container links each project under its name, and the workspace's MCP overrides
+        // are read from the container root, which is otherwise always fresh. A project named
+        // like the metadata directory would alias that overrides path into its checkout, whose
+        // tracked file could silently enable plugins once other trees can message this
+        // workspace. (Registration-time sanitization, which multi-project does not need
+        // otherwise, would refuse that symlinked path too; #4455.)
+        if ((PROJECT_METADATA_DIR_NAMES as readonly string[]).includes(project.projectName)) {
+          return Err(
+            `Project ${project.projectName} cannot join a multi-project workspace: its name collides with the workspace metadata directory. Rename the project's folder first.`
           );
         }
       }
@@ -11435,6 +11463,8 @@ export class WorkspaceService
       this.preflightForkCounts,
       sourceWorkspaceId
     );
+    // Set once the fork's ID exists; the finally below finalizes its pending default (#4455).
+    let forkWorkspaceId: string | undefined;
     try {
       const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
@@ -11540,6 +11570,7 @@ export class WorkspaceService
       });
 
       const newWorkspaceId = this.config.generateStableId();
+      forkWorkspaceId = newWorkspaceId;
 
       const session = this.getOrCreateSession(newWorkspaceId);
       this.initStateManager.startInit(newWorkspaceId, foundProjectPath);
@@ -11986,6 +12017,12 @@ export class WorkspaceService
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to fork workspace: ${message}`);
+    } finally {
+      // Fail closed (#4455): a fork that fails after registering its row must not leave the
+      // default pending on it. A no-op once the grant consumed the mark or a rollback removed the row.
+      if (forkWorkspaceId != null) {
+        await this.clearPendingDefaultUnrelatedConsent(forkWorkspaceId);
+      }
     }
   }
 

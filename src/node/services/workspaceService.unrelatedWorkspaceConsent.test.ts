@@ -582,7 +582,7 @@ describe("WorkspaceService.setAgentMessageDispatchMode", () => {
  * in config, can toggle consent in that window. B's explicit choice must win: the pending
  * default lives on the row, so B's toggle clears it.
  */
-describe("default consent pending across backends (#4446)", () => {
+describe("default consent pending mark (#4446, #4455)", () => {
   const CREATED_ID = "c0ffee0001";
   let harness: Awaited<ReturnType<typeof createWorkspaceServiceHarness>>;
   let projectPath: string;
@@ -616,11 +616,12 @@ describe("default consent pending across backends (#4446)", () => {
       ...args: unknown[]
     ) => Promise<string | undefined>;
     sanitizeMaterializedTaskWorkspace: (...args: unknown[]) => Promise<string | undefined>;
+    secretsStore: { getEffectiveSecrets: (projectPath: string) => unknown };
   }
   const internals = () => harness.service as unknown as CreateInternals;
 
-  /** create() with a deferred checkout whose materialization waits for `gate`. */
-  async function createDeferred(gate: Promise<void>) {
+  /** Runtime whose checkout is deferred and materializes when `gate` resolves. */
+  function mockDeferredRuntime(gate: Promise<void>) {
     let initStarted!: () => void;
     const initRan = new Promise<void>((resolve) => (initStarted = resolve));
     const workspacePath = path.join(projectPath, "deferred");
@@ -635,13 +636,61 @@ describe("default consent pending across backends (#4446)", () => {
       initStarted();
       return Promise.resolve(undefined);
     });
-    const result = await harness.service.create(projectPath, "deferred", undefined, undefined, {
-      type: "local",
-    });
+    return { initRan };
+  }
+
+  const createDeferredWorkspace = () =>
+    harness.service.create(projectPath, "deferred", undefined, undefined, { type: "local" });
+
+  /** create() with a deferred checkout whose materialization waits for `gate`. */
+  async function createDeferred(gate: Promise<void>) {
+    const { initRan } = mockDeferredRuntime(gate);
+    const result = await createDeferredWorkspace();
     expect(result.success).toBe(true);
     // Wrapped: returning the bare promise would make `await createDeferred()` wait for init.
     return { initRan };
   }
+
+  test("create() announces a deferred checkout with the mark set and settles it into consent", async () => {
+    // At the announcement the checkout is not sanitized yet: pending, and no consent.
+    const atAnnouncement: Array<{ pending: unknown; consent: unknown }> = [];
+    harness.service.on("metadata", (event: { workspaceId: string }) => {
+      if (event.workspaceId !== CREATED_ID || atAnnouncement.length > 0) return;
+      const entry = readEntry();
+      atAnnouncement.push({
+        pending: entry?.unrelatedWorkspaceConsentPending,
+        consent: entry?.unrelatedWorkspaceConsent,
+      });
+    });
+    let release!: () => void;
+    const { initRan } = await createDeferred(new Promise<void>((resolve) => (release = resolve)));
+    expect(atAnnouncement).toEqual([{ pending: true, consent: undefined }]);
+
+    release();
+    await initRan;
+
+    expect(getValidUnrelatedWorkspaceConsent(readEntry()?.unrelatedWorkspaceConsent)).toBeDefined();
+    expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
+  });
+
+  test("create() that fails after registration leaves no pending mark behind", async () => {
+    mockDeferredRuntime(new Promise<void>(() => undefined));
+    // Fails once the row is registered, before the deferred checkout's settlement is retained.
+    const secretsStore = internals().secretsStore;
+    const realGetEffectiveSecrets = secretsStore.getEffectiveSecrets.bind(secretsStore);
+    spyOn(secretsStore, "getEffectiveSecrets").mockImplementation((projectPathArg: string) => {
+      if (readEntry() != null) throw new Error("secrets unavailable");
+      return realGetEffectiveSecrets(projectPathArg);
+    });
+
+    const result = await createDeferredWorkspace();
+
+    expect(result.success).toBe(false);
+    // The failed create() keeps its row today (tracked separately); the default must not stay
+    // pending on it, and no consent was granted.
+    expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
+    expect(readEntry()?.unrelatedWorkspaceConsent).toBeUndefined();
+  });
 
   test.each([
     { choice: false, label: "opts out" },

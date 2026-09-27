@@ -359,6 +359,78 @@ describe("WorkspaceService fork", () => {
     }
   });
 
+  test("a fork that fails after registration leaves no pending default consent behind (#4455)", async () => {
+    const sourceWorkspaceId = "source-workspace";
+    const newWorkspaceId = "forked-workspace";
+    const sourceProjectPath = path.join(tempDir, "project");
+    const forkedWorkspacePath = path.join(sourceProjectPath, "fork-child");
+    const sourceMetadata: FrontendWorkspaceMetadata = {
+      id: sourceWorkspaceId,
+      name: "source-branch",
+      projectPath: sourceProjectPath,
+      projectName: "project",
+      runtimeConfig: { type: "local" },
+      namedWorkspacePath: path.join(sourceProjectPath, "source-branch"),
+    };
+    await fsPromises.mkdir(sourceProjectPath, { recursive: true });
+    await config.addWorkspace(sourceProjectPath, sourceMetadata);
+    await config.editConfig((current) => {
+      current.projects.get(sourceProjectPath)!.trusted = true;
+      return current;
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config,
+      historyService,
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      }),
+    });
+    // Goal inheritance runs after the fork's row (with its pending mark) is registered.
+    workspaceService.setWorkspaceGoalService({
+      inheritFromFork: mock(() => Promise.reject(new Error("goal store unavailable"))),
+    } as unknown as WorkspaceGoalService);
+    spyOn(config, "generateStableId").mockReturnValue(newWorkspaceId);
+    spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      getWorkspacePath: mock(() => forkedWorkspacePath),
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+    spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+    spyOn(forkOrchestratorModule, "orchestrateFork").mockResolvedValue(
+      Ok({
+        workspacePath: forkedWorkspacePath,
+        trunkBranch: "main",
+        forkedRuntimeConfig: { type: "local" },
+        targetRuntime: {
+          getWorkspacePath: mock(() => forkedWorkspacePath),
+        } as unknown as ReturnType<typeof runtimeFactory.createRuntime>,
+        forkedFromSource: true,
+        sourceRuntimeConfigUpdated: false,
+      })
+    );
+    spyOn(
+      workspaceService as unknown as {
+        sanitizeStalePluginOverridesForNewWorkspace: (...args: unknown[]) => Promise<undefined>;
+      },
+      "sanitizeStalePluginOverridesForNewWorkspace"
+    ).mockResolvedValue(undefined);
+
+    try {
+      const result = await workspaceService.fork(sourceWorkspaceId, "fork-child");
+
+      expect(result.success).toBe(false);
+      // The failed fork keeps its row today (tracked separately); the default must not stay
+      // pending on it, and no consent was granted.
+      const forkEntry = [...new Config(config.rootDir).loadConfigOrDefault().projects.values()]
+        .flatMap((project) => project.workspaces)
+        .find((entry) => entry.id === newWorkspaceId);
+      expect(forkEntry?.unrelatedWorkspaceConsentPending).toBeUndefined();
+      expect(forkEntry?.unrelatedWorkspaceConsent).toBeUndefined();
+    } finally {
+      mock.restore();
+    }
+  });
+
   test("resets forked session usage while preserving copied history", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
