@@ -11,15 +11,15 @@ const KiB = 1024;
 /**
  * Models the parts of a `ws` WebSocket the wrapper relies on: `bufferedAmount`
  * counts frames accepted by send() whose write callback has not fired, the
- * test decides when the client reads (flush), and sends after close are
- * dropped with an async error callback like `ws` does.
+ * test decides when the client reads (flush), and sends on a closing or
+ * closed socket are dropped with a next-tick error callback like `ws` does.
  */
 class FakeSocket extends EventTarget implements FlowControlSocket {
   bufferedAmount = 0;
+  readyState = 1; // OPEN
   readonly written: string[] = [];
   readonly droppedAfterClose: string[] = [];
   throwOnNextSend = false;
-  private closed = false;
   private readonly unflushed: Array<{ data: string; cb: (err?: Error) => void }> = [];
 
   send(data: string | Uint8Array<ArrayBuffer>, cb: (err?: Error) => void): void {
@@ -30,9 +30,9 @@ class FakeSocket extends EventTarget implements FlowControlSocket {
       this.throwOnNextSend = false;
       throw new Error("send failed");
     }
-    if (this.closed) {
+    if (this.readyState !== 1) {
       this.droppedAfterClose.push(data);
-      queueMicrotask(() => cb(new Error("WebSocket is not open")));
+      process.nextTick(cb, new Error("WebSocket is not open"));
       return;
     }
     this.written.push(data);
@@ -48,8 +48,19 @@ class FakeSocket extends EventTarget implements FlowControlSocket {
     frame.cb();
   }
 
+  /**
+   * The peer went away (e.g. a browser reload): the socket is CLOSING, pending
+   * writes fail, and "close" is only dispatched later by close().
+   */
+  beginClose(): void {
+    this.readyState = 2; // CLOSING
+    for (const pending of this.unflushed.splice(0)) {
+      process.nextTick(pending.cb, new Error("socket destroyed"));
+    }
+  }
+
   close(): void {
-    this.closed = true;
+    this.readyState = 3; // CLOSED
     this.dispatchEvent(new Event("close"));
   }
 }
@@ -214,6 +225,43 @@ describe("createFlowControlledWebSocket", () => {
     const nextWs = createFlowControlledWebSocket(nextSocket);
     await nextWs.send("hello");
     expect(nextSocket.written).toEqual(["hello"]);
+  });
+
+  test("a closing socket parks senders until close instead of draining their backlog", async () => {
+    const socket = new FakeSocket();
+    const ws = createFlowControlledWebSocket(socket);
+
+    // Like oRPC: a transmitter pulls from a large backlog with one send
+    // outstanding, and oRPC's own "close" listener (registered after the
+    // wrapper) marks it done so it stops at its next send.
+    let transmitterDone = false;
+    socket.addEventListener("close", () => {
+      transmitterDone = true;
+    });
+    const backlog = 10_000;
+    let sent = 0;
+    const transmitter = (async () => {
+      while (!transmitterDone && sent < backlog) {
+        await ws.send(frame(`row${sent}`, 64 * KiB));
+        sent++;
+      }
+    })();
+    // Let it fill the window and park (the client is not reading).
+    await new Promise((resolve) => setImmediate(resolve));
+    const sentBeforeClosing = sent;
+    expect(sentBeforeClosing).toBeLessThan(backlog);
+
+    // The client disconnects. A macrotask must get to run before "close"
+    // (the real close event and other requests arrive as I/O), and by then
+    // the transmitter must still be parked, not have drained its backlog.
+    socket.beginClose();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(sent).toBe(sentBeforeClosing);
+    expect(socket.droppedAfterClose).toHaveLength(0);
+
+    socket.close();
+    await transmitter;
+    expect(sent).toBeLessThanOrEqual(sentBeforeClosing + 1);
   });
 
   test("a synchronous send failure rejects only that send", async () => {

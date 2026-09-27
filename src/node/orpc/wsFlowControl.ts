@@ -27,12 +27,20 @@ import { assert } from "@/common/utils/assert";
 /**
  * Window sizes. Measured browser drain is ~1.7-4 MB/s, so one 1 MiB window
  * delays a heartbeat, an RPC response, or the keepalive pong by < 1 s instead
- * of tens of seconds. Sends are awaited, so server memory is bounded to one
+ * of tens of seconds. Sends are awaited, so the transport holds at most one
  * window plus one queued frame per active sender. The low-water mark adds
  * hysteresis so a draining socket is refilled in batches, not frame by frame.
+ *
+ * Note: this bounds the socket and the transport, not the whole server heap.
+ * A producer that pushes into an unbounded subscription queue (the onChat
+ * replay) still holds its not-yet-sent values in that queue; bounding the
+ * producer is a separate change.
  */
 export const WS_FLOW_CONTROL_HIGH_WATER_BYTES = 1024 * 1024;
 export const WS_FLOW_CONTROL_LOW_WATER_BYTES = 256 * 1024;
+
+/** `readyState` of an open socket (WHATWG WebSocket and `ws` share the value). */
+const WS_READY_STATE_OPEN = 1;
 
 type FlowControlledFrame = Parameters<WebSocketLike["send"]>[0];
 
@@ -46,6 +54,8 @@ export interface FlowControlSocket extends Pick<
 > {
   /** Bytes accepted by `send()` but not yet written to the OS socket. */
   readonly bufferedAmount: number;
+  /** Anything but OPEN means `send()` drops frames and fails their callbacks. */
+  readonly readyState: number;
   /** `cb` fires once the frame is written (or with an error if it never will be). */
   send(data: FlowControlledFrame, cb: (err?: Error) => void): void;
 }
@@ -76,8 +86,21 @@ export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowContro
   // Frames handed to ws.send whose write callback has not fired yet. Each
   // callback is the wake-up signal to re-check the window and pump the queue.
   let pendingWrites = 0;
+  // A write callback reported an error: the socket is failing and its "close"
+  // event follows, so writing more would only produce more failures.
+  let writeFailed = false;
 
   const canWrite = (): boolean => {
+    // Closing (or failing) sockets drop frames and fail each callback on the
+    // next tick. Writing there would let senders drain their whole backlog
+    // (e.g. a 1M-row replay) through nextTicks and microtasks, starving the
+    // event loop so "close" (and every other request) waits until the backlog
+    // is gone (#4655 UAT: 18-63 s server freeze on reload). Park senders
+    // instead; the "close" listener below settles them, and ws guarantees
+    // "close" follows a closing handshake or a failed socket.
+    if (writeFailed || ws.readyState !== WS_READY_STATE_OPEN) {
+      return false;
+    }
     if (pendingWrites === 0) {
       // No write callback is left to wake us, so waiting could hang forever.
       // Whatever is still buffered is not ours (e.g. keepalive control
@@ -93,8 +116,9 @@ export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowContro
     return !blocked;
   };
 
-  const onWritten = (): void => {
+  const onWritten = (err?: Error): void => {
     pendingWrites--;
+    if (err != null) writeFailed = true;
     pump();
   };
 
@@ -128,6 +152,9 @@ export function createFlowControlledWebSocket(ws: FlowControlSocket): FlowContro
     closed = true;
     // Queued frames are never written after close. Settle them as no-ops,
     // matching ws.send after close (which does not throw), so no sender hangs.
+    // Their continuations run as microtasks after every "close" listener,
+    // including oRPC's, which marks its transmitters done first; they then
+    // stop instead of pulling the rest of their backlog.
     for (const frame of queue.splice(0)) {
       frame.resolve();
     }
