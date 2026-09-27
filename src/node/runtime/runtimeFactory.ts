@@ -15,6 +15,7 @@ import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility
 import { detectContainerEngine, isEngineResponsive } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
 import type { WorkspaceUseLeases } from "@/node/services/workspaceUseLeases";
+import { log } from "@/node/services/log";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
 import { buildDevcontainerConfigInfo, scanDevcontainerConfigs } from "./devcontainerConfigs";
@@ -71,17 +72,7 @@ export function runBackgroundInit(
   // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   logger?: { error: (msg: string, ctx: object) => void }
 ): Promise<void> {
-  const leasedInit = async () => {
-    const lease = await useLeases.hold(workspaceId, "init");
-    try {
-      return await runFullInit(runtime, params);
-    } finally {
-      await lease.release().catch((error: unknown) => {
-        logger?.error(`Failed to release the init use lease for ${workspaceId}:`, { error });
-      });
-    }
-  };
-  return leasedInit().then(
+  return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
     () => undefined,
     (error: unknown) => {
       const errorMsg = getErrorMessage(error);
@@ -90,6 +81,30 @@ export function runBackgroundInit(
       params.initLogger.logComplete(-1);
     }
   );
+}
+
+/**
+ * Run a background init under this backend's "init" use lease for the workspace (#4857; see
+ * runBackgroundInit). Throws WorkspaceMutationInProgressError, without running `init`, while
+ * another backend mutates the workspace. The lease is released before the returned promise
+ * settles. Multi-project creation runs its per-project inits through this directly.
+ */
+export async function withInitUseLease<T>(
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
+  workspaceId: string,
+  init: () => Promise<T>
+): Promise<T> {
+  const lease = await useLeases.hold(workspaceId, "init");
+  try {
+    return await init();
+  } finally {
+    // A failed release leaves the lease file held (fail closed); never fail the init for it.
+    await lease.release().catch((error: unknown) => {
+      log.warn(`Failed to release the init use lease for ${workspaceId}`, {
+        error: getErrorMessage(error),
+      });
+    });
+  }
 }
 
 function shouldUseSSH2Runtime(): boolean {

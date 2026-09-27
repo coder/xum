@@ -40,10 +40,14 @@ export class MCPStdioTransport implements Transport {
     this.stdoutReader = execStream.stdout.getReader();
     this.stdinWriter = execStream.stdin.getWriter();
     this.exitPromise = execStream.exitCode;
-    // Observe process exit to trigger close event
-    void this.exitPromise.then(() => {
-      if (this.onclose) this.onclose();
-    });
+    // Observe process exit to trigger close event. A rejected exit observation proves nothing
+    // (see close()), so it does not close; handled so it is not an unhandled rejection.
+    void this.exitPromise.then(
+      () => {
+        if (this.onclose) this.onclose();
+      },
+      () => undefined
+    );
   }
 
   start(): Promise<void> {

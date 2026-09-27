@@ -78,6 +78,7 @@ import {
   createRuntime,
   IncompatibleRuntimeError,
   runBackgroundInit,
+  withInitUseLease,
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
@@ -6433,10 +6434,11 @@ export class WorkspaceService
       // Multi-project creation should mirror create(): return metadata immediately, but only mark init
       // complete after initialization work has run.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        // Retained (not just fired) so archive can await the per-project init loop's exit.
+        // Retained (not just fired) so archive can await the per-project init loop's exit. The
+        // loop runs under one "init" use lease, as runBackgroundInit does (#4857).
         this.retainInitSettlement(
           workspaceId,
-          (async () => {
+          withInitUseLease(workspaceUseLeasesFor(this.config), workspaceId, async () => {
             let initFailed = false;
 
             for (const createdWorkspace of createdWorkspaces) {
@@ -6506,7 +6508,11 @@ export class WorkspaceService
             }
 
             initLogger.logComplete(initFailed ? -1 : 0);
-          })()
+          }).catch((error: unknown) => {
+            // Refused while another backend mutates the workspace: no init hook ran.
+            initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+            initLogger.logComplete(-1);
+          })
         );
       } else {
         initAbortController.abort();

@@ -95,6 +95,28 @@ describe("MCPServerManager workspace use leases", () => {
     await waitFor(() => heldCount() === 0);
   });
 
+  test("a server whose exit cannot be confirmed keeps its lease", async () => {
+    const spawnFake = servers.exec.getMockImplementation();
+    expect(spawnFake).toBeDefined();
+    servers.exec.mockImplementationOnce(async (cmd, options) => {
+      const stream = await spawnFake!(cmd, options);
+      // The transport to the process breaks: its exit is never observed.
+      const exitCode = stream.exitCode.then((): number => {
+        throw new Error("transport lost");
+      });
+      exitCode.catch(() => undefined);
+      return { ...stream, exitCode };
+    });
+    servers.serve(command);
+    await start();
+    expect(heldCount()).toBe(1);
+
+    await manager.stopServers(workspaceId);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(heldCount()).toBe(1);
+    expect(await otherBackendMutation()).toContain("mcp");
+  });
+
   test("a failed startup releases its lease", async () => {
     servers.serve(command, { connect: () => Promise.reject(new Error("handshake failed")) });
     const started = await start();

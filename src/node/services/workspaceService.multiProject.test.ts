@@ -20,6 +20,7 @@ import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { WorkspaceService } from "@/node/services/workspaceService";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   createMockAIService,
   createTestBackgroundProcessManager,
@@ -700,7 +701,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
           workspacePath: path.join(srcDir, "project-b", branchName),
         })
       );
-      const initWorkspaceAMock = mock(() => Promise.resolve({ success: true as const }));
+      // #4857: the per-project inits run under this backend's "init" use lease.
+      const initLeasesHeld: number[] = [];
+      const initWorkspaceAMock = mock(() => {
+        initLeasesHeld.push(workspaceUseLeasesFor(config).heldCount(workspaceId, "init"));
+        return Promise.resolve({ success: true as const });
+      });
       const initWorkspaceBMock = mock(() => Promise.resolve({ success: true as const }));
       const deleteWorkspaceMock = mock(() =>
         Promise.resolve({ success: true as const, deletedPath: "/tmp/deleted" })
@@ -789,6 +795,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", branchName),
           })
         );
+        expect(initLeasesHeld).toEqual([1]);
+        for (let turn = 0; workspaceUseLeasesFor(config).heldCount(workspaceId) > 0; turn++) {
+          assert(turn < 1000, "the init use lease was never released");
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
         const storedMultiWorkspaces =
           config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
         expect(storedMultiWorkspaces).toHaveLength(1);

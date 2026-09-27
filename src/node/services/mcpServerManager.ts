@@ -6150,7 +6150,16 @@ export class MCPServerManager {
               error: getErrorMessage(error),
             });
           });
-        void execStream.exitCode.then(releaseUseLease, releaseUseLease);
+        // A rejected exit observation does not prove the process stopped: ask it to exit and keep
+        // the lease (fail closed) until this backend exits.
+        void execStream.exitCode.then(releaseUseLease, (error: unknown) => {
+          processAbort.abort();
+          log.warn("[MCP] Stdio server exit unconfirmed; keeping its workspace use lease", {
+            name,
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
       }
 
       const cleanupSpawnedExecStream = async () => {
