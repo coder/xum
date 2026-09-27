@@ -675,18 +675,6 @@ export class TerminalService {
    */
   private readonly nativeTerminalUseLeases = new Map<string, WorkspaceUseLease>();
 
-  private async holdNativeTerminalUseLease(workspaceId: string): Promise<void> {
-    if (this.nativeTerminalUseLeases.has(workspaceId)) return;
-    // Throws while another backend renames or removes the workspace: no terminal may open there.
-    const lease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "terminal");
-    if (this.nativeTerminalUseLeases.has(workspaceId)) {
-      // A concurrent open took one first; one share per workspace is enough.
-      await lease.release();
-      return;
-    }
-    this.nativeTerminalUseLeases.set(workspaceId, lease);
-  }
-
   /** Ends the native-terminal use lease of a workspace this backend archives or removes. */
   async releaseNativeTerminalUseLease(workspaceId: string): Promise<void> {
     const lease = this.nativeTerminalUseLeases.get(workspaceId);
@@ -698,7 +686,13 @@ export class TerminalService {
   /** Body of openNative after pending-open admission; see openNative. */
   private async openNativeAdmitted(workspaceId: string): Promise<void> {
     let admissionToken: symbol | null = null;
+    // This open's share of the lease until it is kept or released below.
+    let openLease: WorkspaceUseLease | undefined;
     try {
+      // #4902: held before the path is read, and on every open (it probes the gate), so a
+      // rename, removal or archive can neither slip in between nor run meanwhile. Throws while
+      // one runs: no terminal may open there.
+      openLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "terminal");
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
 
@@ -717,9 +711,14 @@ export class TerminalService {
         );
       }
 
-      // Before any durable effect: a refusal must not leave a marker behind. Kept after a
-      // failed launch too (fail closed; see nativeTerminalUseLeases).
-      await this.holdNativeTerminalUseLease(workspaceId);
+      // Before any durable effect: one share per workspace is kept, after a failed launch too
+      // (fail closed; see nativeTerminalUseLeases), and a refusal above releases this open's.
+      if (this.nativeTerminalUseLeases.has(workspaceId)) {
+        await openLease.release();
+      } else {
+        this.nativeTerminalUseLeases.set(workspaceId, openLease);
+      }
+      openLease = undefined;
 
       // Durable marker: the detached emulator can outlive Xum, so a restart must not forget
       // the open (the in-memory Set resets, and both archive checks would otherwise let a
@@ -826,6 +825,7 @@ export class TerminalService {
         });
       }
     } catch (err) {
+      await openLease?.release();
       // No failure path in openNative launches a shell: pre-marker failures (unknown/archived
       // workspace, marker persistence) never reach a launcher and recorded nothing durable
       // (the pending-open count covers that window and releases in openNative's finally). A

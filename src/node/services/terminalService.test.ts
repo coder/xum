@@ -1,6 +1,10 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn, vi, type Mock } from "bun:test";
 import { TerminalService } from "./terminalService";
-import { WorkspaceMutationInProgressError, WorkspaceUseLeases } from "./workspaceUseLeases";
+import {
+  WorkspaceMutationInProgressError,
+  WorkspaceUseLeases,
+  workspaceUseLeasesFor,
+} from "./workspaceUseLeases";
 import type { PTYService } from "./ptyService";
 import type { Config, SecretsStore } from "@/node/config";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -1395,6 +1399,56 @@ describe("TerminalService.openNative", () => {
       } finally {
         await release();
       }
+    });
+
+    // #4902: the lease is held before the path is read, so a mutation cannot slip in between.
+    it("refuses the other backend's mutation that starts while this backend reads the workspace path", async () => {
+      let mutationDuringRead: string | undefined;
+      const config = {
+        ...configWithLeaseWorkspace,
+        getAllWorkspaceMetadata: mock(async () => {
+          mutationDuringRead ??= await otherBackend()
+            .acquireMutationGate([workspaceId], gateOptions)
+            .then(
+              async (release) => {
+                await release();
+                return "allowed";
+              },
+              (error: unknown) => String(error)
+            );
+          return configWithLeaseWorkspace.getAllWorkspaceMetadata();
+        }),
+      } as unknown as Config;
+      service = new TerminalService(config, mockPTYService, mockSecretsStore);
+      try {
+        await service.openNative(workspaceId);
+        expect(mutationDuringRead).toContain("in use by another Xum process: a terminal");
+      } finally {
+        await service.releaseNativeTerminalUseLease(workspaceId);
+      }
+    });
+
+    it("probes the gate on every open, even after an earlier open of the workspace", async () => {
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      await service.openNative(workspaceId);
+      spawnSpy.mockClear();
+      // This backend's own rename ignores its own terminals, so it can hold the gate meanwhile.
+      const release = await workspaceUseLeasesFor(configWithLeaseWorkspace).acquireMutationGate(
+        [workspaceId],
+        { ...gateOptions, ignoreOwnKinds: new Map([[workspaceId, new Set(["terminal" as const])]]) }
+      );
+      try {
+        let error: unknown;
+        await service.openNative(workspaceId).catch((caught: unknown) => (error = caught));
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+      } finally {
+        await release();
+      }
+      // One share stays held per workspace, and the archive release ends it.
+      expect(workspaceUseLeasesFor(configWithLeaseWorkspace).heldCount(workspaceId)).toBe(1);
+      await service.releaseNativeTerminalUseLease(workspaceId);
+      expect(workspaceUseLeasesFor(configWithLeaseWorkspace).heldCount(workspaceId)).toBe(0);
     });
   });
 

@@ -504,6 +504,42 @@ describe("structural workspace mutations across two backends on one root", () =>
     }
   });
 
+  // #4902: the lease is held before the workspace row is read, so an open never launches at a
+  // path the other backend removed or moved just before the lease.
+  test("an editor open reads the workspace after its lease, so it sees the other backend's removal", async () => {
+    const leasesB = workspaceUseLeasesFor(b.config);
+    const realHold = leasesB.hold.bind(leasesB);
+    spyOn(leasesB, "hold").mockImplementationOnce(async (id, kind) => {
+      expect(await a.workspaceService.remove(rootId, true)).toMatchObject({ success: true });
+      return realHold(id, kind);
+    });
+
+    expect(errorOf(await b.workspaceService.recordExternalEditorOpenForLaunch(rootId))).toContain(
+      "Workspace not found"
+    );
+    expect(heldCount(b, "editor")).toBe(0);
+  });
+
+  test("every editor open probes the gate, even after an earlier open of the workspace", async () => {
+    expect(await b.workspaceService.recordExternalEditorOpenForLaunch(rootId)).toMatchObject({
+      success: true,
+    });
+    // This backend's own rename ignores its own editors, so it can hold the gate meanwhile.
+    const release = await workspaceUseLeasesFor(b.config).acquireMutationGate([rootId], {
+      ignoreOwnKinds: new Map([[rootId, new Set<WorkspaceUseKind>(["editor"])]]),
+      hasRunningBackgroundProcesses: () => Promise.resolve(false),
+    });
+    try {
+      expect(errorOf(await b.workspaceService.recordExternalEditorOpenForLaunch(rootId))).toContain(
+        "being renamed, removed or archived"
+      );
+    } finally {
+      await release();
+    }
+    // One share stays held per workspace.
+    expect(heldCount(b, "editor")).toBe(1);
+  });
+
   test("own MCP servers, init hook and one-off commands follow what each mutator ends", async () => {
     // Rename moves the checkout under its own MCP servers (their processes follow it) and
     // in-flight commands, as before, but nothing stops its own init hook.
