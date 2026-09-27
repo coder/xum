@@ -612,6 +612,50 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
+  // #4819: the abort only signals; deleting under a still-exiting init hook (or a background
+  // SSH materialization) races its writes, so removal waits for the settlement as archive does.
+  test("remove() deletes the checkout only after an aborted init settles", async () => {
+    const workspaceId = "ws-remove-awaits-init";
+    await using harness = await createWorkspaceServiceHarness();
+    const { config, service: workspaceService } = harness;
+    const projectPath = path.join(harness.rootDir, "proj");
+    await config.addWorkspace(projectPath, {
+      id: workspaceId,
+      name: "ws",
+      projectPath,
+      projectName: "proj",
+      runtimeConfig: { type: "local" },
+    });
+    const { deleteWorkspaceMock, createRuntimeSpy } = mockDeleteWorkspace(() =>
+      Promise.resolve({ success: true as const, deletedPath: "/tmp/deleted" })
+    );
+    let settleInit!: () => void;
+    const initAbort = new AbortController();
+    workspaceService.registerExternalBackgroundInit(
+      workspaceId,
+      initAbort,
+      new Promise<void>((resolve) => (settleInit = resolve))
+    );
+
+    try {
+      const removal = workspaceService.remove(workspaceId, true);
+      // Without the wait, the whole removal (deletion included) completes well inside this bound.
+      const settledEarly = await Promise.race([
+        removal.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 500)),
+      ]);
+      expect(settledEarly).toBe(false);
+      expect(initAbort.signal.aborted).toBe(true);
+      expect(deleteWorkspaceMock).not.toHaveBeenCalled();
+
+      settleInit();
+      expect((await removal).success).toBe(true);
+      expect(deleteWorkspaceMock).toHaveBeenCalledTimes(1);
+    } finally {
+      createRuntimeSpy.mockRestore();
+    }
+  });
+
   test("remove() calls runtime.deleteWorkspace when force=true", async () => {
     const workspaceId = "ws-remove-runtime-delete";
     await using harness = await createWorkspaceServiceHarness();

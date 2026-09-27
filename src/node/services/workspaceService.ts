@@ -6626,6 +6626,13 @@ export class WorkspaceService
       initAbortController.abort();
       this.initAbortControllers.delete(workspaceId);
     }
+    // The abort only signals: the init hook (or an SSH background materialization) may still be
+    // writing. Wait for its retained settlement before any teardown, as archive does (#4819: a
+    // failed delegated creation removes its target right after create()). Never rejects.
+    const initSettlement = this.initSettlementPromises.get(workspaceId);
+    if (initSettlement != null) {
+      await initSettlement;
+    }
 
     // The registered entry is read AFTER the MCP-overrides lock below is held
     // (a sibling backend's rename retargets the lock onto the renamed checkout,
