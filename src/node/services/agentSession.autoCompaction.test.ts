@@ -1430,6 +1430,46 @@ describe("AgentSession on-send auto-compaction for synthetic guidance sends", ()
     await fixture.session.dispose();
   });
 
+  // #4721: a durable compaction follow-up keeps only text + send options, so a synthetic wake's
+  // caller restrictions and in-memory admission guards would be replayed after compaction even
+  // if manual input tightened the policy meanwhile. Guarded wakes therefore opt out of on-send
+  // compaction (mid-stream forcing still protects the limit) and never become a follow-up.
+  for (const [name, skipOnSendCompaction, expectCompaction] of [
+    ["a guarded synthetic wake runs as its own turn", true, false],
+    ["an unguarded synthetic send still compacts first", false, true],
+  ] satisfies Array<[string, boolean, boolean]>) {
+    test(`on-send pressure: ${name}`, async () => {
+      const workspaceId = `ws-guarded-wake-${String(skipOnSendCompaction)}`;
+      const fixture = await createGuidanceHarness({ workspaceId });
+      const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+
+      const result = await fixture.session.sendMessage(
+        "Sub-agents completed. Their reports are in the conversation above.",
+        { model: "openai:gpt-4o", agentId: "exec", toolPolicy: restrictedPolicy },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          ...(skipOnSendCompaction ? { skipOnSendCompaction: true } : {}),
+        }
+      );
+      expect(result.success).toBe(true);
+      await waitForCondition(() => fixture.streamHistories.length >= 1);
+
+      const firstRequestIsCompaction = fixture.streamHistories[0].some(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      );
+      expect(firstRequestIsCompaction).toBe(expectCompaction);
+      if (!expectCompaction) {
+        // The wake's own user row carries the restrictions captured when it was sent.
+        const wakeRow = fixture.streamHistories[0].at(-1);
+        expect(wakeRow?.role).toBe("user");
+        expect(wakeRow?.metadata?.toolPolicy).toEqual(restrictedPolicy);
+      }
+
+      await fixture.session.dispose();
+    });
+  }
+
   test("startup retry of an interrupted compaction keeps compaction identity", async () => {
     const workspaceId = "ws-compaction-startup-retry";
     const fixture = await createGuidanceHarness({ workspaceId });

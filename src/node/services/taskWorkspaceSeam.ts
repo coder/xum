@@ -366,6 +366,11 @@ export interface SendMessageInternalOptions {
    */
   admissionStale?: () => boolean;
   /**
+   * Synthetic wakes whose caller restrictions or in-memory guards a durable compaction follow-up
+   * cannot preserve skip on-send compaction (see AgentSession SendMessageInternalOptions).
+   */
+  skipOnSendCompaction?: boolean;
+  /**
    * Obligation minted by TaskService for a send it fenced itself (task launch). When absent on a
    * send into an agent-task workspace, WorkspaceService asks TaskService for one at the session
    * handoff (admitTaskWorkspaceTurn) so every task-workspace send is accounted for.

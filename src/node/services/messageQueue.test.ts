@@ -1973,6 +1973,30 @@ describe("MessageQueue", () => {
     });
   });
 
+  describe("skipOnSendCompaction", () => {
+    it("keeps the opt-out on its own entry and forwards it at dispatch", () => {
+      // #4721: the opt-out must reach the session for the guarded wake, and must not leak onto
+      // (or be lost to) a later plain message batched into the same entry.
+      queue.add(
+        "guarded wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, skipOnSendCompaction: true }
+      );
+      queue.add(
+        "plain follow-up",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true }
+      );
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("guarded wake");
+      expect(first.internal?.skipOnSendCompaction).toBe(true);
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("plain follow-up");
+      expect(second.internal?.skipOnSendCompaction).toBeUndefined();
+    });
+  });
+
   describe("preTurnMessages", () => {
     const preTurnRow = (id: string) =>
       createMuxMessage(id, "assistant", `payload ${id}`, { timestamp: 0, synthetic: true });

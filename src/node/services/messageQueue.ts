@@ -196,6 +196,8 @@ interface QueuedMessageInternalOptions {
    * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
    */
   admissionStale?: () => boolean;
+  /** See AgentSession SendMessageInternalOptions.skipOnSendCompaction (entries carrying it are sealed). */
+  skipOnSendCompaction?: boolean;
   /**
    * Task-attempt obligation for this send. The queue owns it from insertion (onEnqueued) until
    * the entry dispatches (the session reports admission) or is removed (disposed here). Entries
@@ -293,6 +295,8 @@ interface QueueEntry {
   onPreTurnRowsPersisted?: () => void;
   /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
   admissionStale?: () => boolean;
+  /** Dispatch without on-send compaction (sealed; see QueuedMessageInternalOptions). */
+  skipOnSendCompaction?: boolean;
   /** Task-attempt obligation owned by this entry until dispatch or removal (sealed). */
   turnAdmission?: TurnAdmissionToken;
 }
@@ -712,6 +716,8 @@ export class MessageQueue {
       // A staleness probe gates exactly one dispatch; batching would let one
       // sender's stop-refusal veto unrelated queued messages.
       internal?.admissionStale != null ||
+      // The on-send compaction opt-out applies to exactly the guarded send that asked for it.
+      internal?.skipOnSendCompaction === true ||
       internal?.turnAdmission != null ||
       internal?.goalKind != null ||
       incomingHasAcceptedCallbacks;
@@ -824,6 +830,9 @@ export class MessageQueue {
     }
     if (internal?.admissionStale != null) {
       entry.admissionStale = internal.admissionStale;
+    }
+    if (internal?.skipOnSendCompaction === true) {
+      entry.skipOnSendCompaction = true;
     }
     if (internal?.turnAdmission != null) {
       // Sealed entries are 1:1 with their token; a batched add can never reach a token-carrying
@@ -1336,6 +1345,7 @@ export class MessageQueue {
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
       admissionStale != null ||
+      entry.skipOnSendCompaction === true ||
       entry.turnAdmission != null ||
       refreshCompactionAdmission != null ||
       readCompactionAdmission != null ||
@@ -1360,6 +1370,7 @@ export class MessageQueue {
             ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
           ...(admissionStale != null ? { admissionStale } : {}),
+          ...(entry.skipOnSendCompaction === true ? { skipOnSendCompaction: true } : {}),
           ...(entry.turnAdmission != null ? { turnAdmission: entry.turnAdmission } : {}),
           ...(readCompactionAdmission != null ? { readCompactionAdmission } : {}),
           ...(refreshCompactionAdmission != null ? { refreshCompactionAdmission } : {}),

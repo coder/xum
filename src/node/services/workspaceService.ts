@@ -13108,6 +13108,7 @@ export class WorkspaceService
             // invisible to queue clearing, so the session's turn-admission gates must
             // re-check it at dispatch.
             admissionStale: internal?.admissionStale,
+            skipOnSendCompaction: internal?.skipOnSendCompaction,
             turnAdmission: taskTurnAdmission,
             compactionAdmissionStale: () => compactionAdmissionStale(),
             refreshCompactionAdmission:
@@ -13273,6 +13274,7 @@ export class WorkspaceService
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
         admissionEpochStale,
         admissionStale: internal?.admissionStale,
+        skipOnSendCompaction: internal?.skipOnSendCompaction,
         turnAdmission: taskTurnAdmission,
       });
       if (

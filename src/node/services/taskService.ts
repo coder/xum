@@ -12281,6 +12281,9 @@ export class TaskService implements AgentTaskIntegration {
         synthetic: true,
         agentInitiated: true,
         requireIdle: true,
+        // The wake carries caller restrictions, and its prompt is the only record of workspace-turn
+        // handles marked delivered below, so it must not become a compaction follow-up (#4721).
+        skipOnSendCompaction: true,
       }
     );
     // Deferred until after the delivery attempt so no await separates the
@@ -12333,6 +12336,8 @@ export class TaskService implements AgentTaskIntegration {
             skipAutoResumeReset: true,
             synthetic: true,
             agentInitiated: true,
+            // Same wake as the primary send above (#4721).
+            skipOnSendCompaction: true,
             onCanceled: () => {
               this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
@@ -12676,6 +12681,11 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
         ...(params.yieldToPreflightSends === true ? { yieldToPreflightSends: true } : {}),
         ...(params.admissionStale != null ? { admissionStale: params.admissionStale } : {}),
+        // Caller restrictions and admission probes cannot survive a deferral into a durable
+        // compaction follow-up (#4721), so such wakes skip on-send compaction.
+        ...(params.sendRestrictions != null || params.admissionStale != null
+          ? { skipOnSendCompaction: true }
+          : {}),
         ...(workspaceTurnMuxMetadata != null
           ? {
               onCanceled: async (reason: string) => {

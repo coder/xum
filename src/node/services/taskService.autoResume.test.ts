@@ -1853,6 +1853,8 @@ describe("TaskService", () => {
         agentInitiated: true,
         promoteAheadOfHiddenTurnEnd: true,
         yieldToPreflightSends: true,
+        // Restricted wakes never become compaction follow-ups (#4721).
+        skipOnSendCompaction: true,
       })
     );
     // Keyed so reports arriving before the wake dispatches coalesce into one queued turn.

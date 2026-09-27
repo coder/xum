@@ -591,7 +591,13 @@ describe("TaskService", () => {
     const prompt = wakeCall?.[1] as string;
     expect(prompt).toContain("task_await");
     expect(prompt).toContain("timeout_secs: 0");
-    expect(wakeCall?.[3]).toMatchObject({ synthetic: true, requireIdle: true });
+    // The prompt is the only record of the handles, and the wake carries caller restrictions, so
+    // it must never be deferred into a compaction follow-up (#4721).
+    expect(wakeCall?.[3]).toMatchObject({
+      synthetic: true,
+      requireIdle: true,
+      skipOnSendCompaction: true,
+    });
 
     // Restart-safe dedupe marker and the exact terminal outcome notification are persisted.
     const snapshot = await workspaceTurnSnapshot(taskService, parentId);

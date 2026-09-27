@@ -3495,6 +3495,8 @@ describe("TaskService", () => {
         startStreamInBackground: true,
         queueDedupeKey: "agent-report:child-progress:progress-1",
         promoteAheadOfHiddenTurnEnd: true,
+        // The report text is the message and its supersession probe is in memory (#4721).
+        skipOnSendCompaction: true,
       })
     );
     expect(sendMessage.mock.calls[0]?.[1]).toContain('"status": "in_progress"');
