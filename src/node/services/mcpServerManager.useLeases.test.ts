@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, setSystemTime, test } from "bun:test";
 
 import { Config } from "@/node/config";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
@@ -46,6 +46,8 @@ describe("MCPServerManager workspace use leases", () => {
   afterEach(() => {
     servers.reset();
     manager.dispose();
+    // expireStartupDeadline leaves the clock frozen; later files in the process need real time.
+    setSystemTime();
     tmp[Symbol.dispose]();
   });
 
