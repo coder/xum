@@ -35,6 +35,10 @@ const ALLOWED_PROCEDURES = {
   // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
   // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
   agents: new Set(["list"]),
+  // Read-only admin policy (provider/model allowlists, runtime and MCP flags) so the model list
+  // matches what the backend enforces (#4739); onChanged only emits empty change signals.
+  // redactWebviewOrpcResult strips provider forcedBaseUrl before policy.get reaches the webview.
+  policy: new Set(["get", "onChanged"]),
 } as const;
 
 export function isAllowedOrpcPath(path: string[]): boolean {
@@ -61,9 +65,45 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.providers.has(procedure);
     case "agents":
       return ALLOWED_PROCEDURES.agents.has(procedure);
+    case "policy":
+      return ALLOWED_PROCEDURES.policy.has(procedure);
     default:
       return false;
   }
+}
+
+/**
+ * Removes fields the webview does not need from results before they cross the bridge.
+ *
+ * policy.get: a provider's forcedBaseUrl is an internal gateway URL that could embed credentials,
+ * and no webview code reads it; only the allowlists and flags are forwarded. The input is not
+ * mutated. Every other result passes through unchanged.
+ */
+export function redactWebviewOrpcResult(path: string[], value: unknown): unknown {
+  if (path[0] !== "policy" || path[1] !== "get") {
+    return value;
+  }
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  const response = value as { policy?: unknown };
+  const policy = response.policy as { providerAccess?: unknown } | null | undefined;
+  if (typeof policy !== "object" || policy === null || !Array.isArray(policy.providerAccess)) {
+    return value;
+  }
+  return {
+    ...response,
+    policy: {
+      ...policy,
+      providerAccess: policy.providerAccess.map((entry: unknown) => {
+        if (typeof entry !== "object" || entry === null) {
+          return entry;
+        }
+        const { forcedBaseUrl: _forcedBaseUrl, ...rest } = entry as Record<string, unknown>;
+        return rest;
+      }),
+    },
+  };
 }
 
 export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; error: string };

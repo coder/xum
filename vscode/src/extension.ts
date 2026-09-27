@@ -23,7 +23,11 @@ import type {
   UiConnectionStatus,
   UiWorkspace,
 } from "./webview/protocol";
-import { isAllowedOrpcPath, sanitizeWebviewOrpcInput } from "./orpcAllowlist";
+import {
+  isAllowedOrpcPath,
+  redactWebviewOrpcResult,
+  sanitizeWebviewOrpcInput,
+} from "./orpcAllowlist";
 import { parseWebviewToExtensionMessage } from "./parseWebviewToExtensionMessage";
 import { openWorkspace } from "./workspaceOpener";
 
@@ -1667,7 +1671,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
         requestId: args.requestId,
         ok: true,
         kind: "value",
-        value: result,
+        value: redactWebviewOrpcResult(args.path, result),
       });
     } catch (error) {
       if (controller.signal.aborted) {
