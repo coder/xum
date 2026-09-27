@@ -19,7 +19,7 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveLocalParentWorkspace,
-  saveWorkspaces,
+  saveWorkspacesWithCheckouts as saveWorkspaces,
   streamEnd,
   testTaskSettings,
   workspaceTurnManagerFor,

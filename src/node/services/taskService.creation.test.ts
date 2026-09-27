@@ -1024,7 +1024,8 @@ describe("TaskService", () => {
       expect(runBackgroundInitSpy).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({ skipInitHook: true }),
-        queued.data.taskId
+        queued.data.taskId,
+        expect.anything()
       );
     } finally {
       runBackgroundInitSpy.mockRestore();

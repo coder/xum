@@ -78,6 +78,7 @@ import {
   createRuntime,
   IncompatibleRuntimeError,
   runBackgroundInit,
+  withInitUseLease,
   runFullInit,
 } from "@/node/runtime/runtimeFactory";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
@@ -184,6 +185,7 @@ import {
   WorkspaceBusyError,
   workspaceUseLeasesFor,
   type WorkspaceUseKind,
+  type WorkspaceUseLease,
 } from "@/node/services/workspaceUseLeases";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
@@ -3506,7 +3508,13 @@ export class WorkspaceService
     // this workspace. Granting at registration would rely on waitForInit, which a second
     // backend sharing this root does not observe.
     await this.grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId);
-    await runBackgroundInit(runtime, initParams, workspaceId, log);
+    await runBackgroundInit(
+      runtime,
+      initParams,
+      workspaceId,
+      workspaceUseLeasesFor(this.config),
+      log
+    );
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -5986,7 +5994,13 @@ export class WorkspaceService
                 createdBranch: createResult!.createdBranch === true,
                 // Removal, failed checkout or failed sanitization: the default never applies.
               }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
-            : runBackgroundInit(runtime, initParams, workspaceId, log)
+            : runBackgroundInit(
+                runtime,
+                initParams,
+                workspaceId,
+                workspaceUseLeasesFor(this.config),
+                log
+              )
         );
       } else {
         initAbortController.abort();
@@ -6420,10 +6434,13 @@ export class WorkspaceService
       // Multi-project creation should mirror create(): return metadata immediately, but only mark init
       // complete after initialization work has run.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        // Retained (not just fired) so archive can await the per-project init loop's exit.
+        // Retained (not just fired) so archive can await the per-project init loop's exit. The
+        // loop runs under one "init" use lease, as runBackgroundInit does (#4857).
+        // Captured: the callback does not narrow the outer `let`.
+        const projectsInitLogger = initLogger;
         this.retainInitSettlement(
           workspaceId,
-          (async () => {
+          withInitUseLease(workspaceUseLeasesFor(this.config), workspaceId, async () => {
             let initFailed = false;
 
             for (const createdWorkspace of createdWorkspaces) {
@@ -6437,7 +6454,7 @@ export class WorkspaceService
                 )?.trusted ?? false;
 
               const projectInitLogger = {
-                ...initLogger,
+                ...projectsInitLogger,
                 // Each runtime's init path reports completion. Suppress per-project completion so
                 // multi-project workspaces only transition out of initializing after all runtimes finish.
                 logComplete: (_exitCode: number) => undefined,
@@ -6475,7 +6492,7 @@ export class WorkspaceService
                   projectPath: createdWorkspace.project.projectPath,
                   error: message,
                 });
-                initLogger.logStderr(
+                projectsInitLogger.logStderr(
                   `Initialization failed for ${createdWorkspace.project.projectName}: ${message}`
                 );
               }
@@ -6492,8 +6509,12 @@ export class WorkspaceService
               return;
             }
 
-            initLogger.logComplete(initFailed ? -1 : 0);
-          })()
+            projectsInitLogger.logComplete(initFailed ? -1 : 0);
+          }).catch((error: unknown) => {
+            // Refused while another backend mutates the workspace: no init hook ran.
+            projectsInitLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+            projectsInitLogger.logComplete(-1);
+          })
         );
       } else {
         initAbortController.abort();
@@ -6736,10 +6757,12 @@ export class WorkspaceService
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
       // #4476: refuse while another backend uses the workspace (or its shared sub-agents), before
-      // any effect. This backend's own stream, terminals and background processes keep today's
-      // handling: removal stops them below.
+      // any effect. This backend's own stream, terminals, MCP servers, init hook and background
+      // processes keep today's handling: removal stops them (it waits for the init below). So do
+      // its own in-flight one-off commands (#4857): removal never waited for them, and
+      // removingWorkspaces refuses new ones.
       const gate = await this.acquireStructuralMutationGate(workspaceId, {
-        ignoreKinds: new Set(["turn", "terminal"]),
+        ignoreKinds: new Set(["turn", "terminal", "mcp", "init", "exec"]),
         backgroundProcesses: "allow",
       });
       if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
@@ -8582,9 +8605,11 @@ export class WorkspaceService
       // #4476: the move must not pull the checkout from under a turn, terminal or background
       // process of another backend (or of a shared sub-agent), nor under this backend's own turn
       // or background process (#4478; the isStreaming check above misses preparation and shared
-      // children). Own terminals stay open, as before: their shells follow the moved directory.
+      // children). Own terminals stay open, as before: their shells follow the moved directory,
+      // and so do its own MCP server processes (#4857). Its own init hook refuses: nothing here
+      // stops it. Its own in-flight one-off commands keep today's handling (never waited for).
       const gate = await this.acquireStructuralMutationGate(workspaceId, {
-        ignoreKinds: new Set(["terminal"]),
+        ignoreKinds: new Set(["terminal", "mcp", "exec"]),
         backgroundProcesses: "refuse",
       });
       if (!gate.success) return Err(`Cannot rename workspace: ${gate.error}`);
@@ -10503,14 +10528,16 @@ export class WorkspaceService
 
       // #4476: an archive that deletes the checkout (snapshot or delete behavior) refuses while
       // another backend uses the workspace or its shared sub-agents. Keep-mode archive is not a
-      // structural mutation. This backend's own stream and terminals keep today's handling
-      // (stopped below), and so do its own background processes.
+      // structural mutation. This backend's own stream, terminals and MCP servers keep today's
+      // handling (stopped below), and so do its own background processes and in-flight one-off
+      // commands (#4857; a model-facing archive refuses those itself). Its own init hook was
+      // aborted and awaited above, so a lease still held here is a new one and refuses.
       if (
         beforeArchiveMetadata != null &&
         archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior)
       ) {
         const gate = await this.acquireStructuralMutationGate(workspaceId, {
-          ignoreKinds: new Set(["turn", "terminal"]),
+          ignoreKinds: new Set(["turn", "terminal", "mcp", "exec"]),
           backgroundProcesses: "allow",
         });
         if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
@@ -11976,6 +12003,7 @@ export class WorkspaceService
           trusted: projectConfig.trusted ?? false,
         },
         newWorkspaceId,
+        workspaceUseLeasesFor(this.config),
         log
       );
       // Also retained for archive: see initSettlementPromises.
@@ -17233,6 +17261,25 @@ export class WorkspaceService
           this.preflightExecCounts.set(workspaceId, remaining);
         }
       },
+    };
+    // #4857: one "exec" use lease per call, until the command settles, so another backend
+    // sharing this Xum root refuses to rename or remove the checkout under it. Taken before the
+    // metadata read, so a mutation that finished first is seen by the reads below. While another
+    // backend mutates the workspace, the command does not run.
+    let useLease: WorkspaceUseLease;
+    try {
+      useLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "exec");
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+    await using _useLease = {
+      [Symbol.asyncDispose]: () =>
+        useLease.release().catch((error: unknown) => {
+          log.warn("Failed to release the exec use lease", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }),
     };
 
     const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);

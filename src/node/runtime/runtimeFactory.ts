@@ -14,6 +14,8 @@ import { hasSrcBaseDir } from "@/common/types/runtime";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
 import { detectContainerEngine, isEngineResponsive } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
+import type { WorkspaceUseLeases } from "@/node/services/workspaceUseLeases";
+import { log } from "@/node/services/log";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
 import { buildDevcontainerConfigInfo, scanDevcontainerConfigs } from "./devcontainerConfigs";
@@ -55,15 +57,22 @@ export async function runFullInit(
  * error paths that must tear down the checkout can await termination first —
  * deleting a worktree while init still runs against it races its writes and
  * open handles. Callers that never tear down may ignore it with `void`.
+ *
+ * #4857: the init hook runs in the checkout, so it holds this backend's "init" use lease until
+ * it ends, and another backend sharing the Xum root refuses to rename or remove the workspace
+ * meanwhile. The lease is released before the returned promise settles, so a caller awaiting
+ * the settlement (archive, remove) no longer sees it. While another backend mutates the
+ * workspace, the init does not run and fails like any other init failure.
  */
 export function runBackgroundInit(
   runtime: Runtime,
   params: WorkspaceInitParams,
   workspaceId: string,
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
   // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   logger?: { error: (msg: string, ctx: object) => void }
 ): Promise<void> {
-  return runFullInit(runtime, params).then(
+  return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
     () => undefined,
     (error: unknown) => {
       const errorMsg = getErrorMessage(error);
@@ -72,6 +81,30 @@ export function runBackgroundInit(
       params.initLogger.logComplete(-1);
     }
   );
+}
+
+/**
+ * Run a background init under this backend's "init" use lease for the workspace (#4857; see
+ * runBackgroundInit). Throws WorkspaceMutationInProgressError, without running `init`, while
+ * another backend mutates the workspace. The lease is released before the returned promise
+ * settles. Multi-project creation runs its per-project inits through this directly.
+ */
+export async function withInitUseLease<T>(
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
+  workspaceId: string,
+  init: () => Promise<T>
+): Promise<T> {
+  const lease = await useLeases.hold(workspaceId, "init");
+  try {
+    return await init();
+  } finally {
+    // A failed release leaves the lease file held (fail closed); never fail the init for it.
+    await lease.release().catch((error: unknown) => {
+      log.warn(`Failed to release the init use lease for ${workspaceId}`, {
+        error: getErrorMessage(error),
+      });
+    });
+  }
 }
 
 function shouldUseSSH2Runtime(): boolean {

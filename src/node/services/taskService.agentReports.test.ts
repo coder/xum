@@ -38,6 +38,7 @@ import {
   initGitRepo,
   projectWorkspace,
   saveWorkspaces,
+  saveWorkspacesWithCheckouts,
   streamEnd,
   stubStableIds,
   testTaskSettings,
@@ -3457,7 +3458,7 @@ describe("TaskService", () => {
     const parentId = "parent-progress";
     const childId = "child-progress";
 
-    await saveWorkspaces(
+    await saveWorkspacesWithCheckouts(
       config,
       projectPath,
       [
@@ -3532,7 +3533,7 @@ describe("TaskService", () => {
       const projectPath = path.join(rootDir, "repo");
       const parentId = "parent-progress-hold";
       const childId = "child-progress-hold";
-      await saveWorkspaces(
+      await saveWorkspacesWithCheckouts(
         config,
         projectPath,
         [
@@ -3571,7 +3572,7 @@ describe("TaskService", () => {
     const projectPath = path.join(rootDir, "repo");
     const parentId = "parent-progress-late-hold";
     const childId = "child-progress-late-hold";
-    await saveWorkspaces(
+    await saveWorkspacesWithCheckouts(
       config,
       projectPath,
       [
@@ -3615,13 +3616,44 @@ describe("TaskService", () => {
     );
   });
 
+  test("agent_report refuses to wake a parent whose checkout is missing (#4824)", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    await saveWorkspacesWithCheckouts(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", "parent"),
+        projectWorkspace(projectPath, "child", "child", {
+          parentWorkspaceId: "parent",
+          agentType: "review",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+    await fsPromises.rm(path.join(projectPath, "parent", ".git"), { recursive: true, force: true });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    let caught: unknown;
+    try {
+      await taskService.reportAgentProgress("child", "progress-1", { reportMarkdown: "Finding." });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(String(caught)).toContain("checkout is unavailable");
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("agent_report refuses an update whose run ended before the wake was sent", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
     const parentId = "parent-late-progress";
     const childId = "child-late-progress";
 
-    await saveWorkspaces(
+    await saveWorkspacesWithCheckouts(
       config,
       projectPath,
       [

@@ -197,6 +197,46 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("does not reuse a record directory whose exited process another backend still tracks", async () => {
+      // #4882: backend A's command exits (writes exit_code) while A still tracks it. Backend B
+      // cannot see A's in-memory map, so reusing the settled directory would make A's later
+      // output and status reads describe B's command.
+      const otherBackend = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const first = await manager.spawn(runtime, testWorkspaceId, "echo from-a", {
+          cwd: process.cwd(),
+          displayName: "job",
+        });
+        expect(first.success).toBe(true);
+        if (!first.success) return;
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline) {
+          try {
+            await fs.access(path.join(first.outputDir, "exit_code"));
+            break;
+          } catch {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+        }
+        await fs.access(path.join(first.outputDir, "exit_code"));
+
+        const second = await otherBackend.spawn(runtime, testWorkspaceId, "sleep 30", {
+          cwd: process.cwd(),
+          displayName: "job",
+        });
+        expect(second.success).toBe(true);
+        if (!second.success) return;
+        expect(second.outputDir).not.toBe(first.outputDir);
+        const output = await manager.getOutput(first.processId);
+        expect(output.success).toBe(true);
+        if (!output.success) return;
+        expect(output.status).toBe("exited");
+        expect(output.output).toContain("from-a");
+      } finally {
+        await otherBackend.cleanup(testWorkspaceId);
+      }
+    });
+
     it("should return error on spawn failure", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo test", {
         cwd: "/nonexistent/path/that/does/not/exist",
@@ -3804,11 +3844,12 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
     });
 
-    it("clears a stale exit_code file when a restart reuses the process directory", async () => {
+    it("does not reuse a settled record directory from a previous session", async () => {
       // Process IDs are display-name based and deduplicated only in memory, so after a
-      // restart a new spawn can land in a prior session's directory whose exit trap already
-      // wrote exit_code. That stale marker must not survive the new spawn: it would flip the
-      // live process to "exited" and let crash-orphan gating treat it as exited too.
+      // restart a new spawn could land in a prior session's directory whose exit trap already
+      // wrote exit_code. Settled directories are never reused (the other backend may still
+      // track them, #4882), so the new process gets a fresh directory and the stale marker
+      // can neither flip it to "exited" nor hide it from crash-orphan gating.
       const displayName = "reused-name";
       const processDir = path.join(workspaceDir, displayName);
       await fs.mkdir(processDir, { recursive: true });
@@ -3819,16 +3860,11 @@ describe("BackgroundProcessManager", () => {
         displayName,
       });
       expect(result.success).toBe(true);
-
-      let staleMarkerExists = true;
-      try {
-        await fs.access(path.join(processDir, "exit_code"));
-      } catch {
-        staleMarkerExists = false;
-      }
-      expect(staleMarkerExists).toBe(false);
+      if (!result.success) return;
+      expect(result.outputDir).not.toBe(processDir);
+      expect(await fs.readFile(path.join(processDir, "exit_code"), "utf-8")).toBe("0");
       const processes = await manager.list(orphanWorkspaceId);
-      expect(processes.find((p) => p.id === displayName)?.status).toBe("running");
+      expect(processes.find((p) => p.id === result.processId)?.status).toBe("running");
     });
 
     it("skips processes the manager still tracks", async () => {

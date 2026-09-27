@@ -37,7 +37,7 @@ const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
 // Host file lock serializing background spawns per workspace across backends (#4873).
 // A regular file inside the workspace records root: record scanners only read directories.
-const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
+export const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
 // Held from the name probe until the new record's meta.json is written (one local spawn).
 const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
@@ -109,6 +109,28 @@ export function parseSpawnRecordMeta(raw: string): { pid: number; status: string
   if (typeof pid !== "number" || !Number.isInteger(pid)) return null;
   if (typeof status !== "string") return null;
   return { pid, status };
+}
+
+/**
+ * Host-local name probe for a new spawn or migrated record, called while holding the
+ * per-workspace spawn-name lock: a name is free only if its record directory does not exist.
+ * Existing directories are never reused, even settled ones (exit marker, non-running status,
+ * dead PID). Two backends on one XUM_ROOT (desktop + `xum server`) cannot see each other's
+ * in-memory process maps, so a settled record may still be tracked by the other backend, and
+ * reusing it would make that backend's output/status reads describe the new command (#4882).
+ * A crash orphan's directory is skipped the same way, and a fresh directory never inherits a
+ * stale exit marker. Cost: a name used before keeps getting a suffix until its old record is
+ * removed. Throws when the directory cannot be probed, so callers fail closed instead of
+ * looping over candidates.
+ */
+async function recordDirIsFree(recordDir: string): Promise<boolean> {
+  try {
+    await fsPromises.lstat(recordDir);
+    return false;
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) return true;
+    throw error;
+  }
 }
 
 import { EventEmitter } from "events";
@@ -1383,27 +1405,81 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Allocate a unique process ID and reserve it in the same synchronous step.
+   * Claim a unique process name for foreground-to-background migration.
    *
-   * Foreground-to-background migration awaits between choosing its ID and registering the
-   * migrated process; without a reservation, two concurrent same-name migrations would both
-   * be handed the same ID and share one output directory and manager entry — the first exit
-   * would then write the shared exit marker and settle the survivor's records, blinding
-   * archive gating after an unclean restart. Callers release on success only after the
-   * process is registered (the processes map then holds the name) and on failure only once
-   * the process's exit settles, so an unverifiable survivor keeps its name reserved for the
-   * session.
+   * Migrated records live under `<bgOutputDir>/<workspaceId>/<processId>`. Two backends on one
+   * XUM_ROOT (desktop + `xum server`) have separate managers, so an in-memory reservation
+   * alone let both migrate a same-named command into one directory and share its
+   * output.log/exit marker (#4878). The claim therefore holds the same per-workspace host file
+   * lock as spawn() and only picks a name whose directory does not exist yet (recordDirIsFree).
+   * A fresh directory also never inherits a previous session's exit marker, which would make
+   * the live migrated command read as exited to name probes and crash-orphan archive gating.
+   *
+   * The caller keeps the claim (lock) until migrateToBackground() has created the directory,
+   * after which every other backend's probe reads the name as held, then disposes it. The
+   * in-memory name reservation is released separately via releaseName(): on success once the
+   * process is registered (the processes map then holds the name), on failure only once the
+   * process's exit settles, so an unverifiable survivor keeps its name for the session.
    */
-  reserveUniqueProcessId(baseId: string): { processId: string; release: () => void } {
-    const processId = this.generateUniqueProcessId(baseId);
+  async claimMigrationProcessId(
+    workspaceId: string,
+    displayName: string
+  ): Promise<
+    | ({ success: true; processId: string; releaseName: () => void } & AsyncDisposable)
+    | { success: false; error: string }
+  > {
+    assert(workspaceId.length > 0, "claimMigrationProcessId requires workspaceId");
+    const workspaceDir = nodePath.join(this.bgOutputDir, workspaceId);
+    let lock: AsyncDisposable;
+    try {
+      lock = await acquireProcessFileLock({
+        lockPath: nodePath.join(workspaceDir, SPAWN_NAME_LOCK_FILENAME),
+        timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+        label: "background migration lock",
+      });
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+      };
+    }
+    // Each candidate is reserved in the same tick it is chosen (see reservedProcessIds), so a
+    // concurrent spawn() in this manager cannot pick it during the directory probes below.
+    let processId = this.generateUniqueProcessId(displayName);
     this.reservedProcessIds.add(processId);
-    let released = false;
-    return {
-      processId,
-      release: () => {
-        if (released) return;
-        released = true;
+    try {
+      let suffix = 2;
+      while (!(await recordDirIsFree(nodePath.join(workspaceDir, processId)))) {
         this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    } catch (error) {
+      this.reservedProcessIds.delete(processId);
+      await lock[Symbol.asyncDispose]();
+      return {
+        success: false,
+        error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+      };
+    }
+    const claimedId = processId;
+    let nameReleased = false;
+    let unlocked = false;
+    return {
+      success: true,
+      processId: claimedId,
+      releaseName: () => {
+        if (nameReleased) return;
+        nameReleased = true;
+        this.reservedProcessIds.delete(claimedId);
+      },
+      [Symbol.asyncDispose]: async () => {
+        if (unlocked) return;
+        unlocked = true;
+        await lock[Symbol.asyncDispose]();
       },
     };
   }
@@ -1457,11 +1533,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         }
       },
     };
-    // Restart-unique directories: skip names whose durable directory may still belong to a
-    // surviving process from a previous session — see localSpawnDirMayHoldLiveProcess for
-    // why reuse would blind archive gating. Host-local records are probed on the local
-    // filesystem with host PID checks; all other layouts (SSH/Coder, Docker, devcontainer)
-    // live in the runtime's exec namespace and are probed through the runtime instead.
+    // Restart-unique directories: the in-memory allocator resets with the app, so skip names
+    // whose durable directory already exists. Reusing a surviving crash orphan's directory
+    // would hand two live processes one meta.json/exit_code and blind archive gating, and
+    // reusing a settled one may clobber a record the other backend still tracks (see
+    // recordDirIsFree). Host-local records are probed on the local filesystem; all other
+    // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
+    // probed through the runtime instead.
     // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
     // separate in-memory reservations but share the host records root, so both could probe a
     // name as free and spawn into one directory. Host-local spawns therefore hold a
@@ -1487,13 +1565,24 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     await using _claimLock = claimLock;
     if (spawnRecordsAreHostLocal(runtime)) {
       let suffix = 2;
-      while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
-        this.reservedProcessIds.delete(processId);
-        do {
-          processId = `${config.displayName} (${suffix})`;
-          suffix++;
-        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
-        this.reservedProcessIds.add(processId);
+      try {
+        while (
+          !(await recordDirIsFree(nodePath.join(localBgWorkspaceDir(workspaceId), processId)))
+        ) {
+          this.reservedProcessIds.delete(processId);
+          do {
+            processId = `${config.displayName} (${suffix})`;
+            suffix++;
+          } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+          this.reservedProcessIds.add(processId);
+        }
+      } catch (error) {
+        // Unprobeable records root: nothing was written under this name, so the reservation
+        // is safe to release.
+        return {
+          success: false,
+          error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+        };
       }
     } else {
       let suffix = 2;
@@ -2576,57 +2665,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Whether the local durable spawn directory for this process name may still belong to a
-   * live process from a previous app session. Used to keep process directories unique across
-   * restarts: the in-memory ID allocator resets with the app, and reusing a surviving crash
-   * orphan's directory would hand two live processes one meta.json/exit_code — the newer
-   * process's exit marker would then settle the survivor's record and blind the crash-orphan
-   * archive gate. Settled records (exit marker present, non-running status, or dead PID) are
-   * safe to reuse; anything unprovable is treated as live so the allocator picks a new name.
-   */
-  private async localSpawnDirMayHoldLiveProcess(
-    workspaceId: string,
-    processId: string
-  ): Promise<boolean> {
-    const processDir = nodePath.join(localBgWorkspaceDir(workspaceId), processId);
-    try {
-      await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
-      return false; // The exit trap ran: settled — spawn clears the stale marker on reuse.
-    } catch {
-      // No exit marker — consult the meta record.
-    }
-    let raw: string;
-    try {
-      raw = await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8");
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
-        try {
-          await fsPromises.access(processDir);
-          // Metaless, markerless directory: a crash artifact the orphan probe fails closed
-          // on — leave it undisturbed rather than overwrite whatever evidence remains.
-          return true;
-        } catch {
-          return false; // Directory absent: the name is free.
-        }
-      }
-      return true; // Unreadable record: may belong to a live process.
-    }
-    const meta = parseSpawnRecordMeta(raw);
-    if (meta == null) return true; // Torn record without an exit marker: may be live.
-    if (meta.status !== "running") return false; // Settled.
-    if (meta.pid <= 1) return true; // Unprobeable pid recorded as running: do not reuse.
-    try {
-      process.kill(meta.pid, 0);
-      return true; // Alive.
-    } catch (error) {
-      // ESRCH: gone. Anything else (EPERM, ...): not provably dead — treat as live.
-      return !isErrnoWithCode(error, "ESRCH");
-    }
-  }
-
-  /**
-   * Counterpart of localSpawnDirMayHoldLiveProcess for runtimes whose spawn records are NOT
-   * host-local (SSH/Coder, Docker, devcontainer — see spawnRecordsAreHostLocal): the record
+   * Counterpart of spawn()'s host-local name probe (recordDirIsFree) for runtimes whose spawn
+   * records are NOT host-local (SSH/Coder, Docker, devcontainer — see spawnRecordsAreHostLocal): the record
    * layout lives in the runtime's exec namespace, so probe it through the runtime. Only the
    * exit marker (or directory absence) proves the name safe to reuse — a markerless
    * directory may belong to a live detached process from a previous session or a preserved
@@ -2687,8 +2727,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const tempDir = await runtime.tempDir();
       const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
-      // One POSIX-shell pass over the per-process record dirs (see localSpawnDirMayHoldLiveProcess
-      // for the host-local equivalent of these rules):
+      // One POSIX-shell pass over the per-process record dirs (see recordRootHoldsOrphan for the
+      // host-local equivalent of these rules):
       // - exit marker present → settled; missing meta.json (or one without a "status" field,
       //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.
       // - running status: dead PID means SIGKILL/reboot skipped the trap → settled; a live or

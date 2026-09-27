@@ -12,7 +12,7 @@
  * - ManyWorkspaces: 14 workspaces across 5 projects to stress-test scrolling/grouping
  */
 
-import { expect, userEvent, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks, type AppStory } from "./meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import { collapseRightSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
@@ -306,7 +306,11 @@ export const RemoveCurrentWorkspaceRefused: AppStory = {
     await userEvent.keyboard(">Remove Current Workspace");
     const body = within(canvasElement.ownerDocument.body);
     await userEvent.click(await body.findByText("Remove Current Workspace…"));
-    await userEvent.click(await body.findByRole("button", { name: "Remove" }));
+    const confirm = await body.findByRole("button", { name: "Remove" });
+    // The confirm dialog mounts while the closing palette dialog still holds
+    // `pointer-events: none` on the page; clicking before it lifts fails under load.
+    await waitFor(() => expect(getComputedStyle(confirm).pointerEvents).not.toBe("none"));
+    await userEvent.click(confirm);
     const alert = await body.findByRole("alert", {}, { timeout: 5000 });
     await expect(alert).toHaveTextContent("Failed to remove workspace");
     await expect(alert).toHaveTextContent(REMOVE_REFUSAL);

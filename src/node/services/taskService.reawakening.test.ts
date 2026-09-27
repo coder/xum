@@ -17,7 +17,7 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveLocalParentWorkspace,
-  saveWorkspaces,
+  saveWorkspacesWithCheckouts as saveWorkspaces,
   streamEnd,
   stubStableIds,
   testTaskSettings,

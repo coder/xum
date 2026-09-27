@@ -20,6 +20,7 @@ import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
 import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { WorkspaceService } from "@/node/services/workspaceService";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   createMockAIService,
   createTestBackgroundProcessManager,
@@ -28,6 +29,13 @@ import {
 import { Ok } from "@/common/types/result";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
+/** Background init starts after this backend records its init use lease (file I/O), not in one tick. */
+async function waitForCall(fn: { mock: { calls: unknown[] } }): Promise<void> {
+  for (let turn = 0; fn.mock.calls.length === 0; turn++) {
+    assert(turn < 2000, "waitForCall: never called");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
 async function withTempMuxRoot<T>(fn: (root: string) => Promise<T>): Promise<T> {
   const originalMuxRoot = process.env.MUX_ROOT;
   const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-multi-project-"));
@@ -700,7 +708,12 @@ describe("WorkspaceService multi-project lifecycle", () => {
           workspacePath: path.join(srcDir, "project-b", branchName),
         })
       );
-      const initWorkspaceAMock = mock(() => Promise.resolve({ success: true as const }));
+      // #4857: the per-project inits run under this backend's "init" use lease.
+      const initLeasesHeld: number[] = [];
+      const initWorkspaceAMock = mock(() => {
+        initLeasesHeld.push(workspaceUseLeasesFor(config).heldCount(workspaceId, "init"));
+        return Promise.resolve({ success: true as const });
+      });
       const initWorkspaceBMock = mock(() => Promise.resolve({ success: true as const }));
       const deleteWorkspaceMock = mock(() =>
         Promise.resolve({ success: true as const, deletedPath: "/tmp/deleted" })
@@ -772,7 +785,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", branchName),
           },
         ]);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(initWorkspaceBMock);
         expect(initWorkspaceAMock).toHaveBeenCalledWith(
           expect.objectContaining({
             projectPath: projectAPath,
@@ -789,6 +802,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
             workspacePath: path.join(srcDir, "project-b", branchName),
           })
         );
+        expect(initLeasesHeld).toEqual([1]);
+        for (let turn = 0; workspaceUseLeasesFor(config).heldCount(workspaceId) > 0; turn++) {
+          assert(turn < 1000, "the init use lease was never released");
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
         const storedMultiWorkspaces =
           config.loadConfigOrDefault().projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? [];
         expect(storedMultiWorkspaces).toHaveLength(1);
@@ -896,12 +914,11 @@ describe("WorkspaceService multi-project lifecycle", () => {
           "main"
         );
         expect(result.success).toBe(true);
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(initWorkspaceAMock);
         expect(initWorkspaceAMock).toHaveBeenCalledTimes(1);
         expect(metadataEvents[0]?.isInitializing).toBe(true);
         initWorkspaceADeferred.resolve({ success: true });
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(clearInMemoryStateMock);
         expect(clearInMemoryStateMock).toHaveBeenCalledWith(workspaceId);
         expect(getInitStateMock.mock.calls.length).toBeGreaterThanOrEqual(2);
         expect(initWorkspaceBMock).not.toHaveBeenCalled();
@@ -1134,7 +1151,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
         expect(createWorkspaceBMock).toHaveBeenCalledWith(
           expect.objectContaining({ projectPath: projectBPath, trunkBranch: "master" })
         );
-        await new Promise((resolve) => setTimeout(resolve, 0));
+        await waitForCall(initWorkspaceBMock);
         expect(initWorkspaceAMock).toHaveBeenCalledWith(
           expect.objectContaining({ projectPath: projectAPath, trunkBranch: "main" })
         );
