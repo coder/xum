@@ -20,7 +20,7 @@ import {
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   projectWorkspace,
-  saveWorkspaces,
+  saveWorkspaces as saveHarnessWorkspaces,
   testTaskSettings,
   workspaceTurnManagerFor,
   workspaceTurnManagerInternals,
@@ -34,6 +34,19 @@ import {
   removeTaskServiceTestRoot,
   reserveFamilyMessageTargetSlots,
 } from "@/node/services/taskService.shared.testHarness";
+
+/**
+ * Saves the workspaces and gives each one a real checkout marker: an unrelated send probes the
+ * root recipient's checkout and refuses a missing one before anything is persisted (#4305).
+ */
+async function saveWorkspaces(
+  ...args: Parameters<typeof saveHarnessWorkspaces>
+): ReturnType<typeof saveHarnessWorkspaces> {
+  await saveHarnessWorkspaces(...args);
+  for (const workspace of args[2]) {
+    await fsPromises.mkdir(path.join(workspace.path, ".git"), { recursive: true });
+  }
+}
 
 describe("TaskService", () => {
   let rootDir: string;
