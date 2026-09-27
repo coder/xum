@@ -3064,6 +3064,84 @@ describe("HistoryService", () => {
     });
   });
 
+  describe("hasHistoryBeforeSequence", () => {
+    // The answer is an existence check over chat-archive.jsonl ∪ chat.jsonl. The
+    // implementation reads the archive first and falls back to chat.jsonl, and
+    // answers bound 0 without reading; these cases pin the union semantics.
+    const row = (id: string, historySequence?: number) =>
+      messageLine("ws-has-older", createMuxMessage(id, "user", id, { historySequence }));
+    const malformed = "{not json";
+
+    it.each<{
+      name: string;
+      bound: number;
+      archive: string[] | null;
+      chat: string[];
+      expected: boolean;
+    }>([
+      {
+        name: "bound 0 is false even with sequence-0 and unsequenced rows in both files",
+        bound: 0,
+        archive: [row("a0", 0), row("a-unsequenced")],
+        chat: [row("c0", 0), row("c-unsequenced"), row("c1", 1)],
+        expected: false,
+      },
+      {
+        name: "older row only in the archive",
+        bound: 5,
+        archive: [row("a1", 1)],
+        chat: [row("c5", 5), row("c6", 6)],
+        expected: true,
+      },
+      {
+        name: "older row only in chat.jsonl without an archive file",
+        bound: 5,
+        archive: null,
+        chat: [row("c3", 3), row("c5", 5)],
+        expected: true,
+      },
+      {
+        name: "archive holds no smaller sequence, so chat.jsonl is still checked",
+        bound: 5,
+        archive: [row("a5", 5), row("a-unsequenced"), malformed, row("a7", 7)],
+        chat: [row("c4", 4), row("c6", 6)],
+        expected: true,
+      },
+      {
+        name: "no smaller sequence anywhere (equal sequences do not count)",
+        bound: 5,
+        archive: [row("a5", 5), row("a-unsequenced")],
+        chat: [row("c5", 5), row("c6", 6)],
+        expected: false,
+      },
+      {
+        name: "malformed and unsequenced rows are ignored",
+        bound: 5,
+        archive: null,
+        chat: [malformed, row("c-unsequenced"), row("c5", 5)],
+        expected: false,
+      },
+      {
+        name: "malformed and unsequenced rows newer than an older row do not stop the walk",
+        bound: 5,
+        archive: [row("a-unsequenced"), malformed],
+        chat: [row("c2", 2), malformed, row("c-unsequenced"), row("c5", 5)],
+        expected: true,
+      },
+    ])("$name", async ({ bound, archive, chat, expected }) => {
+      const workspaceId = "ws-has-older";
+      await writeHistoryLines(config, workspaceId, chat);
+      if (archive) {
+        await fs.writeFile(
+          path.join(config.sessionsDir, workspaceId, "chat-archive.jsonl"),
+          archive.join("\n") + "\n"
+        );
+      }
+
+      expect(await service.hasHistoryBeforeSequence(workspaceId, bound)).toBe(expected);
+    });
+  });
+
   describe("getMessagesForCompactionEpoch", () => {
     it("returns evidence rows between the previous boundary and the new summary", async () => {
       const workspaceId = "ws-compaction-epoch";

@@ -2342,6 +2342,13 @@ export class HistoryService {
     workspaceId: string,
     beforeHistorySequence: number
   ): Promise<boolean> {
+    // Only non-negative integer sequences strictly below the bound count, and
+    // none is below 0. Chat replay of an uncompacted chat usually starts at
+    // sequence 0, so answering here avoids parsing the whole file (#4655).
+    if (beforeHistorySequence === 0) {
+      return false;
+    }
+
     let hasOlder = false;
     const visitor = (messages: MuxMessage[]): boolean | void => {
       for (const message of messages) {
@@ -2357,9 +2364,15 @@ export class HistoryService {
       }
     };
 
-    const completed = await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
+    // This is an existence check over the union of both files, so the order
+    // does not change the answer. Archive first is fast: it holds the sealed
+    // rows before the latest rotated boundary, so its newest sequenced row is
+    // normally already older than the replayed active epoch and the last chunk
+    // answers. Walking chat.jsonl first parsed the entire active epoch (every
+    // row there is >= the replay's oldest sequence) before reaching the archive.
+    const completed = await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
     if (completed && !hasOlder) {
-      await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
+      await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
     }
 
     return hasOlder;
