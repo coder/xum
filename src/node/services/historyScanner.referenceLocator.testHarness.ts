@@ -1,31 +1,213 @@
 // Frozen copy of findProviderHistoryStart at 55c8e3c76f1cd92457f2a4f12b393c7ce77efe8a (#4655
-// differential oracle). Do not edit to follow production; delete together with the locator fast
-// path. historyScanner.differential.test.ts compares production against this copy, so a change
-// to which rows the production locator parses or probes shows up as a divergence here.
+// differential oracle), together with every historyScanner.ts helper it reaches: the reset token
+// recognizer, the raw-marker and ambiguous-key checks, the readability check and the row
+// classifier. Do not edit to follow production; delete together with the locator fast path.
+// historyScanner.differential.test.ts compares production against this copy, so a change in
+// historyScanner.ts to which rows the locator parses, probes, floors at or delivers shows up as a
+// divergence. Blind spot: helpers and constants imported from other modules below
+// (normalizePersistedMessage, isManualHistoryReset, the boundary predicates, MuxMessageSchema and
+// the contextBudget constants) are shared with production, so a change there changes both sides.
+import { createScanner, SyntaxKind } from "jsonc-parser";
 import type * as fs from "node:fs/promises";
 import assert from "node:assert";
 import {
   SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE,
   SESSION_HISTORY_MAX_BOUNDARY_ROW_BYTES,
   SESSION_HISTORY_MAX_LINE_BYTES,
+  SESSION_HISTORY_RESET_NEEDLE,
+  SESSION_HISTORY_RESET_PROBE_CHARS,
   SESSION_HISTORY_SCAN_CHUNK_BYTES,
 } from "@/common/constants/contextBudget";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import type { MuxMessage } from "@/common/types/message";
 import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import {
   isDurableCompactionBoundaryMarker,
   isDurableContextBoundaryMarker,
 } from "@/common/utils/messages/compactionBoundary";
-import {
-  addHistoryResetProbe,
-  classifyHistoryScanRow,
-  type HistoryResetProbe,
-  type LocatedHistoryBoundary,
-  type ProviderHistoryStart,
-  type ScannedHistoryRow,
-} from "./historyScanner";
+import { normalizePersistedMessage } from "@/node/utils/messages/normalizePersistedMessage";
+import type { CompactionPendingBoundary as PendingBoundary } from "./compactionPendingState";
 import { log } from "./log";
 
+const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
+const resetTokenPattern = new RegExp(
+  [resetKeyToken, resetValueToken, ":"]
+    .map((token) =>
+      [...token]
+        .map((character) => {
+          const hex = character
+            .charCodeAt(0)
+            .toString(16)
+            .padStart(4, "0")
+            .replace(/[a-f]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+          return `(?:${character}|\\\\(?:u${hex}|x${hex.slice(2)}))`;
+        })
+        .join("")
+    )
+    .join("|"),
+  "g"
+);
+
+function isReadableHistoryMessage(value: unknown): value is MuxMessage {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    "id" in value &&
+    typeof value.id === "string" &&
+    "role" in value &&
+    ["user", "assistant", "system"].includes(String(value.role)) &&
+    (!("metadata" in value) ||
+      value.metadata === undefined ||
+      (value.metadata !== null &&
+        typeof value.metadata === "object" &&
+        !Array.isArray(value.metadata))) &&
+    "parts" in value &&
+    MuxMessageSchema.shape.parts.safeParse(value.parts).success
+  );
+}
+
+// Corrupted JSON can contain JS hex escapes; raw and incremental probes must
+// recognize the same reset tokens without making the row provider-readable.
+function decodeResetEscapes(text: string): string {
+  return text.replace(/\\(?:u[\da-fA-F]{4}|x[\da-fA-F]{2})/g, (escape) =>
+    String.fromCharCode(Number.parseInt(escape.slice(2), 16))
+  );
+}
+
+function compactResetProbe(text: string): string {
+  // Corruption may insert raw or escaped control separators where JSON permits
+  // whitespace. Remove them before retaining overlap, including long runs.
+  return stripEscapedResetSeparators(stripRawResetSeparators(text));
+}
+
+function stripRawResetSeparators(text: string): string {
+  return text.replace(/[\s\p{Cc}]/gu, "");
+}
+function stripEscapedResetSeparators(text: string): string {
+  return text.replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
+}
+
+function hasRawResetMarker(text: string): boolean {
+  const decoded = decodeResetEscapes(compactResetProbe(text));
+  return decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
+}
+
+/** Call only for parsed reset candidates; oversized rows cannot establish a rollover exemption. */
+function hasAmbiguousResetKeys(text: string): boolean {
+  if (Buffer.byteLength(text, "utf8") > SESSION_HISTORY_MAX_LINE_BYTES) return true;
+  const scanner = createScanner(text, true);
+  const scopes: Array<Set<string> | null> = [];
+  let previousString: string | undefined;
+  for (let token = scanner.scan(); token !== SyntaxKind.EOF; token = scanner.scan()) {
+    switch (token) {
+      case SyntaxKind.OpenBraceToken:
+        scopes.push(new Set());
+        break;
+      case SyntaxKind.OpenBracketToken:
+        scopes.push(null);
+        break;
+      case SyntaxKind.CloseBraceToken:
+      case SyntaxKind.CloseBracketToken:
+        scopes.pop();
+        break;
+      case SyntaxKind.StringLiteral:
+        // Token values decode escapes, so metadata and metad\\u0061ta collide.
+        previousString = scanner.getTokenValue();
+        continue;
+      case SyntaxKind.ColonToken: {
+        const keys = scopes.at(-1);
+        assert(keys && previousString !== undefined, "parsed JSON colon must follow an object key");
+        if (keys.has(previousString)) return true;
+        keys.add(previousString);
+        break;
+      }
+      default:
+        break;
+    }
+    previousString = undefined;
+  }
+  return false;
+}
+
+interface HistoryResetProbe {
+  resetProbe: string;
+  resetStage: 0 | 1 | 2;
+  possibleReset: boolean;
+}
+
+function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse: boolean): void {
+  // Oversized tool outputs remain traversable. Only a potential reset
+  // marker is a fail-closed privacy barrier. Match raw bytes (including
+  // nested objects conservatively) without parsing or retaining the row.
+  // Keep only token-sized raw overlap plus a three-stage recognizer.
+  // Junk of arbitrary size may separate intact tokens in unreadable rows;
+  // valid rows isolate their own evidence in deliver() and reset this state.
+  const raw = segment.toString("latin1");
+  const previousLength = state.resetProbe.length;
+  const probe = reverse ? raw + state.resetProbe : state.resetProbe + raw;
+  const tokens = [...probe.matchAll(resetTokenPattern)];
+  if (reverse) tokens.reverse();
+  for (const match of tokens) {
+    // Ignore tokens entirely inside already-consumed overlap. Otherwise
+    // replaying overlap could manufacture the opposite token ordering.
+    if (reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength)
+      continue;
+    const token = decodeResetEscapes(match[0]);
+    if (token === (reverse ? resetValueToken : resetKeyToken)) {
+      if (state.resetStage === 0) state.resetStage = 1;
+    } else if (token === ":" && state.resetStage === 1) state.resetStage = 2;
+    else if (token === (reverse ? resetKeyToken : resetValueToken) && state.resetStage === 2)
+      state.possibleReset = true;
+  }
+  state.resetProbe = reverse
+    ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
+    : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
+}
+
+function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
+  let rowReset = hasRawResetMarker(text);
+  probe.possibleReset ||= rowReset;
+  try {
+    const raw: unknown = JSON.parse(text);
+    try {
+      rowReset ||= JSON.stringify(raw).includes(SESSION_HISTORY_RESET_NEEDLE);
+      probe.possibleReset ||= rowReset;
+    } catch {
+      rowReset = true;
+      probe.possibleReset = true;
+    }
+    if (rowReset && hasAmbiguousResetKeys(text)) return null;
+    if (!isReadableHistoryMessage(raw)) return null;
+    // Readable payloads may discuss resets; only their top-level metadata can
+    // mark one. Raw evidence is reserved for unreadable/ambiguous rows above.
+    probe.possibleReset = false;
+    return normalizePersistedMessage(raw);
+  } catch {
+    return null;
+  }
+}
+
+interface LocatedHistoryBoundary {
+  offset: number;
+  boundaryPublicationId?: string;
+  boundary: Exclude<PendingBoundary, { kind: "none" }>;
+}
+type ProviderHistoryStart =
+  | ({ kind: "start" } & LocatedHistoryBoundary)
+  | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number }
+  | { kind: "stopped" };
+
+/** One non-empty row delivered by the provider locator, newest first. */
+interface ScannedHistoryRow {
+  start: number;
+  /** Row bytes, excluding the newline. */
+  size: number;
+  /**
+   * Null for unreadable and ambiguous-reset rows, and for oversized
+   * (> SESSION_HISTORY_MAX_LINE_BYTES) rows other than a recovered compaction boundary.
+   */
+  message: MuxMessage | null;
+}
 const COMPACTION_BOUNDARY_NEEDLE = Buffer.from(SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE);
 const STOPPED = Symbol("stopped");
 

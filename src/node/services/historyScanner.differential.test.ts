@@ -3,11 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SESSION_HISTORY_SCAN_CHUNK_BYTES } from "@/common/constants/contextBudget";
-import {
-  findProviderHistoryStart,
-  type ProviderHistoryStart,
-  type ScannedHistoryRow,
-} from "./historyScanner";
+import { findProviderHistoryStart } from "./historyScanner";
 import { createMuxMessage } from "@/common/types/message";
 import {
   deepEqualAnyDepth,
@@ -28,6 +24,9 @@ import { referenceFindProviderHistoryStart } from "./historyScanner.referenceLoc
 // shown by mutating the production locator and watching this test fail.
 
 type Locate = typeof findProviderHistoryStart;
+// Derived from the signature so historyScanner.ts exports only the locator itself.
+type ProviderHistoryStart = Awaited<ReturnType<Locate>>;
+type ScannedHistoryRow = Parameters<NonNullable<Parameters<Locate>[4]>>[0];
 interface Observation {
   result: ProviderHistoryStart | { error: string };
   rows: ScannedHistoryRow[];

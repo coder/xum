@@ -165,19 +165,13 @@ export function hasAmbiguousResetKeys(text: string): boolean {
   return false;
 }
 
-// #4655 differential oracle: historyScanner.referenceLocator.testHarness.ts reuses this unchanged.
-export interface HistoryResetProbe {
+interface HistoryResetProbe {
   resetProbe: string;
   resetStage: 0 | 1 | 2;
   possibleReset: boolean;
 }
 
-// #4655 differential oracle: historyScanner.referenceLocator.testHarness.ts reuses this unchanged.
-export function addHistoryResetProbe(
-  state: HistoryResetProbe,
-  segment: Buffer,
-  reverse: boolean
-): void {
+function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse: boolean): void {
   // Oversized tool outputs remain traversable. Only a potential reset
   // marker is a fail-closed privacy barrier. Match raw bytes (including
   // nested objects conservatively) without parsing or retaining the row.
@@ -215,8 +209,7 @@ export function createUnreadableHistoryResetProbe() {
   };
 }
 
-// #4655 differential oracle: historyScanner.referenceLocator.testHarness.ts reuses this unchanged.
-export function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
+function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
   let rowReset = hasRawResetMarker(text);
   probe.possibleReset ||= rowReset;
   try {
@@ -258,23 +251,20 @@ function historyFileStamp(
   return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : "missing";
 }
 
-// #4655 differential oracle: historyScanner.referenceLocator.testHarness.ts reuses this unchanged.
-export interface LocatedHistoryBoundary {
+interface LocatedHistoryBoundary {
   offset: number;
   boundaryPublicationId?: string;
   boundary: Exclude<PendingBoundary, { kind: "none" }>;
 }
-// #4655 differential oracle: historyScanner.referenceLocator.testHarness.ts reuses this unchanged.
-export type ProviderHistoryStart =
+type ProviderHistoryStart =
   | ({ kind: "start" } & LocatedHistoryBoundary)
   | { kind: "exhausted"; oldestBoundary: LocatedHistoryBoundary | null; boundaryCount: number }
   | { kind: "stopped" };
 
 const COMPACTION_BOUNDARY_NEEDLE = Buffer.from(SESSION_HISTORY_COMPACTION_BOUNDARY_NEEDLE);
 
-// #4655 differential oracle: historyScanner.referenceLocator.testHarness.ts reuses this unchanged.
 /** One non-empty row delivered by the provider locator, newest first. */
-export interface ScannedHistoryRow {
+interface ScannedHistoryRow {
   start: number;
   /** Row bytes, excluding the newline. */
   size: number;
@@ -291,7 +281,7 @@ const STOPPED = Symbol("stopped");
  * `visit` sees every delivered row and may request a stop; the stop is honored only right
  * after a readable row that is not the start, where no scan state carries over.
  */
-// Exported so historyScanner.differential.test.ts can compare it with the frozen #4655 oracle.
+// Exported for tests: historyScanner.differential.test.ts compares it with the frozen #4655 oracle.
 export async function findProviderHistoryStart(
   handle: fs.FileHandle,
   fileSize: number,

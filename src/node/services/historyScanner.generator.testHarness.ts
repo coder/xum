@@ -272,7 +272,9 @@ function adversarialRows(
   }
   if (r < 0.37) {
     // Metadata of readable rows: manual and rollover resets with escaped keys/values,
-    // whitespace around the colon, and duplicate metadata keys.
+    // whitespace around the colon, and duplicate metadata keys. Assistant rows are durable reset
+    // boundaries; user rows are readable resets that are not boundaries (malformed role), the only
+    // rows where the locator's includeReadableResetFloor option changes the result.
     const ws = pick(["", " ", "\t", "\r", " \t "]);
     const key = escapeSome("contextBoundaryKind");
     const value = random() < 0.1 ? "res\\x65t" : escapeSome("reset");
@@ -284,7 +286,7 @@ function adversarialRows(
       `,"metadata":{}`,
     ]);
     return [
-      `{"id":"${id}","role":"assistant","parts":[],"metadata":{"${key}"${ws}:${ws}"${value}"${muxMetadata}}${duplicate}}`,
+      `{"id":"${id}","role":"${role}","parts":[],"metadata":{"${key}"${ws}:${ws}"${value}"${muxMetadata}}${duplicate}}`,
     ];
   }
   if (r < 0.47) {
