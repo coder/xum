@@ -549,11 +549,42 @@ describe("staged attachment session mirror", () => {
           sessionDir,
         });
         expect(result.success && result.data.restored).toEqual([stagedPath]);
+        // An enumeration error may be transient, so callers must be able to retry it (#4905).
+        expect(result.success && result.data.failed).toEqual([
+          `${STAGED_ATTACHMENT_DIR}/33333333-3333-4333-8333-333333333333`,
+        ]);
       } finally {
         await chmod(lockedDir, 0o755);
       }
     }
   );
+
+  test("rehydration limited to retry paths leaves other mirror entries alone", async () => {
+    const { repo, sessionDir, runtime, stagedPath } = await stageInRepo(Buffer.from("ok"));
+    await rm(path.join(repo, ".xum"), { recursive: true, force: true });
+    const retryId = "44444444-4444-4444-8444-444444444444";
+    const retryDir = path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME, retryId);
+    await mkdir(retryDir);
+    await writeFile(path.join(retryDir, "retry.txt"), "retry");
+
+    // A failed unreadable `<id>` dir is recorded as `<dir>/<id>`: it covers every file in it.
+    const result = await rehydrateStagedWorkspaceAttachments({
+      runtime,
+      workspacePath: repo,
+      sessionDir,
+      onlyPaths: [`${STAGED_ATTACHMENT_DIR}/${retryId}`],
+    });
+
+    expect(result).toEqual({
+      success: true,
+      data: {
+        restored: [`${STAGED_ATTACHMENT_DIR}/${retryId}/retry.txt`],
+        skipped: [],
+        failed: [],
+      },
+    });
+    expect(await Bun.file(path.join(repo, stagedPath)).exists()).toBe(false);
+  });
 
   test("staging keeps a newly created session dir private", async () => {
     const repo = await makeTempDir("mux-stage-mirror-private-");

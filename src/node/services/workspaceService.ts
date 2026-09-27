@@ -13062,7 +13062,8 @@ export class WorkspaceService
    */
   private async rehydrateStagedAttachmentsAfterSnapshotRestore(
     workspaceId: string,
-    metadata: WorkspaceMetadata
+    metadata: WorkspaceMetadata,
+    onlyPaths?: readonly string[]
   ): Promise<void> {
     // restoreSnapshotAfterUnarchive only restores worktree runtimes, whose checkout is host-local.
     assert(isWorktreeRuntime(metadata.runtimeConfig), "snapshot restores are worktree-only");
@@ -13072,6 +13073,7 @@ export class WorkspaceService
         runtime,
         workspacePath,
         sessionDir: path.join(this.config.sessionsDir, workspaceId),
+        onlyPaths,
       });
       if (!result.success) {
         // The pending marker stays, so the startup sweep retries.
@@ -13088,11 +13090,17 @@ export class WorkspaceService
         });
       }
       if (result.data.failed.length > 0) {
-        // Possibly transient (EACCES, ENOSPC): keep the marker so the next startup retries.
+        // Possibly transient (EACCES, ENOSPC): keep the marker so the next startup retries, but
+        // only these paths (#4905). Retrying every entry would bring back restored uploads the
+        // user deleted in between.
         log.warn("Failed to restore some staged attachments after snapshot restore", {
           workspaceId,
           failed: result.data.failed,
         });
+        await this.writeStagedAttachmentRehydrationMarker(
+          workspaceId,
+          JSON.stringify(result.data.failed)
+        );
         return;
       }
       await this.clearStagedAttachmentRehydrationPending(workspaceId);
@@ -13183,7 +13191,6 @@ export class WorkspaceService
       if (!mirrorRoot.isDirectory()) {
         return;
       }
-      await fsPromises.writeFile(this.getStagedAttachmentRehydrationMarkerPath(workspaceId), "");
     } catch (error) {
       if (!isErrnoWithCode(error, "ENOENT")) {
         log.warn("Failed to mark staged attachment rehydration as pending", {
@@ -13191,7 +13198,74 @@ export class WorkspaceService
           error: getErrorMessage(error),
         });
       }
+      return;
     }
+    // Empty: the whole mirror is pending.
+    await this.writeStagedAttachmentRehydrationMarker(workspaceId, "");
+  }
+
+  /**
+   * Write the marker: empty for "every mirror entry", otherwise a JSON array of the staged paths
+   * still to retry. Best-effort, like the marker itself.
+   */
+  private async writeStagedAttachmentRehydrationMarker(
+    workspaceId: string,
+    content: string
+  ): Promise<void> {
+    const markerPath = this.getStagedAttachmentRehydrationMarkerPath(workspaceId);
+    try {
+      // Anything but a regular file is corrupted state (#4905): a directory would fail every
+      // later write with EISDIR, and writeFile would follow a symlink. lstat and rm act on the
+      // entry itself, never on a link target.
+      const existing = await fsPromises.lstat(markerPath).catch((error: unknown) => {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          return null;
+        }
+        throw error;
+      });
+      if (existing != null && !existing.isFile()) {
+        await fsPromises.rm(markerPath, { recursive: true, force: true });
+      }
+      await fsPromises.writeFile(markerPath, content);
+    } catch (error) {
+      log.warn("Failed to mark staged attachment rehydration as pending", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * The paths a retry covers; undefined means every mirror entry. An unreadable or malformed
+   * marker also means every entry: that is the behavior before #4905 and never overwrites files.
+   */
+  private async readStagedAttachmentRehydrationScope(
+    workspaceId: string
+  ): Promise<string[] | undefined> {
+    try {
+      const content = await fsPromises.readFile(
+        this.getStagedAttachmentRehydrationMarkerPath(workspaceId),
+        "utf8"
+      );
+      if (content === "") {
+        return undefined;
+      }
+      const parsed: unknown = JSON.parse(content);
+      if (Array.isArray(parsed)) {
+        const paths = parsed.filter((entry): entry is string => typeof entry === "string");
+        if (paths.length === parsed.length) {
+          return paths;
+        }
+      }
+    } catch (error) {
+      log.debug("Could not read the staged attachment rehydration marker", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+    log.debug("Ignoring malformed staged attachment rehydration marker content", { workspaceId });
+    return undefined;
   }
 
   private async clearStagedAttachmentRehydrationPending(workspaceId: string): Promise<void> {
@@ -13238,7 +13312,11 @@ export class WorkspaceService
         if (live == null || isWorkspaceArchived(live.archivedAt, live.unarchivedAt)) {
           return;
         }
-        await this.rehydrateStagedAttachmentsAfterSnapshotRestore(metadata.id, metadata);
+        await this.rehydrateStagedAttachmentsAfterSnapshotRestore(
+          metadata.id,
+          metadata,
+          await this.readStagedAttachmentRehydrationScope(metadata.id)
+        );
       });
     }
   }

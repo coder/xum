@@ -223,11 +223,16 @@ export async function copyStagedWorkspaceAttachments(input: {
  * only: snapshot restores exist solely for worktree runtimes. Entries staging could not have
  * produced are skipped rather than failing the unarchive, one entry is held in memory at a time,
  * and existing files are never overwritten.
+ *
+ * `onlyPaths` limits a retry to entries an earlier run reported as failed (#4905): a staged
+ * path, or `<dir>/<id>` for a mirror entry dir that could not be listed. A retry of the whole
+ * mirror would bring back restored uploads the user has deleted since.
  */
 export async function rehydrateStagedWorkspaceAttachments(input: {
   runtime: Runtime;
   workspacePath: string;
   sessionDir: string;
+  onlyPaths?: readonly string[];
 }): Promise<Result<{ restored: string[]; skipped: string[]; failed: string[] }, string>> {
   try {
     assert(path.isAbsolute(input.workspacePath), "workspacePath must be an absolute host path");
@@ -237,7 +242,20 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
     // I/O errors that may be transient; a retry can still restore these.
     const failed: string[] = [];
     const candidates: string[] = [];
-    for (const stagedPath of await listStagedAttachmentMirrorPaths(input.sessionDir)) {
+    const onlyPaths = input.onlyPaths;
+    // Either side may be the `<dir>/<id>` form, which covers every file in that entry dir.
+    const inScope = (stagedPath: string) =>
+      onlyPaths == null ||
+      onlyPaths.some(
+        (retryPath) =>
+          retryPath === stagedPath ||
+          stagedPath.startsWith(`${retryPath}/`) ||
+          retryPath.startsWith(`${stagedPath}/`)
+      );
+    const listing = await listStagedAttachmentMirrorPaths(input.sessionDir);
+    // Enumeration errors (EACCES, EIO) may be transient, so they are retryable failures.
+    failed.push(...listing.unreadable.filter(inScope));
+    for (const stagedPath of listing.stagedPaths.filter(inScope)) {
       if (resolveStagedAttachmentMirrorPath(input.sessionDir, stagedPath) == null) {
         skipped.push(stagedPath);
       } else {
@@ -608,19 +626,25 @@ async function readStagedAttachmentMirrorFile(
   }
 }
 
-/** List mirror entries as canonical staged paths (`<dir>/<id>/<name>`); unvalidated. */
-async function listStagedAttachmentMirrorPaths(sessionDir: string): Promise<string[]> {
+/**
+ * List mirror entries as canonical staged paths (`<dir>/<id>/<name>`); unvalidated. Entry dirs
+ * that could not be listed are reported separately as `<dir>/<id>`.
+ */
+async function listStagedAttachmentMirrorPaths(
+  sessionDir: string
+): Promise<{ stagedPaths: string[]; unreadable: string[] }> {
   const mirrorRoot = path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME);
+  const stagedPaths: string[] = [];
+  const unreadable: string[] = [];
   let ids: string[];
   try {
     ids = await fsPromises.readdir(mirrorRoot);
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) {
-      return [];
+      return { stagedPaths, unreadable };
     }
     throw error;
   }
-  const stagedPaths: string[] = [];
   for (const id of ids.sort()) {
     const entryDir = path.join(mirrorRoot, id);
     let names: string[];
@@ -634,7 +658,8 @@ async function listStagedAttachmentMirrorPaths(sessionDir: string): Promise<stri
         entryDir,
         error: getErrorMessage(error),
       });
-      names = [];
+      unreadable.push(`${STAGED_ATTACHMENT_DIR}/${id}`);
+      continue;
     }
     if (names.length === 0) {
       // Reported as skipped: it fails resolveStagedAttachmentMirrorPath's two-segment shape.
@@ -645,7 +670,7 @@ async function listStagedAttachmentMirrorPaths(sessionDir: string): Promise<stri
       stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}/${name}`);
     }
   }
-  return stagedPaths;
+  return { stagedPaths, unreadable };
 }
 
 /** Create/verify `root/segments...` as real directories (no symlinks); null if one is not. */

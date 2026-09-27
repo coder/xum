@@ -2654,6 +2654,109 @@ describe("WorkspaceService recovers interrupted staged attachment rehydration", 
 
     expect(await exists(path.join(repo, stagedPath))).toBe(false);
   });
+
+  // #4905: retries cover only the entries that failed, so a restored upload the user deleted in
+  // between stays deleted.
+  async function stageSecondUpload(): Promise<string> {
+    const second = Buffer.from("second upload");
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(repo),
+      workspacePath: repo,
+      sessionDir: path.join(harness.config.sessionsDir, workspaceId),
+      filename: "second.md",
+      mediaType: "text/markdown",
+      sizeBytes: second.byteLength,
+      dataBase64: second.toString("base64"),
+    });
+    if (!staged.success) throw new Error(staged.error);
+    await fsPromises.rm(path.join(repo, ".xum"), { recursive: true, force: true });
+    return staged.data.stagedPath;
+  }
+
+  test.skipIf(process.getuid?.() === 0)(
+    "startup retries only the entries whose restore failed",
+    async () => {
+      const failingPath = await stageSecondUpload();
+      // The restored checkout has the failing entry's dir read-only, so only its write fails.
+      const failingDir = path.join(repo, path.dirname(failingPath));
+      await fsPromises.mkdir(failingDir, { recursive: true });
+      await fsPromises.chmod(failingDir, 0o500);
+      useRestore(() => Promise.resolve(Ok("restored" as const)));
+      try {
+        expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+      } finally {
+        await fsPromises.chmod(failingDir, 0o755);
+      }
+      expect(await exists(path.join(repo, stagedPath))).toBe(true);
+      expect(await exists(path.join(repo, failingPath))).toBe(false);
+      await fsPromises.rm(path.join(repo, stagedPath));
+
+      await harness.service.initialize();
+
+      expect(await exists(path.join(repo, failingPath))).toBe(true);
+      expect(await exists(path.join(repo, stagedPath))).toBe(false);
+    }
+  );
+
+  test.skipIf(process.getuid?.() === 0)(
+    "startup retries a mirror entry dir that could not be listed",
+    async () => {
+      const failingPath = await stageSecondUpload();
+      const mirrorEntryDir = path.join(
+        harness.config.sessionsDir,
+        workspaceId,
+        "staged-attachments",
+        path.basename(path.dirname(failingPath))
+      );
+      await fsPromises.chmod(mirrorEntryDir, 0o000);
+      useRestore(() => Promise.resolve(Ok("restored" as const)));
+      try {
+        expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+      } finally {
+        await fsPromises.chmod(mirrorEntryDir, 0o755);
+      }
+      expect(await exists(path.join(repo, failingPath))).toBe(false);
+      await fsPromises.rm(path.join(repo, stagedPath));
+
+      await harness.service.initialize();
+
+      expect(await exists(path.join(repo, failingPath))).toBe(true);
+      expect(await exists(path.join(repo, stagedPath))).toBe(false);
+    }
+  );
+
+  test("a directory left at the marker path does not block a later marker", async () => {
+    const markerPath = path.join(
+      harness.config.sessionsDir,
+      workspaceId,
+      "staged-attachments-rehydrate-pending"
+    );
+    await fsPromises.mkdir(path.join(markerPath, "nested"), { recursive: true });
+    useRestore(() => Promise.reject(new Error("simulated crash after restore")));
+    await harness.service.unarchive(workspaceId).catch(() => undefined);
+
+    await harness.service.initialize();
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("a symlink at the marker path is replaced, not written through", async () => {
+    const markerPath = path.join(
+      harness.config.sessionsDir,
+      workspaceId,
+      "staged-attachments-rehydrate-pending"
+    );
+    const outside = path.join(repo, "outside.txt");
+    await fsPromises.writeFile(outside, "keep");
+    await fsPromises.symlink(outside, markerPath);
+    useRestore(() => Promise.reject(new Error("simulated crash after restore")));
+    await harness.service.unarchive(workspaceId).catch(() => undefined);
+
+    expect(await fsPromises.readFile(outside, "utf8")).toBe("keep");
+    await harness.service.initialize();
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
 });
 
 // #4845: uploads staged before the session mirror existed have only a checkout copy, which a
