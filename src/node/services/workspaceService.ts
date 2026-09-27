@@ -6695,9 +6695,12 @@ export class WorkspaceService
               );
             if (!descendantsResult.success) return failure(descendantsResult.error);
           }
-          const result = await this.removeUnlocked(workspaceId, force, binding, {
-            mutationGateHeld: releaseTreeGate != null,
-          });
+          const result = await this.removeUnlocked(
+            workspaceId,
+            force,
+            binding,
+            releaseTreeGate != null ? { mutationGateHeld: true } : undefined
+          );
           return result.success ? result : failure(result.error);
         } catch (error) {
           return failure(getErrorMessage(error));
@@ -6812,6 +6815,9 @@ export class WorkspaceService
     options?: RemovalCheckoutOptions
   ): Promise<Result<void>> {
     if (this.shuttingDown) return Err("Server is shutting down");
+    // Only the checkout options reach the runtime.
+    const { mutationGateHeld, ...checkoutOptions } = options ?? {};
+    const runtimeOptions = mutationGateHeld === undefined ? options : checkoutOptions;
     // Idempotent: if already removing, return success to prevent race conditions
     if (this.removingWorkspaces.has(workspaceId)) {
       return Ok(undefined);
@@ -6875,7 +6881,7 @@ export class WorkspaceService
       // #4476: refuse while another backend uses the workspace (or its shared sub-agents), before
       // any effect (own activity: see REMOVAL_OWN_ACTIVITY_POLICY). A parent removal already
       // holds the gate of its whole tree (#4477, see remove()).
-      if (options?.mutationGateHeld !== true) {
+      if (mutationGateHeld !== true) {
         const gate = await this.acquireStructuralMutationGate(
           workspaceId,
           REMOVAL_OWN_ACTIVITY_POLICY
@@ -7254,7 +7260,7 @@ export class WorkspaceService
                 force,
                 undefined,
                 projectRemoval.trusted,
-                options
+                runtimeOptions
               );
 
               if (!deleteResult.success) {
@@ -7367,7 +7373,7 @@ export class WorkspaceService
             force,
             undefined, // abortSignal
             trusted,
-            options
+            runtimeOptions
           );
 
           if (!deleteResult.success) {

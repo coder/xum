@@ -13822,7 +13822,7 @@ export class TaskService implements AgentTaskIntegration {
         taskId,
         true,
         { expectedAttemptId: entry.workspace.taskAttemptId },
-        { mutationGateHeld: options?.mutationGateHeld === true }
+        options?.mutationGateHeld === true ? { mutationGateHeld: true } : undefined
       );
       return Ok(
         result.success
