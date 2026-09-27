@@ -18,6 +18,7 @@ const mockSecretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = {
 };
 
 // Mock dependencies
+// rootDir holds the workspace use leases (#4476); keep them inside this run's temp dir.
 const mockConfig = {
   getAllWorkspaceMetadata: mock(() =>
     Promise.resolve([
@@ -35,6 +36,7 @@ const mockConfig = {
     terminalDefaultShell: undefined,
   })),
   sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+  rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
   srcDir: "/tmp",
 } as unknown as Config;
 
@@ -52,6 +54,7 @@ function createConfigWithMetadata(metadata: {
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 }
@@ -1033,6 +1036,7 @@ describe("TerminalService.openNative", () => {
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1059,6 +1063,7 @@ describe("TerminalService.openNative", () => {
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1082,6 +1087,7 @@ describe("TerminalService.openNative", () => {
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1105,6 +1111,7 @@ describe("TerminalService.openNative", () => {
       terminalDefaultShell: undefined,
     })),
     sessionsDir: NATIVE_TERMINAL_SESSIONS_DIR,
+    rootDir: NATIVE_TERMINAL_SESSIONS_DIR,
     srcDir: "/tmp",
   } as unknown as Config;
 

@@ -272,3 +272,19 @@ export class WorkspaceUseLeases {
     };
   }
 }
+
+const leasesByBackend = new WeakMap<object, WorkspaceUseLeases>();
+
+/**
+ * This backend's WorkspaceUseLeases. A backend is identified by its Config instance: each
+ * ServiceContainer (and each CLI run) owns exactly one, and the services that start activities
+ * (AgentSession, TerminalService) all share it without extra wiring.
+ */
+export function workspaceUseLeasesFor(config: { readonly rootDir: string }): WorkspaceUseLeases {
+  let leases = leasesByBackend.get(config);
+  if (leases == null) {
+    leases = new WorkspaceUseLeases(config.rootDir);
+    leasesByBackend.set(config, leases);
+  }
+  return leases;
+}

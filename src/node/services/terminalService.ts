@@ -24,6 +24,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { workspaceUseLeasesFor, type WorkspaceUseLease } from "@/node/services/workspaceUseLeases";
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
@@ -67,6 +68,12 @@ export class TerminalService {
   private readonly headlessTerminals = new Map<string, Terminal>();
   private readonly serializeAddons = new Map<string, SerializeAddon>();
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
+  /**
+   * Each session's workspace use lease (#4476): another backend on the same Xum root must not
+   * rename or remove the checkout while a shell runs in it. Released by cleanup(), which every
+   * exit and close path goes through.
+   */
+  private readonly sessionUseLeases = new Map<string, WorkspaceUseLease>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
 
   private shuttingDown = false;
@@ -262,7 +269,15 @@ export class TerminalService {
           `Workspace is being archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
         );
       }
-      return await this.createUnreserved(params, closeEpoch);
+      // Throws while another backend renames or removes the workspace: no shell may start there.
+      const lease = await workspaceUseLeasesFor(this.config).hold(params.workspaceId, "terminal");
+      try {
+        return await this.createUnreserved(params, closeEpoch, lease);
+      } catch (error) {
+        // Idempotent: a PTY that was spawned and then cleaned up already released it.
+        await lease.release();
+        throw error;
+      }
     } finally {
       const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
       if (remaining <= 0) {
@@ -276,7 +291,8 @@ export class TerminalService {
 
   private async createUnreserved(
     params: TerminalCreateParams,
-    closeEpoch: number
+    closeEpoch: number,
+    lease: WorkspaceUseLease
   ): Promise<TerminalSession> {
     const closedSinceStart = () =>
       (this.startupCloseEpochs.get(params.workspaceId) ?? 0) !== closeEpoch;
@@ -400,6 +416,8 @@ export class TerminalService {
       );
 
       tempSessionId = session.sessionId;
+      // From here cleanup(sessionId) owns the lease, like every other per-session resource.
+      this.sessionUseLeases.set(session.sessionId, lease);
 
       // Post-spawn recheck: a user-driven archive (which force-closes rather than refuses) may
       // have run closeWorkspaceSessions while createSession was awaiting — that close only
@@ -1353,5 +1371,18 @@ export class TerminalService {
     headless?.dispose();
     this.headlessTerminals.delete(sessionId);
     this.serializeAddons.delete(sessionId);
+
+    const lease = this.sessionUseLeases.get(sessionId);
+    if (lease != null) {
+      this.sessionUseLeases.delete(sessionId);
+      // cleanup() runs from synchronous exit/close paths. The release enters the lease's FIFO
+      // transition lock synchronously, so a later hold or mutation check always observes it.
+      lease.release().catch((error: unknown) => {
+        log.warn("Failed to release a terminal's workspace use lease", {
+          sessionId,
+          error: getErrorMessage(error),
+        });
+      });
+    }
   }
 }
