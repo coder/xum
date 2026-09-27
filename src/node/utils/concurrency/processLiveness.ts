@@ -29,10 +29,11 @@
  * spawns claim their names under a per-workspace host lock (#4873). Known gaps: MCP servers, init
  * hooks and executeBash take no use lease, and SSH/Docker/devcontainer/multi-project background
  * records are neither probed by the gate nor name-claimed (#4857); migrated background names are
- * per process (#4878); keep-mode unarchive and Coder stop/delete archives take no gate (#4871). Two
- * guarantees hold for the attempt-fenced orchestration writes (report publication, settlement
- * receipts, the plan-handoff boundary, task-state transitions): a superseded attempt's writes never
- * land on its successor, and for a retired attempt a workflow accepts either the late report or the
+ * per process (#4878); a settled record the other backend still tracks can be reused (#4882);
+ * keep-mode unarchive and Coder stop/delete archives take no gate (#4871). Two guarantees hold for
+ * the attempt-fenced orchestration writes (report publication, settlement receipts, the
+ * plan-handoff boundary, task-state transitions): a superseded attempt's writes never land on its
+ * successor, and for a retired attempt a workflow accepts either the late report or the
  * replacement, never both. Not fenced: the effects of an execution that is already running (its
  * stream, tool calls, file changes and history rows continue until that backend stops it). Not
  * guaranteed: a backend's startup recovery re-queues or re-drives `starting`/`running`/
