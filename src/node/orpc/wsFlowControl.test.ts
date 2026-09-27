@@ -54,6 +54,11 @@ class FakeSocket extends EventTarget implements FlowControlSocket {
    */
   beginClose(): void {
     this.readyState = 2; // CLOSING
+    this.failPendingWrites();
+  }
+
+  /** Every write not yet flushed reports an error on the next tick. */
+  failPendingWrites(): void {
     for (const pending of this.unflushed.splice(0)) {
       process.nextTick(pending.cb, new Error("socket destroyed"));
     }
@@ -227,42 +232,55 @@ describe("createFlowControlledWebSocket", () => {
     expect(nextSocket.written).toEqual(["hello"]);
   });
 
-  test("a closing socket parks senders until close instead of draining their backlog", async () => {
-    const socket = new FakeSocket();
-    const ws = createFlowControlledWebSocket(socket);
+  test.each([
+    { disconnect: "a closing socket", begin: (socket: FakeSocket) => socket.beginClose() },
+    // A write callback can report an error before ws updates readyState; the
+    // wrapper must treat that failure as closing too.
+    {
+      disconnect: "a failed write on a still-OPEN socket",
+      begin: (socket: FakeSocket) => socket.failPendingWrites(),
+    },
+  ])(
+    "$disconnect parks senders until close instead of draining their backlog",
+    async (scenario) => {
+      const socket = new FakeSocket();
+      const ws = createFlowControlledWebSocket(socket);
 
-    // Like oRPC: a transmitter pulls from a large backlog with one send
-    // outstanding, and oRPC's own "close" listener (registered after the
-    // wrapper) marks it done so it stops at its next send.
-    let transmitterDone = false;
-    socket.addEventListener("close", () => {
-      transmitterDone = true;
-    });
-    const backlog = 10_000;
-    let sent = 0;
-    const transmitter = (async () => {
-      while (!transmitterDone && sent < backlog) {
-        await ws.send(frame(`row${sent}`, 64 * KiB));
-        sent++;
-      }
-    })();
-    // Let it fill the window and park (the client is not reading).
-    await new Promise((resolve) => setImmediate(resolve));
-    const sentBeforeClosing = sent;
-    expect(sentBeforeClosing).toBeLessThan(backlog);
+      // Like oRPC: a transmitter pulls from a large backlog with one send
+      // outstanding, and oRPC's own "close" listener (registered after the
+      // wrapper) marks it done so it stops at its next send.
+      let transmitterDone = false;
+      socket.addEventListener("close", () => {
+        transmitterDone = true;
+      });
+      const backlog = 10_000;
+      let sent = 0;
+      const transmitter = (async () => {
+        while (!transmitterDone && sent < backlog) {
+          await ws.send(frame(`row${sent}`, 64 * KiB));
+          sent++;
+        }
+      })();
+      // Let it fill the window and park (the client is not reading).
+      await new Promise((resolve) => setImmediate(resolve));
+      const sentBeforeClosing = sent;
+      const writtenBeforeClosing = socket.written.length;
+      expect(sentBeforeClosing).toBeLessThan(backlog);
 
-    // The client disconnects. A macrotask must get to run before "close"
-    // (the real close event and other requests arrive as I/O), and by then
-    // the transmitter must still be parked, not have drained its backlog.
-    socket.beginClose();
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(sent).toBe(sentBeforeClosing);
-    expect(socket.droppedAfterClose).toHaveLength(0);
+      // The client disconnects. A macrotask must get to run before "close"
+      // (the real close event and other requests arrive as I/O), and by then
+      // the transmitter must still be parked, not have drained its backlog.
+      scenario.begin(socket);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(sent).toBe(sentBeforeClosing);
+      expect(socket.written).toHaveLength(writtenBeforeClosing);
+      expect(socket.droppedAfterClose).toHaveLength(0);
 
-    socket.close();
-    await transmitter;
-    expect(sent).toBeLessThanOrEqual(sentBeforeClosing + 1);
-  });
+      socket.close();
+      await transmitter;
+      expect(sent).toBeLessThanOrEqual(sentBeforeClosing + 1);
+    }
+  );
 
   test("a synchronous send failure rejects only that send", async () => {
     const socket = new FakeSocket();
