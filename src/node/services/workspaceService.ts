@@ -11846,12 +11846,9 @@ export class WorkspaceService
           // An explicit fork name can reuse an existing branch; never delete that (#4775).
           { keepBranch: forkCreatedBranch !== true }
         );
-        try {
-          await fsPromises.rm(newSessionDir, { recursive: true, force: true });
-        } catch (cleanupError) {
-          log.error(`Failed to clean up session dir ${newSessionDir}:`, cleanupError);
-        }
-        initLogger.logComplete(-1);
+        // No config entry exists yet, so the creation-state cleanup owns everything else: the
+        // registered session, in-memory and persisted init state, and the session dir.
+        await this.discardCreationState(newWorkspaceId, initAbortController, true);
         const message = getErrorMessage(copyError);
         return Err(`Failed to copy fork state: ${message}`);
       }

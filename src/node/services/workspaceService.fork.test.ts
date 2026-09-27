@@ -501,6 +501,10 @@ describe("WorkspaceService fork", () => {
       expect(result.error).toContain("Connection refused");
       // Init is aborted before its checkout is deleted.
       expect(initAbortedAtDelete).toEqual([true]);
+      // The creation-state cleanup ran: no session dir (or init status) survives the failure.
+      expect(
+        await fsPromises.stat(path.join(config.sessionsDir, newWorkspaceId)).catch(() => null)
+      ).toBeNull();
     } finally {
       mock.restore();
     }
