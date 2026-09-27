@@ -237,12 +237,19 @@ export class SSH2Transport implements SSHTransport {
   }
 
   async acquireConnection(options?: SSHTransportAcquireOptions): Promise<void> {
-    await ssh2ConnectionPool.acquireConnection(this.config, {
-      abortSignal: options?.abortSignal,
-      timeoutMs: options?.timeoutMs,
-      maxWaitMs: options?.maxWaitMs,
-      onWait: options?.onWait,
-    });
+    try {
+      await ssh2ConnectionPool.acquireConnection(this.config, {
+        abortSignal: options?.abortSignal,
+        timeoutMs: options?.timeoutMs,
+        maxWaitMs: options?.maxWaitMs,
+        onWait: options?.onWait,
+      });
+    } catch (error) {
+      // An unreachable host is a transport failure, never a missing path (#4438):
+      // SSHRuntime.resolvePath preflights through here. Aborts pass through.
+      if (options?.abortSignal?.aborted === true || error instanceof RuntimeErrorClass) throw error;
+      throw new RuntimeErrorClass(getErrorMessage(error), "network", error);
+    }
   }
 
   async spawnRemoteProcess(fullCommand: string, options: SpawnOptions): Promise<SpawnResult> {
