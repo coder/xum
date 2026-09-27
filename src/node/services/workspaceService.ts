@@ -7944,7 +7944,9 @@ export class WorkspaceService
   private async grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
     try {
       const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-      if (found?.workspace.unrelatedWorkspaceConsentPending !== true) {
+      // No early return on a missing mark: the grant then reports the consent as it stands, so an
+      // opt-in another backend made meanwhile is still published to this backend's UI.
+      if (found == null) {
         return;
       }
       const granted = await this.grantCreationUnrelatedWorkspaceConsent(

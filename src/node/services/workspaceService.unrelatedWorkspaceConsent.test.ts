@@ -655,6 +655,11 @@ describe("default consent pending across backends (#4446)", () => {
       true
     );
     const chosen = readEntry()?.unrelatedWorkspaceConsent;
+    const published: Array<{
+      workspaceId: string;
+      metadata: { unrelatedWorkspaceConsent?: string } | null;
+    }> = [];
+    harness.service.on("metadata", (event: (typeof published)[number]) => published.push(event));
     release();
     await initRan;
 
@@ -662,6 +667,12 @@ describe("default consent pending across backends (#4446)", () => {
     expect(readEntry()?.unrelatedWorkspaceConsent).toBe(chosen);
     expect(chosen === undefined).toBe(!row.choice);
     expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
+    // A's UI learns of B's opt-in (the workspace is already announced); an opt-out publishes nothing.
+    expect(
+      published
+        .filter((event) => event.workspaceId === CREATED_ID)
+        .map((event) => event.metadata?.unrelatedWorkspaceConsent)
+    ).toEqual(row.choice ? [chosen] : []);
   });
 
   test.each([
