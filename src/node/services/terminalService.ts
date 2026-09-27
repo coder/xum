@@ -689,6 +689,12 @@ export class TerminalService {
     // This open's share of the lease until it is kept or released below.
     let openLease: WorkspaceUseLease | undefined;
     try {
+      // #4913: an unknown ID must not publish a lease directory (they are never pruned). This
+      // synchronous registry lookup (which also resolves id-less legacy rows) only decides
+      // whether to take the lease; the metadata read under the lease below stays authoritative.
+      if (this.config.findWorkspace(workspaceId) == null) {
+        throw new Error(`Workspace not found: ${workspaceId}`);
+      }
       // #4902: held before the path is read, and on every open (it probes the gate), so another
       // backend's rename, removal or archive can neither slip in between nor run meanwhile.
       // Throws while one runs: no terminal may open there.

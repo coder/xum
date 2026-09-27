@@ -10179,22 +10179,38 @@ export class WorkspaceService
         }
       }
     }
+    let release: () => Promise<void>;
     try {
-      return Ok(
-        await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
-          ignoreOwnKinds: new Map([[workspaceId, own.ignoreKinds]]),
-          hasRunningBackgroundProcesses: (id) =>
-            own.backgroundProcesses === "refuse" || id !== workspaceId
-              ? this.hasRunningBackgroundBashProcesses(id)
-              : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
-                  extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
-                }),
-        })
-      );
+      release = await workspaceUseLeasesFor(this.config).acquireMutationGate(workspaceIds, {
+        ignoreOwnKinds: new Map([[workspaceId, own.ignoreKinds]]),
+        hasRunningBackgroundProcesses: (id) =>
+          own.backgroundProcesses === "refuse" || id !== workspaceId
+            ? this.hasRunningBackgroundBashProcesses(id)
+            : this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(id, {
+                extraRecordDirs: this.extraBgRecordDirsForWorkspace(id),
+              }),
+      });
     } catch (error) {
       if (error instanceof WorkspaceBusyError) return Err(error.message);
       throw error;
     }
+    // #4909: ignoring this backend's own terminal/editor leases must not let the mutation race an
+    // open of either that is already past its gate probe: it would still launch at the path it
+    // read. Opens are counted before their probe, and every later probe sees this gate, so no
+    // open can join the count once it reads zero here.
+    const openInFlight =
+      own.ignoreKinds.has("terminal") &&
+      this.terminalService?.hasPendingNativeTerminalOpen(workspaceId) === true
+        ? "a native terminal"
+        : own.ignoreKinds.has("editor") &&
+            (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0
+          ? "an external editor"
+          : null;
+    if (openInFlight != null) {
+      await release();
+      return Err(`${openInFlight} is being opened for it in this Xum process; try again`);
+    }
+    return Ok(release);
   }
 
   /**

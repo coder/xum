@@ -4,6 +4,7 @@ import {
   WorkspaceMutationInProgressError,
   WorkspaceUseLeases,
   workspaceUseLeasesFor,
+  workspaceUseLockDir,
 } from "./workspaceUseLeases";
 import type { PTYService } from "./ptyService";
 import type { Config, SecretsStore } from "@/node/config";
@@ -1004,6 +1005,15 @@ describe("TerminalService", () => {
   });
 });
 
+// The registry lookup openNative makes before taking its lease (#4913): every workspace ID is
+// registered except these.
+const UNREGISTERED_WORKSPACE_IDS = new Set(["non-existent", "ws-native-lease-unknown"]);
+function findRegisteredWorkspace(workspaceId: string) {
+  return UNREGISTERED_WORKSPACE_IDS.has(workspaceId)
+    ? null
+    : { workspacePath: "/tmp/project/main", projectPath: "/tmp/project" };
+}
+
 describe("TerminalService.openNative", () => {
   let service: TerminalService;
   // Using simplified mock types since spawnSync has complex overloads
@@ -1036,6 +1046,7 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
@@ -1063,6 +1074,7 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
@@ -1087,6 +1099,7 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
@@ -1111,6 +1124,7 @@ describe("TerminalService.openNative", () => {
         },
       ])
     ),
+    findWorkspace: findRegisteredWorkspace,
     loadConfigOrDefault: mock(() => ({
       projects: new Map(),
       terminalDefaultShell: undefined,
@@ -1456,6 +1470,19 @@ describe("TerminalService.openNative", () => {
         await releaseGate?.();
         await service.releaseNativeTerminalUseLease(workspaceId);
       }
+    });
+
+    // #4913: lease directories are never pruned, so an unknown ID must not create one.
+    it("publishes no lease for an unknown workspace", async () => {
+      const unknownId = "ws-native-lease-unknown";
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      await expect(service.openNative(unknownId)).rejects.toThrow("Workspace not found");
+      expect(
+        await fs.access(workspaceUseLockDir(leaseRoot, unknownId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
     });
 
     it("probes the gate on every open, even after an earlier open of the workspace", async () => {

@@ -9,6 +9,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { Runtime, WorkspaceInitParams } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { HistoryService } from "@/node/services/historyService";
+import type { PTYService } from "@/node/services/ptyService";
 import {
   createTestConfig,
   createTestProject,
@@ -18,6 +19,7 @@ import {
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import { TerminalService } from "@/node/services/terminalService";
 import * as bashToolModule from "@/node/services/tools/bash";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
@@ -553,6 +555,63 @@ describe("structural workspace mutations across two backends on one root", () =>
     }
     // One share stays held per workspace.
     expect(heldCount(b, "editor")).toBe(1);
+  });
+
+  // #4909: this backend's own rename and removal ignore its editor and terminal leases, so they
+  // must refuse an open that is already past its gate probe (it launches at the path it read).
+  test("this backend's rename and removal refuse while its own editor open is past its gate probe", async () => {
+    const leasesA = workspaceUseLeasesFor(a.config);
+    const realHold = leasesA.hold.bind(leasesA);
+    const during: Array<{ success: boolean; error?: unknown }> = [];
+    spyOn(leasesA, "hold").mockImplementationOnce(async (id, kind) => {
+      const lease = await realHold(id, kind);
+      during.push(await a.workspaceService.rename(rootId, "renamed"));
+      during.push(await a.workspaceService.remove(rootId, true));
+      return lease;
+    });
+
+    expect(await a.workspaceService.recordExternalEditorOpenForLaunch(rootId)).toMatchObject({
+      success: true,
+    });
+    expect(during.map(errorOf)).toEqual([
+      expect.stringContaining("an external editor is being opened"),
+      expect.stringContaining("an external editor is being opened"),
+    ]);
+    expect(renameWorkspace).not.toHaveBeenCalled();
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+
+    // Once the open settles, the own rename tolerates the editor again.
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("this backend's rename and removal refuse while its own native terminal open is past its last gate probe", async () => {
+    const terminalService = new TerminalService(a.config, {} as PTYService, {
+      getEffectiveSecrets: () => [],
+    });
+    a.workspaceService.setTerminalService(terminalService);
+    const leasesA = workspaceUseLeasesFor(a.config);
+    const realHold = leasesA.hold.bind(leasesA);
+    const during: Array<{ success: boolean; error?: unknown }> = [];
+    spyOn(leasesA, "hold")
+      .mockImplementationOnce(realHold)
+      // The probe after the open's metadata read; only the marker write and launch follow it.
+      .mockImplementationOnce(async (id, kind) => {
+        const lease = await realHold(id, kind);
+        during.push(await a.workspaceService.rename(rootId, "renamed"));
+        during.push(await a.workspaceService.remove(rootId, true));
+        await lease.release();
+        throw new Error("stop the open before it launches a terminal");
+      });
+
+    await expect(terminalService.openNative(rootId)).rejects.toThrow("stop the open");
+    expect(during.map(errorOf)).toEqual([
+      expect.stringContaining("a native terminal is being opened"),
+      expect.stringContaining("a native terminal is being opened"),
+    ]);
+    expect(renameWorkspace).not.toHaveBeenCalled();
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(rowOf(a.config, rootId)).toBeDefined();
   });
 
   test("own MCP servers, init hook and one-off commands follow what each mutator ends", async () => {

@@ -481,6 +481,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
         closeWorkspaceSessions: mock((id: string) => {
           calls.push(`closeWorkspaceSessions:${id}`);
         }),
+        hasPendingNativeTerminalOpen: () => false,
       } as unknown as TerminalService);
       const cleanup = harness.backgroundProcessManager.cleanup.bind(
         harness.backgroundProcessManager

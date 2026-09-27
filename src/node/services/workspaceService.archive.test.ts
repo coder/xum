@@ -1562,6 +1562,7 @@ describe("WorkspaceService archive snapshots", () => {
     workspaceService.setTerminalService({
       closeWorkspaceSessions,
       setWorkspaceArchiveGuard: () => undefined,
+      hasPendingNativeTerminalOpen: () => false,
     } as unknown as TerminalService);
 
     const closeDesktopSession = mock(() => Promise.resolve(undefined));
