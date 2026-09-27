@@ -548,6 +548,18 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(rowOf(a.config, rootId)?.unarchivedAt).toBeDefined();
   });
 
+  test("a repeated unarchive of an active workspace neither refuses nor blocks the other backend's mutation", async () => {
+    const release = await workspaceUseLeasesFor(b.config).acquireMutationGate([rootId], {
+      hasRunningBackgroundProcesses: () => Promise.resolve(false),
+    });
+    try {
+      expect(await a.workspaceService.unarchive(rootId)).toMatchObject({ success: true });
+      expect(heldCount(a, "unarchive")).toBe(0);
+    } finally {
+      await release();
+    }
+  });
+
   test("worktree deletion refuses while the other backend commits a keep-mode unarchive", async () => {
     await editRow(rootId, (row) => {
       row.archivedAt = new Date().toISOString();

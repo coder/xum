@@ -10901,6 +10901,13 @@ export class WorkspaceService
       }
       const { projectPath, workspacePath } = workspace;
 
+      // Already active (e.g. unarchived by the other backend): nothing to commit, so no lease or
+      // gate that could refuse this call or a concurrent mutation.
+      const current = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+      if (current != null && !isWorkspaceArchived(current.archivedAt, current.unarchivedAt)) {
+        return Ok(undefined);
+      }
+
       const hasSnapshot = () =>
         findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
           .worktreeArchiveSnapshot != null;
