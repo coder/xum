@@ -1,7 +1,7 @@
 import { expect, waitFor, within } from "@storybook/test";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AppStory } from "@/browser/stories/meta.js";
-import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { PIXEL_DISABLED, PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
 import { setupCustomChatStory } from "@/browser/stories/helpers/chatSetup";
 import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
 import { createUserMessage } from "@/browser/stories/mocks/messages";
@@ -74,7 +74,8 @@ const RETRY_REPLY_TEXT = "The SSH host is back; the build passes now.";
 // "Stream interrupted" barrier, matching what a reload of the same history shows.
 export const RetrySucceededAfterPreStartFailures: AppStory = {
   parameters: {
-    pixel: { matrix: PIXEL_DUAL_THEME },
+    // Behavior is guarded by the play test; a snapshot would only add to the Pixel budget.
+    pixel: PIXEL_DISABLED,
   },
   render: () => (
     <AppWithMocks
