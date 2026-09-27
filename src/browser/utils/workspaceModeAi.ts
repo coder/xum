@@ -73,11 +73,6 @@ export function resolveConfiguredAiDefaults(
     }
     return undefined;
   };
-  const autoModelRouting = resolveConfiguredAuto("autoModelRouting", resolved.sources.model);
-  const autoThinkingLevel = resolveConfiguredAuto(
-    "autoThinkingLevel",
-    resolved.sources.thinkingLevel
-  );
 
   return {
     modelString: fromConfig(resolved.sources.model) ? resolved.selected.model : undefined,
@@ -87,8 +82,8 @@ export function resolveConfiguredAiDefaults(
     reasoningMode: fromConfig(resolved.sources.reasoningMode)
       ? resolved.selected.reasoningMode
       : undefined,
-    ...(autoModelRouting ? { autoModelRouting } : {}),
-    ...(autoThinkingLevel ? { autoThinkingLevel } : {}),
+    autoModelRouting: resolveConfiguredAuto("autoModelRouting", resolved.sources.model),
+    autoThinkingLevel: resolveConfiguredAuto("autoThinkingLevel", resolved.sources.thinkingLevel),
   };
 }
 
@@ -133,26 +128,30 @@ export function resolveAutoRoutingForAgent(args: {
   const choices = args.routingChoices?.[normalizedAgentId];
   const bucket = args.workspaceByAgent?.[normalizedAgentId];
   const bucketModel = typeof bucket?.model === "string" ? bucket.model.trim() : "";
-  const hasBucketValue: Record<AutoRoutingDimension, boolean> = {
-    model: isValidModelFormat(bucketModel),
-    thinkingLevel: coerceThinkingLevel(bucket?.thinkingLevel) != null,
-  };
-  const configuredAuto: Record<AutoRoutingDimension, boolean> = {
-    model: configured.autoModelRouting === true,
-    thinkingLevel: configured.autoThinkingLevel === true,
-  };
 
-  const resolveDimension = (dimension: AutoRoutingDimension): boolean | undefined => {
-    const choice = choices?.[dimension];
+  const resolveDimension = (
+    choice: boolean | undefined,
+    configuredAuto: boolean,
+    hasBucketValue: boolean
+  ): boolean | undefined => {
     if (args.explicitSwitch) {
-      return choice ?? configuredAuto[dimension];
+      return choice ?? configuredAuto;
     }
-    return configuredAuto[dimension] && choice === undefined && !hasBucketValue[dimension]
-      ? true
-      : undefined;
+    return configuredAuto && choice === undefined && !hasBucketValue ? true : undefined;
   };
 
-  return { model: resolveDimension("model"), thinkingLevel: resolveDimension("thinkingLevel") };
+  return {
+    model: resolveDimension(
+      choices?.model,
+      configured.autoModelRouting === true,
+      isValidModelFormat(bucketModel)
+    ),
+    thinkingLevel: resolveDimension(
+      choices?.thinkingLevel,
+      configured.autoThinkingLevel === true,
+      coerceThinkingLevel(bucket?.thinkingLevel) != null
+    ),
+  };
 }
 
 // Keep agent -> model/thinking precedence in one place so mode switches that send immediately
