@@ -8,6 +8,8 @@ import { getSendOptionsFromStorage } from "xum/browser/utils/messages/sendOption
 import { matchesKeybind, formatKeybind, KEYBINDS } from "xum/browser/utils/ui/keybinds";
 import { useAPI } from "xum/browser/contexts/API";
 import { useAgent } from "xum/browser/contexts/AgentContext";
+import { usePolicy } from "xum/browser/contexts/PolicyContext";
+import { isModelAllowedByPolicy } from "xum/browser/utils/policyUi";
 import { useThinkingLevel } from "xum/browser/hooks/useThinkingLevel";
 import { useReasoningMode } from "xum/browser/hooks/useReasoningMode";
 import type { WorkspaceAISettingsCache } from "xum/browser/utils/workspaceModeAi";
@@ -144,7 +146,22 @@ function ChatComposerInner(props: {
     listener: true,
   });
 
-  const baseModel = normalizeToCanonical(preferredModel);
+  const storedModel = normalizeToCanonical(preferredModel);
+
+  // #4808: the stored model can be one the admin policy excludes (persisted earlier, seeded from the
+  // workspace, or revoked by a policy refresh), and every send with it fails with policy_denied.
+  // Fall back to the first allowed model for display and send, without writing it anywhere: the
+  // webview does not persist AI settings, and the stored choice comes back if the policy allows it
+  // again. With no allowed model in the list, Send stays disabled. Either way, a status line says so.
+  const policyState = usePolicy();
+  const effectivePolicy =
+    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
+  const storedModelAllowed = isModelAllowedByPolicy(effectivePolicy, storedModel);
+  const policyFallbackModel = storedModelAllowed
+    ? null
+    : (models.find((model) => isModelAllowedByPolicy(effectivePolicy, model)) ?? null);
+  const baseModel = storedModelAllowed ? storedModel : (policyFallbackModel ?? storedModel);
+  const blockedByPolicy = !storedModelAllowed && policyFallbackModel === null;
 
   const inputKey = getInputKey(props.workspaceId);
   const [input, setInput] = usePersistedState<string>(inputKey, "", { listener: true });
@@ -202,7 +219,8 @@ function ChatComposerInner(props: {
     !isSending &&
     input.trim().length > 0 &&
     apiState.status === "connected" &&
-    Boolean(api);
+    Boolean(api) &&
+    !blockedByPolicy;
 
   const onModelChange = (model: string) => {
     const canonicalModel = normalizeToCanonical(model);
@@ -250,7 +268,7 @@ function ChatComposerInner(props: {
       return;
     }
     const trimmed = input.trim();
-    if (!trimmed) {
+    if (!trimmed || blockedByPolicy) {
       return;
     }
 
@@ -290,6 +308,8 @@ function ChatComposerInner(props: {
         // The thinking level is sent as selected: the webview does not load the user's configured
         // per-model minimums, so only the backend can apply the authoritative floor.
         skipAiSettingsPersistence: true,
+        // Only when the stored model is policy-excluded; otherwise keep the stored model string.
+        ...(policyFallbackModel ? { model: policyFallbackModel } : {}),
       };
 
       const result = await api.workspace.sendMessage(
@@ -383,6 +403,13 @@ function ChatComposerInner(props: {
       />
 
       <div className="flex flex-col gap-2">
+        {storedModelAllowed ? null : (
+          <div role="status" className="text-content-secondary text-[11px]">
+            {policyFallbackModel
+              ? `Admin policy does not allow ${storedModel}; using ${policyFallbackModel}.`
+              : `Admin policy does not allow ${storedModel}, and no allowed model is available.`}
+          </div>
+        )}
         <div className="w-full min-w-0" data-component="ModelSelectorGroup">
           <ModelSelector
             value={baseModel}

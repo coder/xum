@@ -4,8 +4,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../tests/ui/dom";
-import { updatePersistedState } from "xum/browser/hooks/usePersistedState";
-import { getAgentIdKey, getThinkingLevelKey } from "xum/common/constants/storage";
+import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
+import { getAgentIdKey, getModelKey, getThinkingLevelKey } from "xum/common/constants/storage";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -49,6 +49,13 @@ class TestBridge implements VscodeBridge {
       }
       await Promise.resolve();
     });
+  }
+
+  // Plays the host answering every call of `path` so far with `value`.
+  async answer(path: string, value: unknown): Promise<void> {
+    for (const call of this.orpcCalls(path)) {
+      await this.emit({ type: "orpcResponse", requestId: call.requestId, ok: true, kind: "value", value });
+    }
   }
 
   orpcCalls(path: string): Array<Extract<WebviewToExtensionMessage, { type: "orpcCall" }>> {
@@ -552,5 +559,91 @@ describe("vscode webview agent lookup", () => {
     const recoveryLookups = bridge.orpcCalls("agents.list").slice(fileModeLookups);
     expect(recoveryLookups).toHaveLength(1);
     expect(recoveryLookups[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+  });
+});
+
+// #4808: the admin policy can exclude the workspace's selected model (persisted, seeded or revoked).
+describe("vscode webview policy-excluded model", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  function enforcedPolicy(providerAccess: Array<{ id: string; allowedModels: string[] | null }>) {
+    return {
+      source: "governor",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess,
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    };
+  }
+
+  async function renderWithPolicy(policy: unknown) {
+    updatePersistedState(getModelKey(WORKSPACE.id), "anthropic:claude-opus-5-5");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    await bridge.answer("policy.get", policy);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "hello");
+    return { bridge, view };
+  }
+
+  async function clickSend(view: ReturnType<typeof render>) {
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+  }
+
+  test("sends with the first allowed model, says so, and keeps the stored choice", async () => {
+    const { bridge, view } = await renderWithPolicy(
+      enforcedPolicy([{ id: "openai", allowedModels: ["gpt-5.6-terra"] }])
+    );
+
+    expect(view.getByRole("status").textContent).toContain("anthropic:claude-opus-5-5");
+    await clickSend(view);
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(1);
+    const input = sends[0].input as { options: Record<string, unknown> };
+    expect(input.options.model).toBe("openai:gpt-5.6-terra");
+    // Local fallback only: nothing is written, locally or to the workspace.
+    expect(readPersistedState(getModelKey(WORKSPACE.id), "")).toBe("anthropic:claude-opus-5-5");
+    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+  });
+
+  test("blocks the send when the policy allows no listed model", async () => {
+    const { bridge, view } = await renderWithPolicy(
+      enforcedPolicy([{ id: "openai", allowedModels: ["not-a-listed-model"] }])
+    );
+
+    expect(view.getByRole("status").textContent).toContain("anthropic:claude-opus-5-5");
+    await clickSend(view);
+    expect(bridge.orpcCalls("workspace.sendMessage")).toHaveLength(0);
+  });
+
+  test("keeps an allowed selection unchanged", async () => {
+    const { bridge, view } = await renderWithPolicy(
+      enforcedPolicy([{ id: "anthropic", allowedModels: null }])
+    );
+
+    expect(view.queryByRole("status")).toBeNull();
+    await clickSend(view);
+    const input = bridge.orpcCalls("workspace.sendMessage")[0].input as {
+      options: Record<string, unknown>;
+    };
+    expect(input.options.model).toBe("anthropic:claude-opus-5-5");
   });
 });
