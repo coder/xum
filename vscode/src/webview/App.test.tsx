@@ -6,6 +6,8 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { getAgentIdKey, getModelKey, getThinkingLevelKey } from "xum/common/constants/storage";
+import { resetAiSelectionIntentForTests } from "xum/browser/utils/aiSelectionIntent";
+import { formatModelDisplayName } from "xum/common/utils/ai/modelDisplay";
 import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { App } from "./App";
@@ -372,6 +374,8 @@ describe("vscode webview workspace AI settings", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    // Picks are recorded in a module-level map; start each test without earlier tests' picks.
+    resetAiSelectionIntentForTests();
   });
 
   afterEach(() => {
@@ -508,6 +512,57 @@ describe("vscode webview workspace AI settings", () => {
     expect(String(options.model)).toContain("sonnet");
     // The pick stays local (#4755): no AI-settings write reaches the workspace.
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+  });
+
+  test("sends a gateway-routed model pick with its gateway ID", async () => {
+    const { bridge, view } = await selectWorkspaceWith(WORKSPACE);
+    // A configured gateway provider lists its custom models under the gateway prefix.
+    await bridge.answer("providers.getConfig", {
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true, models: ["openai/gpt-5"] },
+    });
+
+    try {
+      await act(async () => {
+        fireEvent.click(view.getByRole("combobox"));
+        await Promise.resolve();
+      });
+      await act(async () => {
+        fireEvent.click(view.getByText(formatModelDisplayName("openai/gpt-5")));
+        await Promise.resolve();
+      });
+
+      const options = await send(bridge, view);
+      expect(options.model).toBe("openrouter:openai/gpt-5");
+    } finally {
+      await clearProvidersConfig(bridge);
+    }
+  });
+
+  test("keeps a sub-agent's unsent model pick across a metadata refresh", async () => {
+    const child: UiWorkspace = {
+      ...WORKSPACE,
+      ai: {
+        parentWorkspaceId: "ws-parent",
+        agentId: "exec",
+        agentType: "exec",
+        aiSettingsByAgent: { exec: { model: "openai:gpt-5.6-terra", thinkingLevel: "high" } },
+      },
+    };
+    const { bridge, view } = await selectWorkspaceWith(child);
+
+    await act(async () => {
+      fireEvent.click(view.getByRole("combobox"));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(view.getByText("Sonnet 5"));
+      await Promise.resolve();
+    });
+    // A sub-agent follows its backend settings on every refresh, except a deliberate unsent pick.
+    await bridge.emit({ type: "workspaces", workspaces: [child] });
+
+    const options = await send(bridge, view);
+    expect(String(options.model)).toContain("sonnet");
   });
 
   test("shows the actual custom agent instead of mislabeling it as Exec", async () => {

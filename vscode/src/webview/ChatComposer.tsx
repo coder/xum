@@ -16,7 +16,8 @@ import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
-import { normalizeSelectedModel, normalizeToCanonical } from "xum/common/utils/ai/models";
+import { normalizeSelectedModel } from "xum/common/utils/ai/models";
+import { markAiSelectionIntent } from "xum/browser/utils/aiSelectionIntent";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -146,7 +147,9 @@ function ChatComposerInner(props: {
     listener: true,
   });
 
-  const storedModel = normalizeToCanonical(preferredModel);
+  // Gateway-preserving, like the desktop composer: an explicit gateway pick (e.g.
+  // openrouter:openai/gpt-5) stays selected instead of showing as its direct-provider model.
+  const storedModel = normalizeSelectedModel(preferredModel);
 
   // #4808: the stored model can be one the admin policy excludes (persisted earlier, seeded from the
   // workspace, or revoked by a policy refresh), and every send with it fails with policy_denied.
@@ -227,9 +230,12 @@ function ChatComposerInner(props: {
     Boolean(api);
 
   const onModelChange = (model: string) => {
-    const canonicalModel = normalizeToCanonical(model);
-    ensureModelInSettings(canonicalModel);
-    setPreferredModel(canonicalModel);
+    // The desktop's setPreferredModel semantics (ChatInput): keep an explicit gateway route, and
+    // record the deliberate pick so a sub-agent's metadata refresh keeps it until a send carries it.
+    const selectedModel = normalizeSelectedModel(model);
+    ensureModelInSettings(selectedModel);
+    markAiSelectionIntent(props.workspaceId, "model", selectedModel);
+    setPreferredModel(selectedModel);
 
     // Like the desktop composer, record the pick in the active agent's cache so
     // WorkspaceModeAISync restores it (not the seeded model) after switching agents and back.
@@ -238,7 +244,7 @@ function ChatComposerInner(props: {
       (prev) => ({
         ...(prev && typeof prev === "object" ? prev : {}),
         [normalizeAgentId(agentId, "exec")]: {
-          model: canonicalModel,
+          model: selectedModel,
           thinkingLevel,
           reasoningMode,
         },
@@ -246,8 +252,7 @@ function ChatComposerInner(props: {
       {}
     );
 
-    // #4755: a model change stays local. Persisting from the webview would need the desktop's
-    // selection-intent, gateway-route and write-ordering handling, so it stays off (#4778 review).
+    // #4755: a model change still stays local; sends do not persist AI settings yet (#4781).
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
