@@ -247,6 +247,27 @@ export class WorkspaceUseLeases {
   }
 
   /**
+   * Whether any live `kind` lease on the workspace exists, of this or another backend (#4801). A
+   * reader that finds a record of that activity which no in-memory state here owns (an init left
+   * "running" on disk) can tell a live owner from a dead one. A lease directory that cannot be
+   * listed counts as held: its holders cannot be ruled out.
+   */
+  async isHeld(workspaceId: string, kind: WorkspaceUseKind): Promise<boolean> {
+    const dir = workspaceUseLockDir(this.rootDir, workspaceId);
+    let names: string[];
+    try {
+      names = await fsPromises.readdir(dir);
+    } catch (error) {
+      return !hasErrorCode(error, "ENOENT");
+    }
+    for (const name of names) {
+      if (!name.endsWith(`.${kind}.lock`)) continue;
+      if ((await inspectCrossProcessLock(path.join(dir, name))).state === "held") return true;
+    }
+    return false;
+  }
+
+  /**
    * Record that this backend uses the workspace until the returned lease is released. Throws
    * WorkspaceMutationInProgressError while a live mutator holds the workspace's gate; callers
    * must let it abort the activity (never swallow it), or the mutator's scan could miss them.

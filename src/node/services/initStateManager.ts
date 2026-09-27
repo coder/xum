@@ -7,6 +7,7 @@ import { INIT_HOOK_MAX_LINES } from "@/common/constants/toolLimits";
 import { getErrorMessage } from "@/common/utils/errors";
 import { clamp } from "@/common/utils/clamp";
 import { UnsanitizedTaskCheckoutError } from "@/node/services/unsanitizedTaskCheckout";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 
 /**
  * Output line with timestamp for replay timing.
@@ -414,11 +415,11 @@ export class InitStateManager extends EventEmitter {
    */
   async replayInit(workspaceId: string): Promise<void> {
     if (!this.store.hasState(workspaceId)) {
-      const persisted = await this.store.readPersisted(workspaceId);
-      if (persisted?.status === "running") {
-        // Written by startInit and never finalized, with no live init here: the process that ran
-        // it is gone and the checkout may be empty or partial. Record the failure once so this
-        // and every later replay show the creation as failed.
+      const persisted = await this.readUnownedRunningInit(workspaceId);
+      if (persisted != null) {
+        // Written by startInit and never finalized, with no live init anywhere: the process that
+        // ran it is gone and the checkout may be empty or partial. Record the failure once so
+        // this and every later replay show the creation as failed.
         const endTime = Date.now();
         await this.store.persist(workspaceId, {
           ...persisted,
@@ -434,6 +435,20 @@ export class InitStateManager extends EventEmitter {
     }
     // Pass workspaceId as context for serialization
     await this.store.replay(workspaceId, { workspaceId });
+  }
+
+  /**
+   * The persisted init record if it says "running" but no init runs it anymore. The caller has
+   * no in-memory state for it; #4801: a live init lease (#4890) means another backend on this
+   * Xum root (the desktop app beside a `xum server`) still runs it, so the record is not ours to
+   * judge. Read again after the lease probe, so an owner that finished and released its lease
+   * meanwhile is judged by its final status, not by the stale "running".
+   */
+  private async readUnownedRunningInit(workspaceId: string): Promise<InitStatus | null> {
+    if ((await this.store.readPersisted(workspaceId))?.status !== "running") return null;
+    if (await workspaceUseLeasesFor(this.config).isHeld(workspaceId, "init")) return null;
+    const persisted = await this.store.readPersisted(workspaceId);
+    return persisted?.status === "running" ? persisted : null;
   }
 
   /**
