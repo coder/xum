@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import type { BrowserWindow, Clipboard, WebPreferences } from "electron";
+import type { BrowserWindow, Clipboard, Menu, WebPreferences } from "electron";
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { electronTest, electronExpect as expect } from "../electronTest";
@@ -116,14 +116,22 @@ test("remote connection isolates the page and returns to the same local renderer
     }))
   ).toEqual({ api: "undefined", require: "undefined", process: "undefined" });
   await expect
-    .poll(() => localWindow.evaluate((window: BrowserWindow) => window.isVisible()))
-    .toBe(false);
-  await expect
     .poll(() => page.evaluate(() => window.api?.remoteConnection?.getState()))
     .toEqual({
       status: "connected",
       serverUrl: remoteServer.url,
     });
+  // The server window opens alongside the local window instead of replacing it.
+  expect(await localWindow.evaluate((window: BrowserWindow) => window.isVisible())).toBe(true);
+  // Return to Local has no native accelerator: menu accelerators are global on macOS and would
+  // take Ctrl/Cmd+Shift+L from the visible local window. The server window's before-input-event
+  // handler still provides the shortcut there (exercised below).
+  expect(
+    await app.evaluate(({ Menu: electronMenu }: { Menu: typeof Menu }) => {
+      const item = electronMenu.getApplicationMenu()?.getMenuItemById("return-to-local");
+      return { enabled: item?.enabled ?? null, accelerator: item?.accelerator ?? null };
+    })
+  ).toEqual({ enabled: true, accelerator: null });
   const previousClipboard = await app.evaluate(({ clipboard }: { clipboard: Clipboard }) =>
     clipboard.readText()
   );
@@ -172,7 +180,7 @@ test("remote connection isolates the page and returns to the same local renderer
   expect(
     await page.evaluate(async () => {
       const api = window.__ORPC_CLIENT__;
-      if (!api) throw new Error("Local API is unavailable while hidden");
+      if (!api) throw new Error("Local API is unavailable while the remote window is open");
       return api.projects.list();
     })
   ).toEqual(localProjects);

@@ -27,7 +27,6 @@ interface RemoteWindowEntry {
 
 interface RemoteWindowOptions {
   createWindow(options: BrowserWindowConstructorOptions): BrowserWindow;
-  onConnected(): void;
   onDisconnected(): void;
   onStateChanged(state: RemoteConnectionState): void;
   openExternal(url: string): void;
@@ -320,10 +319,9 @@ export class RemoteConnectionManager {
         error = "The remote server did not respond in time. Connect again to retry.";
         throw new Error(error);
       }
+      // The server window opens alongside the local window, which keeps working (#4846).
       entry.window.show();
       entry.window.focus();
-      // Hide only the local window. Local agents and their renderer state remain alive.
-      this.options.onConnected();
       this.setState({ status: "connected", serverUrl: entry.serverUrl });
     } catch {
       // Electron errors can include URL tokens. Report only a credential-free error.

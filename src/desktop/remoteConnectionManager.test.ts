@@ -70,7 +70,6 @@ afterEach(() => {
 function setup(loading = Promise.resolve()) {
   const windows: TestWindow[] = [];
   const options: BrowserWindowConstructorOptions[] = [];
-  const onConnected = mock(() => undefined);
   const onDisconnected = mock(() => undefined);
   const onStateChanged = mock<(state: RemoteConnectionState) => void>();
   const openExternal = mock<(url: string) => void>();
@@ -83,7 +82,6 @@ function setup(loading = Promise.resolve()) {
       // Electron is the host boundary. Keep this fake local to avoid global module mocks.
       return window as unknown as BrowserWindow;
     },
-    onConnected,
     onDisconnected,
     onStateChanged,
     openExternal,
@@ -93,7 +91,6 @@ function setup(loading = Promise.resolve()) {
     manager,
     windows,
     options,
-    onConnected,
     onDisconnected,
     onStateChanged,
     openExternal,
@@ -114,19 +111,17 @@ function deferred() {
 }
 
 describe("RemoteConnectionManager", () => {
-  test("keeps the local window until load completes and shares duplicate connections", async () => {
+  test("shows the server window only after load completes and shares duplicate connections", async () => {
     const load = deferred();
-    const { manager, windows, onConnected, onStateChanged } = setup(load.promise);
+    const { manager, windows, onStateChanged } = setup(load.promise);
     const first = manager.connect("https://example.com/?token=first");
     const duplicate = manager.connect("https://example.com/?token=second");
     expect(windows).toHaveLength(1);
     expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
     expect(windows[0].show).not.toHaveBeenCalled();
-    expect(onConnected).not.toHaveBeenCalled();
     expect(manager.getState()).toEqual({ status: "connecting", serverUrl: "https://example.com" });
     load.resolve();
     await Promise.all([first, duplicate]);
-    expect(onConnected).toHaveBeenCalledTimes(1);
     expect(windows[0].show).toHaveBeenCalled();
     expect(windows[0].focus).toHaveBeenCalled();
     expect(onStateChanged.mock.calls.map(([state]) => state.status)).toEqual([
@@ -138,7 +133,6 @@ describe("RemoteConnectionManager", () => {
     expect(windows[0].restore).toHaveBeenCalledTimes(1);
     expect(windows[0].minimized).toBe(false);
     expect(windows).toHaveLength(1);
-    expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
   test.each([false, true])(
@@ -164,7 +158,7 @@ describe("RemoteConnectionManager", () => {
     "disconnects pending duplicates before load settles: %s",
     async (completion) => {
       const load = deferred();
-      const { manager, windows, onConnected, onDisconnected } = setup(load.promise);
+      const { manager, windows, onDisconnected } = setup(load.promise);
       const first = manager.connect("https://example.com/");
       const duplicate = manager.connect("https://example.com/");
       manager.disconnect();
@@ -175,7 +169,6 @@ describe("RemoteConnectionManager", () => {
       if (completion === "resolve") load.resolve();
       else load.reject(new Error("late failure"));
       await load.promise.catch(() => undefined);
-      expect(onConnected).not.toHaveBeenCalled();
       expect(windows[0].show).not.toHaveBeenCalled();
       manager.disconnect();
       expect(onDisconnected).toHaveBeenCalledTimes(1);
@@ -187,7 +180,7 @@ describe("RemoteConnectionManager", () => {
     async (completion) => {
       const oldLoad = deferred();
       const newLoad = deferred();
-      const { manager, windows, onConnected, onDisconnected, setLoading } = setup(oldLoad.promise);
+      const { manager, windows, onDisconnected, setLoading } = setup(oldLoad.promise);
       const oldConnection = manager.connect("https://old.example.com/");
       manager.disconnect();
       await oldConnection;
@@ -212,7 +205,6 @@ describe("RemoteConnectionManager", () => {
         status: "connected",
         serverUrl: "https://new.example.com",
       });
-      expect(onConnected).toHaveBeenCalledTimes(1);
       expect(onDisconnected).toHaveBeenCalledTimes(1);
       expect(windows[1].destroyed).toBe(false);
       expect(windows[0].show).not.toHaveBeenCalled();
@@ -243,7 +235,7 @@ describe("RemoteConnectionManager", () => {
     "restores local state when a pending window stops: %s",
     async (event) => {
       const load = deferred();
-      const { manager, windows, onConnected, onDisconnected } = setup(load.promise);
+      const { manager, windows, onDisconnected } = setup(load.promise);
       const pending = manager.connect("https://example.com/?token=private-token");
       const window = windows[0];
       if (event === "closed") window.close();
@@ -264,7 +256,6 @@ describe("RemoteConnectionManager", () => {
       expect(window.destroyed).toBe(true);
       load.resolve();
       await load.promise;
-      expect(onConnected).not.toHaveBeenCalled();
       expect(window.show).not.toHaveBeenCalled();
     }
   );
@@ -290,15 +281,12 @@ describe("RemoteConnectionManager", () => {
     const load = deferred();
     const token = "secret-load-token";
     const url = "https://example.com/?token=" + token;
-    const { manager, windows, options, onConnected, onDisconnected, onStateChanged } = setup(
-      load.promise
-    );
+    const { manager, windows, options, onDisconnected, onStateChanged } = setup(load.promise);
     const pending = manager.connect(url);
     load.reject(new Error("Cannot load " + url));
     expect(pending).rejects.toThrow();
     expect(windows[0].loadURL).toHaveBeenCalledWith(url);
     expect(windows[0].destroyed).toBe(true);
-    expect(onConnected).not.toHaveBeenCalled();
     expect(onDisconnected).toHaveBeenCalledTimes(1);
     expect(manager.getState().error).toBeTruthy();
     expect(JSON.stringify(onStateChanged.mock.calls)).not.toContain(token);
@@ -310,7 +298,7 @@ describe("RemoteConnectionManager", () => {
 
   test.each([false, true])("dispose suppresses local restoration (loaded=%s)", async (loaded) => {
     const load = deferred();
-    const { manager, windows, onConnected, onDisconnected } = setup(load.promise);
+    const { manager, windows, onDisconnected } = setup(load.promise);
     const pending = manager.connect("https://example.com/");
     if (loaded) {
       load.resolve();
@@ -322,7 +310,7 @@ describe("RemoteConnectionManager", () => {
     await load.promise;
     expect(windows[0].destroyed).toBe(true);
     expect(onDisconnected).not.toHaveBeenCalled();
-    expect(onConnected).toHaveBeenCalledTimes(loaded ? 1 : 0);
+    expect(windows[0].show).toHaveBeenCalledTimes(loaded ? 1 : 0);
     expect(manager.connect("https://example.com/")).rejects.toThrow();
     expect(windows).toHaveLength(1);
   });
@@ -456,11 +444,10 @@ describe("RemoteConnectionManager", () => {
   test.each(["file:///etc/passwd", "https://user:password@example.com/", "not a URL"])(
     "rejects invalid input before creating a window: %s",
     (url) => {
-      const { manager, windows, onConnected, onStateChanged } = setup();
+      const { manager, windows, onStateChanged } = setup();
       expect(manager.connect(url)).rejects.toThrow();
       expect(windows).toHaveLength(0);
       expect(manager.getState()).toEqual({ status: "disconnected", serverUrl: null });
-      expect(onConnected).not.toHaveBeenCalled();
       expect(onStateChanged).not.toHaveBeenCalled();
     }
   );

@@ -45,10 +45,7 @@ if (process.platform === "darwin") {
 import { DesktopWindowManager } from "./desktopWindowManager";
 import { KeepAwakeController } from "./keepAwake";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
-import {
-  REMOTE_CONNECTION_CHANNELS,
-  REMOTE_CONNECTION_RETURN_ACCELERATOR,
-} from "@/common/constants/remoteConnection";
+import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
 import { onError } from "@orpc/server";
@@ -437,7 +434,6 @@ function timestamp(): string {
 function initializeRemoteConnections(): void {
   const manager = new RemoteConnectionManager({
     createWindow: (options) => new BrowserWindow(options),
-    onConnected: () => mainWindow?.hide(),
     onDisconnected: () => {
       if (!isQuitting) openXumFromTray();
     },
@@ -526,7 +522,10 @@ function createMenu() {
         {
           id: "return-to-local",
           label: "Return to Local",
-          accelerator: REMOTE_CONNECTION_RETURN_ACCELERATOR,
+          // No accelerator: menu accelerators are global on macOS (registerAccelerator: false is
+          // Linux/Windows only), so it would take Ctrl/Cmd+Shift+L (Show Last Prompt) from the local
+          // window, which stays visible next to the server window. The server window's
+          // before-input-event handler provides the shortcut there.
           enabled:
             remoteConnectionManager?.getState().status !== "disconnected" &&
             remoteConnectionManager != null,

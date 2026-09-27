@@ -205,8 +205,11 @@ export function RemoteConnectionSection() {
         </p>
       )}
       <p className="text-muted text-xs">
-        Close the remote window to return here.
-        <span className="hidden md:inline"> You can also disconnect with {returnShortcut}.</span>
+        Close the remote window to disconnect.
+        <span className="hidden md:inline">
+          {" "}
+          In the remote window, {returnShortcut} also disconnects.
+        </span>
       </p>
     </section>
   );
