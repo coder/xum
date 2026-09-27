@@ -11746,6 +11746,9 @@ export class TaskService implements AgentTaskIntegration {
         // Security: yield to a manual send still in preflight (invisible to the queue check
         // above), and re-check queue leadership at the enqueue point after the send's awaits.
         yieldToPreflightSends: true,
+        // Hold turned on during this helper's or the send's awaits (#4737): the enqueue point
+        // re-checks the probe and yields instead of cutting; the idle drain delivers the report.
+        admissionStale: holdsReportUntilTurnEnd,
       });
       if (!wakeResult.success) wakeError = wakeResult.error;
     } catch (error: unknown) {

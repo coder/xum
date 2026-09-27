@@ -1964,6 +1964,70 @@ describe("TaskService", () => {
       );
     });
 
+  test("terminal report cut yields when hold is turned on before the wake is enqueued", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-late-hold-111";
+    const childTaskId = "task-late-hold-222";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        {
+          path: path.join(projectPath, "child-task"),
+          id: childTaskId,
+          name: "agent_explore_child",
+          parentWorkspaceId,
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskThinkingLevel: "medium",
+        },
+      ],
+      testTaskSettings()
+    );
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((workspaceId: string) => workspaceId === parentWorkspaceId),
+    });
+    const liveTurn = Symbol("parent-turn");
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      getActiveTurnGeneration: mock(() => liveTurn),
+      waitForIdleAndNoQueuedMessages: mock(() => new Promise<void>(() => undefined)),
+    });
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    await streamEnd(taskService, {
+      type: "stream-end",
+      workspaceId: childTaskId,
+      messageId: "assistant-child-output",
+      metadata: { model: "openai:gpt-5.2", finishReason: "stop" },
+      parts: [{ type: "text", text: "Hello from child" }],
+    });
+    await flushTerminalAttentionDrains(taskService, { passes: 1 });
+
+    // WorkspaceService re-checks this probe at the enqueue point, after the send's own awaits;
+    // with yieldToPreflightSends a stale probe yields instead of queueing the cut.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const internal = sendMessage.mock.calls[0]?.[3] as
+      | { admissionStale?: () => boolean; yieldToPreflightSends?: boolean }
+      | undefined;
+    assert(internal?.admissionStale, "the cut must carry a hold probe");
+    expect(internal.yieldToPreflightSends).toBe(true);
+    expect(internal.admissionStale()).toBe(false);
+    await config.editConfig((cfg) => {
+      const parent = cfg.projects
+        .get(projectPath)
+        ?.workspaces.find((candidate) => candidate.id === parentWorkspaceId);
+      assert(parent, "parent workspace must exist");
+      parent.agentMessageDispatchMode = "turn-end";
+      return cfg;
+    });
+    expect(internal.admissionStale()).toBe(true);
+  });
+
   for (const [name, wakeWouldLead, replaceTurnAfterDelivery, expectCut] of [
     // Hidden turn-end entries (peer messages, heartbeats) are overtaken by the promoted wake.
     ["only hidden turn-end work is queued", true, false, true],
