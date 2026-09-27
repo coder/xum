@@ -6848,6 +6848,20 @@ export class WorkspaceService
       });
       if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
       releaseMutationGate = gate.data;
+      // #4914: the marker, the deregistration and other backends' task commits all find the row
+      // by id, so persist a legacy id-less row's id first (the read-time migration that workspace
+      // listing persists). Refuse if it still has none: the removal could not be fenced.
+      if (
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null &&
+        this.config.findWorkspace(workspaceId) != null
+      ) {
+        await this.config.getWorkspaceMetadataById(workspaceId);
+        if (findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId) == null) {
+          return Err(
+            "Cannot remove workspace: recording the id of its legacy config entry failed; try again."
+          );
+        }
+      }
       const claim = await this.claimPendingRemoval(workspaceId, binding);
       if (!claim.success) return Err(claim.error);
       pendingRemovalId = claim.data;

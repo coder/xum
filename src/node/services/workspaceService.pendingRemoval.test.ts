@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import * as fsPromises from "node:fs/promises";
 import * as path from "path";
 
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -372,6 +373,95 @@ describe("workspace removal across two backends on one root", () => {
         title: "child",
       },
     ]);
+
+    expect(created.success ? "created" : created.error).toBe("created");
+  });
+
+  // #4914: an upgraded workspace whose config row is still id-less (its id lives only in its
+  // session metadata) gets the same removal fence.
+  const legacyRootId = "legacy-root";
+
+  async function prepareLegacyRootWithQueuedCreation(): Promise<void> {
+    const projectPath = [...a.config.loadConfigOrDefault().projects.keys()][0];
+    // Config.findWorkspace reads sessions/<checkout basename>/metadata.json for id-less rows.
+    const workspacePath = path.join(path.dirname(rowOf(a.config, rootId)!.path), legacyRootId);
+    const sessionDir = path.join(a.config.sessionsDir, legacyRootId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(sessionDir, "metadata.json"),
+      JSON.stringify({
+        id: legacyRootId,
+        name: legacyRootId,
+        projectName: "repo",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      })
+    );
+    await a.config.editConfig((config) => {
+      config.projects.get(projectPath)!.workspaces.push({ path: workspacePath });
+      config.taskSettings = testTaskSettings(1);
+      return config;
+    });
+    await editRow(taskId, (row) => {
+      row.taskStatus = "running";
+    });
+    spyOn(runtimeFactory, "createRuntime").mockImplementation((...args) =>
+      Object.assign(realCreateRuntime(...args), { deleteWorkspace })
+    );
+    // As in production, batch preparation reads the parent without persisting migrations, so
+    // the parent row stays id-less until something else records its id.
+    const aiService = (
+      b.taskService as unknown as {
+        aiService: { getWorkspaceMetadata: (id: string, options?: object) => Promise<unknown> };
+      }
+    ).aiService;
+    spyOn(aiService, "getWorkspaceMetadata").mockImplementation(async (id, options) => {
+      const metadata = await b.config.getWorkspaceMetadataById(id, options);
+      return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${id}`);
+    });
+    expect(rowOf(b.config, legacyRootId)).toBeUndefined();
+  }
+
+  const childUnderLegacyRoot = {
+    parentWorkspaceId: legacyRootId,
+    kind: "agent" as const,
+    agentId: "explore",
+    prompt: "child work",
+    title: "child",
+  };
+
+  test("a removal marks a legacy id-less row, so the other backend refuses a child under it", async () => {
+    await prepareLegacyRootWithQueuedCreation();
+    const paused = pauseRemovalAfterMarker(a);
+    const removal = a.workspaceService.remove(legacyRootId, true);
+    await paused.reached;
+
+    expect(rowOf(b.config, legacyRootId)?.pendingRemoval).toBeDefined();
+    const created = await b.taskService.create(childUnderLegacyRoot);
+    expect(created.success ? "created" : created.error).toContain("removed");
+    expect(childrenOf(b.config, legacyRootId)).toEqual([]);
+
+    paused.release();
+    expect((await removal).success).toBe(true);
+  });
+
+  test("a batch creation under a legacy id-less parent refuses once the other backend removed it", async () => {
+    await prepareLegacyRootWithQueuedCreation();
+
+    const created = await b.taskService.createMany([childUnderLegacyRoot], {
+      onTaskReserved: async () => {
+        expect((await a.workspaceService.remove(legacyRootId, true)).success).toBe(true);
+      },
+    });
+
+    expect(created.success ? "created" : created.error).toContain("removed");
+    expect(childrenOf(b.config, legacyRootId)).toEqual([]);
+  });
+
+  test("a batch creation under a legacy id-less parent still commits", async () => {
+    await prepareLegacyRootWithQueuedCreation();
+
+    const created = await b.taskService.createMany([childUnderLegacyRoot]);
 
     expect(created.success ? "created" : created.error).toBe("created");
   });

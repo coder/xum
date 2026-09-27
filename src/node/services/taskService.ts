@@ -673,6 +673,8 @@ interface TaskLaunchPlan {
    * commit refuses if it is gone by then (see assertParentAdmitsChild).
    */
   requireParentRow?: boolean;
+  /** createMany only: see LegacyParentRow. */
+  legacyParentRow?: LegacyParentRow;
   /**
    * Flipped by the launch fence immediately before the send is admitted. A launch failure that
    * observes it false has positive evidence that no execution was ever admitted for the attempt.
@@ -707,21 +709,38 @@ export interface TaskRetiresClaim {
 }
 
 /**
+ * #4914: an upgraded parent whose config row is still id-less resolves only through its session
+ * metadata (Config.findWorkspace). Its stable identity (config project key + workspace path) lets
+ * a task-creation commit find that row again, so a removal of it refuses the child as well.
+ */
+interface LegacyParentRow {
+  projectPath: string;
+  workspacePath: string;
+}
+
+/**
  * #4782: a child committed under a parent that another backend is removing (or has removed) would
  * outlive it as an orphaned row. Checked inside every task-creation config write; the removal
  * checks for descendants after its marker claim (WorkspaceService.removeUnlocked), so either the
  * child's write sees the marker or the removal sees the child. `requireRow` refuses a parent row
- * that disappeared since preparation found it by id; callers pass false when preparation did not
- * (a legacy id-less row resolves only through session metadata, never by id here).
+ * that disappeared since preparation found it by id; `legacyRow` finds (and requires) an id-less
+ * row that preparation resolved through session metadata, unless its id was persisted meanwhile.
  */
 function assertParentAdmitsChild(
   config: Parameters<typeof findWorkspaceEntry>[0],
   parentWorkspaceId: string,
-  options: { requireRow: boolean }
+  options: { requireRow: boolean; legacyRow?: LegacyParentRow }
 ): void {
-  const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
+  const legacyRow = options.legacyRow;
+  const parent =
+    findWorkspaceEntry(config, parentWorkspaceId)?.workspace ??
+    (legacyRow == null
+      ? undefined
+      : config.projects
+          .get(legacyRow.projectPath)
+          ?.workspaces.find((row) => !row.id && row.path === legacyRow.workspacePath));
   if (parent == null) {
-    if (options.requireRow) {
+    if (options.requireRow || legacyRow != null) {
       throw new Error(`Task.create: parent workspace ${parentWorkspaceId} was removed`);
     }
     return;
@@ -5540,6 +5559,18 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
+  /** The parent's LegacyParentRow when its config row has no id in `cfg` (#4914). */
+  private legacyParentRowOf(
+    cfg: ReturnType<Config["loadConfigOrDefault"]>,
+    parentWorkspaceId: string
+  ): LegacyParentRow | undefined {
+    if (findWorkspaceEntry(cfg, parentWorkspaceId) != null) return undefined;
+    const found = this.config.findWorkspace(parentWorkspaceId);
+    return found == null
+      ? undefined
+      : { projectPath: found.projectPath, workspacePath: found.workspacePath };
+  }
+
   async createMany(
     argsList: TaskCreateArgs[],
     options: TaskCreateManyOptions = {}
@@ -6101,6 +6132,7 @@ export class TaskService implements AgentTaskIntegration {
         taskId,
         parentWorkspaceId: plan.parentWorkspaceId,
         requireParentRow: findWorkspaceEntry(cfg, plan.parentWorkspaceId) != null,
+        legacyParentRow: this.legacyParentRowOf(cfg, plan.parentWorkspaceId),
         parentMeta: plan.parentMeta,
         agentId: plan.agentId,
         agentType: plan.agentId,
@@ -6326,6 +6358,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const plan of plans) {
         assertParentAdmitsChild(config, plan.parentWorkspaceId, {
           requireRow: plan.requireParentRow === true,
+          legacyRow: plan.legacyParentRow,
         });
         const runtime = createRuntimeForWorkspace({
           runtimeConfig: plan.taskRuntimeConfig,
@@ -7417,6 +7450,7 @@ export class TaskService implements AgentTaskIntegration {
     const cfg = this.config.loadConfigOrDefault();
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    const legacyParentRow = this.legacyParentRowOf(cfg, parentWorkspaceId);
     if (
       parentEntry != null &&
       isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
@@ -7687,7 +7721,10 @@ export class TaskService implements AgentTaskIntegration {
       try {
         await reserveDesktop(async () => {
           await this.config.editConfig((config) => {
-            assertParentAdmitsChild(config, parentWorkspaceId, { requireRow: parentEntry != null });
+            assertParentAdmitsChild(config, parentWorkspaceId, {
+              requireRow: parentEntry != null,
+              legacyRow: legacyParentRow,
+            });
             let projectConfig = config.projects.get(configProjectPath);
             if (!projectConfig) {
               projectConfig = { workspaces: [] };
@@ -8035,7 +8072,10 @@ export class TaskService implements AgentTaskIntegration {
 
       // Persist workspace entry before starting work so it's durable across crashes.
       await this.config.editConfig((config) => {
-        assertParentAdmitsChild(config, parentWorkspaceId, { requireRow: parentEntry != null });
+        assertParentAdmitsChild(config, parentWorkspaceId, {
+          requireRow: parentEntry != null,
+          legacyRow: legacyParentRow,
+        });
         let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
