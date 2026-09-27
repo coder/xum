@@ -522,4 +522,89 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(await a.workspaceService.remove(rootId, true)).toMatchObject({ success: true });
     expect(deleteWorkspace).toHaveBeenCalledTimes(1);
   });
+
+  // #4871: a keep-mode unarchive restores no checkout, so it takes no gate, but it must not mark a
+  // workspace active while the other backend deletes its worktree.
+  test("a keep-mode unarchive refuses while the other backend deletes the worktree, but not on its turn", async () => {
+    await editRow(rootId, (row) => {
+      row.archivedAt = new Date().toISOString();
+    });
+    let unarchiveDuringDeletion: Awaited<ReturnType<WorkspaceService["unarchive"]>> | undefined;
+    const removeWorktree = spyOn(
+      removeManagedWorktree,
+      "removeManagedGitWorktree"
+    ).mockImplementation(async () => {
+      unarchiveDuringDeletion = await a.workspaceService.unarchive(rootId);
+    });
+
+    expect(await b.workspaceService.deleteWorktree(rootId)).toMatchObject({ success: true });
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(errorOf(unarchiveDuringDeletion!)).toContain("being renamed, removed or archived");
+    expect(rowOf(a.config, rootId)?.unarchivedAt).toBeUndefined();
+
+    // Ordinary activity of the other backend never blocks it.
+    await hold(b, rootId, "turn");
+    expect(await a.workspaceService.unarchive(rootId)).toMatchObject({ success: true });
+    expect(rowOf(a.config, rootId)?.unarchivedAt).toBeDefined();
+  });
+
+  test("worktree deletion refuses while the other backend commits a keep-mode unarchive", async () => {
+    await editRow(rootId, (row) => {
+      row.archivedAt = new Date().toISOString();
+    });
+    const removeWorktree = spyOn(
+      removeManagedWorktree,
+      "removeManagedGitWorktree"
+    ).mockResolvedValue(undefined);
+    let deletionDuringUnarchive:
+      | Awaited<ReturnType<WorkspaceService["deleteWorktree"]>>
+      | undefined;
+    const editConfig = a.config.editConfig.bind(a.config);
+    spyOn(a.config, "editConfig").mockImplementationOnce(async (...args) => {
+      deletionDuringUnarchive ??= await b.workspaceService.deleteWorktree(rootId);
+      return editConfig(...args);
+    });
+
+    expect(await a.workspaceService.unarchive(rootId)).toMatchObject({ success: true });
+    expect(errorOf(deletionDuringUnarchive!)).toContain(inUseElsewhere);
+    expect(removeWorktree).not.toHaveBeenCalled();
+  });
+
+  // #4871: stopping or deleting a dedicated Coder workspace ends the other backend's turn in it.
+  test("an archive that stops or deletes a dedicated Coder workspace refuses while the other backend uses it", async () => {
+    await editRow(rootId, (row) => {
+      row.runtimeConfig = {
+        type: "ssh",
+        host: "coder.example",
+        srcBaseDir: "/home/coder/src",
+        coder: { workspaceName: "xum-root", existingWorkspace: false },
+      };
+    });
+    const hooks = new WorkspaceLifecycleHooks();
+    const beforeArchive = mock(() => Promise.resolve(Ok(undefined)));
+    hooks.registerBeforeArchive(beforeArchive);
+    a.workspaceService.setWorkspaceLifecycleHooks(hooks);
+    await hold(b, rootId, "turn");
+
+    for (const behavior of ["stop", "delete"] as const) {
+      const refused = errorOf(
+        await a.workspaceService.archive(rootId, undefined, {
+          coderWorkspaceArchiveBehaviorOverride: behavior,
+        })
+      );
+      expect(refused).toContain(inUseElsewhere);
+    }
+    expect(beforeArchive).not.toHaveBeenCalled();
+    expect(rowOf(a.config, rootId)?.archivedAt).toBeUndefined();
+
+    // This backend's own turn is stopped by the archive itself, as before.
+    await releaseAll();
+    await hold(a, rootId, "turn");
+    expect(
+      await a.workspaceService.archive(rootId, undefined, {
+        coderWorkspaceArchiveBehaviorOverride: "stop",
+      })
+    ).toMatchObject({ success: true, data: { kind: "archived" } });
+    expect(beforeArchive).toHaveBeenCalledTimes(1);
+  });
 });

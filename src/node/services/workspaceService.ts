@@ -10630,9 +10630,12 @@ export class WorkspaceService
       // handling (stopped below), and so do its own background processes and in-flight one-off
       // commands (#4857; a model-facing archive refuses those itself). Its own init hook was
       // aborted and awaited above, so a lease still held here is a new one and refuses.
+      // #4871: stopping or deleting a dedicated Coder workspace (runBeforeArchive) ends the other
+      // backend's activity in it just the same, so it takes the gate with the same policy.
       if (
         beforeArchiveMetadata != null &&
-        archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior)
+        (archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior) ||
+          stopsDedicatedCoderWorkspace)
       ) {
         const gate = await this.acquireStructuralMutationGate(workspaceId, {
           ignoreKinds: new Set(["turn", "terminal", "editor", "mcp", "exec"]),
@@ -10890,6 +10893,7 @@ export class WorkspaceService
 
   private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
     let releaseMutationGate: (() => Promise<void>) | undefined;
+    let releaseCommitLease: (() => Promise<void>) | undefined;
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
@@ -10910,6 +10914,28 @@ export class WorkspaceService
         });
         if (!gate.success) return Err(`Cannot unarchive workspace: ${gate.error}`);
         releaseMutationGate = gate.data;
+      }
+
+      // #4871: a keep-mode unarchive restores no checkout, so the other backend's ordinary
+      // activity must not refuse it. It must still not mark the workspace active while the other
+      // backend deletes the worktree (or otherwise mutates it) under the gate: a use lease held
+      // across the commit either sees that gate (refuse) or is seen by its scan (Dekker ordering
+      // in workspaceUseLeases.ts), where a bare gate probe could race the mutator's archived check.
+      if (releaseMutationGate == null) {
+        let commitLease: WorkspaceUseLease;
+        try {
+          commitLease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "unarchive");
+        } catch (error) {
+          return Err(`Cannot unarchive workspace: ${getErrorMessage(error)}`);
+        }
+        // Idempotent; the finally below covers a failed commit.
+        releaseCommitLease = () =>
+          commitLease.release().catch((error: unknown) => {
+            log.warn("Failed to release the unarchive use lease", {
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
       }
 
       let didUnarchive = false;
@@ -10942,6 +10968,8 @@ export class WorkspaceService
         }
         return config;
       });
+      // Committed: a mutator that takes the gate from here on reads the result.
+      await releaseCommitLease?.();
 
       // Only run hooks when the workspace is transitioning from archived → unarchived.
       if (!didUnarchive) {
@@ -11067,6 +11095,7 @@ export class WorkspaceService
       const message = getErrorMessage(error);
       return Err(`Failed to unarchive workspace: ${message}`);
     } finally {
+      await releaseCommitLease?.();
       await releaseMutationGate?.().catch((error: unknown) => {
         log.warn("Failed to release the mutation gate after unarchive", {
           workspaceId,
