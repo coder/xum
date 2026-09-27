@@ -18,23 +18,17 @@ function comparePriorHistoryRows(left: PriorHistoryRow, right: PriorHistoryRow):
 }
 
 /**
- * Non-blocking twin of computePriorHistoryFingerprint (the reference, which must return the same
- * value for every input). The synchronous version serializes and hashes every prior row in one
- * block, 2+ s on a 1.24M-row epoch, which stalls heartbeats, IPC and other workspaces' replays
- * (#4655). This one:
+ * Non-blocking twin of computePriorHistoryFingerprint, the reference: both must return the same
+ * value for every input. The reference hashes every prior row in one block (2+ s on a 1.24M-row
+ * epoch), stalling heartbeats, IPC and other workspaces' replays (#4655). This version:
  * - yields to the event loop while collecting and while hashing rows;
- * - skips the sort when rows are already in comparator order (the normal case: history is
- *   stored in sequence order), because sorting 1.24M entries is itself a long block. Skipping is
- *   exact only for a consistent comparator: Array.prototype.sort is stable, so sorting an array
- *   whose adjacent pairs all compare <= 0 leaves it unchanged. A sequence that is not a finite
- *   number (persisted metadata is not schema-checked on read, so NaN, Infinity or a string can
- *   appear) makes the subtraction NaN, which `||` turns into the id tiebreak, and the comparator
- *   stops being consistent: adjacent pairs can look ordered while the reference's sort still
- *   moves rows. Such histories, and any unordered one, sort exactly like the reference, on the
- *   same rows in the same input order;
- * - serializes parts only while hashing and feeds FNV-1a the entry's pieces in order instead of
- *   one concatenated string (FNV-1a streams UTF-16 code units, so the hash is identical), so it
- *   never holds every row's serialized parts at once.
+ * - skips the sort when rows are already in comparator order (the normal case), because sorting
+ *   1.24M entries is itself a long block. Array.prototype.sort is stable, so skipping is exact for
+ *   a consistent comparator. A non-finite sequence (persisted metadata is not schema-checked, so
+ *   NaN, Infinity or a string can appear) turns the subtraction into NaN, which `||` sends to the
+ *   id tiebreak, so the comparator is inconsistent: such histories always sort, like the reference;
+ * - hashes each row's pieces in order instead of one concatenated string (FNV-1a streams UTF-16
+ *   code units, so the hash is identical), so it never holds every row's serialized parts at once.
  *
  * Callers must not mutate `messages` until the promise settles.
  */
