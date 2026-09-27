@@ -372,6 +372,9 @@ export class SSH2Transport implements SSHTransport {
             finish(() => reject(new Error("SSH2 exec did not return a stream")));
             return;
           }
+          // Track inside the callback: ssh2 can emit this channel's close in
+          // the same tick, before an await continuation would run (#4876).
+          ssh2ConnectionPool.trackChannel(this.config, entry, stream);
           finish(() => resolve(stream));
         };
 
@@ -382,7 +385,6 @@ export class SSH2Transport implements SSHTransport {
         }
       });
 
-      ssh2ConnectionPool.trackChannel(this.config, entry, channel);
       // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
       const process = new SSH2ChildProcess(channel, () =>
         closedClients.has(client)
@@ -429,6 +431,8 @@ export class SSH2Transport implements SSHTransport {
             reject(new Error("SSH2 shell did not return a stream"));
             return;
           }
+          // Same-tick close is possible here too (see spawnRemoteProcess).
+          ssh2ConnectionPool.trackChannel(this.config, entry, stream);
           resolve(stream);
         }
       );
@@ -437,7 +441,6 @@ export class SSH2Transport implements SSHTransport {
     // expandTildeForSSH already returns a quoted string (e.g., "$HOME/path")
     // Do NOT wrap with shellQuotePath - that would double-quote it
     // Exit on cd failure to match OpenSSH transport behavior (cd ... && exec $SHELL -i)
-    ssh2ConnectionPool.trackChannel(this.config, entry, channel);
     const expandedPath = expandTildeForSSH(params.workspacePath);
     channel.write(`cd ${expandedPath} || exit 1\n`);
 
