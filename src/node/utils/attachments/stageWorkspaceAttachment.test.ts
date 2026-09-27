@@ -1,16 +1,28 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import {
+  MAX_STAGED_ATTACHMENT_SIZE_BYTES,
   STAGED_ATTACHMENT_DIR,
   STAGED_ATTACHMENT_MIRROR_DIR_NAME,
 } from "@/common/constants/stagedAttachments";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 
 import {
+  backfillStagedAttachmentMirror,
   copyStagedAttachmentMirrorEntries,
   copyStagedWorkspaceAttachments,
   extractStagedAttachmentPathsFromText,
@@ -559,5 +571,133 @@ describe("staged attachment session mirror", () => {
     });
 
     expect(await readFile(mirrorPathFor(targetSessionDir, stagedPath))).toEqual(bytes);
+  });
+
+  // #4845: uploads staged before the mirror existed have only a checkout copy.
+  describe("backfill before a snapshot archive", () => {
+    async function stageWithoutMirror(bytes: Buffer, filename = "notes.md") {
+      const staged = await stageInRepo(bytes, filename);
+      await rm(path.join(staged.sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME), {
+        recursive: true,
+      });
+      return staged;
+    }
+
+    async function listMirror(sessionDir: string): Promise<string[]> {
+      const mirrorRoot = path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME);
+      const entries = await Array.fromAsync(
+        new Bun.Glob("**/*").scan({ cwd: mirrorRoot, dot: true, throwErrorOnBrokenSymlink: false })
+      ).catch(() => []);
+      return entries.sort();
+    }
+
+    test("copies only referenced checkout uploads that have no mirror entry", async () => {
+      const bytes = Buffer.from("staged before the mirror");
+      const { repo, sessionDir, runtime, stagedPath } = await stageWithoutMirror(bytes);
+      const unreferenced = await stageWorkspaceAttachment({
+        runtime,
+        workspacePath: repo,
+        sessionDir,
+        filename: "unreferenced.md",
+        sizeBytes: 1,
+        dataBase64: Buffer.from("u").toString("base64"),
+      });
+      const mirrored = await stageWorkspaceAttachment({
+        runtime,
+        workspacePath: repo,
+        sessionDir,
+        filename: "mirrored.md",
+        sizeBytes: 1,
+        dataBase64: Buffer.from("m").toString("base64"),
+      });
+      if (!unreferenced.success || !mirrored.success) throw new Error("staging failed");
+      await rm(path.dirname(mirrorPathFor(sessionDir, unreferenced.data.stagedPath)), {
+        recursive: true,
+      });
+      // An existing mirror entry wins over a checkout copy the workspace edited later.
+      await writeFile(path.join(repo, mirrored.data.stagedPath), "edited in checkout");
+
+      const result = await backfillStagedAttachmentMirror({
+        workspacePath: repo,
+        sessionDir,
+        stagedPaths: [stagedPath, mirrored.data.stagedPath],
+      });
+
+      expect(result).toEqual({ copied: [stagedPath], skipped: [] });
+      expect(await readFile(mirrorPathFor(sessionDir, stagedPath))).toEqual(bytes);
+      expect(await readFile(mirrorPathFor(sessionDir, mirrored.data.stagedPath), "utf8")).toBe("m");
+      expect(
+        await readFile(mirrorPathFor(sessionDir, unreferenced.data.stagedPath)).catch(() => null)
+      ).toBeNull();
+    });
+
+    test("never copies symlinks, special files, oversized files, or non-canonical paths", async () => {
+      const { repo, sessionDir } = await stageWithoutMirror(Buffer.from("ok"));
+      const outside = await makeTempDir("mux-stage-backfill-outside-");
+      await writeFile(path.join(outside, "secret.txt"), "secret");
+      const stagingRoot = path.join(repo, STAGED_ATTACHMENT_DIR);
+      const id = (n: number) =>
+        `${String(n).repeat(8)}-${String(n).repeat(4)}-4${String(n).repeat(3)}-8${String(n).repeat(3)}-${String(n).repeat(12)}`;
+
+      // Symlinked leaf.
+      await mkdir(path.join(stagingRoot, id(1)));
+      await symlink(path.join(outside, "secret.txt"), path.join(stagingRoot, id(1), "secret.txt"));
+      // Symlinked `<uuid>` segment.
+      await symlink(outside, path.join(stagingRoot, id(2)));
+      // Oversized regular file.
+      await mkdir(path.join(stagingRoot, id(3)));
+      await writeFile(
+        path.join(stagingRoot, id(3), "big.bin"),
+        Buffer.alloc(MAX_STAGED_ATTACHMENT_SIZE_BYTES + 1)
+      );
+      // A FIFO would block a plain open() forever.
+      await mkdir(path.join(stagingRoot, id(4)));
+      execFileSync("mkfifo", [path.join(stagingRoot, id(4), "pipe.txt")]);
+      // Names and shapes staging never produces.
+      await writeFile(path.join(stagingRoot, id(1), "bad$name.txt"), "x");
+      await mkdir(path.join(stagingRoot, "not-a-uuid"));
+      await writeFile(path.join(stagingRoot, "not-a-uuid", "a.txt"), "x");
+      await mkdir(path.join(stagingRoot, id(5), "nested"), { recursive: true });
+      await writeFile(path.join(stagingRoot, id(5), "nested", "a.txt"), "x");
+      await mkdir(path.join(repo, ".mux/user-attachments", id(6)), { recursive: true });
+      await writeFile(path.join(repo, ".mux/user-attachments", id(6), "a.txt"), "x");
+
+      const stagedPaths = [
+        `${STAGED_ATTACHMENT_DIR}/${id(1)}/secret.txt`,
+        `${STAGED_ATTACHMENT_DIR}/${id(2)}/secret.txt`,
+        `${STAGED_ATTACHMENT_DIR}/${id(3)}/big.bin`,
+        `${STAGED_ATTACHMENT_DIR}/${id(4)}/pipe.txt`,
+        `${STAGED_ATTACHMENT_DIR}/${id(1)}/bad$name.txt`,
+        `${STAGED_ATTACHMENT_DIR}/not-a-uuid/a.txt`,
+        `${STAGED_ATTACHMENT_DIR}/${id(5)}/nested/a.txt`,
+        `.mux/user-attachments/${id(6)}/a.txt`,
+        `${STAGED_ATTACHMENT_DIR}/${id(7)}/missing.txt`,
+      ];
+      const result = await backfillStagedAttachmentMirror({
+        workspacePath: repo,
+        sessionDir,
+        stagedPaths,
+      });
+
+      expect(result).toEqual({ copied: [], skipped: stagedPaths });
+      expect(await listMirror(sessionDir)).toEqual([]);
+    });
+
+    test("never reads through a symlinked staging root", async () => {
+      const { repo, sessionDir, stagedPath } = await stageWithoutMirror(Buffer.from("ok"));
+      const outside = await makeTempDir("mux-stage-backfill-root-");
+      // A repo can track `.xum` as a symlink to a tree holding the same relative path.
+      await rename(path.join(repo, ".xum"), path.join(outside, ".xum"));
+      await symlink(path.join(outside, ".xum"), path.join(repo, ".xum"));
+
+      const result = await backfillStagedAttachmentMirror({
+        workspacePath: repo,
+        sessionDir,
+        stagedPaths: [stagedPath],
+      });
+
+      expect(result).toEqual({ copied: [], skipped: [stagedPath] });
+      expect(await listMirror(sessionDir)).toEqual([]);
+    });
   });
 });

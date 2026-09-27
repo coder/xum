@@ -191,6 +191,7 @@ import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktr
 import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
 import {
+  backfillStagedAttachmentMirror,
   copyStagedAttachmentMirrorEntries,
   copyStagedWorkspaceAttachments,
   extractStagedAttachmentPathsFromText,
@@ -10581,6 +10582,7 @@ export class WorkspaceService
 
         await this.closeDesktopSessionBestEffort(workspaceId, "archive");
         await this.stopLiveWorkspaceActivityForArchive(workspaceId);
+        await this.backfillStagedAttachmentMirrorBeforeSnapshot(workspaceId, beforeArchiveMetadata);
 
         // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
         // closing the remaining race window between the final confirmation check and the
@@ -12864,6 +12866,45 @@ export class WorkspaceService
       }
     } catch (error) {
       log.warn("Failed to restore staged attachments after snapshot restore", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Uploads staged before the session mirror existed (#3947) have only the checkout copy, which
+   * the snapshot archive is about to delete with the worktree (#4845). Copy the ones the chat
+   * references into the mirror so unarchive can rehydrate them. Best-effort: the archive
+   * confirmation still lists the staging dir as lossy, so a skipped copy never blocks archiving.
+   */
+  private async backfillStagedAttachmentMirrorBeforeSnapshot(
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ): Promise<void> {
+    // Snapshot capture runs only for worktree runtimes, whose checkout is host-local.
+    assert(isWorktreeRuntime(metadata.runtimeConfig), "snapshot capture is worktree-only");
+    try {
+      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+      const stagedPaths = await collectReferencedStagedAttachmentPaths(sessionDir);
+      if (stagedPaths.length === 0) {
+        return;
+      }
+      const { workspacePath } = createRuntimeContextForWorkspace(metadata);
+      const result = await backfillStagedAttachmentMirror({
+        workspacePath,
+        sessionDir,
+        stagedPaths,
+      });
+      if (result.copied.length > 0 || result.skipped.length > 0) {
+        log.info("Backfilled staged attachment mirror before snapshot archive", {
+          workspaceId,
+          copied: result.copied,
+          skipped: result.skipped,
+        });
+      }
+    } catch (error) {
+      log.warn("Failed to backfill staged attachment mirror before snapshot archive", {
         workspaceId,
         error: getErrorMessage(error),
       });
