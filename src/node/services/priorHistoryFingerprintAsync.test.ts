@@ -105,7 +105,7 @@ describe("computePriorHistoryFingerprintAsync", () => {
     }
   });
 
-  test("yields to the event loop on a long input", async () => {
+  test("keeps yielding to the event loop while it hashes a long input", async () => {
     const history: MuxMessage[] = [2, 1, 0].map(
       (historySequence): MuxMessage => ({
         id: `msg-${historySequence}`,
@@ -119,19 +119,27 @@ describe("computePriorHistoryFingerprintAsync", () => {
     let fakeNow = 0;
     const nowSpy = spyOn(performance, "now").mockImplementation(() => (fakeNow += 1_000));
 
-    let timerRan = false;
-    setTimeout(() => {
-      timerRan = true;
-    }, 0);
+    // Counts event-loop turns. This timer re-arms before the function schedules its next yield,
+    // so it is due (and runs first) on every turn that resumes the function.
+    let timerTurns = 0;
+    let ticker: ReturnType<typeof setTimeout> | undefined;
+    const tick = () => {
+      timerTurns += 1;
+      ticker = setTimeout(tick, 0);
+    };
+    ticker = setTimeout(tick, 0);
     let fingerprint: string | undefined;
     try {
       fingerprint = await computePriorHistoryFingerprintAsync(history, 3);
     } finally {
       nowSpy.mockRestore();
+      clearTimeout(ticker);
     }
 
-    // A non-yielding async function settles in a microtask, before any timer callback.
-    expect(timerRan).toBe(true);
+    // A non-yielding async function settles in a microtask, before any timer callback. With the
+    // clock always past the budget, each row is its own stretch; a hashing loop that ran every
+    // row in one block (the expensive part on a large epoch) would allow at most one turn.
+    expect(timerTurns).toBeGreaterThanOrEqual(history.length);
     expect(fingerprint).toBe(computePriorHistoryFingerprint(history, 3));
   });
 });
