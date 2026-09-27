@@ -26,6 +26,7 @@ import assert from "@/common/utils/assert";
 import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -801,6 +802,39 @@ const DESCENDANT_WORKSPACE_REMOVE_ERROR =
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
+// Archive stops this backend's own stream, terminals and MCP servers itself, and so its own
+// background processes and in-flight one-off commands (#4857). Its own init is aborted and awaited
+// before the gate, so an init lease still held there is a new one and refuses.
+const ARCHIVE_OWN_ACTIVITY_POLICY = {
+  ignoreKinds: new Set<WorkspaceUseKind>(["turn", "terminal", "editor", "mcp", "exec"]),
+  backgroundProcesses: "allow",
+} as const;
+
+/** A Coder workspace Xum created for this workspace (not an existing one it connected to). */
+function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
+  return (
+    runtimeConfig != null &&
+    isSSHRuntime(runtimeConfig) &&
+    runtimeConfig.coder != null &&
+    runtimeConfig.coder.existingWorkspace !== true &&
+    (runtimeConfig.coder.workspaceName?.trim() ?? "") !== ""
+  );
+}
+
+/**
+ * Whether archiving takes the structural mutation gate (#4476): it deletes the managed checkout,
+ * or stops or deletes a dedicated Coder workspace (#4871).
+ */
+function archiveTakesMutationGate(
+  metadata: WorkspaceMetadata,
+  worktreeArchiveBehavior: WorktreeArchiveBehavior,
+  coderWorkspaceArchiveBehavior: CoderWorkspaceArchiveBehavior
+): boolean {
+  return (
+    archiveDeletesManagedWorktree(metadata, worktreeArchiveBehavior) ||
+    (isDedicatedCoderRuntime(metadata.runtimeConfig) && coderWorkspaceArchiveBehavior !== "keep")
+  );
+}
 // #4476: removal stops this backend's own stream, terminals, MCP servers, init hook and background
 // processes itself (it waits for the init). So it ignores those, and its own in-flight one-off
 // commands (#4857): removal never waited for them, and removingWorkspaces refuses new ones.
@@ -10471,8 +10505,92 @@ export class WorkspaceService
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
-      this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options)
+      this.archiveWithDescendants(workspaceId, acknowledgedUntrackedPaths, options)
     );
+  }
+
+  /**
+   * #4477: archiving a parent archives its unarchived sub-agents first, deepest-first, with the
+   * parent's worktree archive behavior: "keep" archives them without touching their checkouts,
+   * "delete" deletes their checkouts, "snapshot" snapshots them. The Coder archive policy applies
+   * to the parent only. The descendants (and the parent, when its own archive takes the gate) are
+   * gated in one sorted acquisition first, so a descendant that either backend is using refuses
+   * the whole archive before anything is archived. Unarchiving the parent later leaves them
+   * archived: the user restores each one on its own.
+   */
+  private async archiveWithDescendants(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>> {
+    const config = this.config.loadConfigOrDefault();
+    const descendants = (
+      this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? []
+    ).filter((descendant) => {
+      const row = findWorkspaceEntry(config, descendant.workspaceId)?.workspace;
+      return row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
+    });
+    if (descendants.length === 0) {
+      return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
+    }
+    if (descendants.some((descendant) => descendant.active)) {
+      return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
+    }
+    // One read of each policy for the whole tree, pinned for every archive below.
+    const worktreeArchiveBehavior =
+      options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior();
+    const coderWorkspaceArchiveBehavior =
+      options?.coderWorkspaceArchiveBehaviorOverride ??
+      this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+      DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+    const parentMetadata = await this.aiService.getWorkspaceMetadata(workspaceId);
+    if (!parentMetadata.success) return Err(parentMetadata.error);
+    const parentGated = archiveTakesMutationGate(
+      parentMetadata.data,
+      worktreeArchiveBehavior,
+      coderWorkspaceArchiveBehavior
+    );
+    const gate = await this.acquireStructuralMutationGate(
+      [
+        ...descendants.map((descendant) => descendant.workspaceId),
+        ...(parentGated ? [workspaceId] : []),
+      ],
+      ARCHIVE_OWN_ACTIVITY_POLICY
+    );
+    if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
+    try {
+      for (const descendant of descendants) {
+        const result = await this.archiveUnlocked(descendant.workspaceId, undefined, {
+          worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+          coderWorkspaceArchiveBehaviorOverride: "keep",
+          mutationGateHeld: true,
+        });
+        const failure = !result.success
+          ? result.error
+          : result.data.kind !== "archived"
+            ? // Its untracked files need their own confirmation: the parent's does not cover them.
+              "its untracked files would be lost by the snapshot archive; archive it on its own to review them"
+            : null;
+        if (failure != null) {
+          return Err(
+            `Cannot archive sub-agent ${descendant.title} (${descendant.workspaceId}): ${failure}`
+          );
+        }
+      }
+      return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, {
+        ...options,
+        worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+        coderWorkspaceArchiveBehaviorOverride: coderWorkspaceArchiveBehavior,
+        mutationGateHeld: parentGated,
+      });
+    } finally {
+      await gate.data().catch((error: unknown) => {
+        log.warn("Failed to release the sub-agent tree's mutation gate after archive", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+    }
   }
 
   /**
@@ -10701,13 +10819,9 @@ export class WorkspaceService
         options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-      const beforeArchiveRuntimeConfig = beforeArchiveMetadata?.runtimeConfig;
-      const isDedicatedCoderWorkspace =
-        beforeArchiveRuntimeConfig != null &&
-        isSSHRuntime(beforeArchiveRuntimeConfig) &&
-        beforeArchiveRuntimeConfig.coder != null &&
-        beforeArchiveRuntimeConfig.coder.existingWorkspace !== true &&
-        (beforeArchiveRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
+      const isDedicatedCoderWorkspace = isDedicatedCoderRuntime(
+        beforeArchiveMetadata?.runtimeConfig
+      );
       if (options?.forbidCoderWorkspaceDeletion === true) {
         if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
           return Err(
@@ -10754,17 +10868,23 @@ export class WorkspaceService
       // aborted and awaited above, so a lease still held here is a new one and refuses.
       // #4871: stopping or deleting a dedicated Coder workspace (runBeforeArchive) ends the other
       // backend's activity in it just the same, so it takes the gate with the same policy.
+      // A parent archive may already hold this gate (#4477, see archiveWithDescendants).
       if (
         beforeArchiveMetadata != null &&
-        (archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior) ||
-          stopsDedicatedCoderWorkspace)
+        archiveTakesMutationGate(
+          beforeArchiveMetadata,
+          worktreeArchiveBehavior,
+          coderWorkspaceArchiveBehavior
+        )
       ) {
-        const gate = await this.acquireStructuralMutationGate(workspaceId, {
-          ignoreKinds: new Set(["turn", "terminal", "editor", "mcp", "exec"]),
-          backgroundProcesses: "allow",
-        });
-        if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
-        releaseMutationGate = gate.data;
+        if (options?.mutationGateHeld !== true) {
+          const gate = await this.acquireStructuralMutationGate(
+            workspaceId,
+            ARCHIVE_OWN_ACTIVITY_POLICY
+          );
+          if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
+          releaseMutationGate = gate.data;
+        }
         // A rename by another backend that finished before the gate was taken would leave the
         // paths read above stale; the gate now excludes renames, so this read stays current.
         const reloaded = await this.aiService.getWorkspaceMetadata(workspaceId);

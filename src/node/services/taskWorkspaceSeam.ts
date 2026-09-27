@@ -322,6 +322,11 @@ export interface ArchiveWorkspaceOptions {
    * otherwise strand already-interrupted turns behind a failed archive.
    */
   coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
+  /**
+   * The caller already holds this workspace's structural mutation gate: a parent archive gates
+   * its sub-agent tree before archiving any of it (#4477).
+   */
+  mutationGateHeld?: boolean;
 }
 
 export interface WorkspaceLiveActivity {
