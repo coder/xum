@@ -348,6 +348,8 @@ export async function buildPlanInstructions(
             });
             lastAgentIsPlanLike = isPlanLikeInResolvedChain(lastChain);
           } catch (error) {
+            // An unreachable host must not silently drop the plan handoff (#4438).
+            if (isRuntimeTransportError(error)) throw error;
             workspaceLog.warn("Failed to resolve last agent definition for plan handoff", {
               lastAgentId,
               error: getErrorMessage(error),
@@ -1033,7 +1035,9 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           // Re-resolve with inheritance so derived agents inherit runnable: true from their base.
           subagentRunnable: resolvedFrontmatter.subagent?.runnable ?? false,
         };
-      } catch {
+      } catch (error) {
+        // An unreachable host must not publish unverified sub-agent metadata (#4438).
+        if (isRuntimeTransportError(error)) throw error;
         // Best-effort: keep the descriptor if enablement or inheritance can't be resolved.
         return descriptor;
       }

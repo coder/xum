@@ -546,6 +546,56 @@ describe("assemblePromptPayload", () => {
 });
 
 describe("buildPlanInstructions", () => {
+  test("fails instead of dropping the plan handoff when the last agent is unreadable", async () => {
+    using tempRoot = new DisposableTempDir("turn-context-plan-handoff-transport");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "mux-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    const metadata: WorkspaceMetadata = {
+      id: "ws-handoff",
+      name: "workspace-handoff",
+      projectName: "project-handoff",
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
+    await fs.mkdir(path.dirname(planPath), { recursive: true });
+    await fs.writeFile(planPath, "The approved plan.");
+
+    // #4438: an unreachable host while resolving the previous (plan) agent must not
+    // silently send exec without the plan.
+    class DroppedAgentsRuntime extends TestRuntime {
+      override stat(filePath: string, abortSignal?: AbortSignal) {
+        if (filePath.includes(`${path.sep}agents${path.sep}`)) {
+          return Promise.reject(new RuntimeError("Connection refused", "network"));
+        }
+        return super.stat(filePath, abortSignal);
+      }
+    }
+    const runtime = new DroppedAgentsRuntime(projectPath, xumHome);
+
+    const outcome = await buildPlanInstructions({
+      runtime,
+      metadata,
+      workspaceId: metadata.id,
+      workspacePath: projectPath,
+      effectiveMode: "exec",
+      effectiveAgentId: "exec",
+      agentIsPlanLike: false,
+      agentDiscoveryRuntime: runtime,
+      agentDiscoveryPath: projectPath,
+      additionalSystemInstructions: undefined,
+      shouldDisableTaskToolsForDepth: false,
+      taskDepth: 0,
+      taskSettings: DEFAULT_TASK_SETTINGS,
+      requestPayloadMessages: [
+        createMuxMessage("a1", "assistant", "Here is the plan.", { agentId: "plan" }),
+        createMuxMessage("u1", "user", "implement it"),
+      ],
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
+  });
+
   test("prepends runtime plan file guidance ahead of caller additional instructions", async () => {
     using tempRoot = new DisposableTempDir("turn-context-assembler");
 

@@ -23,6 +23,7 @@ import { Config, ProvidersConfigStore } from "@/node/config";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
 import { createTaskTool } from "./tools/task";
@@ -4090,6 +4091,35 @@ describe("buildAppAttributionHeaders", () => {
 });
 
 describe("discoverAvailableSubagentsForToolContext", () => {
+  it("fails instead of publishing unverified metadata when inheritance is unreadable", async () => {
+    using project = new DisposableTempDir("available-subagents-transport");
+    using xumHome = new DisposableTempDir("available-subagents-transport-home");
+    const agentsRoot = path.join(project.path, ".mux", "agents");
+    await fs.mkdir(agentsRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsRoot, "custom.md"),
+      "---\nname: Custom\nbase: exec\n---\nBody\n"
+    );
+    // #4438: a transport failure must not fall back to the raw, unverified descriptor.
+    const resolve = spyOn(agentDefinitionsService, "resolveAgentFrontmatter").mockRejectedValue(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+    try {
+      const outcome = await discoverAvailableSubagentsForToolContext({
+        runtime: new LocalRuntime(project.path),
+        workspacePath: project.path,
+        cfg: new Config(xumHome.path).loadConfigOrDefault(),
+        roots: {
+          projectRoots: [agentsRoot],
+          globalRoot: path.join(project.path, "empty-global-agents"),
+        },
+      }).catch((error: unknown) => error);
+      expect(outcome).toMatchObject({ type: "network" });
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+
   it("includes derived agents that inherit subagent.runnable from base", async () => {
     using project = new DisposableTempDir("available-subagents");
     using xumHome = new DisposableTempDir("available-subagents-home");
