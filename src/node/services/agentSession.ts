@@ -983,7 +983,8 @@ export class AgentSession {
    * preparation that never left idle, and by dispose.
    */
   private turnUseLease: Promise<WorkspaceUseLease | Error> | undefined;
-  private turnUseLeaseRelease: Promise<void> | undefined;
+  /** In-flight releases, awaited by dispose (a Set, so settled ones are not retained). */
+  private readonly turnUseLeaseReleases = new Set<Promise<void>>();
   private activePreparations = 0;
   private readonly onTurnSuperseded?: (previous: symbol, next: symbol) => void;
   /** Last generation observed by phaseChanged and whether it was seen settling to idle. */
@@ -1609,7 +1610,7 @@ export class AgentSession {
         cleanupExecution[Symbol.dispose]();
         await cleanup("drain", () => this.coordinator.drain());
         this.releaseTurnUseLeaseIfIdle();
-        await cleanup("turn use lease", () => this.turnUseLeaseRelease);
+        await cleanup("turn use lease", () => Promise.all(this.turnUseLeaseReleases));
         await cleanup("compaction cancellation", () => this.compactionCancellation.flush());
         // Raw bridges stay attached through the attempt fence. Destructive disposal suppresses
         // recovery policy, but still presents its captured terminal exactly once below.
@@ -3727,16 +3728,16 @@ export class AgentSession {
     const lease = this.turnUseLease;
     if (lease == null || this.activePreparations > 0 || this.coordinator.phase !== "idle") return;
     this.turnUseLease = undefined;
-    const previous = this.turnUseLeaseRelease;
-    this.turnUseLeaseRelease = lease
+    const releasing: Promise<void> = lease
       .then((held) => (held instanceof Error ? undefined : held.release()))
-      .then(() => previous)
       .catch((error: unknown) => {
         log.warn("Failed to release the workspace turn use lease", {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
         });
-      });
+      })
+      .finally(() => this.turnUseLeaseReleases.delete(releasing));
+    this.turnUseLeaseReleases.add(releasing);
   }
 
   private releasePreparationEdit(attempt: PreparationAttempt): void {
