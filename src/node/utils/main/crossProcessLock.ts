@@ -217,18 +217,60 @@ interface Blocker {
   why: string;
 }
 
+function describeHolder(holder: LockHolder): string {
+  return (
+    `pid ${holder.pid} (started ${holder.identity?.birth ?? "at an unknown time"}` +
+    `${holder.identity?.hostname ? ` on ${holder.identity.hostname}` : ""})`
+  );
+}
+
 function describeBlocker(lockPath: string, blocker: Blocker | undefined): string {
   if (blocker === undefined) {
     return `Lock: ${lockPath}.`;
   }
   const holder = blocker.holder;
-  const who =
-    holder === undefined
-      ? ""
-      : ` by pid ${holder.pid} (started ${holder.identity?.birth ?? "at an unknown time"}` +
-        `${holder.identity?.hostname ? ` on ${holder.identity.hostname}` : ""})`;
+  const who = holder === undefined ? "" : ` by ${describeHolder(holder)}`;
   const hint = holder === undefined ? "" : " Stop that process to free the lock.";
   return `Lock ${lockPath} is held${who} and was not taken over because ${blocker.why}.${hint}`;
+}
+
+/**
+ * What a read-only probe of a lock found. "held" covers a live holder AND any state whose holder
+ * cannot be judged (unreadable, freshly written corrupt content): callers fail closed on it.
+ */
+export type CrossProcessLockState =
+  | { state: "absent" }
+  | { state: "dead" }
+  | { state: "held"; holder: string; why: string };
+
+/**
+ * Judge a lock's holder without acquiring, reclaiming or writing anything (#4476). A try-acquire
+ * (acquireTimeoutMs 0) is not a probe: it takes an absent lock and reclaims a dead one, so a
+ * scanner would write paths other processes own. Uses the same death rule as acquisition, so
+ * "dead" here means acquisition would reclaim it and "held" means acquisition would refuse.
+ */
+export async function inspectCrossProcessLock(lockPath: string): Promise<CrossProcessLockState> {
+  const observation = await observe(lockPath);
+  if (observation.kind === "absent") {
+    return { state: "absent" };
+  }
+  if (observation.kind === "unreadable") {
+    return {
+      state: "held",
+      holder: "an unknown holder",
+      why: `the lock file cannot be read (${observation.code})`,
+    };
+  }
+  const verdict = judge(observation);
+  if (verdict.dead) {
+    return { state: "dead" };
+  }
+  return {
+    state: "held",
+    holder:
+      observation.kind === "holder" ? describeHolder(observation.holder) : "an unknown holder",
+    why: verdict.why,
+  };
 }
 
 /**

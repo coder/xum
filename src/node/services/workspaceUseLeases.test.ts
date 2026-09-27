@@ -1,0 +1,164 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fsPromises from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+
+import {
+  WorkspaceMutationInProgressError,
+  WorkspaceUseLeases,
+  workspaceMutationLockPath,
+  workspaceUseLockDir,
+} from "@/node/services/workspaceUseLeases";
+import {
+  acquireCrossProcessLock,
+  inspectCrossProcessLock,
+} from "@/node/utils/main/crossProcessLock";
+
+// #4476: two backends on one Xum root (the desktop app beside a `xum server`, or
+// XUM_ALLOW_MULTIPLE_INSTANCES) each own one WorkspaceUseLeases; a use lease is the evidence
+// another backend's structural mutation (rename, remove) must see before it touches the checkout.
+
+const workspaceId = "ws-lease";
+
+describe("WorkspaceUseLeases across two backends on one root", () => {
+  let rootDir: string;
+  let a: WorkspaceUseLeases;
+  let b: WorkspaceUseLeases;
+
+  beforeEach(async () => {
+    rootDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-use-leases-"));
+    a = new WorkspaceUseLeases(rootDir);
+    b = new WorkspaceUseLeases(rootDir);
+  });
+  afterEach(async () => {
+    await fsPromises.rm(rootDir, { recursive: true, force: true });
+  });
+
+  const leaseFiles = async () =>
+    (await fsPromises.readdir(workspaceUseLockDir(rootDir, workspaceId)).catch(() => [])).filter(
+      (name) => name.endsWith(".lock")
+    );
+
+  /** What backend A's scan of the workspace's use directory sees for each lease file. */
+  const probeAll = async () =>
+    Promise.all(
+      (await leaseFiles()).map((name) =>
+        inspectCrossProcessLock(path.join(workspaceUseLockDir(rootDir, workspaceId), name))
+      )
+    );
+
+  test("B's lease is a live lease file for A; release removes it and returns B's count to 0", async () => {
+    const lease = await b.hold(workspaceId, "terminal");
+
+    expect(b.heldCount(workspaceId)).toBe(1);
+    expect(a.heldCount(workspaceId)).toBe(0);
+    const [file] = await leaseFiles();
+    expect(file).toContain(b.instanceToken);
+    expect(file).toContain("terminal");
+    const [probe] = await probeAll();
+    expect(probe.state === "held" && probe.holder).toContain(`pid ${process.pid}`);
+
+    await lease.release();
+    expect(b.heldCount(workspaceId)).toBe(0);
+    expect(await leaseFiles()).toEqual([]);
+  });
+
+  test("a lease whose owner died probes as dead", async () => {
+    await b.hold(workspaceId, "turn");
+    const [file] = await leaseFiles();
+    const lockPath = path.join(workspaceUseLockDir(rootDir, workspaceId), file);
+    // The owner process died: its record names a token no live process holds.
+    const record = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
+    await fsPromises.writeFile(lockPath, JSON.stringify({ ...record, token: "dead-owner" }));
+
+    expect(await probeAll()).toEqual([{ state: "dead" }]);
+  });
+
+  test("holds are refcounted per kind; release is idempotent", async () => {
+    const first = await b.hold(workspaceId, "turn");
+    const second = await b.hold(workspaceId, "turn");
+    const terminal = await b.hold(workspaceId, "terminal");
+    expect(b.heldCount(workspaceId, "turn")).toBe(2);
+    expect(b.heldCount(workspaceId)).toBe(3);
+    expect((await leaseFiles()).length).toBe(2);
+
+    await first.release();
+    await first.release(); // A second release of one lease must not drop another holder's count.
+    expect(b.heldCount(workspaceId, "turn")).toBe(1);
+    expect((await leaseFiles()).length).toBe(2);
+
+    await Promise.all([second.release(), terminal.release()]);
+    expect(b.heldCount(workspaceId)).toBe(0);
+    expect(await leaseFiles()).toEqual([]);
+  });
+
+  test("concurrent holds share one file and a hold racing the last release keeps its file", async () => {
+    const [first, second] = await Promise.all([
+      b.hold(workspaceId, "turn"),
+      b.hold(workspaceId, "turn"),
+    ]);
+    expect(b.heldCount(workspaceId, "turn")).toBe(2);
+    expect((await leaseFiles()).length).toBe(1);
+    await second.release();
+
+    // The 1→0 release and a new 0→1 hold interleave; the survivor must still have a live file.
+    const [, third] = await Promise.all([first.release(), b.hold(workspaceId, "turn")]);
+    expect(b.heldCount(workspaceId, "turn")).toBe(1);
+    expect((await probeAll()).map((probe) => probe.state)).toEqual(["held"]);
+    await third.release();
+    expect(await leaseFiles()).toEqual([]);
+  });
+
+  test("a hold that observes a live mutation gate throws and leaves no lease", async () => {
+    // A's structural mutation holds the gate (the gate helper itself arrives with its call sites).
+    const releaseGate = await acquireCrossProcessLock({
+      lockPath: workspaceMutationLockPath(rootDir, workspaceId),
+      acquireTimeoutMs: 0,
+      staleMs: 60_000,
+      timeoutMessage: "gate busy",
+    });
+
+    let refused: unknown;
+    try {
+      await b.hold(workspaceId, "turn");
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(WorkspaceMutationInProgressError);
+    expect((refused as Error).message).toContain(`pid ${process.pid}`);
+    expect(b.heldCount(workspaceId)).toBe(0);
+    expect(await leaseFiles()).toEqual([]);
+
+    await releaseGate();
+    const lease = await b.hold(workspaceId, "turn");
+    expect(b.heldCount(workspaceId)).toBe(1);
+    await lease.release();
+  });
+
+  test("a dead mutator's gate does not refuse a hold", async () => {
+    const gatePath = workspaceMutationLockPath(rootDir, workspaceId);
+    const releaseGate = await acquireCrossProcessLock({
+      lockPath: gatePath,
+      acquireTimeoutMs: 0,
+      staleMs: 60_000,
+      timeoutMessage: "gate busy",
+    });
+    const record = JSON.parse(await fsPromises.readFile(gatePath, "utf-8")) as object;
+    await fsPromises.writeFile(gatePath, JSON.stringify({ ...record, token: "dead-mutator" }));
+
+    const lease = await b.hold(workspaceId, "turn");
+    expect(b.heldCount(workspaceId)).toBe(1);
+    await lease.release();
+    await releaseGate(); // Not ours anymore: leaves the dead record alone.
+  });
+
+  test("workspace ids never escape the lock directories", () => {
+    const hostile = "../../etc/passwd";
+    expect(path.dirname(workspaceUseLockDir(rootDir, hostile))).toBe(
+      path.dirname(workspaceUseLockDir(rootDir, workspaceId))
+    );
+    expect(path.dirname(workspaceMutationLockPath(rootDir, hostile))).toBe(
+      path.dirname(workspaceMutationLockPath(rootDir, workspaceId))
+    );
+  });
+});

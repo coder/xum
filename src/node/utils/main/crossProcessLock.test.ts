@@ -14,6 +14,7 @@ import {
   acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
   guardPath,
+  inspectCrossProcessLock,
 } from "./crossProcessLock";
 
 async function tempLockPath(): Promise<string> {
@@ -399,6 +400,38 @@ describe("acquireCrossProcessLock", () => {
     } finally {
       holder.stop();
     }
+  });
+});
+
+describe("inspectCrossProcessLock", () => {
+  test("reports absent, a live holder with its description, and a dead holder, writing nothing", async () => {
+    const lockPath = await tempLockPath();
+    expect(await inspectCrossProcessLock(lockPath)).toEqual({ state: "absent" });
+
+    const release = await acquireCrossProcessLock({ lockPath, ...baseOptions });
+    const live = await inspectCrossProcessLock(lockPath);
+    expect(live.state).toBe("held");
+    expect(live.state === "held" && live.holder).toContain(`pid ${process.pid}`);
+    // The probe never takes the lock: its owner still releases it normally.
+    await release();
+    expect(await pathExists(lockPath)).toBe(false);
+
+    await writeRecord(lockPath, { pid: deadPid(), token: "dead-holder" });
+    const deadBytes = await fsPromises.readFile(lockPath, "utf-8");
+    expect(await inspectCrossProcessLock(lockPath)).toEqual({ state: "dead" });
+    // A dead holder's record is left for its own path's owner to reclaim.
+    expect(await fsPromises.readFile(lockPath, "utf-8")).toBe(deadBytes);
+  });
+
+  test("fails closed on content it cannot judge", async () => {
+    const lockPath = await tempLockPath();
+    await fsPromises.writeFile(lockPath, "not json");
+    expect((await inspectCrossProcessLock(lockPath)).state).toBe("held");
+    if (process.getuid?.() === 0 || process.platform === "win32") return; // root/Windows ignore modes
+    await fsPromises.chmod(lockPath, 0o000);
+    const unreadable = await inspectCrossProcessLock(lockPath);
+    expect(unreadable.state === "held" && unreadable.why).toContain("cannot be read");
+    await fsPromises.chmod(lockPath, 0o600);
   });
 });
 
