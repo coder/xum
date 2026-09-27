@@ -2370,11 +2370,11 @@ export class HistoryService {
     // An unreadable archive must not fail a check that chat.jsonl alone answers
     // (reading chat.jsonl first never opened the archive then), so its error is
     // rethrown only when chat.jsonl has no older row either.
-    let archiveError: unknown;
+    let archiveError: Error | undefined;
     try {
       await this.iterateBackward(this.getChatArchivePath(workspaceId), visitor);
     } catch (error) {
-      archiveError = error ?? new Error("chat-archive.jsonl read failed");
+      archiveError = error instanceof Error ? error : new Error(String(error));
     }
     if (!hasOlder) {
       await this.iterateBackward(this.getChatHistoryPath(workspaceId), visitor);
