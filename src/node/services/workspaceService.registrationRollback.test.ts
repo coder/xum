@@ -16,12 +16,12 @@ import {
 } from "./workspaceService.testHarness";
 
 /**
- * #4745: when the registration config edit rejects, create and fork must undo what they made on
- * disk and in memory, return the original error, and leave the next attempt unobstructed. The
- * rename rollback is #4779.
+ * #4745/#4779: when the registration config edit rejects, create, fork and rename must undo what
+ * they made on disk and in memory, return the original error, and leave the next attempt
+ * unobstructed.
  * Real Config, real git worktrees; only the rename that publishes config.json fails (#4752).
  */
-function failConfigPublish() {
+function failConfigPublish(options: { corruptConfig?: boolean } = {}) {
   const realRename = cjsFs.rename.bind(cjsFs);
   return spyOn(cjsFs, "rename").mockImplementation(((
     from: cjsFs.PathLike,
@@ -29,6 +29,7 @@ function failConfigPublish() {
     callback: cjsFs.NoParamCallback
   ) => {
     if (path.basename(String(to)) === "config.json") {
+      if (options.corruptConfig) cjsFs.writeFileSync(String(to), "{ not json");
       callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
       return;
     }
@@ -243,5 +244,60 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       success: true,
       data: { metadata: { name: "fork-a" } },
     });
+  });
+
+  test("rename moves the checkout back and keeps the save error", async () => {
+    const created = await createWorktree("before");
+    if (!created.success) throw new Error(created.error);
+    const { id, namedWorkspacePath: oldPath } = created.data.metadata;
+
+    await expectFailsWithSaveError(() => service.rename(id, "after"));
+    // Disk agrees with the unchanged config again: old checkout and branch, nothing new.
+    expect(worktreePaths(projectPath)).toEqual(
+      [await fs.realpath(projectPath), await fs.realpath(oldPath)].sort()
+    );
+    expect(git(oldPath, "branch", "--show-current")).toBe("before");
+    expect(git(projectPath, "branch", "--list", "after")).toBe("");
+    expect((await harness.config.getWorkspaceMetadataById(id))?.name).toBe("before");
+
+    expect((await service.rename(id, "after")).success).toBe(true);
+    expect((await harness.config.getWorkspaceMetadataById(id))?.name).toBe("after");
+  });
+
+  test("multi-project rename moves every checkout and the container back", async () => {
+    const created = await service.createMultiProject(
+      projects(),
+      "multi-before",
+      "main",
+      undefined,
+      {
+        type: "worktree",
+        srcBaseDir,
+      }
+    );
+    if (!created.success) throw new Error(created.error);
+    const { id, namedWorkspacePath: oldContainer } = created.data;
+    const checkoutsBefore = [worktreePaths(projectPath), worktreePaths(otherProjectPath)];
+
+    await expectFailsWithSaveError(() => service.rename(id, "multi-after"));
+    expect([worktreePaths(projectPath), worktreePaths(otherProjectPath)]).toEqual(checkoutsBefore);
+    expect(git(projectPath, "branch", "--list", "multi-after")).toBe("");
+    expect(await exists(path.join(oldContainer, "project", "README.md"))).toBe(true);
+    expect(await exists(path.join(path.dirname(oldContainer), "multi-after"))).toBe(false);
+
+    expect((await service.rename(id, "multi-after")).success).toBe(true);
+  });
+
+  test("rename leaves the moved checkout when the config cannot be read back", async () => {
+    const created = await createWorktree("keep-before");
+    if (!created.success) throw new Error(created.error);
+    const publish = failConfigPublish({ corruptConfig: true });
+    const result = await service
+      .rename(created.data.metadata.id, "keep-after")
+      .finally(() => publish.mockRestore());
+
+    expect(result.success ? "" : result.error).toContain("EACCES");
+    // Unreadable config is not proof the rename did not land, so the move stays.
+    expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("keep-after");
   });
 });

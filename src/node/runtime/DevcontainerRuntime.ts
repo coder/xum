@@ -776,9 +776,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     oldName: string,
     newName: string,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   > {
     // Stop container before rename (container labels reference old path)
     const oldPath = this.getWorkspacePath(projectPath, oldName);
@@ -789,7 +791,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       projectPath,
       oldName,
       newName,
-      trusted
+      trusted,
+      options
     );
 
     if (result.success) {

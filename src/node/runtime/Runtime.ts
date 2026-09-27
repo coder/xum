@@ -621,6 +621,8 @@ export interface Runtime {
    * @param oldName Current workspace name
    * @param newName New workspace name
    * @param abortSignal Optional abort signal for cancellation
+   * @param options.renameBranch Undoing an earlier rename (#4779): rename the tracked branch back
+   *   exactly when that rename reported `branchRenamed`, instead of re-deriving it from names.
    * @returns Promise resolving to Result with old/new paths on success, or error message
    */
   renameWorkspace(
@@ -628,9 +630,11 @@ export interface Runtime {
     oldName: string,
     newName: string,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   >;
 
   /**
