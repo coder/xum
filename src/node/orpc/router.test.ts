@@ -13,6 +13,7 @@ import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/au
 
 import type { ORPCContext } from "./context";
 import { inFlightProcedureCount } from "./inFlightProcedures";
+import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { router } from "./router";
 
 describe("config.previewAutoModelRouting", () => {
@@ -135,6 +136,26 @@ describe("config.previewAutoModelRouting", () => {
     expect(result.success).toBe(false);
     expect(classifyEffect).not.toHaveBeenCalled();
     expect(recordHeadlessUsage).not.toHaveBeenCalled();
+  });
+});
+
+describe("router terminal.create", () => {
+  test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
+    const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
+    const context = {
+      terminalService: {
+        create: mock(() => Promise.reject(new WorkspaceMutationInProgressError(message))),
+      },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+
+    let refused: unknown;
+    await client.terminal
+      .create({ workspaceId: "ws-1", cols: 80, rows: 24 })
+      .catch((error: unknown) => (refused = error));
+    expect(refused).toBeInstanceOf(ORPCError);
+    expect((refused as ORPCError<string, unknown>).code).toBe("CONFLICT");
+    expect((refused as Error).message).toBe(message);
   });
 });
 

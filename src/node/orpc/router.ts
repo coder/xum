@@ -18,7 +18,8 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * uninterruptible in the service pipeline (see asAtomicMutation in
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
-import { os } from "@orpc/server";
+import { ORPCError, os } from "@orpc/server";
+import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import * as schemas from "@/common/orpc/schemas";
 import type { ORPCContext } from "./context";
 import {
@@ -2190,7 +2191,18 @@ export const router = (authToken?: string) => {
       create: t
         .input(schemas.terminal.create.input)
         .output(schemas.terminal.create.output)
-        .handler(async ({ context, input }) => context.terminalService.create(input)),
+        .handler(async ({ context, input }) => {
+          try {
+            return await context.terminalService.create(input);
+          } catch (error) {
+            // #4476: a rename/removal in another backend refuses the shell. Transports mask plain
+            // errors as "Internal Server Error", so pass this one on with its message.
+            if (error instanceof WorkspaceMutationInProgressError) {
+              throw new ORPCError("CONFLICT", { message: error.message });
+            }
+            throw error;
+          }
+        }),
       close: t
         .input(schemas.terminal.close.input)
         .output(schemas.terminal.close.output)
