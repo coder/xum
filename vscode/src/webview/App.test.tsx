@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { installDom } from "../../../tests/ui/dom";
 import { readPersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { getAgentIdKey, getModelKey, getThinkingLevelKey } from "xum/common/constants/storage";
+import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
 import { App } from "./App";
 import type { UiWorkspace, WebviewToExtensionMessage } from "./protocol";
 import type { VscodeBridge } from "./vscodeBridge";
@@ -648,5 +649,50 @@ describe("vscode webview policy-excluded model", () => {
       options: Record<string, unknown>;
     };
     expect(input.options.model).toBe("anthropic:claude-opus-5-5");
+  });
+});
+
+// #4766: the webview loads the user's routing and thinking-floor config and the providers config.
+describe("vscode webview app and providers config", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    // The store is an app-wide singleton; drop the floors a test loaded so later tests start clean.
+    getAppConfigStore().updateOptimistically({ minThinkingLevelByModel: undefined });
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  test("shows the thinking level raised to the user's configured minimum", async () => {
+    // "low" is below both the built-in minimum (MED) and the configured one (HIGH).
+    updatePersistedState(getThinkingLevelKey(WORKSPACE.id), "low");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await selectWorkspace(bridge);
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
+
+    await bridge.answer("config.getConfig", {
+      minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+    });
+    expect(view.getByText("HIGH")).toBeDefined();
+    expect(view.queryByText("MED")).toBeNull();
+  });
+
+  test("loads the config again when the connection recovers from file mode", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(0);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(0);
+
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
+    expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
   });
 });

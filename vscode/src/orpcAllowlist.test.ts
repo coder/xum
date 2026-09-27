@@ -127,6 +127,58 @@ describe("policy (#4739)", () => {
     const noPolicy = { source: "none", status: { state: "disabled" }, policy: null };
     expect(redactWebviewOrpcResult(["policy", "get"], noPolicy)).toEqual(noPolicy);
     const other = { forcedBaseUrl: "kept" };
-    expect(redactWebviewOrpcResult(["providers", "getConfig"], other)).toBe(other);
+    expect(redactWebviewOrpcResult(["workspace", "getPlanContent"], other)).toBe(other);
+  });
+});
+
+describe("app and providers config (#4766)", () => {
+  test("allows reading the app config and its change signal only", () => {
+    expect(isAllowedOrpcPath(["config", "getConfig"])).toBe(true);
+    expect(isAllowedOrpcPath(["config", "onConfigChanged"])).toBe(true);
+    expect(isAllowedOrpcPath(["config", "saveConfig"])).toBe(false);
+    expect(isAllowedOrpcPath(["config", "updateRoutePreferences"])).toBe(false);
+  });
+
+  test("projects config.getConfig to the model-routing and thinking-floor fields", () => {
+    const config = {
+      routePriority: ["mux-gateway", "direct"],
+      routeOverrides: { "openai:gpt-5.6-terra": "direct" },
+      minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+      muxGovernorUrl: "https://governor.corp.example",
+      heartbeatDefaultPrompt: "private prompt",
+      userPreferences: { name: "alice" },
+      taskSettings: { maxParallelAgentTasks: 3 },
+    };
+    expect(redactWebviewOrpcResult(["config", "getConfig"], config)).toEqual({
+      routePriority: ["mux-gateway", "direct"],
+      routeOverrides: { "openai:gpt-5.6-terra": "direct" },
+      minThinkingLevelByModel: { "anthropic:claude-opus-5-5": "high" },
+    });
+  });
+
+  test("strips URL and key-file fields from providers.getConfig and keeps everything else", () => {
+    const providers = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        baseUrl: "https://user:token@proxy.corp.example/v1",
+        baseUrlResolved: "https://proxy.corp.example/v1?key=secret",
+        apiKeyFile: "/home/alice/.secrets/openai",
+        models: ["gpt-5.6-terra"],
+      },
+      coder: {
+        apiKeySet: false,
+        isConfigured: true,
+        deploymentUrl: "https://coder.corp.example",
+        discoveredModels: ["openai/gpt-5.6-sol"],
+      },
+    };
+    expect(redactWebviewOrpcResult(["providers", "getConfig"], providers)).toEqual({
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true, models: ["gpt-5.6-terra"] },
+      coder: { apiKeySet: false, isConfigured: true, discoveredModels: ["openai/gpt-5.6-sol"] },
+    });
+    // The input object is not mutated.
+    expect(providers.openai.baseUrl).toBeDefined();
   });
 });

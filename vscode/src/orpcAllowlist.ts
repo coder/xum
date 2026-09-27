@@ -30,7 +30,12 @@ const ALLOWED_PROCEDURES = {
     "answerAskUserQuestion",
     "getPlanContent",
   ]),
+  // redactWebviewOrpcResult strips URL and key-file fields from providers.getConfig (#4766).
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
+  // App config for the model routing and thinking-floor stores (#4766). getConfig is projected to
+  // the fields those stores read (see redactWebviewOrpcResult); onConfigChanged only emits empty
+  // change signals. Every write (saveConfig, update*) stays blocked.
+  config: new Set(["getConfig", "onConfigChanged"]),
   // Read-only agent descriptors (names, descriptions, UI flags, model defaults, tool patterns) for
   // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
   // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
@@ -67,6 +72,8 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.agents.has(procedure);
     case "policy":
       return ALLOWED_PROCEDURES.policy.has(procedure);
+    case "config":
+      return ALLOWED_PROCEDURES.config.has(procedure);
     default:
       return false;
   }
@@ -78,9 +85,24 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * policy.get: a provider's forcedBaseUrl is an internal gateway URL that could embed credentials,
  * and no webview code reads it; only the allowlists and flags are forwarded. The input is not
  * mutated. Every other result passes through unchanged.
+ *
+ * config.getConfig (#4766): the app config also holds prompts, the governor URL, preferences and
+ * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
+ * later stay in the host).
+ *
+ * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
+ * the deployment URL can embed credentials and apiKeyFile is a local path; no webview code reads
+ * them, so they are removed from every provider entry.
  */
 export function redactWebviewOrpcResult(path: string[], value: unknown): unknown {
-  if (path[0] !== "policy" || path[1] !== "get") {
+  const procedure = path.join(".");
+  if (procedure === "config.getConfig") {
+    return projectAppConfig(value);
+  }
+  if (procedure === "providers.getConfig") {
+    return redactProvidersConfig(value);
+  }
+  if (procedure !== "policy.get") {
     return value;
   }
   if (typeof value !== "object" || value === null) {
@@ -104,6 +126,44 @@ export function redactWebviewOrpcResult(path: string[], value: unknown): unknown
       }),
     },
   };
+}
+
+const WEBVIEW_APP_CONFIG_FIELDS = ["routePriority", "routeOverrides", "minThinkingLevelByModel"];
+const REDACTED_PROVIDER_CONFIG_FIELDS = new Set([
+  "baseUrl",
+  "baseUrlResolved",
+  "deploymentUrl",
+  "apiKeyFile",
+]);
+
+function projectAppConfig(value: unknown): Record<string, unknown> {
+  const projected: Record<string, unknown> = {};
+  if (typeof value !== "object" || value === null) {
+    return projected;
+  }
+  const config = value as Record<string, unknown>;
+  for (const field of WEBVIEW_APP_CONFIG_FIELDS) {
+    if (config[field] !== undefined) {
+      projected[field] = config[field];
+    }
+  }
+  return projected;
+}
+
+function redactProvidersConfig(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([provider, info]: [string, unknown]) => [
+      provider,
+      typeof info === "object" && info !== null
+        ? Object.fromEntries(
+            Object.entries(info).filter(([field]) => !REDACTED_PROVIDER_CONFIG_FIELDS.has(field))
+          )
+        : info,
+    ])
+  );
 }
 
 export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; error: string };
