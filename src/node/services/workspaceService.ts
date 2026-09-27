@@ -3331,15 +3331,14 @@ export class WorkspaceService
     trusted: boolean;
     initAbortController: AbortController;
     /**
-     * What to do with a worktree checkout; default "delete" (`branch -d` keeps unmerged branches).
-     * "force-delete" also removes a dirty or unpopulated checkout but runs `branch -D`;
-     * "force-delete-keep-branch" removes it the same way but never touches a branch this
-     * creation did not make (#4745, #4775).
+     * What to do with a worktree checkout; "delete" runs `branch -d`, which keeps unmerged
+     * branches but deletes merged ones. "force-delete" also removes a dirty or unpopulated
+     * checkout but runs `branch -D`. The "-keep-branch" variants remove the checkout the same way
+     * but never touch a branch this creation did not make (#4745, #4775, #4842).
      */
-    checkout?: "delete" | "force-delete" | "force-delete-keep-branch";
+    checkout: "delete" | "delete-keep-branch" | "force-delete" | "force-delete-keep-branch";
   }): Promise<boolean> {
-    const { workspaceId } = args;
-    const checkout = args.checkout ?? "delete";
+    const { workspaceId, checkout } = args;
     const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
     // WORKTREE runtimes created a fresh checkout; without deleting it,
     // retrying the same branch collides with the orphaned worktree and leaks
@@ -3365,10 +3364,10 @@ export class WorkspaceService
           // Worktree directories are named after the sanitized workspace
           // name (branch names may contain "/").
           args.workspaceName,
-          checkout !== "delete",
+          checkout.startsWith("force-"),
           undefined,
           args.trusted,
-          { keepBranch: checkout === "force-delete-keep-branch" }
+          { keepBranch: checkout.endsWith("-keep-branch") }
         )
         .catch((error: unknown) => ({
           success: false as const,
@@ -3432,6 +3431,8 @@ export class WorkspaceService
     initParams: WorkspaceInitParams;
     pending: PendingMaterialization;
     initAbortController: AbortController;
+    /** Whether the creation made the branch; a sanitize abort keeps one it merely reused. */
+    createdBranch: boolean;
   }): Promise<void> {
     const { workspaceId, runtime, initParams } = args;
     assert(
@@ -3479,6 +3480,9 @@ export class WorkspaceService
         workspaceName: args.workspaceName,
         trusted: initParams.trusted ?? false,
         initAbortController: args.initAbortController,
+        // Not forced: the workspace is already announced. `branch -d` alone would still delete
+        // a merged branch that existed before this creation (#4842).
+        checkout: args.createdBranch ? "delete" : "delete-keep-branch",
       });
       initParams.initLogger.logComplete(-1);
       // Already announced, unlike a registration-time abort.
@@ -5906,15 +5910,8 @@ export class WorkspaceService
           );
           if (sanitizeError !== undefined) {
             rollBackRegistration = undefined;
-            const rolledBack = await this.abortUnsanitizedCreation({
-              workspaceId,
-              runtime,
-              runtimeConfig: finalRuntimeConfig,
-              projectPath: owningProjectPath,
-              workspaceName: finalWorkspaceName,
-              trusted: projectConfig.trusted ?? false,
-              initAbortController,
-            });
+            // Same abort as a failed registration: it keeps a branch this creation reused (#4842).
+            const rolledBack = await abortRegistration();
             initLogger.logComplete(-1);
             return Err(
               rolledBack
@@ -5986,6 +5983,7 @@ export class WorkspaceService
                 initParams,
                 pending: pendingMaterialization,
                 initAbortController,
+                createdBranch: createResult!.createdBranch === true,
                 // Removal, failed checkout or failed sanitization: the default never applies.
               }).finally(() => this.clearPendingDefaultUnrelatedConsent(workspaceId))
             : runBackgroundInit(runtime, initParams, workspaceId, log)
@@ -6048,6 +6046,9 @@ export class WorkspaceService
     }
 
     let initLogger: ReturnType<WorkspaceService["createInitLogger"]> | null = null;
+    // Set while a failure must undo this creation's registration (#4818, #4842); returns the
+    // error to report.
+    let rollBackRegistration: ((error: string) => Promise<string>) | undefined;
 
     try {
       const validation = validateWorkspaceBranchName(branchName);
@@ -6357,32 +6358,39 @@ export class WorkspaceService
         config.projects.set(MULTI_PROJECT_CONFIG_KEY, multiProjectConfig);
         return config;
       });
-      await registration.catch(async (error: unknown) => {
-        // #4745: undo this creation newest first (container, then worktrees), then fail with
-        // the write's own error. Checkouts go only once the entry is provably not persisted.
-        try {
-          const entryGone = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
-          if (entryGone) {
-            await containerManager
-              .removeContainer(workspaceName)
-              .catch((cleanupError: unknown) =>
-                logRegistrationRollbackFailure(workspaceId, cleanupError)
-              );
-            await rollbackCreatedWorkspaces(true);
-          }
-          await this.discardCreationState(workspaceId, initAbortController, entryGone);
-        } catch (rollbackError: unknown) {
-          logRegistrationRollbackFailure(workspaceId, rollbackError);
+      // Undo this creation newest first (container, then worktrees). Checkouts go only once the
+      // entry is provably not persisted. Returns whether it is.
+      const abortRegistration = async (): Promise<boolean> => {
+        const entryGone = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+        if (entryGone) {
+          await containerManager
+            .removeContainer(workspaceName)
+            .catch((cleanupError: unknown) =>
+              logRegistrationRollbackFailure(workspaceId, cleanupError)
+            );
+          await rollbackCreatedWorkspaces(true);
         }
+        await this.discardCreationState(workspaceId, initAbortController, entryGone);
+        return entryGone;
+      };
+      await registration.catch(async (error: unknown) => {
+        // #4745: fail with the write's own error once the creation is undone.
+        await abortRegistration().catch((rollbackError: unknown) =>
+          logRegistrationRollbackFailure(workspaceId, rollbackError)
+        );
         throw error;
       });
+      rollBackRegistration = (error) =>
+        this.rollBackFailedRegistration(workspaceId, abortRegistration, error);
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const completeMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
       if (!completeMetadata) {
-        initLogger.logComplete(-1);
-        return Err("Failed to retrieve workspace metadata");
+        throw new Error("Failed to retrieve workspace metadata");
       }
+      // Publication starts here: once the UI can reach the workspace, a rollback could delete it
+      // under the user, so the steps from here on do not undo the registration.
+      rollBackRegistration = undefined;
 
       const enrichedMetadata = this.enrichFrontendMetadata(completeMetadata);
       session.emitMetadata(enrichedMetadata);
@@ -6481,8 +6489,8 @@ export class WorkspaceService
       return Ok(enrichedMetadata);
     } catch (error) {
       initLogger?.logComplete(-1);
-      const message = getErrorMessage(error);
-      return Err(`Failed to create multi-project workspace: ${message}`);
+      const message = `Failed to create multi-project workspace: ${getErrorMessage(error)}`;
+      return Err(rollBackRegistration ? await rollBackRegistration(message) : message);
     }
   }
 

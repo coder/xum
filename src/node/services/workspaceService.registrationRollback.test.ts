@@ -404,6 +404,47 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     }
   );
 
+  // #4842: a sanitize failure aborts the creation like a failed registration does, so it must
+  // keep a branch the creation reused; a plain delete's `git branch -d` removes a merged one.
+  test.each([
+    { label: "materialized, a branch it made", awaitMaterialization: true, existingBranch: false },
+    { label: "materialized, an existing branch", awaitMaterialization: true, existingBranch: true },
+    { label: "deferred, a branch it made", awaitMaterialization: false, existingBranch: false },
+    { label: "deferred, an existing branch", awaitMaterialization: false, existingBranch: true },
+  ])(
+    "create ($label) aborted by a failed sanitization keeps only the branch it did not make",
+    async ({ awaitMaterialization, existingBranch }) => {
+      // Merged into main, so `git branch -d` would delete it.
+      if (existingBranch) git(projectPath, "branch", "sanitize-fail");
+      const tip = existingBranch ? git(projectPath, "rev-parse", "sanitize-fail") : undefined;
+      const workspaceId = "ddddddddd4";
+      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      spyOn(
+        service as unknown as {
+          sanitizeStalePluginOverridesForNewWorkspace: () => Promise<string | undefined>;
+        },
+        "sanitizeStalePluginOverridesForNewWorkspace"
+      ).mockResolvedValue("override file unreadable");
+
+      const result = await createWorktree("sanitize-fail", awaitMaterialization);
+      if (awaitMaterialization) {
+        expect(result.success ? "" : result.error).toBe("override file unreadable");
+      } else {
+        // The deferred checkout is sanitized after creation returns; wait for its abort.
+        expect(result.success).toBe(true);
+        await (
+          service as unknown as { initSettlementPromises: Map<string, Promise<void>> }
+        ).initSettlementPromises.get(workspaceId);
+      }
+      await expectNoCreationLeftovers(workspaceId, "sanitize-fail", [projectPath]);
+      if (tip === undefined) {
+        expect(git(projectPath, "branch", "--list", "sanitize-fail")).toBe("");
+      } else {
+        expect(git(projectPath, "rev-parse", "sanitize-fail")).toBe(tip);
+      }
+    }
+  );
+
   test("create whose cleanup throws after the deregistration still reports it rolled back", async () => {
     const workspaceId = "ddddddddd2";
     spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
@@ -436,6 +477,28 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(git(projectPath, "branch", "--list", "fork-after-reg")).toBe("");
     expect(persistedWorkspaceIds()).toEqual([sourceId]);
     expect((await service.fork(sourceId, "fork-after-reg")).success).toBe(true);
+  });
+
+  // #4842: the #4818 rule for createMultiProject; its row even carries consent from the start.
+  test("createMultiProject failing after registration rolls it back and keeps the error", async () => {
+    git(projectPath, "branch", "multi-after");
+    const tip = git(projectPath, "rev-parse", "multi-after");
+    const workspaceId = "ddddddddd5";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+
+    const create = () =>
+      service.createMultiProject(projects(), "multi-after", "main", undefined, {
+        type: "worktree",
+        srcBaseDir,
+      });
+    const result = await create();
+    expect(result.success ? "" : result.error).toContain("Failed to retrieve workspace metadata");
+    await expectNoCreationLeftovers(workspaceId, "multi-after", [projectPath, otherProjectPath]);
+    expect(await exists(path.join(srcBaseDir, "_workspaces", "multi-after"))).toBe(false);
+    expect(git(projectPath, "rev-parse", "multi-after")).toBe(tip);
+    expect(git(otherProjectPath, "branch", "--list", "multi-after")).toBe("");
+    expect((await create()).success).toBe(true);
   });
 
   // #4775 item 7: MultiProjectRuntime.deleteWorkspace must forward keepBranch to every project.
