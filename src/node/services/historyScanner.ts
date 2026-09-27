@@ -777,7 +777,10 @@ function scanProviderHistory(
         // Monotonic: the stop stays requested across unreadable rows until a safe one.
         return matching >= stop.minMatching;
       });
-      assert(stop || location.kind !== "stopped", "provider reads without a stop never stop");
+      assert(
+        stop !== undefined || location.kind !== "stopped",
+        "provider reads without a stop never stop"
+      );
       scanned.push({ file, rows, from: location.kind === "start" ? location.offset : 0 });
       // A start or a clean stop ends the read. An exhausted file keeps all its rows (no older
       // file can exclude them); continue into the archive only while the window is short.
