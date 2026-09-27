@@ -67,13 +67,15 @@ export const PendingRemovalSchema = z.object({
   instanceId: z.string(),
   // A pid judgeHolder can probe; anything else is dropped as malformed at load.
   pid: z.number().int().positive(),
+  // Non-empty or null (#4782): parseProcessIdentity reads "" as unknown, which judgeHolder treats
+  // as an unknown PID domain that never dies, so such a marker is dropped at load instead.
   identity: z.object({
-    birth: z.string().nullable(),
-    bootId: z.string().nullable(),
-    pidNs: z.string().nullable(),
-    machineId: z.string().nullable(),
-    platform: z.string().nullable(),
-    hostname: z.string().nullable(),
+    birth: z.string().min(1).nullable(),
+    bootId: z.string().min(1).nullable(),
+    pidNs: z.string().min(1).nullable(),
+    machineId: z.string().min(1).nullable(),
+    platform: z.string().min(1).nullable(),
+    hostname: z.string().min(1).nullable(),
   }),
   at: z.string(),
 });

@@ -25,11 +25,15 @@ import {
   createMockAIService,
   createWorkspaceServiceForTest,
 } from "@/node/services/workspaceService.testHarness";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
 
 // #4478: two backends on one Xum root (the desktop app beside a `xum server`, or
 // XUM_ALLOW_MULTIPLE_INSTANCES) each run their own in-process locks, so a removal decided by one
 // backend must close admission durably on the row before any destructive effect.
+
+// Captured before the per-test spy: the child-creation test resolves agents through a real runtime.
+const realCreateRuntime = runtimeFactory.createRuntime;
 
 const rootId = "root-removal";
 const taskId = "leaf-removal";
@@ -260,9 +264,82 @@ describe("workspace removal across two backends on one root", () => {
     expect(admission).toMatchObject({ kind: "refused" });
   });
 
+  // #4782 item 2: a child created under a workspace being removed would outlive its parent.
+  test("the other backend cannot create a child task under a workspace being removed", async () => {
+    const leafRootId = "root-without-children";
+    await a.config.editConfig((config) => {
+      const project = [...config.projects.values()][0];
+      project.workspaces.push({
+        ...projectWorkspace(rowOf(a.config, rootId)!.path, "root2", leafRootId, {
+          runtimeConfig: { type: "local" },
+        }),
+        path: `${rowOf(a.config, rootId)!.path}-2`,
+      });
+      // Queue the child (persist-only), so its config write is the only effect.
+      config.taskSettings = testTaskSettings(1);
+      return config;
+    });
+    await editRow(taskId, (row) => {
+      row.taskStatus = "running";
+    });
+    spyOn(runtimeFactory, "createRuntime").mockImplementation((...args) =>
+      Object.assign(realCreateRuntime(...args), { deleteWorkspace })
+    );
+    const paused = pauseRemovalAfterMarker(a);
+    const removal = a.workspaceService.remove(leafRootId, true);
+    await paused.reached;
+
+    const created = await b.taskService.create({
+      parentWorkspaceId: leafRootId,
+      kind: "agent",
+      agentId: "explore",
+      prompt: "child work",
+      title: "child",
+    });
+
+    expect(created.success ? "created" : created.error).toContain("removed");
+    const children = [...b.config.loadConfigOrDefault().projects.values()].flatMap((project) =>
+      project.workspaces.filter((row) => row.parentWorkspaceId === leafRootId)
+    );
+    expect(children).toEqual([]);
+    paused.release();
+    expect((await removal).success).toBe(true);
+  });
+
+  test("a removal refuses when the other backend created a child just before it closed admission", async () => {
+    const leasesA = workspaceUseLeasesFor(a.config);
+    const acquireMutationGate = leasesA.acquireMutationGate.bind(leasesA);
+    // The other backend's child commit lands after the removal decided to proceed.
+    spyOn(leasesA, "acquireMutationGate").mockImplementationOnce(async (...args) => {
+      await a.config.editConfig((config) => {
+        const project = [...config.projects.values()][0];
+        project.workspaces.push({
+          ...projectWorkspace(rowOf(a.config, taskId)!.path, "grandchild", "grandchild-removal"),
+          path: `${rowOf(a.config, taskId)!.path}-grandchild`,
+          parentWorkspaceId: taskId,
+          agentId: "explore",
+          taskStatus: "queued",
+        });
+        return config;
+      });
+      return acquireMutationGate(...args);
+    });
+
+    const removal = await a.workspaceService.remove(taskId, true);
+
+    expect(removal.success ? "removed" : removal.error).toContain("descendant");
+    expect(deleteWorkspace).not.toHaveBeenCalled();
+    expect(rowOf(b.config, taskId)?.pendingRemoval).toBeUndefined();
+  });
+
   test.each([
     ["not an object", () => "not a marker"],
     ["an unprobeable pid", () => ({ ...deadOwnerMarker(), pid: 0 })],
+    // #4782 item 3: an empty identity field reads as an unknown PID domain that never dies.
+    [
+      "an empty identity field",
+      () => ({ ...deadOwnerMarker(), identity: { ...getSelfIdentity(), bootId: "" } }),
+    ],
   ])(
     "a malformed removal marker (%s) is dropped instead of blocking the task",
     async (_, marker) => {

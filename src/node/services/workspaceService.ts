@@ -6823,9 +6823,6 @@ export class WorkspaceService
     let releaseMutationGate: (() => Promise<void>) | undefined;
     // Try to remove from runtime (filesystem)
     try {
-      if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
-        return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
-      }
       // #4476: refuse while another backend uses the workspace (or its shared sub-agents), before
       // any effect. This backend's own stream, terminals, MCP servers, init hook and background
       // processes keep today's handling: removal stops them (it waits for the init below). So do
@@ -6840,6 +6837,12 @@ export class WorkspaceService
       const claim = await this.claimPendingRemoval(workspaceId, binding);
       if (!claim.success) return Err(claim.error);
       pendingRemovalId = claim.data;
+      // #4782: after the claim, so a child that another backend commits under this workspace
+      // either lands before the marker (seen here; the finally releases the marker) or sees the
+      // marker and refuses (TaskService's assertParentAdmitsChild).
+      if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
+        return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
+      }
       // The init abort above only signals: the init hook (or an SSH background materialization)
       // may still be writing. Wait for its retained settlement before any teardown, as archive
       // does (#4819: a failed delegated creation removes its target right after create()). Only

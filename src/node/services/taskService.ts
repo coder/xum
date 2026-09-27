@@ -701,6 +701,27 @@ export interface TaskRetiresClaim {
   nonce: string;
 }
 
+/**
+ * #4782: a child committed under a parent that another backend is removing (or has removed) would
+ * outlive it as an orphaned row. Checked inside every task-creation config write; the removal
+ * checks for descendants after its marker claim (WorkspaceService.removeUnlocked), so either the
+ * child's write sees the marker or the removal sees the child.
+ */
+function assertParentAdmitsChild(
+  config: Parameters<typeof findWorkspaceEntry>[0],
+  parentWorkspaceId: string
+): void {
+  const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
+  if (parent == null) {
+    throw new Error(`Task.create: parent workspace ${parentWorkspaceId} was removed`);
+  }
+  if (parent.pendingRemoval != null) {
+    throw new Error(
+      `Task.create: parent workspace ${parentWorkspaceId} is being removed (by Xum process ${parent.pendingRemoval.pid})`
+    );
+  }
+}
+
 /** Last stage a reservation entered; carried into abort/timeout diagnostics and the stall warning. */
 type TaskReservationStage =
   | "tree-lock"
@@ -6291,6 +6312,7 @@ export class TaskService implements AgentTaskIntegration {
       const canceledInsideCommit = signal?.aborted === true;
       if (canceledInsideCommit) onCanceledInsideCommit();
       for (const plan of plans) {
+        assertParentAdmitsChild(config, plan.parentWorkspaceId);
         const runtime = createRuntimeForWorkspace({
           runtimeConfig: plan.taskRuntimeConfig,
           projectPath: plan.parentMeta.projectPath,
@@ -7651,6 +7673,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         await reserveDesktop(async () => {
           await this.config.editConfig((config) => {
+            assertParentAdmitsChild(config, parentWorkspaceId);
             let projectConfig = config.projects.get(configProjectPath);
             if (!projectConfig) {
               projectConfig = { workspaces: [] };
@@ -7998,6 +8021,7 @@ export class TaskService implements AgentTaskIntegration {
 
       // Persist workspace entry before starting work so it's durable across crashes.
       await this.config.editConfig((config) => {
+        assertParentAdmitsChild(config, parentWorkspaceId);
         let projectConfig = config.projects.get(configProjectPath);
         if (!projectConfig) {
           projectConfig = { workspaces: [] };
