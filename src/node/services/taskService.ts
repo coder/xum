@@ -5390,6 +5390,7 @@ export class TaskService implements AgentTaskIntegration {
       this.workflowAttentionSweepTimer.unref?.();
     }
     if (cancelled()) return;
+    await this.getWorkspaceTurnManager().clearOrphanedDelegatedConsentDefaults();
     const recoveredTerminalWorkspaceTurnNotificationCount =
       await this.getWorkspaceTurnManager().recoverTerminalWorkspaceTurnAttentionNotifications();
     const terminalAttentionDrainStartedAt = Date.now();

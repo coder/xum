@@ -733,6 +733,44 @@ export class WorkspaceTurnManager {
   }
 
   /**
+   * Startup resolver (#4453): a delegated target whose creator died before settling its creating
+   * turn (crash between create() and the handle record, or between the terminal write and the
+   * grant) keeps its pending mark. Clear such marks; never grant. A handle whose live-owner lock
+   * has a live holder, here or in another backend, is still being created and is left alone.
+   * Never throws: startup must not fail.
+   */
+  async clearOrphanedDelegatedConsentDefaults(): Promise<void> {
+    try {
+      for (const project of this.config.loadConfigOrDefault().projects.values()) {
+        for (const workspace of project.workspaces) {
+          const tagged = workspace.tags?.[WORKSPACE_TURN_TASK_TAGS.handle];
+          if (workspace.unrelatedWorkspaceConsentPending !== true) continue;
+          if (tagged == null || !isWorkspaceTurnTaskId(tagged)) continue;
+          const handleId: string = tagged;
+          const workspaceId = workspace.id;
+          if (workspaceId == null) continue;
+          await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+            // Checked first: acquireTurnOwnerLock also answers "held" for this manager's own.
+            if (this.turnOwnerLocks.has(handleId) || this.creationConsentFinalizers.has(handleId)) {
+              return;
+            }
+            if ((await this.acquireTurnOwnerLock(handleId)) !== "held") return;
+            try {
+              await this.workspaceService.clearPendingDefaultUnrelatedConsent(workspaceId);
+            } finally {
+              await this.releaseTurnOwnerLock(handleId);
+            }
+          });
+        }
+      }
+    } catch (error: unknown) {
+      log.warn("Failed to clear orphaned delegated consent defaults", {
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
    * Strictly increasing createdAt for workspace-turn handles issued by this
    * process: listAllWorkspaceTurns() orders records by createdAt, and the
    * immediate-predecessor announcement in createWorkspaceTurn (newest-first

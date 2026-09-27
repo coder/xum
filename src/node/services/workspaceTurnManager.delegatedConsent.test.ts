@@ -212,9 +212,9 @@ describe("delegated target default consent (#4453)", () => {
   };
   for (const [exit, { afterCreate, modelString }] of Object.entries(exitsBeforeRecord)) {
     test(`an exit before the handle record persists clears the mark (${exit})`, async () => {
-      let config: Config | undefined;
-      const a = await setUp({ afterCreate: async () => void (await afterCreate?.(config!)) });
-      config = a.config;
+      const late: { config?: Config } = {};
+      const a = await setUp({ afterCreate: async () => void (await afterCreate?.(late.config!)) });
+      late.config = a.config;
       const created = await createTurn(a.manager, a.parentId, { mode: "new" }, modelString);
 
       expect(created.success).toBe(false);
@@ -255,5 +255,40 @@ describe("delegated target default consent (#4453)", () => {
 
     expect(await workspaceTurnSnapshot(manager, parentId)).toMatchObject({ status: "completed" });
     expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: true });
+
+    // The next startup's resolver clears it (the lock was released with the settlement).
+    await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+    expect(targetRow(config)).toEqual({ exists: true, consent: undefined, pending: undefined });
   });
+
+  for (const creator of ["alive", "dead"] as const) {
+    test(`the startup resolver clears a mark only when its creator is dead (${creator})`, async () => {
+      let resume!: () => void;
+      let reached!: () => void;
+      const paused = new Promise<void>((resolve) => (resume = resolve));
+      const created = new Promise<void>((resolve) => (reached = resolve));
+      const a = await setUp({
+        afterCreate: async () => {
+          reached();
+          await paused;
+        },
+      });
+      const creating = createTurn(a.manager, a.parentId, { mode: "new" });
+      await created; // The row exists with its mark; the handle record does not yet.
+      if (creator === "dead") {
+        const lockPath = workspaceTurnOwnerLockPath(rootDir, "wst_handle");
+        const lock = JSON.parse(await fsPromises.readFile(lockPath, "utf-8")) as object;
+        await fsPromises.writeFile(lockPath, JSON.stringify({ ...lock, token: "dead-owner" }));
+      }
+
+      await a.manager.clearOrphanedDelegatedConsentDefaults();
+      await (await backend()).manager.clearOrphanedDelegatedConsentDefaults();
+      expect(targetRow(a.config).pending).toBe(creator === "alive" ? true : undefined);
+
+      resume();
+      expect((await creating).success).toBe(true);
+      await endTurn(a.manager, a.parentId);
+      expect(targetRow(a.config).consent === undefined).toBe(creator === "dead");
+    });
+  }
 });
