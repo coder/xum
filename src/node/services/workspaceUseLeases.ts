@@ -32,7 +32,7 @@ import {
  * file per holder, and the kind in the name lets a refusal say what is running without a new
  * record schema. The path is unique to this instance, so acquiring it never contends.
  */
-export type WorkspaceUseKind = "turn" | "terminal" | "init" | "mcp" | "exec";
+export type WorkspaceUseKind = "turn" | "terminal" | "init" | "mcp" | "exec" | "editor";
 
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
 export class WorkspaceMutationInProgressError extends Error {}

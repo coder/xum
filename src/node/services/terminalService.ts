@@ -666,6 +666,35 @@ export class TerminalService {
     }
   }
 
+  /**
+   * #4883: this backend's use lease for the native terminals it opened, per workspace. A native
+   * terminal is detached and daemonizes, so its lifetime cannot be tracked; the conservative
+   * lifetime is from the first open until this backend archives or removes the workspace (see
+   * releaseNativeTerminalUseLease) or exits. Another backend's rename or removal refuses
+   * meanwhile; this backend's own mutators treat it like its other terminals.
+   */
+  private readonly nativeTerminalUseLeases = new Map<string, WorkspaceUseLease>();
+
+  private async holdNativeTerminalUseLease(workspaceId: string): Promise<void> {
+    if (this.nativeTerminalUseLeases.has(workspaceId)) return;
+    // Throws while another backend renames or removes the workspace: no terminal may open there.
+    const lease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "terminal");
+    if (this.nativeTerminalUseLeases.has(workspaceId)) {
+      // A concurrent open took one first; one share per workspace is enough.
+      await lease.release();
+      return;
+    }
+    this.nativeTerminalUseLeases.set(workspaceId, lease);
+  }
+
+  /** Ends the native-terminal use lease of a workspace this backend archives or removes. */
+  async releaseNativeTerminalUseLease(workspaceId: string): Promise<void> {
+    const lease = this.nativeTerminalUseLeases.get(workspaceId);
+    if (lease == null) return;
+    this.nativeTerminalUseLeases.delete(workspaceId);
+    await lease.release();
+  }
+
   /** Body of openNative after pending-open admission; see openNative. */
   private async openNativeAdmitted(workspaceId: string): Promise<void> {
     let admissionToken: symbol | null = null;
@@ -687,6 +716,10 @@ export class TerminalService {
           `Workspace is archived: ${workspaceId}. Unarchive it before opening a terminal.`
         );
       }
+
+      // Before any durable effect: a refusal must not leave a marker behind. Kept after a
+      // failed launch too (fail closed; see nativeTerminalUseLeases).
+      await this.holdNativeTerminalUseLease(workspaceId);
 
       // Durable marker: the detached emulator can outlive Xum, so a restart must not forget
       // the open (the in-memory Set resets, and both archive checks would otherwise let a

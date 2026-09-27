@@ -1,5 +1,6 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn, vi, type Mock } from "bun:test";
 import { TerminalService } from "./terminalService";
+import { WorkspaceMutationInProgressError, WorkspaceUseLeases } from "./workspaceUseLeases";
 import type { PTYService } from "./ptyService";
 import type { Config, SecretsStore } from "@/node/config";
 import type { TerminalWindowManager } from "@/desktop/terminalWindowManager";
@@ -1328,6 +1329,72 @@ describe("TerminalService.openNative", () => {
       expect(script).toContain("-p 2222"); // port
       expect(script).toContain("-i ~/.ssh/id_rsa"); // identity file
       expect(script).toContain("remote.example.com"); // host
+    });
+  });
+
+  // #4883: a native terminal's lifetime cannot be tracked, so this backend holds a "terminal" use
+  // lease from the first open until it archives or removes the workspace; another backend on the
+  // same Xum root refuses to rename or remove the checkout meanwhile.
+  describe("native terminal use leases", () => {
+    const workspaceId = "ws-native-lease";
+    // Never opened: the other test's durable marker would answer for workspaceId.
+    const refusedWorkspaceId = "ws-native-lease-refused";
+    const leaseRoot = `${NATIVE_TERMINAL_SESSIONS_DIR}-leases`;
+    const configWithLeaseWorkspace = {
+      ...configWithLocalWorkspace,
+      getAllWorkspaceMetadata: mock(() =>
+        Promise.resolve([
+          ...[workspaceId, refusedWorkspaceId].map((id) => ({
+            id,
+            projectPath: "/tmp/project",
+            name: "main",
+            namedWorkspacePath: "/tmp/project/main",
+            runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+          })),
+        ])
+      ),
+      sessionsDir: leaseRoot,
+      rootDir: leaseRoot,
+    } as unknown as Config;
+    // The other backend: its own instance token over the same root.
+    const otherBackend = () => new WorkspaceUseLeases(leaseRoot);
+    const gateOptions = { hasRunningBackgroundProcesses: () => Promise.resolve(false) };
+
+    beforeEach(() => {
+      setPlatform("darwin");
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+    });
+
+    it("refuses the other backend's mutation until this backend archives or removes the workspace", async () => {
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      await service.openNative(workspaceId);
+      await service.openNative(workspaceId);
+
+      const refused = await otherBackend()
+        .acquireMutationGate([workspaceId], gateOptions)
+        .then(
+          () => "allowed",
+          (error: unknown) => String(error)
+        );
+      expect(refused).toContain("in use by another Xum process: a terminal");
+
+      await service.releaseNativeTerminalUseLease(workspaceId);
+      const release = await otherBackend().acquireMutationGate([workspaceId], gateOptions);
+      await release();
+    });
+
+    it("opens no terminal while the other backend mutates the workspace", async () => {
+      service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
+      const release = await otherBackend().acquireMutationGate([refusedWorkspaceId], gateOptions);
+      try {
+        let error: unknown;
+        await service.openNative(refusedWorkspaceId).catch((caught: unknown) => (error = caught));
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect(await service.hasOpenedNativeTerminal(refusedWorkspaceId)).toBe(false);
+      } finally {
+        await release();
+      }
     });
   });
 

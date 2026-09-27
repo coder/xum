@@ -465,6 +465,45 @@ describe("structural workspace mutations across two backends on one root", () =>
     }
   });
 
+  // #4883: an external editor's lifetime cannot be tracked, so its open holds an "editor" lease
+  // until this backend archives or removes the workspace.
+  test("an editor opened by the other backend refuses rename until that backend archives the workspace", async () => {
+    expect(await b.workspaceService.recordExternalEditorOpenForLaunch(rootId)).toMatchObject({
+      success: true,
+    });
+    const refused = errorOf(await a.workspaceService.rename(rootId, "renamed"));
+    expect(refused).toContain(inUseElsewhere);
+    expect(refused).toContain("editor");
+    expect(renameWorkspace).not.toHaveBeenCalled();
+
+    // This backend's own rename treats its editor like its terminals, as before.
+    expect(await a.workspaceService.recordExternalEditorOpenForLaunch(rootId)).toMatchObject({
+      success: true,
+    });
+    await b.workspaceService.archive(rootId, undefined, {
+      worktreeArchiveBehaviorOverride: "keep",
+    });
+    expect(heldCount(b, "editor")).toBe(0);
+    await a.workspaceService.unarchive(rootId);
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("no editor open is recorded while the other backend mutates the workspace", async () => {
+    const release = await workspaceUseLeasesFor(a.config).acquireMutationGate([rootId], {
+      hasRunningBackgroundProcesses: () => Promise.resolve(false),
+    });
+    try {
+      expect(errorOf(await b.workspaceService.recordExternalEditorOpenForLaunch(rootId))).toContain(
+        "being renamed, removed or archived"
+      );
+      expect(await b.workspaceService.hasUntrackableExternalAppOpen(rootId)).toBe(false);
+      expect(heldCount(b, "editor")).toBe(0);
+    } finally {
+      await release();
+    }
+  });
+
   test("own MCP servers, init hook and one-off commands follow what each mutator ends", async () => {
     // Rename moves the checkout under its own MCP servers (their processes follow it) and
     // in-flight commands, as before, but nothing stops its own init hook.

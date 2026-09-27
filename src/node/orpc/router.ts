@@ -2254,9 +2254,17 @@ export const router = (authToken?: string) => {
       openNative: t
         .input(schemas.terminal.openNative.input)
         .output(schemas.terminal.openNative.output)
-        .handler(async ({ context, input }) =>
-          context.terminalService.openNative(input.workspaceId)
-        ),
+        .handler(async ({ context, input }) => {
+          try {
+            await context.terminalService.openNative(input.workspaceId);
+          } catch (error) {
+            // Another backend is renaming or removing the workspace (#4883), as for terminal.create.
+            if (error instanceof WorkspaceMutationInProgressError) {
+              throw new ORPCError("CONFLICT", { message: error.message });
+            }
+            throw error;
+          }
+        }),
       activity: {
         subscribe: t
           .input(schemas.terminal.activity.subscribe.input)

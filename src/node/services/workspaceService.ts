@@ -3391,6 +3391,36 @@ export class WorkspaceService
   }
 
   /**
+   * Run a creation rollback that deletes the checkout of an already persisted row, under the
+   * structural mutation gate (#4476, #4883): from the registration write on, another backend
+   * may see the row and use the workspace. If it does, keep the row and the checkout instead of
+   * deleting them under that activity, and return false ("could not be rolled back", as for a
+   * row that did not leave the config). `ignoreOwnKinds`: this creation's own activity that
+   * `abort` ends itself (fork aborts and awaits its init); all other own activity refuses.
+   */
+  private async abortCreationUnlessInUse(
+    workspaceId: string,
+    initAbortController: AbortController,
+    abort: () => Promise<boolean>,
+    ignoreOwnKinds: ReadonlySet<WorkspaceUseKind> = new Set()
+  ): Promise<boolean> {
+    const gate = await this.acquireStructuralMutationGate(workspaceId, {
+      ignoreKinds: ignoreOwnKinds,
+      backgroundProcesses: "refuse",
+    });
+    if (!gate.success) {
+      log.warn("Kept a half-created workspace that is in use", { workspaceId, error: gate.error });
+      await this.discardCreationState(workspaceId, initAbortController, false);
+      return false;
+    }
+    try {
+      return await abort();
+    } finally {
+      await gate.data();
+    }
+  }
+
+  /**
    * #4818: undo the registration of a create()/fork() that failed after its config write and
    * before publishing the workspace, so the caller is not told creation failed while the workspace
    * stays listed (and, after the default grant, messageable). `rollback` is the operation's own
@@ -3474,18 +3504,32 @@ export class WorkspaceService
     if (sanitizeError !== undefined) {
       log.error(`Workspace creation aborted for ${workspaceId}: ${sanitizeError}`);
       initParams.initLogger.logStderr(sanitizeError);
-      await this.abortUnsanitizedCreation({
+      // Announced, so another backend may already use the workspace: the abort runs under the
+      // mutation gate and keeps the row while the workspace is in use (#4883).
+      const rolledBack = await this.abortCreationUnlessInUse(
         workspaceId,
-        runtime,
-        runtimeConfig: args.runtimeConfig,
-        projectPath: initParams.projectPath,
-        workspaceName: args.workspaceName,
-        trusted: initParams.trusted ?? false,
-        initAbortController: args.initAbortController,
-        // Not forced: the workspace is already announced. `branch -d` alone would still delete
-        // a merged branch that existed before this creation (#4842).
-        checkout: args.createdBranch ? "delete" : "delete-keep-branch",
-      });
+        args.initAbortController,
+        () =>
+          this.abortUnsanitizedCreation({
+            workspaceId,
+            runtime,
+            runtimeConfig: args.runtimeConfig,
+            projectPath: initParams.projectPath,
+            workspaceName: args.workspaceName,
+            trusted: initParams.trusted ?? false,
+            initAbortController: args.initAbortController,
+            // Not forced: the workspace is already announced. `branch -d` alone would still delete
+            // a merged branch that existed before this creation (#4842).
+            checkout: args.createdBranch ? "delete" : "delete-keep-branch",
+          })
+      );
+      if (!rolledBack) {
+        initParams.initLogger.logStderr(
+          `The half-created workspace could not be rolled back; remove workspace ${workspaceId} manually before retrying.`
+        );
+        initParams.initLogger.logComplete(-1);
+        return;
+      }
       initParams.initLogger.logComplete(-1);
       // Already announced, unlike a registration-time abort.
       this.emit("metadata", { workspaceId, metadata: null });
@@ -3902,6 +3946,7 @@ export class WorkspaceService
 
     // Archiving hides workspace UI; do not leave terminal PTYs running headless.
     this.terminalService?.closeWorkspaceSessions(workspaceId);
+    await this.releaseExternalAppUseLeases(workspaceId);
 
     // Cached MCP servers outlive the stream that started them, and stdio ones run inside the
     // checkout a snapshot archive is about to delete. Removal-style stop (no
@@ -5893,7 +5938,9 @@ export class WorkspaceService
           );
           throw error;
         });
-        rollBackRegistration = abortRegistration;
+        // Persisted from here on: another backend may already use the workspace (#4883).
+        rollBackRegistration = () =>
+          this.abortCreationUnlessInUse(workspaceId, initAbortController, abortRegistration);
 
         const allMetadata = await this.config.getAllWorkspaceMetadata();
         completeMetadata = allMetadata.find((m) => m.id === workspaceId);
@@ -5919,7 +5966,12 @@ export class WorkspaceService
           if (sanitizeError !== undefined) {
             rollBackRegistration = undefined;
             // Same abort as a failed registration: it keeps a branch this creation reused (#4842).
-            const rolledBack = await abortRegistration();
+            // The row is persisted, so it runs under the mutation gate (#4883).
+            const rolledBack = await this.abortCreationUnlessInUse(
+              workspaceId,
+              initAbortController,
+              abortRegistration
+            );
             initLogger.logComplete(-1);
             return Err(
               rolledBack
@@ -6396,27 +6448,12 @@ export class WorkspaceService
       });
       // The row is persisted from here on, so another backend may already use the workspace
       // (#4476): keep it rather than delete the checkouts under that activity.
-      const abortRegistrationUnlessInUse = async (): Promise<boolean> => {
-        const gate = await this.acquireStructuralMutationGate(workspaceId, {
-          ignoreKinds: new Set(),
-          backgroundProcesses: "refuse",
-        });
-        if (!gate.success) {
-          log.warn("Kept a half-created multi-project workspace that is in use", {
-            workspaceId,
-            error: gate.error,
-          });
-          await this.discardCreationState(workspaceId, initAbortController, false);
-          return false;
-        }
-        try {
-          return await abortRegistration();
-        } finally {
-          await gate.data();
-        }
-      };
       rollBackRegistration = (error) =>
-        this.rollBackFailedRegistration(workspaceId, abortRegistrationUnlessInUse, error);
+        this.rollBackFailedRegistration(
+          workspaceId,
+          () => this.abortCreationUnlessInUse(workspaceId, initAbortController, abortRegistration),
+          error
+        );
 
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const completeMetadata = allMetadata.find((metadata) => metadata.id === workspaceId);
@@ -6762,7 +6799,7 @@ export class WorkspaceService
       // its own in-flight one-off commands (#4857): removal never waited for them, and
       // removingWorkspaces refuses new ones.
       const gate = await this.acquireStructuralMutationGate(workspaceId, {
-        ignoreKinds: new Set(["turn", "terminal", "mcp", "init", "exec"]),
+        ignoreKinds: new Set(["turn", "terminal", "editor", "mcp", "init", "exec"]),
         backgroundProcesses: "allow",
       });
       if (!gate.success) return Err(`Cannot remove workspace: ${gate.error}`);
@@ -7458,6 +7495,7 @@ export class WorkspaceService
       }
 
       this.terminalService?.closeWorkspaceSessions(workspaceId);
+      await this.releaseExternalAppUseLeases(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
       // Capture managed roots before the config entry disappears: a worktree
@@ -8609,7 +8647,7 @@ export class WorkspaceService
       // and so do its own MCP server processes (#4857). Its own init hook refuses: nothing here
       // stops it. Its own in-flight one-off commands keep today's handling (never waited for).
       const gate = await this.acquireStructuralMutationGate(workspaceId, {
-        ignoreKinds: new Set(["terminal", "mcp", "exec"]),
+        ignoreKinds: new Set(["terminal", "editor", "mcp", "exec"]),
         backgroundProcesses: "refuse",
       });
       if (!gate.success) return Err(`Cannot rename workspace: ${gate.error}`);
@@ -9633,6 +9671,31 @@ export class WorkspaceService
    */
   private readonly externalEditorWorkspaces = new Set<string>();
 
+  /** See recordExternalEditorOpenAdmitted (#4883). */
+  private readonly externalEditorUseLeases = new Map<string, WorkspaceUseLease>();
+
+  /**
+   * End this backend's native-terminal and editor use leases for a workspace it archives or
+   * removes (#4883): the apps may still run, but the user chose to archive or remove it here,
+   * as before. Release failures leave the lease held (fail closed) and are only logged.
+   */
+  private async releaseExternalAppUseLeases(workspaceId: string): Promise<void> {
+    const editorLease = this.externalEditorUseLeases.get(workspaceId);
+    this.externalEditorUseLeases.delete(workspaceId);
+    const releases = [
+      editorLease?.release(),
+      this.terminalService?.releaseNativeTerminalUseLease(workspaceId),
+    ];
+    for (const release of releases) {
+      await release?.catch((error: unknown) => {
+        log.warn("Failed to release an external app use lease", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      });
+    }
+  }
+
   /**
    * Marker ancestry batches per workspace. A batch begins with a disk probe (did a durable
    * marker exist before this batch wrote one?) and collects one launch-evidence token per
@@ -9845,6 +9908,23 @@ export class WorkspaceService
       )
     ) {
       return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+    }
+    // #4883: like a native terminal (see TerminalService.nativeTerminalUseLeases), an editor's
+    // lifetime cannot be tracked, so this backend holds an "editor" use lease from the first
+    // open until it archives or removes the workspace (releaseExternalAppUseLeases) or exits.
+    // Taken before any durable effect; kept after a failed launch (fail closed).
+    if (!this.externalEditorUseLeases.has(workspaceId)) {
+      let lease: WorkspaceUseLease;
+      try {
+        lease = await workspaceUseLeasesFor(this.config).hold(workspaceId, "editor");
+      } catch (error) {
+        return Err(getErrorMessage(error));
+      }
+      if (this.externalEditorUseLeases.has(workspaceId)) {
+        await lease.release();
+      } else {
+        this.externalEditorUseLeases.set(workspaceId, lease);
+      }
     }
     // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
     // Persistence failure is fatal to the open (mirrors TerminalService.openNative): an
@@ -10537,7 +10617,7 @@ export class WorkspaceService
         archiveDeletesManagedWorktree(beforeArchiveMetadata, worktreeArchiveBehavior)
       ) {
         const gate = await this.acquireStructuralMutationGate(workspaceId, {
-          ignoreKinds: new Set(["turn", "terminal", "mcp", "exec"]),
+          ignoreKinds: new Set(["turn", "terminal", "editor", "mcp", "exec"]),
           backgroundProcesses: "allow",
         });
         if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
@@ -12273,7 +12353,16 @@ export class WorkspaceService
             );
             throw error;
           });
-        rollBackForkRegistration = abortForkRegistration;
+        // Persisted from here on: another backend may already use the workspace (#4883). The
+        // abort itself aborts and awaits this fork's init, so the init's lease does not refuse.
+        const abortForkRegistrationUnlessInUse = () =>
+          this.abortCreationUnlessInUse(
+            newWorkspaceId,
+            initAbortController,
+            abortForkRegistration,
+            new Set(["init"])
+          );
+        rollBackForkRegistration = abortForkRegistrationUnlessInUse;
         if (forkIsHostLocalCheckout) {
           const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
             newWorkspaceId,
@@ -12281,7 +12370,7 @@ export class WorkspaceService
           );
           if (sanitizeError !== undefined) {
             rollBackForkRegistration = undefined;
-            const rolledBack = await abortForkRegistration();
+            const rolledBack = await abortForkRegistrationUnlessInUse();
             initLogger.logComplete(-1);
             return Err(
               rolledBack

@@ -535,6 +535,103 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     }
   });
 
+  // #4883: the create()/fork() rollbacks after the registration write follow the same rule.
+  /** Another backend's lease on `workspaceId`, taken the first time `hold` runs. */
+  function foreignTurn(workspaceId: string) {
+    const leases = new WorkspaceUseLeases(harness.config.rootDir);
+    let lease: WorkspaceUseLease | undefined;
+    return {
+      hold: async () => {
+        lease ??= await leases.hold(workspaceId, "turn");
+      },
+      release: () => lease?.release(),
+    };
+  }
+
+  test("create keeps a failed registration another backend already uses", async () => {
+    const workspaceId = "ddddddddd7";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    const foreign = foreignTurn(workspaceId);
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockImplementationOnce(async () => {
+      await foreign.hold();
+      return [];
+    });
+    try {
+      const result = await createWorktree("busy-after-reg");
+      expect(result.success ? "" : result.error).toContain("could not be rolled back");
+      expect(persistedWorkspaceIds()).toContain(workspaceId);
+      expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("busy-after-reg");
+    } finally {
+      await foreign.release();
+    }
+  });
+
+  test.each([
+    { label: "materialized", awaitMaterialization: true },
+    { label: "deferred", awaitMaterialization: false },
+  ])(
+    "create ($label) aborted by a failed sanitization keeps a row another backend already uses",
+    async ({ awaitMaterialization }) => {
+      const workspaceId = "ddddddddd8";
+      spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+      const foreign = foreignTurn(workspaceId);
+      spyOn(
+        service as unknown as {
+          sanitizeStalePluginOverridesForNewWorkspace: () => Promise<string | undefined>;
+        },
+        "sanitizeStalePluginOverridesForNewWorkspace"
+      ).mockImplementation(async () => {
+        await foreign.hold();
+        return "override file unreadable";
+      });
+      const metadataEvents: unknown[] = [];
+      service.on("metadata", (event: { metadata: unknown }) => metadataEvents.push(event.metadata));
+      try {
+        const result = await createWorktree("busy-sanitize", awaitMaterialization);
+        if (awaitMaterialization) {
+          expect(result.success ? "" : result.error).toContain("could not be rolled back");
+        } else {
+          expect(result.success).toBe(true);
+          await (
+            service as unknown as { initSettlementPromises: Map<string, Promise<void>> }
+          ).initSettlementPromises.get(workspaceId);
+          // Kept, so it stays listed.
+          expect(metadataEvents).not.toContain(null);
+        }
+        expect(persistedWorkspaceIds()).toContain(workspaceId);
+        expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("busy-sanitize");
+      } finally {
+        await foreign.release();
+      }
+    }
+  );
+
+  test("fork keeps a failed registration another backend already uses", async () => {
+    const source = await createWorktree("busy-source");
+    if (!source.success) throw new Error(source.error);
+    const goals = new WorkspaceGoalService(
+      harness.config,
+      harness.historyService,
+      harness.extensionMetadata
+    );
+    service.setWorkspaceGoalService(goals);
+    const forkId = "ddddddddd9";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(forkId);
+    const foreign = foreignTurn(forkId);
+    spyOn(goals, "inheritFromFork").mockImplementationOnce(async () => {
+      await foreign.hold();
+      throw new Error("goal store unavailable");
+    });
+    try {
+      const result = await service.fork(source.data.metadata.id, "busy-fork");
+      expect(result.success ? "" : result.error).toContain("could not be rolled back");
+      expect(persistedWorkspaceIds()).toContain(forkId);
+      expect(worktreePaths(projectPath).map((p) => path.basename(p))).toContain("busy-fork");
+    } finally {
+      await foreign.release();
+    }
+  });
+
   // #4775 item 7: MultiProjectRuntime.deleteWorkspace must forward keepBranch to every project.
   const createMultiSource = async () => {
     const source = await service.createMultiProject(projects(), "multi-src", "main", undefined, {
