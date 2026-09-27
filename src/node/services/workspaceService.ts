@@ -12691,6 +12691,10 @@ export class WorkspaceService
     if (this.archivingWorkspaces.has(input.workspaceId)) {
       return Err("Workspace is being archived. Unarchive it before attaching files.");
     }
+    // Staging also writes the session-dir mirror; a removal in progress is deleting that dir.
+    if (this.removingWorkspaces.has(input.workspaceId)) {
+      return Err("Workspace is being removed.");
+    }
     using _preflightStaging = this.acquirePreflightAdmission(
       this.preflightStagingCounts,
       input.workspaceId

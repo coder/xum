@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -473,6 +473,53 @@ describe("staged attachment session mirror", () => {
     expect(await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: outside, dot: true }))).toEqual(
       []
     );
+  });
+
+  test.skipIf(process.getuid?.() === 0)(
+    "an unreadable mirror entry does not block its siblings",
+    async () => {
+      const { repo, sessionDir, runtime, stagedPath } = await stageInRepo(Buffer.from("ok"));
+      await rm(path.join(repo, ".xum"), { recursive: true, force: true });
+      const lockedDir = path.join(
+        sessionDir,
+        STAGED_ATTACHMENT_MIRROR_DIR_NAME,
+        "33333333-3333-4333-8333-333333333333"
+      );
+      await mkdir(lockedDir);
+      await writeFile(path.join(lockedDir, "locked.txt"), "x");
+      await chmod(lockedDir, 0o000);
+      try {
+        const result = await rehydrateStagedWorkspaceAttachments({
+          runtime,
+          workspacePath: repo,
+          sessionDir,
+        });
+        expect(result.success && result.data.restored).toEqual([stagedPath]);
+      } finally {
+        await chmod(lockedDir, 0o755);
+      }
+    }
+  );
+
+  test("staging keeps a newly created session dir private", async () => {
+    const repo = await makeTempDir("mux-stage-mirror-private-");
+    // Not created yet: the first chat write has not happened when the creation flow stages.
+    const sessionDir = path.join(await makeTempDir("mux-stage-mirror-sessions-"), "ws");
+    const bytes = Buffer.from("private");
+    // A permissive umask would otherwise make plain mkdir create it group/world-readable.
+    const previousUmask = process.umask(0o022);
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(repo),
+      workspacePath: repo,
+      sessionDir,
+      filename: "a.txt",
+      mediaType: "text/plain",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    }).finally(() => process.umask(previousUmask));
+
+    expect(staged.success).toBe(true);
+    expect((await stat(sessionDir)).mode & 0o777).toBe(0o700);
   });
 
   test.skipIf(process.getuid?.() === 0)(

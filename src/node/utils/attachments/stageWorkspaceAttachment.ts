@@ -17,7 +17,7 @@ import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { log } from "@/node/services/log";
-import { isErrnoWithCode } from "@/node/utils/fs";
+import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 
 export interface StagedWorkspaceAttachment {
@@ -86,7 +86,10 @@ export async function stageWorkspaceAttachment(input: {
     assert(mirrorPath != null, "freshly staged paths must map to a mirror path");
     // Mirror first: "staged" must imply durable, and a failed checkout write can clean up the
     // host-local mirror file without a runtime round trip.
-    await fsPromises.mkdir(path.dirname(mirrorPath), { recursive: true });
+    // Staging can run before the first chat write creates the session dir; keep it private like
+    // HistoryService does instead of letting the mirror create it world-readable.
+    await ensurePrivateDir(input.sessionDir);
+    await fsPromises.mkdir(path.dirname(mirrorPath), { recursive: true, mode: 0o700 });
     await fsPromises.writeFile(mirrorPath, bytes, { flag: "wx" });
     try {
       await input.runtime.ensureDir(`${input.workspacePath}/${stagedDir}`);
@@ -434,11 +437,25 @@ async function listStagedAttachmentMirrorPaths(sessionDir: string): Promise<stri
   const stagedPaths: string[] = [];
   for (const id of ids.sort()) {
     const entryDir = path.join(mirrorRoot, id);
-    if (!(await fsPromises.lstat(entryDir)).isDirectory()) {
+    let names: string[];
+    try {
+      names = (await fsPromises.lstat(entryDir)).isDirectory()
+        ? await fsPromises.readdir(entryDir)
+        : [];
+    } catch (error) {
+      // One damaged entry (EACCES, EIO, ...) must not hide its valid siblings.
+      log.debug("Skipping unreadable staged attachment mirror entry", {
+        entryDir,
+        error: getErrorMessage(error),
+      });
+      names = [];
+    }
+    if (names.length === 0) {
+      // Reported as skipped: it fails resolveStagedAttachmentMirrorPath's two-segment shape.
       stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}`);
       continue;
     }
-    for (const name of (await fsPromises.readdir(entryDir)).sort()) {
+    for (const name of names.sort()) {
       stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}/${name}`);
     }
   }
