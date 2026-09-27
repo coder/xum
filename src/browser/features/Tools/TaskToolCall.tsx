@@ -1748,6 +1748,16 @@ const MESSAGE_DELIVERY: Record<
   rate_limited: { status: "failed", label: "Rate limited" },
 };
 
+// Results persisted before the dispatch mode was recorded have no mode ("unknown").
+type QueuedDispatchMode = NonNullable<
+  Extract<TaskSendMessageToolSuccessResult, { status: "queued" }>["queueDispatchMode"]
+>;
+const QUEUED_LABEL: Record<QueuedDispatchMode | "unknown", string> = {
+  "tool-end": "Queued for next step",
+  "turn-end": "Queued until turn end",
+  unknown: "Queued for delivery",
+};
+
 export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (props) => {
   const workspaceContext = useOptionalWorkspaceContext();
   const workspace = findWorkspaceForTaskTarget(
@@ -1762,7 +1772,13 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
   const invalidResult =
     (props.result != null || props.status === "completed") && result == null && toolError == null;
   // A finished tool call can still mean delivery was refused or queued, not sent.
-  const delivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  const baseDelivery = result ? MESSAGE_DELIVERY[result.status] : undefined;
+  // The card shows only the send-time result and never learns when the queue entry dispatches,
+  // so a bare "Queued" read as never delivered (#4736). Name when it dispatches instead.
+  const delivery =
+    result?.status === "queued" && baseDelivery != null
+      ? { ...baseDelivery, label: QUEUED_LABEL[result.queueDispatchMode ?? "unknown"] }
+      : baseDelivery;
   const relation = result && "targetRelation" in result ? result.targetRelation : undefined;
   const error = toolError?.error ?? (result && "error" in result ? result.error : undefined);
 

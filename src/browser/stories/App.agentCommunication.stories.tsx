@@ -203,6 +203,56 @@ export const CompactedPhone: AppStory = {
   parameters: Phone.parameters,
 };
 
+// Messages queued behind a busy recipient, one per dispatch mode (#4736).
+function setupQueuedCommunicationStory() {
+  collapseLeftSidebar();
+  collapseRightSidebar();
+  return setupSimpleChatStory({
+    workspaceId: "ws-queued-agent-communication",
+    workspaceName: "queued-communication",
+    projectName: "mux",
+    messages: [
+      createAssistantMessage("queued-messages", "", {
+        historySequence: 1,
+        timestamp: STABLE_TIMESTAMP,
+        toolCalls: (["tool-end", "turn-end"] as const).map((queueDispatchMode) => ({
+          type: "dynamic-tool" as const,
+          toolCallId: `queued-${queueDispatchMode}`,
+          toolName: "task_send_message",
+          state: "output-available" as const,
+          input: { task_id: "b3947e259a", message: MESSAGE },
+          output: { status: "queued", taskId: "b3947e259a", queueDispatchMode },
+        })),
+      }),
+    ],
+  });
+}
+
+export const Queued: AppStory = {
+  render: () => <AppWithMocks setup={setupQueuedCommunicationStory} />,
+  parameters: Outgoing.parameters,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("Queued until turn end");
+    const cards = canvasElement.querySelectorAll('[data-component="AgentCommunicationCard"]');
+    await expect(cards).toHaveLength(2);
+    for (const card of cards) {
+      // Queued is neither a failure nor a completed delivery.
+      const status = within(card as HTMLElement).getByRole("status");
+      await expect(status).not.toHaveClass("text-danger");
+      await expect(status).not.toHaveClass("text-success");
+      await expect(card.scrollWidth).toBeLessThanOrEqual(card.clientWidth);
+    }
+  },
+};
+
+export const QueuedPhone: AppStory = {
+  ...Queued,
+  globals: Phone.globals,
+  decorators: Phone.decorators,
+  parameters: Phone.parameters,
+};
+
 export const DeliveryFailures: AppStory = {
   render: () => <AppWithMocks setup={() => setupCommunicationStory(true)} />,
   parameters: {
