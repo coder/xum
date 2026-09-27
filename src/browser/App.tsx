@@ -130,6 +130,8 @@ import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { prependInitialAppProxyBasePath } from "@/browser/utils/frontendBasePath";
 import { WorkspaceActiveGoalsWarningToast } from "@/browser/components/ActiveGoalsWarningToast/ActiveGoalsWarningToast";
 import { LoadingScreen } from "@/browser/components/LoadingScreen/LoadingScreen";
+import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
+import { usePopoverError } from "@/browser/hooks/usePopoverError";
 
 function RootRouteShell(props: {
   leftSidebarCollapsed: boolean;
@@ -901,9 +903,18 @@ function AppInner() {
     [setSelectedWorkspace]
   );
 
+  // The palette has no anchor element, so refusals (e.g. the cross-backend structural-mutation
+  // gate, #4865) use the anchorless popover error; otherwise they only reach the renderer log.
+  const paletteRemoveError = usePopoverError();
   const removeWorkspaceFromPalette = useCallback(
-    async (workspaceId: string) => removeWorkspace(workspaceId),
-    [removeWorkspace]
+    async (workspaceId: string) => {
+      const result = await removeWorkspace(workspaceId);
+      if (!result.success) {
+        paletteRemoveError.showError(workspaceId, result.error ?? "Failed to remove workspace");
+      }
+      return result;
+    },
+    [removeWorkspace, paletteRemoveError]
   );
 
   const updateTitleFromPalette = useCallback(
@@ -1483,6 +1494,11 @@ function AppInner() {
         </div>
         <WorkspaceActiveGoalsWarningToast />
         <CommandPalette getSlashContext={() => ({ workspaceId: selectedWorkspace?.workspaceId })} />
+        <PopoverError
+          error={paletteRemoveError.error}
+          prefix="Failed to remove workspace"
+          onDismiss={paletteRemoveError.clearError}
+        />
         <ProjectCreateModal
           initialPath={projectCreateInitialPath}
           isOpen={isProjectCreateModalOpen}

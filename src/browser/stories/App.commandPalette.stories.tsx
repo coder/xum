@@ -280,3 +280,33 @@ export const ManyWorkspaces: AppStory = {
     await openPalette(canvasElement, "Fix login button styling issue");
   },
 };
+
+const REMOVE_REFUSAL =
+  "Workspace ws-myapp-fix-login is in use by another Xum process: a terminal in pid 4242; " +
+  "try again when it finishes (holder alive).";
+
+/**
+ * "Remove Current Workspace…" when the backend refuses (e.g. the cross-backend
+ * structural-mutation gate): the refusal must reach the user instead of only the log.
+ */
+export const RemoveCurrentWorkspaceRefused: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupStory(createRichWorkspaces());
+        client.workspace.remove = () => Promise.resolve({ success: false, error: REMOVE_REFUSAL });
+        return client;
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await openPalette(canvasElement, "Fix login button styling issue");
+    await userEvent.keyboard(">Remove Current Workspace");
+    const body = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await body.findByText("Remove Current Workspace…"));
+    await userEvent.click(await body.findByRole("button", { name: "Remove" }));
+    const alert = await body.findByRole("alert", {}, { timeout: 5000 });
+    await expect(alert).toHaveTextContent("Failed to remove workspace");
+    await expect(alert).toHaveTextContent(REMOVE_REFUSAL);
+  },
+};
