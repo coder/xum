@@ -327,8 +327,6 @@ export interface ArchiveWorkspaceOptions {
    * its sub-agent tree before archiving any of it (#4477).
    */
   mutationGateHeld?: boolean;
-  /** Refuse, in the archive's own config commit, while any sub-agent below is unarchived (#4477). */
-  refuseUnarchivedDescendants?: boolean;
 }
 
 export interface WorkspaceLiveActivity {

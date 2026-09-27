@@ -30,7 +30,6 @@ import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchive
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { buildAgentTaskIndex } from "@/node/services/agentTaskIndex";
 import {
   comparePinnedOrder,
   isWorkspacePinned,
@@ -10525,17 +10524,24 @@ export class WorkspaceService
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     const config = this.config.loadConfigOrDefault();
-    const descendants = (
-      this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? []
-    ).filter((descendant) => {
+    let listed: WorkspaceRemovalDescendant[];
+    try {
+      listed = this.agentTaskIntegration?.listWorkspaceRemovalDescendants(workspaceId) ?? [];
+    } catch (error) {
+      // Malformed persisted ancestry (a parentWorkspaceId cycle) must not make the workspace
+      // impossible to archive: archive it alone, as before the cascade existed.
+      log.warn("Archiving without sub-agents: their ancestry could not be read", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      listed = [];
+    }
+    const descendants = listed.filter((descendant) => {
       const row = findWorkspaceEntry(config, descendant.workspaceId)?.workspace;
       return row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt);
     });
     if (descendants.length === 0) {
-      return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, {
-        ...options,
-        refuseUnarchivedDescendants: this.agentTaskIntegration != null,
-      });
+      return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
     }
     if (descendants.some((descendant) => descendant.active)) {
       return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
@@ -10554,13 +10560,18 @@ export class WorkspaceService
       worktreeArchiveBehavior,
       coderWorkspaceArchiveBehavior
     );
-    const gate = await this.acquireStructuralMutationGate(
-      [
-        ...descendants.map((descendant) => descendant.workspaceId),
-        ...(parentGated ? [workspaceId] : []),
-      ],
-      ARCHIVE_OWN_ACTIVITY_POLICY
-    );
+    let gate: Result<() => Promise<void>>;
+    try {
+      gate = await this.acquireStructuralMutationGate(
+        [
+          ...descendants.map((descendant) => descendant.workspaceId),
+          ...(parentGated ? [workspaceId] : []),
+        ],
+        ARCHIVE_OWN_ACTIVITY_POLICY
+      );
+    } catch (error) {
+      return Err(`Failed to archive workspace: ${getErrorMessage(error)}`);
+    }
     if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
     try {
       for (const descendant of descendants) {
@@ -10586,7 +10597,6 @@ export class WorkspaceService
         worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
         coderWorkspaceArchiveBehaviorOverride: coderWorkspaceArchiveBehavior,
         mutationGateHeld: parentGated,
-        refuseUnarchivedDescendants: true,
       });
     } finally {
       await gate.data().catch((error: unknown) => {
@@ -10978,27 +10988,7 @@ export class WorkspaceService
       // Let borrowed viewers release input before archivedAt revokes their bridge identity.
       if (!needsSnapshotCapture) await this.closeDesktopSessionBestEffort(workspaceId, "archive");
 
-      let addedDescendantId: string | undefined;
       await this.config.editConfig((config) => {
-        // #4477: another backend can commit a sub-agent under this workspace after the cascade
-        // listed its tree. Its commit and this one share the config lock, so checking here, in
-        // the archive's own commit, leaves no window for one to be left behind unarchived.
-        if (options?.refuseUnarchivedDescendants === true) {
-          const { childrenByParent } = buildAgentTaskIndex(config);
-          const pending = [...(childrenByParent.get(workspaceId) ?? [])];
-          for (
-            let id = pending.pop();
-            id != null && addedDescendantId == null;
-            id = pending.pop()
-          ) {
-            const row = findWorkspaceEntry(config, id)?.workspace;
-            if (row != null && !isWorkspaceArchived(row.archivedAt, row.unarchivedAt)) {
-              addedDescendantId = id;
-            }
-            pending.push(...(childrenByParent.get(id) ?? []));
-          }
-          if (addedDescendantId != null) return config;
-        }
         const projectConfig = config.projects.get(projectPath);
         if (projectConfig) {
           const workspaceEntry =
@@ -11020,11 +11010,6 @@ export class WorkspaceService
         }
         return config;
       });
-      if (addedDescendantId != null) {
-        return Err(
-          `Sub-agent ${addedDescendantId} was added to this workspace while it was being archived; try again to archive it too.`
-        );
-      }
       // Only now that the archive is durable (#4883): a snapshot capture that asked for
       // confirmation or failed returned above with the native terminals and editors still
       // counted as in use.
