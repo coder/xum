@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { createDisplayUsage, recomputeUsageCosts } from "./displayUsage";
-import { getTotalCost } from "./usageAggregator";
+import { getTotalCost, sumUsageHistory } from "./usageAggregator";
+import { ChatUsageDisplaySchema } from "@/common/orpc/schemas/chatStats";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 
 describe("createDisplayUsage", () => {
@@ -683,5 +684,58 @@ describe("OpenAI service-tier pricing (#4352)", () => {
       "openai:gpt-6-sol"
     );
     expect(getTotalCost(viaOverride)).toBe(base);
+  });
+});
+
+describe("repricing keeps the billed service tier (#4787)", () => {
+  // gpt-5-mini has Fast and Flex rates but no long-context tier, so its session
+  // aggregates are repriced rather than preserved.
+  const MODEL = "openai:gpt-5-mini";
+  const priced = (model: string, tier?: string) => {
+    const usage = createDisplayUsage(
+      { inputTokens: 100_000, outputTokens: 1_000 },
+      model,
+      tier === undefined ? undefined : { openai: { serviceTier: tier } }
+    );
+    if (usage === undefined) throw new Error("expected display usage");
+    return usage;
+  };
+  const total = (usage: Parameters<typeof getTotalCost>[0]) => {
+    const value = getTotalCost(usage);
+    if (value === undefined) throw new Error("expected a priced total");
+    return value;
+  };
+
+  test("reprices a Fast or Flex request at the tier it was billed at", () => {
+    expect(total(priced("openai:gpt-6-sol", "priority"))).toBeGreaterThan(
+      total(priced("openai:gpt-6-sol"))
+    );
+    for (const tier of ["priority", "flex"]) {
+      const usage = priced("openai:gpt-6-sol", tier);
+      expect(total(recomputeUsageCosts(usage, "openai:gpt-6-sol"))).toBeCloseTo(total(usage), 12);
+    }
+  });
+
+  test("the billed tier survives the session-usage schema", () => {
+    const usage = priced("openai:gpt-6-sol", "priority");
+    const parsed = ChatUsageDisplaySchema.parse(usage);
+    expect(total(recomputeUsageCosts(parsed, "openai:gpt-6-sol"))).toBeCloseTo(total(usage), 12);
+  });
+
+  test("reprices an aggregate of one tier at that tier", () => {
+    const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL, "priority")]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    const repriced = recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true });
+    expect(repriced.hasUnknownCosts).toBeUndefined();
+    expect(total(repriced)).toBeCloseTo(total(aggregate), 12);
+  });
+
+  test("keeps the stored costs, marked approximate, of an aggregate that mixes tiers", () => {
+    const aggregate = sumUsageHistory([priced(MODEL, "priority"), priced(MODEL)]);
+    if (aggregate === undefined) throw new Error("expected an aggregate");
+    expect(recomputeUsageCosts(aggregate, MODEL, { aggregatedUsage: true })).toEqual({
+      ...aggregate,
+      hasUnknownCosts: true,
+    });
   });
 });
