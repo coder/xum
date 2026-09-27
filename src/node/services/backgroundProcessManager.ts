@@ -35,11 +35,11 @@ import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
-// Host file lock serializing background process name claims across backends (#4873).
+// Host file lock serializing background spawns per workspace across backends (#4873).
 // A regular file inside the workspace records root: record scanners only read directories.
 const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
-// The critical section is a few local fs calls; a longer wait means a wedged holder.
-const SPAWN_NAME_LOCK_TIMEOUT_MS = 10_000;
+// Held from the name probe until the new record's meta.json is written (one local spawn).
+const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
 const MONITOR_POLL_INTERVAL_MS_REMOTE = 1_000;
 const MONITOR_MAX_PENDING_LINES = 50;
@@ -1383,42 +1383,22 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Allocate a unique process ID for a foreground-to-background migration and claim its
-   * host record directory under the manager's output root.
+   * Allocate a unique process ID and reserve it in the same synchronous step.
    *
-   * Migration awaits between choosing its ID and registering the migrated process; without a
-   * reservation, two concurrent same-name migrations would both be handed the same ID and
-   * share one output directory and manager entry — the first exit would then write the shared
-   * exit marker and settle the survivor's records, blinding archive gating after an unclean
-   * restart. The claim extends that across processes (#4873): another backend's manager has
-   * its own reservations but writes migrated records under the same host root. Callers
-   * release on success only after the process is registered (the processes map then holds
-   * the name) and on failure only once the process's exit settles, so an unverifiable
-   * survivor keeps its name reserved for the session.
+   * Foreground-to-background migration awaits between choosing its ID and registering the
+   * migrated process; without a reservation, two concurrent same-name migrations would both
+   * be handed the same ID and share one output directory and manager entry — the first exit
+   * would then write the shared exit marker and settle the survivor's records, blinding
+   * archive gating after an unclean restart. Callers release on success only after the
+   * process is registered (the processes map then holds the name) and on failure only once
+   * the process's exit settles, so an unverifiable survivor keeps its name reserved for the
+   * session.
    */
-  async reserveMigrationProcessId(
-    workspaceId: string,
-    baseId: string
-  ): Promise<
-    { success: true; processId: string; release: () => void } | { success: false; error: string }
-  > {
-    const claim = { processId: this.generateUniqueProcessId(baseId) };
-    this.reservedProcessIds.add(claim.processId);
-    try {
-      await this.claimHostProcessDir(nodePath.join(this.bgOutputDir, workspaceId), baseId, claim);
-    } catch (error) {
-      this.reservedProcessIds.delete(claim.processId);
-      return {
-        success: false,
-        error: `Failed to reserve background process name ${JSON.stringify(
-          claim.processId
-        )}: ${getErrorMessage(error)}`,
-      };
-    }
-    const processId = claim.processId;
+  reserveUniqueProcessId(baseId: string): { processId: string; release: () => void } {
+    const processId = this.generateUniqueProcessId(baseId);
+    this.reservedProcessIds.add(processId);
     let released = false;
     return {
-      success: true,
       processId,
       release: () => {
         if (released) return;
@@ -1426,53 +1406,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         this.reservedProcessIds.delete(processId);
       },
     };
-  }
-
-  /**
-   * Cross-process name claim for host records (#4873). Two backends on one XUM_ROOT
-   * (desktop + `xum server`) have separate in-memory reservations but share the host records
-   * root, so without a host-level claim both could probe a name as free and write into one
-   * directory. The probe-and-reuse therefore runs under a per-workspace host file lock and
-   * ends by creating a fresh, empty directory. An empty directory reads as held to every
-   * other backend's probe (no meta, no exit marker), so the name stays taken after the lock is
-   * released. The lock is a regular file, which record scanners skip (they read only
-   * directories).
-   *
-   * `claim.processId` must be reserved in this manager on entry; it is advanced (moving the
-   * reservation) past names whose directory may hold a live process. Returns the claimed
-   * directory; throws when the lock or the directory cannot be taken.
-   */
-  private async claimHostProcessDir(
-    workspaceDir: string,
-    displayName: string,
-    claim: { processId: string }
-  ): Promise<string> {
-    assert(
-      this.reservedProcessIds.has(claim.processId),
-      "claimHostProcessDir requires a reserved process ID"
-    );
-    await using _claimLock = await acquireProcessFileLock({
-      lockPath: nodePath.join(workspaceDir, SPAWN_NAME_LOCK_FILENAME),
-      timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
-      label: "background process name lock",
-    });
-    let suffix = 2;
-    while (
-      await this.localSpawnDirMayHoldLiveProcess(nodePath.join(workspaceDir, claim.processId))
-    ) {
-      this.reservedProcessIds.delete(claim.processId);
-      do {
-        claim.processId = `${displayName} (${suffix})`;
-        suffix++;
-      } while (this.processes.has(claim.processId) || this.reservedProcessIds.has(claim.processId));
-      this.reservedProcessIds.add(claim.processId);
-    }
-    // Free or settled: drop any settled record and create the directory exclusively.
-    // Non-recursive mkdir fails with EEXIST instead of silently sharing a directory.
-    const processDir = nodePath.join(workspaceDir, claim.processId);
-    await fsPromises.rm(processDir, { recursive: true, force: true });
-    await fsPromises.mkdir(processDir);
-    return processDir;
   }
 
   /**
@@ -1529,27 +1462,38 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // why reuse would blind archive gating. Host-local records are probed on the local
     // filesystem with host PID checks; all other layouts (SSH/Coder, Docker, devcontainer)
     // live in the runtime's exec namespace and are probed through the runtime instead.
-    // Set once this spawn has created its host-local record directory (see below).
-    let claimedLocalDir: string | null = null;
+    // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
+    // separate in-memory reservations but share the host records root, so both could probe a
+    // name as free and spawn into one directory. Host-local spawns therefore hold a
+    // per-workspace host file lock from the probe below until meta.json records the new
+    // process as running (end of this method), after which every other backend's probe reads
+    // the name as held. Holding it across the whole spawn adds no pre-spawn on-disk state, and
+    // spawnProcess's own failure cleanup runs while no one else can claim the name.
+    let claimLock: AsyncDisposable | null = null;
     if (spawnRecordsAreHostLocal(runtime)) {
-      // Cross-process claim (#4873): see claimHostProcessDir.
-      const claim = { processId };
       try {
-        claimedLocalDir = await this.claimHostProcessDir(
-          localBgWorkspaceDir(workspaceId),
-          config.displayName,
-          claim
-        );
+        claimLock = await acquireProcessFileLock({
+          lockPath: nodePath.join(localBgWorkspaceDir(workspaceId), SPAWN_NAME_LOCK_FILENAME),
+          timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+          label: "background spawn lock",
+        });
       } catch (error) {
         return {
           success: false,
-          error: `Failed to reserve background process name ${JSON.stringify(
-            claim.processId
-          )}: ${getErrorMessage(error)}`,
+          error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
         };
-      } finally {
-        // Keep the disposer's view in sync with the name the claim moved to.
-        processId = claim.processId;
+      }
+    }
+    await using _claimLock = claimLock;
+    if (spawnRecordsAreHostLocal(runtime)) {
+      let suffix = 2;
+      while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
+        this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${config.displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
       }
     } else {
       let suffix = 2;
@@ -1582,13 +1526,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     if (!result.success) {
       log.debug(`BackgroundProcessManager: Failed to spawn: ${result.error}`);
-      if (claimedLocalDir != null) {
-        // Early failures (e.g. a missing cwd) return before spawnProcess touches the
-        // directory; our still-empty claim would otherwise read as a held name and a crash
-        // artifact forever. rmdir only removes an empty directory, so anything spawnProcess
-        // chose to keep (e.g. an ambiguous launch's record) stays.
-        await fsPromises.rmdir(claimedLocalDir).catch(() => undefined);
-      }
       // Non-host record layouts: a failed spawn may leave the record directory holding a
       // live detached process (preserved ambiguous PID echo, post-dispatch transport throw,
       // or a failed best-effort cleanup), and the local disk probe above cannot see those
@@ -2647,7 +2584,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * archive gate. Settled records (exit marker present, non-running status, or dead PID) are
    * safe to reuse; anything unprovable is treated as live so the allocator picks a new name.
    */
-  private async localSpawnDirMayHoldLiveProcess(processDir: string): Promise<boolean> {
+  private async localSpawnDirMayHoldLiveProcess(
+    workspaceId: string,
+    processId: string
+  ): Promise<boolean> {
+    const processDir = nodePath.join(localBgWorkspaceDir(workspaceId), processId);
     try {
       await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
       return false; // The exit trap ran: settled — spawn clears the stale marker on reuse.

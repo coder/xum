@@ -1431,21 +1431,12 @@ ${scriptWithEnv}`;
 
             // Migrate to background tracking if manager is available
             let migrationError = "background process manager unavailable";
-            // Allocate-and-claim: the migration awaits below would otherwise let a concurrent
-            // same-name migration (in this or another backend) receive the same ID and share
-            // this process's output directory (see reserveMigrationProcessId).
-            const reservation =
-              config.backgroundProcessManager && config.workspaceId
-                ? await config.backgroundProcessManager.reserveMigrationProcessId(
-                    config.workspaceId,
-                    safeDisplayName
-                  )
-                : null;
-            if (reservation?.success === false) {
-              // Nothing was written under a name; fall through to fail-closed termination.
-              migrationError = reservation.error;
-            }
-            if (config.backgroundProcessManager && config.workspaceId && reservation?.success) {
+            if (config.backgroundProcessManager && config.workspaceId) {
+              // Allocate-and-reserve atomically: the migration awaits below would otherwise
+              // let a concurrent same-name migration receive the same ID and share this
+              // process's output directory and manager entry (see reserveUniqueProcessId).
+              const reservation =
+                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
               const processId = reservation.processId;
 
               // Create a synthetic ExecStream for the migration streams

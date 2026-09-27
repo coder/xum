@@ -197,24 +197,6 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
-    it("gives concurrent same-name migrations from two backends distinct names", async () => {
-      const otherBackend = new BackgroundProcessManager(bgOutputDir);
-      const [first, second] = await Promise.all(
-        [manager, otherBackend].map((m) => m.reserveMigrationProcessId(testWorkspaceId, "dev"))
-      );
-      expect(first.success && second.success).toBe(true);
-      if (!first.success || !second.success) return;
-      expect(first.processId).not.toBe(second.processId);
-      // Each claim holds its directory, so a later backend cannot reuse either name.
-      const third = await new BackgroundProcessManager(bgOutputDir).reserveMigrationProcessId(
-        testWorkspaceId,
-        "dev"
-      );
-      expect(third.success).toBe(true);
-      if (!third.success) return;
-      expect([first.processId, second.processId]).not.toContain(third.processId);
-    });
-
     it("should return error on spawn failure", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo test", {
         cwd: "/nonexistent/path/that/does/not/exist",
@@ -222,12 +204,6 @@ describe("BackgroundProcessManager", () => {
       });
 
       expect(result.success).toBe(false);
-      // The failed spawn must release its host name claim: a leftover empty directory would
-      // hold the name and read as a crash artifact to the orphan archive gate.
-      expect(
-        await fs.stat(path.join(localBgWorkspaceDir(testWorkspaceId), "test")).catch(() => null)
-      ).toBeNull();
-      expect(await manager.hasOrphanedRunningBackgroundProcesses(testWorkspaceId)).toBe(false);
     });
 
     it("should write stdout and stderr to unified output file", async () => {
