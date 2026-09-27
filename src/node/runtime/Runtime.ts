@@ -716,7 +716,11 @@ export interface Runtime {
 }
 
 /**
- * Error thrown by runtime implementations
+ * Error thrown by runtime implementations.
+ *
+ * `type: "network"` means a transport failure: the remote host could not be
+ * reached or the channel failed, so the state of the file or command is
+ * unknown. Callers must never read it as "file missing" (#4438).
  */
 export class RuntimeError extends Error {
   constructor(
@@ -734,4 +738,15 @@ export class RuntimeError extends Error {
     super(message, cause !== undefined ? { cause } : undefined);
     this.name = "RuntimeError";
   }
+}
+
+/**
+ * True when a runtime operation failed in transport (see RuntimeError), so a
+ * fallback chain must stop instead of treating the target as absent.
+ *
+ * SSH2 also reports aborted execs as "network": callers that own an abort
+ * signal check it first, as they already do for missing-candidate fallbacks.
+ */
+export function isRuntimeTransportError(error: unknown): error is RuntimeError {
+  return error instanceof RuntimeError && error.type === "network";
 }

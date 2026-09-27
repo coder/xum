@@ -420,8 +420,18 @@ export abstract class RemoteRuntime implements Runtime {
           abortSignal: signal,
         });
       },
-      abortSignal
+      abortSignal,
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
     );
+  }
+
+  /**
+   * Whether a non-zero exit came from the transport itself (host unreachable)
+   * rather than the remote command. Only runtimes whose transport reserves an
+   * exit code for its own failures override this (SSH: exit 255, #4438).
+   */
+  protected isTransportFailureExit(_exitCode: number, _stderr: string): boolean {
+    return false;
   }
 
   /**
@@ -471,14 +481,18 @@ export abstract class RemoteRuntime implements Runtime {
    * Get file statistics via exec.
    */
   stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
-    return statViaExec(filePath, async () => {
-      const resolvedPath = await this.resolveFilePath(filePath, abortSignal);
-      return this.exec(`${STAT_VIA_EXEC_COMMAND} ${this.quoteForRemote(resolvedPath)}`, {
-        cwd: this.getBasePath(),
-        timeout: 10,
-        abortSignal,
-      });
-    });
+    return statViaExec(
+      filePath,
+      async () => {
+        const resolvedPath = await this.resolveFilePath(filePath, abortSignal);
+        return this.exec(`${STAT_VIA_EXEC_COMMAND} ${this.quoteForRemote(resolvedPath)}`, {
+          cwd: this.getBasePath(),
+          timeout: 10,
+          abortSignal,
+        });
+      },
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
+    );
   }
 
   /**

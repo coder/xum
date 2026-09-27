@@ -2,7 +2,14 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { INSTRUCTION_SCOPE } from "@/common/types/instructions";
-import { readClaudeCompatGlobalInstructionSet, readInstructionSet } from "./instructionFiles";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
+import {
+  readClaudeCompatGlobalInstructionSet,
+  readInstructionSet,
+  readInstructionSetFromRuntime,
+} from "./instructionFiles";
 
 describe("instructionFiles", () => {
   let tempDir: string;
@@ -110,8 +117,8 @@ describe("instructionFiles", () => {
     it("should propagate projectName for project scope", async () => {
       await fs.writeFile(path.join(tempDir, "AGENTS.md"), "project content");
 
-      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.PROJECT, "my-project");
-      expect(result?.scope).toBe(INSTRUCTION_SCOPE.PROJECT);
+      const result = await readInstructionSet(tempDir, INSTRUCTION_SCOPE.WORKSPACE, "my-project");
+      expect(result?.scope).toBe(INSTRUCTION_SCOPE.WORKSPACE);
       expect(result?.projectName).toBe("my-project");
       expect(result?.files[0]?.projectName).toBe("my-project");
     });
@@ -214,6 +221,63 @@ describe("instructionFiles", () => {
       const result = await readClaudeCompatGlobalInstructionSet(tempDir);
 
       expect(result?.files.map((file) => file.content)).toEqual(["claude instructions"]);
+    });
+  });
+
+  // #4438: on SSH runtimes a read that failed in transport says nothing about the file.
+  // It must fail loudly instead of letting a lower-priority file (CLAUDE.md, the legacy
+  // .mux tree) or a missing .local.md silently change the instructions.
+  describe("readInstructionSetFromRuntime transport failures", () => {
+    function failInTransport(runtime: LocalRuntime, failingPath: string) {
+      const readFile = runtime.readFile.bind(runtime);
+      spyOn(runtime, "readFile").mockImplementation((filePath, ...rest) => {
+        if (filePath !== failingPath) return readFile(filePath, ...rest);
+        return new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.error(
+              new RuntimeError(`Failed to read file ${filePath}: Connection refused`, "network")
+            );
+          },
+        });
+      });
+    }
+
+    it.each([
+      // An unreadable AGENTS.md must not let CLAUDE.md win.
+      ["AGENTS.md", ["AGENTS.md", "CLAUDE.md"]],
+      // An unreadable companion must not silently drop local instructions.
+      ["AGENTS.local.md", ["AGENTS.md", "AGENTS.local.md"]],
+      // An unreadable .xum/AGENTS.md must not fall back to the legacy .mux tree.
+      [".xum/AGENTS.md", [".xum/AGENTS.md", ".mux/AGENTS.md"]],
+    ])("rejects when %s fails in transport", async (failing, files) => {
+      for (const file of files) {
+        await fs.mkdir(path.dirname(path.join(tempDir, file)), { recursive: true });
+        await fs.writeFile(path.join(tempDir, file), `${file} instructions`);
+      }
+      const runtime = new LocalRuntime(tempDir);
+      failInTransport(runtime, path.join(tempDir, failing));
+
+      const error: unknown = await readInstructionSetFromRuntime(
+        runtime,
+        tempDir,
+        INSTRUCTION_SCOPE.WORKSPACE
+      ).then(
+        () => null,
+        (rejection: unknown) => rejection
+      );
+      expect(error).toMatchObject({ type: "network" });
+    });
+
+    it("still falls back to CLAUDE.md when AGENTS.md is missing", async () => {
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+      const runtime = new LocalRuntime(tempDir);
+
+      const result = await readInstructionSetFromRuntime(
+        runtime,
+        tempDir,
+        INSTRUCTION_SCOPE.WORKSPACE
+      );
+      expect(result?.files.map((file) => file.filename)).toEqual(["CLAUDE.md"]);
     });
   });
 });
