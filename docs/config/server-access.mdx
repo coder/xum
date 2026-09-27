@@ -109,6 +109,7 @@ What does not work across the two:
 
 - Streams, Stop, and message queues belong to the process that started them. Stopping a turn in one app does not stop a turn that the other app runs.
 - Busy state and delegated-turn checks are per process. The other app can admit a message into a workspace that looks busy only in the first app.
+- An open chat or sidebar does not update when the other app writes. Reload the app or reopen the workspace to see the other app's messages and changes.
 
 <Warning>
   Do not drive the same workspace or task from both apps at the same time. Pick one app per
@@ -116,9 +117,10 @@ What does not work across the two:
 </Warning>
 
 <Note>
-  When one of the two processes starts, it re-drives the sub-agent tasks that were `running`, even
-  if the other process is still running them. Start the second app when no sub-agent tasks are
-  running, or expect those tasks to restart.
+  When one of the two processes starts, it recovers the sub-agent tasks that were starting, running,
+  or awaiting a report, even if the other process is still running them. That can start a second
+  copy of a task while the first copy keeps running. Start the second app only when no sub-agent
+  tasks are active.
 </Note>
 
 Running two different Xum versions on the same data directory is not supported.

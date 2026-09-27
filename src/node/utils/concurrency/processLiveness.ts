@@ -23,10 +23,15 @@
  * instance discovery honor another backend's delegated turn only as a courtesy (the airtight
  * version needs a cross-process admission registry, #4476).
  * Driving one workspace or task from two backends at once is unsupported. Under that misuse two
- * guarantees still hold: a superseded attempt's stale effects never land on its successor, and
- * for a retired attempt a workflow accepts either the late report or the replacement, never
- * both. Not guaranteed: a backend's startup recovery re-drives `running` sub-agent tasks that a
- * live backend still runs (rotating their attempt); mixed Xum versions on one root (#4480).
+ * guarantees still hold for the attempt-fenced orchestration writes (report publication, settlement
+ * receipts, the plan-handoff boundary, task-state transitions): a superseded attempt's writes never
+ * land on its successor, and for a retired attempt a workflow accepts either the late report or the
+ * replacement, never both. Not fenced: the effects of an execution that is already running (its
+ * stream, tool calls, file changes and history rows continue until that backend stops it). Not
+ * guaranteed: a backend's startup recovery re-queues or re-drives `starting`/`running`/
+ * `awaiting_report` sub-agent tasks that a live backend still runs (a duplicate execution);
+ * UIs do not observe the other backend's writes until they resubscribe; mixed Xum versions on one
+ * root (#4480).
  */
 
 import { spawnSync } from "node:child_process";
