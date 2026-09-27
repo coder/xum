@@ -10486,6 +10486,11 @@ export class WorkspaceService
         });
         if (!gate.success) return Err(`Cannot archive workspace: ${gate.error}`);
         releaseMutationGate = gate.data;
+        // A rename by another backend that finished before the gate was taken would leave the
+        // paths read above stale; the gate now excludes renames, so this read stays current.
+        const reloaded = await this.aiService.getWorkspaceMetadata(workspaceId);
+        if (!reloaded.success) return Err(reloaded.error);
+        beforeArchiveMetadata = reloaded.data;
       }
 
       if (needsSnapshotCapture && beforeArchiveMetadata) {
@@ -10739,9 +10744,10 @@ export class WorkspaceService
         findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
           .worktreeArchiveSnapshot != null
       ) {
+        // Nothing here stops this backend's own background processes, so they refuse too.
         const gate = await this.acquireStructuralMutationGate(workspaceId, {
           ignoreKinds: new Set(),
-          backgroundProcesses: "allow",
+          backgroundProcesses: "refuse",
         });
         if (!gate.success) return Err(`Cannot unarchive workspace: ${gate.error}`);
         releaseMutationGate = gate.data;
@@ -10916,9 +10922,10 @@ export class WorkspaceService
     try {
       // #4476: refuse while another backend uses the workspace or its shared sub-agents. Taken
       // before the archived check below, so an unarchive by another backend in between is seen.
+      // Nothing here stops this backend's own background processes, so they refuse too.
       const gate = await this.acquireStructuralMutationGate(workspaceId, {
         ignoreKinds: new Set(),
-        backgroundProcesses: "allow",
+        backgroundProcesses: "refuse",
       });
       if (!gate.success) return Err(`Cannot delete the managed worktree: ${gate.error}`);
       releaseMutationGate = gate.data;

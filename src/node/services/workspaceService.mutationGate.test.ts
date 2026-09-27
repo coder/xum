@@ -265,6 +265,20 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(rowOf(a.config, rootId)?.unarchivedAt).toBeUndefined();
 
     await releaseAll();
+    // Neither operation stops this backend's own background processes, so those refuse too.
+    const ownBackground = spyOn(
+      a.workspaceService,
+      "hasRunningBackgroundBashProcesses"
+    ).mockResolvedValue(true);
+    expect(errorOf(await a.workspaceService.deleteWorktree(rootId))).toContain(
+      "running background process"
+    );
+    expect(errorOf(await a.workspaceService.unarchive(rootId))).toContain(
+      "running background process"
+    );
+    expect(removeWorktree).not.toHaveBeenCalled();
+
+    ownBackground.mockRestore();
     expect(await a.workspaceService.deleteWorktree(rootId)).toMatchObject({ success: true });
     expect(removeWorktree).toHaveBeenCalledTimes(1);
   });
