@@ -9,10 +9,19 @@ import type { SwitchMilestones } from "./pageMilestones";
 export const CHAT_SWITCH_LEGS = [
   "cold-open-small",
   "cold-open-large",
+  "cold-open-xl",
   "switch-back-small",
   "switch-back-large",
+  "switch-back-xl",
 ] as const;
 export type ChatSwitchLeg = (typeof CHAT_SWITCH_LEGS)[number];
+
+/**
+ * Which window measured the switch (#4846): the desktop's local window (in-process backend) or
+ * a desktop window connected to a running `xum server` over its WebSocket.
+ */
+export const CHAT_SWITCH_TRANSPORTS = ["in-process", "server-window"] as const;
+export type ChatSwitchTransport = (typeof CHAT_SWITCH_TRANSPORTS)[number];
 
 /** Renderer User Timing (xum:chat-switch:*), ms from WorkspaceStore.setActiveWorkspaceId. */
 export interface ChatSwitchRendererTimings {
@@ -43,6 +52,8 @@ export interface ChatSwitchServerReplay {
 export interface ChatSwitchRecord {
   index: number;
   leg: ChatSwitchLeg;
+  /** Missing in runs recorded before #4846; read those as in-process. */
+  transport?: ChatSwitchTransport;
   workspaceId: string;
   historyProfile: string;
   /** Round (workspace pair) this switch belongs to. */
@@ -54,9 +65,13 @@ export interface ChatSwitchRecord {
   server: ChatSwitchServerReplay[];
 }
 
+type ChatSwitchMediansByLeg = Partial<Record<ChatSwitchLeg, ChatSwitchLegMedians>>;
+
 export interface ChatSwitchPerfSummary {
   switches: ChatSwitchRecord[];
-  medians: Partial<Record<ChatSwitchLeg, ChatSwitchLegMedians>>;
+  /** In-process medians only, the same shape as before #4846 so nightly compares need no shim. */
+  medians: ChatSwitchMediansByLeg;
+  mediansByTransport: Partial<Record<ChatSwitchTransport, ChatSwitchMediansByLeg>>;
 }
 
 export type ChatSwitchLegMedians = Record<string, number | null> & { count: number };
@@ -100,10 +115,12 @@ function metricsOf(record: ChatSwitchRecord): Record<string, number | null> {
   };
 }
 
-export function summarizeChatSwitches(
-  records: readonly ChatSwitchRecord[]
-): Partial<Record<ChatSwitchLeg, ChatSwitchLegMedians>> {
-  const result: Partial<Record<ChatSwitchLeg, ChatSwitchLegMedians>> = {};
+function transportOf(record: ChatSwitchRecord): ChatSwitchTransport {
+  return record.transport ?? "in-process";
+}
+
+function mediansByLeg(records: readonly ChatSwitchRecord[]): ChatSwitchMediansByLeg {
+  const result: ChatSwitchMediansByLeg = {};
   for (const leg of CHAT_SWITCH_LEGS) {
     const legMetrics = records.filter((record) => record.leg === leg).map(metricsOf);
     if (legMetrics.length === 0) continue;
@@ -117,17 +134,36 @@ export function summarizeChatSwitches(
   return result;
 }
 
-/** Markdown table: one row per metric, one column per leg (medians over all records). */
+export function summarizeChatSwitches(
+  records: readonly ChatSwitchRecord[]
+): Pick<ChatSwitchPerfSummary, "medians" | "mediansByTransport"> {
+  const mediansByTransport: ChatSwitchPerfSummary["mediansByTransport"] = {};
+  for (const transport of CHAT_SWITCH_TRANSPORTS) {
+    const transportRecords = records.filter((record) => transportOf(record) === transport);
+    if (transportRecords.length > 0) mediansByTransport[transport] = mediansByLeg(transportRecords);
+  }
+  return { medians: mediansByTransport["in-process"] ?? {}, mediansByTransport };
+}
+
+/**
+ * Markdown table: one row per metric, one column per leg × transport (medians over all
+ * records), so each leg's in-process and server-window columns sit side by side.
+ */
 export function renderChatSwitchMarkdownTable(records: readonly ChatSwitchRecord[]): string {
-  const summary = summarizeChatSwitches(records);
-  const legs = CHAT_SWITCH_LEGS.filter((leg) => summary[leg] !== undefined);
-  const metricNames = [...new Set(legs.flatMap((leg) => Object.keys(summary[leg] ?? {})))];
+  const { mediansByTransport } = summarizeChatSwitches(records);
+  const columns = CHAT_SWITCH_LEGS.flatMap((leg) =>
+    CHAT_SWITCH_TRANSPORTS.flatMap((transport) => {
+      const medians = mediansByTransport[transport]?.[leg];
+      return medians ? [{ label: `${leg} · ${transport}`, medians }] : [];
+    })
+  );
+  const metricNames = [...new Set(columns.flatMap((column) => Object.keys(column.medians)))];
   const format = (value: number | null | undefined) => (value == null ? "–" : String(value));
   const lines = [
-    `| metric (median) | ${legs.join(" | ")} |`,
-    `| --- | ${legs.map(() => "---:").join(" | ")} |`,
+    `| metric (median) | ${columns.map((column) => column.label).join(" | ")} |`,
+    `| --- | ${columns.map(() => "---:").join(" | ")} |`,
     ...metricNames.map(
-      (name) => `| ${name} | ${legs.map((leg) => format(summary[leg]?.[name])).join(" | ")} |`
+      (name) => `| ${name} | ${columns.map((column) => format(column.medians[name])).join(" | ")} |`
     ),
   ];
   return lines.join("\n");

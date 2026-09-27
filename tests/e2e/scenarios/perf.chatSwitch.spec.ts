@@ -1,3 +1,4 @@
+import { randomBytes } from "crypto";
 import fs from "fs";
 import path from "path";
 import type { Page } from "@playwright/test";
@@ -5,12 +6,14 @@ import { electronTest, electronExpect as expect } from "../electronTest";
 import { getXumE2EEnv, setXumE2EEnv } from "../env";
 import { MOCK_LONG_STREAM_PROMPT } from "../mockAiPrompts";
 import {
+  CHAT_SWITCH_TRANSPORTS,
   renderChatSwitchMarkdownTable,
   summarizeChatSwitches,
   type ChatSwitchLeg,
   type ChatSwitchRecord,
   type ChatSwitchRendererTimings,
   type ChatSwitchServerReplay,
+  type ChatSwitchTransport,
 } from "../utils/chatSwitchSummary";
 import { addDemoWorkspace, trustDemoProject, type DemoProjectConfig } from "../utils/demoProject";
 import {
@@ -24,6 +27,8 @@ import {
   withChromeProfiles,
   writePerfArtifacts,
 } from "../utils/perfProfile";
+import { createWorkspaceUI, type WorkspaceUI } from "../utils/ui";
+import { getFreePort, startXumServer } from "../utils/xumServerProcess";
 import {
   CHAT_SWITCH_MARK_PREFIX,
   CHAT_SWITCH_START_MARK,
@@ -44,11 +49,21 @@ import { ONCHAT_REPLAY_TIMING_LOG_MESSAGE } from "../../../src/node/services/onC
  * Each return replays the chat's live mock stream (`streamReplayed: true`, with a
  * `streamReplay` phase in the server line; #4542) over a stale cached transcript, in since mode
  * (#4505). A fresh pair per round keeps every round's history and stream load identical.
+ *
+ * Transports (#4846): the rounds run first in the desktop's local window (in-process backend),
+ * then in a desktop window connected to a real `xum server` on the same root (its WebSocket
+ * transport), each on its own fresh workspaces. That comparison also includes process
+ * differences (a separate backend with its own caches), not only the transport.
+ *
+ * XUM_E2E_CHAT_SWITCH_XL=1 adds one `xl` round per transport (~2.7 MB history, enough to cross
+ * the server's 1 MiB WebSocket send window, #4655): cold-open xl, start a stream, leave it for
+ * the transport's last small chat (not recorded), and switch back.
  */
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
 const roundCount = Number(getXumE2EEnv("E2E_CHAT_SWITCH_ROUNDS") ?? "3");
 const dwellMs = Number(getXumE2EEnv("E2E_CHAT_SWITCH_DWELL_MS") ?? "1000");
+const includeXl = getXumE2EEnv("E2E_CHAT_SWITCH_XL") === "1";
 /** Generous: the point is to record the latency, not to gate on it. */
 const CAUGHT_UP_BUDGET_MS = 15_000;
 
@@ -80,9 +95,11 @@ function findSplitMessageIds(renderedIds: string[]): string[] {
   return [...split];
 }
 
+type ChatProfile = "small" | "large" | "xl";
+
 interface SeededChat {
   config: DemoProjectConfig;
-  profile: "small" | "large";
+  profile: ChatProfile;
   history: SeededHistoryProfileSummary;
 }
 
@@ -91,20 +108,38 @@ interface SeededRound {
   large: SeededChat;
 }
 
+interface SwitchTarget {
+  page: Page;
+  ui: WorkspaceUI;
+  transport: ChatSwitchTransport;
+}
+
+/** One transport's chats. Each transport gets its own, so no workspace is replayed by both. */
+interface SeededTransport {
+  rounds: SeededRound[];
+  xl: SeededChat | null;
+}
+
 // Set by the workspace fixture override below; every chat must exist before the app launches,
 // and the app fixture depends only on `workspace`.
-let seededRounds: SeededRound[] | undefined;
+let seededTransports: Record<ChatSwitchTransport, SeededTransport> | undefined;
 
 async function seedChat(
   workspace: { configRoot: string; demoProject: DemoProjectConfig },
-  profile: "small" | "large",
+  transport: ChatSwitchTransport,
+  profile: ChatProfile,
   round: number
 ): Promise<SeededChat> {
-  // Round 0's small chat is the fixture's demo workspace; the rest are added beside it.
+  // Round 0's in-process small chat is the fixture's demo workspace; the rest are added beside it.
+  const namePrefix = transport === "in-process" ? "perf" : "perf-server";
   const config =
-    profile === "small" && round === 0
+    transport === "in-process" && profile === "small" && round === 0
       ? workspace.demoProject
-      : addDemoWorkspace(workspace.configRoot, workspace.demoProject, `perf-${profile}-${round}`);
+      : addDemoWorkspace(
+          workspace.configRoot,
+          workspace.demoProject,
+          `${namePrefix}-${profile}-${round}`
+        );
   const history = await seedWorkspaceHistoryProfile({ demoProject: config, profile });
   // Real workspaces keep session-usage.json current. Without one, the first open rebuilds it
   // from the full history while holding the workspace history lock (~250-320 ms), and the
@@ -119,14 +154,21 @@ async function seedChat(
 const test = electronTest.extend({
   workspace: async ({ workspace }, use) => {
     expect(Number.isInteger(roundCount) && roundCount > 0).toBe(true);
-    const rounds: SeededRound[] = [];
-    for (let round = 0; round < roundCount; round++) {
-      rounds.push({
-        small: await seedChat(workspace, "small", round),
-        large: await seedChat(workspace, "large", round),
-      });
-    }
-    seededRounds = rounds;
+    const seedTransport = async (transport: ChatSwitchTransport): Promise<SeededTransport> => {
+      const rounds: SeededRound[] = [];
+      for (let round = 0; round < roundCount; round++) {
+        rounds.push({
+          small: await seedChat(workspace, transport, "small", round),
+          large: await seedChat(workspace, transport, "large", round),
+        });
+      }
+      const xl = includeXl ? await seedChat(workspace, transport, "xl", roundCount) : null;
+      return { rounds, xl };
+    };
+    seededTransports = {
+      "in-process": await seedTransport("in-process"),
+      "server-window": await seedTransport("server-window"),
+    };
     // Measure the common trusted case (the workspace-creation flow asks for trust). In an
     // untrusted project every executeBash first runs four `git` spawns to discover repo
     // automation drivers. A workspace open fires four executeBash calls (git status, git fetch,
@@ -136,17 +178,21 @@ const test = electronTest.extend({
     trustDemoProject(workspace.demoProject);
 
     // The per-replay server line logs at debug unless the replay is slow; the app fixture
-    // copies process.env into the Electron environment, so set it before launch.
-    const originalLogLevels = {
+    // copies process.env into the Electron environment, so set it before launch. `xum server`
+    // inherits it too. The desktop stays off server.lock (no API server; the local window uses
+    // the in-process MessagePort transport either way) so `xum server` can start on this root.
+    const originalEnv = {
       XUM_LOG_LEVEL: process.env.XUM_LOG_LEVEL,
       MUX_LOG_LEVEL: process.env.MUX_LOG_LEVEL,
+      XUM_NO_API_SERVER: process.env.XUM_NO_API_SERVER,
     };
     setXumE2EEnv(process.env, "LOG_LEVEL", "debug");
+    process.env.XUM_NO_API_SERVER = "1";
     try {
       await use(workspace);
     } finally {
-      seededRounds = undefined;
-      for (const [key, value] of Object.entries(originalLogLevels)) {
+      seededTransports = undefined;
+      for (const [key, value] of Object.entries(originalEnv)) {
         if (value === undefined) {
           delete process.env[key];
         } else {
@@ -240,26 +286,42 @@ async function readRendererTimings(
 test.describe("chat switch performance profiling", () => {
   test.skip(!shouldRunPerfScenarios, "Set XUM_E2E_RUN_PERF=1 to run perf profiling scenarios");
 
-  test("perf: switch back to chats left mid-stream", async ({ ui, page, workspace }, testInfo) => {
+  test("perf: switch back to chats left mid-stream", async ({
+    app,
+    ui,
+    page,
+    workspace,
+  }, testInfo) => {
     expect(Number.isFinite(dwellMs) && dwellMs >= 0).toBe(true);
-    test.setTimeout(120_000 + roundCount * 60_000);
-    const rounds = seededRounds;
-    if (!rounds) {
+    test.setTimeout(180_000 + roundCount * 120_000 + (includeXl ? 120_000 : 0));
+    const seeded = seededTransports;
+    if (!seeded) {
       throw new Error("Chat-switch workspaces were not seeded");
     }
     const logsDir = path.join(workspace.configRoot, "logs");
-    const stopButton = page.getByRole("button", { name: "Stop streaming" });
     const switches: ChatSwitchRecord[] = [];
+    // Every server-window switch, recorded or not, must match exactly one replay line.
+    const serverWindowSwitchCounts = new Map<string, number>();
 
+    /** Switch to `chat` and wait until it caught up; a null `leg` records nothing. */
     const switchTo = async (
+      target: SwitchTarget,
       chat: SeededChat,
       round: number,
-      leg: ChatSwitchLeg,
+      leg: ChatSwitchLeg | null,
       targetMidStream: boolean
     ) => {
+      const { page, ui, transport } = target;
       const workspaceId = chat.config.workspaceId;
+      const label = `${transport} ${leg ?? "unrecorded switch"} (round ${round})`;
       const rowSelector = `[data-workspace-id="${workspaceId}"]`;
       const consumedReplays = readServerReplays(logsDir, workspaceId).length;
+      if (transport === "server-window") {
+        serverWindowSwitchCounts.set(
+          workspaceId,
+          (serverWindowSwitchCounts.get(workspaceId) ?? 0) + 1
+        );
+      }
       const measuredNames = async () =>
         (await readRendererTimings(page, workspaceId, null)).measured;
 
@@ -267,7 +329,7 @@ test.describe("chat switch performance profiling", () => {
         // Inactive rows show server-side activity, and partial.json exists only while the
         // backend stream runs, so the chat is still streaming right before the switch.
         await expect(page.locator(`div[role="button"]${rowSelector}`)).toContainText("streaming");
-        expect(fs.existsSync(partialPath(chat)), `${leg} target is still streaming`).toBe(true);
+        expect(fs.existsSync(partialPath(chat)), `${label} target is still streaming`).toBe(true);
       }
       await startSwitchMilestones(page, rowSelector);
       await ui.projects.openWorkspaceById(workspaceId);
@@ -283,10 +345,10 @@ test.describe("chat switch performance profiling", () => {
         .evaluateAll((elements) =>
           elements.map((element) => element.getAttribute("data-message-id") ?? "")
         );
-      expect(renderedIds.length, `${leg} renders transcript rows`).toBeGreaterThan(0);
+      expect(renderedIds.length, `${label} renders transcript rows`).toBeGreaterThan(0);
       expect(
         findSplitMessageIds(renderedIds),
-        `${leg} has no duplicated or reordered rows`
+        `${label} has no duplicated or reordered rows`
       ).toEqual([]);
 
       const dom = await readSwitchMilestones(page);
@@ -300,11 +362,17 @@ test.describe("chat switch performance profiling", () => {
         .poll(() => readServerReplays(logsDir, workspaceId).length, { timeout: 10_000 })
         .toBeGreaterThan(consumedReplays);
       const server = readServerReplays(logsDir, workspaceId).slice(consumedReplays);
+      if (transport === "server-window") {
+        // Only the server window ever opens this workspace, so its lines come from `xum server`.
+        expect(server, `${label} matched exactly one server replay line`).toHaveLength(1);
+      }
+      if (leg === null) return;
 
       switches.push({
         index: switches.length,
         round,
         leg,
+        transport,
         workspaceId,
         historyProfile: chat.profile,
         targetMidStream,
@@ -314,61 +382,164 @@ test.describe("chat switch performance profiling", () => {
       });
     };
 
-    const startLongStream = async () => {
-      await ui.chat.sendMessage(MOCK_LONG_STREAM_PROMPT);
-      await expect(stopButton).toBeVisible({ timeout: 20_000 });
-    };
+    const runRounds = async (target: SwitchTarget, chats: SeededTransport) => {
+      const stopButton = target.page.getByRole("button", { name: "Stop streaming" });
+      const startLongStream = async () => {
+        await target.ui.chat.sendMessage(MOCK_LONG_STREAM_PROMPT);
+        await expect(stopButton).toBeVisible({ timeout: 20_000 });
+      };
 
-    await resetReactProfileSamples(page);
-    const runLabel = "chat-switch-mid-stream";
-    const chromeProfile = await withChromeProfiles(page, { label: runLabel }, async () => {
-      for (const [round, chats] of rounds.entries()) {
-        await switchTo(chats.small, round, "cold-open-small", false);
+      for (const [round, pair] of chats.rounds.entries()) {
+        await switchTo(target, pair.small, round, "cold-open-small", false);
         await startLongStream();
-        await switchTo(chats.large, round, "cold-open-large", false);
+        await switchTo(target, pair.large, round, "cold-open-large", false);
         await startLongStream();
         // Stay on the current chat so the one left behind falls behind its stream, like a
         // user reading one chat while the other keeps working.
-        await page.waitForTimeout(dwellMs);
-        await switchTo(chats.small, round, "switch-back-small", true);
-        await page.waitForTimeout(dwellMs);
-        await switchTo(chats.large, round, "switch-back-large", true);
+        await target.page.waitForTimeout(dwellMs);
+        await switchTo(target, pair.small, round, "switch-back-small", true);
+        await target.page.waitForTimeout(dwellMs);
+        await switchTo(target, pair.large, round, "switch-back-large", true);
         // Let this round's streams finish so every round is measured under the same backend
         // load (two streams) instead of piling up behind earlier rounds' streams.
         await expect
-          .poll(() => [chats.small, chats.large].some((chat) => fs.existsSync(partialPath(chat))), {
+          .poll(() => [pair.small, pair.large].some((chat) => fs.existsSync(partialPath(chat))), {
             timeout: 60_000,
           })
           .toBe(false);
       }
-    });
 
+      if (chats.xl) {
+        const xl = chats.xl;
+        const round = chats.rounds.length;
+        await switchTo(target, xl, round, "cold-open-xl", false);
+        await startLongStream();
+        await switchTo(target, chats.rounds[chats.rounds.length - 1].small, round, null, false);
+        await target.page.waitForTimeout(dwellMs);
+        await switchTo(target, xl, round, "switch-back-xl", true);
+        // Nothing after this measures xl, so stop its stream instead of waiting it out.
+        await stopButton.click();
+        await expect.poll(() => fs.existsSync(partialPath(xl)), { timeout: 60_000 }).toBe(false);
+      }
+    };
+
+    await resetReactProfileSamples(page);
+    const runLabel = "chat-switch-mid-stream";
+    const chromeProfile = await withChromeProfiles(page, { label: runLabel }, () =>
+      runRounds({ page, ui, transport: "in-process" }, seeded["in-process"])
+    );
     const reactProfileSnapshot = await readReactProfileSnapshot(page);
+
+    // The local window now stays on its last in-process chat. It keeps that one onChat
+    // subscription while the server window runs: the desktop backend must replay nothing more
+    // (the server window never opens an in-process workspace, so these lines are the desktop's).
+    const inProcessIds = [
+      ...seeded["in-process"].rounds.flatMap((pair) => [pair.small, pair.large]),
+      ...(seeded["in-process"].xl ? [seeded["in-process"].xl] : []),
+    ].map((chat) => chat.config.workspaceId);
+    const countDesktopReplays = () =>
+      inProcessIds.reduce((total, id) => total + readServerReplays(logsDir, id).length, 0);
+    const desktopReplays = countDesktopReplays();
+
+    const server = await startXumServer({
+      root: workspace.configRoot,
+      port: await getFreePort(),
+      token: randomBytes(32).toString("hex"),
+      logPath: testInfo.outputPath("xum-server.log"),
+    });
+    try {
+      const opened = app.waitForEvent("window");
+      const openResult = await page.evaluate(() => {
+        const bridge = window.api?.remoteConnection;
+        if (!bridge) throw new Error("The local window has no remote connection bridge");
+        return bridge.openLocalServer();
+      });
+      expect(openResult).toEqual({ status: "shown" });
+      const serverPage = await opened;
+      // The server window has no preload, so it misses the local window's e2e switches: the
+      // `page` fixture disables tutorials, and window.api.isE2E hides the onboarding splash.
+      await serverPage.evaluate(() => {
+        const tutorialState = {
+          disabled: true,
+          completed: { creation: true, workspace: true, review: true },
+        };
+        localStorage.setItem("tutorialState", JSON.stringify(tutorialState));
+      });
+      await serverPage.reload();
+      await serverPage.getByRole("button", { name: "Skip" }).click({ timeout: 30_000 });
+      await expect(serverPage.getByRole("navigation", { name: "Projects" })).toBeVisible({
+        timeout: 30_000,
+      });
+      const serverRunLabel = `${runLabel}-server-window`;
+      // Profile this window too, so both transports pay the same profiler overhead.
+      const serverChromeProfile = await withChromeProfiles(
+        serverPage,
+        { label: serverRunLabel },
+        () =>
+          runRounds(
+            {
+              page: serverPage,
+              ui: createWorkspaceUI(serverPage, workspace.demoProject),
+              transport: "server-window",
+            },
+            seeded["server-window"]
+          )
+      );
+      expect(countDesktopReplays(), "the local window replayed nothing more").toBe(desktopReplays);
+      // The server window's CPU profile and trace; perf-summary.json below holds every switch.
+      await writePerfArtifacts({
+        testInfo,
+        runLabel: serverRunLabel,
+        chromeProfile: serverChromeProfile,
+        reactProfile: await readReactProfileSnapshot(serverPage),
+        historyProfile: null,
+      });
+    } finally {
+      await server.stop();
+    }
+
+    const firstRound = seeded["in-process"].rounds[0];
     const artifactDirectory = await writePerfArtifacts({
       testInfo,
       runLabel,
       chromeProfile,
       reactProfile: reactProfileSnapshot,
-      historyProfile: { small: rounds[0].small.history, large: rounds[0].large.history },
-      chatSwitch: { switches, medians: summarizeChatSwitches(switches) },
+      historyProfile: {
+        small: firstRound.small.history,
+        large: firstRound.large.history,
+        ...(seeded["in-process"].xl ? { xl: seeded["in-process"].xl.history } : {}),
+      },
+      chatSwitch: { switches, ...summarizeChatSwitches(switches) },
     });
     testInfo.annotations.push({ type: "perf-artifact", description: artifactDirectory });
 
     console.log(`[chat-switch] medians\n${renderChatSwitchMarkdownTable(switches)}`);
 
-    const switchBacks = switches.filter((record) => record.targetMidStream);
-    expect(switchBacks).toHaveLength(roundCount * 2);
+    for (const transport of CHAT_SWITCH_TRANSPORTS) {
+      const switchBacks = switches.filter(
+        (record) => record.transport === transport && record.targetMidStream
+      );
+      expect(switchBacks, `${transport} switch-backs`).toHaveLength(
+        roundCount * 2 + (includeXl ? 1 : 0)
+      );
+    }
     for (const record of switches) {
-      const label = `switch #${record.index} (${record.leg})`;
+      const label = `switch #${record.index} (${record.transport} ${record.leg})`;
       expect(record.renderer.caughtUpMs, `${label} reached caught-up`).not.toBeNull();
       expect(record.renderer.caughtUpMs ?? Infinity, label).toBeLessThan(CAUGHT_UP_BUDGET_MS);
       expect(record.server.length, `${label} has a server replay line`).toBeGreaterThan(0);
+      if (record.targetMidStream) {
+        expect(
+          record.renderer.skeletonShownMs !== null,
+          `${label} skeleton shown on mid-stream switch-back`
+        ).toBe(EXPECT_SKELETON_ON_MID_STREAM_SWITCH_BACK);
+      }
     }
-    for (const record of switchBacks) {
-      expect(
-        record.renderer.skeletonShownMs !== null,
-        `switch #${record.index} (${record.leg}) skeleton shown on mid-stream switch-back`
-      ).toBe(EXPECT_SKELETON_ON_MID_STREAM_SWITCH_BACK);
+    // No late duplicate replay arrived after a server-window switch was read.
+    for (const [workspaceId, count] of serverWindowSwitchCounts) {
+      expect(readServerReplays(logsDir, workspaceId), `${workspaceId} replay lines`).toHaveLength(
+        count
+      );
     }
   });
 });

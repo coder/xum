@@ -16,7 +16,7 @@ interface HistoryProfileDefinition {
   largeDiffLinePairs?: number;
 }
 
-const HISTORY_PROFILE_NAMES = [
+const DEFAULT_HISTORY_PROFILE_NAMES = [
   "small",
   "medium",
   "large",
@@ -24,6 +24,10 @@ const HISTORY_PROFILE_NAMES = [
   "reasoning-heavy",
   "large-diff",
 ] as const;
+
+// `xl` is opt-in (explicit XUM_E2E_PERF_PROFILES entry, or perf.chatSwitch.spec.ts's
+// XUM_E2E_CHAT_SWITCH_XL) so the default perf run stays short.
+const HISTORY_PROFILE_NAMES = [...DEFAULT_HISTORY_PROFILE_NAMES, "xl"] as const;
 
 export type HistoryProfileName = (typeof HISTORY_PROFILE_NAMES)[number];
 
@@ -54,6 +58,14 @@ const HISTORY_PROFILES: Record<HistoryProfileName, HistoryProfileDefinition> = {
   },
   large: {
     messagePairs: 90,
+    userChars: 320,
+    assistantChars: 9_500,
+    reasoningChars: 0,
+    toolOutputChars: 0,
+  },
+  // ~2.7 MB of text: a replay crosses the server's 1 MiB WebSocket send window (#4655).
+  xl: {
+    messagePairs: 270,
     userChars: 320,
     assistantChars: 9_500,
     reasoningChars: 0,
@@ -287,7 +299,7 @@ export async function seedWorkspaceHistoryProfile(args: {
 
 export function parseHistoryProfilesFromEnv(rawProfiles: string | undefined): HistoryProfileName[] {
   if (!rawProfiles) {
-    return [...HISTORY_PROFILE_NAMES];
+    return [...DEFAULT_HISTORY_PROFILE_NAMES];
   }
 
   const requestedProfiles = rawProfiles
