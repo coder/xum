@@ -84,6 +84,13 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
 
     await first.release();
     await first.release(); // A second release of one lease must not drop another holder's count.
+    // A concurrent second call awaits the same release instead of returning before it lands.
+    const again = await b.hold(workspaceId, "exec");
+    const racing = again.release();
+    await again.release();
+    expect(b.heldCount(workspaceId, "exec")).toBe(0);
+    expect((await leaseFiles()).some((name) => name.includes(".exec."))).toBe(false);
+    await racing;
     expect(b.heldCount(workspaceId, "turn")).toBe(1);
     expect((await leaseFiles()).length).toBe(2);
 
@@ -152,6 +159,13 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
     await releaseGate(); // Not ours anymore: leaves the dead record alone.
   });
 
+  test("counts of one workspace never include another's, whatever the ids contain", async () => {
+    const lease = await b.hold("a\0b", "turn");
+    expect(b.heldCount("a")).toBe(0);
+    expect(b.heldCount("a\0b")).toBe(1);
+    await lease.release();
+  });
+
   test("workspace ids never escape the lock directories", () => {
     const useParent = path.dirname(workspaceUseLockDir(rootDir, workspaceId));
     const gateParent = path.dirname(workspaceMutationLockPath(rootDir, workspaceId));
@@ -174,6 +188,8 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
       expect(path.dirname(gate)).toBe(gateParent);
       expect(path.basename(gate).length).toBeLessThan(100);
     }
+    // Distinct lone surrogates, which UTF-8 would both encode as U+FFFD.
+    hostileIds.push("\ud800", "\udc00");
     // Distinct ids never share a directory, even on a case-insensitive filesystem.
     const names = new Set(
       [...hostileIds, workspaceId].map((id) => workspaceUseLockDir(rootDir, id).toLowerCase())

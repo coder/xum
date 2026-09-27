@@ -43,7 +43,9 @@ const USE_LOCK_STALE_MS = 5 * 60 * 1000;
 // Always a digest: ids from older builds can contain path separators, be "." or "..", exceed a
 // file name's length, differ only in case (aliases on case-insensitive filesystems) or be
 // reserved names on Windows. Lowercase hex of fixed length is none of these.
-const safeName = (workspaceId: string) => createHash("sha256").update(workspaceId).digest("hex");
+// UTF-16 code units are hashed as-is: UTF-8 would map distinct lone surrogates to one byte string.
+const safeName = (workspaceId: string) =>
+  createHash("sha256").update(Buffer.from(workspaceId, "utf16le")).digest("hex");
 
 /** Directory holding every backend's use-lease files for one workspace. */
 export function workspaceUseLockDir(rootDir: string, workspaceId: string): string {
@@ -66,27 +68,21 @@ interface HeldFile {
 export class WorkspaceUseLeases {
   /** Names this backend's lease files; distinct per instance, so two stacks never share one. */
   readonly instanceToken = randomUUID();
-  private readonly held = new Map<string, HeldFile>();
-  // Serializes each file's 0→1 and 1→0 transitions (they await file I/O).
+  private readonly held = new Map<string, Map<WorkspaceUseKind, HeldFile>>();
+  // Serializes a workspace's 0→1 and 1→0 transitions (they await file I/O).
   private readonly transitions = new MutexMap<string>();
 
   constructor(private readonly rootDir: string) {
     assert(rootDir.length > 0, "WorkspaceUseLeases requires a root directory");
   }
 
-  private key(workspaceId: string, kind: WorkspaceUseKind): string {
-    return `${workspaceId}\0${kind}`;
-  }
-
   /** How many holds this backend has on the workspace (of one kind, or of every kind). */
   heldCount(workspaceId: string, kind?: WorkspaceUseKind): number {
-    if (kind != null) {
-      return this.held.get(this.key(workspaceId, kind))?.count ?? 0;
-    }
+    const files = this.held.get(workspaceId);
+    if (files == null) return 0;
+    if (kind != null) return files.get(kind)?.count ?? 0;
     let total = 0;
-    for (const [key, file] of this.held) {
-      if (key.startsWith(`${workspaceId}\0`)) total += file.count;
-    }
+    for (const file of files.values()) total += file.count;
     return total;
   }
 
@@ -96,9 +92,8 @@ export class WorkspaceUseLeases {
    * must let it abort the activity (never swallow it), or the mutator's scan could miss them.
    */
   async hold(workspaceId: string, kind: WorkspaceUseKind): Promise<WorkspaceUseLease> {
-    const key = this.key(workspaceId, kind);
-    await this.transitions.withLock(key, async () => {
-      const existing = this.held.get(key);
+    await this.transitions.withLock(workspaceId, async () => {
+      const existing = this.held.get(workspaceId)?.get(kind);
       if (existing != null) {
         assert(existing.count > 0, "a tracked use lease file must have holders");
         existing.count++;
@@ -125,24 +120,29 @@ export class WorkspaceUseLeases {
             `try again when it finishes (${gate.why}).`
         );
       }
-      this.held.set(key, { count: 1, release });
+      const files = this.held.get(workspaceId) ?? new Map<WorkspaceUseKind, HeldFile>();
+      files.set(kind, { count: 1, release });
+      this.held.set(workspaceId, files);
     });
 
-    let released = false;
+    // Idempotent, and concurrent callers share (and await) the one release.
+    let releasing: Promise<void> | undefined;
     return {
-      release: async () => {
-        if (released) return;
-        released = true;
-        await this.transitions.withLock(key, async () => {
-          const file = this.held.get(key);
-          assert(file != null && file.count > 0, `use lease ${kind} released more than held`);
+      release: () =>
+        (releasing ??= this.transitions.withLock(workspaceId, async () => {
+          const files = this.held.get(workspaceId);
+          const file = files?.get(kind);
+          assert(
+            files != null && file != null && file.count > 0,
+            `use lease ${kind} over-released`
+          );
           file.count--;
           if (file.count === 0) {
-            this.held.delete(key);
+            files.delete(kind);
+            if (files.size === 0) this.held.delete(workspaceId);
             await file.release();
           }
-        });
-      },
+        })),
     };
   }
 }
