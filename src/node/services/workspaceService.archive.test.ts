@@ -2545,6 +2545,22 @@ describe("WorkspaceService recovers interrupted staged attachment rehydration", 
         name: path.basename(repo),
         archivedAt: "2020-01-01T00:00:00.000Z",
         runtimeConfig,
+        worktreeArchiveSnapshot: {
+          version: 1,
+          capturedAt: "2026-03-30T00:00:00.000Z",
+          stateDirPath: "archive-state",
+          projects: [
+            {
+              projectPath,
+              projectName: "proj",
+              storageKey: "proj",
+              branchName: path.basename(repo),
+              trunkBranch: "main",
+              baseSha: "base-sha",
+              headSha: "head-sha",
+            },
+          ],
+        },
       },
     ]);
     const staged = await stageWorkspaceAttachment({
@@ -2585,6 +2601,21 @@ describe("WorkspaceService recovers interrupted staged attachment rehydration", 
     await harness.service.initialize();
 
     expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("a crash during a keep-policy unarchive does not trigger startup rehydration", async () => {
+    // Archived without a snapshot: restore never touches the checkout, so nothing is pending.
+    await harness.config.editConfig((config) => {
+      const entry = config.projects.get(projectPath)?.workspaces[0];
+      if (entry) delete entry.worktreeArchiveSnapshot;
+      return config;
+    });
+    useRestore(() => Promise.reject(new Error("simulated crash during unarchive")));
+    await harness.service.unarchive(workspaceId).catch(() => undefined);
+
+    await harness.service.initialize();
+
+    expect(await exists(path.join(repo, stagedPath))).toBe(false);
   });
 
   test("startup does not resurrect an upload deleted after a completed unarchive", async () => {

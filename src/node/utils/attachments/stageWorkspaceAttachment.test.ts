@@ -436,7 +436,10 @@ describe("staged attachment session mirror", () => {
       sessionDir,
     });
 
-    expect(result).toEqual({ success: true, data: { restored: [stagedPath], skipped: [] } });
+    expect(result).toEqual({
+      success: true,
+      data: { restored: [stagedPath], skipped: [], failed: [] },
+    });
     expect(await readFile(path.join(repo, stagedPath))).toEqual(bytes);
     const status = execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" });
     expect(status).toBe("");
@@ -502,6 +505,29 @@ describe("staged attachment session mirror", () => {
       []
     );
   });
+
+  test.skipIf(process.getuid?.() === 0)(
+    "rehydration reports write errors as failed so callers can retry",
+    async () => {
+      const { repo, sessionDir, runtime, stagedPath } = await stageInRepo(Buffer.from("ok"));
+      const entryDir = path.dirname(path.join(repo, stagedPath));
+      await rm(path.join(repo, stagedPath));
+      await chmod(entryDir, 0o500);
+      try {
+        const result = await rehydrateStagedWorkspaceAttachments({
+          runtime,
+          workspacePath: repo,
+          sessionDir,
+        });
+        expect(result).toEqual({
+          success: true,
+          data: { restored: [], skipped: [], failed: [stagedPath] },
+        });
+      } finally {
+        await chmod(entryDir, 0o755);
+      }
+    }
+  );
 
   test.skipIf(process.getuid?.() === 0)(
     "an unreadable mirror entry does not block its siblings",

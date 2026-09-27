@@ -475,6 +475,7 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
+const STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS = 10_000;
 
 /**
  * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
@@ -3841,13 +3842,18 @@ export class WorkspaceService
       await this.cleanupOrphanSessionDirs(allMetadata).catch((error: unknown) => {
         log.debug("Failed to clean orphaned session directories", { error });
       });
-      // Before chat recovery below, so a resumed turn already finds its attachments.
-      await this.recoverPendingStagedAttachmentRehydration(allMetadata, options?.signal).catch(
-        (error: unknown) => {
-          log.warn("Failed to recover pending staged attachment rehydration", {
-            error: getErrorMessage(error),
-          });
-        }
+      // Before chat recovery below, so a resumed turn already finds its attachments. Capped like
+      // the .code-workspace sync: a stalled volume must not delay recovery; past the deadline the
+      // sweep keeps running in the background and never rejects.
+      await raceWithAbortAndTimeout(
+        this.recoverPendingStagedAttachmentRehydration(allMetadata, options?.signal).catch(
+          (error: unknown) => {
+            log.warn("Failed to recover pending staged attachment rehydration", {
+              error: getErrorMessage(error),
+            });
+          }
+        ),
+        { signal: options?.signal, timeoutMs: STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS }
       );
       let scheduledCount = 0;
       let skippedTaskCount = 0;
@@ -12944,6 +12950,14 @@ export class WorkspaceService
           skipped: result.data.skipped,
         });
       }
+      if (result.data.failed.length > 0) {
+        // Possibly transient (EACCES, ENOSPC): keep the marker so the next startup retries.
+        log.warn("Failed to restore some staged attachments after snapshot restore", {
+          workspaceId,
+          failed: result.data.failed,
+        });
+        return;
+      }
       await this.clearStagedAttachmentRehydrationPending(workspaceId);
     } catch (error) {
       log.warn("Failed to restore staged attachments after snapshot restore", {
@@ -13018,7 +13032,10 @@ export class WorkspaceService
     workspaceId: string,
     metadata: WorkspaceMetadata
   ): Promise<void> {
-    if (!isWorktreeRuntime(metadata.runtimeConfig)) {
+    // Without a pending snapshot, restore leaves the checkout untouched; a marker there would make
+    // a crash look like a recreated checkout and resurrect deliberately deleted uploads.
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
+    if (!isWorktreeRuntime(metadata.runtimeConfig) || entry?.worktreeArchiveSnapshot == null) {
       return;
     }
     const sessionDir = path.join(this.config.sessionsDir, workspaceId);

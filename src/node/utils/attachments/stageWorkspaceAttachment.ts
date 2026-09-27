@@ -228,11 +228,14 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
   runtime: Runtime;
   workspacePath: string;
   sessionDir: string;
-}): Promise<Result<{ restored: string[]; skipped: string[] }, string>> {
+}): Promise<Result<{ restored: string[]; skipped: string[]; failed: string[] }, string>> {
   try {
     assert(path.isAbsolute(input.workspacePath), "workspacePath must be an absolute host path");
     const restored: string[] = [];
+    // Nothing to do: malformed entries, and paths that already exist in the checkout.
     const skipped: string[] = [];
+    // I/O errors that may be transient; a retry can still restore these.
+    const failed: string[] = [];
     const candidates: string[] = [];
     for (const stagedPath of await listStagedAttachmentMirrorPaths(input.sessionDir)) {
       if (resolveStagedAttachmentMirrorPath(input.sessionDir, stagedPath) == null) {
@@ -242,7 +245,7 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
       }
     }
     if (candidates.length === 0) {
-      return Ok({ restored, skipped });
+      return Ok({ restored, skipped, failed });
     }
 
     const excludeResult = await ensureGitInfoExclude({
@@ -276,16 +279,18 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
         await fsPromises.writeFile(path.join(entryDir, filename), bytes, { flag: "wx" });
         restored.push(stagedPath);
       } catch (error) {
-        if (!isErrnoWithCode(error, "EEXIST")) {
-          log.debug("Skipping unrestorable staged attachment mirror entry", {
-            stagedPath,
-            error: getErrorMessage(error),
-          });
+        if (isErrnoWithCode(error, "EEXIST")) {
+          skipped.push(stagedPath);
+          continue;
         }
-        skipped.push(stagedPath);
+        log.debug("Could not restore staged attachment mirror entry", {
+          stagedPath,
+          error: getErrorMessage(error),
+        });
+        failed.push(stagedPath);
       }
     }
-    return Ok({ restored, skipped });
+    return Ok({ restored, skipped, failed });
   } catch (error) {
     return Err(getErrorMessage(error));
   }
