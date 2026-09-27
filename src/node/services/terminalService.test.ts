@@ -1476,7 +1476,9 @@ describe("TerminalService.openNative", () => {
     it("publishes no lease for an unknown workspace", async () => {
       const unknownId = "ws-native-lease-unknown";
       service = new TerminalService(configWithLeaseWorkspace, mockPTYService, mockSecretsStore);
-      await expect(service.openNative(unknownId)).rejects.toThrow("Workspace not found");
+      let error: unknown;
+      await service.openNative(unknownId).catch((caught: unknown) => (error = caught));
+      expect(String(error)).toContain("Workspace not found");
       expect(
         await fs.access(workspaceUseLockDir(leaseRoot, unknownId)).then(
           () => true,

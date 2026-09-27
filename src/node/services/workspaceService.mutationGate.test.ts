@@ -573,10 +573,9 @@ describe("structural workspace mutations across two backends on one root", () =>
     expect(await a.workspaceService.recordExternalEditorOpenForLaunch(rootId)).toMatchObject({
       success: true,
     });
-    expect(during.map(errorOf)).toEqual([
-      expect.stringContaining("an external editor is being opened"),
-      expect.stringContaining("an external editor is being opened"),
-    ]);
+    expect(during).toHaveLength(2);
+    for (const result of during)
+      expect(errorOf(result)).toContain("an external editor is being opened");
     expect(renameWorkspace).not.toHaveBeenCalled();
     expect(deleteWorkspace).not.toHaveBeenCalled();
 
@@ -604,11 +603,14 @@ describe("structural workspace mutations across two backends on one root", () =>
         throw new Error("stop the open before it launches a terminal");
       });
 
-    await expect(terminalService.openNative(rootId)).rejects.toThrow("stop the open");
-    expect(during.map(errorOf)).toEqual([
-      expect.stringContaining("a native terminal is being opened"),
-      expect.stringContaining("a native terminal is being opened"),
-    ]);
+    const opened = await terminalService.openNative(rootId).then(
+      () => "opened",
+      (error: unknown) => String(error)
+    );
+    expect(opened).toContain("stop the open");
+    expect(during).toHaveLength(2);
+    for (const result of during)
+      expect(errorOf(result)).toContain("a native terminal is being opened");
     expect(renameWorkspace).not.toHaveBeenCalled();
     expect(deleteWorkspace).not.toHaveBeenCalled();
     expect(rowOf(a.config, rootId)).toBeDefined();
