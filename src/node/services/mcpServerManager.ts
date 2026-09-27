@@ -6127,6 +6127,9 @@ export class MCPServerManager {
       );
 
       const cleanupSpawnedExecStream = async () => {
+        // The launch fence stops forwarding the startup signal once it returns, so kill the
+        // process explicitly: closing stdio alone leaves a server that ignores EOF running.
+        processAbort.abort();
         try {
           await execStream.stdin.close();
         } catch (error) {

@@ -2438,9 +2438,6 @@ export class WorkspaceService
   // runtime (which can re-wake a stopped Coder workspace) and starts cached stdio servers inside
   // the checkout. See acquireMcpPromptDiscoveryAdmission.
   private readonly preflightMcpPromptDiscoveryCounts = new Map<string, number>();
-  // Bumped when a removal stops servers while discoveries are admitted (#4760); see
-  // acquireMcpPromptDiscoveryAdmission. Dropped when the workspace's last discovery settles.
-  private readonly mcpPromptDiscoveryRemovalEpochs = new Map<string, number>();
   /**
    * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
    * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
@@ -6839,14 +6836,6 @@ export class WorkspaceService
         // force=false deletion that fails below keeps the workspace with these already stopped,
         // which is recoverable (MCP servers restart on demand), unlike a process outliving its
         // checkout.
-        // Flag admitted MCP prompt discoveries only here, past the refusal gates: a refused
-        // removal must not make them stop the servers of a workspace that stays (#4760).
-        if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
-          this.mcpPromptDiscoveryRemovalEpochs.set(
-            workspaceId,
-            (this.mcpPromptDiscoveryRemovalEpochs.get(workspaceId) ?? 0) + 1
-          );
-        }
         await this.mcpServerManager?.stopServers(workspaceId);
         this.terminalService?.closeWorkspaceSessions(workspaceId);
         await this.backgroundProcessManager.cleanup(workspaceId);
@@ -12466,14 +12455,10 @@ export class WorkspaceService
    * admitted first holds the archive gate open until the caller disposes the admission, and one
    * entering after the gate armed (or against an archived workspace) is refused with undefined.
    *
-   * Removal (#4760) refuses new discoveries too, but does not wait for admitted ones: removal's
-   * stopServers can run before an admitted discovery publishes its servers, so the discovery
-   * reads removalStarted (set when removal stops servers) after startup and stops what it
-   * started.
+   * Removal refuses new discoveries too (#4760). A discovery admitted before the removal
+   * started is not joined; that remaining window is tracked as a follow-up.
    */
-  acquireMcpPromptDiscoveryAdmission(
-    workspaceId: string
-  ): (Disposable & { readonly removalStarted: boolean }) | undefined {
+  acquireMcpPromptDiscoveryAdmission(workspaceId: string): Disposable | undefined {
     if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
       return undefined;
     }
@@ -12487,19 +12472,7 @@ export class WorkspaceService
     ) {
       return undefined;
     }
-    const counts = this.preflightMcpPromptDiscoveryCounts;
-    const epochs = this.mcpPromptDiscoveryRemovalEpochs;
-    const admission = this.acquirePreflightAdmission(counts, workspaceId);
-    const removalEpoch = epochs.get(workspaceId) ?? 0;
-    return {
-      get removalStarted() {
-        return (epochs.get(workspaceId) ?? 0) !== removalEpoch;
-      },
-      [Symbol.dispose]: () => {
-        admission[Symbol.dispose]();
-        if (!counts.has(workspaceId)) epochs.delete(workspaceId);
-      },
-    };
+    return this.acquirePreflightAdmission(this.preflightMcpPromptDiscoveryCounts, workspaceId);
   }
 
   async stageAttachment(input: {

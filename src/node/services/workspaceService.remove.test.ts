@@ -509,10 +509,9 @@ describe("WorkspaceService remove shared-workspace guard", () => {
     }
   });
 
-  // #4760: MCP prompt discovery starts stdio servers in the checkout. Removal refuses new
-  // discoveries, and one admitted before it learns (even after the removal finished) that it
-  // must tear down what it started instead of publishing it.
-  test("refuses MCP prompt discovery during removal and flags discoveries it spans", async () => {
+  // #4760: MCP prompt discovery starts stdio servers in the checkout, so a removal refuses
+  // new discoveries while it runs.
+  test("refuses MCP prompt discovery while a removal runs", async () => {
     const { createRuntimeSpy } = mockDeleteWorkspace();
     try {
       await using harness = await createChildHarness(undefined);
@@ -524,23 +523,10 @@ describe("WorkspaceService remove shared-workspace guard", () => {
         }),
       } as unknown as MCPServerManager);
 
-      using spanning = harness.service.acquireMcpPromptDiscoveryAdmission(workspaceId);
-      expect(spanning?.removalStarted).toBe(false);
-
-      // A removal refused by an early gate leaves the workspace and its servers alone.
-      let refuse = true;
-      harness.service.setAgentTaskIntegration(
-        makeAgentTaskIntegrationFake({ hasDescendantAgentTasks: () => refuse })
-      );
-      expect((await harness.service.remove(workspaceId, true)).success).toBe(false);
-      expect(spanning?.removalStarted).toBe(false);
-      refuse = false;
-
       const result = await harness.service.remove(workspaceId, true);
 
       expect(result.success).toBe(true);
       expect(admittedDuringRemoval).toBeUndefined();
-      expect(spanning?.removalStarted).toBe(true);
     } finally {
       createRuntimeSpy.mockRestore();
     }

@@ -235,8 +235,7 @@ describe("TerminalService", () => {
     const spawnStartedPromise = new Promise<void>((resolve) => {
       spawnStarted = resolve;
     });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (mockPTYService.createSession as any) = mock(async (params: TerminalCreateParams) => {
+    (mockPTYService.createSession as unknown) = mock(async (params: TerminalCreateParams) => {
       spawnStarted();
       await spawnGate;
       return { sessionId: "session-spanning", workspaceId: params.workspaceId, cols: 80, rows: 24 };

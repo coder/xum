@@ -75,9 +75,10 @@ export class MCPStdioTransport implements Transport {
     // and kill a server that ignores EOF, so none outlives the checkout.
     const kill = this.options?.kill;
     if (kill === undefined) return;
+    // A rejected exit observation (e.g. a child-process error) does not prove the tree exited.
     const exited = await raceWithAbortAndTimeout(this.exitPromise, {
       timeoutMs: MCP_STDIO_EXIT_GRACE_MS,
-    }).catch(() => ({ kind: "ok" as const }));
+    }).catch(() => ({ kind: "rejected" as const }));
     if (exited.kind === "ok") return;
     kill();
     await raceWithAbortAndTimeout(this.exitPromise, { timeoutMs: MCP_STDIO_KILL_JOIN_MS }).catch(
