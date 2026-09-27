@@ -40,8 +40,9 @@ export interface WorkspaceUseLease {
 /** Renewal cadence for the lock kit only (new locks: no older build reclaims them by age). */
 const USE_LOCK_STALE_MS = 5 * 60 * 1000;
 
-// Workspace ids from older builds could contain path separators; encode so none escapes.
-const safeName = (workspaceId: string) => encodeURIComponent(workspaceId);
+// Workspace ids from older builds could contain path separators, or be "." or "..": encode
+// separators and dots (encodeURIComponent keeps dots) so every id names its own entry.
+const safeName = (workspaceId: string) => encodeURIComponent(workspaceId).replace(/\./g, "%2E");
 
 /** Directory holding every backend's use-lease files for one workspace. */
 export function workspaceUseLockDir(rootDir: string, workspaceId: string): string {
