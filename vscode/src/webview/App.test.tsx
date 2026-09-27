@@ -634,6 +634,20 @@ describe("vscode webview policy-excluded model", () => {
     expect(bridge.orpcCalls("workspace.sendMessage")).toHaveLength(0);
   });
 
+  test("still runs the local /vim command when the policy allows no listed model", async () => {
+    const { view } = await renderWithPolicy(
+      enforcedPolicy([{ id: "openai", allowedModels: ["not-a-listed-model"] }])
+    );
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    await typeInto(textarea, "/vim");
+    await act(async () => {
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      await Promise.resolve();
+    });
+    expect(view.getByText("Vim mode enabled.")).toBeDefined();
+  });
+
   test("keeps an allowed selection unchanged", async () => {
     const { bridge, view } = await renderWithPolicy(
       enforcedPolicy([{ id: "anthropic", allowedModels: null }])
