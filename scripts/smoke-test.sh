@@ -132,6 +132,22 @@ fi
 
 log_info "✅ Package installed successfully"
 
+# Bun-managed servers stage updates by installing the downloaded tarball with this command
+# (installCommand in src/node/services/serverUpdate/staging.ts), and bun honors manifest fields npm
+# ignores. bun also ignores npm-shrinkwrap.json, so the no-shrinkwrap pass would only repeat this.
+if [[ "$SKIP_SHRINKWRAP" != "1" ]]; then
+  log_info "Installing package with bun like the server updater..."
+  BUN_INSTALL_DIR="$TEST_DIR/bun-install"
+  mkdir "$BUN_INSTALL_DIR"
+  echo '{"private":true}' >"$BUN_INSTALL_DIR/package.json"
+  if ! (cd "$BUN_INSTALL_DIR" && "$SCRIPT_DIR/retry.sh" 5 60 bun add --ignore-scripts --save-text-lockfile \
+    "$PACKAGE_TARBALL" --registry "${npm_config_registry:-https://registry.npmjs.org}"); then
+    log_error "bun failed to install the package the way the server updater does"
+    exit 1
+  fi
+  log_info "✅ Package installed with bun"
+fi
+
 # Verify both the canonical binary and downgrade-compatible alias are available.
 for binary in xum mux; do
   if [[ ! -f "node_modules/.bin/$binary" ]]; then

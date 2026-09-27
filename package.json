@@ -255,7 +255,6 @@
     "dist/**/*.json",
     "dist/**/*.png",
     "dist/assets/**/*",
-    "patches/**/*",
     "npm-shrinkwrap.json",
     "README.md",
     "LICENSE"
