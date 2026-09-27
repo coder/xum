@@ -1,6 +1,7 @@
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
+import cjsFs from "fs";
 import * as os from "os";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
@@ -3162,6 +3163,45 @@ exit 1
       if (result.success) throw new Error("Expected failure");
       expect(result.error).toContain("Failed to create project");
     });
+
+    // #4746: secrets are irreversible, so they may only be deleted after the config
+    // write that forgets the project lands. A failed write must leave both intact.
+    for (const kind of ["sub-project", "project"] as const) {
+      it(`keeps ${kind} secrets when the removal's config write fails`, async () => {
+        const parentPath = "/fake/parent";
+        const childPath = "/fake/parent/packages/api";
+        const targetPath = kind === "sub-project" ? childPath : parentPath;
+        const cfg = config.loadConfigOrDefault();
+        cfg.projects.set(parentPath, { workspaces: [] });
+        cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        await config.editConfig(() => cfg);
+        const secret = { key: "TOKEN", value: "kept" };
+        expect((await service.updateSecrets(targetPath, [secret])).success).toBe(true);
+
+        const realRename = cjsFs.rename.bind(cjsFs);
+        const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+          from: cjsFs.PathLike,
+          to: cjsFs.PathLike,
+          callback: cjsFs.NoParamCallback
+        ) => {
+          if (path.basename(String(to)) === "config.json") {
+            callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+            return;
+          }
+          realRename(from, to, callback);
+        }) as typeof cjsFs.rename);
+        let result: Awaited<ReturnType<ProjectService["remove"]>>;
+        try {
+          result = await service.remove(targetPath);
+        } finally {
+          renameSpy.mockRestore();
+        }
+
+        expect(result.success).toBe(false);
+        expect(config.loadConfigOrDefault().projects.has(targetPath)).toBe(true);
+        expect(service.getSecrets(targetPath)).toEqual([secret]);
+      });
+    }
 
     it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import cjsFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -159,6 +160,22 @@ async function writeWorkspaceBranchMap(
     `${JSON.stringify(branchMap, null, 2)}\n`,
     "utf-8"
   );
+}
+
+/** Makes config saves reject by failing the atomic rename onto config.json. */
+function failConfigPublish() {
+  const realRename = cjsFs.rename.bind(cjsFs);
+  return spyOn(cjsFs, "rename").mockImplementation(((
+    from: cjsFs.PathLike,
+    to: cjsFs.PathLike,
+    callback: cjsFs.NoParamCallback
+  ) => {
+    if (path.basename(String(to)) === "config.json") {
+      callback(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+      return;
+    }
+    realRename(from, to, callback);
+  }) as typeof cjsFs.rename);
 }
 
 describe("WorktreeArchiveSnapshotService", () => {
@@ -885,7 +902,7 @@ describe("WorktreeArchiveSnapshotService", () => {
     expect(await pathExists(fixture.workspacePath)).toBe(false);
   });
 
-  test("preserves snapshot metadata when artifact cleanup fails after a successful restore", async () => {
+  test("clears snapshot metadata and orphans the artifacts when artifact cleanup fails after a successful restore", async () => {
     await makeWorkspaceDirty(fixture);
 
     const captureResult = await fixture.service.captureSnapshotForArchive({
@@ -930,7 +947,7 @@ describe("WorktreeArchiveSnapshotService", () => {
       expect(
         fixture.config.loadConfigOrDefault().projects.get(fixture.projectPath)?.workspaces[0]
           ?.worktreeArchiveSnapshot
-      ).toEqual(captureResult.data);
+      ).toBeUndefined();
       expect(
         await pathExists(
           path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
@@ -1008,7 +1025,9 @@ describe("WorktreeArchiveSnapshotService", () => {
     ).toBeUndefined();
   });
 
-  test("keeps the restored worktree when snapshot-state writeback fails", async () => {
+  // #4746: the pointer is cleared before the artifacts are deleted, so a failed write
+  // keeps both and config never points at a deleted snapshot.
+  test("keeps the restored worktree and the snapshot artifacts when snapshot-state writeback fails", async () => {
     await makeWorkspaceDirty(fixture);
 
     const captureResult = await fixture.service.captureSnapshotForArchive({
@@ -1031,10 +1050,7 @@ describe("WorktreeArchiveSnapshotService", () => {
 
     runGit(fixture.projectPath, ["worktree", "remove", "--force", fixture.workspacePath]);
 
-    const originalEditConfig = fixture.config.editConfig.bind(fixture.config);
-    const editConfigSpy = spyOn(fixture.config, "editConfig").mockImplementation((_mutate) =>
-      Promise.reject(new Error("config writeback failed"))
-    );
+    const renameSpy = failConfigPublish();
 
     try {
       const restoreResult = await fixture.service.restoreSnapshotAfterUnarchive({
@@ -1051,10 +1067,9 @@ describe("WorktreeArchiveSnapshotService", () => {
         await pathExists(
           path.join(fixture.config.sessionsDir, fixture.workspaceId, "archive-state")
         )
-      ).toBe(false);
+      ).toBe(true);
     } finally {
-      editConfigSpy.mockRestore();
-      fixture.config.editConfig = originalEditConfig;
+      renameSpy.mockRestore();
     }
   });
 

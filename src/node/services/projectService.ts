@@ -1396,11 +1396,6 @@ export class ProjectService {
       }
 
       if (projectConfig.parentProjectPath) {
-        try {
-          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
-        } catch (error) {
-          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
-        }
         // Mutate inside the serialized editConfig transform, re-resolving the sub-project
         // and its parent from FRESH config: persisting the pre-read snapshot would clobber
         // concurrent config edits (e.g. resurrect concurrently removed workspaces).
@@ -1418,6 +1413,14 @@ export class ProjectService {
           freshConfig.projects.delete(normalizedPath);
           return freshConfig;
         });
+        // Delete secrets only after the config write lands (#4746): a rejected write
+        // must not leave the sub-project configured without its secrets. A failed
+        // delete here only orphans the secrets file entry.
+        try {
+          await this.secretsStore.updateProjectSecrets(normalizedPath, []);
+        } catch (error) {
+          log.error(`Failed to clean up secrets for sub-project ${normalizedPath}:`, error);
+        }
         this.mcpServerManager?.forgetProjectTrust(normalizedPath);
         return Ok(undefined);
       }
@@ -1514,6 +1517,9 @@ export class ProjectService {
           }
         }
 
+        // Each WorkspaceService.remove records its own removal durably before deleting
+        // (pendingRemoval marker) and drops its config row, so a later failure leaves the
+        // project configured with only the workspaces that still exist (#4746).
         for (const workspace of orderWorkspacesForCascadeRemoval(projectConfig.workspaces)) {
           // Legacy workspace entries can be missing `id`. Resolve through metadata so
           // WorkspaceService.remove() receives the canonical workspace ID (it cannot remove by path).
