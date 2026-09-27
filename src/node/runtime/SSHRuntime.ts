@@ -39,6 +39,7 @@ import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import {
   type SSHRuntimeConfig,
   getControlPath,
@@ -1101,7 +1102,12 @@ export class SSHRuntime extends RemoteRuntime {
   }
 
   override isTransportFailureExit(exitCode: number, stderr: string): boolean {
-    return this.transport.isConnectionFailure(exitCode, stderr);
+    // A probe that hit its own client-side deadline proved nothing about the
+    // file: a stalled link (docker pause, dead peer before keepalives notice)
+    // reaches the 5–10 s probe deadlines first (#4825). The callers of this
+    // hook are trivial non-login primitives (cat, stat, find, mv); resolvePath
+    // runs a slow `bash -lc` login shell and deliberately does not use it.
+    return exitCode === EXIT_CODE_TIMEOUT || this.transport.isConnectionFailure(exitCode, stderr);
   }
 
   protected async spawnRemoteProcess(
@@ -1815,6 +1821,16 @@ export class SSHRuntime extends RemoteRuntime {
       const errorDetail = stderr || stdout || "git unavailable";
       const isCommandMissing =
         verifyResult.exitCode === 127 || /command not found/i.test(stderr || stdout);
+
+      // A stall that hits the verify deadline is not a missing repository:
+      // keep it retryable instead of a permanent runtime_not_ready (#4825).
+      if (verifyResult.exitCode === EXIT_CODE_TIMEOUT) {
+        return {
+          ready: false,
+          error: "Failed to reach SSH host: repository check timed out",
+          errorType: "runtime_start_failed",
+        };
+      }
 
       if (this.transport.isConnectionFailure(verifyResult.exitCode, verifyResult.stderr)) {
         return {

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { EventEmitter } from "events";
 import { PassThrough } from "stream";
+import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { type ExecOptions, type ExecStream, isRuntimeTransportError } from "./Runtime";
 import { ssh2ConnectionPool } from "./SSH2ConnectionPool";
 import { SSHRuntime } from "./SSHRuntime";
@@ -46,7 +47,10 @@ async function failures(runtime: Probed, withResolve: boolean): Promise<unknown[
 }
 
 class StubbedSSHRuntime extends SSHRuntime {
-  constructor(private readonly result: [stderr: string, exitCode: number]) {
+  constructor(
+    private readonly result: [stderr: string, exitCode: number],
+    workspace?: { projectPath: string; workspaceName: string }
+  ) {
     const config: SSHRuntimeConfig = { host: "example.test", srcBaseDir: "/remote/src" };
     // OpenSSH semantics: exit 255 is the ssh client's own connection failure.
     const transport: SSHTransport = {
@@ -56,7 +60,7 @@ class StubbedSSHRuntime extends SSHRuntime {
       spawnRemoteProcess: () => Promise.reject(new Error("exec is stubbed")),
       createPtySession: () => Promise.reject(new Error("no PTY here")),
     };
-    super(config, transport);
+    super(config, transport, workspace);
   }
 
   override exec(_command: string, _options: ExecOptions): Promise<ExecStream> {
@@ -197,5 +201,28 @@ describe("SSH2 channel failures after acquisition (#4835)", () => {
     }, controller.signal);
     expect(errors.every((error) => error instanceof Error)).toBe(true);
     expect(errors.map(isRuntimeTransportError)).toEqual([false, false]);
+  });
+});
+
+// #4825: a probe that hit its own client-side deadline proved nothing about the
+// file. A stalled SSH link (e.g. `docker pause` on sshd) reaches the 10 s stat
+// deadline before keepalives notice the dead peer, so trivial non-login probes
+// must not read it as "missing" and ensureReady must stay retryable.
+describe("client-side probe timeouts on SSH (#4825)", () => {
+  it("marks timed-out reads and stats as transport, but not login-shell path resolution", async () => {
+    // resolvePath runs `bash -lc`: slow login shells must keep failing as a
+    // plain resolution error, not a transport outage on every turn.
+    const errors = await failures(new StubbedSSHRuntime(["", EXIT_CODE_TIMEOUT]), true);
+    expect(errors.map(isRuntimeTransportError)).toEqual([true, true, false]);
+  });
+
+  it("reports a timed-out repository check as a retryable start failure", async () => {
+    const workspace = { projectPath: "/local/project", workspaceName: "feature" };
+    const timedOut = await new StubbedSSHRuntime(["", EXIT_CODE_TIMEOUT], workspace).ensureReady();
+    expect(timedOut).toMatchObject({ ready: false, errorType: "runtime_start_failed" });
+
+    // A real missing checkout stays permanent.
+    const missing = await new StubbedSSHRuntime(["missing .git", 10], workspace).ensureReady();
+    expect(missing).toMatchObject({ ready: false, errorType: "runtime_not_ready" });
   });
 });
