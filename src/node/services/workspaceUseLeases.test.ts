@@ -155,19 +155,28 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
   test("workspace ids never escape the lock directories", () => {
     const useParent = path.dirname(workspaceUseLockDir(rootDir, workspaceId));
     const gateParent = path.dirname(workspaceMutationLockPath(rootDir, workspaceId));
-    const hostileIds = ["../../etc/passwd", ".", "..", "%".repeat(300), "x".repeat(300)];
+    const hostileIds = [
+      "../../etc/passwd",
+      ".",
+      "..",
+      "%".repeat(300),
+      "x".repeat(300),
+      "CON",
+      "Foo",
+      "foo",
+    ];
     for (const hostile of hostileIds) {
       const useDir = workspaceUseLockDir(rootDir, hostile);
       expect(path.dirname(useDir)).toBe(useParent);
-      expect(path.basename(useDir)).not.toMatch(/^\.+$/);
+      expect(path.basename(useDir)).toMatch(/^[0-9a-f]{64}$/);
       expect(path.basename(useDir).length).toBeLessThan(100);
       const gate = workspaceMutationLockPath(rootDir, hostile);
       expect(path.dirname(gate)).toBe(gateParent);
       expect(path.basename(gate).length).toBeLessThan(100);
     }
-    // Distinct ids never share a directory.
+    // Distinct ids never share a directory, even on a case-insensitive filesystem.
     const names = new Set(
-      [...hostileIds, workspaceId].map((id) => workspaceUseLockDir(rootDir, id))
+      [...hostileIds, workspaceId].map((id) => workspaceUseLockDir(rootDir, id).toLowerCase())
     );
     expect(names.size).toBe(hostileIds.length + 1);
   });

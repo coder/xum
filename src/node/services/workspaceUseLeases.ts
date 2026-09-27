@@ -40,13 +40,10 @@ export interface WorkspaceUseLease {
 /** Renewal cadence for the lock kit only (new locks: no older build reclaims them by age). */
 const USE_LOCK_STALE_MS = 5 * 60 * 1000;
 
-// Workspace ids from older builds can contain path separators, be "." or "..", or be longer than
-// a file name may be. Such ids get a bounded digest name; "~" never occurs in a kept id, so the
-// two forms cannot collide.
-const safeName = (workspaceId: string) =>
-  /^[A-Za-z0-9_-]{1,64}$/.test(workspaceId)
-    ? workspaceId
-    : `~${createHash("sha256").update(workspaceId).digest("hex")}`;
+// Always a digest: ids from older builds can contain path separators, be "." or "..", exceed a
+// file name's length, differ only in case (aliases on case-insensitive filesystems) or be
+// reserved names on Windows. Lowercase hex of fixed length is none of these.
+const safeName = (workspaceId: string) => createHash("sha256").update(workspaceId).digest("hex");
 
 /** Directory holding every backend's use-lease files for one workspace. */
 export function workspaceUseLockDir(rootDir: string, workspaceId: string): string {
