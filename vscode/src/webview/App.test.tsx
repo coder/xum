@@ -533,4 +533,24 @@ describe("vscode webview agent lookup", () => {
     expect(lookups).toHaveLength(1);
     expect(lookups[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
   });
+
+  test("looks up agents again when the connection recovers from file mode (#4797)", async () => {
+    const bridge = new TestBridge();
+    render(<App bridge={bridge} />);
+    // File mode still lists workspaces from local files, but the host rejects agents.list without a
+    // server connection, so the webview must not spend its lookup there.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "file", error: "offline" } });
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    const fileModeLookups = bridge.orpcCalls("agents.list").length;
+    expect(fileModeLookups).toBe(0);
+
+    // Recovery refreshes the same list and selection; only the connection mode changes.
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
+    const recoveryLookups = bridge.orpcCalls("agents.list").slice(fileModeLookups);
+    expect(recoveryLookups).toHaveLength(1);
+    expect(recoveryLookups[0].input).toMatchObject({ workspaceId: WORKSPACE.id });
+  });
 });

@@ -581,8 +581,14 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                   // Scope agent state (and its agents.list lookup) to the selected workspace only
                   // once the extension has listed it: on a fresh extension host the restored
                   // selection arrives before the list, and the host rejects lookups for workspaces
-                  // it has not sent (#4751).
-                  workspaceId={selectedWorkspace ? selectedWorkspace.id : undefined}
+                  // it has not sent (#4751). It also requires a server connection: file mode lists
+                  // workspaces but the host rejects agents.list there, and a recovery that keeps
+                  // the same selection must change this prop so the lookup runs again (#4797).
+                  workspaceId={
+                    selectedWorkspace && connectionStatus?.mode === "api"
+                      ? selectedWorkspace.id
+                      : undefined
+                  }
                   workspaceAi={selectedWorkspace?.ai}
                 >
                   <div className="flex h-screen flex-col">
