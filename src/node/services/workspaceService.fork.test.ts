@@ -461,7 +461,12 @@ describe("WorkspaceService fork", () => {
         getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
       }),
     });
-    const deleteWorkspace = mock(() => Promise.resolve({ success: true as const }));
+    let initSignal: AbortSignal | undefined;
+    const initAbortedAtDelete: boolean[] = [];
+    const deleteWorkspace = mock(() => {
+      initAbortedAtDelete.push(initSignal?.aborted === true);
+      return Promise.resolve({ success: true as const });
+    });
     const targetRuntime = {
       getWorkspacePath: mock(() => forkedWorkspacePath),
       deleteWorkspace,
@@ -470,7 +475,10 @@ describe("WorkspaceService fork", () => {
     spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
+    spyOn(runtimeFactory, "runBackgroundInit").mockImplementation((_runtime, params) => {
+      initSignal = params.abortSignal;
+      return Promise.resolve(undefined);
+    });
     spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockRejectedValue(
       new RuntimeError("ssh: connect to host dev port 22: Connection refused", "network")
     );
@@ -491,7 +499,8 @@ describe("WorkspaceService fork", () => {
       expect(result.success).toBe(false);
       if (result.success) throw new Error("expected the fork to fail");
       expect(result.error).toContain("Connection refused");
-      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      // Init is aborted before its checkout is deleted.
+      expect(initAbortedAtDelete).toEqual([true]);
     } finally {
       mock.restore();
     }

@@ -8781,8 +8781,10 @@ export class WorkspaceService
       await this.syncCodeWorkspaceFiles(updatedMetadata);
 
       if (planMoveError !== undefined) {
+        // Retrying this rename is a no-op (the name already matches), but renaming back to the old
+        // name finds the plan there again: movePlanFile skips a missing source.
         return Err(
-          `Workspace renamed to "${newName}", but its plan file could not be moved from "${oldName}": ${planMoveError}`
+          `Workspace renamed to "${newName}", but its plan file could not be moved from "${oldName}": ${planMoveError}. The plan is still under the old name; rename the workspace back to "${oldName}" to use it again.`
         );
       }
       return Ok({ newWorkspaceId: workspaceId });
@@ -11830,6 +11832,10 @@ export class WorkspaceService
           projectName
         );
       } catch (copyError) {
+        // Same ordering as abortForkRegistration below: background init still runs against this
+        // checkout, so abort it and AWAIT termination before deleting the worktree.
+        initAbortController.abort();
+        await initSettled;
         const forkTrusted = projectConfig.trusted ?? false;
         await targetRuntime.deleteWorkspace(
           foundProjectPath,
