@@ -30,7 +30,9 @@ const freshProbe = () => ({ resetProbe: "", resetStage: 0 as const, possibleRese
 
 /** The row's bytes cut at up to two random points, in arrival (reverse file) order. */
 function segmentsOf(bytes: Buffer, random: () => number): Buffer[] {
-  const cuts = [random(), random()].map((r) => Math.floor(r * (bytes.length + 1))).sort();
+  const cuts = [random(), random()]
+    .map((r) => Math.floor(r * (bytes.length + 1)))
+    .sort((a, b) => a - b);
   return [bytes.subarray(cuts[1]), bytes.subarray(cuts[0], cuts[1]), bytes.subarray(0, cuts[0])];
 }
 

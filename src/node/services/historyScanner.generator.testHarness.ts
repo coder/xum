@@ -177,7 +177,7 @@ export const RESET_ENCODINGS = [
 ];
 /** Near misses: a key or value alone, and the tokens in the wrong order. */
 const RESET_NEAR_MISSES = ['"contextBoundaryKind"', '"reset" : "contextBoundaryKind"'];
-// Same order as the original single list, so seeded layouts keep drawing the same encodings.
+// Seeded layouts pick by index, so reordering this list changes which encoding each seed draws.
 const ENCODING_CHOICES = [...RESET_ENCODINGS, ...RESET_NEAR_MISSES];
 
 /** historyReplacementRows.test.ts's per-character mixer, driven by the layout's seed. */
