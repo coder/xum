@@ -695,6 +695,7 @@ export class TokenBudgetStrategy {
           toolResultChars: step.toolResultChars,
           imageParts: step.imageParts,
           toolResultTokens: step.toolResultTokens,
+          nextRequestTokens: step.nextRequestTokens,
           modelContextLimit: maxTokens,
           threshold,
           warningEmitted: this.contextBudgetWarningClaimed,

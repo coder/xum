@@ -3,6 +3,7 @@ import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget"
 import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
 import {
   checkAssembledRequestBudgetForModel,
+  estimateAssembledRequestTokensForModel,
   estimateToolResultTokensForModel,
 } from "./contextBudgetCounting";
 import {
@@ -280,6 +281,11 @@ export interface SettledStepBudget {
   toolResultChars: number;
   imageParts: number;
   toolResultTokens?: number;
+  /**
+   * Assembled estimate of the next step's provider request, computed exactly as that step's
+   * preflight will compute it. Absent when no context budget applies.
+   */
+  nextRequestTokens?: number;
   sessionHistoryAvailable: boolean;
   memoryWritable: boolean;
   /** A successful `new_context` result settled in this step (its siblings included). */
@@ -385,6 +391,23 @@ function publishLiveRouting(streamInfo: WorkspaceStreamInfo): void {
     thinkingLevel: coerceThinkingLevel(streamInfo.thinkingLevel),
     autoModelRouting,
   });
+}
+
+/**
+ * Same-turn message transforms applied before every provider step: strip workflow run records
+ * from same-turn tool results (history-level redaction in applyToolOutputRedaction can't see
+ * these), neutralize protocol-envelope lookalikes in same-turn tool inputs/results
+ * (messagePipeline's neutralizer only sees persisted history), then extract supported
+ * attachments out of tool-result JSON so providers don't treat them as text. Idempotent on an
+ * already-transformed prefix. The settled-step budget floor reuses it so it measures exactly the
+ * request the next step's preflight will check.
+ */
+function transformStepMessages(messages: ModelMessage[]): Promise<ModelMessage[]> {
+  return extractToolMediaAsUserMessagesFromModelMessages(
+    neutralizeAgentEnvelopeLookalikesInModelToolParts(
+      stripWorkflowRunRecordsFromModelMessages(messages)
+    )
+  );
 }
 
 interface StepMessageTracker {
@@ -2533,7 +2556,12 @@ export class StreamManager {
       | "tools"
       | "contextBudgetMemoryWritable"
       | "budgetMetadataModel"
-    >
+      | "contextBudgetLimit"
+      | "system"
+      | "messages"
+      | "toolSearchState"
+    >,
+    stepTracker?: StepMessageTracker
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
     // success/ok markers (agent_report, propose_plan).
@@ -2598,12 +2626,42 @@ export class StreamManager {
             model: request.modelString,
             metadataModel: request.budgetMetadataModel,
           });
+          // The next step's preflight hard-stops on the assembled estimate, which can exceed
+          // provider-reported usage by ~10% (#4855). Measure that same request here so the
+          // budget decision can roll over before the preflight blocks. Invariant: this measure
+          // is never below the one prepareStep will enforce for the next step. The SDK builds
+          // the next input as this step's input plus its response messages.
+          const nextRequestTokens =
+            request.contextBudgetLimit == null
+              ? undefined
+              : (
+                  await estimateAssembledRequestTokensForModel(
+                    {
+                      system: request.system,
+                      messages: await transformStepMessages([
+                        ...(stepTracker?.latestMessages ?? [
+                          ...request.messages,
+                          ...steps.slice(0, -1).flatMap((prior) => prior.response.messages),
+                        ]),
+                        ...step.response.messages,
+                      ]),
+                      tools: request.tools,
+                    },
+                    {
+                      model: request.modelString,
+                      metadataModel: request.budgetMetadataModel,
+                      modelContextLimit: request.contextBudgetLimit,
+                      activeTools: computeActiveToolNames(request.toolSearchState),
+                    }
+                  )
+                )?.estimate;
           const { decision, continuationEntryId } = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
             providerMetadata: step.providerMetadata,
             ...size,
             toolResultTokens,
+            ...(nextRequestTokens != null ? { nextRequestTokens } : {}),
             sessionHistoryAvailable: request.tools?.session_history != null,
             memoryWritable: request.contextBudgetMemoryWritable === true,
             newContextRequested: step.toolResults.some(
@@ -2791,16 +2849,7 @@ export class StreamManager {
       abortSignal: abortController.signal,
       prepareStep: async ({ messages: stepMessages, stepNumber }) => {
         // streamText runs multiple internal LLM calls (steps) when tools are enabled.
-        // Strip workflow run records from same-turn tool results (history-level redaction in
-        // applyToolOutputRedaction can't see these), neutralize protocol-envelope lookalikes in
-        // same-turn tool inputs/results (messagePipeline's neutralizer only sees persisted
-        // history), then extract supported attachments out of tool-result JSON so providers
-        // don't treat them as text.
-        const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(
-          neutralizeAgentEnvelopeLookalikesInModelToolParts(
-            stripWorkflowRunRecordsFromModelMessages(stepMessages)
-          )
-        );
+        const rewritten = await transformStepMessages(stepMessages);
         let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
         if (stepTracker?.prefixSwapInvalidated) {
           // Cross-family fallback must not send the old provider's cached prefix.
@@ -2929,11 +2978,7 @@ export class StreamManager {
               thinkingOverride
             );
             // Same per-step transforms the construction-time messages receive.
-            rebuiltFirstStepMessages = await extractToolMediaAsUserMessagesFromModelMessages(
-              neutralizeAgentEnvelopeLookalikesInModelToolParts(
-                stripWorkflowRunRecordsFromModelMessages(rebuilt)
-              )
-            );
+            rebuiltFirstStepMessages = await transformStepMessages(rebuilt);
             if (stepTracker) {
               stepTracker.latestMessages = rebuiltFirstStepMessages;
             }
@@ -2965,10 +3010,19 @@ export class StreamManager {
           );
           // Step zero can follow executed tools on a fallback. This late hard stop
           // preserves settled results; it must not reset/replay the activated catalog.
-          if (exceeded)
+          if (exceeded) {
+            // The settled-step callback measured this same request and should have rolled
+            // over first; reaching here after a settled step means the two measures diverged.
+            if (stepNumber > 0 && request.onStepSettled != null)
+              log.warn("Context budget preflight blocked after a settled step", {
+                model: exceeded.model,
+                estimate: exceeded.estimate,
+                hardCeiling: exceeded.hardCeiling,
+              });
             throw new ContextBudgetBlockedError(
               `The estimated next request exceeds the safe context budget for ${exceeded.model} (${exceeded.hardCeiling} tokens). Use /compact or reduce the active tool/context payload.`
             );
+          }
         }
         if (
           effectiveMessages === stepMessages &&
@@ -2996,7 +3050,7 @@ export class StreamManager {
       onChunk: request.onChunk,
       tools: request.tools,
       experimental_transform: summarizeInvalidToolInputErrors(),
-      stopWhen: this.createStopWhenCondition(request),
+      stopWhen: this.createStopWhenCondition(request, stepTracker),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment
       providerOptions: request.providerOptions as any, // Pass provider-specific options (thinking/reasoning config)
       headers: request.headers, // Per-request HTTP headers (e.g., anthropic-beta for 1M context)

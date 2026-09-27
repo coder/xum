@@ -81,6 +81,11 @@ export interface StepBudgetInput {
   imageParts: number;
   /** Real-encoding tool-output count, including media allowances, when available. */
   toolResultTokens?: number;
+  /**
+   * Assembled estimate of the next provider request (the measure the per-step preflight
+   * enforces), when known. Floors only the hard stop, never the advisory stages.
+   */
+  nextRequestTokens?: number;
   modelContextLimit: number | null | undefined;
   threshold: number;
   warningEmitted: boolean;
@@ -103,6 +108,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.imageParts,
     input.threshold,
     input.toolResultTokens ?? 0,
+    input.nextRequestTokens ?? 0,
   ]) {
     assert(
       Number.isFinite(value) && value >= 0,
@@ -114,9 +120,12 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.outputTokens +
     Math.ceil(input.toolResultChars / 4) +
     IMAGE_TOKEN_ESTIMATE * input.imageParts;
+  // Provider usage can sit ~10% below the assembled estimate the next step's preflight enforces
+  // (#4855). Using the stricter of the two keeps the forced rollover ahead of that hard stop.
   const hardProjected = Math.max(
     projected,
-    input.contextTokens + input.outputTokens + (input.toolResultTokens ?? 0)
+    input.contextTokens + input.outputTokens + (input.toolResultTokens ?? 0),
+    input.nextRequestTokens ?? 0
   );
   const limit = input.modelContextLimit;
   const hardCeiling =

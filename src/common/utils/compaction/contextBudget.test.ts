@@ -98,6 +98,35 @@ describe("step budget decisions", () => {
     expect(evaluate({ contextTokens: 75_000, warningEmitted: true }).decision).toBe("handoff");
   });
 
+  // #4855: provider usage can sit well below the assembled estimate the next step's preflight
+  // enforces. The settled decision must use the stricter of the two, or the preflight hard-stops
+  // the turn before the forced rollover can ever fire.
+  test.each([
+    [0.7, "rollover"],
+    [1, "block"],
+  ] as const)(
+    "a next-request estimate at the ceiling forces the stop at threshold %d",
+    (threshold, decision) => {
+      const result = evaluate({ contextTokens: 80_000, nextRequestTokens: 91_808, threshold });
+      expect(result).toMatchObject({ decision, projected: 91_808 });
+      expect(evaluate({ contextTokens: 80_000, threshold }).decision).not.toBe(decision);
+    }
+  );
+
+  test("a next-request estimate below the ceiling does not move the advisory stages", () => {
+    // Only the hard stop uses the floor: advisories keep the provider-based projection, so the
+    // estimator's overshoot cannot fire the warning or handoff early.
+    expect(evaluate({ contextTokens: 40_000, nextRequestTokens: 75_000 })).toMatchObject({
+      decision: "continue",
+      projected: 40_000,
+    });
+    // It still withholds advisories that the forced stop would pre-empt.
+    expect(
+      evaluate({ contextTokens: 60_000, nextRequestTokens: 91_808 - WARNING_RESERVE_TOKENS })
+        .decision
+    ).toBe("continue");
+  });
+
   test.each([60_000, 75_000, 89_000])(
     "a delivered handoff suppresses both advisories at %d",
     (contextTokens) => {

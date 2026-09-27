@@ -1397,6 +1397,27 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });
 
+  test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
+    // #4855: provider usage far below the ceiling, but the next step's assembled estimate (what
+    // the per-step preflight enforces) reaches it. Rollover must win before that hard stop.
+    const h = await setup();
+    expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+    expect(
+      (await h.requests[0].onStepSettled?.(step(50_000, { nextRequestTokens: 119_808 })))?.decision
+    ).toBe("rollover");
+    expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
+    await h.finishAndDispatch();
+    const rows = await allRows(h);
+    const resets = rolloverRows(rows);
+    expect(resets).toHaveLength(1);
+    expect(resets[0].metadata?.muxMetadata).toMatchObject({
+      reason: "mid-stream",
+      contextTokens: 119_808,
+      budgetTokens: 119_808,
+    });
+    expect(text(rows.at(-1)!)).toBe("Continue");
+  });
+
   test("a new_context request is ignored while automatic rollover is disabled or history is unavailable", async () => {
     const h = await setup();
     await seedThreshold(h, 1);

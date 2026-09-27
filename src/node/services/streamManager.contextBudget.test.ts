@@ -2,7 +2,7 @@ import { tmpdir } from "node:os";
 import { prepareToolSearch, type ToolSearchRuntime } from "@/common/utils/tools/toolCatalog";
 import { createToolSearchTool } from "./tools/toolSearch";
 import { createTestToolConfig } from "./tools/testHelpers";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { tool } from "ai";
@@ -19,6 +19,8 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { StreamManager, type SettledStepBudget, type TurnEngineEvent } from "./streamManager";
 import { onTurnEngineEvent } from "./streamManager.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
+import * as budgetCounting from "./contextBudgetCounting";
+import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
 
 describe("settled context hard ceiling", () => {
   test.each(["inactive", "activation-fits", "activation-overflow", "search-off"] as const)(
@@ -397,6 +399,128 @@ describe("settled context hard ceiling", () => {
       await h.cleanup();
     }
   }, 20000);
+
+  // #4855: the provider reports far fewer input tokens than the assembled estimate the next
+  // step's preflight enforces. The settled step must see that same estimate so the forced
+  // rollover wins; before the fix the preflight hard-stopped the turn every time. With a roomy
+  // limit, the settled measure must equal what the next step's preflight actually checks.
+  test.each([10_000, 100_000])(
+    "a settled step measures the next preflight request (limit %d)",
+    async (limit) => {
+      const preflights = spyOn(budgetCounting, "checkAssembledRequestBudgetForModel");
+      const h = await createTestHistoryService();
+      const workspaceId = "next-request-rollover";
+      const messageId = "assistant-next-request";
+      let providerCalls = 0;
+      const settled: SettledStepBudget[] = [];
+      const usage = {
+        inputTokens: { total: 100, noCache: 100, cacheRead: 0, cacheWrite: 0 },
+        outputTokens: { total: 10, text: 10, reasoning: 0 },
+      };
+      const model = new MockLanguageModelV3({
+        doStream: () => {
+          providerCalls += 1;
+          return Promise.resolve({
+            stream: simulateReadableStream<LanguageModelV3StreamPart>({
+              chunks:
+                providerCalls === 1
+                  ? [
+                      { type: "stream-start", warnings: [] },
+                      { type: "tool-call", toolCallId: "read", toolName: "read", input: "{}" },
+                      {
+                        type: "finish",
+                        finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                        usage,
+                      },
+                    ]
+                  : [
+                      { type: "stream-start", warnings: [] },
+                      { type: "text-start", id: "answer" },
+                      { type: "text-delta", id: "answer", delta: "Done" },
+                      { type: "text-end", id: "answer" },
+                      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+                    ],
+            }),
+          });
+        },
+      });
+      const manager = new StreamManager(h.historyService);
+      const runtimeDir = path.join(h.tempDir, "runtime");
+      await fs.mkdir(runtimeDir);
+      try {
+        expect(
+          (
+            await h.historyService.appendManyToHistory(workspaceId, [
+              createMuxMessage("user", "user", "Read the part"),
+              createMuxMessage(messageId, "assistant", ""),
+            ])
+          ).success
+        ).toBe(true);
+        const started = await manager.startStream({
+          workspaceId,
+          messageId,
+          historySequence: 1,
+          model,
+          modelString: "openai:gpt-4o",
+          messages: [{ role: "user", content: "Read the part" }],
+          // Large enough that the first request fits and the second does not (hard ceiling 7,500).
+          system: "system prompt line ".repeat(1200),
+          runtime: new LocalRuntime(h.tempDir),
+          providedRuntimeTempDir: runtimeDir,
+          tools: {
+            read: tool({
+              inputSchema: z.object({}),
+              execute: () => "part text line ".repeat(700),
+            }),
+          },
+          contextBudgetLimit: limit,
+          onStepSettled: (step) => {
+            settled.push(step);
+            // The same evaluation the token-budget strategy runs, with rollover enabled.
+            const { decision } = evaluateStepBudget({
+              contextTokens: step.usage?.inputTokens ?? 0,
+              outputTokens: step.usage?.outputTokens ?? 0,
+              toolResultChars: step.toolResultChars,
+              imageParts: step.imageParts,
+              toolResultTokens: step.toolResultTokens,
+              nextRequestTokens: step.nextRequestTokens,
+              modelContextLimit: limit,
+              threshold: 0.9,
+              warningEmitted: true,
+              handoffRequested: true,
+            });
+            return Promise.resolve({ decision: decision === "handoff" ? "warn" : decision });
+          },
+        });
+        if (!started.success) throw new Error("Expected stream startup");
+        const completion = await started.data.completion;
+        // Before the fix the next step's preflight failed the stream as "context_budget_blocked".
+        expect(
+          completion.status === "failed" ? completion.streamError.errorType : completion.status
+        ).toBe("completed");
+        if (limit === 10_000) {
+          expect(providerCalls).toBe(1);
+          expect(settled).toHaveLength(1);
+          // Provider usage plus the settled tool output alone stays below the ceiling...
+          expect(110 + (settled[0].toolResultTokens ?? 0)).toBeLessThan(7_500);
+          // ...but the next assembled request does not, so the step stops as a rollover.
+          expect(settled[0].nextRequestTokens).toBeGreaterThan(7_500);
+        } else {
+          expect(providerCalls).toBe(2);
+          // The last preflight checked step two's request: re-measure its exact payload.
+          const [payload, budget] = preflights.mock.calls.at(-1)!;
+          expect(settled[0].nextRequestTokens).toBe(
+            (await estimateAssembledRequestTokensForModel(payload, budget))!.estimate
+          );
+        }
+      } finally {
+        preflights.mockRestore();
+        await manager.stopStream(workspaceId);
+        await h.cleanup();
+      }
+    },
+    20000
+  );
 
   test("a successful new_context settles as a request even when its checkpoint sibling failed", async () => {
     const h = await createTestHistoryService();
