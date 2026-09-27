@@ -319,8 +319,9 @@ function adversarialRows(
   }
   if (r < 0.67) return [json(createMuxMessage(id, role, `\u001b[31mred\u001b[0m ${i}`))];
   if (r < 0.69) {
-    // Deep arrays in a tool output, around V8's JSON.stringify depth limit (production). Rare:
-    // each parse costs milliseconds.
+    // Deep arrays in a tool output, around V8's JSON.stringify depth limit (production). Bun's
+    // limit is far deeper, so these do not throw under bun test. Rare: each parse costs
+    // milliseconds.
     const depth = 5000 + Math.floor(random() * 15_000);
     return [deepToolRow(id, depth, random() < 0.3, random() < 0.5)];
   }

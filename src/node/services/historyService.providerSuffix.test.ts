@@ -118,9 +118,10 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
   }, 60_000);
 
   // Reset encodings split across unreadable rows, readable rows that merely mention resets,
-  // escaped boundary keys, stringify-throwing nesting, line-size and chunk edges, and invalid
-  // UTF-8 (#4655). A window no epoch can fill never stops early, so check() requires that read
-  // to equal the full read exactly.
+  // escaped boundary keys, deep nesting, line-size and chunk edges, and invalid UTF-8 (#4655).
+  // The nesting stays below Bun's JSON.stringify limit, so the classifier's stringify-throw path
+  // is covered only by historyScanner.differential.test.ts. A window no epoch can fill never
+  // stops early, so check() requires that read to equal the full read exactly.
   test("matches the full provider read on adversarial layouts", async () => {
     const windows = [1, 2, 3, 5, 80, Number.MAX_SAFE_INTEGER];
     expect(await checkGeneratedLayouts(240, windows, true)).toEqual([]);
