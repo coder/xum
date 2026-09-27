@@ -126,9 +126,9 @@ export async function listWorkspaceMcpPrompts(
       ? mergeMultiProjectSecrets(metadata, context.secretsStore)
       : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
   );
-  // `return await`, not `return`: `using` disposes at block exit, and a bare returned promise
-  // would release the admission before server startup settles.
-  return await context.mcpServerManager.getPromptsForWorkspace(
+  // Awaited inside the block: `using` disposes at block exit, and releasing the admission
+  // before server startup settles would hide the startup from the archive gate.
+  const prompts = await context.mcpServerManager.getPromptsForWorkspace(
     {
       workspaceId,
       projectPath: metadata.projectPath,
@@ -150,6 +150,13 @@ export async function listWorkspaceMcpPrompts(
     },
     signal ? { signal } : undefined
   );
+  // A removal that began during startup may have stopped servers before these published, and
+  // is about to delete (or has deleted) the checkout they run in (#4760).
+  if (admission.removalStarted) {
+    await context.mcpServerManager.stopServers(workspaceId);
+    return [];
+  }
+  return prompts;
 }
 
 export async function setWorkspaceMcpOverrides(

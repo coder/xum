@@ -1457,6 +1457,9 @@ ${scriptWithEnv}`;
                   processId,
                   script,
                   existingOutput: lines,
+                  // Abort is detached from the tool call once backgrounded, so the wrapped
+                  // controller now only fires through the handle's terminate (#4760).
+                  kill: () => wrappedAbortController.abort(),
                 },
                 config.backgroundProcessManager.getBgOutputDir()
               );

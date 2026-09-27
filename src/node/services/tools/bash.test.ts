@@ -2129,6 +2129,53 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   }, 15000);
 
+  // #4760: workspace removal calls cleanup() before deleting the checkout. For a foreground
+  // command sent to the background, that must kill the process, not just stop tracking it.
+  it("cleanup kills a process that was sent to the background", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-cleanup");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-cleanup.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-cleanup",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+    expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+    const result = await resultPromise;
+    expect(result.success).toBe(true);
+
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
+    await manager.cleanup(config.workspaceId!);
+
+    // cleanup() joins the exit, so the process is gone as soon as it returns.
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
   it("should arm monitor for background mode and echo monitor config", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 

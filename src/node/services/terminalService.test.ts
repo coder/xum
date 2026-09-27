@@ -224,6 +224,46 @@ describe("TerminalService", () => {
     expect(env.TEST_SECRET).toBe("secret-value");
   });
 
+  // #4760: a removal can close the workspace's terminals and finish (clearing its guard)
+  // while a startup is still spawning; that startup must not publish into the deleted checkout.
+  it("kills a terminal whose startup spans a workspace close", async () => {
+    let releaseSpawn!: () => void;
+    const spawnGate = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    let spawnStarted!: () => void;
+    const spawnStartedPromise = new Promise<void>((resolve) => {
+      spawnStarted = resolve;
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mockPTYService.createSession as any) = mock(async (params: TerminalCreateParams) => {
+      spawnStarted();
+      await spawnGate;
+      return { sessionId: "session-spanning", workspaceId: params.workspaceId, cols: 80, rows: 24 };
+    });
+
+    const creation = service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+    await spawnStartedPromise;
+    // The removal closes sessions and completes; its guard no longer reports the workspace.
+    service.closeWorkspaceSessions("ws-1");
+    releaseSpawn();
+
+    let createError: unknown;
+    try {
+      await creation;
+    } catch (error) {
+      createError = error;
+    }
+    expect(createError).toBeInstanceOf(Error);
+    expect(closeSessionMock).toHaveBeenCalledWith("session-spanning");
+    expect(service.hasWorkspaceSessions("ws-1")).toBe(false);
+
+    // A startup that begins after the close is unaffected.
+    (mockPTYService.createSession as unknown) = createSessionMock;
+    const later = await service.create({ workspaceId: "ws-1", cols: 80, rows: 24 });
+    expect(later.sessionId).toBe("session-1");
+  });
+
   it("uses the persisted workspace root for worktree terminals", async () => {
     service = new TerminalService(
       createConfigWithMetadata({

@@ -2,6 +2,12 @@ import { TextDecoder, TextEncoder } from "util";
 import type { Transport, JSONRPCMessage } from "@modelcontextprotocol/client";
 import type { ExecStream } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+
+// After stdin closes, how long a server gets to exit on its own before close() kills it.
+const MCP_STDIO_EXIT_GRACE_MS = 2_000;
+// Upper bound on waiting for the killed process to report its exit (a remote exec may never).
+const MCP_STDIO_KILL_JOIN_MS = 5_000;
 
 /**
  * Minimal stdio transport for MCP servers using newline-delimited JSON (NDJSON).
@@ -23,7 +29,14 @@ export class MCPStdioTransport implements Transport {
   onerror?: (error: Error) => void;
   onmessage?: (message: JSONRPCMessage) => void;
 
-  constructor(execStream: ExecStream) {
+  /**
+   * @param options.kill Kills the server's process tree (its exec's abort). Without it, close()
+   *   only closes stdin and stops reading, so a server that ignores EOF keeps running.
+   */
+  constructor(
+    execStream: ExecStream,
+    private readonly options?: { kill?: () => void }
+  ) {
     this.stdoutReader = execStream.stdout.getReader();
     this.stdinWriter = execStream.stdin.getWriter();
     this.exitPromise = execStream.exitCode;
@@ -58,6 +71,18 @@ export class MCPStdioTransport implements Transport {
     } catch (error) {
       log.debug("Failed to cancel MCP stdout reader", { error });
     }
+    // Workspace removal stops servers before deleting the checkout (#4760): observe the exit,
+    // and kill a server that ignores EOF, so none outlives the checkout.
+    const kill = this.options?.kill;
+    if (kill === undefined) return;
+    const exited = await raceWithAbortAndTimeout(this.exitPromise, {
+      timeoutMs: MCP_STDIO_EXIT_GRACE_MS,
+    }).catch(() => ({ kind: "ok" as const }));
+    if (exited.kind === "ok") return;
+    kill();
+    await raceWithAbortAndTimeout(this.exitPromise, { timeoutMs: MCP_STDIO_KILL_JOIN_MS }).catch(
+      () => undefined
+    );
   }
 
   private async readLoop(): Promise<void> {

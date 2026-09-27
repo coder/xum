@@ -13,7 +13,7 @@ const metadata = {
 };
 
 function createContext(options: {
-  admission: Disposable | undefined;
+  admission: (Disposable & { removalStarted?: boolean }) | undefined;
   getPromptsForWorkspace: () => Promise<never[]>;
 }) {
   const waitForInit = mock(() => Promise.resolve());
@@ -114,6 +114,23 @@ describe("listWorkspaceMcpPrompts archive admission", () => {
     releaseStartup();
     expect(await discovery).toEqual([]);
     expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  // #4760: a removal that began while discovery was starting servers may already have run its
+  // stopServers, so discovery stops what it started instead of publishing it.
+  test("discovery spanning a removal stops the servers it started", async () => {
+    const fixture = createContext({
+      admission: { removalStarted: true, [Symbol.dispose]: () => undefined },
+      getPromptsForWorkspace: () => Promise.resolve([]),
+    });
+    const stopServers = mock(() => Promise.resolve());
+    (
+      fixture.context.mcpServerManager as unknown as { stopServers: typeof stopServers }
+    ).stopServers = stopServers;
+
+    expect(await listWorkspaceMcpPrompts(fixture.context, workspaceId)).toEqual([]);
+    expect(fixture.getPromptsForWorkspace).toHaveBeenCalledTimes(1);
+    expect(stopServers).toHaveBeenCalledWith(workspaceId);
   });
 
   test("the inherited override read is bounded and cancelled with discovery's signal", async () => {

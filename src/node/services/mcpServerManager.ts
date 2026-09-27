@@ -6099,6 +6099,8 @@ export class MCPServerManager {
     {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
+      // Lets the transport's close() kill a server that ignores stdin EOF (#4760).
+      const processAbort = new AbortController();
       const execStream = await this.launchUnderOverrideFence(
         name,
         info,
@@ -6107,7 +6109,7 @@ export class MCPServerManager {
             cwd: launch.cwd ?? workspacePath,
             ...(launch.env !== undefined ? { env: launch.env } : {}),
             timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
-            abortSignal: launchSignal,
+            abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
           }),
         signal,
         // A host-local exec resolves once the process exists; an SSH exec
@@ -6145,7 +6147,7 @@ export class MCPServerManager {
         return null;
       }
 
-      const transport = new MCPStdioTransport(execStream);
+      const transport = new MCPStdioTransport(execStream, { kill: () => processAbort.abort() });
 
       const instanceRef: { current: MCPServerInstance | null } = { current: null };
       let transportClosed = false;
