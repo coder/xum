@@ -195,18 +195,21 @@ export class MultiProjectRuntime implements Runtime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     const errors: string[] = [];
 
     for (const projectRuntime of this.projectRuntimes) {
       try {
+        // Forward keepBranch: a fork rollback must not delete branches it did not create (#4775).
         const deleteResult = await projectRuntime.runtime.deleteWorkspace(
           projectRuntime.projectPath,
           workspaceName,
           force,
           abortSignal,
-          trusted
+          trusted,
+          options
         );
 
         if (!deleteResult.success) {

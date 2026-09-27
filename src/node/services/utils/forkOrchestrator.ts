@@ -165,6 +165,7 @@ async function rollbackCreatedProjectWorkspaces(
   createdProjectRuntimes: MultiProjectRuntimeEntry[],
   workspaceName: string,
   getProjectTrusted: (projectPath: string) => boolean | undefined,
+  branchCreators: ReadonlySet<MultiProjectRuntimeEntry>,
   abortSignal?: AbortSignal
 ): Promise<string[]> {
   const rollbackErrors: string[] = [];
@@ -179,7 +180,9 @@ async function rollbackCreatedProjectWorkspaces(
         workspaceName,
         false,
         abortSignal,
-        projectTrusted
+        projectTrusted,
+        // Even `git branch -d` deletes a merged branch; keep any this fork did not make (#4775).
+        { keepBranch: !branchCreators.has(projectRuntime) }
       );
 
       if (!deleteResult.success) {
@@ -269,6 +272,8 @@ export async function orchestrateFork(
     }));
 
     const createdProjectRuntimes: MultiProjectRuntimeEntry[] = [];
+    // Projects whose fork made the new branch; only those branches may be deleted on rollback.
+    const branchCreators = new Set<MultiProjectRuntimeEntry>();
     const projectWorkspaces: ProjectWorkspaceEntry[] = [];
 
     let normalizedForkedRuntimeConfig: RuntimeConfig = sourceRuntimeConfig;
@@ -319,11 +324,13 @@ export async function orchestrateFork(
       assert(trunkBranch, "Multi-project fork requires trunkBranch after primary fork attempt");
 
       if (forkResult.success) {
+        if (forkResult.createdBranch === true) branchCreators.add(projectRuntime);
         if (!forkResult.workspacePath) {
           const rollbackErrors = await rollbackCreatedProjectWorkspaces(
             [...createdProjectRuntimes, projectRuntime],
             newWorkspaceName,
             getProjectTrusted,
+            branchCreators,
             abortSignal
           );
           return Err(
@@ -351,6 +358,7 @@ export async function orchestrateFork(
           createdProjectRuntimes,
           newWorkspaceName,
           getProjectTrusted,
+          branchCreators,
           abortSignal
         );
         return Err(
@@ -368,6 +376,7 @@ export async function orchestrateFork(
           createdProjectRuntimes,
           newWorkspaceName,
           getProjectTrusted,
+          branchCreators,
           abortSignal
         );
         return Err(
@@ -412,6 +421,7 @@ export async function orchestrateFork(
           createdProjectRuntimes,
           newWorkspaceName,
           getProjectTrusted,
+          branchCreators,
           abortSignal
         );
         return Err(
@@ -427,6 +437,7 @@ export async function orchestrateFork(
       if (runtimeIndex === 0) {
         primaryWorkspacePath = createResult.workspacePath;
       }
+      if (createResult.createdBranch === true) branchCreators.add(projectRuntime);
 
       forkedFromSource = false;
       createdProjectRuntimes.push(projectRuntime);
@@ -449,6 +460,7 @@ export async function orchestrateFork(
         createdProjectRuntimes,
         newWorkspaceName,
         getProjectTrusted,
+        branchCreators,
         abortSignal
       );
       const containerAlreadyExists = isErrnoWithCode(error, "EEXIST");
