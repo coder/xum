@@ -8,6 +8,7 @@ import {
   generateRows,
   json,
   mulberry32,
+  OVERSIZED,
   rowsToBytes,
   type GeneratedRow,
 } from "./historyScanner.generator.testHarness";
@@ -60,7 +61,9 @@ describe("one-pass skip-0 provider read", () => {
     for (const adversarial of [false, true]) {
       for (let seed = 1; seed <= 90; seed++) {
         const random = mulberry32(seed);
-        const rows = generateRows(random, { oversized: seed % 9 === 0, adversarial });
+        // Oversized seeds must not share a residue with the layout choice (seed % 3) below, so
+        // oversized rows land in archive files too, not only in chat-only layouts.
+        const rows = generateRows(random, { oversized: seed % 10 === 0, adversarial });
         const split = Math.floor(random() * (rows.length + 1));
         const workspaceId = `one-pass-${adversarial ? "adv" : "plain"}-${seed}`;
         const label = `${adversarial ? "adversarial" : "plain"} seed ${seed}`;
@@ -93,6 +96,31 @@ describe("one-pass skip-0 provider read", () => {
     }
     expect(problems).toEqual([]);
   }, 60_000);
+
+  // Generated archive layouts almost never return an oversized archive row (chat usually holds
+  // the start), so this pins the case where chat is exhausted and the returned range includes an
+  // oversized row in the archive: it must be re-read from the archive, not from chat.jsonl.
+  test("re-reads an oversized archive row when chat.jsonl has no boundary", async () => {
+    const workspaceId = "one-pass-oversized-archive";
+    await writeLayout(
+      workspaceId,
+      [
+        json(createMuxMessage("old", "user", "before the boundary")),
+        json(
+          createMuxMessage("b1", "assistant", "summary", {
+            compactionBoundary: true,
+            compacted: "user",
+            compactionEpoch: 1,
+          })
+        ),
+        json(createMuxMessage("big", "user", "y".repeat(OVERSIZED))),
+      ],
+      [json(createMuxMessage("newest", "user", "no boundary in chat"))]
+    );
+    const read = await readProviderHistory(pathsFor(workspaceId));
+    expect(read.map((m) => m.id)).toEqual(["b1", "big", "newest"]);
+    expect(read).toEqual((await oracle(workspaceId)).messages);
+  });
 
   test("fails closed if chat.jsonl changes during the read", async () => {
     const workspaceId = "one-pass-replaced";
