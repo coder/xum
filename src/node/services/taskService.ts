@@ -130,6 +130,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
@@ -7194,7 +7195,8 @@ export class TaskService implements AgentTaskIntegration {
               this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
               false,
           },
-          plan.taskId
+          plan.taskId,
+          workspaceUseLeasesFor(this.config)
         )
       );
     }
@@ -8127,7 +8129,8 @@ export class TaskService implements AgentTaskIntegration {
             trusted:
               this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
           },
-          taskId
+          taskId,
+          workspaceUseLeasesFor(this.config)
         )
       );
     }

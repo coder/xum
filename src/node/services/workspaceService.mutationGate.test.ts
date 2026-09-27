@@ -5,6 +5,7 @@ import * as readline from "node:readline";
 
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Err, Ok } from "@/common/types/result";
+import type { Runtime, WorkspaceInitParams } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { HistoryService } from "@/node/services/historyService";
 import {
@@ -16,6 +17,7 @@ import {
   testTaskSettings,
 } from "@/node/services/taskService.testHarness";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import * as bashToolModule from "@/node/services/tools/bash";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import type { WorkspaceService } from "@/node/services/workspaceService";
@@ -69,6 +71,7 @@ describe("structural workspace mutations across two backends on one root", () =>
   let b: Backend;
   let renameWorkspace: ReturnType<typeof mock>;
   let deleteWorkspace: ReturnType<typeof mock>;
+  let ensureReady: ReturnType<typeof mock>;
   const leases: WorkspaceUseLease[] = [];
 
   beforeEach(async () => {
@@ -92,9 +95,12 @@ describe("structural workspace mutations across two backends on one root", () =>
     // The checkout move and deletion are the structural effects every test watches.
     renameWorkspace = mock(() => Promise.resolve({ success: false as const, error: "stub move" }));
     deleteWorkspace = mock(() => Promise.resolve({ success: true as const, deletedPath: "x" }));
+    ensureReady = mock(() => Promise.resolve({ ready: false, error: "stub runtime" }));
     spyOn(runtimeFactory, "createRuntime").mockReturnValue({
       renameWorkspace,
       deleteWorkspace,
+      ensureReady,
+      getWorkspacePath: () => path.join(srcBaseDir, "repo", "root"),
     } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
   });
 
@@ -318,6 +324,162 @@ describe("structural workspace mutations across two backends on one root", () =>
       await exited;
     }
 
+    expect(await a.workspaceService.remove(rootId, true)).toMatchObject({ success: true });
+    expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  // #4857: one-off commands (executeBash) and init hooks run in the checkout too.
+  const heldCount = (backend: Backend, kind: WorkspaceUseKind) =>
+    workspaceUseLeasesFor(backend.config).heldCount(rootId, kind);
+
+  test("a one-off command of the other backend refuses rename until it fails", async () => {
+    const runtimeReady = Promise.withResolvers<{ ready: false; error: string }>();
+    ensureReady.mockImplementation(() => runtimeReady.promise);
+    const exec = b.workspaceService.executeBash(rootId, "git status");
+    while (ensureReady.mock.calls.length === 0) await new Promise((r) => setTimeout(r, 1));
+
+    const refused = errorOf(await a.workspaceService.rename(rootId, "renamed"));
+    expect(refused).toContain(inUseElsewhere);
+    expect(refused).toContain("exec");
+    expect(renameWorkspace).not.toHaveBeenCalled();
+
+    runtimeReady.resolve({ ready: false, error: "runtime down" });
+    expect(errorOf(await exec)).toContain("runtime down");
+    expect(heldCount(b, "exec")).toBe(0);
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("a one-off command releases its lease when it succeeds", async () => {
+    ensureReady.mockResolvedValue({ ready: true });
+    const execute = mock(() => {
+      expect(heldCount(b, "exec")).toBe(1);
+      return Promise.resolve({ success: true, output: "clean", exitCode: 0, wall_duration_ms: 1 });
+    });
+    spyOn(bashToolModule, "createBashTool").mockReturnValue({
+      execute,
+    } as unknown as ReturnType<typeof bashToolModule.createBashTool>);
+
+    expect(await b.workspaceService.executeBash(rootId, "git status")).toMatchObject({
+      success: true,
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(heldCount(b, "exec")).toBe(0);
+  });
+
+  test("no one-off command runs while the other backend mutates the workspace", async () => {
+    const release = await workspaceUseLeasesFor(a.config).acquireMutationGate([rootId], {
+      hasRunningBackgroundProcesses: () => Promise.resolve(false),
+    });
+    try {
+      expect(errorOf(await b.workspaceService.executeBash(rootId, "git status"))).toContain(
+        "being renamed, removed or archived"
+      );
+      expect(ensureReady).not.toHaveBeenCalled();
+      expect(heldCount(b, "exec")).toBe(0);
+    } finally {
+      await release();
+    }
+  });
+
+  function initRun(
+    backend: Backend,
+    initWorkspace: (params: WorkspaceInitParams) => Promise<{ success: boolean }>,
+    abortSignal?: AbortSignal
+  ) {
+    const initLogger = {
+      logStep: mock(() => undefined),
+      logStdout: mock(() => undefined),
+      logStderr: mock(() => undefined),
+      logComplete: mock(() => undefined),
+    };
+    const initWorkspaceMock = mock(initWorkspace);
+    const settled = runtimeFactory.runBackgroundInit(
+      { initWorkspace: initWorkspaceMock } as unknown as Runtime,
+      {
+        projectPath,
+        branchName: "root",
+        trunkBranch: "main",
+        workspacePath: path.join(srcBaseDir, "repo", "root"),
+        initLogger,
+        abortSignal,
+      },
+      rootId,
+      workspaceUseLeasesFor(backend.config)
+    );
+    return { settled, initLogger, initWorkspace: initWorkspaceMock };
+  }
+
+  test("an init hook of the other backend refuses rename until it ends", async () => {
+    const hook = Promise.withResolvers<{ success: boolean }>();
+    const run = initRun(b, () => hook.promise);
+    while (run.initWorkspace.mock.calls.length === 0) await new Promise((r) => setTimeout(r, 1));
+
+    const refused = errorOf(await a.workspaceService.rename(rootId, "renamed"));
+    expect(refused).toContain(inUseElsewhere);
+    expect(refused).toContain("init");
+
+    hook.resolve({ success: true });
+    await run.settled;
+    expect(heldCount(b, "init")).toBe(0);
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test("an init hook releases its lease when it fails or is aborted", async () => {
+    const failed = initRun(b, () => Promise.reject(new Error("hook crashed")));
+    await failed.settled;
+    expect(failed.initLogger.logComplete).toHaveBeenCalledWith(-1);
+    expect(heldCount(b, "init")).toBe(0);
+
+    const abort = new AbortController();
+    const aborted = initRun(
+      b,
+      (params) =>
+        new Promise((resolve) =>
+          params.abortSignal?.addEventListener("abort", () => resolve({ success: false }))
+        ),
+      abort.signal
+    );
+    while (aborted.initWorkspace.mock.calls.length === 0) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(heldCount(b, "init")).toBe(1);
+    abort.abort();
+    await aborted.settled;
+    expect(heldCount(b, "init")).toBe(0);
+  });
+
+  test("no init hook runs while the other backend mutates the workspace", async () => {
+    const release = await workspaceUseLeasesFor(a.config).acquireMutationGate([rootId], {
+      hasRunningBackgroundProcesses: () => Promise.resolve(false),
+    });
+    try {
+      const run = initRun(b, () => Promise.resolve({ success: true }));
+      await run.settled;
+      expect(run.initWorkspace).not.toHaveBeenCalled();
+      expect(run.initLogger.logComplete).toHaveBeenCalledWith(-1);
+      expect(heldCount(b, "init")).toBe(0);
+    } finally {
+      await release();
+    }
+  });
+
+  test("own MCP servers, init hook and one-off commands follow what each mutator ends", async () => {
+    // Rename moves the checkout under its own MCP servers (their processes follow it) and
+    // in-flight commands, as before, but nothing stops its own init hook.
+    await hold(a, rootId, "init");
+    expect(errorOf(await a.workspaceService.rename(rootId, "renamed"))).toContain(
+      "running init in this Xum process"
+    );
+    await releaseAll();
+    await hold(a, rootId, "mcp");
+    await hold(a, rootId, "exec");
+    await a.workspaceService.rename(rootId, "renamed");
+    expect(renameWorkspace).toHaveBeenCalledTimes(1);
+
+    // Removal stops its own MCP servers and init hook itself.
+    await hold(a, rootId, "init");
     expect(await a.workspaceService.remove(rootId, true)).toMatchObject({ success: true });
     expect(deleteWorkspace).toHaveBeenCalledTimes(1);
   });

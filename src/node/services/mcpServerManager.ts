@@ -41,7 +41,8 @@ import assert from "@/common/utils/assert";
 import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
 import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { ExecStream, Runtime } from "@/node/runtime/Runtime";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
@@ -6107,24 +6108,50 @@ export class MCPServerManager {
       const launch = await prepareStdioLaunch(info);
       // Lets the transport's close() kill a server that ignores stdin EOF (#4760).
       const processAbort = new AbortController();
-      const execStream = await this.launchUnderOverrideFence(
-        name,
-        info,
-        (launchSignal) =>
-          runtime.exec(launch.command, {
-            cwd: launch.cwd ?? workspacePath,
-            ...(launch.env !== undefined ? { env: launch.env } : {}),
-            timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
-            abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
-          }),
-        signal,
-        // A host-local exec resolves once the process exists; an SSH exec
-        // can stall on connection acquisition. The writer's lock must not be
-        // held for the whole startup deadline, and the launch must not be
-        // released to send its command after a revocation: abort it instead
-        // (see launchUnderOverrideFence).
-        { workspaceId, abortAfterMs: { ms: MCP_STDIO_LAUNCH_FENCE_MS, serverName: name } }
-      );
+      // #4857: the server runs in the checkout, so another backend sharing this Xum root must
+      // refuse to rename or remove the workspace while it lives. Held from before the spawn (a
+      // refusal while a mutation runs fails this start) until the process exits, like a
+      // terminal's PTY: close() and the idle sweep only ask it to exit.
+      const useLease =
+        this.config != null && workspaceId != null
+          ? await workspaceUseLeasesFor(this.config).hold(workspaceId, "mcp")
+          : undefined;
+      let execStream: ExecStream;
+      try {
+        execStream = await this.launchUnderOverrideFence(
+          name,
+          info,
+          (launchSignal) =>
+            runtime.exec(launch.command, {
+              cwd: launch.cwd ?? workspacePath,
+              ...(launch.env !== undefined ? { env: launch.env } : {}),
+              timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
+              abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
+            }),
+          signal,
+          // A host-local exec resolves once the process exists; an SSH exec
+          // can stall on connection acquisition. The writer's lock must not be
+          // held for the whole startup deadline, and the launch must not be
+          // released to send its command after a revocation: abort it instead
+          // (see launchUnderOverrideFence).
+          { workspaceId, abortAfterMs: { ms: MCP_STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        );
+      } catch (error) {
+        // No process was handed back to watch; a launch that failed started nothing.
+        await useLease?.release();
+        throw error;
+      }
+      if (useLease != null) {
+        const releaseUseLease = () =>
+          useLease.release().catch((error: unknown) => {
+            log.warn("[MCP] Failed to release the workspace use lease", {
+              name,
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        void execStream.exitCode.then(releaseUseLease, releaseUseLease);
+      }
 
       const cleanupSpawnedExecStream = async () => {
         // The launch fence stops forwarding the startup signal once it returns, so kill the
