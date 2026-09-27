@@ -29,13 +29,14 @@ import {
   findWorkspaceInConfig,
   projectWorkspace,
   saveTestConfig,
-  saveWorkspaces,
+  saveWorkspacesWithCheckouts as saveWorkspaces,
   streamEnd,
   stubStableIds,
   testTaskSettings,
   workspaceTurnManagerInternals,
 } from "@/node/services/taskService.testHarness";
 import {
+  collectFullHistory,
   createTaskServiceHarness,
   registerLiveWorkspaceTurnHandle,
   createTaskServiceTestRoot,
@@ -1738,6 +1739,77 @@ describe("TaskService", () => {
       })
     );
   });
+
+  // #4824: a same-tree recipient whose checkout is gone could never run the delivered turn, so
+  // every route refuses before any row, durable guidance or send, instead of failing later with
+  // runtime_not_ready. Healthy-checkout delivery is covered by the route tests above.
+  test.each([
+    { route: "child to parent", target: "parent", code: "send_failed" },
+    { route: "parent guidance", target: "target", code: "send_failed" },
+    { route: "sibling family message", target: "target", code: "send_failed" },
+    { route: "sibling peer message", target: "target", code: "refused" },
+  ] as const)(
+    "$route to a recipient whose checkout is missing refuses before persisting",
+    async ({ route, target, code }) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const running = { parentWorkspaceId: "parent", taskStatus: "running" as const };
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "parent", "parent"),
+          projectWorkspace(projectPath, "sender", "sender", running),
+          projectWorkspace(projectPath, "target", "target", {
+            ...running,
+            agentId: "exec",
+            agentType: "exec",
+            taskModelString: "openai:gpt-5.2",
+          }),
+        ],
+        testTaskSettings()
+      );
+      await fsPromises.rm(path.join(projectPath, target, ".git"), { recursive: true, force: true });
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      simulateAcceptedFamilySends(sendMessage, historyService);
+
+      const message = "Heads up from the family.";
+      const result =
+        route === "child to parent"
+          ? await taskService.sendMessageToParentFromAgentTask("sender", message, "tool-end")
+          : route === "parent guidance"
+            ? await taskService.sendMessageToDescendantAgentTask(
+                "parent",
+                "target",
+                message,
+                "tool-end"
+              )
+            : route === "sibling family message"
+              ? await taskService.sendMessageToSiblingAgentTask(
+                  "sender",
+                  "target",
+                  message,
+                  "tool-end"
+                )
+              : await taskService.sendAgentTreeMessage("sender", "target", message);
+
+      assert(!result.success);
+      expect(result.error.code).toBe(code);
+      const detail =
+        "message" in result.error
+          ? result.error.message
+          : "reason" in result.error
+            ? result.error.reason
+            : "";
+      expect(detail).toContain("checkout is unavailable");
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(await collectFullHistory(historyService, target)).toEqual([]);
+      expect(findWorkspaceInConfig(config, target)?.taskPendingGuidance).toBeUndefined();
+    }
+  );
 
   test("sibling payloads to a queued target stay out of the spliced user prompt", async () => {
     // The queued sub-path splices delivered text into taskPrompt — the

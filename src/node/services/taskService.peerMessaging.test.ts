@@ -20,7 +20,7 @@ import {
   createWorkspaceServiceMocks,
   findWorkspaceInConfig,
   projectWorkspace,
-  saveWorkspaces as saveHarnessWorkspaces,
+  saveWorkspacesWithCheckouts as saveWorkspaces,
   testTaskSettings,
   workspaceTurnManagerFor,
   workspaceTurnManagerInternals,
@@ -34,19 +34,6 @@ import {
   removeTaskServiceTestRoot,
   reserveFamilyMessageTargetSlots,
 } from "@/node/services/taskService.shared.testHarness";
-
-/**
- * Saves the workspaces and gives each one a real checkout marker: an unrelated send probes the
- * root recipient's checkout and refuses a missing one before anything is persisted (#4305).
- */
-async function saveWorkspaces(
-  ...args: Parameters<typeof saveHarnessWorkspaces>
-): ReturnType<typeof saveHarnessWorkspaces> {
-  await saveHarnessWorkspaces(...args);
-  for (const workspace of args[2]) {
-    await fsPromises.mkdir(path.join(workspace.path, ".git"), { recursive: true });
-  }
-}
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -1297,6 +1284,62 @@ describe("TaskService", () => {
         }
       }
     );
+
+    // #4824: a multi-project recipient runs only if every constituent checkout exists. The healthy
+    // case proves the probe resolves the constituents' real paths, not just any missing path.
+    test.each([
+      { constituents: "one constituent missing", missing: true },
+      { constituents: "all constituents present", missing: false },
+    ])("an unrelated multi-project recipient with $constituents", async ({ missing }) => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      const srcBaseDir = path.join(rootDir, "src");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "target", "target", {
+            unrelatedWorkspaceConsent: "consent",
+            runtimeConfig: { type: "worktree", srcBaseDir },
+            projects: [
+              { projectPath: path.join(rootDir, "repo-a"), projectName: "repo-a" },
+              { projectPath: path.join(rootDir, "repo-b"), projectName: "repo-b" },
+            ],
+          }),
+        ],
+        testTaskSettings()
+      );
+      await fsPromises.mkdir(path.join(srcBaseDir, "repo-a", "target", ".git"), {
+        recursive: true,
+      });
+      if (!missing) {
+        await fsPromises.mkdir(path.join(srcBaseDir, "repo-b", "target", ".git"), {
+          recursive: true,
+        });
+      }
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+
+      const result = await taskService.sendAgentTreeMessage("sender", "target", "Hello there");
+
+      if (missing) {
+        expect(result).toEqual(
+          Err({
+            code: "refused",
+            reason:
+              "The target workspace's checkout is unavailable, so it cannot receive messages.",
+          })
+        );
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(await collectFullHistory(historyService, "target")).toEqual([]);
+      } else {
+        expect(result.success).toBe(true);
+        expect(sendMessage).toHaveBeenCalledTimes(1);
+      }
+    });
 
     test("a stop that lands while the recipient's checkout is probed still wins (#4305)", async () => {
       const config = await createTestConfig(rootDir);

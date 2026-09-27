@@ -1847,7 +1847,22 @@ async function getMissingHostLocalCheckoutError(entry: {
   const { workspace } = entry;
   const name = coerceNonEmptyString(workspace.name);
   const runtimeConfig = workspace.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-  if (name == null || !isWorktreeRuntime(runtimeConfig) || (workspace.projects?.length ?? 0) > 1) {
+  if (name == null || !isWorktreeRuntime(runtimeConfig)) {
+    return null;
+  }
+  const projects = workspace.projects ?? [];
+  if (projects.length > 1) {
+    // Multi-project (#4824): MultiProjectRuntime.ensureReady checks each constituent runtime in
+    // order, and the execution paths build worktree constituents without a persisted path hint.
+    // Probing the same constituents here reports the checkout the runtime gate would.
+    for (const project of projects) {
+      const readiness = await createRuntimeForWorkspace({
+        runtimeConfig,
+        projectPath: project.projectPath,
+        name,
+      }).ensureReady();
+      if (!readiness.ready) return readiness.error;
+    }
     return null;
   }
   const runtime = createRuntimeForWorkspace({
@@ -8733,6 +8748,18 @@ export class TaskService implements AgentTaskIntegration {
           return Err({ code: "not_active" as const, taskStatus: previousStatus ?? "unknown" });
         }
 
+        // An active target whose checkout is missing could never run the delivered turn (#4824):
+        // refuse before the durable guidance or any payload row is written, instead of failing
+        // later with runtime_not_ready. Inactive targets are probed by reactivateInactiveAgentTask
+        // after unarchiving (which can restore the checkout); queued targets only edit their prompt.
+        const checkoutError = await getMissingHostLocalCheckoutError(entry);
+        if (checkoutError != null) {
+          return Err({
+            code: "send_failed" as const,
+            message: `Cannot deliver to sub-agent ${taskId}: its checkout is unavailable (${checkoutError}).`,
+          });
+        }
+
         const guidanceId = randomUUID();
         await this.editActiveWorkspaceEntry(
           taskId,
@@ -8977,8 +9004,19 @@ export class TaskService implements AgentTaskIntegration {
           message: "Workflow-owned tasks communicate through the workflow journal, not messaging.",
         });
       }
-      if (findWorkspaceEntry(cfg, parentWorkspaceId) == null) {
+      const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+      if (parentEntry == null) {
         return Err({ code: "send_failed" as const, message: "Parent workspace no longer exists." });
+      }
+      // A parent whose checkout is missing could never run the wake turn (#4824): refuse before
+      // any budget is reserved or row persisted, instead of failing later with runtime_not_ready.
+      // The sender is the parent's own child, so it may see the readiness error.
+      const checkoutError = await getMissingHostLocalCheckoutError(parentEntry);
+      if (checkoutError != null) {
+        return Err({
+          code: "send_failed" as const,
+          message: `Parent workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
+        });
       }
       targetWorkspaceId = parentWorkspaceId;
       familyKind = "child";
@@ -9416,14 +9454,20 @@ export class TaskService implements AgentTaskIntegration {
       // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
       // unarchived: refuse before any envelope row is persisted or budget reserved, instead of
       // accepting the message and failing later with runtime_not_ready. One probe of this target,
-      // never in instance discovery. The reason is fixed: the sender is untrusted, so it gets no
-      // path or runtime detail. A checkout deleted after this probe still hits the runtime gate.
-      // Probed after the stop epochs are captured: this await is a suspension point, and
-      // admissionStale() must still see a Stop that lands while it is pending.
-      if (unrelatedRoot && (await getMissingHostLocalCheckoutError(targetEntry)) != null) {
+      // never in instance discovery. Same-tree targets are probed too (#4824). An unrelated
+      // sender is untrusted, so its reason is fixed and carries no path or runtime detail; a
+      // same-tree sender gets the readiness error. A checkout deleted after this probe still
+      // hits the runtime gate. Probed after the stop epochs are captured: this await is a
+      // suspension point, and admissionStale() must still see a Stop that lands while it is
+      // pending.
+      const checkoutError = await getMissingHostLocalCheckoutError(targetEntry);
+      if (checkoutError != null) {
         return Err({
           code: "refused" as const,
-          reason: "The target workspace's checkout is unavailable, so it cannot receive messages.",
+          reason:
+            relation === "target_unrelated"
+              ? "The target workspace's checkout is unavailable, so it cannot receive messages."
+              : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
         });
       }
 

@@ -155,6 +155,20 @@ export async function saveWorkspaces(
   );
 }
 
+/**
+ * saveWorkspaces plus a real checkout marker (`<path>/.git`) for each workspace: message delivery
+ * probes the recipient's worktree checkout and refuses a missing one before anything is persisted
+ * (#4305, #4824).
+ */
+export async function saveWorkspacesWithCheckouts(
+  ...args: Parameters<typeof saveWorkspaces>
+): Promise<void> {
+  await saveWorkspaces(...args);
+  for (const workspace of args[2]) {
+    await fsPromises.mkdir(path.join(workspace.path, ".git"), { recursive: true });
+  }
+}
+
 export function mergeTestAgentAiDefaults(
   agentAiDefaults?: AgentAiDefaults,
   subagentAiDefaults?: Record<string, AgentAiSubagentProfile>
