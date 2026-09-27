@@ -155,13 +155,20 @@ describe("WorkspaceUseLeases across two backends on one root", () => {
   test("workspace ids never escape the lock directories", () => {
     const useParent = path.dirname(workspaceUseLockDir(rootDir, workspaceId));
     const gateParent = path.dirname(workspaceMutationLockPath(rootDir, workspaceId));
-    for (const hostile of ["../../etc/passwd", ".", ".."]) {
+    const hostileIds = ["../../etc/passwd", ".", "..", "%".repeat(300), "x".repeat(300)];
+    for (const hostile of hostileIds) {
       const useDir = workspaceUseLockDir(rootDir, hostile);
       expect(path.dirname(useDir)).toBe(useParent);
       expect(path.basename(useDir)).not.toMatch(/^\.+$/);
-      expect(path.dirname(workspaceMutationLockPath(rootDir, hostile))).toBe(gateParent);
+      expect(path.basename(useDir).length).toBeLessThan(100);
+      const gate = workspaceMutationLockPath(rootDir, hostile);
+      expect(path.dirname(gate)).toBe(gateParent);
+      expect(path.basename(gate).length).toBeLessThan(100);
     }
     // Distinct ids never share a directory.
-    expect(workspaceUseLockDir(rootDir, ".")).not.toBe(workspaceUseLockDir(rootDir, "%2E"));
+    const names = new Set(
+      [...hostileIds, workspaceId].map((id) => workspaceUseLockDir(rootDir, id))
+    );
+    expect(names.size).toBe(hostileIds.length + 1);
   });
 });

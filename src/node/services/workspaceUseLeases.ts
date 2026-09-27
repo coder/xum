@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
 
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
@@ -40,9 +40,13 @@ export interface WorkspaceUseLease {
 /** Renewal cadence for the lock kit only (new locks: no older build reclaims them by age). */
 const USE_LOCK_STALE_MS = 5 * 60 * 1000;
 
-// Workspace ids from older builds could contain path separators, or be "." or "..": encode
-// separators and dots (encodeURIComponent keeps dots) so every id names its own entry.
-const safeName = (workspaceId: string) => encodeURIComponent(workspaceId).replace(/\./g, "%2E");
+// Workspace ids from older builds can contain path separators, be "." or "..", or be longer than
+// a file name may be. Such ids get a bounded digest name; "~" never occurs in a kept id, so the
+// two forms cannot collide.
+const safeName = (workspaceId: string) =>
+  /^[A-Za-z0-9_-]{1,64}$/.test(workspaceId)
+    ? workspaceId
+    : `~${createHash("sha256").update(workspaceId).digest("hex")}`;
 
 /** Directory holding every backend's use-lease files for one workspace. */
 export function workspaceUseLockDir(rootDir: string, workspaceId: string): string {
