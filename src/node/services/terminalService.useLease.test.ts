@@ -29,6 +29,7 @@ describe("TerminalService workspace use lease across two backends on one root", 
   let leasesB: WorkspaceUseLeases;
   let exits: Array<(code: number) => void>;
   let createSession: ReturnType<typeof mock>;
+  let sendInput: ReturnType<typeof mock>;
   let service: TerminalService;
 
   beforeEach(async () => {
@@ -70,8 +71,10 @@ describe("TerminalService workspace use lease across two backends on one root", 
         });
       }
     );
+    sendInput = mock(() => undefined);
     const pty = {
       createSession,
+      sendInput,
       closeSession: mock(() => undefined),
       closeWorkspaceSessions: mock(() => undefined),
       getWorkspaceSessionIds: mock(() => []),
@@ -103,14 +106,46 @@ describe("TerminalService workspace use lease across two backends on one root", 
     expect(await gate()).toBe("mutated");
   });
 
-  test("close and closeWorkspaceSessions release each session's lease", async () => {
+  test("close and closeWorkspaceSessions keep each lease until that shell actually exits", async () => {
     const first = await service.create(params);
     await service.create(params);
     expect(leasesB.heldCount(workspaceId, "terminal")).toBe(2);
+    // Closing only signals the shell; it may still use the checkout until its exit event.
     service.close(first.sessionId);
+    await settledB();
+    expect(leasesB.heldCount(workspaceId, "terminal")).toBe(2);
+    exits[0](0);
     await settledB();
     expect(leasesB.heldCount(workspaceId, "terminal")).toBe(1);
     service.closeWorkspaceSessions(workspaceId);
+    await settledB();
+    expect(leasesB.heldCount(workspaceId, "terminal")).toBe(1);
+    exits[1](0);
+    await settledB();
+    expect(leasesB.heldCount(workspaceId, "terminal")).toBe(0);
+  });
+
+  test("an exit listener that throws does not keep the lease", async () => {
+    const session = await service.create(params);
+    service.onExit(session.sessionId, () => {
+      throw new Error("stale subscriber");
+    });
+    expect(() => exits[0](0)).toThrow("stale subscriber");
+    await settledB();
+    expect(leasesB.heldCount(workspaceId, "terminal")).toBe(0);
+  });
+
+  test("a create that fails after the shell spawned keeps the lease until the shell exits", async () => {
+    sendInput.mockImplementationOnce(() => {
+      throw new Error("initial command failed");
+    });
+    let failed: unknown;
+    await service
+      .create({ ...params, initialCommand: "echo hi" })
+      .catch((error: unknown) => (failed = error));
+    expect((failed as Error).message).toBe("initial command failed");
+    expect(leasesB.heldCount(workspaceId, "terminal")).toBe(1);
+    exits[0](0);
     await settledB();
     expect(leasesB.heldCount(workspaceId, "terminal")).toBe(0);
   });

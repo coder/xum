@@ -70,8 +70,8 @@ export class TerminalService {
   private readonly headlessOnDataDisposables = new Map<string, { dispose: () => void }>();
   /**
    * Each session's workspace use lease (#4476): another backend on the same Xum root must not
-   * rename or remove the checkout while a shell runs in it. Released by cleanup(), which every
-   * exit and close path goes through.
+   * rename or remove the checkout while a shell runs in it. Released when the PTY exits (close
+   * paths only signal it), and at once when a create fails before any shell was spawned.
    */
   private readonly sessionUseLeases = new Map<string, WorkspaceUseLease>();
   private readonly titleChangeDisposables = new Map<string, { dispose: () => void }>();
@@ -274,8 +274,9 @@ export class TerminalService {
       try {
         return await this.createUnreserved(params, closeEpoch, lease);
       } catch (error) {
-        // Idempotent: a PTY that was spawned and then cleaned up already released it.
-        await lease.release();
+        // A spawned PTY's exit releases its lease (the shell may still be running); otherwise no
+        // shell ever started, so release it now.
+        if (![...this.sessionUseLeases.values()].includes(lease)) await lease.release();
         throw error;
       }
     } finally {
@@ -385,9 +386,15 @@ export class TerminalService {
 
       const onExit = (code: number) => {
         if (tempSessionId) {
-          const emitter = this.exitEmitters.get(tempSessionId);
-          emitter?.emit("exit", code);
-          this.cleanup(tempSessionId);
+          const sessionId = tempSessionId;
+          try {
+            const emitter = this.exitEmitters.get(sessionId);
+            emitter?.emit("exit", code);
+            this.cleanup(sessionId);
+          } finally {
+            // The shell has exited: only now may another backend rename or remove its checkout.
+            this.releaseSessionUseLease(sessionId);
+          }
         }
       };
 
@@ -416,7 +423,8 @@ export class TerminalService {
       );
 
       tempSessionId = session.sessionId;
-      // From here cleanup(sessionId) owns the lease, like every other per-session resource.
+      // From here the PTY's exit owns the lease: close paths only signal the shell, which can
+      // keep using the checkout until it actually exits.
       this.sessionUseLeases.set(session.sessionId, lease);
 
       // Post-spawn recheck: a user-driven archive (which force-closes rather than refuses) may
@@ -1371,18 +1379,19 @@ export class TerminalService {
     headless?.dispose();
     this.headlessTerminals.delete(sessionId);
     this.serializeAddons.delete(sessionId);
+  }
 
+  private releaseSessionUseLease(sessionId: string): void {
     const lease = this.sessionUseLeases.get(sessionId);
-    if (lease != null) {
-      this.sessionUseLeases.delete(sessionId);
-      // cleanup() runs from synchronous exit/close paths. The release enters the lease's FIFO
-      // transition lock synchronously, so a later hold or mutation check always observes it.
-      lease.release().catch((error: unknown) => {
-        log.warn("Failed to release a terminal's workspace use lease", {
-          sessionId,
-          error: getErrorMessage(error),
-        });
+    if (lease == null) return;
+    this.sessionUseLeases.delete(sessionId);
+    // Called from the synchronous PTY exit callback. The release enters the lease's FIFO
+    // transition lock synchronously, so a later hold or mutation check always observes it.
+    lease.release().catch((error: unknown) => {
+      log.warn("Failed to release a terminal's workspace use lease", {
+        sessionId,
+        error: getErrorMessage(error),
       });
-    }
+    });
   }
 }

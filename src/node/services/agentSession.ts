@@ -1013,6 +1013,8 @@ export class AgentSession {
       this.activeToolCallIds.clear();
     },
     phaseChanged: (phase, isCurrent) => {
+      // First, before any listener below can throw: the coordinator has already committed idle.
+      if (phase === "idle") this.releaseTurnUseLeaseIfIdle();
       // Lifecycle listeners can synchronously admit or settle a successor. Capture this transition
       // and publish its ownership first, so nested callbacks cannot overwrite or settle that turn.
       const turnId = this.coordinator.turnId;
@@ -1030,10 +1032,7 @@ export class AgentSession {
       // The coordinator transitions a generation to idle only from its owner's completion paths
       // (finished turn, failed/withdrawn preparation, preemption), so this is that turn's
       // settlement — a stop cascade waiting on the captured generation may release its latch.
-      if (phase === "idle") {
-        this.releaseTurnUseLeaseIfIdle();
-        this.onTurnSettled?.(turnId);
-      }
+      if (phase === "idle") this.onTurnSettled?.(turnId);
     },
     drainQueue: () => {
       if (!this.messageQueue.isEmpty()) this.sendQueuedMessages("idle");

@@ -154,6 +154,51 @@ describe("AgentSession turn use lease across two backends on one root", () => {
     }
   });
 
+  test("a lifecycle listener that throws at idle does not keep the lease", async () => {
+    const reached = Promise.withResolvers<void>();
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
+      reached.resolve();
+      return Promise.resolve(Ok({ messageId: "assistant-1", completion: completion.promise }));
+    });
+    const b = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
+    const leasesB = workspaceUseLeasesFor(b.config);
+    let armed = false;
+    const idlePublished = Promise.withResolvers<void>();
+    b.session.onChatEvent(({ message }) => {
+      // Only the idle publication: the coordinator has committed idle and catches this throw.
+      if (armed && message.type === "stream-lifecycle" && !b.session.isBusy()) {
+        idlePublished.resolve();
+        throw new Error("listener");
+      }
+    });
+    try {
+      const sending = b.session.sendMessage("first", sendOptions);
+      await reached.promise;
+      b.aiEmitter.emit("stream-start", {
+        type: "stream-start",
+        workspaceId,
+        messageId: "assistant-1",
+        model,
+        startTime: Date.now(),
+      });
+      expect((await sending).success).toBe(true);
+      armed = true;
+      b.aiEmitter.emit("stream-end", end());
+      completion.resolve({ status: "completed", streamEnd: end() });
+      await idlePublished.promise;
+      await settled(leasesB);
+      expect(leasesB.heldCount(workspaceId, "turn")).toBe(0);
+    } finally {
+      armed = false;
+      await b.session.dispose();
+      await b.cleanup();
+    }
+  });
+
   test("disposing the session mid-turn releases its lease", async () => {
     const pending = Promise.withResolvers<StreamResult>();
     const reached = Promise.withResolvers<void>();
