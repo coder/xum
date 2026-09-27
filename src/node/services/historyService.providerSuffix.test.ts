@@ -13,12 +13,13 @@ import {
   rowsToBytes,
   type GeneratedRow,
 } from "./historyScanner.generator.testHarness";
+import { readProviderHistoryFromLatestBoundary } from "./historyScanner";
 import { createTestHistoryService } from "./testHistoryService";
 
 // The sidebar status (#4720) keeps `filter(pred).slice(-N)` of this suffix, so its window equals
 // the full provider read's exactly when the suffix is a suffix of that read holding at least N
-// matching rows (or all of it). Every case below checks that contract against the real
-// getHistoryFromLatestBoundary.
+// matching rows (or all of it). Every case below checks that contract against the two-pass
+// provider reader (readProviderHistoryFromLatestBoundary), the independent oracle.
 const statusRow = (m: MuxMessage) =>
   !isDurableContextResetBoundaryMarker(m) && !isModelHiddenMessage(m);
 
@@ -54,9 +55,11 @@ describe("HistoryService.getHistorySuffixFromLatestBoundary", () => {
     return `${await stamp(paths.chat)}|${await stamp(paths.archive)}`;
   }
   async function full(workspaceId: string): Promise<MuxMessage[]> {
+    // The service read may rotate a legacy layout, but for skip 0 it now shares the suffix scan
+    // (#4655), so the oracle is the independent two-pass reader over the same (rotated) files.
     const result = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!result.success) throw new Error(result.error);
-    return result.data;
+    return readProviderHistoryFromLatestBoundary(pathsFor(workspaceId), 0);
   }
   async function suffix(workspaceId: string, window: number): Promise<MuxMessage[]> {
     const result = await h.historyService.getHistorySuffixFromLatestBoundary(

@@ -647,8 +647,16 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
       const messages: Row[] = [];
       // Multi-hundred-MB epochs parse for seconds; keep timers (onChat heartbeats) alive.
       const yielder = new EventLoopYielder();
-      for (const line of buffer.toString("utf8").split("\n")) {
+      // Decode per row instead of one toString+split of the whole tail (a single ~0.4 s block at
+      // hundreds of MB, #4655). Equal output: 0x0A is ASCII, never inside a UTF-8 multibyte
+      // sequence, and an invalid sequence ends at it, so per-row decoding matches decoding the
+      // whole buffer and splitting on "\n".
+      for (let pos = 0; pos < buffer.length; ) {
         if (yielder.isDue()) await yielder.yield();
+        const newline = buffer.indexOf(10, pos);
+        const end = newline === -1 ? buffer.length : newline;
+        const line = buffer.toString("utf8", pos, end);
+        pos = end + 1;
         if (!line.trim()) continue;
         try {
           const row = project(JSON.parse(line) as unknown);
@@ -719,8 +727,43 @@ export function readProviderHistorySuffix(
   matches: (message: MuxMessage) => boolean
 ): Promise<MuxMessage[]> {
   assert(Number.isSafeInteger(minMatching) && minMatching > 0, "suffix window must be positive");
+  return scanProviderHistory(paths, { minMatching, matches });
+}
+
+/**
+ * readProviderHistoryFromLatestBoundary(paths, 0) in one pass (#4655): the suffix scan with a
+ * stop that is never requested, so the active epoch is read and parsed once instead of located
+ * and then re-read. Why the result is equal:
+ * - The scan visits every row from the end of chat.jsonl to the located start (or the whole file
+ *   when exhausted), keeps rows with `start >= from`, and reads the archive only when chat is
+ *   exhausted. With skip 0 an exhausted file has no oldest boundary (the first durable boundary
+ *   always returns a start), so the two-pass reader's clamp branches never apply.
+ * - Rows the classifier leaves null but the two-pass projection would accept (reset evidence with
+ *   ambiguous keys, a stringify throw) floor themselves out: the start is at or after such a row,
+ *   so it is never in the returned range (#4720; providerSuffix "unbounded window" cases).
+ * - A row up to the line limit keeps the locator's message, normalizePersistedMessage of the same
+ *   JSON.parse the projection does; oversized rows are re-read and parsed by that projection.
+ * `onBytesRead` keeps the replay-timing meaning (#4504): the raw tail bytes of each file whose
+ * rows are returned, archive before chat.
+ */
+export function readProviderHistory(
+  paths: Record<HistoryArtifact, string>,
+  options?: { onBytesRead?: (bytes: number) => void }
+): Promise<MuxMessage[]> {
+  return scanProviderHistory(paths, undefined, options?.onBytesRead);
+}
+
+/** Shared scan of readProviderHistorySuffix (with `stop`) and readProviderHistory (without). */
+function scanProviderHistory(
+  paths: Record<HistoryArtifact, string>,
+  stop: { minMatching: number; matches: (message: MuxMessage) => boolean } | undefined,
+  onBytesRead?: (bytes: number) => void
+): Promise<MuxMessage[]> {
   return withVerifiedHistorySnapshot(paths, async (files) => {
-    const kept: Array<ScannedHistoryRow & { file: HistorySnapshotFile }> = []; // newest first
+    // Newest file first; each file's rows are newest first and those starting before `from` are
+    // not part of the read.
+    const scanned: Array<{ file: HistorySnapshotFile; rows: ScannedHistoryRow[]; from: number }> =
+      [];
     let matching = 0;
     for (const artifact of ["chat", "archive"] as const) {
       const file = files.get(artifact);
@@ -728,33 +771,40 @@ export function readProviderHistorySuffix(
       const rows: ScannedHistoryRow[] = [];
       const location = await findProviderHistoryStart(file.handle, file.size, 0, false, (row) => {
         rows.push(row);
+        if (!stop) return false;
         // Only rows the full read projects count; oversized rows are parsed below.
-        if (row.message !== null && matches(row.message)) matching++;
+        if (row.message !== null && stop.matches(row.message)) matching++;
         // Monotonic: the stop stays requested across unreadable rows until a safe one.
-        return matching >= minMatching;
+        return matching >= stop.minMatching;
       });
-      const from = location.kind === "start" ? location.offset : 0;
-      for (const row of rows) if (row.start >= from) kept.push({ ...row, file });
+      assert(stop || location.kind !== "stopped", "provider reads without a stop never stop");
+      scanned.push({ file, rows, from: location.kind === "start" ? location.offset : 0 });
       // A start or a clean stop ends the read. An exhausted file keeps all its rows (no older
       // file can exclude them); continue into the archive only while the window is short.
-      if (location.kind !== "exhausted" || matching >= minMatching) break;
+      if (location.kind !== "exhausted" || (stop && matching >= stop.minMatching)) break;
     }
     const messages: MuxMessage[] = [];
-    for (let i = kept.length - 1; i >= 0; i--) {
-      const row = kept[i];
-      if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) {
-        if (row.message) messages.push(row.message);
-        continue;
-      }
-      // The locator does not parse oversized rows, but the full read's tail projection does.
-      const buffer = Buffer.alloc(row.size);
-      const read = await row.file.handle.read(buffer, 0, buffer.length, row.start);
-      if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
-      try {
-        const value: unknown = JSON.parse(buffer.toString("utf8"));
-        if (isReadableHistoryMessage(value)) messages.push(normalizePersistedMessage(value));
-      } catch {
-        // Same as the full read: unusable rows are not projected.
+    for (let s = scanned.length - 1; s >= 0; s--) {
+      const { file, rows, from } = scanned[s];
+      onBytesRead?.(file.size - from);
+      for (let i = rows.length - 1; i >= 0; i--) {
+        const row = rows[i];
+        if (row.start < from) continue;
+        if (row.size <= SESSION_HISTORY_MAX_LINE_BYTES) {
+          if (row.message) messages.push(row.message);
+          continue;
+        }
+        // The locator does not parse oversized rows, but the full read's tail projection does.
+        const buffer = Buffer.alloc(row.size);
+        const read = await file.handle.read(buffer, 0, buffer.length, row.start);
+        if (read.bytesRead !== buffer.length)
+          throw new Error("History changed during provider read");
+        try {
+          const value: unknown = JSON.parse(buffer.toString("utf8"));
+          if (isReadableHistoryMessage(value)) messages.push(normalizePersistedMessage(value));
+        } catch {
+          // Same as the full read: unusable rows are not projected.
+        }
       }
     }
     return messages;

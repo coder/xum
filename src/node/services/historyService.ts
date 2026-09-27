@@ -14,6 +14,7 @@ import {
   hasUnreadableHistoryResetEvidence,
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
+  readProviderHistory,
   readProviderHistoryFromLatestBoundary,
   readProviderHistorySuffix,
   readCompactionPendingHistoryBoundary,
@@ -2615,15 +2616,16 @@ export class HistoryService {
 
     // Provider and control-evidence reads share raw privacy floors. UI browsing
     // and archival rotation keep the durable-boundary locator and the full log.
+    const paths = {
+      chat: this.getChatHistoryPath(workspaceId),
+      archive: this.getChatArchivePath(workspaceId),
+    };
+    // Skip 0 (every provider request and replay) reads the active epoch once (#4655); older
+    // epochs keep the two-pass reader, whose clamp-to-oldest fallback needs the full location.
     return Ok(
-      await readProviderHistoryFromLatestBoundary(
-        {
-          chat: this.getChatHistoryPath(workspaceId),
-          archive: this.getChatArchivePath(workspaceId),
-        },
-        skip,
-        { onBytesRead }
-      )
+      skip === 0
+        ? await readProviderHistory(paths, { onBytesRead })
+        : await readProviderHistoryFromLatestBoundary(paths, skip, { onBytesRead })
     );
   }
 
