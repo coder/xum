@@ -566,6 +566,22 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     }
   });
 
+  test("create whose mutation gate cannot be taken keeps the row and discards its creation state", async () => {
+    const workspaceId = "ddddddddda";
+    spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+    spyOn(WorkspaceUseLeases.prototype, "acquireMutationGate").mockRejectedValueOnce(
+      Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+    );
+
+    const result = await createWorktree("gate-io-error");
+    expect(result.success ? "" : result.error).toContain("could not be rolled back");
+    expect(persistedWorkspaceIds()).toContain(workspaceId);
+    expect(initStateManager.getInitState(workspaceId)).toBeUndefined();
+    const sessions = (service as unknown as { sessions: Map<string, unknown> }).sessions;
+    expect(sessions.has(workspaceId)).toBe(false);
+  });
+
   test.each([
     { label: "materialized", awaitMaterialization: true },
     { label: "deferred", awaitMaterialization: false },

@@ -3407,7 +3407,8 @@ export class WorkspaceService
     const gate = await this.acquireStructuralMutationGate(workspaceId, {
       ignoreKinds: ignoreOwnKinds,
       backgroundProcesses: "refuse",
-    });
+      // A gate that cannot be taken (lock I/O error) cannot rule out a user either: keep the row.
+    }).catch((error: unknown) => Err(getErrorMessage(error)));
     if (!gate.success) {
       log.warn("Kept a half-created workspace that is in use", { workspaceId, error: gate.error });
       await this.discardCreationState(workspaceId, initAbortController, false);
