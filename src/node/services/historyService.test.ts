@@ -3065,11 +3065,10 @@ describe("HistoryService", () => {
   });
 
   describe("hasHistoryBeforeSequence", () => {
-    // The answer is an existence check over chat-archive.jsonl ∪ chat.jsonl. The
-    // implementation reads the archive first and falls back to chat.jsonl, and
-    // answers bound 0 without reading; these cases pin the union semantics.
+    // Existence check over chat-archive.jsonl ∪ chat.jsonl, independent of read order.
+    const workspaceId = "ws-has-older";
     const row = (id: string, historySequence?: number) =>
-      messageLine("ws-has-older", createMuxMessage(id, "user", id, { historySequence }));
+      messageLine(workspaceId, createMuxMessage(id, "user", id, { historySequence }));
     const malformed = "{not json";
 
     it.each<{
@@ -3129,7 +3128,6 @@ describe("HistoryService", () => {
         expected: true,
       },
     ])("$name", async ({ bound, archive, chat, expected }) => {
-      const workspaceId = "ws-has-older";
       await writeHistoryLines(config, workspaceId, chat);
       if (archive) {
         await fs.writeFile(
