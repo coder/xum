@@ -6436,6 +6436,8 @@ export class WorkspaceService
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
         // Retained (not just fired) so archive can await the per-project init loop's exit. The
         // loop runs under one "init" use lease, as runBackgroundInit does (#4857).
+        // Captured: the callback does not narrow the outer `let`.
+        const projectsInitLogger = initLogger;
         this.retainInitSettlement(
           workspaceId,
           withInitUseLease(workspaceUseLeasesFor(this.config), workspaceId, async () => {
@@ -6452,7 +6454,7 @@ export class WorkspaceService
                 )?.trusted ?? false;
 
               const projectInitLogger = {
-                ...initLogger,
+                ...projectsInitLogger,
                 // Each runtime's init path reports completion. Suppress per-project completion so
                 // multi-project workspaces only transition out of initializing after all runtimes finish.
                 logComplete: (_exitCode: number) => undefined,
@@ -6490,7 +6492,7 @@ export class WorkspaceService
                   projectPath: createdWorkspace.project.projectPath,
                   error: message,
                 });
-                initLogger.logStderr(
+                projectsInitLogger.logStderr(
                   `Initialization failed for ${createdWorkspace.project.projectName}: ${message}`
                 );
               }
@@ -6507,11 +6509,11 @@ export class WorkspaceService
               return;
             }
 
-            initLogger.logComplete(initFailed ? -1 : 0);
+            projectsInitLogger.logComplete(initFailed ? -1 : 0);
           }).catch((error: unknown) => {
             // Refused while another backend mutates the workspace: no init hook ran.
-            initLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
-            initLogger.logComplete(-1);
+            projectsInitLogger.logStderr(`Initialization failed: ${getErrorMessage(error)}`);
+            projectsInitLogger.logComplete(-1);
           })
         );
       } else {
