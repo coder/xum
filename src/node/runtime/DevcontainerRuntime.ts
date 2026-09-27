@@ -810,7 +810,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     workspaceName: string,
     force: boolean,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
 
@@ -822,7 +823,13 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
 
     // Delete worktree on host
-    return this.worktreeManager.deleteWorkspace(projectPath, workspaceName, force, trusted);
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {

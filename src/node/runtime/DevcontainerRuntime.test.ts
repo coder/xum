@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { execFileSync } from "child_process";
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
+import * as devcontainerCli from "./devcontainerCli";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
 import type { ExecOptions, ExecStream } from "./Runtime";
 
@@ -390,5 +392,63 @@ describe("DevcontainerRuntime.getContainerEnv", () => {
     runtime.setCurrentWorkspacePath(workspacePath);
 
     expect(runtime.getContainerEnv()).toEqual({});
+  });
+});
+
+describe("DevcontainerRuntime.deleteWorkspace", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "mux-devcontainer-delete-"));
+  });
+  afterEach(async () => {
+    mock.restore();
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  // #4819: undoing a creation that reused a branch removes the host worktree but not the branch.
+  it("keeps the branch on a forced delete with keepBranch", async () => {
+    spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+    const projectPath = path.join(root, "repo");
+    await fs.mkdir(projectPath);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: projectPath, encoding: "utf8" }).trim();
+    git("init", "-b", "main");
+    git(
+      "-c",
+      "user.email=t@example.com",
+      "-c",
+      "user.name=T",
+      "commit",
+      "--allow-empty",
+      "-m",
+      "init"
+    );
+    const tip = git(
+      "-c",
+      "user.email=t@example.com",
+      "-c",
+      "user.name=T",
+      "commit-tree",
+      "HEAD^{tree}",
+      "-p",
+      "HEAD",
+      "-m",
+      "own work"
+    );
+    git("branch", "reused", tip);
+    const runtime = new DevcontainerRuntime({
+      srcBaseDir: path.join(root, "src"),
+      configPath: ".devcontainer/devcontainer.json",
+    });
+    const workspacePath = runtime.getWorkspacePath(projectPath, "reused");
+    git("worktree", "add", workspacePath, "reused");
+
+    const result = await runtime.deleteWorkspace(projectPath, "reused", true, undefined, true, {
+      keepBranch: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect(git("rev-parse", "reused")).toBe(tip);
+    expect(await fs.stat(workspacePath).catch(() => null)).toBeNull();
   });
 });

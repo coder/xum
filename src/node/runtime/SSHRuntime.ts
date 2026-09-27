@@ -3170,7 +3170,8 @@ export class SSHRuntime extends RemoteRuntime {
     workspaceName: string,
     force: boolean,
     abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Check if already aborted
     if (abortSignal?.aborted) {
@@ -3365,7 +3366,12 @@ export class SSHRuntime extends RemoteRuntime {
         // path (git worktree add -b fails if the branch already exists).
         // Skip protected trunk branch names to avoid accidental deletion.
         const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
-        if (branchToDelete && !PROTECTED_BRANCHES.includes(branchToDelete)) {
+        // keepBranch: the caller undoes a creation that reused this branch (#4819).
+        if (
+          branchToDelete &&
+          !PROTECTED_BRANCHES.includes(branchToDelete) &&
+          options?.keepBranch !== true
+        ) {
           // HEAD neutralization migrates legacy *Xum-owned* base repos whose
           // HEAD still points at a user branch (the Graphite-poisoning state)
           // so `branch -D` keeps Git's native checked-out-branch guard instead
