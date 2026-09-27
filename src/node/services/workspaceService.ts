@@ -3257,23 +3257,25 @@ export class WorkspaceService
   private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
     for (let attempt = 0; attempt < 2; attempt++) {
       await this.config.removeWorkspace(workspaceId).catch(() => undefined);
-      // Strict: a lenient read of an unreadable file returns an empty default, which would
-      // falsely prove the entry gone and license deleting its checkout (#4775).
-      let stillPresent = true;
-      try {
-        const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
-        stillPresent = Array.from(persisted.projects.values()).some((project) =>
-          project.workspaces.some((workspace) => workspace.id === workspaceId)
-        );
-      } catch {
-        // Not provably gone.
-      }
-      if (!stillPresent) {
+      if (this.isRegistrationProvablyGone(workspaceId)) {
         return true;
       }
     }
     log.error(`Failed to roll back workspace ${workspaceId} after its creation aborted`);
     return false;
+  }
+
+  private isRegistrationProvablyGone(workspaceId: string): boolean {
+    // Strict: a lenient read of an unreadable file returns an empty default, which would
+    // falsely prove the entry gone and license deleting its checkout (#4775).
+    try {
+      const persisted = this.config.loadConfigOrDefault({ throwOnError: true });
+      return !Array.from(persisted.projects.values()).some((project) =>
+        project.workspaces.some((workspace) => workspace.id === workspaceId)
+      );
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -3377,9 +3379,10 @@ export class WorkspaceService
   }
 
   /**
-   * #4818: undo the registration of a create()/fork() that failed after its config write, so the
-   * caller is not told creation failed while the workspace stays listed (and, once the default
-   * consent was granted, messageable). `rollback` is the operation's own abort, which keeps
+   * #4818: undo the registration of a create()/fork() that failed after its config write and
+   * before publishing the workspace, so the caller is not told creation failed while the workspace
+   * stays listed (and, after the default grant, messageable). `rollback` is the operation's own
+   * abort, which keeps
    * #4777's rules: only a branch this operation made is deleted, and the checkout only after a
    * strict read shows the entry gone. Returns the error to report.
    */
@@ -3390,13 +3393,14 @@ export class WorkspaceService
   ): Promise<string> {
     const entryGone = await rollback().catch((rollbackError: unknown) => {
       logRegistrationRollbackFailure(workspaceId, rollbackError);
-      return false;
+      // A cleanup step after the deregistration can throw too.
+      return this.isRegistrationProvablyGone(workspaceId);
     });
     if (!entryGone) {
       return `${error} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${workspaceId} manually before retrying.`;
     }
-    // The workspace may already have been announced.
-    this.emit("metadata", { workspaceId, metadata: null });
+    // Setup may already have written activity (fork's goal inheritance, for example).
+    await this.discardExtensionMetadataEntry(workspaceId);
     return error;
   }
 
@@ -5908,6 +5912,10 @@ export class WorkspaceService
             );
           }
         }
+        // Publication starts here (the consent grant, then the announcement below): once other
+        // task trees or the UI can reach the workspace, a forced rollback could delete it under
+        // them, so the steps from here on must not fail.
+        rollBackRegistration = undefined;
         if (defaultConsent !== "after-setup") {
           // Off until the caller finalizes the mark, or for good (see the option).
         } else if (pendingMaterialization !== undefined) {
@@ -5935,13 +5943,9 @@ export class WorkspaceService
 
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
-      // Background init: run postCreateSetup (if present) then initWorkspace
-      const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(owningProjectPath)
-      );
-      // Background init (or a removal already under way) owns the workspace from here, so a
-      // rollback would race it; the remaining steps do not throw (code-workspace sync never does).
-      rollBackRegistration = undefined;
+      // Background init: run postCreateSetup (if present) then initWorkspace. It reuses the
+      // secrets read before the checkout: a second, fallible read here would come after
+      // publication (#4818).
       // Background init: postCreateSetup (provisioning) + initWorkspace (sync/checkout/hook)
       //
       // If the user cancelled creation while create() was still in flight, avoid spawning
@@ -5953,7 +5957,7 @@ export class WorkspaceService
           trunkBranch: normalizedTrunkBranch,
           workspacePath: createResult!.workspacePath,
           initLogger,
-          env: secrets,
+          env: createEnv,
           abortSignal: initAbortController.signal,
           trusted: projectConfig.trusted ?? false,
         };

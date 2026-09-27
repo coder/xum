@@ -673,23 +673,16 @@ describe("default consent pending mark (#4446, #4455)", () => {
     expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
   });
 
-  test("create() that fails after registration leaves no pending mark behind", async () => {
+  test("create() that fails after registration leaves no row, so no pending mark", async () => {
     mockDeferredRuntime(new Promise<void>(() => undefined));
     // Fails once the row is registered, before the deferred checkout's settlement is retained.
-    const secretsStore = internals().secretsStore;
-    const realGetEffectiveSecrets = secretsStore.getEffectiveSecrets.bind(secretsStore);
-    spyOn(secretsStore, "getEffectiveSecrets").mockImplementation((projectPathArg: string) => {
-      if (readEntry() != null) throw new Error("secrets unavailable");
-      return realGetEffectiveSecrets(projectPathArg);
-    });
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
 
     const result = await createDeferredWorkspace();
 
     expect(result.success).toBe(false);
-    // The failed create() keeps its row today (tracked separately); the default must not stay
-    // pending on it, and no consent was granted.
-    expect(readEntry()?.unrelatedWorkspaceConsentPending).toBeUndefined();
-    expect(readEntry()?.unrelatedWorkspaceConsent).toBeUndefined();
+    // #4818 rolls the registration back, so no consent or pending default survives on it.
+    expect(readEntry()).toBeUndefined();
   });
 
   test.each([

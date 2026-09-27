@@ -6,8 +6,6 @@ import * as path from "node:path";
 
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { Result } from "@/common/types/result";
-import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { SecretsStore } from "@/node/config/secretsStore";
 import type { ExperimentsService } from "./experimentsService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -406,29 +404,16 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     }
   );
 
-  test("create failing after the consent grant removes the announced, consented row", async () => {
+  test("create whose cleanup throws after the deregistration still reports it rolled back", async () => {
     const workspaceId = "ddddddddd2";
     spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
-    let secretsCalls = 0;
-    // The second read comes after the grant and the announcement, before background init. The
-    // project has no secrets, so the first read returns what the real store would.
-    spyOn(SecretsStore.prototype, "getEffectiveSecrets").mockImplementation(() => {
-      if (++secretsCalls === 2) throw new Error("secrets store unavailable");
-      return [];
-    });
-    const announced: Array<FrontendWorkspaceMetadata | null> = [];
-    service.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
-      if (event.workspaceId === workspaceId) {
-        announced.push(event.metadata as FrontendWorkspaceMetadata | null);
-      }
-    });
+    spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+    spyOn(initStateManager, "deleteInitStatus").mockRejectedValueOnce(new Error("EBUSY"));
 
-    const result = await createWorktree("after-grant");
-    expect(result.success ? "" : result.error).toContain("secrets store unavailable");
-    expect(announced[0]?.unrelatedWorkspaceConsent).toBeString();
-    expect(announced.at(-1)).toBeNull();
-    await expectNoCreationLeftovers(workspaceId, "after-grant", [projectPath]);
-    expect(git(projectPath, "branch", "--list", "after-grant")).toBe("");
+    const result = await createWorktree("cleanup-throws");
+    expect(result.success ? "" : result.error).toContain("Failed to retrieve workspace metadata");
+    expect(result.success ? "" : result.error).not.toContain("could not be rolled back");
+    expect(persistedWorkspaceIds()).not.toContain(workspaceId);
   });
 
   test("fork failing after registration rolls it back, leaving the source intact", async () => {
