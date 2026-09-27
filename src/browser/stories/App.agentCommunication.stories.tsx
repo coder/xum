@@ -1,7 +1,7 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { getAutoExpandPrefsKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { PhoneSubagentReportDecorator } from "./helpers/subagentReportStory";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
@@ -230,7 +230,9 @@ function setupQueuedCommunicationStory() {
 
 export const Queued: AppStory = {
   render: () => <AppWithMocks setup={setupQueuedCommunicationStory} />,
-  parameters: Outgoing.parameters,
+  // Play-only contract: the Pixel snapshot budget is full, and the label-only change is covered
+  // by the unit test plus this layout check.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await canvas.findByText("Queued until turn end");
@@ -250,7 +252,6 @@ export const QueuedPhone: AppStory = {
   ...Queued,
   globals: Phone.globals,
   decorators: Phone.decorators,
-  parameters: Phone.parameters,
 };
 
 export const DeliveryFailures: AppStory = {
