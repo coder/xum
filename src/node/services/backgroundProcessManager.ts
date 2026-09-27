@@ -31,9 +31,15 @@ import {
 } from "./bashMonitorRegistryStore";
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
+// Host file lock serializing background process name claims across backends (#4873).
+// A regular file inside the workspace records root: record scanners only read directories.
+const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
+// The critical section is a few local fs calls; a longer wait means a wedged holder.
+const SPAWN_NAME_LOCK_TIMEOUT_MS = 10_000;
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
 const MONITOR_POLL_INTERVAL_MS_REMOTE = 1_000;
 const MONITOR_MAX_PENDING_LINES = 50;
@@ -1456,15 +1462,46 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // why reuse would blind archive gating. Host-local records are probed on the local
     // filesystem with host PID checks; all other layouts (SSH/Coder, Docker, devcontainer)
     // live in the runtime's exec namespace and are probed through the runtime instead.
+    // Set once this spawn has created its host-local record directory (see below).
+    let claimedLocalDir: string | null = null;
     if (spawnRecordsAreHostLocal(runtime)) {
-      let suffix = 2;
-      while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
-        this.reservedProcessIds.delete(processId);
-        do {
-          processId = `${config.displayName} (${suffix})`;
-          suffix++;
-        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
-        this.reservedProcessIds.add(processId);
+      // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`)
+      // have separate in-memory reservations but share this records root, so without a
+      // host-level claim both could probe a name as free and spawn into one directory. The
+      // probe-and-reuse therefore runs under a per-workspace host file lock and ends by
+      // creating a fresh, empty directory. An empty directory reads as held to every other
+      // backend's probe (no meta, no exit marker), so the name stays taken after the lock is
+      // released. The lock is a regular file, which record scanners skip (they read only
+      // directories).
+      const workspaceDir = localBgWorkspaceDir(workspaceId);
+      try {
+        await using _claimLock = await acquireProcessFileLock({
+          lockPath: nodePath.join(workspaceDir, SPAWN_NAME_LOCK_FILENAME),
+          timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+          label: "background process name lock",
+        });
+        let suffix = 2;
+        while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
+          this.reservedProcessIds.delete(processId);
+          do {
+            processId = `${config.displayName} (${suffix})`;
+            suffix++;
+          } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+          this.reservedProcessIds.add(processId);
+        }
+        // Free or settled: drop any settled record and create the directory exclusively.
+        // Non-recursive mkdir fails with EEXIST instead of silently sharing a directory.
+        const processDir = nodePath.join(workspaceDir, processId);
+        await fsPromises.rm(processDir, { recursive: true, force: true });
+        await fsPromises.mkdir(processDir);
+        claimedLocalDir = processDir;
+      } catch (error) {
+        return {
+          success: false,
+          error: `Failed to reserve background process name ${JSON.stringify(
+            processId
+          )}: ${getErrorMessage(error)}`,
+        };
       }
     } else {
       let suffix = 2;
@@ -1497,6 +1534,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     if (!result.success) {
       log.debug(`BackgroundProcessManager: Failed to spawn: ${result.error}`);
+      if (claimedLocalDir != null) {
+        // Early failures (e.g. a missing cwd) return before spawnProcess touches the
+        // directory; our still-empty claim would otherwise read as a held name and a crash
+        // artifact forever. rmdir only removes an empty directory, so anything spawnProcess
+        // chose to keep (e.g. an ambiguous launch's record) stays.
+        await fsPromises.rmdir(claimedLocalDir).catch(() => undefined);
+      }
       // Non-host record layouts: a failed spawn may leave the record directory holding a
       // live detached process (preserved ambiguous PID echo, post-dispatch transport throw,
       // or a failed best-effort cleanup), and the local disk probe above cannot see those

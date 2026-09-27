@@ -167,6 +167,36 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("gives concurrent same-name spawns from two backends distinct record directories", async () => {
+      // Two backends (desktop + `xum server` on one XUM_ROOT) each have their own manager
+      // with separate in-memory reservations, but share the host records root.
+      const otherBackend = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const [first, second] = await Promise.all(
+          [manager, otherBackend].map((m) =>
+            m.spawn(runtime, testWorkspaceId, "sleep 30", {
+              cwd: process.cwd(),
+              displayName: "dev server",
+            })
+          )
+        );
+        expect(first.success).toBe(true);
+        expect(second.success).toBe(true);
+        if (!first.success || !second.success) return;
+        expect(first.outputDir).not.toBe(second.outputDir);
+        // Each record describes its own process (no shared meta.json).
+        const metaPids = await Promise.all(
+          [first, second].map(async (r) => {
+            const raw = await fs.readFile(path.join(r.outputDir, "meta.json"), "utf-8");
+            return (JSON.parse(raw) as BackgroundProcessMeta).pid;
+          })
+        );
+        expect(metaPids).toEqual([first.pid, second.pid]);
+      } finally {
+        await otherBackend.cleanup(testWorkspaceId);
+      }
+    });
+
     it("should return error on spawn failure", async () => {
       const result = await manager.spawn(runtime, testWorkspaceId, "echo test", {
         cwd: "/nonexistent/path/that/does/not/exist",
@@ -174,6 +204,12 @@ describe("BackgroundProcessManager", () => {
       });
 
       expect(result.success).toBe(false);
+      // The failed spawn must release its host name claim: a leftover empty directory would
+      // hold the name and read as a crash artifact to the orphan archive gate.
+      expect(
+        await fs.stat(path.join(localBgWorkspaceDir(testWorkspaceId), "test")).catch(() => null)
+      ).toBeNull();
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(testWorkspaceId)).toBe(false);
     });
 
     it("should write stdout and stderr to unified output file", async () => {
