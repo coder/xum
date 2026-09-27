@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { isAllowedOrpcPath, sanitizeWebviewOrpcInput } from "./orpcAllowlist";
+import {
+  isAllowedOrpcPath,
+  sanitizeWebviewOrpcInput,
+  webviewKnownWorkspaceIds,
+} from "./orpcAllowlist";
 
 describe("isAllowedOrpcPath", () => {
   test("allows known procedures", () => {
@@ -77,5 +81,16 @@ describe("agents.list (#4751)", () => {
       ok: true,
       input,
     });
+  });
+
+  test("accepts the restored selection before the workspace list has loaded", () => {
+    // On a fresh extension host the selected workspace is posted to the webview before the list
+    // refresh finishes, and the webview asks for its agents right away.
+    const knownBeforeRefresh = webviewKnownWorkspaceIds([], "ws-restored");
+    expect(
+      sanitizeWebviewOrpcInput(["agents", "list"], { workspaceId: "ws-restored" }, knownBeforeRefresh)
+        .ok
+    ).toBe(true);
+    expect(webviewKnownWorkspaceIds(["ws-1"], null)).toEqual(new Set(["ws-1"]));
   });
 });

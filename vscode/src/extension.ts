@@ -23,7 +23,11 @@ import type {
   UiConnectionStatus,
   UiWorkspace,
 } from "./webview/protocol";
-import { isAllowedOrpcPath, sanitizeWebviewOrpcInput } from "./orpcAllowlist";
+import {
+  isAllowedOrpcPath,
+  sanitizeWebviewOrpcInput,
+  webviewKnownWorkspaceIds,
+} from "./orpcAllowlist";
 import { parseWebviewToExtensionMessage } from "./parseWebviewToExtensionMessage";
 import { openWorkspace } from "./workspaceOpener";
 
@@ -1579,7 +1583,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
       const sanitized = sanitizeWebviewOrpcInput(
         args.path,
         args.input,
-        new Set(this.workspacesById.keys())
+        webviewKnownWorkspaceIds(this.workspacesById.keys(), this.selectedWorkspaceId)
       );
       if (!sanitized.ok) {
         this.postMessage({
