@@ -45,6 +45,7 @@ if (process.platform === "darwin") {
 import { DesktopWindowManager } from "./desktopWindowManager";
 import { KeepAwakeController } from "./keepAwake";
 import { RemoteConnectionManager } from "./remoteConnectionManager";
+import { getLocalServerLoadUrl } from "./localServerDiscovery";
 import { REMOTE_CONNECTION_CHANNELS } from "@/common/constants/remoteConnection";
 import { randomBytes } from "crypto";
 import { RPCHandler } from "@orpc/server/message-port";
@@ -470,6 +471,14 @@ function initializeRemoteConnections(): void {
   electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.disconnect, (event) => {
     assertLocalController(event);
     manager.disconnect();
+  });
+  electronIpcMain.handle(REMOTE_CONNECTION_CHANNELS.openLocalServer, async (event) => {
+    assertLocalController(event);
+    assert(config, "Open Server Window requires the loaded config");
+    // peek() never deletes a stale lock, so discovery cannot race a starting xum server.
+    const lock = await new ServerLockfile(config.rootDir).peek();
+    // The token stays in this process: it only reaches the sandboxed window's load URL.
+    return manager.openLocalServer(getLocalServerLoadUrl(lock, process.pid));
   });
 }
 

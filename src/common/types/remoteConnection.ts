@@ -6,7 +6,12 @@ export interface RemoteConnectionApi {
   connect(url: string): Promise<void>;
   disconnect(): Promise<void>;
   onStateChanged(callback: (state: RemoteConnectionState) => void): () => void;
+  /** Open or focus a window for the xum server holding this root's server.lock. */
+  openLocalServer(): Promise<OpenLocalServerResult>;
 }
+
+/** Never carries the server token. On "unavailable", RemoteConnectionState.error explains why. */
+export type OpenLocalServerResult = { status: "shown" } | { status: "unavailable" };
 
 export interface RemoteConnectionState {
   /** The server base URL retains its app-proxy path but excludes credentials and URL tokens. */

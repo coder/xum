@@ -946,3 +946,87 @@ describe("RemoteConnectionManager", () => {
     expect(openExternal).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("RemoteConnectionManager server restarts and local discovery", () => {
+  test("reloads a connected window only when the same server's token changes", async () => {
+    const { manager, windows } = setup();
+    await manager.connect("http://localhost:3000/?token=first");
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
+    // Same token or no token: focus the existing page.
+    await manager.connect("http://localhost:3000/?token=first");
+    await manager.connect("http://localhost:3000/");
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
+    expect(windows[0].focus).toHaveBeenCalledTimes(3);
+    // A restarted server has a new token; the old page can no longer authenticate.
+    await manager.connect("http://localhost:3000/?token=second");
+    expect(windows).toHaveLength(1);
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(2);
+    expect(windows[0].loadURL).toHaveBeenLastCalledWith("http://localhost:3000/?token=second");
+    expect(manager.getState()).toEqual({ status: "connected", serverUrl: "http://localhost:3000" });
+    await manager.connect("http://localhost:3000/?token=second");
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(2);
+  });
+
+  test("keeps duplicate requests during the first load on that load", async () => {
+    const load = deferred();
+    const { manager, windows } = setup(load.promise);
+    const first = manager.connect("http://localhost:3000/?token=first");
+    const duplicate = manager.connect("http://localhost:3000/?token=second");
+    load.resolve();
+    await Promise.all([first, duplicate]);
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
+  });
+
+  test("closes the window with a credential-free error when a token reload fails", async () => {
+    const { manager, windows, onStateChanged } = setup();
+    await manager.connect("http://localhost:3000/?token=first");
+    windows[0].loadURL.mockImplementationOnce(() =>
+      Promise.reject(new Error("Cannot load ?token=second-secret"))
+    );
+    const result = await manager.openLocalServer("http://localhost:3000/?token=second-secret");
+    expect(result).toEqual({ status: "unavailable" });
+    expect(windows[0].destroyed).toBe(true);
+    expect(manager.getState().status).toBe("disconnected");
+    expect(manager.getState().error).toBeTruthy();
+    expect(JSON.stringify(onStateChanged.mock.calls)).not.toContain("second-secret");
+  });
+
+  test("reports a missing local server without creating a window", async () => {
+    const { manager, windows } = setup();
+    expect(await manager.openLocalServer(null)).toEqual({ status: "unavailable" });
+    expect(windows).toHaveLength(0);
+    expect(manager.getState()).toMatchObject({ status: "disconnected", serverUrl: null });
+    expect(manager.getState().error).toContain("No running xum server");
+  });
+
+  test("keeps another server's window when the local server is missing or different", async () => {
+    const { manager, windows } = setup();
+    await manager.connect("https://remote.example.com/");
+    expect(await manager.openLocalServer(null)).toEqual({ status: "unavailable" });
+    expect(await manager.openLocalServer("http://localhost:3000/?token=local")).toEqual({
+      status: "unavailable",
+    });
+    expect(windows).toHaveLength(1);
+    expect(windows[0].destroyed).toBe(false);
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
+    // The connection stays, and Settings can show why nothing opened.
+    expect(manager.getState()).toMatchObject({
+      status: "connected",
+      serverUrl: "https://remote.example.com",
+    });
+    expect(manager.getState().error).toBeTruthy();
+  });
+
+  test("opens, then focuses, the local server's window", async () => {
+    const { manager, windows } = setup();
+    expect(await manager.openLocalServer("http://localhost:3000/?token=local")).toEqual({
+      status: "shown",
+    });
+    expect(await manager.openLocalServer("http://localhost:3000/?token=local")).toEqual({
+      status: "shown",
+    });
+    expect(windows).toHaveLength(1);
+    expect(windows[0].loadURL).toHaveBeenCalledTimes(1);
+    expect(manager.getState()).toEqual({ status: "connected", serverUrl: "http://localhost:3000" });
+  });
+});

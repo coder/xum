@@ -6,6 +6,7 @@ import { REMOTE_CONNECTION_URL_KEY } from "@/browser/features/Settings/Sections/
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getRemoteConnectionServerUrl,
+  type OpenLocalServerResult,
   type RemoteConnectionApi,
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
@@ -13,6 +14,9 @@ import {
 const SAVED_SERVER_URL = "https://saved.example.com/@user/existing/apps/xum";
 const SERVER_URL = "https://remote.example.com/@user/workspace/apps/xum";
 const TOKEN_URL = SERVER_URL + "///?token=transient-secret#private-fragment";
+const LOCAL_SERVER_URL = "http://localhost:3000";
+const LOCAL_SERVER_NOT_FOUND =
+  "No running xum server found for this Xum root. Start `xum server` first, or connect by URL.";
 
 function createRemoteBridge() {
   let state: RemoteConnectionState = { serverUrl: null, status: "disconnected" };
@@ -30,6 +34,10 @@ function createRemoteBridge() {
     disconnect: fn(() => {
       publish({ serverUrl: null, status: "disconnected" });
       return Promise.resolve();
+    }),
+    openLocalServer: fn((): Promise<OpenLocalServerResult> => {
+      publish({ serverUrl: null, status: "disconnected", error: LOCAL_SERVER_NOT_FOUND });
+      return Promise.resolve({ status: "unavailable" });
     }),
     onStateChanged: fn((listener: (next: RemoteConnectionState) => void) => {
       listeners.add(listener);
@@ -222,6 +230,29 @@ export const HttpWarningPhone: AppStory = {
   play: async ({ canvasElement, parameters }) => {
     await expect(parameters.pixel).toMatchObject({ matrix: { viewports: ["phone"] } });
     await exerciseHttpWarning(canvasElement);
+  },
+};
+
+export const LocalServer: AppStory = {
+  render: () => <AppWithMocks setup={setupRemoteSettings} />,
+  play: async ({ canvasElement }) => {
+    const section = await openRemoteSettings(canvasElement);
+    const open = section.getByRole("button", { name: "Open local xum server" });
+    // No server on this root: the bridge state explains it; nothing else changes.
+    await userEvent.click(open);
+    await expect(await section.findByRole("alert")).toHaveTextContent("No running xum server");
+    await expect(remote.bridge.connect).not.toHaveBeenCalled();
+
+    remote.bridge.openLocalServer.mockImplementationOnce(() => {
+      remote.publish({ serverUrl: LOCAL_SERVER_URL, status: "connected" });
+      return Promise.resolve({ status: "shown" });
+    });
+    await userEvent.click(open);
+    await waitFor(() =>
+      expect(section.getByRole("status")).toHaveTextContent("Connected · " + LOCAL_SERVER_URL)
+    );
+    await expect(section.queryByRole("alert")).toBeNull();
+    await expect(remote.bridge.openLocalServer).toHaveBeenCalledTimes(2);
   },
 };
 

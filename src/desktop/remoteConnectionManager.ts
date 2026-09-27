@@ -10,6 +10,7 @@ import {
 import {
   parseRemoteConnectionUrl,
   getRemoteConnectionServerUrl,
+  type OpenLocalServerResult,
   type RemoteConnectionState,
 } from "@/common/types/remoteConnection";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -23,6 +24,8 @@ interface RemoteWindowEntry {
   loaded: Promise<void>;
   authPopup: BrowserWindow | "opening" | null;
   popups: Map<BrowserWindow, RemotePopupKind>;
+  /** sha256 of the loaded `?token=`, never the token itself. A change means the server restarted. */
+  tokenDigest: string | null;
 }
 
 interface RemoteWindowOptions {
@@ -63,6 +66,15 @@ function isRemoteAppUrl(serverUrl: string, target: string): boolean {
   return destination.pathname === basePath || destination.pathname.startsWith(basePath + "/");
 }
 
+const DIFFERENT_SERVER_ERROR = "Disconnect the current remote server first.";
+const LOCAL_SERVER_NOT_FOUND_ERROR =
+  "No running xum server found for this Xum root. Start `xum server` first, or connect by URL.";
+
+function getUrlTokenDigest(url: URL): string | null {
+  const token = url.searchParams.get("token");
+  return token ? createHash("sha256").update(token).digest("hex") : null;
+}
+
 function isRemoteBlobUrl(serverUrl: string, target: string): boolean {
   const destination = new URL(target);
   return destination.protocol === "blob:" && destination.origin === new URL(serverUrl).origin;
@@ -87,7 +99,20 @@ export class RemoteConnectionManager {
     const existing = this.entry;
     if (existing) {
       if (existing.serverUrl !== serverUrl) {
-        throw new Error("Disconnect the current remote server first.");
+        throw new Error(DIFFERENT_SERVER_ERROR);
+      }
+      const tokenDigest = getUrlTokenDigest(url);
+      // Duplicate requests during a load share it. Once connected, a different token for the same
+      // server means it restarted with new credentials, so reload instead of focusing a page that
+      // can no longer authenticate (#4846).
+      if (
+        this.state.status === "connected" &&
+        tokenDigest != null &&
+        tokenDigest !== existing.tokenDigest
+      ) {
+        existing.tokenDigest = tokenDigest;
+        this.setState({ status: "connecting", serverUrl });
+        existing.loaded = this.loadWindow(existing, url.href);
       }
       await existing.loaded;
       if (this.entry === existing) {
@@ -118,6 +143,7 @@ export class RemoteConnectionManager {
       loaded: Promise.resolve(),
       authPopup: null,
       popups: new Map(),
+      tokenDigest: getUrlTokenDigest(url),
     };
     this.entry = entry;
     this.setState({ status: "connecting", serverUrl });
@@ -125,6 +151,33 @@ export class RemoteConnectionManager {
     // Reserve the window before loading. Duplicate requests share its completion.
     entry.loaded = this.loadWindow(entry, url.href);
     await entry.loaded;
+  }
+
+  /**
+   * Open or focus the window for the xum server discovered from this root's server.lock.
+   * `loadUrl` comes from getLocalServerLoadUrl (null when no server runs). Every unavailable
+   * result leaves its reason in state.error, where Settings shows it; results never carry tokens.
+   */
+  async openLocalServer(loadUrl: string | null): Promise<OpenLocalServerResult> {
+    const existing = this.entry;
+    if (
+      loadUrl == null ||
+      (existing && existing.serverUrl !== getRemoteConnectionServerUrl(loadUrl))
+    ) {
+      const error = loadUrl == null ? LOCAL_SERVER_NOT_FOUND_ERROR : DIFFERENT_SERVER_ERROR;
+      // Keep an open server window and its connection; only add the explanation.
+      this.setState(
+        existing ? { ...this.state, error } : { status: "disconnected", serverUrl: null, error }
+      );
+      return { status: "unavailable" };
+    }
+    try {
+      await this.connect(loadUrl);
+    } catch {
+      // loadWindow already recorded a credential-free state.error.
+      return { status: "unavailable" };
+    }
+    return this.state.status === "connected" ? { status: "shown" } : { status: "unavailable" };
   }
 
   private guardWindow(entry: RemoteWindowEntry): void {

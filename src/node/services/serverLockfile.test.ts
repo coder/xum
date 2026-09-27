@@ -42,6 +42,30 @@ describe("ServerLockfile", () => {
     expect(data!.networkBaseUrls).toEqual(["http://192.168.1.10:12345"]);
   });
 
+  test("peek returns a live lock without deleting anything", async () => {
+    await lockfile.acquire("http://localhost:12345", "test-token");
+    const data = await lockfile.peek();
+    expect(data?.baseUrl).toBe("http://localhost:12345");
+    expect(data?.token).toBe("test-token");
+    await fs.access(lockfile.getLockPath());
+  });
+
+  test("peek ignores a stale lock but leaves it for its owner to clean up", async () => {
+    // Discovery must never unlink a lock: a starting xum server may be replacing it.
+    const lockPath = lockfile.getLockPath();
+    await fs.writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999999999,
+        baseUrl: "http://localhost:12345",
+        token: "test-token",
+        startedAt: new Date().toISOString(),
+      })
+    );
+    expect(await lockfile.peek()).toBeNull();
+    await fs.access(lockPath);
+  });
+
   test("read returns null for non-existent lockfile", async () => {
     const data = await lockfile.read();
     expect(data).toBeNull();
