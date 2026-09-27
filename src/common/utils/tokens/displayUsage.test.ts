@@ -664,6 +664,15 @@ describe("OpenAI service-tier pricing (#4352)", () => {
     expect(getTotalCost(usage)).toBe(0);
   });
 
+  test("prices the bare gpt-5.6 catalog alias like gpt-5.6-sol", () => {
+    expect(cost("openai:gpt-5.6", 100_000, "fast")).toBe(
+      cost("openai:gpt-5.6-sol", 100_000, "fast")
+    );
+    expect(cost("openai:gpt-5.6", 100_000, "fast")).toBeGreaterThan(
+      cost("openai:gpt-5.6", 100_000)
+    );
+  });
+
   test("resolves the same tier rates for dated snapshots and metadata-model overrides", () => {
     const base = cost("openai:gpt-6-sol", 100_000, "fast");
     expect(cost("openai:gpt-6-sol-2026-09-01", 100_000, "fast")).toBe(base);
