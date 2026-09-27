@@ -116,6 +116,16 @@ describe("findProviderHistoryStart differential oracle", () => {
         const ends = [size];
         for (let k = 0; k < TRUNCATIONS && rowEnds.length > 0; k++)
           ends.push(rowEnds[Math.floor(random() * rowEnds.length)]);
+        // A streaming crash can leave an unterminated final row: end one scan on the last row's
+        // bytes without its newline, and one partway through a random row, so the locator's EOF
+        // delivery path sees complete and truncated JSON.
+        if (size > 1) ends.push(size - 1);
+        if (rowEnds.length > 0) {
+          const row = Math.floor(random() * rowEnds.length);
+          const rowStart = row === 0 ? 0 : rowEnds[row - 1];
+          const rowLength = rowEnds[row] - 1 - rowStart;
+          if (rowLength > 1) ends.push(rowStart + 1 + Math.floor(random() * (rowLength - 1)));
+        }
         const cases: Array<[number, number, boolean, number | null]> = [];
         for (const end of ends) {
           for (const skip of [0, 1, 2])
