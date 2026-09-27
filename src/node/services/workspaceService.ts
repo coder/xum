@@ -1961,8 +1961,8 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
  * workspace's creation setup is complete (grantCreationUnrelatedWorkspaceConsent): create after
  * registration-time plugin sanitization or, for a deferred checkout, after that checkout's own
  * sanitization; fork after all of its setup; scratch and multi-project have no such steps and
- * persist it with the entry. Delegated task(kind:"workspace") targets are not opted in yet (they
- * skip the default; tracked in #4453). Pre-existing workspaces are
+ * persist it with the entry. Delegated task(kind:"workspace") targets get it when their creating
+ * turn settles (WorkspaceTurnManager.afterHandleWrite, #4453). Pre-existing workspaces are
  * deliberately not backfilled: an absent value means both "never enabled" and "turned off", so
  * a backfill would silently undo explicit opt-outs. Sub-agent children are created by
  * TaskService and stay off; their parent owns them.
@@ -5505,12 +5505,20 @@ export class WorkspaceService
        */
       awaitMaterialization?: boolean;
       /**
-       * Do not opt this workspace in to unrelated messaging. WorkspaceTurnManager sets it for
-       * delegated targets until their default gets its own finalization design (#4453).
+       * Default unrelated-messaging consent. "after-setup" (the default) grants it once setup
+       * completes. "caller-finalizes" writes the pending mark but never grants: on success the
+       * caller owns it and must grant or clear it (WorkspaceTurnManager, when the creating turn
+       * settles, #4453). "none" never marks or grants.
        */
-      skipDefaultUnrelatedWorkspaceConsent?: boolean;
+      defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
     }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>> {
+    const defaultConsent = options?.defaultUnrelatedConsent ?? "after-setup";
+    // A deferred checkout grants from materializeDeferredCheckout, which would bypass the caller.
+    assert(
+      defaultConsent !== "caller-finalizes" || options?.awaitMaterialization === true,
+      'create: defaultUnrelatedConsent "caller-finalizes" requires awaitMaterialization'
+    );
     if (tags != null) {
       for (const [tagKey, tagValue] of Object.entries(tags)) {
         assert(tagKey.trim().length > 0, "Workspace tag keys must be non-empty");
@@ -5803,7 +5811,7 @@ export class WorkspaceService
             ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
             // Default consent is granted once setup completes; marked in this same write so a
             // toggle from any backend that sees the row cancels it (#4446).
-            ...(options?.skipDefaultUnrelatedWorkspaceConsent === true
+            ...(defaultConsent === "none"
               ? {}
               : { unrelatedWorkspaceConsentPending: true as const }),
           });
@@ -5871,8 +5879,8 @@ export class WorkspaceService
             );
           }
         }
-        if (options?.skipDefaultUnrelatedWorkspaceConsent === true) {
-          // Delegated target: stays off (see the option).
+        if (defaultConsent !== "after-setup") {
+          // Off until the caller finalizes the mark, or for good (see the option).
         } else if (pendingMaterialization !== undefined) {
           // Deferred checkout: its files (and their sanitization) arrive after the announcement,
           // so the grant waits for materializeDeferredCheckout. The row's pending mark lets a
@@ -5947,6 +5955,8 @@ export class WorkspaceService
 
       await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
+      // The caller now owns the pending default (see the option).
+      if (defaultConsent === "caller-finalizes") pendingDefaultHandedOff = true;
       return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
     } catch (error) {
       initLogger.logComplete(-1);
@@ -7952,7 +7962,11 @@ export class WorkspaceService
           workspacePath,
         });
         // Only while the registration's pending mark survives: an explicit toggle cleared it.
-        // Report that choice as it stands (an opt-in from another backend stays on).
+        // Report that choice as it stands (an opt-in from another backend stays on). A row being
+        // removed never gets the default: drop the mark instead.
+        if (entry?.unrelatedWorkspaceConsentPending === true && entry.pendingRemoval != null) {
+          delete entry.unrelatedWorkspaceConsentPending;
+        }
         if (entry?.unrelatedWorkspaceConsentPending !== true) {
           granted = getValidUnrelatedWorkspaceConsent(entry?.unrelatedWorkspaceConsent);
           return freshConfig;
@@ -7990,11 +8004,12 @@ export class WorkspaceService
   }
 
   /**
-   * Default consent for a deferred-checkout creation, once materializeDeferredCheckout has
-   * populated and sanitized it. Applies only while the row's pending mark survives (an explicit
+   * Default consent for an announced creation whose setup is done: a deferred checkout once
+   * materializeDeferredCheckout populated and sanitized it, or a delegated target when its
+   * creating turn settles (#4453). Applies only while the row's pending mark survives (an explicit
    * toggle clears it), and publishes the metadata since the workspace is already announced.
    */
-  private async grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
+  async grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void> {
     try {
       const found = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
       // No early return on a missing mark: the grant then reports the consent as it stands, so an
@@ -8022,11 +8037,11 @@ export class WorkspaceService
   }
 
   /**
-   * A deferred checkout that failed, was cancelled or was removed never gets its default: drop
-   * the row's pending mark (a no-op once the grant consumed it). Never throws: it runs in the
-   * deferred checkout's init settlement.
+   * A creation that failed, was cancelled or was removed never gets its default: drop the row's
+   * pending mark (a no-op once the grant consumed it). Never throws: it runs in init and
+   * workspace-turn settlements.
    */
-  private async clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void> {
+  async clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void> {
     if (
       findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
         .unrelatedWorkspaceConsentPending !== true

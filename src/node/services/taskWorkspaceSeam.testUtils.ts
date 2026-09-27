@@ -7,6 +7,8 @@ export function makeWorkspaceHostFake(overrides: Partial<WorkspaceHost> = {}): W
       run().catch(() => undefined);
     },
     sendMessage: () => Promise.resolve(Ok(undefined)),
+    grantPendingDefaultUnrelatedWorkspaceConsent: () => Promise.resolve(),
+    clearPendingDefaultUnrelatedConsent: () => Promise.resolve(),
     resumeStream: () => Promise.resolve(Ok({ started: true })),
     clearQueue: () => Ok(undefined),
     replaceHistory: () => Promise.resolve(Ok(undefined)),

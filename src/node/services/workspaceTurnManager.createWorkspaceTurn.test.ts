@@ -129,12 +129,11 @@ describe("WorkspaceTurnManager", () => {
     });
 
     expect(result.success).toBe(true);
-    // Delegated targets need a default tied to this turn's lifecycle (#4453);
-    // until then create() must not opt them in.
+    // The default is finalized when this turn settles (#4453), never by create().
     const createCall = createWorkspace.mock.calls[0] as unknown[];
     expect(createCall[8]).toMatchObject({
       awaitMaterialization: true,
-      skipDefaultUnrelatedWorkspaceConsent: true,
+      defaultUnrelatedConsent: "caller-finalizes",
     });
   });
 

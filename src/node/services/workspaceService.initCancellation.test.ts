@@ -458,7 +458,7 @@ describe("WorkspaceService init cancellation", () => {
     }
   });
 
-  test("create() with skipDefaultUnrelatedWorkspaceConsent leaves the workspace opted out", async () => {
+  test('create() with defaultUnrelatedConsent "caller-finalizes" marks the default but never grants it', async () => {
     const setup = await setUpAutoNamedCreate();
     await using harness = setup.harness;
     const workspaceService = harness.service;
@@ -476,7 +476,7 @@ describe("WorkspaceService init cancellation", () => {
         // pendingAutoTitle: true mirrors the /fork-with-message flow.
         true,
         undefined,
-        { skipDefaultUnrelatedWorkspaceConsent: true }
+        { awaitMaterialization: true, defaultUnrelatedConsent: "caller-finalizes" }
       );
 
       expect(result.success).toBe(true);
@@ -496,10 +496,10 @@ describe("WorkspaceService init cancellation", () => {
       const newEntry = readEntry(workspaceId);
       expect(newEntry?.name).toBe("workspace-3");
       expect(newEntry?.pendingAutoTitle).toBe(true);
-      // Delegated targets are not opted in (yet): nothing persisted, announced or pending.
+      // Nothing granted or announced; the success hands the surviving mark to the caller (#4453).
       expect(newEntry?.unrelatedWorkspaceConsent).toBeUndefined();
       expect(result.data.metadata.unrelatedWorkspaceConsent).toBeUndefined();
-      expect(newEntry?.unrelatedWorkspaceConsentPending).toBeUndefined();
+      expect(newEntry?.unrelatedWorkspaceConsentPending).toBe(true);
     } finally {
       setup.createRuntimeSpy.mockRestore();
     }

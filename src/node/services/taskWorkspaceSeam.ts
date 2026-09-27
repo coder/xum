@@ -710,8 +710,14 @@ export interface WorkspaceProvisioningHost {
     subProjectPath?: string,
     pendingAutoTitle?: boolean,
     tags?: Record<string, string>,
-    options?: { awaitMaterialization?: boolean; skipDefaultUnrelatedWorkspaceConsent?: boolean }
+    options?: {
+      awaitMaterialization?: boolean;
+      defaultUnrelatedConsent?: "after-setup" | "caller-finalizes" | "none";
+    }
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata }>>;
+  /** Grant or clear a "caller-finalizes" creation's pending default (#4453). Never throw. */
+  grantPendingDefaultUnrelatedWorkspaceConsent(workspaceId: string): Promise<void>;
+  clearPendingDefaultUnrelatedConsent(workspaceId: string): Promise<void>;
   sanitizeMaterializedTaskWorkspace(
     workspaceId: string,
     workspacePath: string,
