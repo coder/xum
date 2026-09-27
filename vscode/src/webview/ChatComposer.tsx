@@ -16,6 +16,7 @@ import { ThinkingProvider } from "xum/browser/contexts/ThinkingContext";
 import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePersistedState";
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
+import { usePolicy } from "xum/browser/contexts/PolicyContext";
 import { normalizeSelectedModel } from "xum/common/utils/ai/models";
 import {
   consumeAiSelectionIntent,
@@ -180,6 +181,8 @@ function ChatComposerInner(props: {
   // Until the providers config arrives, the model list is not filtered by provider availability,
   // so a fallback could pick a provider without credentials; substitute nothing until then.
   const { config: providersConfig } = useProvidersConfig();
+  // Until the first policy.get settles, the policy looks disabled and the model list is unfiltered.
+  const { loading: policyLoading } = usePolicy();
   const policyFallbackModel =
     storedModelAllowed || providersConfig === null
       ? null
@@ -331,11 +334,12 @@ function ChatComposerInner(props: {
     // #4781: persist only explicit picks, through the desktop's send-time path (the backend saves the
     // sent settings unless skipAiSettingsPersistence; aiSelectionIntent pins them on a sub-agent).
     // Never seeded values (no pending pick), never before the workspace's settings are loaded
-    // (#4755), never a policy-excluded or fallback model (#4808), and never while an earlier
-    // persisting send for this workspace is unresolved. The thinking level is sent as selected; the
-    // backend applies the authoritative floor.
+    // (#4755), never before the admin policy has loaded or for a policy-excluded or fallback model
+    // (#4808), and never while an earlier persisting send for this workspace is unresolved. The
+    // thinking level is sent as selected; the backend applies the authoritative floor.
     const mayPersist =
       props.aiSettingsLoaded &&
+      !policyLoading &&
       storedModelAllowed &&
       !aiPersistenceByWorkspace.has(props.workspaceId);
     const aiSelection = getAiSelectionIntentForSendOptions(props.workspaceId, agentId, {

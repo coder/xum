@@ -889,12 +889,16 @@ describe("vscode webview explicit AI-setting persistence", () => {
     await bridge.emit({ type: "chatEvent", workspaceId, event: { type: "caught-up" } });
   }
 
-  async function open(workspaces: UiWorkspace[]) {
+  // `policy: "pending"` leaves policy.get unanswered; by default it answers "no policy".
+  async function open(workspaces: UiWorkspace[], policy: "none" | "pending" = "none") {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     await bridge.emit({ type: "workspaces", workspaces });
     await selectById(bridge, workspaces[0].id);
+    if (policy === "none") {
+      await bridge.answer("policy.get", null);
+    }
     return { bridge, view };
   }
 
@@ -1036,7 +1040,7 @@ describe("vscode webview explicit AI-setting persistence", () => {
       ...mainWorkspace(TERRA_HIGH),
       ai: { ...mainWorkspace(TERRA_HIGH).ai, agentId: "exec" },
     };
-    const { bridge, view } = await open([workspace]);
+    const { bridge, view } = await open([workspace], "pending");
     await bridge.answer("policy.get", {
       source: "governor",
       status: { state: "enforced" },
@@ -1061,6 +1065,19 @@ describe("vscode webview explicit AI-setting persistence", () => {
     } finally {
       await clearProvidersConfig(bridge);
     }
+  });
+
+  test("does not persist while the admin policy is still loading", async () => {
+    // Until policy.get answers, the model list is unfiltered and the policy looks disabled, so a
+    // pick could be a model the policy forbids.
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)], "pending");
+    await pickModel(view, "Sonnet 5");
+
+    const options = await send(bridge, view);
+    expect(String(options.model)).toContain("sonnet");
+    expect(options.skipAiSettingsPersistence).toBe(true);
+    expect(options.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
   });
 
   test("persists a locked sub-agent's pick only into its locked agent", async () => {
