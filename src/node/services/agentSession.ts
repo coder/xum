@@ -8925,6 +8925,7 @@ export class AgentSession {
         this.clearUsageState();
 
         if (completedCompactionRequest?.source === "auto-compaction") {
+          this.contextController.noteAutoCompactionCompleted();
           this.emitChatEvent({
             type: "auto-compaction-completed",
             newUsagePercent: 0,

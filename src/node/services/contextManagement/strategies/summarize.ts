@@ -11,24 +11,23 @@ export class SummarizeStrategy {
     private readonly continuous: ContinuousStrategy
   ) {}
 
-  /** Returns true once the compaction request was sent; false when an early exit skipped it. */
-  async interruptForCompaction(): Promise<boolean> {
+  async interruptForCompaction(): Promise<void> {
     if (this.host.coordinator.midStreamCompactionPending || this.host.coordinator.closing) {
-      return false;
+      return;
     }
     using _execution = this.host.coordinator.enterExecution();
     const admissionStale = this.host.captureCompactionAdmission("automatic");
 
     const streamContext = this.host.state.stream;
     if (!streamContext?.modelString || !streamContext.options) {
-      return false;
+      return;
     }
 
     const interruptedUserMessageId = this.host.state.userMessageId;
     this.continuous.continuousCompactor.reset("legacy-fallback");
 
     const token = this.host.coordinator.beginCompactionObservation("legacy");
-    if (token == null) return false;
+    if (token == null) return;
     this.host.coordinator.setCompactionStage(token, "stopping");
     try {
       const stopResult = await this.host.streams.stopStream(this.host.workspaceId, {
@@ -39,12 +38,12 @@ export class SummarizeStrategy {
           workspaceId: this.host.workspaceId,
           error: stopResult.error,
         });
-        return false;
+        return;
       }
 
       await this.host.waitForIdle();
       if (this.host.coordinator.disposed || admissionStale()) {
-        return false;
+        return;
       }
 
       const followUpContent = buildAutoCompactionFollowUp({
@@ -65,7 +64,7 @@ export class SummarizeStrategy {
         reason: "mid-stream",
       });
 
-      if (admissionStale()) return false;
+      if (admissionStale()) return;
       const autoCompactionRequest = this.host.buildAutoCompactionRequest({
         followUpContent,
         baseOptions: streamContext.options,
@@ -88,7 +87,6 @@ export class SummarizeStrategy {
           failureDisposition: "legacy-interrupt",
         }
       );
-      return true;
     } finally {
       this.host.coordinator.finishCompactionObservation(token);
       // Preflight drains deferred to this pending compaction have no other retry: if the

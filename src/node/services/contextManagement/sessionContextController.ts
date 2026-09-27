@@ -195,6 +195,11 @@ export class SessionContextController {
     this.compactionMonitor.noteUserTurn();
   }
 
+  /** An auto-compaction boundary was published: arm the no-relief guard (#4421). */
+  noteAutoCompactionCompleted(): void {
+    this.compactionMonitor.noteAutoCompactionCompleted();
+  }
+
   onStreamStarting(): void {
     this.compactionMonitor.resetForNewStream();
   }
@@ -366,11 +371,12 @@ export class SessionContextController {
       openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
     });
 
-    // Arm the no-relief guard only once a compaction request was actually sent (#4421).
-    if (shouldInterruptForCompaction && (await this.summarize.interruptForCompaction())) {
-      this.compactionMonitor.noteAutoCompactionStarted(
+    if (shouldInterruptForCompaction) {
+      // The no-relief guard (#4421) arms only if this compaction completes.
+      this.compactionMonitor.noteAutoCompactionRequested(
         threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
       );
+      await this.summarize.interruptForCompaction();
     }
   }
 
@@ -451,8 +457,9 @@ export class SessionContextController {
         compactionResult.usagePercentage
       )
     ) {
-      // Relief means a live reading under the level that triggered this compaction.
-      this.compactionMonitor.noteAutoCompactionStarted(
+      // Relief means a live reading under the level that triggered this compaction; the guard
+      // (#4421) arms only if the compaction completes.
+      this.compactionMonitor.noteAutoCompactionRequested(
         continuousContext.enabled
           ? threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT
           : compactionResult.thresholdPercentage

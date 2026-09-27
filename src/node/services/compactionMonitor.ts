@@ -63,6 +63,8 @@ export class CompactionMonitor {
    * get user turns) able to compact again.
    */
   private reliefBelowPercent: number | null = null;
+  /** Trigger level of the auto-compaction in flight; it arms the guard only once it completes. */
+  private requestedTriggerPercent: number | null = null;
 
   constructor(
     private readonly workspaceId: string,
@@ -175,10 +177,20 @@ export class CompactionMonitor {
     this.reliefBelowPercent = null;
   }
 
-  /** Arms the guard once an auto-compaction request was actually sent. */
-  noteAutoCompactionStarted(triggerPercent: number): void {
-    assert(Number.isFinite(triggerPercent), "noteAutoCompactionStarted requires a finite percent");
-    this.reliefBelowPercent = triggerPercent;
+  /** Records the level that triggered an auto-compaction; it does not arm the guard yet. */
+  noteAutoCompactionRequested(triggerPercent: number): void {
+    assert(Number.isFinite(triggerPercent), "noteAutoCompactionRequested requires a finite percent");
+    this.requestedTriggerPercent = triggerPercent;
+  }
+
+  /**
+   * Arms the guard when an auto-compaction boundary was published. Arming here, not at the
+   * decision, means a request that was refused, cancelled or failed never suppresses the next one.
+   */
+  noteAutoCompactionCompleted(): void {
+    if (this.requestedTriggerPercent === null) return;
+    this.reliefBelowPercent = this.requestedTriggerPercent;
+    this.requestedTriggerPercent = null;
   }
 
   /**

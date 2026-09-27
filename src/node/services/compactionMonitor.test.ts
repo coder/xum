@@ -258,10 +258,11 @@ describe("CompactionMonitor", () => {
     expect(belowForceTokens).toBeGreaterThan(DEFAULT_AUTO_COMPACTION_THRESHOLD * 200_000);
 
     expect(check(150_000)).toBe(true);
-    // A trigger alone does not arm the guard: the compaction request may never be sent.
+    // A request alone does not arm the guard: it may be refused, cancelled or fail.
+    monitor.noteAutoCompactionRequested(forcePercent);
     monitor.resetForNewStream();
     expect(check(150_000)).toBe(true);
-    monitor.noteAutoCompactionStarted(forcePercent);
+    monitor.noteAutoCompactionCompleted();
 
     // The follow-up stream after that compaction still reports the same pressure.
     monitor.resetForNewStream();
@@ -277,7 +278,8 @@ describe("CompactionMonitor", () => {
     expect(statusEvents).toHaveLength(3);
 
     // A user turn also lifts the guard.
-    monitor.noteAutoCompactionStarted(forcePercent);
+    monitor.noteAutoCompactionRequested(forcePercent);
+    monitor.noteAutoCompactionCompleted();
     monitor.resetForNewStream();
     expect(check(150_000)).toBe(false);
     monitor.noteUserTurn();
