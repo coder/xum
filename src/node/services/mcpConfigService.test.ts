@@ -867,8 +867,12 @@ describe("MCP server disable filtering", () => {
         staleMs: 60_000,
         timeoutMessage: "holder failed",
       });
+      // The spy is module-global: async work left over from an earlier test in the
+      // same process can take an unrelated lock inside this window. Shorten and
+      // count only this service's config lock, and pass other callers through.
       const acquireSpy = spyOn(crossProcessLock, "acquireCrossProcessLock").mockImplementation(
-        (options) => acquire({ ...options, acquireTimeoutMs: 1 })
+        (options) =>
+          acquire(options.lockPath === lockPath ? { ...options, acquireTimeoutMs: 1 } : options)
       );
       try {
         const mutations = [
@@ -884,9 +888,10 @@ describe("MCP server disable filtering", () => {
           if (!result.success) expect(result.error).not.toBe("");
           expect(await fs.readFile(configPath, "utf-8")).toBe(raw);
         }
-        expect(acquireSpy).toHaveBeenCalledTimes(mutations.length);
-        for (const [options] of acquireSpy.mock.calls) {
-          expect(options).toMatchObject({ lockPath, acquireTimeoutMs: 60_000 });
+        const attempts = acquireSpy.mock.calls.filter(([options]) => options.lockPath === lockPath);
+        expect(attempts).toHaveLength(mutations.length);
+        for (const [options] of attempts) {
+          expect(options).toMatchObject({ acquireTimeoutMs: 60_000 });
         }
       } finally {
         acquireSpy.mockRestore();
