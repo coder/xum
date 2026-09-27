@@ -144,7 +144,7 @@ export function getValidUnrelatedWorkspaceConsent(value: unknown): string | unde
 /**
  * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
  * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
- * a sub-agent and sub-agent reports (agent_report) are not affected. Absent means "tool-end" (deliver after the next tool call), because
+ * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
  * prompt delivery is what lets agents coordinate quickly; "turn-end" holds every such message until
  * the current turn ends, even if the sender asked for tool-end.
  */
