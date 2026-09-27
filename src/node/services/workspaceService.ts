@@ -194,7 +194,7 @@ import {
   backfillStagedAttachmentMirror,
   copyStagedAttachmentMirrorEntries,
   copyStagedWorkspaceAttachments,
-  extractStagedAttachmentPathsFromText,
+  extractStagedAttachmentPathsFromFile,
   readStagedWorkspaceAttachment,
   rehydrateStagedWorkspaceAttachments,
   stageWorkspaceAttachment,
@@ -1389,8 +1389,10 @@ async function collectReferencedStagedAttachmentPaths(
   const paths = new Set<string>();
   for (const fileName of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME, "partial.json"] as const) {
     try {
-      const content = await fsPromises.readFile(path.join(sessionDir, fileName), "utf8");
-      for (const stagedPath of extractStagedAttachmentPathsFromText(content)) {
+      // Streamed: every snapshot archive scans the full append-only history.
+      for (const stagedPath of await extractStagedAttachmentPathsFromFile(
+        path.join(sessionDir, fileName)
+      )) {
         paths.add(stagedPath);
       }
     } catch (error) {
@@ -12887,8 +12889,8 @@ export class WorkspaceService
   /**
    * Uploads staged before the session mirror existed (#3947) have only the checkout copy, which
    * the snapshot archive is about to delete with the worktree (#4845). Copy the ones the chat
-   * references into the mirror so unarchive can rehydrate them. Best-effort: the archive
-   * confirmation still lists the staging dir as lossy, so a skipped copy never blocks archiving.
+   * references into the mirror so unarchive can rehydrate them. Best-effort by design (#4845): a
+   * skipped copy is lost exactly as before this backfill existed, and never blocks archiving.
    */
   private async backfillStagedAttachmentMirrorBeforeSnapshot(
     workspaceId: string,

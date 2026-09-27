@@ -25,6 +25,7 @@ import {
   backfillStagedAttachmentMirror,
   copyStagedAttachmentMirrorEntries,
   copyStagedWorkspaceAttachments,
+  extractStagedAttachmentPathsFromFile,
   extractStagedAttachmentPathsFromText,
   readStagedWorkspaceAttachment,
   rehydrateStagedWorkspaceAttachments,
@@ -289,6 +290,21 @@ describe("stageWorkspaceAttachment", () => {
       ".mux/user-attachments/two/data.csv",
       ".mux/user-attachments/three/ARCHIVE.ZIP",
     ]);
+  });
+
+  test("extracts staged paths from a history file across read-chunk boundaries", async () => {
+    const dir = await makeTempDir("mux-stage-history-scan-");
+    const filePath = path.join(dir, "chat.jsonl");
+    const straddling = `${STAGED_ATTACHMENT_DIR}/11111111-1111-4111-8111-111111111111/a.md`;
+    const last = `${STAGED_ATTACHMENT_DIR}/22222222-2222-4222-8222-222222222222/b.md`;
+    // Multi-byte padding puts the first path across the 1 MiB read boundary; the last path sits on
+    // a final line without a trailing newline.
+    const padding = "é".repeat(512 * 1024 - 8);
+    await writeFile(filePath, `{"t":"${padding}\`${straddling}\`"}\n{"t":"\`${last}\`"}`);
+
+    expect((await extractStagedAttachmentPathsFromFile(filePath)).sort()).toEqual(
+      [straddling, last].sort()
+    );
   });
 
   test("rejects invalid base64 before writing", async () => {
@@ -631,35 +647,49 @@ describe("staged attachment session mirror", () => {
       ).toBeNull();
     });
 
-    test("replaces mirror entries rehydration would reject", async () => {
+    test("repairs a symlinked mirror entry without touching directories or link targets", async () => {
       const bytes = Buffer.from("only valid copy");
       const { repo, sessionDir, runtime, stagedPath } = await stageWithoutMirror(bytes);
-      const dirEntry = await stageWorkspaceAttachment({
-        runtime,
-        workspacePath: repo,
-        sessionDir,
-        filename: "dir.md",
-        sizeBytes: 1,
-        dataBase64: Buffer.from("d").toString("base64"),
-      });
-      if (!dirEntry.success) throw new Error(dirEntry.error);
+      async function stageMore(filename: string): Promise<string> {
+        const staged = await stageWorkspaceAttachment({
+          runtime,
+          workspacePath: repo,
+          sessionDir,
+          filename,
+          sizeBytes: 1,
+          dataBase64: Buffer.from("x").toString("base64"),
+        });
+        if (!staged.success) throw new Error(staged.error);
+        return staged.data.stagedPath;
+      }
+      const dirPath = await stageMore("dir.md");
+      const ancestorPath = await stageMore("ancestor.md");
       const outside = await makeTempDir("mux-stage-backfill-corrupt-");
       await writeFile(path.join(outside, "other.txt"), "other");
+      // Symlinked leaf: replaced from the checkout, the link target stays untouched.
       await mkdir(path.dirname(mirrorPathFor(sessionDir, stagedPath)), { recursive: true });
       await symlink(path.join(outside, "other.txt"), mirrorPathFor(sessionDir, stagedPath));
-      const dirMirror = mirrorPathFor(sessionDir, dirEntry.data.stagedPath);
+      // Directory in place of the entry: never deleted.
+      const dirMirror = mirrorPathFor(sessionDir, dirPath);
       await rm(dirMirror);
-      await mkdir(path.join(dirMirror, "junk"), { recursive: true });
+      await mkdir(path.join(dirMirror, "keep"), { recursive: true });
+      // Symlinked `<uuid>` mirror dir: nothing is written through it.
+      const ancestorMirrorDir = path.dirname(mirrorPathFor(sessionDir, ancestorPath));
+      await rm(ancestorMirrorDir, { recursive: true });
+      await symlink(outside, ancestorMirrorDir);
 
       const result = await backfillStagedAttachmentMirror({
         workspacePath: repo,
         sessionDir,
-        stagedPaths: [stagedPath, dirEntry.data.stagedPath],
+        stagedPaths: [stagedPath, dirPath, ancestorPath],
       });
 
-      expect(result).toEqual({ copied: [stagedPath, dirEntry.data.stagedPath], skipped: [] });
+      expect(result).toEqual({ copied: [stagedPath], skipped: [dirPath, ancestorPath] });
       expect(await readFile(mirrorPathFor(sessionDir, stagedPath))).toEqual(bytes);
-      expect(await readFile(dirMirror, "utf8")).toBe("d");
+      expect((await stat(path.join(dirMirror, "keep"))).isDirectory()).toBe(true);
+      expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outside, dot: true }))).toEqual([
+        "other.txt",
+      ]);
       expect(await readFile(path.join(outside, "other.txt"), "utf8")).toBe("other");
     });
 

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants, type Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import {
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
@@ -351,23 +352,34 @@ export async function backfillStagedAttachmentMirror(input: {
       if (existing?.isFile() && existing.size <= MAX_STAGED_ATTACHMENT_SIZE_BYTES) {
         continue;
       }
+      // Never delete a directory in its place; anything else rehydration would reject (a symlink
+      // or an oversized file) is corrupted host state and is replaced below.
+      if (existing?.isDirectory()) {
+        skipped.push(stagedPath);
+        continue;
+      }
       const bytes = await readCheckoutFileWithoutFollowingLinks(input.workspacePath, stagedPath);
       if (bytes == null) {
         skipped.push(stagedPath);
         continue;
       }
       await ensurePrivateDir(input.sessionDir);
-      await fsPromises.mkdir(path.dirname(mirrorPath), { recursive: true, mode: 0o700 });
-      // Write aside then rename, so a crash never leaves a truncated entry that later archives
-      // would treat as the durable copy. The temp name fails the canonical-name check.
-      const tempPath = path.join(path.dirname(mirrorPath), `.backfill-${randomUUID()}`);
-      await fsPromises.writeFile(tempPath, bytes, { flag: "wx" });
-      if (existing != null) {
-        // A mirror entry rehydration would reject (symlink, directory, oversized file) is
-        // corrupted host state; replace it so the checkout copy is not lost with the archive.
-        await fsPromises.rm(mirrorPath, { recursive: true, force: true });
+      // A symlinked mirror ancestor (corrupted host state) would redirect the write outside the
+      // session dir, so each directory is created or verified without following links.
+      const entryDir = await ensureRealDirectoryChain(input.sessionDir, [
+        STAGED_ATTACHMENT_MIRROR_DIR_NAME,
+        path.basename(path.dirname(mirrorPath)),
+      ]);
+      if (entryDir == null) {
+        skipped.push(stagedPath);
+        continue;
       }
-      await fsPromises.rename(tempPath, mirrorPath);
+      // Write aside then rename, so a crash never leaves a truncated entry that later archives
+      // would treat as the durable copy. The temp name fails the canonical-name check, and rename
+      // replaces a symlinked leaf itself, never its target.
+      const tempPath = path.join(entryDir, `.backfill-${randomUUID()}`);
+      await fsPromises.writeFile(tempPath, bytes, { flag: "wx" });
+      await fsPromises.rename(tempPath, path.join(entryDir, path.basename(mirrorPath)));
       copied.push(stagedPath);
     } catch (error) {
       log.debug("Skipping staged attachment mirror backfill", {
@@ -462,6 +474,41 @@ export function extractStagedAttachmentPathsFromText(text: string): string[] {
     if (stagedPath != null) {
       paths.add(stagedPath);
     }
+  }
+  return [...paths];
+}
+
+const HISTORY_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * extractStagedAttachmentPathsFromText over a history file, one line at a time, so a large
+ * append-only history never has to be held in memory whole. Paths cannot span lines: they come
+ * from JSON strings, which escape newlines.
+ */
+export async function extractStagedAttachmentPathsFromFile(filePath: string): Promise<string[]> {
+  const paths = new Set<string>();
+  const scan = (text: string) => {
+    for (const stagedPath of extractStagedAttachmentPathsFromText(text)) {
+      paths.add(stagedPath);
+    }
+  };
+  const handle = await fsPromises.open(filePath, "r");
+  try {
+    const decoder = new StringDecoder("utf8");
+    const chunk = Buffer.alloc(HISTORY_SCAN_CHUNK_BYTES);
+    let carry = "";
+    while (true) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      const lines = (carry + decoder.write(chunk.subarray(0, bytesRead))).split("\n");
+      carry = lines.pop() ?? "";
+      lines.forEach(scan);
+    }
+    scan(carry + decoder.end());
+  } finally {
+    await handle.close();
   }
   return [...paths];
 }
