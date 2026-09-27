@@ -589,14 +589,28 @@ export class CoderSSHRuntime extends SSHRuntime {
 
     // If this workspace is an existing Coder workspace that mux didn't create, just do SSH cleanup.
     if (this.coderConfig.existingWorkspace) {
-      return super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
+      return super.deleteWorkspace(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      );
     }
 
     const coderWorkspaceName = this.coderConfig.workspaceName;
 
     if (!coderWorkspaceName) {
       log.warn("Coder workspace name not set, falling back to SSH-only deletion");
-      return super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
+      return super.deleteWorkspace(
+        projectPath,
+        workspaceName,
+        force,
+        abortSignal,
+        trusted,
+        options
+      );
     }
 
     // For force deletes ("cancel creation"), skip SSH cleanup and focus on deleting the
