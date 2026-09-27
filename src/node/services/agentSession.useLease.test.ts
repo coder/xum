@@ -1,5 +1,4 @@
 import { describe, expect, mock, test } from "bun:test";
-import { EventEmitter } from "events";
 
 import { Err, Ok } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -21,6 +20,7 @@ const workspaceId = "ws-turn-lease";
 const model = "openai:gpt-4o";
 const sendOptions = { model, agentId: "exec" };
 const idle = { hasRunningBackgroundProcesses: () => Promise.resolve(false) };
+type StreamResult = Awaited<ReturnType<AgentSessionAIService["streamMessage"]>>;
 
 const end = (): StreamEndEvent => ({
   type: "stream-end",
@@ -50,9 +50,7 @@ async function refusal(promise: Promise<unknown>): Promise<Error> {
 
 describe("AgentSession turn use lease across two backends on one root", () => {
   test("a turn in B holds its lease from preparation until it settles, on failure and on success", async () => {
-    const streams: Array<
-      PromiseWithResolvers<Awaited<ReturnType<AgentSessionAIService["streamMessage"]>>>
-    > = [];
+    const streams: Array<ReturnType<typeof Promise.withResolvers<StreamResult>>> = [];
     let turnSettled = Promise.withResolvers<void>();
     let streamReached = Promise.withResolvers<void>();
     const b = await createAgentSessionHarness({
@@ -60,8 +58,7 @@ describe("AgentSession turn use lease across two backends on one root", () => {
       onTurnSettled: () => turnSettled.resolve(),
       aiServiceOverrides: {
         streamMessage: mock(() => {
-          const stream =
-            Promise.withResolvers<Awaited<ReturnType<AgentSessionAIService["streamMessage"]>>>();
+          const stream = Promise.withResolvers<StreamResult>();
           streams.push(stream);
           streamReached.resolve();
           return stream.promise;
@@ -158,8 +155,7 @@ describe("AgentSession turn use lease across two backends on one root", () => {
   });
 
   test("disposing the session mid-turn releases its lease", async () => {
-    const pending =
-      Promise.withResolvers<Awaited<ReturnType<AgentSessionAIService["streamMessage"]>>>();
+    const pending = Promise.withResolvers<StreamResult>();
     const reached = Promise.withResolvers<void>();
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(() => {
       reached.resolve();

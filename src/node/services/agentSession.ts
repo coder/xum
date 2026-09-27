@@ -3633,7 +3633,7 @@ export class AgentSession {
     this.activePreparations++;
     // Start (not await) the turn's use lease: preparation keeps its synchronous startup, and
     // streamWithHistory confirms the lease before the provider can touch the checkout.
-    this.startTurnUseLease();
+    this.beginTurnUseLease();
     try {
       const result = await run();
       if (!result.success) await this.settlePreparationFailure(attempt, result.error);
@@ -3696,12 +3696,12 @@ export class AgentSession {
   }
 
   /** Start taking this session's turn use lease (idempotent while one is held or pending). */
-  private startTurnUseLease(): Promise<WorkspaceUseLease | Error> {
+  private beginTurnUseLease(): void {
     // A refusal (or an unexpected lock error) resolves to the error, so a preparation that ends
     // before streamWithHistory confirms the lease leaves no unhandled rejection.
-    return (this.turnUseLease ??= workspaceUseLeasesFor(this.config)
+    this.turnUseLease ??= workspaceUseLeasesFor(this.config)
       .hold(this.workspaceId, "turn")
-      .catch((error: unknown) => (error instanceof Error ? error : new Error(String(error)))));
+      .catch((error: unknown) => (error instanceof Error ? error : new Error(String(error))));
   }
 
   /**
@@ -3710,7 +3710,9 @@ export class AgentSession {
    * lease could not be taken (fail closed).
    */
   private async confirmTurnUseLease(): Promise<string | undefined> {
-    const holding = this.startTurnUseLease();
+    this.beginTurnUseLease();
+    const holding = this.turnUseLease;
+    assert(holding != null, "beginTurnUseLease always leaves a pending or held lease");
     const lease = await holding;
     if (!(lease instanceof Error)) return undefined;
     if (this.turnUseLease === holding) this.turnUseLease = undefined;
