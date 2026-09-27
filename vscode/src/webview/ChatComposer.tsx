@@ -155,7 +155,9 @@ function ChatComposerInner(props: {
   // a status line says so. The check is route-aware, like the model list, because the backend
   // enforces policy after routing; it uses the gateway-preserving identity so an explicitly pinned
   // gateway model is checked on that gateway.
-  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(normalizeSelectedModel(preferredModel));
+  // The status line names this identity too, so a denied gateway pin is not shown as its canonical ID.
+  const storedSelection = normalizeSelectedModel(preferredModel);
+  const storedModelAllowed = isAllowedByPolicyOnActiveRoute(storedSelection);
   const policyFallbackModel = storedModelAllowed
     ? null
     : (models.find((model) => isAllowedByPolicyOnActiveRoute(model)) ?? null);
@@ -403,8 +405,8 @@ function ChatComposerInner(props: {
         {storedModelAllowed ? null : (
           <div role="status" className="text-content-secondary text-[11px]">
             {policyFallbackModel
-              ? `Admin policy does not allow ${storedModel}; using ${policyFallbackModel}.`
-              : `Admin policy does not allow ${storedModel}. Choose an allowed model.`}
+              ? `Admin policy does not allow ${storedSelection}; using ${policyFallbackModel}.`
+              : `Admin policy does not allow ${storedSelection}. Choose an allowed model.`}
           </div>
         )}
         <div className="w-full min-w-0" data-component="ModelSelectorGroup">
