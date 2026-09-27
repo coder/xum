@@ -28,7 +28,7 @@ import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
 import type { TaskSettings } from "@/common/types/tasks";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
@@ -800,6 +800,8 @@ export async function buildStreamSystemContext(
         ).then(
           (resolvedFrontmatter) => resolvedFrontmatter.subagent?.append_prompt,
           (error: unknown) => {
+            // A transport failure must not run the sub-agent without its append prompt (#4438).
+            if (isRuntimeTransportError(error)) throw error;
             workspaceLog.debug("Failed to resolve agent frontmatter for subagent append_prompt", {
               agentId: agentDefinition.id,
               error: getErrorMessage(error),
@@ -830,6 +832,8 @@ export async function buildStreamSystemContext(
       includeClaudeSkills: opts.claudeSkillsCompatEnabled,
       includeAgentPlugins: opts.agentPluginsEnabled,
     }).catch((error: unknown) => {
+      // An unreachable host must fail the turn, not silently drop the skills index (#4438).
+      if (isRuntimeTransportError(error)) throw error;
       workspaceLog.warn("Failed to discover agent skills for tool description", { error });
       return undefined;
     }),

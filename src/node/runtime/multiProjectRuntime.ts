@@ -411,6 +411,10 @@ export class MultiProjectRuntime implements Runtime {
     return this.primaryRuntime.normalizePath(targetPath, basePath);
   }
 
+  isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return this.primaryRuntime.isTransportFailureExit?.(exitCode, stderr) ?? false;
+  }
+
   exec(command: string, options: ExecOptions): Promise<ExecStream> {
     return this.primaryRuntime.exec(command, {
       ...options,

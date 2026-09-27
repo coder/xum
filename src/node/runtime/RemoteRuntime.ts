@@ -430,7 +430,7 @@ export abstract class RemoteRuntime implements Runtime {
    * rather than the remote command. Only runtimes whose transport reserves an
    * exit code for its own failures override this (SSH: exit 255, #4438).
    */
-  protected isTransportFailureExit(_exitCode: number, _stderr: string): boolean {
+  isTransportFailureExit(_exitCode: number, _stderr: string): boolean {
     return false;
   }
 

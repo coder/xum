@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import type { ORPCContext } from "@/node/orpc/context";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
@@ -16,7 +16,11 @@ import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
 import { normalizeForDescendantComparison } from "@/common/utils/subProjects";
 import { getErrorMessage } from "@/common/utils/errors";
-import { execBuffered, readFileString } from "@/node/utils/runtime/helpers";
+import {
+  execBuffered,
+  readFileString,
+  throwIfTransportFailure,
+} from "@/node/utils/runtime/helpers";
 
 import {
   AgentSkillDescriptorSchema,
@@ -439,6 +443,7 @@ async function listSkillDirectoriesFromRuntime(
     `fi`;
 
   const result = await execBuffered(runtime, command, { cwd: options.cwd, timeout: 10 });
+  throwIfTransportFailure(runtime, result, `Failed to read skills directory ${root}`);
   if (result.exitCode !== 0) {
     log.warn(`Failed to read skills directory ${root}: ${result.stderr || result.stdout}`);
     return [];
@@ -501,7 +506,8 @@ async function readSkillDescriptorFromDir(
     let stat;
     try {
       stat = await runtime.stat(skillFilePath);
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) throw error;
       pushInvalidSkill(
         "SKILL.md is missing or unreadable.",
         "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
@@ -528,6 +534,7 @@ async function readSkillDescriptorFromDir(
     try {
       content = await readFileString(runtime, skillFilePath);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       const message = getErrorMessage(err);
       log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
       pushInvalidSkill(
@@ -621,6 +628,7 @@ export async function discoverAgentSkills(
     try {
       resolvedRoot = await scan.runtime.resolvePath(scan.root);
     } catch (err) {
+      if (isRuntimeTransportError(err)) throw err;
       log.warn(`Failed to resolve skills root ${scan.root}: ${getErrorMessage(err)}`);
       continue;
     }
@@ -666,6 +674,7 @@ export async function discoverAgentSkills(
             skillFilePath,
           });
         } catch (error) {
+          if (isRuntimeTransportError(error)) throw error;
           if (hasErrorCode(error, "ENOENT")) {
             continue;
           }
@@ -1000,7 +1009,10 @@ export async function readAgentSkill(
     let resolvedRoot: string;
     try {
       resolvedRoot = await candidate.runtime.resolvePath(candidate.root);
-    } catch {
+    } catch (error) {
+      // An unreachable host is not a missing skill root: never fall back to a
+      // lower-scope or built-in skill on a transport failure (#4438).
+      if (isRuntimeTransportError(error)) throw error;
       continue;
     }
 
@@ -1026,6 +1038,7 @@ export async function readAgentSkill(
           skillFilePath,
         });
       } catch (error) {
+        if (isRuntimeTransportError(error)) throw error;
         if (hasErrorCode(error, "ENOENT")) {
           continue;
         }
@@ -1048,7 +1061,8 @@ export async function readAgentSkill(
         candidate.scope,
         candidate.pluginRoot
       );
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) throw error;
       continue;
     }
   }

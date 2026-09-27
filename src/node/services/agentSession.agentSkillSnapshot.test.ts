@@ -10,6 +10,9 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { AIService } from "@/node/services/aiService";
 
+import { RuntimeError } from "@/node/runtime/Runtime";
+import * as agentSkillsService from "@/node/services/agentSkills/agentSkillsService";
+
 import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 describe("AgentSession.sendMessage (agent skill snapshots)", () => {
@@ -471,6 +474,32 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
     expect(messages[0].metadata?.agentSkillSnapshot?.skillName).toBe("alpha-skill");
     expect(getMessageText(messages[0])).toContain("Follow alpha.");
     expect(getMessageText(messages[1])).toBe("do X");
+  });
+
+  it("refuses the send when an inline skill fails in transport", async () => {
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "alpha-skill",
+      skillBody: "Follow alpha.",
+    });
+    const { session, messages } = await createSessionHarness({ workspacePath });
+    // #4438: an unreachable host is not an unknown skill, so it must not be skipped.
+    const read = spyOn(agentSkillsService, "readAgentSkill").mockRejectedValue(
+      new RuntimeError("ssh: Connection refused", "network")
+    );
+
+    const result = await session
+      .sendMessage("do X", {
+        model: "anthropic:claude-3-5-sonnet-latest",
+        agentId: "exec",
+        muxMetadata: {
+          type: "normal",
+          agentSkillRefs: [{ skillName: "alpha-skill", scope: "project", source: "inline" }],
+        },
+      })
+      .finally(() => read.mockRestore());
+
+    expect(result.success).toBe(false);
+    expect(messages).toHaveLength(0);
   });
 
   it("still throws when a slash skill name is invalid", async () => {

@@ -1,4 +1,9 @@
-import type { Runtime, ExecOptions, ReadFileOptions } from "@/node/runtime/Runtime";
+import {
+  RuntimeError,
+  type Runtime,
+  type ExecOptions,
+  type ReadFileOptions,
+} from "@/node/runtime/Runtime";
 import { streamToString, streamToStringCapped } from "@/node/runtime/streamUtils";
 import { PlatformPaths } from "@/node/utils/paths.main";
 import { getLegacyPlanFilePath, getPlanFilePath } from "@/common/utils/planStorage";
@@ -81,6 +86,21 @@ export async function execBuffered(
 /**
  * Read file contents as a UTF-8 string
  */
+/**
+ * Throw a transport failure when a buffered exec probe failed because the host
+ * was unreachable, so callers never read it as an empty listing or a missing
+ * path (#4438). Other non-zero exits are left to the caller's handling.
+ */
+export function throwIfTransportFailure(
+  runtime: Runtime,
+  result: { exitCode: number; stderr: string },
+  action: string
+): void {
+  if (result.exitCode !== 0 && runtime.isTransportFailureExit?.(result.exitCode, result.stderr)) {
+    throw new RuntimeError(`${action}: ${result.stderr.trim()}`, "network");
+  }
+}
+
 export async function readFileString(
   runtime: Runtime,
   path: string,

@@ -713,6 +713,14 @@ export interface Runtime {
    * Returns empty record for runtimes that don't need env forwarding (local, ssh).
    */
   getContainerEnv?(): Record<string, string>;
+
+  /**
+   * Whether a failed exec's exit came from the transport itself (host
+   * unreachable) rather than the command, e.g. OpenSSH exit 255. Callers that
+   * build their own exec probes use it so an unreachable host never reads as
+   * "absent" (#4438). Runtimes without such a transport omit it.
+   */
+  isTransportFailureExit?(exitCode: number, stderr: string): boolean;
 }
 
 /**

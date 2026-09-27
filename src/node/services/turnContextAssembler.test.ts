@@ -19,6 +19,7 @@ import {
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
 import { extractToolInstructionsFromSources } from "./systemMessage";
@@ -761,6 +762,42 @@ describe("buildStreamSystemContext", () => {
     // A new turn (no snapshot) reads the files again: nothing is cached across turns.
     const nextTurn = await buildSystemContextForTest(buildArgs);
     expect(nextTurn.systemMessage).toContain("Prompt guidance v2.");
+  });
+
+  test("fails instead of dropping the skills index when skill discovery fails in transport", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-skills-transport");
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(projectPath, { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+
+    // #4438: an unreachable host must fail the turn, not silently list no skills.
+    class DroppedSkillsRuntime extends TestRuntime {
+      override resolvePath(filePath: string): Promise<string> {
+        if (path.basename(filePath) === "skills") {
+          return Promise.reject(new RuntimeError("Connection refused", "network"));
+        }
+        return super.resolvePath(filePath);
+      }
+    }
+
+    const metadata = createWorkspaceMetadata({
+      id: "skills-transport-ws",
+      name: "skills-transport-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const outcome = await buildSystemContextForTest({
+      runtime: new DroppedSkillsRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg: createProjectsConfig({
+        projectPath,
+        workspaces: [{ id: metadata.id, name: metadata.name }],
+      }),
+      isSubagentWorkspace: false,
+    }).catch((error: unknown) => error);
+    expect(outcome).toMatchObject({ type: "network" });
   });
 
   test("reads instruction files while agent discovery is still in flight", async () => {

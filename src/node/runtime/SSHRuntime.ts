@@ -1100,7 +1100,7 @@ export class SSHRuntime extends RemoteRuntime {
     return cdCommandForSSH(cwd);
   }
 
-  protected override isTransportFailureExit(exitCode: number, stderr: string): boolean {
+  override isTransportFailureExit(exitCode: number, stderr: string): boolean {
     return this.transport.isConnectionFailure(exitCode, stderr);
   }
 
