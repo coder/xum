@@ -31,6 +31,10 @@ const ALLOWED_PROCEDURES = {
     "getPlanContent",
   ]),
   providers: new Set(["list", "getConfig", "onConfigChanged", "setModels"]),
+  // Read-only agent descriptors (names, descriptions, UI flags, model defaults, tool patterns) for
+  // the agent picker and agent-cycle shortcut (#4751). agents.get (full prompt bodies) stays
+  // blocked, and sanitizeWebviewOrpcInput limits the input to workspaces the webview is shown.
+  agents: new Set(["list"]),
 } as const;
 
 export function isAllowedOrpcPath(path: string[]): boolean {
@@ -55,7 +59,47 @@ export function isAllowedOrpcPath(path: string[]): boolean {
       return ALLOWED_PROCEDURES.workspace.has(procedure);
     case "providers":
       return ALLOWED_PROCEDURES.providers.has(procedure);
+    case "agents":
+      return ALLOWED_PROCEDURES.agents.has(procedure);
     default:
       return false;
   }
+}
+
+export type SanitizedOrpcInput = { ok: true; input: unknown } | { ok: false; error: string };
+
+/**
+ * Narrows webview-supplied input for procedures whose input could otherwise reach beyond what the
+ * webview is shown. The webview is less trusted than the extension host (it renders model output).
+ *
+ * agents.list: a free-form projectPath would let the webview read agent-file frontmatter from any
+ * directory, so only a workspaceId the extension already sent to the webview is accepted, and only
+ * {workspaceId, disableWorkspaceAgents} is forwarded (projectPath/includeDisabled are dropped).
+ */
+export function sanitizeWebviewOrpcInput(
+  path: string[],
+  input: unknown,
+  knownWorkspaceIds: ReadonlySet<string>
+): SanitizedOrpcInput {
+  assert(isAllowedOrpcPath(path), "sanitizeWebviewOrpcInput requires an allowed path");
+
+  if (path[0] !== "agents" || path[1] !== "list") {
+    return { ok: true, input };
+  }
+
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, error: "agents.list requires an input object" };
+  }
+  const record = input as Record<string, unknown>;
+  const workspaceId = record.workspaceId;
+  if (typeof workspaceId !== "string" || !knownWorkspaceIds.has(workspaceId)) {
+    return { ok: false, error: "agents.list is limited to known workspaces" };
+  }
+  return {
+    ok: true,
+    input: {
+      workspaceId,
+      ...(record.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
+    },
+  };
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { isAllowedOrpcPath } from "./orpcAllowlist";
+import { isAllowedOrpcPath, sanitizeWebviewOrpcInput } from "./orpcAllowlist";
 
 describe("isAllowedOrpcPath", () => {
   test("allows known procedures", () => {
@@ -32,5 +32,50 @@ describe("isAllowedOrpcPath", () => {
       .toBe(false);
     expect(isAllowedOrpcPath(["workspace", "send-message"]))
       .toBe(false);
+  });
+});
+
+describe("agents.list (#4751)", () => {
+  test("allows listing agent descriptors but not reading agent packages", () => {
+    expect(isAllowedOrpcPath(["agents", "list"])).toBe(true);
+    // agents.get returns full prompt bodies; it stays blocked.
+    expect(isAllowedOrpcPath(["agents", "get"])).toBe(false);
+  });
+
+  const known = new Set(["ws-1"]);
+
+  test("forwards only a known workspaceId and the disable flag", () => {
+    expect(
+      sanitizeWebviewOrpcInput(
+        ["agents", "list"],
+        {
+          workspaceId: "ws-1",
+          disableWorkspaceAgents: true,
+          projectPath: "/etc",
+          includeDisabled: true,
+        },
+        known
+      )
+    ).toEqual({ ok: true, input: { workspaceId: "ws-1", disableWorkspaceAgents: true } });
+  });
+
+  test("rejects unknown workspaces, free-form project paths and malformed input", () => {
+    for (const input of [
+      { workspaceId: "ws-other" },
+      { projectPath: "/home/alice/secret-project" },
+      {},
+      null,
+      "ws-1",
+    ]) {
+      expect(sanitizeWebviewOrpcInput(["agents", "list"], input, known).ok).toBe(false);
+    }
+  });
+
+  test("leaves other procedures' input unchanged", () => {
+    const input = { workspaceId: "anything", message: "hi" };
+    expect(sanitizeWebviewOrpcInput(["workspace", "sendMessage"], input, known)).toEqual({
+      ok: true,
+      input,
+    });
   });
 });
