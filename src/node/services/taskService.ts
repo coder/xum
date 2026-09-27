@@ -9324,17 +9324,6 @@ export class TaskService implements AgentTaskIntegration {
       // Persisted defaults describe a NEW synthetic turn, never someone else's delegated execution.
       // Pending registrations count too: accepting peer input must not steal a reserved turn.
       if (delegatedRootUnavailable()) return Err(delegatedRootRefusal);
-      // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
-      // unarchived: refuse before any envelope row is persisted or budget reserved, instead of
-      // accepting the message and failing later with runtime_not_ready. One probe of this target,
-      // never in instance discovery. The reason is fixed: the sender is untrusted, so it gets no
-      // path or runtime detail. A checkout deleted after this probe still hits the runtime gate.
-      if (unrelatedRoot && (await getMissingHostLocalCheckoutError(targetEntry)) != null) {
-        return Err({
-          code: "refused" as const,
-          reason: "The target workspace's checkout is unavailable, so it cannot receive messages.",
-        });
-      }
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // Match task_list's effective-running overlay, but require accepted correlation so a
@@ -9422,6 +9411,20 @@ export class TaskService implements AgentTaskIntegration {
       );
       const chainStopEpochChanged = (chainIds: string[]): boolean =>
         chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
+
+      // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
+      // unarchived: refuse before any envelope row is persisted or budget reserved, instead of
+      // accepting the message and failing later with runtime_not_ready. One probe of this target,
+      // never in instance discovery. The reason is fixed: the sender is untrusted, so it gets no
+      // path or runtime detail. A checkout deleted after this probe still hits the runtime gate.
+      // Probed after the stop epochs are captured: this await is a suspension point, and
+      // admissionStale() must still see a Stop that lands while it is pending.
+      if (unrelatedRoot && (await getMissingHostLocalCheckoutError(targetEntry)) != null) {
+        return Err({
+          code: "refused" as const,
+          reason: "The target workspace's checkout is unavailable, so it cannot receive messages.",
+        });
+      }
 
       const throttleError = this.agentPeerMessageBroker.checkPeerAdmission(
         senderWorkspaceId,

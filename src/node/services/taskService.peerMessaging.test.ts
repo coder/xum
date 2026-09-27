@@ -1298,6 +1298,47 @@ describe("TaskService", () => {
       }
     );
 
+    test("a stop that lands while the recipient's checkout is probed still wins (#4305)", async () => {
+      const config = await createTestConfig(rootDir);
+      const projectPath = path.join(rootDir, "repo");
+      await saveWorkspaces(
+        config,
+        projectPath,
+        [
+          projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "target", "target", {
+            unrelatedWorkspaceConsent: "consent",
+          }),
+        ],
+        testTaskSettings()
+      );
+      const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+      const { taskService, historyService } = createTaskServiceHarness(config, {
+        workspaceService,
+      });
+      // Stop and resume the target while the readiness probe is suspended: only the stop epoch
+      // still records it, so the epoch baseline must predate the probe.
+      const targetGitPath = path.join(projectPath, "target", ".git");
+      const realStat = fsPromises.stat.bind(fsPromises);
+      const stat = spyOn(fsPromises, "stat").mockImplementation(((
+        statPath: Parameters<typeof fsPromises.stat>[0],
+        ...rest: unknown[]
+      ) => {
+        if (String(statPath) === targetGitPath) taskService.bumpWorkspaceStopEpoch("target");
+        return (realStat as (...args: unknown[]) => unknown)(statPath, ...rest);
+      }) as typeof fsPromises.stat);
+      try {
+        const result = await taskService.sendAgentTreeMessage("sender", "target", "Before stop");
+
+        expect(stat.mock.calls.some(([statPath]) => String(statPath) === targetGitPath)).toBe(true);
+        expect(result.success).toBe(false);
+        expect(sendMessage).not.toHaveBeenCalled();
+        expect(await collectFullHistory(historyService, "target")).toEqual([]);
+      } finally {
+        stat.mockRestore();
+      }
+    });
+
     test.each([
       { endpoint: "sender", state: "archived", code: "refused" },
       { endpoint: "target", state: "archived", code: "not_active" },
