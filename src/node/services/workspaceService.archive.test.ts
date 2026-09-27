@@ -10,7 +10,6 @@ import * as fsPromises from "fs/promises";
 import path from "path";
 import os from "os";
 import { execFileSync } from "child_process";
-import { createMuxMessage } from "@/common/types/message";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -2460,10 +2459,7 @@ describe("WorkspaceService unarchive rehydrates staged attachments", () => {
     });
     if (!staged.success) throw new Error(staged.error);
     stagedPath = staged.data.stagedPath;
-    await harness.historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("u1", "user", `see \`${stagedPath}\``, { historySequence: 0 })
-    );
+    // No chat message references the upload: it may live only in a persisted composer draft.
     // Simulate the snapshot archive: the checkout (and its git-excluded staging dir) is gone and
     // restore recreates it from git state only.
     await fsPromises.rm(path.join(repo, ".xum"), { recursive: true, force: true });
@@ -2483,7 +2479,7 @@ describe("WorkspaceService unarchive rehydrates staged attachments", () => {
     });
   }
 
-  test("restores referenced attachments into the recreated checkout", async () => {
+  test("restores mirrored attachments, including draft-only ones, into the recreated checkout", async () => {
     useRestoreResult("restored");
 
     expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));

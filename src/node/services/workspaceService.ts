@@ -12643,8 +12643,8 @@ export class WorkspaceService
 
   /**
    * Snapshot archives capture only git-visible state, so the git-excluded staging dir is gone once
-   * restore recreates the checkout (#3947). Put back every upload the chat still references from
-   * the session mirror. Best-effort: the restored checkout is already live, and downloads fall back
+   * restore recreates the checkout (#3947). Put back every mirrored upload, including ones only a
+   * persisted draft references. Best-effort: the restored checkout is already live, and downloads fall back
    * to the mirror anyway. Uploads staged before the mirror existed have no copy and stay lost.
    */
   private async rehydrateStagedAttachmentsAfterSnapshotRestore(
@@ -12654,17 +12654,11 @@ export class WorkspaceService
     // restoreSnapshotAfterUnarchive only restores worktree runtimes, whose checkout is host-local.
     assert(isWorktreeRuntime(metadata.runtimeConfig), "snapshot restores are worktree-only");
     try {
-      const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-      const stagedPaths = await collectReferencedStagedAttachmentPaths(sessionDir);
-      if (stagedPaths.length === 0) {
-        return;
-      }
       const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
       const result = await rehydrateStagedWorkspaceAttachments({
         runtime,
         workspacePath,
-        sessionDir,
-        stagedPaths,
+        sessionDir: path.join(this.config.sessionsDir, workspaceId),
       });
       if (!result.success) {
         log.warn("Failed to restore staged attachments after snapshot restore", {

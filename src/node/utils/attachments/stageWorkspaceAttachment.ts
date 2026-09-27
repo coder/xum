@@ -16,6 +16,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { log } from "@/node/services/log";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 
@@ -211,36 +212,31 @@ export async function copyStagedWorkspaceAttachments(input: {
 }
 
 /**
- * Recreate checkout copies of referenced staged attachments from the session mirror after a
- * snapshot restore recreated the checkout (#3947). Host-local filesystem only: snapshot restores
- * exist solely for worktree runtimes. Only paths that map to a well-formed mirror entry are
- * written; everything else is skipped rather than failing the unarchive. Existing files are never
- * overwritten.
+ * Recreate checkout copies of mirrored staged attachments after a snapshot restore recreated the
+ * checkout (#3947). Every mirror entry is restored, not only paths the chat references: an upload
+ * can live only in a renderer-persisted draft that is sent after unarchive. Host-local filesystem
+ * only: snapshot restores exist solely for worktree runtimes. Entries staging could not have
+ * produced are skipped rather than failing the unarchive, one entry is held in memory at a time,
+ * and existing files are never overwritten.
  */
 export async function rehydrateStagedWorkspaceAttachments(input: {
   runtime: Runtime;
   workspacePath: string;
   sessionDir: string;
-  stagedPaths: readonly string[];
 }): Promise<Result<{ restored: string[]; skipped: string[] }, string>> {
   try {
     assert(path.isAbsolute(input.workspacePath), "workspacePath must be an absolute host path");
     const restored: string[] = [];
     const skipped: string[] = [];
-    const entries: Array<{ stagedPath: string; bytes: Buffer }> = [];
-    for (const rawPath of input.stagedPaths) {
-      const stagedPath = normalizeReadableStagedPath(rawPath);
-      const bytes =
-        stagedPath == null
-          ? null
-          : await readStagedAttachmentMirrorFile(input.sessionDir, stagedPath);
-      if (stagedPath == null || bytes == null) {
-        skipped.push(rawPath);
-        continue;
+    const candidates: string[] = [];
+    for (const stagedPath of await listStagedAttachmentMirrorPaths(input.sessionDir)) {
+      if (resolveStagedAttachmentMirrorPath(input.sessionDir, stagedPath) == null) {
+        skipped.push(stagedPath);
+      } else {
+        candidates.push(stagedPath);
       }
-      entries.push({ stagedPath, bytes });
     }
-    if (entries.length === 0) {
+    if (candidates.length === 0) {
       return Ok({ restored, skipped });
     }
 
@@ -262,22 +258,26 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
     if (stagingRoot == null) {
       return Err(`Refusing to restore attachments: ${STAGED_ATTACHMENT_DIR} is not a directory.`);
     }
-    for (const entry of entries) {
-      const [id, filename] = entry.stagedPath.slice(STAGED_ATTACHMENT_DIR.length + 1).split("/");
-      const entryDir = await ensureRealDirectoryChain(stagingRoot, [id]);
-      if (entryDir == null) {
-        skipped.push(entry.stagedPath);
-        continue;
-      }
+    for (const stagedPath of candidates) {
+      const [id, filename] = stagedPath.slice(STAGED_ATTACHMENT_DIR.length + 1).split("/");
       try {
+        const bytes = await readStagedAttachmentMirrorFile(input.sessionDir, stagedPath);
+        const entryDir = bytes == null ? null : await ensureRealDirectoryChain(stagingRoot, [id]);
+        if (bytes == null || entryDir == null) {
+          skipped.push(stagedPath);
+          continue;
+        }
         // wx: never overwrite, and O_EXCL refuses a symlinked leaf.
-        await fsPromises.writeFile(path.join(entryDir, filename), entry.bytes, { flag: "wx" });
-        restored.push(entry.stagedPath);
+        await fsPromises.writeFile(path.join(entryDir, filename), bytes, { flag: "wx" });
+        restored.push(stagedPath);
       } catch (error) {
         if (!isErrnoWithCode(error, "EEXIST")) {
-          throw error;
+          log.debug("Skipping unrestorable staged attachment mirror entry", {
+            stagedPath,
+            error: getErrorMessage(error),
+          });
         }
-        skipped.push(entry.stagedPath);
+        skipped.push(stagedPath);
       }
     }
     return Ok({ restored, skipped });
@@ -286,27 +286,34 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
   }
 }
 
-/** Copy referenced mirror entries into a fork's session dir; missing entries are skipped. */
+/**
+ * Copy referenced mirror entries into a fork's session dir. The mirror is supplementary to the
+ * checkout copy the fork already made, so a missing or unreadable entry is skipped instead of
+ * rolling back the fork.
+ */
 export async function copyStagedAttachmentMirrorEntries(input: {
   sourceSessionDir: string;
   targetSessionDir: string;
   stagedPaths: readonly string[];
 }): Promise<void> {
-  for (const rawPath of input.stagedPaths) {
-    const stagedPath = normalizeReadableStagedPath(rawPath);
-    const bytes =
-      stagedPath == null
-        ? null
-        : await readStagedAttachmentMirrorFile(input.sourceSessionDir, stagedPath);
-    const targetPath =
-      stagedPath == null
-        ? null
-        : resolveStagedAttachmentMirrorPath(input.targetSessionDir, stagedPath);
-    if (bytes == null || targetPath == null) {
+  for (const stagedPath of input.stagedPaths) {
+    const targetPath = resolveStagedAttachmentMirrorPath(input.targetSessionDir, stagedPath);
+    if (targetPath == null) {
       continue;
     }
-    await fsPromises.mkdir(path.dirname(targetPath), { recursive: true });
-    await fsPromises.writeFile(targetPath, bytes, { flag: "w" });
+    try {
+      const bytes = await readStagedAttachmentMirrorFile(input.sourceSessionDir, stagedPath);
+      if (bytes == null) {
+        continue;
+      }
+      await fsPromises.mkdir(path.dirname(targetPath), { recursive: true });
+      await fsPromises.writeFile(targetPath, bytes, { flag: "w" });
+    } catch (error) {
+      log.warn("Skipping staged attachment mirror entry during fork", {
+        stagedPath,
+        error: getErrorMessage(error),
+      });
+    }
   }
 }
 
@@ -410,6 +417,32 @@ async function readStagedAttachmentMirrorFile(
     }
     throw error;
   }
+}
+
+/** List mirror entries as canonical staged paths (`<dir>/<id>/<name>`); unvalidated. */
+async function listStagedAttachmentMirrorPaths(sessionDir: string): Promise<string[]> {
+  const mirrorRoot = path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME);
+  let ids: string[];
+  try {
+    ids = await fsPromises.readdir(mirrorRoot);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) {
+      return [];
+    }
+    throw error;
+  }
+  const stagedPaths: string[] = [];
+  for (const id of ids.sort()) {
+    const entryDir = path.join(mirrorRoot, id);
+    if (!(await fsPromises.lstat(entryDir)).isDirectory()) {
+      stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}`);
+      continue;
+    }
+    for (const name of (await fsPromises.readdir(entryDir)).sort()) {
+      stagedPaths.push(`${STAGED_ATTACHMENT_DIR}/${id}/${name}`);
+    }
+  }
+  return stagedPaths;
 }
 
 /** Create/verify `root/segments...` as real directories (no symlinks); null if one is not. */

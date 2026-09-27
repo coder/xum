@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -396,7 +396,7 @@ describe("staged attachment session mirror", () => {
     );
   });
 
-  test("rehydrates referenced mirror entries into a recreated checkout", async () => {
+  test("rehydrates mirror entries into a recreated checkout", async () => {
     const bytes = Buffer.from("restored bytes");
     const { repo, sessionDir, runtime, stagedPath } = await stageInRepo(bytes);
     // Snapshot archive removes the whole checkout; restore recreates it from git only.
@@ -406,7 +406,6 @@ describe("staged attachment session mirror", () => {
       runtime,
       workspacePath: repo,
       sessionDir,
-      stagedPaths: [stagedPath],
     });
 
     expect(result).toEqual({ success: true, data: { restored: [stagedPath], skipped: [] } });
@@ -415,38 +414,32 @@ describe("staged attachment session mirror", () => {
     expect(status).toBe("");
   });
 
-  test("rehydration skips malformed, traversal, symlinked, and legacy entries", async () => {
+  test("rehydration skips mirror entries staging could not have produced", async () => {
     const { repo, sessionDir, runtime, stagedPath } = await stageInRepo(Buffer.from("ok"));
     await rm(path.join(repo, ".xum"), { recursive: true, force: true });
     const mirrorRoot = path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME);
     const outside = await makeTempDir("mux-stage-mirror-outside-");
     await writeFile(path.join(outside, "secret.txt"), "secret");
-    const linkId = "11111111-1111-4111-8111-111111111111";
-    await mkdir(path.join(mirrorRoot, linkId), { recursive: true });
-    await symlink(path.join(outside, "secret.txt"), path.join(mirrorRoot, linkId, "secret.txt"));
+    const id = "11111111-1111-4111-8111-111111111111";
+    await mkdir(path.join(mirrorRoot, id, "nested"), { recursive: true });
+    await symlink(path.join(outside, "secret.txt"), path.join(mirrorRoot, id, "secret.txt"));
+    await writeFile(path.join(mirrorRoot, id, "bad$name.txt"), "x");
     await mkdir(path.join(mirrorRoot, "not-a-uuid"), { recursive: true });
     await writeFile(path.join(mirrorRoot, "not-a-uuid", "a.txt"), "x");
+    await writeFile(path.join(mirrorRoot, "loose.txt"), "x");
 
-    const badPaths = [
-      `${STAGED_ATTACHMENT_DIR}/${linkId}/secret.txt`,
-      `${STAGED_ATTACHMENT_DIR}/not-a-uuid/a.txt`,
-      `${STAGED_ATTACHMENT_DIR}/../escape.txt`,
-      `${STAGED_ATTACHMENT_DIR}/${linkId}/sub/deep.txt`,
-      `${STAGED_ATTACHMENT_DIR}/${linkId}/bad$name.txt`,
-      `.mux/user-attachments/${linkId}/legacy.txt`,
-    ];
     const result = await rehydrateStagedWorkspaceAttachments({
       runtime,
       workspacePath: repo,
       sessionDir,
-      stagedPaths: [stagedPath, ...badPaths],
     });
 
     expect(result.success && result.data.restored).toEqual([stagedPath]);
-    expect(result.success && result.data.skipped.length).toBe(badPaths.length);
-    expect(
-      await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: repo, dot: true }))
-    ).not.toContain(`${STAGED_ATTACHMENT_DIR}/${linkId}/secret.txt`);
+    expect(result.success && result.data.skipped.length).toBe(5);
+    const restoredFiles = await Array.fromAsync(
+      new Bun.Glob("**/*").scan({ cwd: path.join(repo, STAGED_ATTACHMENT_DIR), dot: true })
+    );
+    expect(restoredFiles).toEqual([stagedPath.slice(STAGED_ATTACHMENT_DIR.length + 1)]);
   });
 
   test("rehydration never overwrites existing files", async () => {
@@ -457,7 +450,6 @@ describe("staged attachment session mirror", () => {
       runtime,
       workspacePath: repo,
       sessionDir,
-      stagedPaths: [stagedPath],
     });
 
     expect(result.success && result.data.skipped).toEqual([stagedPath]);
@@ -465,7 +457,7 @@ describe("staged attachment session mirror", () => {
   });
 
   test("rehydration refuses when the checkout staging root is a symlink", async () => {
-    const { repo, sessionDir, runtime, stagedPath } = await stageInRepo(Buffer.from("mirror"));
+    const { repo, sessionDir, runtime } = await stageInRepo(Buffer.from("mirror"));
     await rm(path.join(repo, ".xum"), { recursive: true, force: true });
     const outside = await makeTempDir("mux-stage-mirror-escape-");
     // A repo can track `.xum` as a symlink; writes through it would land outside the checkout.
@@ -475,7 +467,6 @@ describe("staged attachment session mirror", () => {
       runtime,
       workspacePath: repo,
       sessionDir,
-      stagedPaths: [stagedPath],
     });
 
     expect(result.success).toBe(false);
@@ -483,6 +474,28 @@ describe("staged attachment session mirror", () => {
       []
     );
   });
+
+  test.skipIf(process.getuid?.() === 0)(
+    "fork mirror copy skips unreadable entries instead of throwing",
+    async () => {
+      const { sessionDir, stagedPath } = await stageInRepo(Buffer.from("locked"));
+      const targetSessionDir = await makeTempDir("mux-stage-mirror-fork-locked-");
+      const entryDir = path.dirname(mirrorPathFor(sessionDir, stagedPath));
+      await chmod(entryDir, 0o000);
+      try {
+        await copyStagedAttachmentMirrorEntries({
+          sourceSessionDir: sessionDir,
+          targetSessionDir,
+          stagedPaths: [stagedPath],
+        });
+      } finally {
+        await chmod(entryDir, 0o755);
+      }
+      expect(
+        await Array.fromAsync(new Bun.Glob("**/*").scan({ cwd: targetSessionDir, dot: true }))
+      ).toEqual([]);
+    }
+  );
 
   test("copies referenced mirror entries into a fork's session dir", async () => {
     const bytes = Buffer.from("fork me");
