@@ -16,6 +16,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { shellQuote } from "@/common/utils/shell";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { ensureGitInfoExclude } from "@/node/utils/git/ensureGitInfoExclude";
 
 export interface StagedWorkspaceAttachment {
@@ -273,7 +274,7 @@ export async function rehydrateStagedWorkspaceAttachments(input: {
         await fsPromises.writeFile(path.join(entryDir, filename), entry.bytes, { flag: "wx" });
         restored.push(entry.stagedPath);
       } catch (error) {
-        if (!isErrnoCode(error, "EEXIST")) {
+        if (!isErrnoWithCode(error, "EEXIST")) {
           throw error;
         }
         skipped.push(entry.stagedPath);
@@ -374,7 +375,7 @@ const STAGED_ATTACHMENT_ID_PATTERN =
  */
 function resolveStagedAttachmentMirrorPath(sessionDir: string, stagedPath: string): string | null {
   const normalized = normalizeReadableStagedPath(stagedPath);
-  if (normalized == null || !normalized.startsWith(`${STAGED_ATTACHMENT_DIR}/`)) {
+  if (!normalized?.startsWith(`${STAGED_ATTACHMENT_DIR}/`)) {
     return null;
   }
   const segments = normalized.slice(STAGED_ATTACHMENT_DIR.length + 1).split("/");
@@ -404,7 +405,7 @@ async function readStagedAttachmentMirrorFile(
     }
     return await fsPromises.readFile(mirrorPath);
   } catch (error) {
-    if (isErrnoCode(error, "ENOENT") || isErrnoCode(error, "ENOTDIR")) {
+    if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
       return null;
     }
     throw error;
@@ -422,7 +423,7 @@ async function ensureRealDirectoryChain(
     try {
       await fsPromises.mkdir(current);
     } catch (error) {
-      if (!isErrnoCode(error, "EEXIST")) {
+      if (!isErrnoWithCode(error, "EEXIST")) {
         throw error;
       }
     }
@@ -432,10 +433,6 @@ async function ensureRealDirectoryChain(
     }
   }
   return current;
-}
-
-function isErrnoCode(error: unknown, code: string): boolean {
-  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === code;
 }
 
 function normalizeStagedAttachmentPaths(stagedPaths: readonly string[]): string[] {
