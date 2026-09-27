@@ -1377,7 +1377,15 @@ function rollUpAncestorWorkspaceIds(params: {
   ];
 }
 
-async function collectReferencedStagedAttachmentPaths(sessionDir: string): Promise<string[]> {
+/**
+ * Staged paths referenced by the session's history files. Throws on an unreadable file unless
+ * `onUnreadable` is given, in which case that file is reported and its readable siblings still
+ * count.
+ */
+async function collectReferencedStagedAttachmentPaths(
+  sessionDir: string,
+  onUnreadable?: (fileName: string, error: unknown) => void
+): Promise<string[]> {
   const paths = new Set<string>();
   for (const fileName of [CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME, "partial.json"] as const) {
     try {
@@ -1386,9 +1394,13 @@ async function collectReferencedStagedAttachmentPaths(sessionDir: string): Promi
         paths.add(stagedPath);
       }
     } catch (error) {
-      if (!isErrnoWithCode(error, "ENOENT")) {
+      if (isErrnoWithCode(error, "ENOENT")) {
+        continue;
+      }
+      if (onUnreadable == null) {
         throw error;
       }
+      onUnreadable(fileName, error);
     }
   }
   return [...paths];
@@ -12886,7 +12898,16 @@ export class WorkspaceService
     assert(isWorktreeRuntime(metadata.runtimeConfig), "snapshot capture is worktree-only");
     try {
       const sessionDir = path.join(this.config.sessionsDir, workspaceId);
-      const stagedPaths = await collectReferencedStagedAttachmentPaths(sessionDir);
+      // One damaged history file must not hide references in its readable siblings.
+      const stagedPaths = await collectReferencedStagedAttachmentPaths(
+        sessionDir,
+        (fileName, error) =>
+          log.warn("Skipping unreadable history file for staged attachment backfill", {
+            workspaceId,
+            fileName,
+            error: getErrorMessage(error),
+          })
+      );
       if (stagedPaths.length === 0) {
         return;
       }

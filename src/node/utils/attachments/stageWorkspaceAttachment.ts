@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -347,7 +347,8 @@ export async function backfillStagedAttachmentMirror(input: {
         skipped.push(stagedPath);
         continue;
       }
-      if (await pathExists(mirrorPath)) {
+      const existing = await lstatOrNull(mirrorPath);
+      if (existing?.isFile() && existing.size <= MAX_STAGED_ATTACHMENT_SIZE_BYTES) {
         continue;
       }
       const bytes = await readCheckoutFileWithoutFollowingLinks(input.workspacePath, stagedPath);
@@ -361,6 +362,11 @@ export async function backfillStagedAttachmentMirror(input: {
       // would treat as the durable copy. The temp name fails the canonical-name check.
       const tempPath = path.join(path.dirname(mirrorPath), `.backfill-${randomUUID()}`);
       await fsPromises.writeFile(tempPath, bytes, { flag: "wx" });
+      if (existing != null) {
+        // A mirror entry rehydration would reject (symlink, directory, oversized file) is
+        // corrupted host state; replace it so the checkout copy is not lost with the archive.
+        await fsPromises.rm(mirrorPath, { recursive: true, force: true });
+      }
       await fsPromises.rename(tempPath, mirrorPath);
       copied.push(stagedPath);
     } catch (error) {
@@ -437,13 +443,12 @@ async function isRealDirectoryChain(root: string, segments: readonly string[]): 
   return true;
 }
 
-async function pathExists(filePath: string): Promise<boolean> {
+async function lstatOrNull(filePath: string): Promise<Stats | null> {
   try {
-    await fsPromises.lstat(filePath);
-    return true;
+    return await fsPromises.lstat(filePath);
   } catch (error) {
     if (isErrnoWithCode(error, "ENOENT")) {
-      return false;
+      return null;
     }
     throw error;
   }

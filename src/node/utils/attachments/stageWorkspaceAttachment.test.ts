@@ -631,6 +631,38 @@ describe("staged attachment session mirror", () => {
       ).toBeNull();
     });
 
+    test("replaces mirror entries rehydration would reject", async () => {
+      const bytes = Buffer.from("only valid copy");
+      const { repo, sessionDir, runtime, stagedPath } = await stageWithoutMirror(bytes);
+      const dirEntry = await stageWorkspaceAttachment({
+        runtime,
+        workspacePath: repo,
+        sessionDir,
+        filename: "dir.md",
+        sizeBytes: 1,
+        dataBase64: Buffer.from("d").toString("base64"),
+      });
+      if (!dirEntry.success) throw new Error(dirEntry.error);
+      const outside = await makeTempDir("mux-stage-backfill-corrupt-");
+      await writeFile(path.join(outside, "other.txt"), "other");
+      await mkdir(path.dirname(mirrorPathFor(sessionDir, stagedPath)), { recursive: true });
+      await symlink(path.join(outside, "other.txt"), mirrorPathFor(sessionDir, stagedPath));
+      const dirMirror = mirrorPathFor(sessionDir, dirEntry.data.stagedPath);
+      await rm(dirMirror);
+      await mkdir(path.join(dirMirror, "junk"), { recursive: true });
+
+      const result = await backfillStagedAttachmentMirror({
+        workspacePath: repo,
+        sessionDir,
+        stagedPaths: [stagedPath, dirEntry.data.stagedPath],
+      });
+
+      expect(result).toEqual({ copied: [stagedPath, dirEntry.data.stagedPath], skipped: [] });
+      expect(await readFile(mirrorPathFor(sessionDir, stagedPath))).toEqual(bytes);
+      expect(await readFile(dirMirror, "utf8")).toBe("d");
+      expect(await readFile(path.join(outside, "other.txt"), "utf8")).toBe("other");
+    });
+
     test("never copies symlinks, special files, oversized files, or non-canonical paths", async () => {
       const { repo, sessionDir } = await stageWithoutMirror(Buffer.from("ok"));
       const outside = await makeTempDir("mux-stage-backfill-outside-");

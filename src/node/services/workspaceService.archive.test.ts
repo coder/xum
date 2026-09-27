@@ -15,6 +15,7 @@ import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspac
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 import type { Config } from "@/node/config";
 import type { AIService } from "./aiService";
 import type { FrontendWorkspaceMetadata, WorkspaceMetadata } from "@/common/types/workspace";
@@ -2579,9 +2580,9 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
     });
   }
 
-  test("a referenced upload staged before the mirror survives archive and unarchive", async () => {
+  /** Stage an upload the way pre-#3947 builds did: checkout copy only, referenced by chat. */
+  async function stagePreMirrorUpload(bytes: Buffer): Promise<string> {
     const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
-    const bytes = Buffer.from("staged before the mirror existed");
     const staged = await stageWorkspaceAttachment({
       runtime: new LocalRuntime(repo),
       workspacePath: repo,
@@ -2592,16 +2593,34 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
       dataBase64: bytes.toString("base64"),
     });
     if (!staged.success) throw new Error(staged.error);
-    const stagedPath = staged.data.stagedPath;
-    // Pre-#3947 staging wrote only the checkout copy.
     await fsPromises.rm(path.join(sessionDir, "staged-attachments"), { recursive: true });
     await fsPromises.writeFile(
       path.join(sessionDir, "chat.jsonl"),
       JSON.stringify({
         id: "m1",
         role: "user",
-        parts: [{ type: "text", text: `Attached \`${stagedPath}\`` }],
+        parts: [{ type: "text", text: `Attached \`${staged.data.stagedPath}\`` }],
       }) + "\n"
+    );
+    return staged.data.stagedPath;
+  }
+
+  test("a referenced upload staged before the mirror survives archive and unarchive", async () => {
+    const bytes = Buffer.from("staged before the mirror existed");
+    const stagedPath = await stagePreMirrorUpload(bytes);
+    useSnapshotService();
+
+    expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("an unreadable history file does not hide references in its siblings", async () => {
+    const bytes = Buffer.from("referenced by chat.jsonl");
+    const stagedPath = await stagePreMirrorUpload(bytes);
+    await fsPromises.mkdir(
+      path.join(harness.config.sessionsDir, workspaceId, CHAT_ARCHIVE_FILE_NAME)
     );
     useSnapshotService();
 
@@ -2611,11 +2630,13 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
     expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
   });
 
-  test("a failing backfill does not block the archive", async () => {
-    // An unreadable chat file makes collecting referenced paths throw.
-    await fsPromises.mkdir(path.join(harness.config.sessionsDir, workspaceId, "chat.jsonl"), {
-      recursive: true,
-    });
+  test("a failed backfill copy does not block the archive", async () => {
+    await stagePreMirrorUpload(Buffer.from("cannot be mirrored"));
+    // The mirror root cannot be created, so the copy fails.
+    await fsPromises.writeFile(
+      path.join(harness.config.sessionsDir, workspaceId, "staged-attachments"),
+      "not a directory"
+    );
     useSnapshotService();
 
     expect(await harness.service.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
