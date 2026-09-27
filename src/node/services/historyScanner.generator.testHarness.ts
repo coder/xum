@@ -28,7 +28,7 @@ export function mulberry32(seed: number) {
 }
 
 export const json = (m: MuxMessage) => JSON.stringify(m);
-export const rollover = {
+const rollover = {
   type: "context-window-rollover",
   rolloverId: "r",
   reason: "on-send",
@@ -37,7 +37,7 @@ export const rollover = {
   contextTokens: 100,
   maxTokens: 200,
 };
-export function toolRow(id: string, output: unknown): string {
+function toolRow(id: string, output: unknown): string {
   const message = createMuxMessage(id, "assistant", "running a tool");
   message.parts.push({
     type: "dynamic-tool",
@@ -49,7 +49,7 @@ export function toolRow(id: string, output: unknown): string {
   });
   return json(message);
 }
-export function hiddenRow(id: string): string {
+function hiddenRow(id: string): string {
   const record = { v: 1 as const, kind: "resolve" as const, recordId: id, threadId: "t" };
   return json(
     createMuxMessage(id, "user", formatPlanReviewEnvelope(record), {
