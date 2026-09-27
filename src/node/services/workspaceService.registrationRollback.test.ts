@@ -409,15 +409,12 @@ describe("WorkspaceService registration rollback (#4745)", () => {
   test("create failing after the consent grant removes the announced, consented row", async () => {
     const workspaceId = "ddddddddd2";
     spyOn(harness.config, "generateStableId").mockReturnValueOnce(workspaceId);
-    const realGetEffectiveSecrets = SecretsStore.prototype.getEffectiveSecrets;
     let secretsCalls = 0;
-    // The second read comes after the grant and the announcement, before background init.
-    spyOn(SecretsStore.prototype, "getEffectiveSecrets").mockImplementation(function (
-      this: SecretsStore,
-      projectPathArg: string
-    ) {
+    // The second read comes after the grant and the announcement, before background init. The
+    // project has no secrets, so the first read returns what the real store would.
+    spyOn(SecretsStore.prototype, "getEffectiveSecrets").mockImplementation(() => {
       if (++secretsCalls === 2) throw new Error("secrets store unavailable");
-      return realGetEffectiveSecrets.call(this, projectPathArg);
+      return [];
     });
     const announced: Array<FrontendWorkspaceMetadata | null> = [];
     service.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
