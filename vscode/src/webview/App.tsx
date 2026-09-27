@@ -733,6 +733,7 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                                 : undefined
                           }
                           aggregator={aggregatorRef.current}
+                          aiSettingsLoaded={selectedWorkspace?.ai != null}
                           onSendComplete={jumpToBottom}
                           onNotice={pushNotice}
                         />

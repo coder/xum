@@ -17,7 +17,12 @@ import { usePersistedState, updatePersistedState } from "xum/browser/hooks/usePe
 import { useModelsFromSettings } from "xum/browser/hooks/useModelsFromSettings";
 import { useProvidersConfig } from "xum/browser/hooks/useProvidersConfig";
 import { normalizeSelectedModel } from "xum/common/utils/ai/models";
-import { markAiSelectionIntent } from "xum/browser/utils/aiSelectionIntent";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  markAiSelectionIntent,
+} from "xum/browser/utils/aiSelectionIntent";
+import assert from "xum/common/utils/assert";
 import { useProviderOptions } from "xum/browser/hooks/useProviderOptions";
 import { useAutoCompactionSettings } from "xum/browser/hooks/useAutoCompactionSettings";
 
@@ -41,6 +46,14 @@ import {
 } from "xum/common/constants/storage";
 
 const SEND_MESSAGE_TIMEOUT_MS = 30_000;
+
+// #4781: at most one AI-settings-persisting send per workspace may be unresolved, so an earlier
+// write can never land after a later pick's. The backend saves the settings before sendMessage
+// returns, so a server reply (success or failure) settles the entry. "unknown": a persisting send
+// ended without a reply (timeout abort or transport error), so its write may still land; later
+// sends for that workspace do not persist until the webview reloads (fail closed; the picks still
+// apply to the turns). Module scope, because the composer remounts per workspace.
+const aiPersistenceByWorkspace = new Map<string, "in-flight" | "unknown">();
 
 /**
  * Simple agent toggle for VS Code extension (no agent discovery).
@@ -117,6 +130,8 @@ function ChatComposerInner(props: {
   disabled: boolean;
   disabledReason?: string | undefined;
   aggregator: StreamingMessageAggregator | null;
+  /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
+  aiSettingsLoaded: boolean;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
@@ -252,7 +267,7 @@ function ChatComposerInner(props: {
       {}
     );
 
-    // #4755: a model change still stays local; sends do not persist AI settings yet (#4781).
+    // #4781: nothing is written here; the next send persists the pick (desktop parity).
   };
 
   const cycleModels = customModels.length > 0 ? customModels : models;
@@ -272,8 +287,9 @@ function ChatComposerInner(props: {
 
   const onSend = async () => {
     // Re-check at dispatch: the composer can be disabled (e.g. history replay not caught up)
-    // after the keystroke or click that triggered this send.
-    if (props.disabled) {
+    // after the keystroke or click that triggered this send. Like the disabled Send button (and the
+    // desktop composer), Enter must not start a second send while one is in flight.
+    if (props.disabled || isSending) {
       return;
     }
     const trimmed = input.trim();
@@ -307,16 +323,36 @@ function ChatComposerInner(props: {
       controller.abort();
     }, SEND_MESSAGE_TIMEOUT_MS);
 
+    const baseOptions = {
+      ...getSendOptionsFromStorage(props.workspaceId),
+      // The effective agent: for a sub-agent workspace, the locked agent (#4738), not a local pick.
+      agentId,
+    };
+    // #4781: persist only explicit picks, through the desktop's send-time path (the backend saves the
+    // sent settings unless skipAiSettingsPersistence; aiSelectionIntent pins them on a sub-agent).
+    // Never seeded values (no pending pick), never before the workspace's settings are loaded
+    // (#4755), never a policy-excluded or fallback model (#4808), and never while an earlier
+    // persisting send for this workspace is unresolved. The thinking level is sent as selected; the
+    // backend applies the authoritative floor.
+    const mayPersist =
+      props.aiSettingsLoaded &&
+      storedModelAllowed &&
+      !aiPersistenceByWorkspace.has(props.workspaceId);
+    const aiSelection = getAiSelectionIntentForSendOptions(props.workspaceId, agentId, {
+      ...baseOptions,
+      skipAiSettingsPersistence: !mayPersist,
+    });
+    const persist = aiSelection.intent !== undefined;
+    assert(!persist || policyFallbackModel === null, "a policy fallback model must never be persisted");
+    if (persist) {
+      aiPersistenceByWorkspace.set(props.workspaceId, "in-flight");
+    }
+
     try {
       const options = {
-        ...getSendOptionsFromStorage(props.workspaceId),
-        // The effective agent: for a sub-agent workspace, the locked agent (#4738), not a local pick.
-        agentId,
-        // #4755: never persist from the webview. Even with the workspace's settings seeded (#4738),
-        // saving needs the desktop's selection-intent/gateway-route handling (#4778 review).
-        // The thinking level is sent as selected: the webview does not load the user's configured
-        // per-model minimums, so only the backend can apply the authoritative floor.
-        skipAiSettingsPersistence: true,
+        ...baseOptions,
+        skipAiSettingsPersistence: !persist,
+        ...(persist ? { aiSelectionIntent: aiSelection.intent } : {}),
         // Only when the stored model is policy-excluded; otherwise keep the stored model string.
         ...(policyFallbackModel ? { model: policyFallbackModel } : {}),
       };
@@ -329,6 +365,10 @@ function ChatComposerInner(props: {
         },
         { signal: controller.signal }
       );
+      if (persist) {
+        // The server replied, so this send's settings write has landed (or was skipped).
+        aiPersistenceByWorkspace.delete(props.workspaceId);
+      }
 
       if (!result.success) {
         const errorString =
@@ -338,8 +378,15 @@ function ChatComposerInner(props: {
         return;
       }
 
+      if (persist) {
+        // A pick made while this send was in flight has a newer token and stays pending.
+        consumeAiSelectionIntent(props.workspaceId, agentId, aiSelection.attachedTokens);
+      }
       props.onSendComplete();
     } catch (error) {
+      if (persist) {
+        aiPersistenceByWorkspace.set(props.workspaceId, "unknown");
+      }
       if (controller.signal.aborted) {
         props.onNotice({
           level: "error",
@@ -481,6 +528,8 @@ export function ChatComposer(props: {
   disabled: boolean;
   disabledReason?: string | undefined;
   aggregator: StreamingMessageAggregator | null;
+  /** The workspace's own AI settings are loaded; until then nothing may be persisted (#4781). */
+  aiSettingsLoaded: boolean;
   onSendComplete: () => void;
   onNotice: (notice: { level: "info" | "error"; message: string }) => void;
 }): JSX.Element {
@@ -492,6 +541,7 @@ export function ChatComposer(props: {
         disabled={props.disabled}
         disabledReason={props.disabledReason}
         aggregator={props.aggregator}
+        aiSettingsLoaded={props.aiSettingsLoaded}
         onSendComplete={props.onSendComplete}
         onNotice={props.onNotice}
       />

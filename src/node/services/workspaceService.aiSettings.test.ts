@@ -26,17 +26,20 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
   // send unchanged while an otherwise identical user-authored send still updates it. The status
   // clearing suite above only proves the persistence hook is skipped; this reads the real config.
   // agentId: a different built-in, a custom agent, and the already-selected agent.
+  // skipAiSettingsPersistence: the VS Code webview sends it for every send without an explicit pick
+  // (#4781), so it must leave the remembered agent and settings untouched too.
   test.each([
-    [true, "plan"],
-    [false, "plan"],
-    [false, "reviewer"],
-    [false, "exec"],
+    [true, "plan", false],
+    [false, "plan", false],
+    [false, "reviewer", false],
+    [false, "exec", false],
+    [false, "plan", true],
   ] as const)(
-    "persists agent and AI settings only for non-synthetic sends (synthetic=%s, agentId=%s)",
-    async (synthetic, agentId) => {
+    "persists agent and AI settings only for non-synthetic sends (synthetic=%s, agentId=%s, skip=%s)",
+    async (synthetic, agentId, skip) => {
       const { config, historyService, cleanup } = await createTestHistoryService();
       try {
-        const workspaceId = `settings-persistence-${synthetic ? "synthetic" : "manual"}-${agentId}`;
+        const workspaceId = `settings-persistence-${synthetic ? "synthetic" : "manual"}-${agentId}${skip ? "-skip" : ""}`;
         const projectPath = "/tmp/settings-persistence-project";
         const remembered = {
           agentId: "exec",
@@ -80,7 +83,12 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
         const result = await workspaceService.sendMessage(
           workspaceId,
           "hello",
-          { agentId, model: "openai:gpt-5.2", thinkingLevel: "high" },
+          {
+            agentId,
+            model: "openai:gpt-5.2",
+            thinkingLevel: "high",
+            ...(skip ? { skipAiSettingsPersistence: true } : {}),
+          },
           synthetic ? { synthetic: true } : undefined
         );
 
@@ -97,7 +105,7 @@ describe("WorkspaceService sendMessage AI settings persistence", () => {
           aiSettingsByAgent: entry?.aiSettingsByAgent,
         };
         expect(persisted).toEqual(
-          synthetic
+          synthetic || skip
             ? remembered
             : {
                 agentId,

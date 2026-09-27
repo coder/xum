@@ -510,8 +510,10 @@ describe("vscode webview workspace AI settings", () => {
     const options = await send(bridge, view);
     expect(options.agentId).toBe("plan");
     expect(String(options.model)).toContain("sonnet");
-    // The pick stays local (#4755): no AI-settings write reaches the workspace.
+    // No pick-time write reaches the workspace; the send carries the pick (#4781).
     expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+    // Settle the persisting send so this webview session has no unresolved one (#4781).
+    await bridge.answer("workspace.sendMessage", { success: true, data: {} });
   });
 
   test("sends a gateway-routed model pick with its gateway ID", async () => {
@@ -563,6 +565,7 @@ describe("vscode webview workspace AI settings", () => {
 
     const options = await send(bridge, view);
     expect(String(options.model)).toContain("sonnet");
+    await bridge.answer("workspace.sendMessage", { success: true, data: {} });
   });
 
   test("shows the actual custom agent instead of mislabeling it as Exec", async () => {
@@ -842,5 +845,314 @@ describe("vscode webview app and providers config", () => {
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(bridge.orpcCalls("config.getConfig")).toHaveLength(1);
     expect(bridge.orpcCalls("providers.getConfig")).toHaveLength(1);
+  });
+});
+
+// #4781: a send persists AI settings only for an explicit, still-current pick, once the workspace's
+// settings are loaded, while admin policy allows the stored model, and never while an earlier
+// persisting send for the workspace is unresolved.
+describe("vscode webview explicit AI-setting persistence", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+    resetAiSelectionIntentForTests();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  function mainWorkspace(
+    plan: { model: string; thinkingLevel: "low" | "medium" | "high" },
+    id = WORKSPACE.id
+  ): UiWorkspace {
+    return {
+      ...WORKSPACE,
+      id,
+      ai: {
+        agentId: "plan",
+        aiSettingsByAgent: {
+          plan,
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "medium" },
+        },
+      },
+    };
+  }
+
+  const TERRA_HIGH = { model: "openai:gpt-5.6-terra", thinkingLevel: "high" } as const;
+
+  async function selectById(bridge: TestBridge, workspaceId: string) {
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId });
+    await bridge.emit({ type: "chatEvent", workspaceId, event: { type: "caught-up" } });
+  }
+
+  async function open(workspaces: UiWorkspace[]) {
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
+    await bridge.emit({ type: "workspaces", workspaces });
+    await selectById(bridge, workspaces[0].id);
+    return { bridge, view };
+  }
+
+  async function pickModel(view: ReturnType<typeof render>, label: string) {
+    await act(async () => {
+      fireEvent.click(view.getByRole("combobox"));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      fireEvent.click(view.getByText(label));
+      await Promise.resolve();
+    });
+  }
+
+  async function pickThinking(view: ReturnType<typeof render>, label: string) {
+    const trigger = view.container.querySelector<HTMLElement>("[data-thinking-selector-trigger]");
+    if (!trigger) throw new Error("thinking selector did not render");
+    await act(async () => {
+      fireEvent.click(trigger);
+      await Promise.resolve();
+    });
+    const option = Array.from(
+      view.container.querySelectorAll<HTMLElement>('[role="option"]')
+    ).find((row) => row.getAttribute("aria-label") === label);
+    if (!option) throw new Error(`thinking option ${label} did not render`);
+    await act(async () => {
+      fireEvent.click(option);
+      await Promise.resolve();
+    });
+  }
+
+  function textarea(view: ReturnType<typeof render>): HTMLTextAreaElement {
+    const element = view.container.querySelector("textarea");
+    if (!element) throw new Error("composer textarea did not render");
+    return element;
+  }
+
+  // Types and clicks Send; returns the options of the new sendMessage call.
+  async function send(bridge: TestBridge, view: ReturnType<typeof render>) {
+    const before = bridge.orpcCalls("workspace.sendMessage").length;
+    await typeInto(textarea(view), "hello");
+    await act(async () => {
+      fireEvent.click(view.getByRole("button", { name: "Send message" }));
+      await Promise.resolve();
+    });
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    expect(sends).toHaveLength(before + 1);
+    const input = sends[before].input as { options?: Record<string, unknown> };
+    if (!input.options) throw new Error("sendMessage carried no options");
+    return input.options;
+  }
+
+  // Plays the host's reply to one sendMessage call (the newest by default).
+  async function reply(bridge: TestBridge, value: unknown, index = -1) {
+    const sends = bridge.orpcCalls("workspace.sendMessage");
+    const call = sends.at(index);
+    if (!call) throw new Error("no sendMessage call to answer");
+    await bridge.emit({ type: "orpcResponse", requestId: call.requestId, ok: true, kind: "value", value });
+  }
+
+  const OK = { success: true, data: {} };
+
+  test("does not persist a send without an explicit pick", async () => {
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
+    const options = await send(bridge, view);
+    expect(options.skipAiSettingsPersistence).toBe(true);
+    expect(options.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+  });
+
+  test("persists an explicit model pick once, at the next send", async () => {
+    // "low" is below Opus 5.5's built-in minimum (MED): the companion thinking level must be sent
+    // (and so persisted) as stored, not raised to a client-side floor.
+    const { bridge, view } = await open([
+      mainWorkspace({ model: "openai:gpt-5.6-terra", thinkingLevel: "low" }),
+    ]);
+    await pickModel(view, "Opus 5.5");
+
+    const first = await send(bridge, view);
+    expect(first).toMatchObject({
+      agentId: "plan",
+      model: "anthropic:claude-opus-5-5",
+      thinkingLevel: "low",
+      skipAiSettingsPersistence: false,
+      aiSelectionIntent: { model: true },
+    });
+    await reply(bridge, OK);
+
+    const second = await send(bridge, view);
+    expect(second.skipAiSettingsPersistence).toBe(true);
+    expect(second.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+    expect(bridge.orpcCalls("workspace.updateAgentAISettings")).toHaveLength(0);
+  });
+
+  test("persists only the last of several rapid picks", async () => {
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
+    await pickModel(view, "Sonnet 5");
+    await pickModel(view, "Opus 5.5");
+
+    const options = await send(bridge, view);
+    expect(options).toMatchObject({
+      model: "anthropic:claude-opus-5-5",
+      skipAiSettingsPersistence: false,
+      aiSelectionIntent: { model: true },
+    });
+    await reply(bridge, OK);
+  });
+
+  test("persists an explicit thinking pick as selected", async () => {
+    const { bridge, view } = await open([
+      mainWorkspace({ model: "openai:gpt-5.6-terra", thinkingLevel: "medium" }),
+    ]);
+    await pickThinking(view, "High");
+
+    const options = await send(bridge, view);
+    expect(options).toMatchObject({
+      thinkingLevel: "high",
+      skipAiSettingsPersistence: false,
+      aiSelectionIntent: { thinkingLevel: true },
+    });
+    await reply(bridge, OK);
+  });
+
+  test("never persists for a workspace without loaded AI settings", async () => {
+    const { bridge, view } = await open([WORKSPACE]);
+    await pickModel(view, "Sonnet 5");
+
+    const options = await send(bridge, view);
+    expect(String(options.model)).toContain("sonnet");
+    expect(options.skipAiSettingsPersistence).toBe(true);
+    expect(options.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+  });
+
+  test("never persists the admin-policy fallback model", async () => {
+    // Exec is seeded with Opus 5.5, which the policy excludes.
+    const workspace: UiWorkspace = {
+      ...mainWorkspace(TERRA_HIGH),
+      ai: { ...mainWorkspace(TERRA_HIGH).ai, agentId: "exec" },
+    };
+    const { bridge, view } = await open([workspace]);
+    await bridge.answer("policy.get", {
+      source: "governor",
+      status: { state: "enforced" },
+      policy: {
+        policyFormatVersion: "0.1",
+        providerAccess: [{ id: "openai", allowedModels: ["gpt-5.6-terra"] }],
+        mcp: { allowUserDefined: { stdio: true, remote: true } },
+        runtimes: null,
+      },
+    });
+    await bridge.answer("providers.getConfig", {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
+    try {
+      await pickThinking(view, "High");
+
+      const options = await send(bridge, view);
+      expect(options.model).toBe("openai:gpt-5.6-terra");
+      expect(options.skipAiSettingsPersistence).toBe(true);
+      expect(options.aiSelectionIntent).toBeUndefined();
+      await reply(bridge, OK);
+    } finally {
+      await clearProvidersConfig(bridge);
+    }
+  });
+
+  test("persists a locked sub-agent's pick only into its locked agent", async () => {
+    // agentId was restamped by a recovery send; agentType is the child's creation-time identity.
+    const { bridge, view } = await open([
+      {
+        ...WORKSPACE,
+        ai: {
+          parentWorkspaceId: "ws-parent",
+          agentId: "plan",
+          agentType: "exec",
+          aiSettingsByAgent: { exec: TERRA_HIGH },
+        },
+      },
+    ]);
+    await pickModel(view, "Sonnet 5");
+
+    expect((view.getByRole("button", { name: "Exec" }) as HTMLButtonElement).disabled).toBe(true);
+    const options = await send(bridge, view);
+    expect(options).toMatchObject({
+      agentId: "exec",
+      skipAiSettingsPersistence: false,
+      aiSelectionIntent: { model: true },
+    });
+    expect(String(options.model)).toContain("sonnet");
+    await reply(bridge, OK);
+  });
+
+  test("keeps one persisting send per workspace in flight; the next send writes the latest pick", async () => {
+    const other = mainWorkspace(TERRA_HIGH, "ws-2");
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH), other]);
+    await pickModel(view, "Sonnet 5");
+    const first = await send(bridge, view);
+    expect(first.skipAiSettingsPersistence).toBe(false);
+
+    // Enter must not start a second send while the first is in flight (the Send button is disabled).
+    await typeInto(textarea(view), "second");
+    await act(async () => {
+      fireEvent.keyDown(textarea(view), { key: "Enter" });
+      await Promise.resolve();
+    });
+    expect(bridge.orpcCalls("workspace.sendMessage")).toHaveLength(1);
+
+    // Switching workspaces remounts the composer; the first send is still unresolved.
+    await selectById(bridge, other.id);
+    await selectById(bridge, WORKSPACE.id);
+    await pickModel(view, "Opus 5.5");
+    const overlapping = await send(bridge, view);
+    expect(overlapping.model).toBe("anthropic:claude-opus-5-5");
+    expect(overlapping.skipAiSettingsPersistence).toBe(true);
+    expect(overlapping.aiSelectionIntent).toBeUndefined();
+
+    await reply(bridge, OK, 0);
+    await reply(bridge, OK, 1);
+    const next = await send(bridge, view);
+    expect(next).toMatchObject({
+      model: "anthropic:claude-opus-5-5",
+      skipAiSettingsPersistence: false,
+      aiSelectionIntent: { model: true },
+    });
+    await reply(bridge, OK);
+  });
+
+  test("stops persisting for a workspace after a send ends without a server result", async () => {
+    // Own workspace ID: the unknown outcome lasts for this webview session.
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH, "ws-unknown-outcome")]);
+    await pickModel(view, "Sonnet 5");
+    const first = await send(bridge, view);
+    expect(first.skipAiSettingsPersistence).toBe(false);
+    const call = bridge.orpcCalls("workspace.sendMessage")[0];
+    await bridge.emit({ type: "orpcResponse", requestId: call.requestId, ok: false, error: "network" });
+
+    await pickModel(view, "Opus 5.5");
+    const next = await send(bridge, view);
+    expect(next.skipAiSettingsPersistence).toBe(true);
+    expect(next.aiSelectionIntent).toBeUndefined();
+    await reply(bridge, OK);
+  });
+
+  test("keeps a pick pending after a server-reported send failure", async () => {
+    const { bridge, view } = await open([mainWorkspace(TERRA_HIGH)]);
+    await pickModel(view, "Sonnet 5");
+    const first = await send(bridge, view);
+    expect(first.skipAiSettingsPersistence).toBe(false);
+    await reply(bridge, { success: false, error: { type: "policy_denied", message: "denied" } });
+
+    const retry = await send(bridge, view);
+    expect(retry).toMatchObject({
+      skipAiSettingsPersistence: false,
+      aiSelectionIntent: { model: true },
+    });
+    expect(String(retry.model)).toContain("sonnet");
+    await reply(bridge, OK);
   });
 });
