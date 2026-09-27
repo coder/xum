@@ -6,7 +6,7 @@ import path from "path";
 import { Err, Ok } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
-import type { SecretsStore } from "@/node/config";
+import { Config, type SecretsStore } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
@@ -646,6 +646,12 @@ describe("WorkspaceService init cancellation", () => {
       ]);
       expect(settledEarly).toBe(false);
       expect(initAbort.signal.aborted).toBe(true);
+      // Other backends refuse new work on the durable marker while removal waits.
+      const row = new Config(harness.rootDir)
+        .loadConfigOrDefault()
+        .projects.get(projectPath)
+        ?.workspaces.find((entry) => entry.id === workspaceId);
+      expect(row?.pendingRemoval).toBeDefined();
       expect(deleteWorkspaceMock).not.toHaveBeenCalled();
 
       settleInit();

@@ -6626,13 +6626,6 @@ export class WorkspaceService
       initAbortController.abort();
       this.initAbortControllers.delete(workspaceId);
     }
-    // The abort only signals: the init hook (or an SSH background materialization) may still be
-    // writing. Wait for its retained settlement before any teardown, as archive does (#4819: a
-    // failed delegated creation removes its target right after create()). Never rejects.
-    const initSettlement = this.initSettlementPromises.get(workspaceId);
-    if (initSettlement != null) {
-      await initSettlement;
-    }
 
     // The registered entry is read AFTER the MCP-overrides lock below is held
     // (a sibling backend's rename retargets the lock onto the renamed checkout,
@@ -6665,6 +6658,15 @@ export class WorkspaceService
       const claim = await this.claimPendingRemoval(workspaceId, binding);
       if (!claim.success) return Err(claim.error);
       pendingRemovalId = claim.data;
+      // The init abort above only signals: the init hook (or an SSH background materialization)
+      // may still be writing. Wait for its retained settlement before any teardown, as archive
+      // does (#4819: a failed delegated creation removes its target right after create()). Only
+      // now, with local admission held and the durable marker refusing other backends' new work,
+      // so nothing can be admitted during the wait. Never rejects.
+      const initSettlement = this.initSettlementPromises.get(workspaceId);
+      if (initSettlement != null) {
+        await initSettlement;
+      }
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
