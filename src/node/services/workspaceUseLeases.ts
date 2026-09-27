@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
+import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
+
+import { getErrorMessage } from "@/common/utils/errors";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import {
   acquireCrossProcessLock,
+  CrossProcessLockTimeoutError,
   inspectCrossProcessLock,
 } from "@/node/utils/main/crossProcessLock";
 
@@ -19,7 +24,7 @@ import {
  * Protocol (Dekker ordering on atomic lock-file publications):
  * - A user publishes its lease file, THEN probes the workspace's mutation gate; a live gate makes
  *   it withdraw the lease and throw WorkspaceMutationInProgressError.
- * - A mutator publishes the gate, THEN scans the lease files (the gate helper).
+ * - A mutator publishes the gate, THEN scans the lease files (withMutationGate).
  * So at least one side always observes the other. Nobody waits on another process: both sides
  * refuse instead, and every lock dies with its process under the kit's liveness contract.
  *
@@ -29,8 +34,33 @@ import {
  */
 export type WorkspaceUseKind = "turn" | "terminal" | "init" | "mcp" | "exec";
 
+const WORKSPACE_USE_KINDS: readonly WorkspaceUseKind[] = [
+  "turn",
+  "terminal",
+  "init",
+  "mcp",
+  "exec",
+];
+
 /** Thrown by hold() while a structural mutation of the workspace is in progress. */
 export class WorkspaceMutationInProgressError extends Error {}
+
+/** Thrown by withMutationGate() when the workspace is in use or already being mutated. */
+export class WorkspaceBusyError extends Error {}
+
+export interface WorkspaceMutationGateOptions {
+  /**
+   * This backend's own lease kinds that do not block the mutation, because the mutator ends or
+   * tolerates them itself (remove closes its own terminals, for example). Other backends' leases
+   * always block: this backend cannot stop them.
+   */
+  ignoreOwnKinds?: ReadonlySet<WorkspaceUseKind>;
+  /**
+   * Background processes leave their own cross-process evidence (spawn records), so the gate asks
+   * instead of leasing: true when any runs in the workspace, in this or any other process.
+   */
+  hasRunningBackgroundProcesses: (workspaceId: string) => Promise<boolean>;
+}
 
 export interface WorkspaceUseLease {
   /** Idempotent: a second call never releases another holder's share. */
@@ -84,6 +114,100 @@ export class WorkspaceUseLeases {
     let total = 0;
     for (const file of files.values()) total += file.count;
     return total;
+  }
+
+  /**
+   * Run a structural mutation (rename, remove, archive with delete or snapshot) of the given
+   * workspaces, or throw WorkspaceBusyError without running it. The caller lists every workspace
+   * whose activity the mutation would disturb (children sharing the checkout, too). Never waits:
+   * the gate is try-locked, and any live use refuses. The gates stay held until `fn` settles, so
+   * no backend can start a leased activity in these workspaces meanwhile (hold() refuses).
+   */
+  async withMutationGate<T>(
+    workspaceIds: readonly string[],
+    options: WorkspaceMutationGateOptions,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    assert(workspaceIds.length > 0, "withMutationGate requires at least one workspace");
+    // Sorted, so two mutators over overlapping sets take the gates in one order.
+    const ids = [...new Set(workspaceIds)].sort();
+    const releases: Array<() => Promise<void>> = [];
+    try {
+      for (const id of ids) {
+        try {
+          releases.push(
+            await acquireCrossProcessLock({
+              lockPath: workspaceMutationLockPath(this.rootDir, id),
+              acquireTimeoutMs: 0,
+              staleMs: USE_LOCK_STALE_MS,
+              timeoutMessage: `Workspace ${id} is already being renamed, removed or archived.`,
+            })
+          );
+        } catch (error) {
+          if (error instanceof CrossProcessLockTimeoutError) {
+            throw new WorkspaceBusyError(error.message);
+          }
+          throw error;
+        }
+      }
+      // Gates published: now scan the uses (see the protocol above).
+      for (const id of ids) {
+        await this.assertUnused(id, options);
+      }
+      return await fn();
+    } finally {
+      for (const release of releases.reverse()) {
+        await release();
+      }
+    }
+  }
+
+  private async assertUnused(
+    workspaceId: string,
+    options: WorkspaceMutationGateOptions
+  ): Promise<void> {
+    for (const kind of WORKSPACE_USE_KINDS) {
+      if (options.ignoreOwnKinds?.has(kind) === true) continue;
+      if (this.heldCount(workspaceId, kind) > 0) {
+        throw new WorkspaceBusyError(
+          `Workspace ${workspaceId} has a running ${kind} in this Xum process; ` +
+            "try again when it finishes."
+        );
+      }
+    }
+    const dir = workspaceUseLockDir(this.rootDir, workspaceId);
+    let names: string[];
+    try {
+      names = await fsPromises.readdir(dir);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) {
+        names = [];
+      } else {
+        // Leases exist but cannot be listed: their holders cannot be ruled out.
+        throw new WorkspaceBusyError(
+          `Workspace ${workspaceId}'s use records in ${dir} cannot be read, so another Xum ` +
+            `process may be using it (${getErrorMessage(error)}).`
+        );
+      }
+    }
+    for (const name of names) {
+      // Only published lease files: the kit's temp and takeover-guard files end differently.
+      if (!name.endsWith(".lock") || name.startsWith(`${this.instanceToken}.`)) continue;
+      const probe = await inspectCrossProcessLock(path.join(dir, name));
+      // A dead holder's file is left alone: only its own path's owner ever writes it.
+      if (probe.state !== "held") continue;
+      const kind = name.split(".").at(-2) ?? "activity";
+      throw new WorkspaceBusyError(
+        `Workspace ${workspaceId} is in use by another Xum process: a ${kind} in ` +
+          `${probe.holder}; try again when it finishes (${probe.why}).`
+      );
+    }
+    if (await options.hasRunningBackgroundProcesses(workspaceId)) {
+      throw new WorkspaceBusyError(
+        `Workspace ${workspaceId} has a running background process (in this, another or a ` +
+          "crashed Xum process); stop it and try again."
+      );
+    }
   }
 
   /**
