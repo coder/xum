@@ -177,7 +177,10 @@ export class RemoteConnectionManager {
       // loadWindow already recorded a credential-free state.error.
       return { status: "unavailable" };
     }
-    return this.state.status === "connected" ? { status: "shown" } : { status: "unavailable" };
+    if (this.state.status !== "connected") return { status: "unavailable" };
+    // Focusing an open window emits no state; drop an explanation left by an earlier attempt.
+    if (this.state.error) this.setState({ status: "connected", serverUrl: this.state.serverUrl });
+    return { status: "shown" };
   }
 
   private guardWindow(entry: RemoteWindowEntry): void {

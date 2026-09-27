@@ -1017,6 +1017,19 @@ describe("RemoteConnectionManager server restarts and local discovery", () => {
     expect(manager.getState().error).toBeTruthy();
   });
 
+  test("clears an earlier explanation once the local server's window is shown again", async () => {
+    const { manager } = setup();
+    await manager.openLocalServer("http://localhost:3000/?token=local");
+    // The server went away for a moment: the connection stays and gains an explanation.
+    await manager.openLocalServer(null);
+    expect(manager.getState().error).toBeTruthy();
+    // Same server, same token: focus-only, and the stale explanation must not linger.
+    expect(await manager.openLocalServer("http://localhost:3000/?token=local")).toEqual({
+      status: "shown",
+    });
+    expect(manager.getState()).toEqual({ status: "connected", serverUrl: "http://localhost:3000" });
+  });
+
   test("opens, then focuses, the local server's window", async () => {
     const { manager, windows } = setup();
     expect(await manager.openLocalServer("http://localhost:3000/?token=local")).toEqual({
