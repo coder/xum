@@ -41,12 +41,9 @@ import { ONCHAT_REPLAY_TIMING_LOG_MESSAGE } from "../../../src/node/services/onC
  * sets the round count; XUM_E2E_CHAT_SWITCH_DWELL_MS (default 1000) is how long a chat stays
  * open before the next switch so the one left behind falls behind its stream.
  *
- * Mock AI limitation (why a fresh pair per round): mock streams have no mid-stream replay
- * (MockAiStreamPlayer.replayStream is a no-op and StreamManager.getStreamInfo is undefined for
- * them). The server therefore replays the chat without its live stream (`streamReplayed:
- * false`) and the renderer then shows it as interrupted, so only the FIRST return after leaving
- * a chat mid-stream is representative. That return still exercises the since-mode replay over
- * a stale cached transcript (#4505); the streamReplay phase needs a real provider.
+ * Each return replays the chat's live mock stream (`streamReplayed: true`, with a
+ * `streamReplay` phase in the server line; #4542) over a stale cached transcript, in since mode
+ * (#4505). A fresh pair per round keeps every round's history and stream load identical.
  */
 
 const shouldRunPerfScenarios = getXumE2EEnv("E2E_RUN_PERF") === "1";
@@ -268,9 +265,7 @@ test.describe("chat switch performance profiling", () => {
 
       if (targetMidStream) {
         // Inactive rows show server-side activity, and partial.json exists only while the
-        // backend stream runs, so the chat is still streaming right before the switch. (After
-        // the switch the mock's missing replay makes the chat look interrupted; see the file
-        // comment.)
+        // backend stream runs, so the chat is still streaming right before the switch.
         await expect(page.locator(`div[role="button"]${rowSelector}`)).toContainText("streaming");
         expect(fs.existsSync(partialPath(chat)), `${leg} target is still streaming`).toBe(true);
       }

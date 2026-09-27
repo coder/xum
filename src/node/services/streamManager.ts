@@ -951,10 +951,27 @@ export interface StopStreamOptions {
   expectedMessageId?: string;
 }
 
+/** Snapshot of an active stream, as returned by StreamManager.getStreamInfo. */
+export interface ActiveStreamInfo {
+  messageId: string;
+  model: string;
+  historySequence: number;
+  startTime: number;
+  parts: CompletedMessagePart[];
+  currentStepStartIndex: number;
+  stepStartIndices: number[];
+  initialMetadata?: { systemMessageTokens?: number };
+  toolCompletionTimestamps: Map<string, number>;
+  muxMetadata?: unknown;
+}
+
 interface MockStreamLifecycle {
   isStreaming(workspaceId: string): boolean;
   stop(workspaceId: string, options?: StopStreamOptions): Promise<void>;
-  replayStream(workspaceId: string): Promise<void>;
+  // Mock streams are not registered in workspaceStreams; reconnect replay needs both of these
+  // to see them (#4542).
+  getStreamInfo(workspaceId: string, includeFinalizing: boolean): ActiveStreamInfo | undefined;
+  replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void>;
 }
 
 /** The token-counting surface StreamManager uses for live streaming stats. */
@@ -6265,23 +6282,10 @@ export class StreamManager {
    * Gets the current stream info for a workspace if actively streaming.
    * Include finalizing streams when checking whether recovery can proceed.
    */
-  getStreamInfo(
-    workspaceId: string,
-    includeFinalizing = false
-  ):
-    | {
-        messageId: string;
-        model: string;
-        historySequence: number;
-        startTime: number;
-        parts: CompletedMessagePart[];
-        currentStepStartIndex: number;
-        stepStartIndices: number[];
-        initialMetadata?: { systemMessageTokens?: number };
-        toolCompletionTimestamps: Map<string, number>;
-        muxMetadata?: unknown;
-      }
-    | undefined {
+  getStreamInfo(workspaceId: string, includeFinalizing = false): ActiveStreamInfo | undefined {
+    if (this.mockStreamLifecycle) {
+      return this.mockStreamLifecycle.getStreamInfo(workspaceId, includeFinalizing);
+    }
     const typedWorkspaceId = workspaceId as WorkspaceId;
     const streamInfo = this.workspaceStreams.get(typedWorkspaceId);
 
@@ -6319,7 +6323,7 @@ export class StreamManager {
    */
   async replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
     if (this.mockStreamLifecycle) {
-      await this.mockStreamLifecycle.replayStream(workspaceId);
+      await this.mockStreamLifecycle.replayStream(workspaceId, opts);
       return;
     }
 

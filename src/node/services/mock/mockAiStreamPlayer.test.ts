@@ -952,4 +952,115 @@ describe("MockAiStreamPlayer", () => {
 
     await player.stop(workspaceId);
   });
+
+  test("replays a mid-stream subscriber's missed events before the live tail, without duplicates", async () => {
+    // Chat-switch reconnects (#4542): a subscriber that joins mid-stream must see the stream's
+    // events so far (full replay) or only those after its cursor (incremental replay), then the
+    // live tail, with nothing duplicated, dropped, or interleaved.
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-mid-stream-replay";
+
+    interface SeenEvent {
+      type: string;
+      replay: boolean;
+      messageId: string;
+      delta?: string;
+      timestamp?: number;
+    }
+    const seen: SeenEvent[] = [];
+    for (const type of ["stream-start", "stream-delta", "usage-delta", "stream-end"]) {
+      aiServiceStub.on(
+        type,
+        (event: {
+          workspaceId: string;
+          messageId: string;
+          replay?: boolean;
+          delta?: string;
+          timestamp?: number;
+        }) => {
+          if (event.workspaceId !== workspaceId) return;
+          seen.push({
+            type,
+            replay: event.replay === true,
+            messageId: event.messageId,
+            delta: event.delta,
+            timestamp: event.timestamp,
+          });
+        }
+      );
+    }
+    const deltasOf = (events: SeenEvent[]) =>
+      events.filter((event) => event.type === "stream-delta");
+
+    // Long enough (~15 chunks) that the stream is still running when the subscriber joins.
+    const userText = "replay ".repeat(50).trim();
+    const expectedDeltas = buildMockStreamEventsFromReply(
+      { assistantText: `Mock response: ${userText}` },
+      { messageId: "expected" }
+    ).flatMap((event) => (event.kind === "stream-delta" ? [event.text] : []));
+
+    expect(player.getStreamInfo(workspaceId)).toBeUndefined();
+    const user = createMuxMessage("user-1", "user", userText, { timestamp: Date.now() });
+    const playResult = await player.play([user], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const messageId = playResult.data.messageId;
+    await waitForCondition(() => deltasOf(seen).length >= 3, 5000);
+
+    const joinIndex = seen.length;
+    const deltasBeforeJoin = deltasOf(seen);
+    expect(deltasBeforeJoin.length).toBeLessThan(expectedDeltas.length);
+    // The reconnect cursor is StreamManager-shaped: the last part carries the newest delta time.
+    const info = player.getStreamInfo(workspaceId);
+    expect(info?.messageId).toBe(messageId);
+    expect(info?.parts.at(-1)?.timestamp).toBe(deltasBeforeJoin.at(-1)?.timestamp);
+
+    const cursor = deltasBeforeJoin[0].timestamp;
+    if (cursor === undefined) throw new Error("live deltas must carry timestamps");
+    // Subscriber A has no stream cursor (full replay); subscriber B saw only the first delta.
+    const fullReplay = player.replayStream(workspaceId);
+    const fullEnd = seen.length;
+    const incrementalReplay = player.replayStream(workspaceId, { afterTimestamp: cursor });
+    const incrementalEnd = seen.length;
+    await Promise.all([fullReplay, incrementalReplay]);
+
+    const full = seen.slice(joinIndex, fullEnd);
+    const incremental = seen.slice(fullEnd, incrementalEnd);
+    for (const replayed of [full, incremental]) {
+      expect(replayed.every((event) => event.replay && event.messageId === messageId)).toBe(true);
+      expect(replayed[0]?.type).toBe("stream-start");
+      expect(replayed.some((event) => event.type === "stream-end")).toBe(false);
+    }
+    const pick = (events: SeenEvent[]) =>
+      events.map(({ delta, timestamp }) => ({ delta, timestamp }));
+    expect(pick(deltasOf(full))).toEqual(pick(deltasBeforeJoin));
+    expect(pick(deltasOf(incremental))).toEqual(pick(deltasBeforeJoin.slice(1)));
+    // Incremental replays carry stream context only, never stale usage snapshots.
+    expect(incremental.some((event) => event.type === "usage-delta")).toBe(false);
+
+    const completion = await playResult.data.completion;
+    expect(completion.status).toBe("completed");
+    const tail = seen.slice(incrementalEnd);
+    expect(tail.every((event) => !event.replay)).toBe(true);
+
+    // Each subscriber's view: its replay, then the live tail. Together they are the whole reply.
+    for (const replayed of [full, [...deltasBeforeJoin.slice(0, 1), ...incremental]]) {
+      const view = [...deltasOf(replayed), ...deltasOf(tail)];
+      expect(view.map((event) => event.delta)).toEqual(expectedDeltas);
+      const timestamps = view.map((event) => event.timestamp ?? Number.NaN);
+      expect(
+        timestamps.every((timestamp, index) => index === 0 || timestamp > timestamps[index - 1])
+      ).toBe(true);
+    }
+
+    // A finished stream has nothing to replay.
+    expect(player.getStreamInfo(workspaceId)).toBeUndefined();
+    const afterEnd = seen.length;
+    await player.replayStream(workspaceId);
+    expect(seen.length).toBe(afterEnd);
+  });
 });

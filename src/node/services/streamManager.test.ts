@@ -1177,18 +1177,36 @@ describe("StreamManager - stopStream", () => {
     const streamManager = new StreamManager(historyService);
     const stop = mock(() => Promise.resolve());
     const replayStream = mock(() => Promise.resolve());
+    const mockStreamInfo = {
+      messageId: "msg-mock-0",
+      model: "mock:model",
+      historySequence: 1,
+      startTime: 1,
+      parts: [],
+      currentStepStartIndex: 0,
+      stepStartIndices: [0],
+      toolCompletionTimestamps: new Map<string, number>(),
+    };
+    const getStreamInfo = mock((workspaceId: string) =>
+      workspaceId === "mock-workspace" ? mockStreamInfo : undefined
+    );
     streamManager.setMockStreamLifecycle({
       isStreaming: (workspaceId) => workspaceId === "mock-workspace",
       stop,
+      getStreamInfo,
       replayStream,
     });
 
     expect(streamManager.isStreaming("mock-workspace")).toBe(true);
+    // Reconnect replay keys off getStreamInfo, so mock streams must be visible through it (#4542).
+    expect(streamManager.getStreamInfo("mock-workspace", true)).toBe(mockStreamInfo);
+    expect(streamManager.getStreamInfo("idle-workspace")).toBeUndefined();
     expect((await streamManager.stopStream("mock-workspace")).success).toBe(true);
     await streamManager.replayStream("mock-workspace", { afterTimestamp: 10 });
 
     expect(stop).toHaveBeenCalledWith("mock-workspace", undefined);
-    expect(replayStream).toHaveBeenCalledWith("mock-workspace");
+    expect(getStreamInfo).toHaveBeenCalledWith("mock-workspace", true);
+    expect(replayStream).toHaveBeenCalledWith("mock-workspace", { afterTimestamp: 10 });
   });
 
   test("emits stream-abort when stopping non-existent stream", async () => {

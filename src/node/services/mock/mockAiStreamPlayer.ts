@@ -9,6 +9,7 @@ import type { AIService } from "@/node/services/aiService";
 import { createErrorEvent } from "@/node/services/utils/sendMessageError";
 import {
   createTurnCompletionController,
+  type ActiveStreamInfo,
   type StopStreamOptions,
   type TurnCompletion,
   type TurnStreamHandle,
@@ -127,6 +128,13 @@ interface StreamStartGate {
   resolve: () => void;
 }
 
+/** Live payloads a mid-stream replay re-emits (see replayStream). */
+type ReplayableMockEvent =
+  | StreamDeltaEvent
+  | ReasoningDeltaEvent
+  | ToolCallStartEvent
+  | ToolCallEndEvent;
+
 interface ActiveStream {
   timers: Array<ReturnType<typeof setTimeout>>;
   messageId: string;
@@ -146,6 +154,19 @@ interface ActiveStream {
   terminalCompletion?: TurnCompletion;
   cancelled: boolean;
   settleCompletion: (completion: TurnCompletion) => void;
+  // Reconnect replay state (#4542). `parts` above merges deltas for partial.json and history;
+  // StreamManager instead keeps one part per delta, and reconnect cursors depend on that.
+  /** Live stream-start payload; unset until emitted, so replay never precedes the live start. */
+  streamStart?: StreamStartEvent;
+  /** Set when stream-end/stream-error handling begins (StreamManager's FINALIZING). */
+  finalizing: boolean;
+  /** Every emitted delta/tool event in emission order, re-emitted by replayStream. */
+  emittedEvents: ReplayableMockEvent[];
+  lastUsageDelta?: UsageDeltaEvent;
+  /** StreamManager-shaped parts (one per delta) and tool completions for getStreamInfo. */
+  streamInfoParts: CompletedMessagePart[];
+  toolCompletionTimestamps: Map<string, number>;
+  lastEventTimestamp: number;
 }
 
 export class MockAiStreamPlayer {
@@ -444,8 +465,104 @@ export class MockAiStreamPlayer {
     return Ok(handle);
   }
 
-  async replayStream(_workspaceId: string): Promise<void> {
-    // No-op for mock streams; events are deterministic and do not support mid-stream replay.
+  /** Mirrors StreamManager.getStreamInfo for mock streams, which it does not track. */
+  getStreamInfo(workspaceId: string, includeFinalizing = false): ActiveStreamInfo | undefined {
+    const active = this.activeStreams.get(workspaceId);
+    if (!active || (!includeFinalizing && !this.isReplayable(active))) return undefined;
+    return {
+      messageId: active.messageId,
+      model: active.model,
+      historySequence: active.historySequence,
+      startTime: active.startTime,
+      parts: active.streamInfoParts,
+      currentStepStartIndex: 0,
+      stepStartIndices: [0],
+      initialMetadata: {},
+      toolCompletionTimestamps: active.toolCompletionTimestamps,
+      muxMetadata: active.muxMetadata,
+    };
+  }
+
+  /**
+   * Re-emit the active stream's start and its events after `afterTimestamp` (all of them when
+   * unset) with `replay: true`, like StreamManager.replayStream. Emission is synchronous: the
+   * events emitted so far are exactly what gets replayed, so no live event can be duplicated or
+   * interleaved, and AgentSession routes the replay to the reconnecting subscriber through this
+   * call's async context.
+   */
+  replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
+    const active = this.activeStreams.get(workspaceId);
+    if (!active?.streamStart || !this.isReplayable(active)) return Promise.resolve();
+
+    const afterTimestamp = opts?.afterTimestamp;
+    this.deps.aiService.emit("stream-start", { ...active.streamStart, replay: true });
+    for (const event of active.emittedEvents) {
+      if (afterTimestamp != null && event.timestamp <= afterTimestamp) continue;
+      this.deps.aiService.emit(event.type, { ...event, replay: true });
+    }
+    // Like StreamManager: only full replays restore usage; incremental ones would duplicate it.
+    if (afterTimestamp == null && active.lastUsageDelta) {
+      this.deps.aiService.emit("usage-delta", { ...active.lastUsageDelta, replay: true });
+    }
+    return Promise.resolve();
+  }
+
+  private isReplayable(active: ActiveStream): boolean {
+    return active.streamStart !== undefined && !active.cancelled && !active.finalizing;
+  }
+
+  // StreamManager.nextPartTimestamp: reconnect cursors compare timestamps, so two events in the
+  // same millisecond must not share one.
+  private nextEventTimestamp(active: ActiveStream): number {
+    const now = Date.now();
+    active.lastEventTimestamp =
+      now <= active.lastEventTimestamp ? active.lastEventTimestamp + 1 : now;
+    return active.lastEventTimestamp;
+  }
+
+  private recordReplayableEvent(active: ActiveStream, event: ReplayableMockEvent): void {
+    active.emittedEvents.push(event);
+    switch (event.type) {
+      case "stream-delta":
+        active.streamInfoParts.push({
+          type: "text",
+          text: event.delta,
+          timestamp: event.timestamp,
+        });
+        break;
+      case "reasoning-delta":
+        active.streamInfoParts.push({
+          type: "reasoning",
+          text: event.delta,
+          timestamp: event.timestamp,
+        });
+        break;
+      case "tool-call-start":
+        active.streamInfoParts.push({
+          type: "dynamic-tool",
+          state: "input-available",
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          input: event.args,
+          timestamp: event.timestamp,
+        });
+        break;
+      case "tool-call-end": {
+        const index = active.streamInfoParts.findIndex(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
+        );
+        const part = active.streamInfoParts[index];
+        if (part?.type === "dynamic-tool") {
+          active.streamInfoParts[index] = {
+            ...part,
+            state: "output-available",
+            output: event.result,
+          };
+        }
+        active.toolCompletionTimestamps.set(event.toolCallId, event.timestamp);
+        break;
+      }
+    }
   }
 
   private scheduleEvents(
@@ -486,6 +603,11 @@ export class MockAiStreamPlayer {
       isProcessing: false,
       cancelled: false,
       settleCompletion: completionController.settle,
+      finalizing: false,
+      emittedEvents: [],
+      streamInfoParts: [],
+      toolCompletionTimestamps: new Map(),
+      lastEventTimestamp: 0,
     });
 
     let nextEventIndex = 0;
@@ -749,6 +871,7 @@ export class MockAiStreamPlayer {
         };
         active.model = event.model;
         active.startTime = payload.startTime;
+        active.streamStart = payload;
         this.deps.aiService.emit("stream-start", payload);
         break;
       }
@@ -762,11 +885,12 @@ export class MockAiStreamPlayer {
           messageId,
           delta: event.text,
           tokens,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.appendReasoningPart(active, event.text, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("reasoning-delta", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "tool-start": {
@@ -782,11 +906,12 @@ export class MockAiStreamPlayer {
           toolName: event.toolName,
           args: event.args,
           tokens,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.setToolPartInput(active, event, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("tool-call-start", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "usage-delta": {
@@ -800,6 +925,7 @@ export class MockAiStreamPlayer {
           cumulativeProviderMetadata: event.cumulativeProviderMetadata,
         };
         this.deps.aiService.emit("usage-delta", payload);
+        active.lastUsageDelta = payload;
         break;
       }
       case "tool-end": {
@@ -810,11 +936,12 @@ export class MockAiStreamPlayer {
           toolCallId: event.toolCallId,
           toolName: event.toolName,
           result: event.result,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.setToolPartOutput(active, event, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("tool-call-end", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "stream-delta": {
@@ -832,11 +959,12 @@ export class MockAiStreamPlayer {
           messageId,
           delta: event.text,
           tokens,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.appendTextPart(active, event.text, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("stream-delta", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "stream-error": {
@@ -844,6 +972,7 @@ export class MockAiStreamPlayer {
         if (!this.isCurrentActiveStream(workspaceId, active)) {
           return;
         }
+        active.finalizing = true;
 
         const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
         if (!deletePartialResult.success) {
@@ -876,6 +1005,7 @@ export class MockAiStreamPlayer {
         break;
       }
       case "stream-end": {
+        active.finalizing = true;
         if (active.partialWriteTimer) {
           clearTimeout(active.partialWriteTimer);
           active.partialWriteTimer = null;
