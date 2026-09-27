@@ -26,20 +26,18 @@
  * worktree deletion) refuses while another backend has a turn or terminal lease or a host-local
  * background process in the workspace (#4476, workspaceUseLeases.ts).
  * Using one workspace from two backends at once is supported (user decision). Host-local background
- * spawns claim their names under a per-workspace host lock (#4873). Known gaps: MCP servers, init
- * hooks and executeBash take no use lease, and SSH/Docker/devcontainer/multi-project background
- * records are neither probed by the gate nor name-claimed (#4857); migrated background names are
- * per process (#4878); a settled record the other backend still tracks can be reused (#4882);
- * keep-mode unarchive and Coder stop/delete archives take no gate (#4871). Two guarantees hold for
- * the attempt-fenced orchestration writes (report publication, settlement receipts, the
- * plan-handoff boundary, task-state transitions): a superseded attempt's writes never land on its
- * successor, and for a retired attempt a workflow accepts either the late report or the
- * replacement, never both. Not fenced: the effects of an execution that is already running (its
+ * spawns claim their names under a per-workspace host lock (#4873). Known gap: SSH/Docker/
+ * devcontainer/multi-project background records are neither probed by the gate nor name-claimed
+ * (#4889). Two guarantees hold for the attempt-fenced orchestration writes (report publication,
+ * settlement receipts, the plan-handoff boundary, task-state transitions): a superseded attempt's
+ * writes never land on its successor, and for a retired attempt a workflow accepts either the
+ * late report or the replacement, never both. Not fenced: the effects of an execution that is already running (its
  * stream, tool calls, file changes and history rows continue until that backend stops it). Not
- * guaranteed: a backend's startup recovery re-queues or re-drives `starting`/`running`/
- * `awaiting_report` sub-agent tasks that a live backend still runs (a duplicate execution); UIs do
- * not observe the other backend's writes until they resubscribe; mixed Xum versions on one root
- * (#4480).
+ * guaranteed: startup recovery skips a `starting`/`running`/`awaiting_report` sub-agent task only
+ * while a live backend holds a use lease on its workspace (#4801), so it can still re-drive a task
+ * that backend runs but is idle in (reservation, between turns, waiting on descendants), a
+ * duplicate execution whose original is fenced as superseded; UIs do not observe the other
+ * backend's writes until they resubscribe; mixed Xum versions on one root (#4480).
  */
 
 import { spawnSync } from "node:child_process";

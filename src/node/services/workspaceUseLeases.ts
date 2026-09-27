@@ -268,6 +268,29 @@ export class WorkspaceUseLeases {
   }
 
   /**
+   * Another backend's live lease of any kind on the workspace, or null (#4801). This backend's own
+   * leases are skipped. A lease directory that cannot be listed counts as in use (fail closed).
+   */
+  async findForeignUse(workspaceId: string): Promise<{ kind: string; holder: string } | null> {
+    const dir = workspaceUseLockDir(this.rootDir, workspaceId);
+    let names: string[];
+    try {
+      names = await fsPromises.readdir(dir);
+    } catch (error) {
+      if (hasErrorCode(error, "ENOENT")) return null;
+      return { kind: "unknown", holder: `unreadable use records (${getErrorMessage(error)})` };
+    }
+    for (const name of names) {
+      if (!name.endsWith(".lock") || name.startsWith(`${this.instanceToken}.`)) continue;
+      const probe = await inspectCrossProcessLock(path.join(dir, name));
+      if (probe.state === "held") {
+        return { kind: name.split(".").at(-2) ?? "activity", holder: probe.holder };
+      }
+    }
+    return null;
+  }
+
+  /**
    * Record that this backend uses the workspace until the returned lease is released. Throws
    * WorkspaceMutationInProgressError while a live mutator holds the workspace's gate; callers
    * must let it abort the activity (never swallow it), or the mutator's scan could miss them.

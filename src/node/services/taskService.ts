@@ -4974,8 +4974,19 @@ export class TaskService implements AgentTaskIntegration {
 
     await this.getWorkspaceTurnManager().reconcileAgentTaskExecutionIds();
 
+    // A task that another live backend is still running holds a use lease on its workspace there
+    // (a turn, init hook, MCP server, command, terminal or editor). Leave it to that backend in
+    // every pass below: re-driving it here would start a duplicate execution (#4801). Idle windows
+    // (reservation, between turns, waiting on descendants) hold no lease, so this backend can
+    // still take such a task over by rotation; the attempt-bound CAS fencing treats the other
+    // backend's execution as superseded.
+    const inUseElsewhere = await this.findTasksInUseByOtherBackends(startupConfig);
+
     const staleStartingTasks = this.listAgentTaskWorkspaces(startupConfig).filter(
-      (task) => task.taskStatus === "starting" && typeof task.id === "string"
+      (task) =>
+        task.taskStatus === "starting" &&
+        typeof task.id === "string" &&
+        !inUseElsewhere.has(task.id)
     );
     if (staleStartingTasks.length > 0) {
       let acceptedPromptCount = 0;
@@ -5014,7 +5025,10 @@ export class TaskService implements AgentTaskIntegration {
     let taskIndex = this.buildAgentTaskIndex(config);
     const startupTasks = () =>
       this.listAgentTaskWorkspaces(config).filter(
-        (task) => task.id && ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
+        (task) =>
+          task.id &&
+          !inUseElsewhere.has(task.id) &&
+          ["running", "awaiting_report"].includes(task.taskStatus ?? "running")
       );
 
     // Workflow cancellation is authoritative even when a child has its own Stop or question.
@@ -5312,6 +5326,7 @@ export class TaskService implements AgentTaskIntegration {
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
       totalMs: Date.now() - startupStartedAt,
+      skippedInUseElsewhereCount: inUseElsewhere.size,
       awaitingReportTaskCount: awaitingReportTasks.length,
       resumedAwaitingReportCount,
       skippedAwaitingReportDueToActiveDescendants,
@@ -5490,6 +5505,31 @@ export class TaskService implements AgentTaskIntegration {
     } else {
       log.info("[startup] TaskService.runStartupHousekeeping completed", completedPayload);
     }
+  }
+
+  /** Active tasks whose workspace another live backend holds a use lease on (see recovery). */
+  private async findTasksInUseByOtherBackends(config: ProjectsConfig): Promise<Set<string>> {
+    const leases = workspaceUseLeasesFor(this.config);
+    const inUse = new Set<string>();
+    const candidates = this.listAgentTaskWorkspaces(config).filter(
+      (task) =>
+        typeof task.id === "string" &&
+        ["starting", "running", "awaiting_report"].includes(task.taskStatus ?? "running")
+    );
+    await Promise.all(
+      candidates.map(async (task) => {
+        const taskId = task.id!;
+        const use = await leases.findForeignUse(taskId);
+        if (use == null) return;
+        inUse.add(taskId);
+        log.info("[startup] task skipped: another Xum backend is using its workspace", {
+          taskId,
+          kind: use.kind,
+          holder: use.holder,
+        });
+      })
+    );
+    return inUse;
   }
 
   private async hasAcceptedInitialTaskPrompt(workspaceId: string): Promise<boolean> {
