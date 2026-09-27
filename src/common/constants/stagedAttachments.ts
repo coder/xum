@@ -5,6 +5,12 @@ import {
 
 export const STAGED_ATTACHMENT_DIR = getCanonicalProjectMetadataRelativePath("user-attachments");
 export const STAGED_ATTACHMENT_DIRS = listProjectMetadataRelativePaths("user-attachments");
+/**
+ * Session-dir directory (`<sessionDir>/<name>/<uuid>/<filename>`) holding a durable copy of each
+ * staged upload. The checkout copy under STAGED_ATTACHMENT_DIR stays the path the agent reads, but
+ * it is git-excluded, so snapshot archives drop it; unarchive rehydrates it from this mirror (#3947).
+ */
+export const STAGED_ATTACHMENT_MIRROR_DIR_NAME = "staged-attachments";
 export const MAX_STAGED_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024;
 export const MAX_STAGED_ATTACHMENT_BASE64_CHARS =
   Math.ceil(MAX_STAGED_ATTACHMENT_SIZE_BYTES / 3) * 4 + 8;

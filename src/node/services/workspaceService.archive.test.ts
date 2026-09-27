@@ -8,6 +8,11 @@ import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import path from "path";
+import os from "os";
+import { execFileSync } from "child_process";
+import { createMuxMessage } from "@/common/types/message";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -2385,5 +2390,117 @@ describe("WorkspaceService archiveMergedInProject", () => {
     expect(bashFailedError?.error).toBe("gh failed");
 
     expect(archiveMock).toHaveBeenCalledTimes(0);
+  });
+});
+
+// #3947: snapshot archives delete the git-excluded staging dir with the checkout; unarchive
+// must put referenced uploads back from the session mirror once the checkout is recreated.
+describe("WorkspaceService unarchive rehydrates staged attachments", () => {
+  const workspaceId = "ws-unarchive-attachments";
+  const projectPath = "/tmp/project";
+
+  let harness: WorkspaceServiceHarness;
+  let repo: string;
+  let stagedPath: string;
+  const bytes = Buffer.from("staged before archive");
+
+  beforeEach(async () => {
+    repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "ws-unarchive-attachments-"));
+    execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
+    const runtimeConfig = { type: "worktree" as const, srcBaseDir: os.tmpdir() };
+    const metadata: FrontendWorkspaceMetadata = {
+      id: workspaceId,
+      name: path.basename(repo),
+      projectName: "proj",
+      projectPath,
+      runtimeConfig,
+      archivedAt: "2020-01-01T00:00:00.000Z",
+      namedWorkspacePath: repo,
+    };
+    harness = await createWorkspaceServiceHarness({
+      aiService: createMockAIService({
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock(() => Promise.resolve(Ok(metadata))),
+      }),
+    });
+    await saveWorkspaces(harness.config, projectPath, [
+      {
+        path: repo,
+        id: workspaceId,
+        name: path.basename(repo),
+        archivedAt: "2020-01-01T00:00:00.000Z",
+        runtimeConfig,
+        worktreeArchiveSnapshot: {
+          version: 1,
+          capturedAt: "2026-03-30T00:00:00.000Z",
+          stateDirPath: "archive-state",
+          projects: [
+            {
+              projectPath,
+              projectName: "proj",
+              storageKey: "proj",
+              branchName: path.basename(repo),
+              trunkBranch: "main",
+              baseSha: "base-sha",
+              headSha: "head-sha",
+            },
+          ],
+        },
+      },
+    ]);
+
+    const staged = await stageWorkspaceAttachment({
+      runtime: new LocalRuntime(repo),
+      workspacePath: repo,
+      sessionDir: path.join(harness.config.sessionsDir, workspaceId),
+      filename: "notes.md",
+      mediaType: "text/markdown",
+      sizeBytes: bytes.byteLength,
+      dataBase64: bytes.toString("base64"),
+    });
+    if (!staged.success) throw new Error(staged.error);
+    stagedPath = staged.data.stagedPath;
+    await harness.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", `see \`${stagedPath}\``, { historySequence: 0 })
+    );
+    // Simulate the snapshot archive: the checkout (and its git-excluded staging dir) is gone and
+    // restore recreates it from git state only.
+    await fsPromises.rm(path.join(repo, ".xum"), { recursive: true, force: true });
+  });
+
+  afterEach(async () => {
+    await harness.cleanup();
+    await fsPromises.rm(repo, { recursive: true, force: true });
+  });
+
+  function useRestoreResult(result: "restored" | "skipped") {
+    harness.service.setWorktreeArchiveSnapshotService({
+      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
+      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
+      restoreSnapshotAfterUnarchive: mock(() => Promise.resolve(Ok(result))),
+      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
+    });
+  }
+
+  test("restores referenced attachments into the recreated checkout", async () => {
+    useRestoreResult("restored");
+
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+    expect(await fsPromises.readFile(path.join(repo, stagedPath))).toEqual(bytes);
+  });
+
+  test("leaves the checkout alone when no snapshot was restored", async () => {
+    useRestoreResult("skipped");
+
+    expect(await harness.service.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+    expect(
+      await fsPromises
+        .access(path.join(repo, stagedPath))
+        .then(() => true)
+        .catch(() => false)
+    ).toBe(false);
   });
 });
