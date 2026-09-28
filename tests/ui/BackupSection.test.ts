@@ -210,6 +210,8 @@ describe("BackupSection", () => {
 
     fireEvent.click(restore);
     const confirm = await body.findByRole("dialog", { name: "Restore settings backup?" });
+    fireEvent.keyDown(document.body, { key: "c", code: "KeyC", ctrlKey: true, altKey: true });
+    expect(mcp.getAttribute("aria-checked")).toBe("true");
     fireEvent.click(within(confirm).getByRole("button", { name: /Cancel/ }));
     await waitFor(() =>
       expect(body.queryByRole("dialog", { name: "Restore settings backup?" }) === null).toBe(true)
