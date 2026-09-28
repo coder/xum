@@ -3496,8 +3496,47 @@ export class WorkspaceService
     // (session, init record, abort controller) exactly like workspace
     // removal would; without this every aborted retry against the same bad
     // file leaks another unreachable session for the process lifetime.
-    await this.discardCreationState(workspaceId, args.initAbortController, rolledBack);
+    await this.discardCreationStateAfterRollback(workspaceId, args.initAbortController, rolledBack);
     return { entryGone: rolledBack, leftovers };
+  }
+
+  /**
+   * What a fork's failed checkout delete may have left (#4899). A multi-project fork owns one
+   * checkout per project plus its container, and its runtime deletes them one by one, so report
+   * the ones that still exist rather than only the container.
+   */
+  private async listForkCleanupLeftovers(
+    runtime: Runtime,
+    projectPath: string,
+    workspaceName: string
+  ): Promise<string[]> {
+    if (!(runtime instanceof MultiProjectRuntime)) {
+      return [runtime.getWorkspacePath(projectPath, workspaceName)];
+    }
+    const owned = runtime.getOwnedWorkspacePaths(workspaceName);
+    const present = await Promise.all(
+      owned.map((ownedPath) =>
+        fsPromises.lstat(ownedPath).then(
+          () => true,
+          () => false
+        )
+      )
+    );
+    return owned.filter((_, index) => present[index]);
+  }
+
+  /**
+   * The last step of a creation rollback. A failure here is logged, not thrown: the entry and the
+   * checkouts are already settled, and the caller must still report what was left (#4899).
+   */
+  private async discardCreationStateAfterRollback(
+    workspaceId: string,
+    initAbortController: AbortController,
+    entryGone: boolean
+  ): Promise<void> {
+    await this.discardCreationState(workspaceId, initAbortController, entryGone).catch(
+      (error: unknown) => logRegistrationRollbackFailure(workspaceId, error)
+    );
   }
 
   /**
@@ -6592,7 +6631,7 @@ export class WorkspaceService
           });
           leftovers.push(...(await rollbackCreatedWorkspaces(true)));
         }
-        await this.discardCreationState(workspaceId, initAbortController, entryGone);
+        await this.discardCreationStateAfterRollback(workspaceId, initAbortController, entryGone);
         return { entryGone, leftovers };
       };
       await registration.catch(async (error: unknown) => {
@@ -12666,7 +12705,7 @@ export class WorkspaceService
             `Failed to copy fork state: ${message}`,
             deleteResult.success
               ? []
-              : [targetRuntime.getWorkspacePath(foundProjectPath, resolvedName)]
+              : await this.listForkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName)
           )
         );
       }
@@ -12755,10 +12794,20 @@ export class WorkspaceService
               newWorkspaceId,
               error: deleteResult.error,
             });
-            leftovers.push(namedWorkspacePath);
+            leftovers.push(
+              ...(await this.listForkCleanupLeftovers(
+                targetRuntime,
+                foundProjectPath,
+                resolvedName
+              ))
+            );
           }
         }
-        await this.discardCreationState(newWorkspaceId, initAbortController, rolledBack);
+        await this.discardCreationStateAfterRollback(
+          newWorkspaceId,
+          initAbortController,
+          rolledBack
+        );
         return { entryGone: rolledBack, leftovers };
       };
 

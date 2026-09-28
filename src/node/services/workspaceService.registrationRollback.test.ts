@@ -525,6 +525,20 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       expect(error).toContain(`could not be fully cleaned up: ${checkout!}; delete it`);
     });
 
+    test("create keeps naming the leftover checkout when a later cleanup step throws", async () => {
+      spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+      spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockResolvedValueOnce({
+        success: false,
+        error: "EBUSY",
+      });
+      spyOn(initStateManager, "deleteInitStatus").mockRejectedValueOnce(new Error("EBUSY"));
+
+      const result = await createWorktree("leftover-c");
+      const error = result.success ? "" : result.error;
+      expect(error).not.toContain("could not be rolled back");
+      expect(error).toContain(`could not be fully cleaned up: ${leftoverCheckout("leftover-c")!}`);
+    });
+
     test("create whose registration write rejects names the checkout it could not delete", async () => {
       spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockRejectedValueOnce(new Error("EIO"));
 
@@ -746,6 +760,36 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     for (const repo of [projectPath, otherProjectPath]) {
       expect(worktreePaths(repo).map((p) => path.basename(p))).not.toContain("multi-fork");
     }
+  });
+
+  test("multi-project fork names the project checkout its rollback could not delete (#4899)", async () => {
+    const sourceId = await createMultiSource();
+    type DeleteWorkspace = WorktreeRuntime["deleteWorkspace"];
+    const realDelete = Object.getOwnPropertyDescriptor(
+      WorktreeRuntime.prototype,
+      "deleteWorkspace"
+    )!.value as (
+      this: WorktreeRuntime,
+      ...args: Parameters<DeleteWorkspace>
+    ) => ReturnType<DeleteWorkspace>;
+    spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockImplementation(function (
+      this: WorktreeRuntime,
+      ...args: Parameters<WorktreeRuntime["deleteWorkspace"]>
+    ) {
+      if (args[0] === otherProjectPath && args[1] === "multi-left") {
+        return Promise.resolve({ success: false as const, error: "EBUSY" });
+      }
+      return realDelete.apply(this, args);
+    });
+
+    const publish = failConfigPublish();
+    const result = await service.fork(sourceId, "multi-left").finally(() => publish.mockRestore());
+    const error = result.success ? "" : result.error;
+    expect(error).toContain("EACCES");
+    const leftover = worktreePaths(otherProjectPath).find((p) => path.basename(p) === "multi-left");
+    expect(leftover).toBeDefined();
+    // Only what is still on disk: the other project's checkout, not the removed container.
+    expect(error).toContain(`could not be fully cleaned up: ${leftover!}; delete it`);
   });
 
   test("multi-project fork that fails in a later project keeps the earlier existing branch", async () => {

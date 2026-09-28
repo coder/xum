@@ -403,6 +403,16 @@ export class MultiProjectRuntime implements Runtime {
     return this.containerPath;
   }
 
+  /** Every path this workspace owns on disk: each project's checkout, then the container. */
+  getOwnedWorkspacePaths(workspaceName: string): string[] {
+    return [
+      ...this.projectRuntimes.map((projectRuntime) =>
+        projectRuntime.runtime.getWorkspacePath(projectRuntime.projectPath, workspaceName)
+      ),
+      this.containerPath,
+    ];
+  }
+
   resolvePath(targetPath: string): Promise<string> {
     return this.primaryRuntime.resolvePath(targetPath);
   }
