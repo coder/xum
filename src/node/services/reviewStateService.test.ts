@@ -125,40 +125,84 @@ describe("ReviewStateService", () => {
     expect(updated.sections.hunkExpand).toEqual({ h1: false });
   });
 
-  it("imports legacy entries the backend lacks without overwriting its own", async () => {
+  it("imports legacy notes the backend lacks but leaves present hunk-keyed sections untouched", async () => {
     using tempDir = new TestTempDir("review-state-import");
     const { config } = await createHarness(tempDir);
     const service = new ReviewStateService(config);
     await service.applyDelta(WORKSPACE_ID, {
       reviews: { set: { shared: makeReview("shared", "backend copy") } },
-      firstSeen: { set: { h1: 100, h2: 50 } },
+      firstSeen: { set: { h1: 100 } },
+      // The user marked h1 unread (deleted its entry) after an earlier import.
+      readState: { delete: ["h1"] },
     });
 
-    // Another origin's localStorage: its own notes plus an older copy of a shared one.
+    // Another origin's localStorage: its own note, an older copy of a shared one, and hunk keys.
     const result = await service.importLegacy(WORKSPACE_ID, {
       reviews: {
         shared: makeReview("shared", "legacy copy"),
         other: makeReview("other", "other origin"),
       },
-      firstSeen: { h1: 40, h2: 80, h3: 7 },
+      firstSeen: { h1: 40, h2: 80 },
       readState: { h1: { hunkId: "h1", isRead: true, timestamp: 5 } },
+      hunkExpand: { h1: true },
     });
 
     expect(result.results).toEqual({
       reviews: "present",
       firstSeen: "present",
-      readState: "applied",
+      readState: "present",
+      hunkExpand: "applied",
     });
     const reloaded = await new ReviewStateService(config).getSnapshot(WORKSPACE_ID);
     expect(reloaded.sections.reviews).toEqual({
       shared: makeReview("shared", "backend copy"),
       other: makeReview("other", "other origin"),
     });
-    // First-seen keeps the earlier timestamp per hunk, as in every other merge.
-    expect(reloaded.sections.firstSeen).toEqual({ h1: 40, h2: 50, h3: 7 });
-    expect(reloaded.sections.readState).toEqual({
-      h1: { hunkId: "h1", isRead: true, timestamp: 5 },
+    // Hunk ids are deterministic: merging them would resurrect the cleared read state.
+    expect(reloaded.sections.readState).toEqual({});
+    expect(reloaded.sections.firstSeen).toEqual({ h1: 100 });
+    expect(reloaded.sections.hunkExpand).toEqual({ h1: true });
+  });
+
+  it("rejects a workspace id that escapes the sessions dir", async () => {
+    using tempDir = new TestTempDir("review-state-escape");
+    const { config } = await createHarness(tempDir);
+    const service = new ReviewStateService(config);
+    const escaped = path.join(config.sessionsDir, "..", "x");
+
+    let error: unknown = null;
+    await service.applyDelta("../x", { hunkExpand: { set: { h1: true } } }).catch((e) => {
+      error = e;
     });
+
+    expect(error).not.toBeNull();
+    expect(
+      await fs.stat(escaped).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("fails a write instead of replacing a review-state file it cannot read", async () => {
+    using tempDir = new TestTempDir("review-state-unreadable");
+    const { config, filePath } = await createHarness(tempDir);
+    const service = new ReviewStateService(config);
+    await service.applyDelta(WORKSPACE_ID, { reviews: { set: { r1: makeReview("r1", "keep") } } });
+    const original = await fs.readFile(filePath, "utf-8");
+    await fs.chmod(filePath, 0o000);
+
+    let error: unknown = null;
+    try {
+      await service.applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: true } } }).catch((e) => {
+        error = e;
+      });
+    } finally {
+      await fs.chmod(filePath, 0o600);
+    }
+
+    expect(error).not.toBeNull();
+    expect(await fs.readFile(filePath, "utf-8")).toBe(original);
   });
 
   it("does not recreate the session dir for a workspace missing from config", async () => {

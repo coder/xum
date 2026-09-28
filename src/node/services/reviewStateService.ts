@@ -1,4 +1,5 @@
 import { EventEmitter } from "events";
+import * as fs from "fs/promises";
 import * as path from "path";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
@@ -22,22 +23,27 @@ import {
 } from "@/common/utils/reviewState";
 
 /**
- * The legacy entries to add to one section: keys it lacks, plus (firstSeen) keys the legacy
- * value should replace. Undefined when the section was not provided.
+ * Legacy review notes to add: the ids the backend lacks (all of them when the section is
+ * absent). Undefined when the section was not provided.
  */
-function importDelta<V>(
+function missingEntries<V>(
   existing: Record<string, V> | undefined,
-  legacy: Record<string, V> | undefined,
-  replaces?: (kept: V, legacy: V) => boolean
+  legacy: Record<string, V> | undefined
 ): { set: Record<string, V> } | undefined {
   if (legacy === undefined) return undefined;
-  const set = Object.fromEntries(
-    Object.entries(legacy).filter(
-      ([key, value]) =>
-        existing === undefined || !(key in existing) || (replaces?.(existing[key], value) ?? false)
-    )
-  );
-  return { set };
+  return {
+    set: Object.fromEntries(
+      Object.entries(legacy).filter(([key]) => existing === undefined || !(key in existing))
+    ),
+  };
+}
+
+/** A hunk-keyed legacy section is imported whole, and only when the backend lacks it. */
+function wholeIfAbsent<V>(
+  existing: Record<string, V> | undefined,
+  legacy: Record<string, V> | undefined
+): { set: Record<string, V> } | undefined {
+  return existing === undefined ? missingEntries(undefined, legacy) : undefined;
 }
 
 /**
@@ -82,6 +88,7 @@ export class ReviewStateService extends EventEmitter {
   /** Sanitized snapshot; empty sections for an unknown workspace or a missing file. */
   async getSnapshot(workspaceId: string): Promise<ReviewStateSnapshot> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.getSnapshot requires a workspaceId");
+    this.sessionDirFor(workspaceId);
     // No lock: writes are atomic renames, so a read sees either the old or the new file.
     return this.load(workspaceId);
   }
@@ -97,6 +104,7 @@ export class ReviewStateService extends EventEmitter {
 
   async applyDelta(workspaceId: string, delta: ReviewStateDelta): Promise<ReviewStateUpdateOutput> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.applyDelta requires a workspaceId");
+    this.sessionDirFor(workspaceId);
     return this.withWriteLock(workspaceId, async () => {
       const current = await this.load(workspaceId);
       const snapshot: ReviewStateSnapshot = {
@@ -108,21 +116,26 @@ export class ReviewStateService extends EventEmitter {
   }
 
   /**
-   * Non-clobbering, per-entry localStorage migration: add only the legacy entries whose keys a
-   * section lacks (creating an absent section); existing backend entries always win, except
-   * that firstSeen keeps the earlier timestamp, as in every other merge. Caps apply after.
+   * Non-clobbering localStorage migration. An absent section is created from the legacy value;
+   * existing backend entries are never overwritten. Caps apply after.
    *
-   * localStorage is per origin (desktop app vs a browser tab) while this file is shared, and a
-   * client removes its legacy keys once imported. So a key that still exists means that origin
-   * was never imported, and its missing entries are new data, not stale leftovers. Results:
-   * "applied" = the section was absent and was created, "present" = it existed and gained only
-   * missing entries.
+   * `reviews` also gains the legacy notes whose ids it lacks. localStorage is per origin
+   * (desktop app vs a browser tab) while this file is shared, and a client removes its legacy
+   * keys once imported, so a key that still exists means that origin was never imported: its
+   * notes (unique per-origin ids, user-authored) are new data that must not be lost.
+   *
+   * The hunk-keyed sections (readState, firstSeen, hunkExpand, readMore) are NOT merged per
+   * entry: their keys are deterministic hunk ids, so an older origin's key would resurrect an
+   * entry the user deliberately cleared (e.g. marked unread = deleted). When present, they are
+   * only reported. Results: "applied" = the section was absent and was created, "present" = it
+   * existed (reviews: gained only missing notes; other sections: untouched).
    */
   async importLegacy(
     workspaceId: string,
     sections: ReviewStateSections
   ): Promise<ReviewStateImportLegacyOutput> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.importLegacy requires a workspaceId");
+    this.sessionDirFor(workspaceId);
     return this.withWriteLock(workspaceId, async () => {
       const current = await this.load(workspaceId);
       // Sanitize the untrusted legacy payload with the same rules as the file load.
@@ -140,11 +153,11 @@ export class ReviewStateService extends EventEmitter {
       }
       const has = current.sections;
       const delta: ReviewStateDelta = {
-        reviews: importDelta(has.reviews, provided.reviews),
-        readState: importDelta(has.readState, provided.readState),
-        firstSeen: importDelta(has.firstSeen, provided.firstSeen, (kept, legacy) => legacy < kept),
-        hunkExpand: importDelta(has.hunkExpand, provided.hunkExpand),
-        readMore: importDelta(has.readMore, provided.readMore),
+        reviews: missingEntries(has.reviews, provided.reviews),
+        readState: wholeIfAbsent(has.readState, provided.readState),
+        firstSeen: wholeIfAbsent(has.firstSeen, provided.firstSeen),
+        hunkExpand: wholeIfAbsent(has.hunkExpand, provided.hunkExpand),
+        readMore: wholeIfAbsent(has.readMore, provided.readMore),
       };
       changed ||= REVIEW_STATE_SECTIONS.some(
         (section) => Object.keys(delta[section]?.set ?? {}).length > 0
@@ -159,10 +172,39 @@ export class ReviewStateService extends EventEmitter {
     });
   }
 
+  /**
+   * The workspace's session dir. Rejects IDs that would resolve anywhere but a direct child of
+   * the sessions dir (e.g. `../x`): IDs arrive over the API and must not reach other paths.
+   */
+  private sessionDirFor(workspaceId: string): string {
+    const sessionDir = path.join(this.config.sessionsDir, workspaceId);
+    if (path.dirname(path.resolve(sessionDir)) !== path.resolve(this.config.sessionsDir)) {
+      throw new Error(`Invalid workspace id for review state: ${JSON.stringify(workspaceId)}`);
+    }
+    return sessionDir;
+  }
+
+  /**
+   * Missing or unparseable file: self-heal to empty. Any other read failure (EACCES, EIO,
+   * EISDIR...) throws: treating it as empty would let the next write replace data that exists
+   * but could not be read, while a rejection makes the client keep its change and retry.
+   */
   private async load(workspaceId: string): Promise<ReviewStateSnapshot> {
-    const raw = await this.file.read(workspaceId);
-    if (raw === null) {
-      // Missing or unparseable file (SessionFileManager logs parse errors): self-heal to empty.
+    const filePath = path.join(this.sessionDirFor(workspaceId), REVIEW_STATE_FILE_NAME);
+    let text: string;
+    try {
+      text = await fs.readFile(filePath, "utf-8");
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+        return createEmptyReviewStateSnapshot();
+      }
+      throw error;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (error) {
+      log.warn(`Ignoring unparseable ${REVIEW_STATE_FILE_NAME}`, { workspaceId, error });
       return createEmptyReviewStateSnapshot();
     }
     const { snapshot, droppedEntries } = sanitizeReviewStateSnapshot(raw);
@@ -183,11 +225,7 @@ export class ReviewStateService extends EventEmitter {
    * backends sharing one Xum root, which an in-memory mutex alone cannot.
    */
   private withWriteLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
-    return withTargetMutationLock(
-      this.config.rootDir,
-      path.join(this.config.sessionsDir, workspaceId),
-      fn
-    );
+    return withTargetMutationLock(this.config.rootDir, this.sessionDirFor(workspaceId), fn);
   }
 
   private getRevision(workspaceId: string): number {
