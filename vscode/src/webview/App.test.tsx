@@ -1981,8 +1981,7 @@ describe("vscode webview message rows", () => {
     expect(view.queryByText(warningText)).toBeNull();
   });
 
-  // plan-display rows only come from the desktop /plan command today; a replayed row still proves
-  // Close acts on the webview's own aggregator (WorkspaceStore has none for this workspace).
+  // Close must act on the webview's own aggregator; WorkspaceStore has none for this workspace.
   test("closing a plan-display preview removes it from the transcript", async () => {
     const bridge = new TestBridge();
     const view = render(<App bridge={bridge} />);

@@ -15,8 +15,6 @@ export function DisplayedMessageRenderer(props: {
   workspaceId: string;
   isLatestProposePlan?: boolean;
   isCompacting: boolean;
-  // The webview owns its StreamingMessageAggregator (WorkspaceStore has none for this workspace),
-  // so plan-display Close and history-hidden "Load all" must act on it through these callbacks.
   onCloseEphemeral: (historyId: string) => void;
   onShowAllHistory: () => void;
 }): JSX.Element {

@@ -17,6 +17,7 @@ export const HistoryHiddenMessage: React.FC<HistoryHiddenMessageProps> = ({
   className,
   onShowAll,
 }) => {
+  const handleShowAll = onShowAll ?? (workspaceId ? () => showAllMessages(workspaceId) : undefined);
   const omittedMessageDetails: string[] = [];
   if (message.omittedMessageCounts?.tool) {
     omittedMessageDetails.push(
@@ -60,17 +61,11 @@ export const HistoryHiddenMessage: React.FC<HistoryHiddenMessageProps> = ({
         />
       </svg>
       <span className="text-muted">Some messages are hidden for performance • {detailSummary}</span>
-      {(onShowAll != null || Boolean(workspaceId)) && (
+      {handleShowAll && (
         <button
           type="button"
           className="text-link hover:text-link-hover cursor-pointer border-none bg-transparent p-0 font-medium underline"
-          onClick={() => {
-            if (onShowAll) {
-              onShowAll();
-            } else if (workspaceId) {
-              showAllMessages(workspaceId);
-            }
-          }}
+          onClick={() => handleShowAll()}
         >
           Load all
         </button>
