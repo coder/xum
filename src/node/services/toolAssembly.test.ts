@@ -15,6 +15,9 @@ import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { appendRefinementEvent } from "@/node/services/refinement/refinementJournal";
 import { listRefinements } from "@/node/services/refinement/refinementRollback";
+import { createFileEditInsertTool } from "./tools/file_edit_insert";
+import { createFileEditReplaceStringTool } from "./tools/file_edit_replace_string";
+import { getTestDeps } from "./tools/testHelpers";
 
 function executableTool(description: string): Tool {
   return {
@@ -25,6 +28,103 @@ function executableTool(description: string): Tool {
 }
 
 describe("applyToolPolicyAndExperiments", () => {
+  test("PTC keeps literal file edits direct without duplicating them in the sandbox", async () => {
+    using tmp = new DisposableTempDir("ptc-direct-file-edits");
+    const deps = {
+      ...getTestDeps(),
+      cwd: tmp.path,
+      runtime: new LocalRuntime(tmp.path),
+      runtimeTempDir: tmp.path,
+    };
+    const tools = await applyToolPolicyAndExperiments({
+      allTools: {
+        file_edit_insert: createFileEditInsertTool(deps),
+        file_edit_replace_string: createFileEditReplaceStringTool(deps),
+        bash: executableTool("Run a command"),
+      },
+      effectiveToolPolicy: undefined,
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(tools).sort()).toEqual([
+      "code_execution",
+      "file_edit_insert",
+      "file_edit_replace_string",
+    ]);
+
+    // JSON, shell substitutions, and Markdown fences are literal document data,
+    // not source to be repaired by a JavaScript parser.
+    const content = [
+      "# Handoff",
+      'HTTP 200 `{"status":"ok"}`',
+      '`${String(key)}:${version}` and "quoted" text',
+      "```sh",
+      "printf '%s\\n' \"${HOME}\"",
+      "```",
+      "",
+    ].join("\n");
+    const options = { toolCallId: "direct-edit", messages: [], context: undefined };
+    const filePath = path.join(tmp.path, "handoff.md");
+    expect(
+      await tools.file_edit_insert.execute!({ path: filePath, content }, options)
+    ).toMatchObject({ success: true });
+    expect(await fsPromises.readFile(filePath, "utf8")).toBe(content);
+
+    const oldString = '{"status":"ok"}';
+    const newString = '{"status":"ready","note":"it\'s literal"}';
+    expect(
+      await tools.file_edit_replace_string.execute!(
+        { path: filePath, old_string: oldString, new_string: newString },
+        options
+      )
+    ).toMatchObject({ success: true });
+    expect(await fsPromises.readFile(filePath, "utf8")).toBe(content.replace(oldString, newString));
+
+    // A duplicate bridge would bypass request.assemble filters/wrappers.
+    const evaluated: unknown = await tools.code_execution.execute!(
+      {
+        code: "return [typeof xum.file_edit_insert, typeof xum.file_edit_replace_string, typeof xum.bash];",
+      },
+      options
+    );
+    expect(evaluated).toMatchObject({
+      success: true,
+      result: ["undefined", "undefined", "function"],
+    });
+  });
+
+  test.each(["policy", "grants"] as const)(
+    "PTC direct file edits still obey %s",
+    async (ceiling) => {
+      const tools = await applyToolPolicyAndExperiments({
+        allTools: {
+          file_edit_insert: executableTool("Insert text"),
+          file_edit_replace_string: executableTool("Replace text"),
+          bash: executableTool("Run a command"),
+        },
+        effectiveToolPolicy:
+          ceiling === "policy" ? [{ regex_match: "file_edit_.*", action: "disable" }] : undefined,
+        capabilityGrants:
+          ceiling === "grants"
+            ? {
+                version: 1,
+                bridgeTools: { allow: ["bash"] },
+                vars: false,
+                hostEvents: false,
+              }
+            : undefined,
+        experiments: { programmaticToolCalling: true },
+        emitNestedToolEvent: () => undefined,
+      });
+      expect(Object.keys(tools)).toEqual(["code_execution"]);
+      const evaluated: unknown = await tools.code_execution.execute!(
+        { code: "return [typeof xum.file_edit_insert, typeof xum.file_edit_replace_string];" },
+        { toolCallId: "denied-edit", messages: [], context: undefined }
+      );
+      expect(evaluated).toMatchObject({ success: true, result: ["undefined", "undefined"] });
+    }
+  );
+
   test("PTC keeps mcp_prompt_get directly visible", async () => {
     const result = await applyToolPolicyAndExperiments({
       allTools: {

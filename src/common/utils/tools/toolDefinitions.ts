@@ -2960,6 +2960,8 @@ export const TOOL_DEFINITIONS = {
   },
 
   file_edit_replace_string: {
+    // Literal edits must not require another layer of JavaScript string escaping.
+    ptcExcluded: "Replacement text belongs in structured tool arguments, not JavaScript source",
     resultSchema: FileEditReplaceStringToolResultSchema,
     description:
       "Edits fail if old_string is not found or is not unique. Check the tool result before dependent operations such as commits, pushes, or builds.\n\n" +
@@ -3007,6 +3009,7 @@ export const TOOL_DEFINITIONS = {
     ),
   },
   file_edit_insert: {
+    ptcExcluded: "File contents belong in structured tool arguments, not JavaScript source",
     resultSchema: FileEditInsertToolResultSchema,
     description:
       "Insert content into a file using substring guards. " +
