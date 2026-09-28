@@ -482,6 +482,9 @@ export class DraftStore {
     const source = this.entries.get(key);
     if (!source || (source.view.text.length === 0 && source.view.attachmentCount === 0)) return;
     this.setText(to, source.text);
+    // Captured with the copy it describes: an edit during the payload load below must keep the
+    // source (the text was copied before it).
+    const textVersion = source.textVersion;
     if (!source.payloadsLoaded) {
       // A hydrated source may not have its attachment payloads yet. Deleting it before they
       // arrive would lose the attachments, so move them once loaded; on failure the source stays.
@@ -494,7 +497,6 @@ export class DraftStore {
       if (this.entries.get(key) !== source || !source.payloadsLoaded) return;
     }
     if (source.attachments.length > 0) this.setAttachments(to, source.attachments);
-    const textVersion = source.textVersion;
     const attachmentsVersion = source.attachmentsVersion;
     try {
       await this.flush(to);
@@ -857,6 +859,16 @@ export class DraftStore {
         removeKeys();
       } catch (error) {
         console.warn("Failed to import a legacy draft; will retry on next start:", error);
+        // The backend could not be consulted, so this bypasses the non-clobber rule on purpose:
+        // if the snapshot has no draft for the scope, show the legacy one and let the normal write
+        // path save it. Otherwise the composer starts empty, the user types, and the next import
+        // answers "present" and drops the legacy keys: a guaranteed loss. The keys stay until a
+        // later import confirms.
+        const existing = this.entries.get(draftStoreScopeKey(scope));
+        if (!existing || (existing.text.length === 0 && existing.attachmentCount === 0)) {
+          this.setText(scope, text);
+          this.setAttachments(scope, attachments);
+        }
       }
     }
   }

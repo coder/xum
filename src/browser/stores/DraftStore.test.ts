@@ -502,4 +502,47 @@ describe("DraftStore", () => {
     await store.flush(WS_SCOPE).catch(() => undefined);
     expect(errors).toEqual(["update failed"]);
   });
+
+  test("shows and saves a legacy draft whose import failed when the backend has none", async () => {
+    using tempDir = new TestTempDir("draft-store-import-failed");
+    const { service, client, control } = await createHarness(tempDir);
+    updatePersistedState(getInputKey(WS), "pre-upgrade");
+
+    control.failImports = 100;
+    const first = createStore(client);
+    await first.whenReady();
+    // Were it empty, the user would type over it and the next import would answer "present".
+    expect(first.getText(WS_SCOPE)).toBe("pre-upgrade");
+    await first.flush(WS_SCOPE);
+    expect(listPersistedKeys("input")).toHaveLength(1);
+    first.setClient(null);
+
+    control.failImports = 0;
+    const second = createStore(client);
+    await second.whenReady();
+    expect((await service.get(WS_SCOPE)).text).toBe("pre-upgrade");
+    expect(listPersistedKeys("input")).toEqual([]);
+  });
+
+  test("keeps the source of a move that was edited while its payloads loaded", async () => {
+    using tempDir = new TestTempDir("draft-store-move-edit");
+    const { projectPath, service, client, control } = await createHarness(tempDir);
+    const source: DraftScope = { kind: "creation", projectPath, draftId: "draft-a" };
+    await service.update({ scope: source, text: "moving", attachments: [image] });
+    const store = createStore(client);
+    await store.whenReady();
+
+    let release: () => void = () => undefined;
+    control.getGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const moved = store.moveDraft(source, WS_SCOPE);
+    store.setText(source, "moving, edited");
+    release();
+    await moved;
+
+    expect(store.getText(source)).toBe("moving, edited");
+    await store.flush(source);
+    expect((await service.get(source)).text).toBe("moving, edited");
+  });
 });
