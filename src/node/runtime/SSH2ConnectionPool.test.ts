@@ -148,14 +148,13 @@ describe.skipIf(process.platform === "win32")(
       expect(first.waits).toEqual([]);
       expect(connections).toBe(1);
 
-      // The pool still recorded the failure: a caller arriving during that backoff gets the
-      // permanent error without sleeping or logging in again.
+      // The pool still recorded the failure: the next caller waits out that backoff, then
+      // makes one login of its own and stops on its failure. (The recorded last error alone
+      // is not trusted: other writers report failures into it too.)
       const next = acquire(pool, config, 5_000);
-      const refusal = String(await next.result);
-      expect(refusal).toContain("backoff");
-      expect(refusal).toContain("All configured authentication methods failed");
-      expect(next.waits).toEqual([]);
-      expect(connections).toBe(1);
+      expect(String(await next.result)).toContain("All configured authentication methods failed");
+      expect(next.waits).toHaveLength(1);
+      expect(connections).toBe(2);
     });
 
     it("a refused connection still waits through the backoff", async () => {

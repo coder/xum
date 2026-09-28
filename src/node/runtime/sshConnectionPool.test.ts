@@ -702,12 +702,12 @@ describe.skipIf(process.platform === "win32")(
     });
 
     /** Put an `ssh` on PATH that fails with `stderr` and exit code 255; returns its call count. */
-    async function shimSsh(stderr: string): Promise<() => Promise<number>> {
+    async function shimSsh(stderr: string, exitCode = 255): Promise<() => Promise<number>> {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-shim-"));
       const calls = path.join(dir, "calls");
       await fs.writeFile(
         path.join(dir, "ssh"),
-        `#!/bin/sh\necho call >> '${calls}'\nprintf '%s\\n' '${stderr}' >&2\nexit 255\n`,
+        `#!/bin/sh\necho call >> '${calls}'\nprintf '%s\\n' '${stderr}' >&2\nexit ${exitCode}\n`,
         { mode: 0o755 }
       );
       const originalPath = process.env.PATH;
@@ -748,13 +748,29 @@ describe.skipIf(process.platform === "win32")(
         expect(await calls()).toBe(1);
         expect(pool.getConnectionHealth(config)?.status).toBe("unhealthy");
 
-        // A caller arriving during the backoff gets the permanent error without another login.
+        // The next caller waits out the backoff, then probes once and stops on its failure.
+        // (The recorded last error alone is not trusted: exec failures report into it too.)
         const next = acquire(pool, config, 5_000);
         expect(String(await next.result)).toContain(stderr);
-        expect(next.waits).toEqual([]);
-        expect(await calls()).toBe(1);
+        expect(next.waits).toHaveLength(1);
+        expect(await calls()).toBe(2);
       }
     );
+
+    // Exec failures report into the same health record: a remote command that itself runs
+    // `ssh` and is refused must not make the pool treat the workspace host as refusing logins.
+    test("a permanent-looking error reported by an exec still waits and probes", async () => {
+      const calls = await shimSsh("", 0);
+      const pool = new SSHConnectionPool();
+      const config: SSHRuntimeConfig = { host: "shim.test", srcBaseDir: "/work" };
+      pool.reportFailure(config, "git@example.com: Permission denied (publickey).");
+
+      const { waits, result } = acquire(pool, config, 5_000);
+      // The helper maps a successful acquisition to this marker error.
+      expect(String(await result)).toContain("unexpectedly succeeded");
+      expect(waits).toHaveLength(1);
+      expect(await calls()).toBe(1);
+    });
 
     test("a transient failure still waits through the backoff", async () => {
       const calls = await shimSsh("ssh: connect to host shim.test port 22: Connection refused");
