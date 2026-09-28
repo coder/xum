@@ -2143,7 +2143,8 @@ describe("vscode webview message rows", () => {
         fireEvent.click(next!);
         await Promise.resolve();
       });
-      expect(scrolled).toEqual([view.container.querySelector('[data-message-id="second"]')!]);
+      // Compare IDs, not elements: a failing toEqual on DOM nodes can exhaust memory while diffing.
+      expect(scrolled.map((element) => element.getAttribute("data-message-id"))).toEqual(["second"]);
     } finally {
       Element.prototype.scrollIntoView = originalScrollIntoView;
     }
@@ -2165,16 +2166,17 @@ describe("vscode webview message rows", () => {
       )
     );
 
-    const middleRow = () => view.container.querySelector('[data-message-id="out-2"]');
+    // A boolean, so a failure does not print the whole row element.
+    const middleRowRendered = () => view.container.querySelector('[data-message-id="out-2"]') !== null;
     expect(view.container.querySelector('[data-message-id="out-1"]')).not.toBeNull();
     expect(view.container.querySelector('[data-message-id="out-3"]')).not.toBeNull();
-    expect(middleRow()).toBeNull();
+    expect(middleRowRendered()).toBe(false);
 
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: /Show 1 more output check for proc-1/ }));
       await Promise.resolve();
     });
-    expect(middleRow()).not.toBeNull();
+    expect(middleRowRendered()).toBe(true);
     expect(view.queryByRole("button", { name: /Hide 1 more output check/ })).not.toBeNull();
   });
 
