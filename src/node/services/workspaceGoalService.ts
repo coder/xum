@@ -53,6 +53,7 @@ import {
 import { buildGoalBudgetLimitMessage, buildGoalContinuationMessage } from "@/constants/goalPrompts";
 import type { IdleDispatcher, IdleDispatchPayload } from "./idleDispatcher";
 import { log } from "./log";
+import { isRuntimeTransportError } from "@/node/runtime/Runtime";
 import { NOOP_TIMELINE_RECORDER, type TimelineRecorder } from "./timelineRecorder";
 import {
   applyBudgetDrivenStatus,
@@ -1463,7 +1464,7 @@ export class WorkspaceGoalService {
     if (modelHasPricingData(normalized.model, providersConfig)) {
       return normalized;
     }
-    const kickoff = await this.goalContinuationBridge?.getKickoffSendOptions?.(workspaceId);
+    const kickoff = await this.getKickoffSendOptionsForArming(workspaceId);
     if (!kickoff || kickoff.agentId === "plan" || kickoff.agentId === "compact") {
       return null;
     }
@@ -3075,6 +3076,28 @@ export class WorkspaceGoalService {
     return { ...persisted, model: kickoffModel };
   }
 
+  /**
+   * Kickoff options for arming a continuation. Arming runs after the goal is
+   * persisted, so an unreachable runtime (#4829) must neither throw out of the
+   * caller nor arm with default AI settings: the goal stays idle and the user's
+   * next turn resumes it through the stream-end continuation.
+   */
+  private async getKickoffSendOptionsForArming(
+    workspaceId: string,
+    kickoffModel?: string | null
+  ): Promise<SendMessageOptions | null> {
+    try {
+      return await this.getKickoffSendOptions(workspaceId, kickoffModel);
+    } catch (error) {
+      if (!isRuntimeTransportError(error)) throw error;
+      log.warn("Goal continuation not armed: the workspace runtime is unreachable", {
+        workspaceId,
+        error: error.message,
+      });
+      return null;
+    }
+  }
+
   private async setGoalImmediately(
     input: SetGoalInput & { objective?: string },
     options?: GoalPersistenceOptions
@@ -3623,7 +3646,7 @@ export class WorkspaceGoalService {
       }
       return;
     }
-    const sendOptions = await this.getKickoffSendOptions(workspaceId, kickoffModel);
+    const sendOptions = await this.getKickoffSendOptionsForArming(workspaceId, kickoffModel);
     if (!sendOptions) {
       return;
     }
@@ -3778,7 +3801,7 @@ export class WorkspaceGoalService {
     if (this.pendingContinuationCandidates.has(workspaceId)) {
       return;
     }
-    const sendOptions = await this.goalContinuationBridge.getKickoffSendOptions?.(workspaceId);
+    const sendOptions = await this.getKickoffSendOptionsForArming(workspaceId);
     if (!sendOptions || sendOptions.agentId === "plan" || sendOptions.agentId === "compact") {
       return;
     }

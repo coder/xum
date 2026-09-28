@@ -16,6 +16,8 @@ import type { TaskService } from "@/node/services/taskService";
 import { isActiveWorkspaceTurnTaskStatus, TaskHandleStore } from "@/node/services/taskHandleStore";
 import { log } from "@/node/services/log";
 import * as resolveNodeAgentAiSettingsModule from "@/node/services/agentDefinitions/resolveNodeAgentAiSettings";
+import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import { Ok, Err, type Result } from "@/common/types/result";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
@@ -2746,4 +2748,56 @@ describe("TaskService", () => {
     expect(childEntry?.taskModelString).toBe("openai:gpt-5.3-codex");
     expect(childEntry?.taskThinkingLevel).toBe("xhigh");
   }, 20_000);
+});
+
+describe("TaskService agent reads over an unreachable runtime (#4829, #4831)", () => {
+  let rootDir: string;
+  beforeEach(async () => {
+    rootDir = await createTaskServiceTestRoot();
+  });
+  afterEach(async () => {
+    await removeTaskServiceTestRoot(rootDir);
+  });
+
+  async function createTaskWhile(
+    failingRead: "loadAgentDefinitionAiLayers" | "resolveAgentFrontmatter"
+  ): Promise<{ created: Awaited<ReturnType<typeof createAgentTask>>; sendCalls: number }> {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["aaaaaaaaaa"], "bbbbbbbbbb");
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const unreachable = new RuntimeError("ssh: Connection reset by peer", "network");
+    const read =
+      failingRead === "loadAgentDefinitionAiLayers"
+        ? spyOn(resolveNodeAgentAiSettingsModule, failingRead).mockRejectedValue(unreachable)
+        : spyOn(agentDefinitionsService, failingRead).mockRejectedValue(unreachable);
+    try {
+      const created = await createAgentTask(taskService, parentId, "should not spawn");
+      return { created, sendCalls: sendMessage.mock.calls.length };
+    } finally {
+      read.mockRestore();
+    }
+  }
+
+  test("fails retryably instead of spawning with default AI settings", async () => {
+    // Validation passes; only the AI-settings read of the definition chain fails.
+    const { created, sendCalls } = await createTaskWhile("loadAgentDefinitionAiLayers");
+    expect(created.success).toBe(false);
+    if (!created.success) {
+      expect(created.error).toStartWith("Task.create: the workspace runtime is unreachable");
+    }
+    expect(sendCalls).toBe(0);
+  });
+
+  test("reports an unreachable runtime instead of an unknown agentId", async () => {
+    const { created, sendCalls } = await createTaskWhile("resolveAgentFrontmatter");
+    expect(created.success).toBe(false);
+    if (!created.success) {
+      expect(created.error).toStartWith(
+        "Task.create: could not verify agentId (explore): the workspace runtime is unreachable"
+      );
+    }
+    expect(sendCalls).toBe(0);
+  });
 });

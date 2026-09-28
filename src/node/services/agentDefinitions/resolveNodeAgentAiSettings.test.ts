@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 
 import {
   collectDefinitionLayers,
@@ -206,5 +206,55 @@ describe("loadAgentDefinitionAiLayers cancellation", () => {
     const viaAsync = await resolveNodeAgentAiSettings({ ...params, definitionContext: context });
     expect(viaLayers).toEqual(viaAsync);
     expect(viaLayers.selected.model).toBe(MODEL_B);
+  });
+});
+
+describe("loadAgentDefinitionAiLayers read failures (#4829)", () => {
+  const context = (stat: (path: string, signal?: AbortSignal) => Promise<never>) => ({
+    runtime: {
+      normalizePath: (target: string, base: string) => `${base}/${target}`,
+      resolvePath: (path: string) => Promise.resolve(path),
+      getXumHome: () => "/home/test/.xum",
+      stat,
+    } as unknown as Runtime,
+    workspacePath: "/ws",
+    workspaceId: "ws",
+  });
+
+  it("rethrows a transport failure instead of resolving without the chain", async () => {
+    const unreachable = new RuntimeError("ssh: Connection reset by peer", "network");
+    const loaded = await loadAgentDefinitionAiLayers(
+      "worker",
+      context(() => Promise.reject(unreachable))
+    ).catch((error: unknown) => error);
+    expect(loaded).toBe(unreachable);
+    // resolveNodeAgentAiSettings must not fall back to default settings either.
+    const resolved = await resolveNodeAgentAiSettings({
+      agentId: "worker",
+      profile: "subagent",
+      cfg: {},
+      definitionContext: context(() => Promise.reject(unreachable)),
+    }).catch((error: unknown) => error);
+    expect(resolved).toBe(unreachable);
+  });
+
+  it("still settles to null for other read failures and for aborted transport reads", async () => {
+    const denied = await loadAgentDefinitionAiLayers(
+      "worker",
+      context(() => Promise.reject(new Error("EACCES: permission denied")))
+    );
+    expect(denied).toBeNull();
+
+    // SSH2 reports an aborted exec as "network": the abort decides, not the error type.
+    const controller = new AbortController();
+    const aborted = await loadAgentDefinitionAiLayers(
+      "worker",
+      context(() => {
+        controller.abort(new Error("timed out"));
+        return Promise.reject(new RuntimeError("ssh: exec aborted", "network"));
+      }),
+      { abortSignal: controller.signal }
+    );
+    expect(aborted).toBeNull();
   });
 });

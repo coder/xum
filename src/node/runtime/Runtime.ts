@@ -758,3 +758,12 @@ export class RuntimeError extends Error {
 export function isRuntimeTransportError(error: unknown): error is RuntimeError {
   return error instanceof RuntimeError && error.type === "network";
 }
+
+/**
+ * Caller-facing text for a transport failure that ends an operation early. It
+ * says the host was unreachable and the operation can be retried, so a model or
+ * user does not read it as a missing agent or a bad argument.
+ */
+export function formatRuntimeUnreachableError(operation: string, error: RuntimeError): string {
+  return `${operation}: the workspace runtime is unreachable (${error.message}); retry once it is reachable`;
+}

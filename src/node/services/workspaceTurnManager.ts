@@ -49,7 +49,11 @@ import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/r
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
-import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  formatRuntimeUnreachableError,
+  isRuntimeTransportError,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import {
   coerceNonEmptyString,
   tryReadGitBranchMatchesOrigin,
@@ -1004,7 +1008,16 @@ export class WorkspaceTurnManager {
         scope: entry.scope,
         ...(entry.source != null ? { source: entry.source } : {}),
       }));
-    } catch {
+    } catch (error) {
+      // An unreachable host is not an unknown agent (#4831): say it can be retried.
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createWorkspaceTurn: could not verify agentId (${params.agentId})`,
+            error
+          )
+        );
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
@@ -1015,7 +1028,15 @@ export class WorkspaceTurnManager {
         params.agentId,
         { includeAgentPlugins: params.includeAgentPlugins }
       );
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createWorkspaceTurn: could not verify agentId (${params.agentId})`,
+            error
+          )
+        );
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     if (!resolveAgentVisibility(frontmatter.ui).selectable) {
@@ -1130,7 +1151,15 @@ export class WorkspaceTurnManager {
         { includeAgentPlugins: params.owner.includeAgentPlugins }
       );
       resolvedScope = definition.scope;
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createWorkspaceTurn: could not verify agentId (${params.agentId})`,
+            error
+          )
+        );
+      }
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
     if (resolvedScope === "project") {
@@ -1670,6 +1699,11 @@ export class WorkspaceTurnManager {
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.createWorkspaceTurn: ${error.message}`);
+      }
+      // The agent's definition defaults could not be read (#4829): fail retryably
+      // instead of dispatching with default AI settings.
+      if (isRuntimeTransportError(error)) {
+        return Err(formatRuntimeUnreachableError("Task.createWorkspaceTurn", error));
       }
       throw error;
     }

@@ -415,6 +415,9 @@ export async function resolveAgentForStream(
         effectiveAgentId = agentDefinition.id;
       }
     } catch (error: unknown) {
+      // An unreachable host is neither an ineligible agent nor a skippable check:
+      // TurnRequestBuilder.prepare reports it as a retryable startup failure (#4831).
+      if (isRuntimeTransportError(error)) throw error;
       // Strict sends fail closed when eligibility cannot be verified: a hook or edit
       // that breaks the definition (e.g. a base pointing at a missing definition) after
       // launch validation would otherwise stream a partially resolved prompt/tool policy.

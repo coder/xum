@@ -6,6 +6,7 @@ import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataServi
 import { WorkspaceGoalService, type GoalContinuationRuntimeBridge } from "./workspaceGoalService";
 import { IdleDispatcher } from "./idleDispatcher";
 import { createTestHistoryService } from "./testHistoryService";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { HistoryService } from "./historyService";
 import type { GoalRecordV1 } from "@/common/types/goal";
@@ -692,6 +693,24 @@ describe("WorkspaceGoalService", () => {
     await setGoalOk(service, { workspaceId, objective: "No kickoff defaults" });
 
     expect(executed).toHaveLength(0);
+  });
+
+  test("leaves a persisted goal idle when kickoff options hit an unreachable runtime (#4829)", async () => {
+    const dispatcher = new IdleDispatcher();
+    const execute = mock(() => Promise.resolve(true));
+    service.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(execute),
+      getKickoffSendOptions: () =>
+        Promise.reject(new RuntimeError("ssh: Connection reset by peer", "network")),
+    });
+
+    // The goal is already written when arming runs: set_goal must still succeed,
+    // and no kickoff may run with settings resolved without the agent definition.
+    const goal = await setGoalOk(service, { workspaceId, objective: "Remote host is down" });
+    await drainPendingDispatches();
+
+    expect(goal).toMatchObject({ status: "active" });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   test("falls back to priced kickoff options when stream options are unpriced for budgeted goals", async () => {

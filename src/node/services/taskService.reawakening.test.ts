@@ -10,6 +10,8 @@ import type { SendMessageError } from "@/common/types/errors";
 import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import assert from "node:assert";
+import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import {
   createAIServiceMocks,
   createTestConfig,
@@ -1221,6 +1223,59 @@ describe("TaskService", () => {
       "Inspect the original queued assignment.\n\nUpdated guidance from parent:\n\nAlso verify the regression tests."
     );
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPrompt).toBeUndefined();
+  });
+
+  test("reawakening fails retryably when the child's definition cannot be read (#4829)", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-unreachable";
+    const childTaskId = "child-unreachable";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        {
+          // Project-dir local runtime: the checkout path is the project path.
+          ...projectWorkspace(projectPath, "child", childTaskId, {
+            runtimeConfig: { type: "local" },
+            parentWorkspaceId,
+            agentId: "explore",
+            agentType: "explore",
+            taskStatus: "reported",
+            // New-style task: reawakening re-resolves its AI settings from the definition.
+            taskAiPins: {},
+          }),
+          path: projectPath,
+        },
+      ],
+      testTaskSettings()
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const read = spyOn(agentDefinitionsService, "readAgentDefinition").mockRejectedValue(
+      new RuntimeError("ssh: Connection reset by peer", "network")
+    );
+    try {
+      const result = await taskService.sendMessageToDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        "Continue",
+        "tool-end"
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toMatchObject({ code: "send_failed" });
+        if (result.error.code === "send_failed") {
+          expect(result.error.message).toContain("workspace runtime is unreachable");
+        }
+      }
+    } finally {
+      read.mockRestore();
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskStatus).toBe("reported");
   });
 
   test("higher ancestors steer a nested active continuation without reawakening it again", async () => {

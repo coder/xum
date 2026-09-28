@@ -13,6 +13,8 @@ import type { SendMessageError } from "@/common/types/errors";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
+import * as agentDefinitionsService from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { RuntimeError } from "@/node/runtime/Runtime";
 import {
   createTestConfig,
   createTestProject,
@@ -307,6 +309,41 @@ describe("WorkspaceTurnManager", () => {
       expect(internal.error).toContain("no turn was dispatched");
     }
 
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn reports an unreachable runtime instead of an unknown agentId (#4831)", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+
+    const createWorkspace = makeCreateMockReturning(
+      Ok({ metadata: createWorkspaceTurnMetadata(projectPath) })
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createWorkspaceTurnManagerHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+    const read = spyOn(agentDefinitionsService, "readAgentDefinition").mockRejectedValue(
+      new RuntimeError("ssh: Connection reset by peer", "network")
+    );
+    try {
+      const result = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        agentId: "plan",
+        prompt: "Should not run",
+        title: "Unreachable target",
+        workspace: { mode: "new" },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain("workspace runtime is unreachable");
+        expect(result.error).not.toContain("unknown agentId");
+      }
+    } finally {
+      read.mockRestore();
+    }
     expect(sendMessage).not.toHaveBeenCalled();
   });
 

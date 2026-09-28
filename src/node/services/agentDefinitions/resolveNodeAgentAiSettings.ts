@@ -22,7 +22,7 @@ import type {
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
 
 import { readAgentDefinition } from "./agentDefinitionsService";
@@ -132,7 +132,8 @@ export interface AgentDefinitionAiLayers {
 /**
  * Reads the target definition and its declared base chain. Returns null when the
  * chain is unavailable (missing/unreadable definition) or the read was aborted;
- * callers decide the fallback. The abort signal is forwarded to the runtime
+ * callers decide the fallback. Rethrows a transport RuntimeError (unreachable
+ * host), so callers fail retryably instead of resolving without the chain. The abort signal is forwarded to the runtime
  * reads so a timeout cancels underlying (e.g. SSH) work for runtimes that honor
  * it, and settles this promise promptly even while a runtime call is still pending.
  */
@@ -184,6 +185,10 @@ export async function loadAgentDefinitionAiLayers(
     });
     return await Promise.race([work, aborted]);
   } catch (error) {
+    // An unreachable host is not a missing definition: resolving without the
+    // definition layers would silently pick default AI settings (#4829). Aborts
+    // are checked first because SSH2 reports an aborted exec as "network".
+    if (abortSignal?.aborted !== true && isRuntimeTransportError(error)) throw error;
     log.debug("resolveNodeAgentAiSettings: definition chain unavailable", {
       agentId,
       workspaceId: context.workspaceId,
@@ -228,7 +233,8 @@ export async function resolveNodeAgentAiSettings(
   params: ResolveNodeAgentAiSettingsParams
 ): Promise<ResolvedAgentAiSettings> {
   // A missing or unreadable definition must not break resolution: fall back
-  // to the implicit base the resolver appends on its own.
+  // to the implicit base the resolver appends on its own. An unreachable host
+  // throws instead (see loadAgentDefinitionAiLayers).
   const layers =
     params.definitionContext != null
       ? await loadAgentDefinitionAiLayers(params.agentId, params.definitionContext)

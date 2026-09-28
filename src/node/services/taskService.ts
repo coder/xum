@@ -131,7 +131,12 @@ import {
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
-import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
+import {
+  formatRuntimeUnreachableError,
+  isRuntimeTransportError,
+  type InitLogger,
+  type Runtime,
+} from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   coerceNonEmptyString,
@@ -5972,7 +5977,16 @@ export class TaskService implements AgentTaskIntegration {
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
       definitionSource = definition.source;
       frontmatterJson = JSON.stringify(frontmatter);
-    } catch {
+    } catch (error) {
+      // An unreachable host is not an unknown agent (#4831): say it can be retried.
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(
+            `Task.createMany: could not verify agentId (${agentId})`,
+            error
+          )
+        );
+      }
       const hint = await getRunnableHint();
       return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
     }
@@ -6011,6 +6025,11 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.createMany: ${error.message}`);
+      }
+      // The agent's definition defaults could not be read (#4829): fail retryably
+      // instead of spawning with default AI settings.
+      if (isRuntimeTransportError(error)) {
+        return Err(formatRuntimeUnreachableError("Task.createMany", error));
       }
       throw error;
     }
@@ -7677,7 +7696,12 @@ export class TaskService implements AgentTaskIntegration {
         return Err(`Task.create: agentId is disabled (${agentId}). ${hint}`);
       }
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
-    } catch {
+    } catch (error) {
+      if (isRuntimeTransportError(error)) {
+        return Err(
+          formatRuntimeUnreachableError(`Task.create: could not verify agentId (${agentId})`, error)
+        );
+      }
       const hint = await getRunnableHint();
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);
     }
@@ -7714,6 +7738,9 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error) {
       if (error instanceof InvalidExplicitAiSettingError) {
         return Err(`Task.create: ${error.message}`);
+      }
+      if (isRuntimeTransportError(error)) {
+        return Err(formatRuntimeUnreachableError("Task.create", error));
       }
       throw error;
     }
@@ -8797,8 +8824,18 @@ export class TaskService implements AgentTaskIntegration {
 
     // Definition I/O never runs under the event or tree lifecycle lock: read the child's
     // definition layers first (inactive candidates only), then plan under the locks.
-    const preparedReawakenAi =
-      sender === "ancestor" ? await this.prepareReawakenAi(taskId) : undefined;
+    let preparedReawakenAi: PreparedReawakenAi | undefined;
+    try {
+      preparedReawakenAi = sender === "ancestor" ? await this.prepareReawakenAi(taskId) : undefined;
+    } catch (error) {
+      // Reawakening without the definition layers would persist default AI settings for
+      // the child (#4829); a timeout still falls back inside prepareReawakenAi.
+      if (!isRuntimeTransportError(error)) throw error;
+      return Err({
+        code: "send_failed" as const,
+        message: formatRuntimeUnreachableError("Could not reawaken the task", error),
+      });
+    }
 
     // Event lock first, then the task-tree lock: the order every path holding both follows (see
     // workspaceEventLocks). The reverse nesting deadlocked against reported-task cleanup.

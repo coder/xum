@@ -699,6 +699,32 @@ describe("resolveAgentForStream strict resolution", () => {
     }
   });
 
+  test("strict eligibility check rethrows transport failures instead of agent_resolution (#4831)", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-transport");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    // TurnRequestBuilder.prepare turns the rethrown error into a retryable
+    // runtime_start_failed; a non-retryable agent_resolution event would stop auto-retry.
+    const unreachable = new RuntimeError("ssh: Connection reset by peer", "network");
+    const frontmatter = spyOn(agentDefinitionsService, "resolveAgentFrontmatter").mockRejectedValue(
+      unreachable
+    );
+    const emittedErrorTypes: Array<string | undefined> = [];
+    try {
+      const outcome = await resolveTopLevel({
+        projectPath,
+        agentId: "plan",
+        strictAgentResolution: true,
+        onError: (event) => emittedErrorTypes.push(event.errorType),
+      }).catch((error: unknown) => error);
+      expect(outcome).toBe(unreachable);
+    } finally {
+      frontmatter.mockRestore();
+    }
+    expect(emittedErrorTypes).toEqual([]);
+  });
+
   test("strict mode rejects a definition resolving from a different scope than validated", async () => {
     using tempDir = new DisposableTempDir("agent-resolution-strict-provenance");
     const projectPath = path.join(tempDir.path, "project");
