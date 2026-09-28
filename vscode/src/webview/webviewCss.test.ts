@@ -82,11 +82,21 @@ function readCandidates(files: string[]): string[] {
 }
 
 // All tests need the same bundle scan; compute it once.
-let bundledSources: Promise<{ files: string[]; candidates: string[] }> | null = null;
-function loadBundledSources(): Promise<{ files: string[]; candidates: string[] }> {
+interface BundledSources {
+  files: string[];
+  candidates: string[];
+  // Candidates from the modules the webview bundles today (a subset of `candidates`).
+  bundledCandidates: Set<string>;
+}
+let bundledSources: Promise<BundledSources> | null = null;
+function loadBundledSources(): Promise<BundledSources> {
   bundledSources ??= getBundledSourceFiles().then((bundled) => {
     const files = [...new Set([...bundled, ...getImportableRendererFiles()])];
-    return { files, candidates: readCandidates(files) };
+    return {
+      files,
+      candidates: readCandidates(files),
+      bundledCandidates: new Set(readCandidates(bundled)),
+    };
   });
   return bundledSources;
 }
@@ -128,13 +138,12 @@ const DESKTOP_ONLY_CLASSES = new Set([
   "titlebar-safe-right-gutter-2",
   "titlebar-safe-right-gutter-3",
   "titlebar-safe-right-minus-sidebar",
-  // Mobile/touch app shell: these rules live in the desktop shell's (max-width: 768px) and
-  // (pointer: coarse) media blocks (sidebar overlay, sticky header, 44px touch targets,
-  // shortcut-hint hiding). The webview has no app shell and its pointer is never coarse.
+  // Mobile app shell: these rules live in the desktop shell's (max-width: 768px) and
+  // (pointer: coarse) media blocks (sidebar overlay, sticky header, touch rows). The webview has
+  // no app shell and does not bundle these components.
   "mobile-bottom-inset-host",
   "mobile-header-spacer",
   "mobile-hide-right-sidebar",
-  "mobile-hide-shortcut-hints",
   "mobile-layout",
   "mobile-main-content",
   "mobile-menu-btn",
@@ -222,7 +231,7 @@ describe("webview stylesheet", () => {
   // not Tailwind utilities, so the utility check cannot see them, and the webview compiles its
   // own @source scan, so a class the bundle uses from an unscanned module is caught here too.
   test("defines every desktop class selector used by webview-importable components", async () => {
-    const { candidates } = await loadBundledSources();
+    const { candidates, bundledCandidates } = await loadBundledSources();
     const desktopClasses = classSelectors(await loadDesktopCss());
     const webviewClasses = classSelectors(await loadWebviewCss());
 
@@ -245,13 +254,16 @@ describe("webview stylesheet", () => {
       );
     }
 
+    // A listed class stops being desktop-only once the webview bundle renders it (for example a
+    // shared component starts using it): its desktop rule must then exist in the webview too.
     const stale = [...DESKTOP_ONLY_CLASSES].filter(
-      (name) => webviewClasses.has(name) || !desktopClasses.has(name)
+      (name) => webviewClasses.has(name) || !desktopClasses.has(name) || bundledCandidates.has(name)
     );
     if (stale.length > 0) {
       throw new Error(
-        `DESKTOP_ONLY_CLASSES lists classes that are no longer desktop-only (defined in the ` +
-          `webview or gone from the desktop CSS): ${stale.sort().join(", ")}. Remove them from the list.`
+        `DESKTOP_ONLY_CLASSES lists classes that are no longer desktop-only (rendered by the ` +
+          `webview bundle, defined in the webview, or gone from the desktop CSS): ` +
+          `${stale.sort().join(", ")}. Remove them from the list and give the webview their rule.`
       );
     }
   }, 30_000);

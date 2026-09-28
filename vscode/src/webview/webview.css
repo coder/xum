@@ -105,6 +105,18 @@ body {
 @import "../../../src/browser/styles/transcript-content.css";
 @import "../../../src/browser/styles/heartbeat.css";
 
+/*
+ * Mirrors the shortcut-hint rule from globals.css's (max-width: 768px) and (pointer: coarse)
+ * block, because the webview renders shortcut hints with this class (for example App.tsx's jump
+ * to bottom keybind) and VS Code can run on touch-primary devices. Only this rule is recreated:
+ * the rest of that desktop block styles the desktop app shell (touch targets, sidebar overlay).
+ */
+@media (max-width: 768px) and (pointer: coarse) {
+  .mobile-hide-shortcut-hints {
+    display: none !important;
+  }
+}
+
 /* Font utility classes (used by xum message/tool components; desktop defines them in globals.css).
    Declared after the shared imports to keep the desktop cascade order. */
 .font-primary {
