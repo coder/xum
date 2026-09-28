@@ -62,7 +62,10 @@ interface RevealState {
    * grow — never advance again when the grouping changes back.
    */
   anchorMessageId: string | null;
-  /** Index the anchor had when chosen; the fallback bound if the id disappears. */
+  /**
+   * Index the anchor had when last located; the fast path for finding it, and the fallback bound
+   * if the id disappears.
+   */
   anchorIndexHint: number;
   /**
    * Newest row id at the last render. Rows after it on the next render are the appended
@@ -247,7 +250,19 @@ export function useBoundedTranscriptReveal<Row extends RevealRow>(
   // is persisted as the new anchor so it cannot move forward again (see RevealState).
   let fromIndex = 0;
   if (current.anchorMessageId !== null) {
-    const anchorIndex = args.messages.findIndex((row) => row.id === current.anchorMessageId);
+    // Try the index hint before scanning (#4869: the scan ran over ~620k rows on every reveal
+    // step render at 1.24M rows). Appends after the anchor never shift it; a prepend or deletion
+    // above it misses the hint and falls back to the scan.
+    const anchorId = current.anchorMessageId;
+    const anchorIndex =
+      args.messages[current.anchorIndexHint]?.id === anchorId
+        ? current.anchorIndexHint
+        : args.messages.findIndex((row) => row.id === anchorId);
+    if (anchorIndex !== -1 && anchorIndex !== current.anchorIndexHint) {
+      // Found by the scan at a shifted index: remember it so the next render hits the hint.
+      current = { ...current, anchorIndexHint: anchorIndex };
+      setState(current);
+    }
     fromIndex = nearestSafeCutAtOrBefore(
       anchorIndex === -1 ? current.anchorIndexHint : anchorIndex,
       length,

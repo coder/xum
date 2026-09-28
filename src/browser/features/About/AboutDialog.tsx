@@ -22,6 +22,18 @@ const channelDescriptions: Record<UpdateChannel, string> = {
   npm: "Most recently published npm package, including pre-releases.",
 };
 
+/**
+ * Names shown per blocker line; the rest collapse into a count so the dialog stays bounded. The
+ * backend already cut each name (nameRestartBlockerWorkspaces), keeping a duplicate's ID suffix.
+ */
+const MAX_BLOCKER_WORKSPACE_NAMES = 3;
+
+function formatBlockerWorkspaceNames(names: readonly string[]): string {
+  const shown = names.slice(0, MAX_BLOCKER_WORKSPACE_NAMES).join(", ");
+  const hidden = names.length - MAX_BLOCKER_WORKSPACE_NAMES;
+  return hidden > 0 ? `${shown} and ${hidden} more` : shown;
+}
+
 const blockerLabels: Record<RestartBlocker["kind"], string> = {
   "active-streams": "Active streams",
   "pending-turns": "Pending turns",
@@ -367,6 +379,13 @@ export function AboutDialog() {
                         <li key={blocker.kind}>
                           {blockerLabels[blocker.kind]}:{" "}
                           <span className="counter-nums">{blocker.count}</span>
+                          {/* Which workspaces to open, e.g. an archived one (#4770). */}
+                          {blocker.workspaceNames != null && blocker.workspaceNames.length > 0 && (
+                            <span className="break-words">
+                              {" "}
+                              ({formatBlockerWorkspaceNames(blocker.workspaceNames)})
+                            </span>
+                          )}
                         </li>
                       ))}
                     </ul>

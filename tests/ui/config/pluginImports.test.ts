@@ -29,6 +29,16 @@ async function commit(remote: string) {
   await save.result;
 }
 
+/**
+ * A component save shows its result (alert or counts) while the panel is still busy
+ * refreshing the plugin list for the surrounding card, and busy disables every control. A
+ * click in that window is dropped, so a reselection right after the alert never saved on a
+ * slow runner (#4394). Wait for the panel's own idle signal before interacting again.
+ */
+async function waitForComponentsIdle(canvas: { queryByText: (text: string) => unknown }) {
+  await waitFor(() => expect(canvas.queryByText("Saving components…")).toBeNull());
+}
+
 async function openPreview(app: AppHarness, remote: string) {
   const canvas = await openSettingsDialog(app.view.container);
   fireEvent.click(await canvas.findByRole("button", { name: "Plugins" }));
@@ -254,6 +264,7 @@ describeIntegration("Selective plugin imports", () => {
           canvas.getByRole("checkbox", { name: "research" }).getAttribute("aria-checked")
         ).toBe("false");
         expect(mutation).toHaveBeenCalledTimes(1);
+        await waitForComponentsIdle(canvas);
         await user.click(canvas.getByRole("checkbox", { name: "research" }));
         await user.click(canvas.getByRole("checkbox", { name: "reference" }));
         await user.click(canvas.getByRole("button", { name: "Save changes" }));
@@ -519,6 +530,7 @@ describeIntegration("Selective plugin imports", () => {
       );
     });
     expect(await canvas.findByRole("alert")).toBeDefined();
+    await waitForComponentsIdle(canvas);
     const refreshed = await inventory(app);
     expect(refreshed.lockedSha).toBe(before.lockedSha);
     expect(refreshed.contentHash).not.toBe(before.contentHash);
@@ -557,11 +569,13 @@ describeIntegration("Selective plugin imports", () => {
     await waitFor(async () => expect((await inventory(app)).lockedSha).not.toBe(before.lockedSha));
     await user.click(canvas.getByRole("button", { name: "Save changes" }));
     await canvas.findByRole("alert");
+    await waitForComponentsIdle(canvas);
     await waitFor(() =>
       expect(canvas.getByRole("checkbox", { name: "research" }).getAttribute("aria-checked")).toBe(
         "false"
       )
     );
+    // Idle now, so this is disabled because nothing changed, not because a save is running.
     expect(canvas.getByRole("button", { name: "Save changes" }).hasAttribute("disabled")).toBe(
       true
     );

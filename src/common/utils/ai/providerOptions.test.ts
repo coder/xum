@@ -221,6 +221,10 @@ describe("buildProviderOptions - Anthropic", () => {
       expect(
         anthropicProviderOptions(buildProviderOptions("anthropic:claude-opus-5-5", "xhigh"))
       ).toMatchObject({ thinking: { type: "adaptive", display: "summarized" }, effort: "xhigh" });
+      // Sonnet 5.5 is provisionally treated the same way (see anthropicRejectsDisabledThinking).
+      expect(buildProviderOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
     });
   });
 
@@ -254,7 +258,12 @@ describe("buildProviderOptions - Anthropic", () => {
       ).thinking as Record<string, unknown>;
 
     test("drops invalidated blocks for prefix-binding models on the direct Anthropic API", () => {
-      for (const model of ["claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"]) {
+      for (const model of [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+      ]) {
         expect(thinkingFor(`anthropic:${model}`)).toEqual({
           type: "adaptive",
           display: "summarized",
@@ -269,7 +278,7 @@ describe("buildProviderOptions - Anthropic", () => {
     });
 
     test("leaves models that do not bind thinking to the prefix unchanged", () => {
-      for (const model of ["claude-opus-5", "claude-fable-5"]) {
+      for (const model of ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"]) {
         expect(thinkingFor(`anthropic:${model}`)).not.toHaveProperty("blockBinding");
       }
     });

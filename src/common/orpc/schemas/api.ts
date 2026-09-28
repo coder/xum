@@ -1422,6 +1422,14 @@ export const workspace = {
       .optional(),
     output: z.array(FrontendWorkspaceMetadataSchema),
   },
+  /**
+   * Every known workspace id (active, archived, sub-agent, multi-project, legacy aliases) for the
+   * renderer's orphaned localStorage GC. Fails instead of returning a partial set.
+   */
+  listKnownIdsForStorageGc: {
+    input: z.void(),
+    output: z.object({ workspaceIds: z.array(z.string()) }),
+  },
   create: {
     input: z.object({
       projectPath: z.string(),

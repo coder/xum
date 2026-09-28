@@ -9443,22 +9443,6 @@ export class TaskService implements AgentTaskIntegration {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
       };
-      // A persisted running mirror can outlive its handle after a crash. Requiring the matching
-      // accepted registration prevents stale mirrors and creation-time reservations from
-      // peer-reactivating a terminal task.
-      const hasLiveRunningExecution = (
-        workspace: WorkspaceConfigEntry,
-        workspaceId: string
-      ): boolean => {
-        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
-        return (
-          workspace.taskExecutionStatus === "running" &&
-          workspace.taskExecutionId != null &&
-          live != null &&
-          live.handleId === workspace.taskExecutionId &&
-          live.accepted
-        );
-      };
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
         // Unrelated roots can send here too; archive must win before the root lifecycle shortcut.
         if (isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) return true;
@@ -9468,7 +9452,7 @@ export class TaskService implements AgentTaskIntegration {
         }
         const status = workspace.taskStatus ?? "running";
         return (
-          !hasLiveRunningExecution(workspace, senderWorkspaceId) &&
+          !this.hasLiveRunningExecution(workspace, senderWorkspaceId) &&
           status !== "running" &&
           status !== "awaiting_report"
         );
@@ -9565,7 +9549,7 @@ export class TaskService implements AgentTaskIntegration {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // Match task_list's effective-running overlay, but require accepted correlation so a
         // queued reawakening cannot be converted into an unowned peer continuation.
-        const targetExecutionActive = hasLiveRunningExecution(targetEntry.workspace, targetId);
+        const targetExecutionActive = this.hasLiveRunningExecution(targetEntry.workspace, targetId);
         if (!targetExecutionActive) {
           if (targetStatus === "queued" || targetStatus === "starting") {
             return Err({
@@ -9889,7 +9873,7 @@ export class TaskService implements AgentTaskIntegration {
           // always wins the race.
           const freshStatus = freshEntry.workspace.taskStatus ?? "running";
           if (
-            !hasLiveRunningExecution(freshEntry.workspace, targetId) &&
+            !this.hasLiveRunningExecution(freshEntry.workspace, targetId) &&
             freshStatus !== "running" &&
             freshStatus !== "awaiting_report"
           ) {
@@ -13646,6 +13630,24 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return null;
+  }
+
+  private hasLiveRunningExecution(workspace: WorkspaceConfigEntry, workspaceId: string): boolean {
+    // A persisted running mirror can outlive its handle after a crash.
+    // Require a matching accepted registration to exclude stale mirrors and unaccepted reservations.
+    const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId);
+    return (
+      workspace.taskExecutionStatus === "running" &&
+      workspace.taskExecutionId != null &&
+      live != null &&
+      live.handleId === workspace.taskExecutionId &&
+      live.accepted
+    );
+  }
+
+  hasLiveAgentTaskContinuation(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return entry != null && this.hasLiveRunningExecution(entry.workspace, workspaceId);
   }
 
   getAgentTaskStatus(taskId: string): AgentTaskStatus | null {

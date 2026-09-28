@@ -77,18 +77,19 @@ const MODEL_DEFINITIONS = {
     // usage can run ~1.0-1.3x higher than this estimate (same situation as FABLE above).
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Sonnet 5 - released June 30, 2026. The most agentic Sonnet yet (native 1M context,
-  // 128K max output, adaptive thinking + effort including native xhigh). Standard pricing matches
-  // Sonnet 4.6 ($3/M in, $15/M out); introductory $2/$10 applies through Aug 31, 2026. API id
-  // `claude-sonnet-5`. The bare `sonnet` alias tracks the latest Sonnet tier.
+  // Claude Sonnet 5.5 - released September 28, 2026, successor to Sonnet 5 at the same
+  // pricing ($2/M input, $10/M output). API id `claude-sonnet-5-5`; Sonnet 5 stays usable as
+  // the custom model string `anthropic:claude-sonnet-5`. Unlike Sonnet 5, thinking cannot be
+  // disabled (see anthropicRejectsDisabledThinking). The bare `sonnet` alias tracks the latest
+  // Sonnet tier.
   SONNET: {
     provider: "anthropic",
-    providerModelId: "claude-sonnet-5",
+    providerModelId: "claude-sonnet-5-5",
     aliases: ["sonnet"],
     warm: true,
-    // Sonnet 5 ships an updated tokenizer (same kind of change introduced with Opus 4.7) that
-    // isn't published upstream yet; reuse Sonnet 4.5 for approximate counting. Real usage can run
-    // ~1.0-1.35x higher than this estimate depending on content type.
+    // Sonnet 5.5 keeps Sonnet 5's updated tokenizer, which isn't published upstream;
+    // reuse Sonnet 4.5 for approximate counting. Real usage can run ~1.0-1.35x higher than this
+    // estimate depending on content type.
     tokenizerOverride: "anthropic/claude-sonnet-4.5",
   },
   HAIKU: {
@@ -317,6 +318,7 @@ const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-mythos-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-sonnet-5": "anthropic/claude-sonnet-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
   "openai:gpt-5.6-sol": "openai/gpt-5",
   "openai:gpt-5.6-luna": "openai/gpt-5",

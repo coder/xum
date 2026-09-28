@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -9,13 +9,17 @@ import {
   type ExecStream,
   RuntimeError,
   isRuntimeReadFailure,
+  isRuntimeRetryableTransportError,
   isRuntimeTransportError,
 } from "./Runtime";
 import type { SpawnResult } from "./RemoteRuntime";
 import { SSHRuntime } from "./SSHRuntime";
 import { TestRemoteRuntime } from "./testRemoteRuntime";
 import type { SSHRuntimeConfig } from "./sshConnectionPool";
-import type { SSHTransport } from "./transports";
+import { createSSHTransport, type SSHTransport } from "./transports";
+import type { AddressInfo } from "node:net";
+import { Server, utils } from "ssh2";
+import { ssh2ConnectionPool } from "./SSH2ConnectionPool";
 
 // #4830: one transient SSH blip during stream startup (connection reset, a
 // channel refused under MaxSessions, a pool refusal) must not fail the turn.
@@ -144,6 +148,75 @@ describe("bounded retry of idempotent SSH reads (#4830)", () => {
     }
   });
 
+  // #5034: both transports report every pool-acquisition failure as "network" (#4812), which
+  // fallback callers need. A rejected key or a failed host-key check cannot recover, though,
+  // so the one retry would only repeat the whole authentication attempt.
+  it("never retries a permanent acquisition failure (auth, host key)", async () => {
+    const permanent = [
+      // OpenSSH probe stderr, as the pool reports it.
+      new RuntimeError("testuser@example.test: Permission denied (publickey,password).", "network"),
+      new RuntimeError("Host key verification failed.", "network"),
+      // The pool's backoff refusal after an earlier authentication failure.
+      new RuntimeError(
+        "SSH connection to example.test is in backoff for 5s. Last error: testuser@example.test: Permission denied (publickey).",
+        "network"
+      ),
+      // SSH2Transport's wrap of the ssh2 client error, which carries its level.
+      new RuntimeError(
+        "SSH2 connection failed: All configured authentication methods failed",
+        "network",
+        Object.assign(new Error("All configured authentication methods failed"), {
+          level: "client-authentication",
+        })
+      ),
+    ];
+    for (const failure of permanent) {
+      const reader = new ScriptedSSHRuntime([
+        { reject: failure },
+        { stdout: "# rules", exitCode: 0 },
+      ]);
+      // Still a transport failure for fallback callers, and the first error is what they see.
+      expect(await read(reader)).toBe(failure);
+      expect(reader.calls).toHaveLength(1);
+
+      const stater = new ScriptedSSHRuntime([
+        { reject: failure },
+        { stdout: STAT_OUTPUT, exitCode: 0 },
+      ]);
+      expect(await stat(stater)).toBe(failure);
+      expect(stater.calls).toHaveLength(1);
+
+      const resolver = new ScriptedSSHRuntime([
+        { reject: failure },
+        { stdout: "/home/u/.xum\n", exitCode: 0 },
+      ]);
+      expect(await settle(resolver.resolvePath("~/.xum"))).toBe(failure);
+      expect(resolver.calls).toHaveLength(1);
+    }
+  });
+
+  it("still retries transient drops that mention no authentication failure", async () => {
+    for (const failure of [
+      new RuntimeError("kex_exchange_identification: read: Connection reset by peer", "network"),
+      new RuntimeError("SSH2 channel failed: (SSH) Channel open failure: open failed", "network"),
+      new RuntimeError(
+        "SSH connection to example.test is in backoff for 2s. Last error: Connection timed out",
+        "network"
+      ),
+    ]) {
+      const reader = new ScriptedSSHRuntime([
+        { reject: failure },
+        { stdout: "# rules", exitCode: 0 },
+      ]);
+      expect(await read(reader)).toBe("# rules");
+      const resolver = new ScriptedSSHRuntime([
+        { reject: failure },
+        { stdout: "/home/u/.xum\n", exitCode: 0 },
+      ]);
+      expect(await settle(resolver.resolvePath("~/.xum"))).toBe("/home/u/.xum");
+    }
+  });
+
   it("never retries a read that already delivered bytes", async () => {
     // The consumer already holds the first chunk; a second cat would repeat it.
     const reader = new ScriptedSSHRuntime([{ stdout: "partial", stderr: REFUSED, exitCode: 255 }]);
@@ -206,4 +279,73 @@ describe("bounded retry of idempotent SSH reads (#4830)", () => {
       }
     }
   );
+});
+
+describe("real SSH2 acquisition failure shapes (#5034)", () => {
+  let cleanup: (() => Promise<void>) | undefined;
+  afterEach(async () => {
+    ssh2ConnectionPool.clearAllHealthForTests();
+    await cleanup?.();
+    cleanup = undefined;
+  });
+
+  // The predicate matches error text, so check it against what the real ssh2 client and pool
+  // produce, not only against hand-written messages. ECDSA keys: ssh2's ed25519 generator
+  // emits an unparseable key ~0.4% of the time under Bun.
+  const newPrivateKey = () => utils.generateKeyPairSync("ecdsa", { bits: 256 }).private;
+
+  async function startServer(onConnection: ConstructorParameters<typeof Server>[1]) {
+    const server = new Server({ hostKeys: [newPrivateKey()] }, onConnection);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-ssh-acquire-"));
+    const identityFile = path.join(dir, "id_ecdsa");
+    await fs.writeFile(identityFile, newPrivateKey(), { mode: 0o600 });
+    const config: SSHRuntimeConfig = {
+      host: "127.0.0.1",
+      port: (server.address() as AddressInfo).port,
+      identityFile,
+      srcBaseDir: "/remote/src",
+    };
+    const close = () => new Promise<void>((resolve) => server.close(() => resolve()));
+    cleanup = async () => {
+      await close().catch(() => undefined);
+      await fs.rm(dir, { recursive: true, force: true });
+    };
+    return { config, close };
+  }
+
+  // maxWaitMs 0: one connection attempt, without the pool's own wait loop.
+  const acquireOnce = (config: SSHRuntimeConfig) =>
+    createSSHTransport(config, true)
+      .acquireConnection({ maxWaitMs: 0 })
+      .then(
+        () => new Error("acquisition unexpectedly succeeded"),
+        (error: unknown) => error
+      );
+
+  it("a rejected key is a transport failure that does not retry", async () => {
+    let connections = 0;
+    const { config } = await startServer((conn) => {
+      connections++;
+      conn.on("authentication", (ctx) => ctx.reject());
+      conn.on("error", () => undefined);
+    });
+    const error = await acquireOnce(config);
+    expect(isRuntimeTransportError(error)).toBe(true);
+    expect(isRuntimeRetryableTransportError(error)).toBe(false);
+    expect(connections).toBe(1);
+
+    // In backoff, the pool's refusal repeats the authentication error: still no retry.
+    const refusal = await acquireOnce(config);
+    expect(String(refusal)).toContain("backoff");
+    expect(isRuntimeRetryableTransportError(refusal)).toBe(false);
+  });
+
+  it("a refused connection stays retryable", async () => {
+    const { config, close } = await startServer((conn) => conn.on("error", () => undefined));
+    await close(); // Nothing listens on the port any more: ECONNREFUSED.
+    const error = await acquireOnce(config);
+    expect(isRuntimeTransportError(error)).toBe(true);
+    expect(isRuntimeRetryableTransportError(error)).toBe(true);
+  });
 });

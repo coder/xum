@@ -111,7 +111,7 @@ describe("plan implement setting (#4942)", () => {
 });
 
 describe("webview preferences (#4972, #4962)", () => {
-  test("forwards a valid bash collapsed-summary mode and nothing else from userPreferences", () => {
+  test("forwards a valid bash collapsed-summary mode and transcript density and nothing else from userPreferences", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {
         userPreferences: {
@@ -129,15 +129,42 @@ describe("webview preferences (#4972, #4962)", () => {
           notifications: { sound: true },
         },
       })
-    ).toEqual({ userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } } });
+    ).toEqual({
+      userPreferences: {
+        appearance: { bashCollapsedSummaryMode: "intent", transcriptDensity: "hyper" },
+      },
+    });
   });
 
-  test("omits userPreferences when the bash mode is invalid", () => {
+  test("omits userPreferences when the bash mode and transcript density are invalid", () => {
     expect(
       redactWebviewOrpcResult(["config", "getConfig"], {
-        userPreferences: { appearance: { bashCollapsedSummaryMode: "everything", theme: "dark" } },
+        userPreferences: {
+          appearance: {
+            bashCollapsedSummaryMode: "everything",
+            transcriptDensity: 1,
+            theme: "dark",
+          },
+        },
       })
     ).toEqual({});
+  });
+
+  test("forwards each valid appearance preference independently of an invalid one", () => {
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: {
+          appearance: { bashCollapsedSummaryMode: "everything", transcriptDensity: "normal" },
+        },
+      })
+    ).toEqual({ userPreferences: { appearance: { transcriptDensity: "normal" } } });
+    expect(
+      redactWebviewOrpcResult(["config", "getConfig"], {
+        userPreferences: {
+          appearance: { bashCollapsedSummaryMode: "intent", transcriptDensity: "dense" },
+        },
+      })
+    ).toEqual({ userPreferences: { appearance: { bashCollapsedSummaryMode: "intent" } } });
   });
 
   test("forwards agentAiDefaults rebuilt from named fields, without invalid agents", () => {

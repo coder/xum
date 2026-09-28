@@ -213,6 +213,30 @@ describe("useBoundedTranscriptReveal", () => {
     expect(result.current.fromIndex).toBe(anchorIndex);
   });
 
+  test("(f') after a prepend, a vanished anchor falls back to where it was last seen", () => {
+    manualFrames();
+    let props = { workspaceId: "ws", messages: rows(300) };
+    const { result, rerender } = renderHook(() =>
+      useBoundedTranscriptReveal({
+        ...props,
+        isSafeCut: alwaysSafe,
+      })
+    );
+    // An older page arrives above the anchor, then the anchor row itself goes away. The fallback
+    // must use the shifted index, not the pre-prepend one (which would mount the page at once).
+    const prepended = 50;
+    props = { ...props, messages: [...rows(prepended, "old"), ...props.messages] };
+    rerender();
+    const shiftedAnchorIndex = result.current.fromIndex;
+    expect(shiftedAnchorIndex).toBe(300 - TRANSCRIPT_REVEAL_TAIL_ROWS + prepended);
+    props = {
+      ...props,
+      messages: props.messages.filter((_, index) => index !== shiftedAnchorIndex),
+    };
+    rerender();
+    expect(result.current.fromIndex).toBe(shiftedAnchorIndex);
+  });
+
   test("(i,k) never cuts inside a bundle and computes each cut from the grouping current at execution", () => {
     const frames = manualFrames();
     const messages = rows(200);

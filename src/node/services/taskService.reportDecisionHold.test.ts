@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -89,6 +89,27 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   beforeEach(async () => {
     fixture = await createTestHistoryService();
     rootDir = fixture.tempDir;
+  });
+  // Every host a test built must end with nothing left running: a session (the root's, created
+  // to deliver a report) or a tracked cleanup still alive here keeps doing history I/O under a
+  // deleted temp root after this file ends, where later files' fs spies see it (#5010).
+  const hosts: WorkspaceService[] = [];
+  afterAll(() => {
+    const leftovers = hosts.flatMap((host, index) => {
+      const state = host as unknown as {
+        sessions: Map<string, unknown>;
+        transientStartupRecoverySessions: Map<string, unknown>;
+        pendingWorkspaceCleanup: Set<Promise<void>>;
+      };
+      return [
+        ...[...state.sessions.keys()].map((id) => `host ${index}: session ${id}`),
+        ...[...state.transientStartupRecoverySessions.keys()].map(
+          (id) => `host ${index}: startup session ${id}`
+        ),
+        ...(state.pendingWorkspaceCleanup.size > 0 ? [`host ${index}: pending cleanup`] : []),
+      ];
+    });
+    expect(leftovers).toEqual([]);
   });
   afterEach(async () => {
     await fixture.cleanup();
@@ -224,6 +245,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       childId,
       sessionHarness.session
     );
+    hosts.push(workspaceService);
     ledger.host = workspaceService as unknown as EventEmitter;
     const { taskService } = createTaskServiceStack(config, {
       historyService,
@@ -269,7 +291,22 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       for (const completion of completions) {
         completion.resolve({ status: "aborted", abortReason: "user" });
       }
+      // The host also runs sessions of its own: the root's, created to deliver the child's
+      // report. Latch it so nothing starts another session, then dispose every session it holds
+      // before the fixture deletes the temp root; otherwise the root's history I/O outlives the
+      // test and lands in later files (#5010).
+      workspaceService.beginShutdown();
       await sessionHarness.session.dispose();
+      const hostSessions = (workspaceService as unknown as { sessions: Map<string, unknown> })
+        .sessions;
+      await Promise.all([...hostSessions.keys()].map((id) => workspaceService.disposeSession(id)));
+      // Join the host's tracked cleanup as the app-scope finalizer does. Since #5058 that
+      // includes the stream listeners' streaming-status writes, which would otherwise land in
+      // hold-extension-metadata.json after the fixture deleted the root.
+      const pending = (
+        workspaceService as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> }
+      ).pendingWorkspaceCleanup;
+      while (pending.size > 0) await Promise.all([...pending]);
       await sessionHarness.cleanup();
     };
     return {
@@ -693,7 +730,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
 
   test("a session holding refused input blocks an app restart until the input is sent or discarded (it lives only in memory)", async () => {
     const childId = "holdrestart001";
-    const stack = await createStack(childId);
+    // The blocker names the workspace by its title (#4770).
+    const stack = await createStack(childId, { title: "Rescue the report" });
     const { config, taskService, workspaceService, sendOptions } = stack;
     const heldBlockers = () =>
       workspaceService.collectRestartBlockers().filter((blocker) => blocker.kind === "held-inputs");
@@ -711,7 +749,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => !stack.sessionHarness.session.isBusy(), "turn settled");
       // Not queued work, yet a restart would lose it.
       expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
-      expect(heldBlockers()).toEqual([{ kind: "held-inputs", count: 1 }]);
+      expect(heldBlockers()).toEqual([
+        { kind: "held-inputs", count: 1, workspaceNames: ["Rescue the report"] },
+      ]);
 
       const [held] = stack.heldInputs();
       expect(workspaceService.discardHeldInput(childId, held.id)).toEqual(Ok(undefined));

@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { isBashCollapsedSummaryMode } from "xum/common/constants/storage";
+import { isBashCollapsedSummaryMode, isTranscriptDensity } from "xum/common/constants/storage";
 import { normalizeAgentAiDefaults } from "xum/common/types/agentAiDefaults";
 
 const FORBIDDEN_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
@@ -96,8 +96,9 @@ export function isAllowedOrpcPath(path: string[]): boolean {
  * task settings. Only the fields AppConfigStore reads are forwarded (an allow-list, so fields added
  * later stay in the host).
  * Of the task settings, only proposePlanImplementReplacesChatHistory (a boolean) is forwarded (#4942).
- * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode) is forwarded, and
- * agentAiDefaults is forwarded rebuilt by normalizeAgentAiDefaults (#4972, #4962).
+ * Of the user preferences, only appearance.bashCollapsedSummaryMode (a valid mode) and
+ * appearance.transcriptDensity (a valid density) are forwarded, and agentAiDefaults is forwarded
+ * rebuilt by normalizeAgentAiDefaults (#4972, #4979, #4962).
  *
  * providers.getConfig (#4766): it carries no keys (only apiKeySet-style booleans), but base URLs and
  * the deployment URL can embed credentials and apiKeyFile is a local path; no webview code reads
@@ -166,8 +167,9 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
   if (typeof replacesHistory === "boolean") {
     projected.taskSettings = { proposePlanImplementReplacesChatHistory: replacesHistory };
   }
-  // Bash tool headers follow the user's collapsed-summary preference, as on desktop (#4972). Only
-  // this one valid mode crosses, never the rest of userPreferences (theme, editor, paths, ...).
+  // Bash tool headers follow the user's collapsed-summary preference, and the transcript its
+  // density (work bundles), as on desktop (#4972, #4979). Only these valid values cross, never the
+  // rest of userPreferences (theme, editor, paths, ...).
   const userPreferences = config.userPreferences as Record<string, unknown> | null | undefined;
   const appearance =
     typeof userPreferences === "object" && userPreferences !== null
@@ -177,8 +179,19 @@ function projectAppConfig(value: unknown): Record<string, unknown> {
     typeof appearance === "object" && appearance !== null
       ? appearance.bashCollapsedSummaryMode
       : undefined;
+  const transcriptDensity =
+    typeof appearance === "object" && appearance !== null
+      ? appearance.transcriptDensity
+      : undefined;
+  const projectedAppearance: Record<string, unknown> = {};
   if (isBashCollapsedSummaryMode(bashMode)) {
-    projected.userPreferences = { appearance: { bashCollapsedSummaryMode: bashMode } };
+    projectedAppearance.bashCollapsedSummaryMode = bashMode;
+  }
+  if (isTranscriptDensity(transcriptDensity)) {
+    projectedAppearance.transcriptDensity = transcriptDensity;
+  }
+  if (Object.keys(projectedAppearance).length > 0) {
+    projected.userPreferences = { appearance: projectedAppearance };
   }
   // Agent switches and plan actions fall back to the per-agent defaults (Settings > Tasks) when the
   // workspace has no settings for the target agent (#4962). normalizeAgentAiDefaults rebuilds each

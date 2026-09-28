@@ -3,6 +3,7 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
 import {
+  nameRestartBlockerWorkspaces,
   PLAN_FILE_DELETE_UNREACHABLE_MESSAGE,
   STARTUP_RECOVERY_CONCURRENCY,
 } from "./workspaceService";
@@ -50,6 +51,41 @@ function workspaceEntries(
 ): WorkspaceConfigEntry[] {
   return ids.map((id) => projectWorkspace(PROJECT_PATH, id, id, options));
 }
+
+// #4770: the restart blocker must tell the user which workspaces to open, even when titles repeat.
+describe("nameRestartBlockerWorkspaces", () => {
+  test("adds the stable ID only to labels two workspaces share, sorted", () => {
+    expect(
+      nameRestartBlockerWorkspaces([
+        { id: "b2", title: "Fix validation" },
+        { id: "c3", name: "archived-work" },
+        { id: "a1", title: "Fix validation", name: "fix" },
+      ])
+    ).toEqual(["archived-work", "Fix validation (a1)", "Fix validation (b2)"]);
+  });
+
+  test("cuts a long label before adding the ID, so cut duplicates stay distinct", () => {
+    // Identical for the first 40 characters, different after: cut, they would read the same.
+    const shared = "Migrate the storage layer to the new sch";
+    expect(
+      nameRestartBlockerWorkspaces([
+        { id: "e5", title: `${shared}ema, part one` },
+        { id: "f6", title: `${shared}ema, part two` },
+        { id: "g7", title: "Short" },
+      ])
+    ).toEqual([
+      "Migrate the storage layer to the new sc… (e5)",
+      "Migrate the storage layer to the new sc… (f6)",
+      "Short",
+    ]);
+  });
+
+  test("a non-string title or name from a hand-edited config falls back to the ID", () => {
+    expect(nameRestartBlockerWorkspaces([{ id: "d4", title: 42, name: { bad: true } }])).toEqual([
+      "d4",
+    ]);
+  });
+});
 
 describe("WorkspaceService initialize", () => {
   let harness: WorkspaceServiceHarness;
