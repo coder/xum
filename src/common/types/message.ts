@@ -632,6 +632,10 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         flushOpportunity: boolean;
         contextTokens: number;
         maxTokens: number;
+        /** The agent's latest new_context handoff; `windowId` is the window that wrote it. */
+        handoff?: { text: string; windowId: string };
+        /** Bounded copy of the request that owned the interrupted turn; IDs are canonical only. */
+        request?: { text: string; truncated: boolean; windowId?: string; itemId?: string };
       }
     | {
         type: "context-window-continuation";

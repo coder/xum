@@ -31,6 +31,7 @@ import {
   SESSION_HISTORY_MAX_QUERY_CHARS,
   SESSION_HISTORY_MAX_ID_CHARS,
   SESSION_HISTORY_MAX_READ_CHARS,
+  CONTEXT_HANDOFF_MAX_CHARS,
 } from "@/common/constants/contextBudget";
 import {
   SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT,
@@ -2572,8 +2573,18 @@ export const TOOL_DEFINITIONS = {
     description:
       "Request a fresh context window (token-budget mode). Nothing happens immediately: the rollover is scheduled after this tool step settles, so sibling tool calls in the same step still complete and their results are persisted. " +
       "The next window starts with a rollover marker and can retrieve earlier transcript data through session_history; workspace files, tasks, goals and costs are preserved, and this is not a privacy reset. " +
-      "Prefer this after a context handoff request or at a natural task boundary, once durable notes are saved with the memory tool and the write is confirmed. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
-    schema: z.object({}).strict(),
+      "Prefer this after a context handoff request or at a natural task boundary. A request in the current window is honored once; if automatic rollover is disabled (threshold 100%) the request is ignored.",
+    schema: z
+      .object({
+        handoff: z
+          .string()
+          .min(1)
+          .max(CONTEXT_HANDOFF_MAX_CHARS)
+          .describe(
+            "Handoff for your next context window, which does not carry this transcript. Xum shows it at the start of that window, together with the request you are working on. Essential state first: goal, decisions, invariants, current step, open tasks, blockers, and the exact paths, commands, and IDs needed to resume."
+          ),
+      })
+      .strict(),
     resultSchema: z.object({
       success: z.boolean(),
       status: z.literal("scheduled"),

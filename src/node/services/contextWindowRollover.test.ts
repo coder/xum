@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { createMuxMessage } from "@/common/types/message";
+import { CONTEXT_REQUEST_MAX_CHARS } from "@/common/constants/contextBudget";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { isManualHistoryReset } from "@/common/utils/messages/contextWindows";
 import {
   createContextBudgetWarning,
   createRolloverPrefix,
@@ -7,6 +9,7 @@ import {
   estimateLastStepToolResults,
   hasRolloverEligibleMessages,
   hasUnconsumedNewContextRequest,
+  resolveRolloverPayload,
   type ContextWindowRollover,
 } from "./contextWindowRollover";
 
@@ -260,5 +263,93 @@ describe("model-requested rollover receipts", () => {
       ])
     ).toBe(false);
     expect(hasUnconsumedNewContextRequest([user])).toBe(false);
+  });
+});
+
+describe("rollover payload", () => {
+  const leadInText = (payload: ContextWindowRollover) =>
+    createRolloverPrefix(payload)[1]
+      .parts.flatMap((part) => (part.type === "text" ? [part.text] : []))
+      .join("\n");
+  const newContextCall = (handoff: string) =>
+    createMuxMessage("call", "assistant", "", {}, [
+      {
+        type: "dynamic-tool",
+        toolCallId: "nc",
+        toolName: "new_context",
+        state: "output-available",
+        input: { handoff },
+        output: { success: true },
+      },
+    ]);
+  const previousWindow = (): MuxMessage[] => {
+    const [boundary, leadIn] = createRolloverPrefix({
+      ...rollover,
+      previousWindowId: "w:2",
+      handoff: { text: "Older handoff", windowId: "w:2" },
+      request: { text: "Original request", truncated: false, windowId: "w:0", itemId: "1" },
+    });
+    boundary.metadata!.historySequence = 4;
+    return [boundary, leadIn];
+  };
+
+  test("carries this window's handoff and request with canonical IDs", () => {
+    const request = createMuxMessage("req", "user", "Fix the bug", { historySequence: 10 });
+    const history = [...previousWindow(), request, newContextCall("Resume at step 3")];
+    const payload = resolveRolloverPayload({ history, carryRequest: true });
+    expect(payload).toEqual({
+      handoff: { text: "Resume at step 3", windowId: "w:4" },
+      request: { text: "Fix the bug", truncated: false, windowId: "w:4", itemId: "10" },
+    });
+    // An explicit handoff from a step that is not persisted yet wins over the window scan.
+    expect(
+      resolveRolloverPayload({ history, handoff: "Newest", carryRequest: true }).handoff?.text
+    ).toBe("Newest");
+    const next = { ...rollover, previousWindowId: "w:4", ...payload };
+    const text = leadInText(next);
+    expect(text).toContain("<request>\nFix the bug\n</request>");
+    expect(text).toContain("item 10 in w:4");
+    expect(text).toContain("<handoff>\nResume at step 3\n</handoff>");
+    expect(text).not.toContain("earlier window");
+    // Optional payload fields keep the row a rollover, not a manual privacy reset.
+    expect(isManualHistoryReset(createRolloverPrefix(next)[0])).toBe(false);
+    expect(isManualHistoryReset(createRolloverPrefix(rollover)[0])).toBe(false);
+  });
+
+  test("falls back to the previous boundary and marks a carried handoff as stale", () => {
+    const continuation = createMuxMessage("cont", "user", "Continue", {
+      synthetic: true,
+      muxMetadata: { type: "normal", contextBudgetContinuation: true },
+    });
+    const history = [
+      ...previousWindow(),
+      continuation,
+      createMuxMessage("a", "assistant", "working"),
+    ];
+    const payload = resolveRolloverPayload({ history, carryRequest: true });
+    expect(payload).toEqual({
+      handoff: { text: "Older handoff", windowId: "w:2" },
+      request: { text: "Original request", truncated: false, windowId: "w:0", itemId: "1" },
+    });
+    expect(leadInText({ ...rollover, previousWindowId: "w:4", ...payload })).toContain(
+      "earlier window"
+    );
+    // A human send owns its turn and follows the lead-in, so no request is carried.
+    expect(resolveRolloverPayload({ history, carryRequest: false })).toEqual({
+      handoff: payload.handoff,
+    });
+  });
+
+  test("cuts long requests and omits legacy item IDs", () => {
+    const request = createMuxMessage("legacy", "user", "x".repeat(CONTEXT_REQUEST_MAX_CHARS + 10));
+    const payload = resolveRolloverPayload({ history: [request], carryRequest: true });
+    expect(payload.request).toEqual({
+      text: "x".repeat(CONTEXT_REQUEST_MAX_CHARS),
+      truncated: true,
+      windowId: "w:0",
+    });
+    const text = leadInText({ ...rollover, ...payload });
+    expect(text).toContain("cut to fit");
+    expect(text).not.toContain("legacy");
   });
 });

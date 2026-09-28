@@ -328,13 +328,16 @@ describe("StreamManager - stopWhen configuration", () => {
             usage: { inputTokens: 90, outputTokens: 10, totalTokens: 100 },
             toolResults: [
               { toolName: "bash", output: "side effect done" },
-              { toolName: "new_context", output },
+              { toolName: "new_context", input: { handoff: "Resume here" }, output },
             ],
           },
         ],
       });
     expect(await settle({ success: true, status: "scheduled", message: "ok" })).toBe(true);
-    expect(onStepSettled.mock.calls[0][0].newContextRequested).toBe(true);
+    expect(onStepSettled.mock.calls[0][0]).toMatchObject({
+      newContextRequested: true,
+      newContextHandoff: "Resume here",
+    });
     // Even a policy that "requires" new_context cannot turn its success into a terminal
     // completion that would skip the settled-step callback.
     const {

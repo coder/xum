@@ -1371,7 +1371,11 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.session.sendMessage("Work", options)).success).toBe(true);
     // Far below the budget: only the explicit request drives the rollover.
     expect(
-      (await h.requests[0].onStepSettled?.(step(20_000, { newContextRequested: true })))?.decision
+      (
+        await h.requests[0].onStepSettled?.(
+          step(20_000, { newContextRequested: true, newContextHandoff: "Resume at step 3" })
+        )
+      )?.decision
     ).toBe("rollover");
     expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
     expect(h.session.hasQueuedDedupeKey(CONTEXT_CONTINUE_DEDUPE_KEY)).toBe(true);
@@ -1388,13 +1392,15 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(resets[0].metadata?.muxMetadata).toMatchObject({
       reason: "mid-stream",
       requestedBy: "model",
+      handoff: { text: "Resume at step 3" },
+      request: { text: "Work", truncated: false },
     });
     expect(text(rows.at(-1)!)).toBe("Continue");
-    expect(
-      sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages).some((row) =>
-        text(row).includes("new_context")
-      )
-    ).toBe(true);
+    const leadIn = sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages)
+      .map(text)
+      .find((row) => row.includes("new_context"));
+    expect(leadIn).toContain("Resume at step 3");
+    expect(leadIn).toContain("<request>\nWork\n</request>");
     // The fresh window has no outstanding request: an ordinary settled step continues.
     expect((await h.requests[1].onStepSettled?.(step(5_000)))?.decision).toBe("continue");
   });

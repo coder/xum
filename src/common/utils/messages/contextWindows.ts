@@ -22,6 +22,16 @@ const rolloverMetadataSchema: z.ZodType<
   flushOpportunity: z.boolean(),
   contextTokens: z.number().finite().nonnegative(),
   maxTokens: z.number().finite().positive(),
+  // Optional: a required field would turn rows written before it existed into manual resets.
+  handoff: z.object({ text: z.string(), windowId: z.string() }).optional(),
+  request: z
+    .object({
+      text: z.string(),
+      truncated: z.boolean(),
+      windowId: z.string().optional(),
+      itemId: z.string().optional(),
+    })
+    .optional(),
 });
 const rolloverBoundarySchema = z.object({
   id: z.string().min(1),

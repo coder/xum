@@ -2,6 +2,10 @@
 export const CONTEXT_NOTES_MEMORY_PATH = "/memories/workspace/context-notes.md";
 export const CONTEXT_NOTES_RESERVED_BYTES = 8 * 1024;
 export const CONTEXT_NOTES_RESERVED_TOKENS = 2_000;
+export const CONTEXT_HANDOFF_MAX_CHARS = 8 * 1024;
+// The request that owns the turn is carried into the next window's lead-in; longer text is cut
+// and the lead-in points at the full row in session_history.
+export const CONTEXT_REQUEST_MAX_CHARS = 8 * 1024;
 export const CONTEXT_CONTINUE_DEDUPE_KEY = "context-budget-continue";
 export const CONTEXT_WARNING_DEDUPE_KEY = "context-budget-warning";
 /**
