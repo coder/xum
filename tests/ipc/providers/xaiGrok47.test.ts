@@ -23,6 +23,8 @@ if (shouldRunIntegrationTests()) {
   validateApiKeys(["XAI_API_KEY"]);
 }
 
+type StreamCollector = ReturnType<typeof createStreamCollector>;
+
 const DISABLE_TOOLS: ToolPolicy = [{ regex_match: ".*", action: "disable" }];
 
 function hasXaiEncryptedReasoning(messages: MuxMessage[]): boolean {
@@ -131,9 +133,13 @@ describeIntegration("xAI Grok 4.7 integration", () => {
       await retryOnProviderCapacity("xAI Grok 4.7 store=false multi-turn", async () => {
         const { env, workspaceId, cleanup } = await setupWorkspace("xai", "grok-4-7-zdr");
         const historyService = new HistoryService(env.config);
+        // A capacity error throws out of waitForTerminal before a turn's own stop(); stop
+        // every collector here so a retried attempt leaves no subscription or timer behind.
+        const collectors: StreamCollector[] = [];
 
         try {
           const firstCollector = createStreamCollector(env.orpc, workspaceId);
+          collectors.push(firstCollector);
           firstCollector.start();
           await firstCollector.waitForSubscription();
 
@@ -174,6 +180,7 @@ describeIntegration("xAI Grok 4.7 integration", () => {
 
           // Second turn must succeed by replaying encrypted reasoning without server storage.
           const secondCollector = createStreamCollector(env.orpc, workspaceId);
+          collectors.push(secondCollector);
           secondCollector.start();
           await secondCollector.waitForSubscription();
 
@@ -201,6 +208,7 @@ describeIntegration("xAI Grok 4.7 integration", () => {
           expect(firstEnd.metadata.model).toBe(KNOWN_MODELS.GROK_47.id);
           secondCollector.stop();
         } finally {
+          for (const collector of collectors) collector.stop();
           await cleanup();
         }
       });
