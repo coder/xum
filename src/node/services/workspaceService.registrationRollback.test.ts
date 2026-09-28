@@ -10,6 +10,8 @@ import type { ExperimentsService } from "./experimentsService";
 import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { ContainerManager } from "@/node/multiProject/containerManager";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import type { InitStateManager } from "./initStateManager";
 import { WorkspaceUseLeases, type WorkspaceUseLease } from "./workspaceUseLeases";
@@ -500,6 +502,81 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(git(projectPath, "rev-parse", "multi-after")).toBe(tip);
     expect(git(otherProjectPath, "branch", "--list", "multi-after")).toBe("");
     expect((await create()).success).toBe(true);
+  });
+
+  // #4899: a rollback that could not delete what it made says so, so a retry under the same name
+  // does not collide with a leftover the caller was never told about.
+  describe("reports what a rollback could not clean up", () => {
+    const leftoverCheckout = (name: string) =>
+      worktreePaths(projectPath).find((p) => path.basename(p) === name);
+
+    test("create failing after registration names the checkout it could not delete", async () => {
+      spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+      spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockResolvedValueOnce({
+        success: false,
+        error: "EBUSY",
+      });
+
+      const result = await createWorktree("leftover-a");
+      const error = result.success ? "" : result.error;
+      expect(error).toContain("Failed to retrieve workspace metadata");
+      const checkout = leftoverCheckout("leftover-a");
+      expect(checkout).toBeDefined();
+      expect(error).toContain(`could not be fully cleaned up: ${checkout!}; delete it`);
+    });
+
+    test("create whose registration write rejects names the checkout it could not delete", async () => {
+      spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockRejectedValueOnce(new Error("EIO"));
+
+      const publish = failConfigPublish();
+      const result = await createWorktree("leftover-b").finally(() => publish.mockRestore());
+      const error = result.success ? "" : result.error;
+      expect(error).toContain("EACCES");
+      expect(error).toContain(`could not be fully cleaned up: ${leftoverCheckout("leftover-b")!}`);
+    });
+
+    test("fork failing after registration names the checkout it could not delete", async () => {
+      const source = await createWorktree("leftover-src");
+      if (!source.success) throw new Error(source.error);
+      const goals = new WorkspaceGoalService(
+        harness.config,
+        harness.historyService,
+        harness.extensionMetadata
+      );
+      service.setWorkspaceGoalService(goals);
+      spyOn(goals, "inheritFromFork").mockRejectedValueOnce(new Error("goal store unavailable"));
+      spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockRejectedValueOnce(new Error("EIO"));
+
+      const result = await service.fork(source.data.metadata.id, "leftover-fork");
+      const error = result.success ? "" : result.error;
+      expect(error).toContain("goal store unavailable");
+      expect(error).toContain(
+        `could not be fully cleaned up: ${leftoverCheckout("leftover-fork")!}`
+      );
+    });
+
+    test("createMultiProject failing after registration names the container it could not delete", async () => {
+      spyOn(harness.config, "getAllWorkspaceMetadata").mockResolvedValueOnce([]);
+      spyOn(ContainerManager.prototype, "removeContainer").mockRejectedValueOnce(
+        new Error("EBUSY")
+      );
+
+      const result = await service.createMultiProject(
+        projects(),
+        "leftover-multi",
+        "main",
+        undefined,
+        {
+          type: "worktree",
+          srcBaseDir,
+        }
+      );
+      const error = result.success ? "" : result.error;
+      expect(error).toContain("Failed to retrieve workspace metadata");
+      const container = path.join(srcBaseDir, "_workspaces", "leftover-multi");
+      expect(await exists(container)).toBe(true);
+      expect(error).toContain(`could not be fully cleaned up: ${container}; delete it`);
+    });
   });
 
   test("createMultiProject keeps a failed registration another backend already uses", async () => {

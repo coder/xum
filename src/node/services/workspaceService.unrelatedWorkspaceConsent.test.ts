@@ -335,7 +335,9 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   interface ServiceInternals {
     grantPendingDefaultUnrelatedWorkspaceConsent: (workspaceId: string) => Promise<void>;
     sanitizeMaterializedTaskWorkspace: (...args: unknown[]) => Promise<string | undefined>;
-    abortUnsanitizedCreation: (...args: unknown[]) => Promise<boolean>;
+    abortUnsanitizedCreation: (
+      ...args: unknown[]
+    ) => Promise<{ entryGone: boolean; leftovers: string[] }>;
     materializeDeferredCheckout: (args: unknown) => Promise<void>;
     saveConfig: (config: unknown) => Promise<void>;
     grantCreationUnrelatedWorkspaceConsent: (
@@ -421,7 +423,10 @@ describe("WorkspaceService deferred-checkout default consent", () => {
   ])("$label never grants", async ({ sanitizeError, materializeError }) => {
     await markPending();
     spyOn(internals(), "sanitizeMaterializedTaskWorkspace").mockResolvedValue(sanitizeError);
-    spyOn(internals(), "abortUnsanitizedCreation").mockResolvedValue(true);
+    spyOn(internals(), "abortUnsanitizedCreation").mockResolvedValue({
+      entryGone: true,
+      leftovers: [],
+    });
     spyOn(runtimeFactory, "runBackgroundInit").mockResolvedValue(undefined);
 
     await runDeferredCheckout({ materializeError });
