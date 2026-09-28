@@ -185,6 +185,8 @@ describe("ReviewStateService", () => {
   });
 
   it("fails a write instead of replacing a review-state file it cannot read", async () => {
+    // Root reads a 0o000 file anyway, so the unreadable-file condition cannot be staged.
+    if (process.getuid?.() === 0) return;
     using tempDir = new TestTempDir("review-state-unreadable");
     const { config, filePath } = await createHarness(tempDir);
     const service = new ReviewStateService(config);
