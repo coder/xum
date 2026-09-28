@@ -793,6 +793,8 @@ export interface AgentTaskIntegration {
   ): Promise<Result<void>>;
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean;
   hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean>;
+  /** A running continuation has a matching accepted live registration, not only a persisted execution status. */
+  hasLiveAgentTaskContinuation(workspaceId: string): boolean;
   getAgentTaskStatus(workspaceId: string): AgentTaskStatus | null | undefined;
   resetAutoResumeCount(workspaceId: string): void;
   /** The workspace left the config: drop the task's in-memory marks (#5028). */

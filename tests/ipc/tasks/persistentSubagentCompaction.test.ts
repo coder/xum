@@ -170,9 +170,14 @@ describe("Persistent sub-agent compaction", () => {
     25_000
   );
 
-  test.each(["tool-end", "turn-end"] as const)(
-    "parent guidance stays attached to a reawakened execution with %s dispatch",
-    async (queueDispatchMode) => {
+  test.each([
+    ["tool-end", "reported"],
+    ["turn-end", "reported"],
+    ["tool-end", "interrupted"],
+    ["turn-end", "interrupted"],
+  ] as const)(
+    "parent guidance stays attached to a reawakened execution with %s dispatch after %s",
+    async (queueDispatchMode, previousStatus) => {
       if (!env || !repoPath) throw new Error("Test environment not initialized");
       const testEnv = env;
       const parent = await createWorkspace(env, repoPath, generateBranchName("guidance-parent"));
@@ -188,7 +193,7 @@ describe("Persistent sub-agent compaction", () => {
         parentWorkspaceId: parentId,
         agentId: "explore",
         agentType: "explore",
-        taskStatus: "reported",
+        taskStatus: previousStatus,
         taskModelString: HAIKU_MODEL,
         title: "Reviewer",
       });
@@ -212,12 +217,21 @@ describe("Persistent sub-agent compaction", () => {
             10_000
           )
         ).toBe(true);
+        const attemptId = findWorkspace(env, childId)?.taskAttemptId;
         const guidance = await env.services.taskService.sendMessageToDescendantAgentTask(
           parentId,
           childId,
           "Check lifecycle behavior before reporting.",
           queueDispatchMode
         );
+        expect(guidance).toMatchObject({ success: true, data: { delivery: "queued" } });
+        // Guidance must not replace the execution that reactivation already owns.
+        expect(findWorkspace(env, childId)).toMatchObject({
+          taskStatus: previousStatus,
+          taskAttemptId: attemptId,
+          taskExecutionId: handleId,
+          taskExecutionStatus: "running",
+        });
         const correlation =
           await env.services.workspaceTurnManager.getActiveWorkspaceTurnMuxMetadataForWorkspace(
             childId
@@ -226,7 +240,6 @@ describe("Persistent sub-agent compaction", () => {
         expect(
           env.services.workspaceService.hasPendingWorkspaceTurnContinuation(childId, correlation)
         ).toBe(true);
-        expect(guidance).toMatchObject({ success: true, data: { delivery: "queued" } });
       } finally {
         env.services.aiService.releaseMockStreamStartGate(childId);
       }

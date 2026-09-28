@@ -14607,7 +14607,12 @@ export class WorkspaceService
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
         const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        if (taskStatus === "interrupted") {
+        // Reactivation preserves the interrupted base status while a new continuation runs.
+        // Accept guidance for that live execution; the stop and attempt fences still apply.
+        if (
+          taskStatus === "interrupted" &&
+          !this.agentTaskIntegration?.hasLiveAgentTaskContinuation(workspaceId)
+        ) {
           return Err({
             type: "unknown",
             raw: "Interrupted task is still winding down. Wait until it is idle, then try again.",
