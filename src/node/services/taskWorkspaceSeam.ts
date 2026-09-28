@@ -689,6 +689,7 @@ export interface WorkspaceLifecycleHost {
     options: {
       queuedDelegatedTurnCount: number;
       expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
+      operation?: "archive" | "remove";
     }
   ): Result<Disposable>;
   listLiveWorkspaceActivity(workspaceId: string): WorkspaceLiveActivity;

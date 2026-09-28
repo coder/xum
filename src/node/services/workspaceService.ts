@@ -10481,6 +10481,12 @@ export class WorkspaceService
        * turn) refuses the hold so interruption cannot stopStream() user work.
        */
       expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
+      /**
+       * Which destructive operation the hold guards, for the refusal text. A model-driven
+       * task_remove (#4761) holds it through its lossy-work check and the forced removal, so
+       * no writer can be admitted between the check and the deletion.
+       */
+      operation?: "archive" | "remove";
     }
   ): Result<Disposable> {
     assert(workspaceId.length > 0, "acquirePreInterruptionArchiveHold requires workspaceId");
@@ -10595,7 +10601,9 @@ export class WorkspaceService
     if (activityLabels.length > 0) {
       hold[Symbol.dispose]();
       return Err(
-        `Workspace has live activity (${activityLabels.join(", ")}) that interrupting and archiving would destroy or terminate. Wait for it to finish or ask the user to archive manually.`
+        options.operation === "remove"
+          ? `Workspace has live activity (${activityLabels.join(", ")}) that removing it would destroy or terminate. Wait for it to finish or ask the user to remove it.`
+          : `Workspace has live activity (${activityLabels.join(", ")}) that interrupting and archiving would destroy or terminate. Wait for it to finish or ask the user to archive manually.`
       );
     }
     return Ok(hold);
