@@ -243,7 +243,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
             await h.session.sendMessage("Summarize the idle workspace", {
               model,
               agentId: "compact",
-              experiments: { [strategy]: true },
+              experiments: { [strategy]: true, memory: strategy === "tokenBudget" },
               muxMetadata: {
                 type: "compaction-request",
                 rawCommand: "/compact",

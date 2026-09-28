@@ -762,14 +762,15 @@ describe("token budget history policy", () => {
     expect(execution).toMatchObject({ success: true, result: "undefined" });
   });
 
-  test("token budget honors renderer override before backend default", () => {
-    expect(resolveBackendGatedPtcExperiments(undefined, () => true).tokenBudget).toBe(true);
-    expect(resolveBackendGatedPtcExperiments({ tokenBudget: false }, () => true).tokenBudget).toBe(
-      false
-    );
-    expect(resolveBackendGatedPtcExperiments({ tokenBudget: true }, () => false).tokenBudget).toBe(
-      true
-    );
+  test("token budget honors renderer overrides before backend defaults and needs memory", () => {
+    const tokenBudget = (
+      experiments: Parameters<typeof resolveBackendGatedPtcExperiments>[0],
+      enabled: boolean
+    ) => resolveBackendGatedPtcExperiments(experiments, () => enabled).tokenBudget;
+    expect(tokenBudget(undefined, true)).toBe(true);
+    expect(tokenBudget({ tokenBudget: false }, true)).toBe(false);
+    expect(tokenBudget({ tokenBudget: true, memory: true }, false)).toBe(true);
+    expect(tokenBudget({ tokenBudget: true, memory: false }, true)).toBe(false);
   });
 });
 

@@ -357,7 +357,7 @@ describe("AgentSession scoped turn lifetimes", () => {
           await fs.writeFile(path.join(history.config.rootDir, "oversized.txt"), large);
         send = h.session.sendMessage(branch === "initial" ? large : "Read @oversized.txt", {
           ...options,
-          experiments: { tokenBudget: true },
+          experiments: { tokenBudget: true, memory: true },
         });
         await entered.promise;
         expect(h.session.isBusy()).toBe(false);

@@ -32,7 +32,7 @@ test("sessions sharing app dependencies keep strategy state and resets workspace
   });
   harnesses.push(budget);
   spyOn(continuous.aiService, "isExperimentEnabled").mockImplementation(
-    (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET
+    (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
   );
   // The default single-session harness closes handles with its first session's signal.
   // Shared AI dependencies must instead retain each workspace's physical stream lifetime.

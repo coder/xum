@@ -28,6 +28,7 @@ const LEAD_IN = "Model-only instructions for retrieving earlier context windows.
 function setupTokenBudgetStory(inputTokens = 2400) {
   collapseLeftSidebar();
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TOKEN_BUDGET), true);
+  updatePersistedState(getExperimentKey(EXPERIMENT_IDS.MEMORY), true);
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.CONTINUOUS_COMPACTION), false);
   updatePersistedState(getExperimentKey(EXPERIMENT_IDS.RLM), false);
   updatePersistedState(getModelKey(WORKSPACE_ID), MODEL);

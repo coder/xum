@@ -25,6 +25,7 @@ function setupCompactionSettings(mode: "legacy" | "defaults" | "conflict" = "leg
             [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: mode === "legacy",
             [EXPERIMENT_IDS.TOKEN_BUDGET]: true,
           }),
+      [EXPERIMENT_IDS.MEMORY]: true,
       [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: mode === "conflict",
       [EXPERIMENT_IDS.RLM]: mode === "conflict",
     },

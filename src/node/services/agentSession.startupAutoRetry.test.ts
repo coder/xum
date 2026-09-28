@@ -691,7 +691,7 @@ describe("AgentSession startup auto-retry recovery", () => {
           retrySendOptions: pickStartupRetrySendOptions({
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
+            experiments: { tokenBudget: true, memory: true },
           }),
         })
       );

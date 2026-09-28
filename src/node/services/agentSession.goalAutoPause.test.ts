@@ -149,7 +149,7 @@ describe("AgentSession goal safety hooks", () => {
         "Oversized intervention ".repeat(40_000),
         {
           ...SEND_OPTIONS,
-          experiments: { tokenBudget: true },
+          experiments: { tokenBudget: true, memory: true },
         },
         synthetic ? { synthetic: true, agentInitiated: true } : undefined
       );
@@ -171,8 +171,12 @@ describe("AgentSession goal safety hooks", () => {
     await setGoalOk(goalService, { workspaceId, objective: "Continue working" });
     await goalService.requireUserAcknowledgment(workspaceId, 55_000);
     expect(
-      (await session.sendMessage(" ", { ...SEND_OPTIONS, experiments: { tokenBudget: true } }))
-        .success
+      (
+        await session.sendMessage(" ", {
+          ...SEND_OPTIONS,
+          experiments: { tokenBudget: true, memory: true },
+        })
+      ).success
     ).toBe(false);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({
       status: "active",

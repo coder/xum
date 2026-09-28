@@ -120,7 +120,7 @@ describe("AgentSession.sendMessage (preTurnMessages)", () => {
       try {
         await session.sendMessage(
           "family trigger",
-          { model: TEST_MODEL, agentId: "exec", experiments: { tokenBudget } },
+          { model: TEST_MODEL, agentId: "exec", experiments: { tokenBudget, memory: tokenBudget } },
           { synthetic: true, agentInitiated: true, preTurnMessages: [userRow] }
         );
         expect.unreachable("sendMessage must reject a user-role pre-turn row");

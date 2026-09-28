@@ -887,7 +887,7 @@ describe("AgentSession turn completion", () => {
         workspaceId,
         createMuxMessage("prior", "assistant", "Earlier completed work")
       );
-      const options = { ...sendOptions, experiments: { tokenBudget: true } };
+      const options = { ...sendOptions, experiments: { tokenBudget: true, memory: true } };
       expect((await h.session.sendMessage("original request", options)).success).toBe(true);
       oldPolicy = policyPromise(consumer);
       const read = h.historyService.getHistoryFromLatestBoundary.bind(h.historyService);

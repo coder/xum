@@ -599,7 +599,11 @@ describe("AgentSession continuous compaction wiring", () => {
         providersConfig: null,
         options: {
           ...sendOptions,
-          experiments: { continuousCompaction: false, tokenBudget: guard === "token-budget" },
+          experiments: {
+            continuousCompaction: false,
+            tokenBudget: guard === "token-budget",
+            memory: true,
+          },
         },
       };
       const strategy = continuous(h.session);

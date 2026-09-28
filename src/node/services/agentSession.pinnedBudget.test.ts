@@ -252,7 +252,7 @@ describe("pinned full-payload rollover admission", () => {
         const result = await h.session.sendMessage("Small follow-up", {
           model,
           agentId: "exec",
-          experiments: { tokenBudget: true, toolSearch: kind === "deferred-schema" },
+          experiments: { tokenBudget: true, memory: true, toolSearch: kind === "deferred-schema" },
         });
         const fits = kind === "deferred-schema";
         expect(result.success).toBe(fits);
@@ -310,7 +310,7 @@ describe("pinned full-payload rollover admission", () => {
         });
       const sending = h.session.sendMessage(
         "Canceled candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           onAccepted:
             phase === "after-preparation"
@@ -364,7 +364,7 @@ describe("pinned full-payload rollover admission", () => {
           (
             await h.session.sendMessage(
               "Manual intervention",
-              { model, agentId: "exec", experiments: { tokenBudget: true } },
+              { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
               {
                 enqueuedAtMs: consent ? goal!.lastUserActivationAtMs! - 1000 : undefined,
               }
@@ -399,7 +399,7 @@ describe("pinned full-payload rollover admission", () => {
       const result = await fixture.h.session.sendMessage("Manual intervention", {
         model,
         agentId: "exec",
-        experiments: { tokenBudget: true },
+        experiments: { tokenBudget: true, memory: true },
       });
       expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
       expect((await fixture.goalService.getGoal(workspaceId))?.status).toBe("paused");
@@ -508,7 +508,7 @@ describe("pinned full-payload rollover admission", () => {
       let revoked = false;
       const sending = h.session.sendMessage(
         "Revocable candidate",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           cancelSignal: controller.signal,
           admissionStale: () => revoked,
@@ -571,7 +571,7 @@ describe("pinned full-payload rollover admission", () => {
       expect(
         await h.session.sendMessage(
           "Prepared but not committed",
-          { model, agentId: "exec", experiments: { tokenBudget: true } },
+          { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
           { onAccepted: accepted }
         )
       ).toMatchObject({ success: false, error: { type: "unknown" } });
@@ -632,7 +632,7 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Start a fresh window", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
+            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
@@ -819,7 +819,7 @@ describe("pinned full-payload rollover admission", () => {
           await h.session.sendMessage("Use a prepared primary", {
             model,
             agentId: "exec",
-            experiments: { tokenBudget: true },
+            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
@@ -867,7 +867,7 @@ describe("pinned full-payload rollover admission", () => {
       }
       const sending = h.session.sendMessage(
         "Durable prepared monitor wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           synthetic: true,
           agentInitiated: true,
@@ -925,7 +925,7 @@ describe("pinned full-payload rollover admission", () => {
       const controller = new AbortController();
       const sending = h.session.sendMessage(
         "Accepted prepared wake",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           synthetic: true,
           agentInitiated: true,
@@ -984,7 +984,7 @@ describe("pinned full-payload rollover admission", () => {
       const cancelState = { canceledBeforeAcceptance: false };
       const sending = h.session.sendMessage(
         "Wake retained when rollback fails",
-        { model, agentId: "exec", experiments: { tokenBudget: true } },
+        { model, agentId: "exec", experiments: { tokenBudget: true, memory: true } },
         {
           acceptanceOrigin: "automatic",
           synthetic: true,

@@ -1382,7 +1382,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         messages,
         modelString: "openai:gpt-5.2",
         thinkingLevel: "off",
-        experiments: { tokenBudget: true },
+        experiments: { tokenBudget: true, memory: true },
         ...(identity === "send-metadata" ? { muxMetadata: compactionMetadata } : {}),
       });
       const shouldBypass = identity !== "ordinary" && identity !== "historical";
@@ -1588,7 +1588,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         workspaceId: metadata.id,
         modelString: sourceModel,
         thinkingLevel: "off" as const,
-        experiments: { tokenBudget },
+        experiments: { tokenBudget, memory: true },
       };
       expect(
         (

@@ -597,7 +597,7 @@ describe("AgentPluginHookService", () => {
           await h.session.sendMessage("New request", {
             model: "openai:gpt-4o",
             agentId: "exec",
-            experiments: { tokenBudget: true },
+            experiments: { tokenBudget: true, memory: true },
           })
         ).success
       ).toBe(true);
