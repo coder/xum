@@ -12386,8 +12386,8 @@ export class WorkspaceService
       // Auto-generate branch name (and title) when user omits one (seamless fork).
       // Uses pattern: {parentName}-{N} for branch, "{parentTitle} (N)" for title.
       const isAutoName = newName == null;
-      // Fetch all metadata upfront for both branch name and title collision checks.
-      const allMetadata = isAutoName ? await this.config.getAllWorkspaceMetadata() : [];
+      // Fetch all metadata upfront for the branch name, title and explicit-name collision checks.
+      const allMetadata = await this.config.getAllWorkspaceMetadata();
       let resolvedName: string;
       if (isAutoName) {
         const existingNamesSet = new Set(
@@ -12444,6 +12444,24 @@ export class WorkspaceService
       const resolvedNameValidation = validateWorkspaceName(resolvedName);
       if (!resolvedNameValidation.valid) {
         return Err(resolvedNameValidation.error ?? "Invalid workspace name");
+      }
+      // Plan files live at plans/<projectName>/<name>.md, so a fork reusing the name of a workspace
+      // in this project (or in another project with the same name) would overwrite that
+      // workspace's plan (#5009). Project-dir forks never fail on the name by themselves; refuse
+      // for every runtime here, before anything is created or copied. With live names refused,
+      // copyPlanFileAcrossRuntimes can only overwrite an orphaned plan of a removed workspace.
+      // The message avoids the "Workspace already exists" text create() retries on.
+      const collision = allMetadata.find(
+        (m) =>
+          (m.projectPath === foundProjectPath || m.projectName === projectName) &&
+          m.name === resolvedName
+      );
+      if (collision) {
+        return Err(
+          collision.projectPath === foundProjectPath
+            ? `Workspace with name "${resolvedName}" already exists in this project`
+            : `Workspace with name "${resolvedName}" already exists in ${collision.projectPath}, which shares this project's plan directory`
+        );
       }
 
       const sourceWorkspace = this.config.findWorkspace(sourceWorkspaceId);
