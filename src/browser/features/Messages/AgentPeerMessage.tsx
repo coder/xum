@@ -13,8 +13,9 @@ interface AgentPeerMessageProps {
 }
 
 /**
- * Intra-tree agent peer messages are machine-authored, untrusted input: keep them visible and
- * attributable (sender + relationship) without a full user bubble. Payloads are assistant-role
+ * Agent peer messages are machine-authored, untrusted input: keep them visible and attributable
+ * (sender) without a full user bubble. The fixed user-role wake trigger that accompanies each
+ * payload is folded into this card by StreamingMessageAggregator. Payloads are assistant-role
  * synthetic pre-turn rows (peer bytes never gain user-role authority); rendering is gated on the
  * backend-attached agent-peer-message metadata (see displayedMessageBuilder), so a lookalike
  * envelope in ordinary text renders as a plain message.
@@ -26,7 +27,8 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
   const envelope = parseAgentMessageEnvelope(props.message.content);
   const fromTitle = meta?.fromTitle ?? envelope?.fromTitle;
   const fromWorkspaceId = meta?.fromWorkspaceId ?? envelope?.from;
-  const relationship = meta?.relationship ?? envelope?.relationship;
+  // No relationship pill: the sender's name already identifies it, and the relationship
+  // (sibling/descendant/unrelated) is a trust hint for the receiving model, not the user.
 
   return (
     <div
@@ -46,11 +48,6 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
         </span>
         <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
         <span className="truncate">Message from {fromTitle ?? fromWorkspaceId ?? "agent"}</span>
-        {relationship != null && (
-          <span className="bg-muted/20 shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] font-medium uppercase">
-            {relationship}
-          </span>
-        )}
         <ChevronRight
           aria-hidden="true"
           className={cn("size-3 shrink-0", expanded && "rotate-90")}

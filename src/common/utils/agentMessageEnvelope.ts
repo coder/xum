@@ -50,6 +50,12 @@ export interface AgentPeerMessageMeta {
   fromWorkspaceId: string;
   fromTitle?: string;
   relationship: AgentMessageRelationship;
+  /**
+   * Set only on the user-role wake trigger: the history ID of the assistant payload row it
+   * announces. Lets the transcript fold the trigger into the payload card instead of showing a
+   * second row for one message.
+   */
+  payloadMessageId?: string;
 }
 
 /**
@@ -80,6 +86,11 @@ export function getValidAgentPeerTriggerMeta(value: unknown): AgentPeerMessageMe
     fromWorkspaceId: record.fromWorkspaceId,
     ...(typeof record.fromTitle === "string" ? { fromTitle: record.fromTitle } : {}),
     relationship: record.relationship,
+    // Display-only pairing hint: a malformed value is dropped (the trigger then renders as its
+    // own notification row) rather than failing the whole attribution closed.
+    ...(isNonEmptyString(record.payloadMessageId)
+      ? { payloadMessageId: record.payloadMessageId }
+      : {}),
   };
 }
 

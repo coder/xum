@@ -830,6 +830,8 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         fromTitle?: string;
         /** The sender's relationship to the recipient (mirrors the envelope enum). */
         relationship: AgentMessageRelationship;
+        /** Trigger rows only: history ID of the payload row (see AgentPeerMessageMeta). */
+        payloadMessageId?: string;
       }
     | {
         // Native plan review record (src/common/utils/planReview). The <mux_plan_review>
