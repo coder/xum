@@ -896,8 +896,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   useEffect(() => {
     if (!primaryPlanAction || !workspaceId) return;
     const runIfEnabled = (): boolean => {
-      if (primaryPlanAction.disabled) return false;
-      primaryPlanAction.onClick();
+      const { disabled, onClick } = primaryPlanAction;
+      if (disabled || !onClick) return false;
+      onClick();
       return true;
     };
     const handleKeyDown = (event: KeyboardEvent) => {
