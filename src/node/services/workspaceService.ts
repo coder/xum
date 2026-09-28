@@ -7835,6 +7835,10 @@ export class WorkspaceService
         throw error;
       }
       removedFromConfig = true;
+      // #5019: only now, with the checkout and the registration gone, is the plan unowned. Right
+      // after deregistration, so a fork that takes the freed name has the least time to copy a
+      // plan to this path first. Without captured metadata there is no path to derive.
+      if (removedMetadata) await this.deletePlanFilesAfterRemoval(workspaceId, removedMetadata);
       this.autoTitlingWorkspaces.delete(workspaceId);
       this.agentTaskIntegration?.noteWorkspaceRemoved(workspaceId);
       // Only once the workspace is deregistered (and its session, with the
@@ -7930,6 +7934,63 @@ export class WorkspaceService
       }
       this.removingWorkspaces.delete(workspaceId);
       this.retireRemovalInstanceIfIdle();
+    }
+  }
+
+  /**
+   * Delete a removed workspace's plan files (#5019): plan paths key on project and workspace
+   * name, so a plan left behind is inherited by the next workspace that takes the name. Runs only
+   * after a committed removal, so it is best-effort: a failure (for example an unreachable SSH
+   * host, which deletePlanFiles reports as a typed error) is logged and the orphan stays.
+   */
+  private async deletePlanFilesAfterRemoval(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<void> {
+    const runtimeConfig = metadata.runtimeConfig;
+    // Skipped where the plan is not at a path this process can safely delete: Docker keeps it in
+    // the container the removal deleted; a devcontainer keeps it inside the container, and the
+    // same host path is not this workspace's (#4775); a Coder workspace that Xum created is
+    // deleted with the workspace, and an exec would reach for a host that is gone.
+    if (
+      isDockerRuntime(runtimeConfig) ||
+      isDevcontainerRuntime(runtimeConfig) ||
+      (isSSHRuntime(runtimeConfig) &&
+        runtimeConfig.coder != null &&
+        runtimeConfig.coder.existingWorkspace !== true)
+    ) {
+      return;
+    }
+    try {
+      // Plans key on the project basename: a same-named workspace in another project with that
+      // basename shares this path, and the plan may be its live one. Keep it (a harmless orphan
+      // at worst, when the two live on different hosts).
+      const sharedWith = (await this.config.getAllWorkspaceMetadata()).find(
+        (other) =>
+          other.id !== workspaceId &&
+          other.name === metadata.name &&
+          other.projectName === metadata.projectName
+      );
+      if (sharedWith) {
+        log.info("Keeping the removed workspace's plan path: another workspace shares it", {
+          workspaceId,
+          sharedWith: sharedWith.id,
+        });
+        return;
+      }
+      const deleted = await this.deletePlanFilesOfMetadata(workspaceId, metadata);
+      if (!deleted.success) {
+        log.warn("Failed to delete the plan files of a removed workspace", {
+          workspaceId,
+          errorType: deleted.error.type,
+          error: deleted.error.message,
+        });
+      }
+    } catch (error) {
+      log.warn("Failed to delete the plan files of a removed workspace", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
@@ -15948,6 +16009,14 @@ export class WorkspaceService
     const metadata = await this.getInfo(workspaceId);
     // No metadata: no plan path to derive, so there is nothing to delete.
     if (!metadata) return Ok(undefined);
+    return this.deletePlanFilesOfMetadata(workspaceId, metadata);
+  }
+
+  /** deletePlanFilesForWorkspace for metadata the caller already holds (removal: deregistered). */
+  private async deletePlanFilesOfMetadata(
+    workspaceId: string,
+    metadata: FrontendWorkspaceMetadata
+  ): Promise<Result<void, PlanFileDeletionError>> {
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
     const xumHome = runtime.getXumHome();

@@ -932,7 +932,8 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         expect(worktreePaths(projectPath)).toEqual(worktreesBefore);
       });
 
-      // Removal leaves plans behind; a fork may reuse that name, and its rollback must not delete
+      // Orphaned plans remain (older builds, failed deletions after removal, #5019); a fork may
+      // reuse that name, and its rollback must not delete
       // a file its copy did not create (#5003).
       test("failed local fork over an orphaned plan leaves that file in place", async () => {
         await withTempMuxRoot(async (root) => {
