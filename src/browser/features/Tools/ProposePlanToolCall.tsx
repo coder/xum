@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useSyncExternalStore } from "react";
 import type {
   ProposePlanToolResult,
   ProposePlanToolError,
@@ -62,6 +62,7 @@ import {
   useHostTranscriptMutationCheck,
 } from "@/browser/utils/transcriptBarrier";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 import {
   resolveAutoRoutingForAgent,
@@ -198,7 +199,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const [annotateMode, setAnnotateMode] = useState(false);
   const [isImplementing, setIsImplementing] = useState(false);
   const [isContinuingInAuto, setIsContinuingInAuto] = useState(false);
-  const [implementReplacesChatHistory, setImplementReplacesChatHistory] = useState(false);
 
   // On small screens, render the primary plan actions (Implement / Continue in Auto) as
   // shortcut icons alongside the other action buttons to avoid right-side overflow.
@@ -242,6 +242,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // A host that cannot replace chat history (VS Code webview) hides Start Here, and refuses
   // Implement / Continue in Auto when the user's setting says they replace history, rather than
   // silently sending without the replacement.
+  // Live from the shared app config store (refreshed on config changes), so a setting change
+  // while the card is mounted updates the affordance. Dispatch re-reads the config anyway.
+  const appConfig = useSyncExternalStore(
+    getAppConfigStore().subscribe,
+    getAppConfigStore().getSnapshot
+  );
+  const implementReplacesChatHistory = appConfig?.proposePlanImplementReplacesChatHistory ?? false;
   const canReplaceChatHistory =
     useChatHostContext().uiSupport.chatHistoryReplacement === "supported";
   const historyReplacementUnavailable = implementReplacesChatHistory && !canReplaceChatHistory;
@@ -274,31 +281,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
   }, []);
-
-  useEffect(() => {
-    if (!api) return;
-    if (isEphemeralPreview) return;
-    if (!isLatest) return;
-    if (status !== "completed") return;
-
-    let cancelled = false;
-
-    void api.config
-      .getConfig()
-      .then((cfg) => {
-        if (cancelled) return;
-        setImplementReplacesChatHistory(
-          cfg.taskSettings.proposePlanImplementReplacesChatHistory ?? false
-        );
-      })
-      .catch(() => {
-        // Ignore failures (we'll default to old behavior).
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, isEphemeralPreview, isLatest, status]);
 
   // Fetch fresh plan content for the latest plan
   // Re-fetches on mount, when window regains focus, and when tool completes

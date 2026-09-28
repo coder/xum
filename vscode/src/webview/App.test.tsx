@@ -660,6 +660,13 @@ describe("vscode webview plan actions (#4942)", () => {
       await Promise.resolve();
     });
     expect(bridge.orpcCalls("workspace.sendMessage")).toHaveLength(0);
+
+    // Turning the setting off while the card is mounted re-enables it (config change refresh).
+    // This also clears the app-wide AppConfigStore singleton for later tests.
+    const refreshed = getAppConfigStore().refresh();
+    await bridge.answer("config.getConfig", {});
+    await refreshed;
+    expect(implementButton(view).disabled).toBe(false);
   });
 });
 

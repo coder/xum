@@ -10,6 +10,8 @@ export interface AppConfigSnapshot {
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
   minThinkingLevelByModel?: Record<string, ThinkingLevel>;
+  /** Plan Implement / Continue in Auto replace the chat history first (task setting). */
+  proposePlanImplementReplacesChatHistory?: boolean;
 }
 
 /**
@@ -70,10 +72,17 @@ export class AppConfigStore {
       const config = await client.config.getConfig();
       // Only update if this is the latest fetch (ignore stale responses).
       if (myVersion === this.fetchVersion) {
+        // The VS Code webview host projects the config and forwards taskSettings only with
+        // this one flag, or not at all (#4942), so read it defensively.
+        const taskSettings = config.taskSettings as
+          | { proposePlanImplementReplacesChatHistory?: boolean }
+          | undefined;
         this.snapshot = {
           routePriority: config.routePriority,
           routeOverrides: config.routeOverrides,
           minThinkingLevelByModel: config.minThinkingLevelByModel,
+          proposePlanImplementReplacesChatHistory:
+            taskSettings?.proposePlanImplementReplacesChatHistory === true,
         };
         this.notify();
       }
