@@ -11,6 +11,7 @@
     { "file": "src/browser/utils/highlighting/highlightWorkerClient.ts", "symbol": "highlightWithBudget", "reason": "production caller: enqueueHighlightWithBudget in the same file" },
     { "file": "src/browser/utils/highlighting/highlightWorkerClient.ts", "symbol": "enqueueHighlightWithBudget", "reason": "production caller: highlightCode in the same file" },
     { "file": "src/browser/utils/highlighting/highlightWorkerClient.ts", "symbol": "__resetForTests", "reason": "module-singleton reset hook named ...ForTests" },
+    { "file": "src/browser/utils/messages/StreamingMessageAggregator.ts", "symbol": "AgentSkillSnapshotMetadataSchema", "reason": "production callers: maybeCollectAgentSkillSnapshot and maybeTrackLoadedSkillFromAgentSkillSnapshot in the same file; the replay test spies on it to count parse attempts (#4869)" },
     { "file": "src/common/utils/ai/modelCapabilities.ts", "symbol": "extractModelCapabilities", "reason": "production caller: getModelCapabilities in the same file" },
     { "file": "src/common/utils/tokens/tokenStatsCalculator.ts", "symbol": "extractToolOutputData", "reason": "production caller: countToolOutputTokens in the same file" },
     { "file": "src/node/runtime/SSH2ConnectionPool.ts", "symbol": "getProxyShellArgs", "reason": "production caller: spawnProxyCommand in the same file" },
