@@ -12,6 +12,7 @@ import {
   type ReviewStateImportLegacyOutput,
   type ReviewStateSections,
   type ReviewStateSnapshot,
+  type ReviewStateUpdateOutput,
 } from "@/common/orpc/schemas/reviewState";
 import {
   applyReviewStateDelta,
@@ -31,9 +32,23 @@ import {
  */
 export const REVIEW_STATE_FILE_NAME = "review-state.json";
 
+/** Payload of the per-workspace change event: the persisted snapshot and its revision. */
+export interface ReviewStateChange {
+  snapshot: ReviewStateSnapshot;
+  revision: number;
+}
+
 export class ReviewStateService extends EventEmitter {
   private readonly config: Config;
   private readonly file: SessionFileManager<unknown>;
+  /**
+   * In-memory per-workspace revision (see ReviewStateRevisionSchema), bumped under the write
+   * lock on every persisted change. Every workspace starts at the process start time, so a
+   * restarted backend does not regress below the old process's revisions in practice (writes
+   * are far rarer than one per millisecond); clients also reset on each new subscription.
+   */
+  private readonly revisions = new Map<string, number>();
+  private readonly initialRevision = Date.now();
 
   constructor(config: Config) {
     super();
@@ -52,15 +67,24 @@ export class ReviewStateService extends EventEmitter {
     return this.load(workspaceId);
   }
 
-  async applyDelta(workspaceId: string, delta: ReviewStateDelta): Promise<ReviewStateSnapshot> {
+  /** A subscription's initial snapshot with a revision that is never newer than its content. */
+  async getSnapshotWithRevision(workspaceId: string): Promise<ReviewStateChange> {
+    // Read the revision BEFORE the file: a write landing in between leaves content newer than
+    // its revision (harmless), never an old file labelled with the new write's revision, which
+    // would make a client treat that write's reply as already applied.
+    const revision = this.getRevision(workspaceId);
+    return { snapshot: await this.getSnapshot(workspaceId), revision };
+  }
+
+  async applyDelta(workspaceId: string, delta: ReviewStateDelta): Promise<ReviewStateUpdateOutput> {
     assert(workspaceId.trim().length > 0, "ReviewStateService.applyDelta requires a workspaceId");
     return this.withWriteLock(workspaceId, async () => {
       const current = await this.load(workspaceId);
       const snapshot: ReviewStateSnapshot = {
         sections: applyReviewStateDelta(current.sections, delta),
       };
-      await this.persist(workspaceId, snapshot);
-      return snapshot;
+      const revision = await this.persist(workspaceId, snapshot);
+      return { ...snapshot, revision };
     });
   }
 
@@ -90,10 +114,11 @@ export class ReviewStateService extends EventEmitter {
         results[section] = "applied";
       }
       const snapshot: ReviewStateSnapshot = { sections: next };
-      if (next !== current.sections) {
-        await this.persist(workspaceId, snapshot);
-      }
-      return { snapshot, results };
+      const revision =
+        next !== current.sections
+          ? await this.persist(workspaceId, snapshot)
+          : this.getRevision(workspaceId);
+      return { snapshot, revision, results };
     });
   }
 
@@ -128,19 +153,34 @@ export class ReviewStateService extends EventEmitter {
     );
   }
 
-  /** Call under withWriteLock, so a removal cannot start between this check and the write. */
-  private async persist(workspaceId: string, snapshot: ReviewStateSnapshot): Promise<void> {
+  private getRevision(workspaceId: string): number {
+    return this.revisions.get(workspaceId) ?? this.initialRevision;
+  }
+
+  /**
+   * Call under withWriteLock, so a removal cannot start between this check and the write.
+   * Returns the revision of the write (the current revision when the write was skipped).
+   */
+  private async persist(workspaceId: string, snapshot: ReviewStateSnapshot): Promise<number> {
     // A late flush for a removed workspace must not recreate `sessions/<removedId>/`. Removal
     // publishes its tombstone under the same lock before deleting the dir, and deregisters from
     // config only afterwards, so the tombstone (not config) is what closes that window.
-    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      return this.getRevision(workspaceId);
+    }
     // Strict lookup: an unreadable config throws, failing the update so the client keeps its
     // change and retries. Only a conclusive "not registered" skips the write.
-    if (this.config.findWorkspace(workspaceId, { throwOnError: true }) == null) return;
+    if (this.config.findWorkspace(workspaceId, { throwOnError: true }) == null) {
+      return this.getRevision(workspaceId);
+    }
     const result = await this.file.write(workspaceId, snapshot);
     if (!result.success) {
       throw new Error(result.error);
     }
-    this.emit(ReviewStateService.changeEventName(workspaceId), snapshot);
+    const revision = this.getRevision(workspaceId) + 1;
+    this.revisions.set(workspaceId, revision);
+    const change: ReviewStateChange = { snapshot, revision };
+    this.emit(ReviewStateService.changeEventName(workspaceId), change);
+    return revision;
   }
 }

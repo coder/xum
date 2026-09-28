@@ -83,6 +83,19 @@ export const ReviewStateSnapshotSchema = z.object({
   sections: ReviewStateSectionsSchema,
 });
 
+/**
+ * Wire-only ordering for snapshots (never persisted): the backend's in-memory per-workspace
+ * counter, bumped on every persisted change. It lets a client tell whether a write's reply is
+ * older than a subscription push it already applied. It is only comparable within one
+ * subscription to one backend process, so clients reset it on each subscription's first event.
+ */
+const ReviewStateRevisionSchema = z.number();
+
+/** `update` reply: the snapshot right after this write, and that write's revision. */
+export const ReviewStateUpdateOutputSchema = ReviewStateSnapshotSchema.extend({
+  revision: ReviewStateRevisionSchema,
+});
+
 function sectionDelta<T extends z.ZodType>(entry: T) {
   return z.object({
     set: sectionRecord(entry).optional(),
@@ -103,6 +116,7 @@ export const ReviewStateImportResultSchema = z.enum(["applied", "present"]);
 
 export const ReviewStateImportLegacyOutputSchema = z.object({
   snapshot: ReviewStateSnapshotSchema,
+  revision: ReviewStateRevisionSchema,
   results: z.object({
     reviews: ReviewStateImportResultSchema.optional(),
     readState: ReviewStateImportResultSchema.optional(),
@@ -115,11 +129,13 @@ export const ReviewStateImportLegacyOutputSchema = z.object({
 export const ReviewStateEventSchema = z.object({
   type: z.literal("snapshot"),
   snapshot: ReviewStateSnapshotSchema,
+  revision: ReviewStateRevisionSchema,
 });
 
 export type ReviewStateSections = z.infer<typeof ReviewStateSectionsSchema>;
 export type ReviewStateSnapshot = z.infer<typeof ReviewStateSnapshotSchema>;
 export type ReviewStateDelta = z.infer<typeof ReviewStateDeltaSchema>;
+export type ReviewStateUpdateOutput = z.infer<typeof ReviewStateUpdateOutputSchema>;
 export type ReviewStateImportLegacyOutput = z.infer<typeof ReviewStateImportLegacyOutputSchema>;
 export type ReviewStateEvent = z.infer<typeof ReviewStateEventSchema>;
 /** Full record type for one section. */

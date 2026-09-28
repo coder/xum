@@ -101,7 +101,7 @@ import {
   ReviewStateEventSchema,
   ReviewStateImportLegacyOutputSchema,
   ReviewStateSectionsSchema,
-  ReviewStateSnapshotSchema,
+  ReviewStateUpdateOutputSchema,
 } from "./reviewState";
 import {
   AgentMessageDispatchModeSchema,
@@ -2156,7 +2156,7 @@ export const workspace = {
     },
     update: {
       input: z.object({ workspaceId: z.string(), delta: ReviewStateDeltaSchema }),
-      output: ReviewStateSnapshotSchema,
+      output: ReviewStateUpdateOutputSchema,
     },
     importLegacy: {
       input: z.object({ workspaceId: z.string(), sections: ReviewStateSectionsSchema }),

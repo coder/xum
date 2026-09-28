@@ -59,6 +59,25 @@ describe("ReviewStateService", () => {
     expect(reloaded.sections.readState).toBeUndefined();
   });
 
+  it("orders writes with a revision shared by the reply, the change event and new subscriptions", async () => {
+    using tempDir = new TestTempDir("review-state-revision");
+    const { config } = await createHarness(tempDir);
+    const service = new ReviewStateService(config);
+    const emitted: number[] = [];
+    service.on(ReviewStateService.changeEventName(WORKSPACE_ID), (change: { revision: number }) =>
+      emitted.push(change.revision)
+    );
+
+    const first = await service.applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: true } } });
+    const second = await service.applyDelta(WORKSPACE_ID, { hunkExpand: { set: { h1: false } } });
+
+    expect(second.revision).toBeGreaterThan(first.revision);
+    expect(emitted).toEqual([first.revision, second.revision]);
+    const initial = await service.getSnapshotWithRevision(WORKSPACE_ID);
+    expect(initial.revision).toBe(second.revision);
+    expect(initial.snapshot.sections.hunkExpand).toEqual({ h1: false });
+  });
+
   it("evicts the oldest read states beyond the cap", async () => {
     using tempDir = new TestTempDir("review-state-caps");
     const { config } = await createHarness(tempDir);

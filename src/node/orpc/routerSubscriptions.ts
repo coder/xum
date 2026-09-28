@@ -15,7 +15,7 @@ import type { SshPromptEvent, SshPromptRequest } from "@/common/orpc/schemas/ssh
 import type { TimelineSubscriptionEvent } from "@/common/orpc/schemas/timeline";
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { ReviewStateEvent } from "@/common/orpc/schemas/reviewState";
-import { ReviewStateService } from "@/node/services/reviewStateService";
+import { ReviewStateService, type ReviewStateChange } from "@/node/services/reviewStateService";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ORPCContext } from "./context";
@@ -128,14 +128,13 @@ export function subscribeReviewState(
     buffer: "latest",
     subscribe: (emit) => {
       const eventName = ReviewStateService.changeEventName(workspaceId);
-      const listener = (snapshot: ReviewStateEvent["snapshot"]) =>
-        emit.push({ type: "snapshot", snapshot });
+      const listener = (change: ReviewStateChange) => emit.push({ type: "snapshot", ...change });
       service.on(eventName, listener);
       return () => service.off(eventName, listener);
     },
     initial: async () => ({
       type: "snapshot" as const,
-      snapshot: await service.getSnapshot(workspaceId),
+      ...(await service.getSnapshotWithRevision(workspaceId)),
     }),
   });
 }
