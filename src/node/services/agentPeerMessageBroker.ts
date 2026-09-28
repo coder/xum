@@ -95,6 +95,12 @@ export class AgentPeerMessageBroker {
   }
 
   recordPeerSend(senderWorkspaceId: string, targetId: string, message: string): void {
+    this.recordPeerAttempt(senderWorkspaceId, targetId);
+    this.recordPeerDelivery(senderWorkspaceId, targetId, message);
+  }
+
+  /** Consume one rate-limit slot for the pair and the target. */
+  recordPeerAttempt(senderWorkspaceId: string, targetId: string): void {
     const now = this.now();
     const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
     const pairTimes = this.peerMessageSendTimesByPair.get(pairKey) ?? [];
@@ -103,7 +109,12 @@ export class AgentPeerMessageBroker {
     const targetTimes = this.peerMessageSendTimesByTarget.get(targetId) ?? [];
     targetTimes.push(now);
     this.peerMessageSendTimesByTarget.set(targetId, targetTimes);
-    this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, now);
+  }
+
+  /** Arm duplicate suppression for a delivered message. */
+  recordPeerDelivery(senderWorkspaceId: string, targetId: string, message: string): void {
+    const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
+    this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, this.now());
   }
 
   preparePeerMessage(params: {

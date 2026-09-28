@@ -363,6 +363,32 @@ describe("MessageQueue", () => {
       expect(queue.countAgentPeerMessageEntries()).toBe(0);
     });
 
+    it("counts family-message entries by their payload row", () => {
+      // task_message_parent/sibling triggers carry no peer metadata or agent-msg: key, but they
+      // share the peer queue cap, so their family-message payload row must be counted.
+      queue.add("Family message notification", undefined, {
+        synthetic: true,
+        agentInitiated: true,
+        preTurnMessages: [
+          createMuxMessage("family-payload", "assistant", "untrusted payload", {
+            synthetic: true,
+            muxMetadata: { type: "family-message" },
+          }),
+        ],
+      });
+      queue.add("Other synthetic wake", undefined, {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("other-payload", "assistant", "plain payload", { synthetic: true }),
+        ],
+      });
+      queue.add("User follow-up");
+
+      expect(queue.countAgentPeerMessageEntries()).toBe(1);
+      queue.dequeueNext();
+      expect(queue.countAgentPeerMessageEntries()).toBe(0);
+    });
+
     it("should return rawCommand for compaction request", () => {
       const metadata: MuxMessageMetadata = {
         type: "compaction-request",

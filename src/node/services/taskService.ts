@@ -9219,6 +9219,10 @@ export class TaskService implements AgentTaskIntegration {
               : throttleError.reason,
         });
       }
+      // Charge the rate slot before dispatch: a delivery can persist its rows and still report
+      // failure (goal sync, acceptance observers), and charging only successes would let a
+      // loop retry at full speed while appending a payload each time.
+      this.agentPeerMessageBroker.recordPeerAttempt(spec.senderWorkspaceId, targetWorkspaceId);
       // SECURITY: sender-controlled content and title stay in an untrusted assistant row. A fixed
       // user-row trigger containing only server-generated IDs wakes the recipient (r21/r25), and
       // both rows ride turn admission together so neither can land in a PREPARING window (r30).
@@ -9249,7 +9253,7 @@ export class TaskService implements AgentTaskIntegration {
         if (!wakeResult.success) {
           return Err({ code: "send_failed" as const, message: wakeResult.error });
         }
-        this.agentPeerMessageBroker.recordPeerSend(
+        this.agentPeerMessageBroker.recordPeerDelivery(
           spec.senderWorkspaceId,
           targetWorkspaceId,
           message
@@ -9271,7 +9275,7 @@ export class TaskService implements AgentTaskIntegration {
         }
       );
       if (sendResult.success) {
-        this.agentPeerMessageBroker.recordPeerSend(
+        this.agentPeerMessageBroker.recordPeerDelivery(
           spec.senderWorkspaceId,
           targetWorkspaceId,
           message

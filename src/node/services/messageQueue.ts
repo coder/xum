@@ -365,10 +365,16 @@ export class MessageQueue {
   countAgentPeerMessageEntries(): number {
     // The dedupe-key prefix also matches triggers whose muxMetadata was replaced by a
     // workspace-turn correlation (upward sends into a delegated turn keep the peer count).
+    // Family-message entries (task_message_parent/sibling) are recognized by their payload row:
+    // their triggers carry neither marker, and they share the same queue cap.
     return this.entries.filter(
       (entry) =>
         isAgentPeerMessageMetadata(entry.muxMetadata) ||
-        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX))
+        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX)) ||
+        (entry.preTurnMessages?.some(
+          (row) => row.metadata?.muxMetadata?.type === "family-message"
+        ) ??
+          false)
     ).length;
   }
 

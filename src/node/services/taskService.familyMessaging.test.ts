@@ -24,6 +24,7 @@ import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { AgentPeerMessageBroker } from "@/node/services/agentPeerMessageBroker";
 import { Ok, Err, type Result } from "@/common/types/result";
+import { createUnknownSendMessageError } from "@/node/services/utils/sendMessageError";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -1347,6 +1348,57 @@ describe("TaskService", () => {
       setSystemTime();
     }
     expect(sendMessage).toHaveBeenCalledTimes(sendsPerRoute * routes.length);
+  });
+
+  test("failed family deliveries still consume the rate limit", async () => {
+    // A wake can persist its payload and still report failure, so a loop retrying a failing
+    // delivery must not bypass the throttle.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "family-fail-parent";
+    const childTaskId = "family-fail-child";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const sendMessage = mock(() =>
+      Promise.resolve(Err(createUnknownSendMessageError("goal sync failed after persistence")))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    setSystemTime(new Date(Date.now()));
+    try {
+      for (let i = 0; i < PEER_MESSAGE_RATE_LIMIT_MAX; i++) {
+        const failed = await taskService.sendMessageToParentFromAgentTask(
+          childTaskId,
+          `attempt ${i}`,
+          "tool-end"
+        );
+        assert(!failed.success && "message" in failed.error);
+        expect(failed.error.message).toContain("goal sync failed");
+      }
+      const limited = await taskService.sendMessageToParentFromAgentTask(
+        childTaskId,
+        "one more attempt",
+        "tool-end"
+      );
+      assert(!limited.success && "message" in limited.error);
+      expect(limited.error.message).toMatch(/rate limited/i);
+      expect(sendMessage).toHaveBeenCalledTimes(PEER_MESSAGE_RATE_LIMIT_MAX);
+    } finally {
+      setSystemTime();
+    }
   });
 
   test("sendMessageToParentFromAgentTask refuses non-child and workflow-owned callers", async () => {
