@@ -39,6 +39,11 @@ import { getAppConfigStore } from "xum/browser/stores/AppConfigStore";
 import { getProvidersConfigStore } from "xum/browser/stores/ProvidersConfigStore";
 import { VIM_ENABLED_KEY } from "xum/common/constants/storage";
 import { useAutoScroll } from "xum/browser/hooks/useAutoScroll";
+import { useTranscriptDensity } from "xum/browser/hooks/useTranscriptDensity";
+import {
+  TranscriptBundleRows,
+  useTranscriptBundles,
+} from "xum/browser/components/ChatPane/TranscriptBundles";
 import { applyWorkspaceChatEventToAggregator } from "xum/browser/utils/messages/applyWorkspaceChatEventToAggregator";
 import { StreamingMessageAggregator } from "xum/browser/utils/messages/StreamingMessageAggregator";
 import { LiveBashOutputSourceContext } from "xum/browser/stores/liveBashOutputSource";
@@ -53,7 +58,7 @@ import type {
 import { WorkspacePicker } from "./WorkspacePicker";
 import { ChatComposer } from "./ChatComposer";
 import { VSCODE_CHAT_UI_SUPPORT } from "./chatUiCapabilities";
-import { VscodeStreamingBarrier } from "./StreamingBarrier";
+import { getAggregatorStreamState, VscodeStreamingBarrier } from "./StreamingBarrier";
 import { DisplayedMessageRenderer } from "./DisplayedMessageRenderer";
 import { CHAT_BUFFER_LIMITS } from "./config";
 import { createVscodeOrpcLink } from "./createVscodeOrpcLink";
@@ -752,6 +757,18 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
     }
   }
 
+  // Work bundles (hyper density) and operational bundles collapse rows as on desktop (#4979).
+  const [transcriptDensity] = useTranscriptDensity();
+  const streamState = aggregatorRef.current
+    ? getAggregatorStreamState(aggregatorRef.current)
+    : undefined;
+  const transcriptBundles = useTranscriptBundles({
+    workspaceId: selectedWorkspaceId ?? "",
+    messages: displayedMessages,
+    transcriptDensity,
+    isTurnActive: streamState ? streamState.isStreamStarting || streamState.canInterrupt : false,
+  });
+
   return (
     // Shared providers (SettingsProvider, settings links in the model selector and tool cards) need
     // a router. The webview renders no routes, so an embedded in-memory router is enough: those
@@ -832,17 +849,32 @@ export function App(props: { bridge: VscodeBridge }): JSX.Element {
                         {selectedWorkspaceId ? (
                           <BackgroundBashProvider workspaceId={selectedWorkspaceId}>
                             <LiveBashOutputSourceContext.Provider value={liveBashOutput}>
-                              {displayedMessages.map((msg) => (
-                                <DisplayedMessageRenderer
-                                  key={msg.id}
-                                  message={msg}
-                                  workspaceId={selectedWorkspaceId}
-                                  isLatestProposePlan={msg.id === latestProposePlanId}
-                                  isCompacting={aggregatorRef.current?.isCompacting() ?? false}
-                                  onCloseEphemeral={messageRowActions.closeEphemeral}
-                                  onShowAllHistory={messageRowActions.showAllHistory}
-                                />
-                              ))}
+                              <TranscriptBundleRows
+                                workspaceId={selectedWorkspaceId}
+                                messages={displayedMessages}
+                                indexOffset={0}
+                                bundles={transcriptBundles}
+                                renderMessageAtIndex={(msg, _index, options) => {
+                                  const row = (
+                                    <DisplayedMessageRenderer
+                                      key={options.key}
+                                      message={msg}
+                                      workspaceId={selectedWorkspaceId}
+                                      isLatestProposePlan={msg.id === latestProposePlanId}
+                                      isCompacting={aggregatorRef.current?.isCompacting() ?? false}
+                                      onCloseEphemeral={messageRowActions.closeEphemeral}
+                                      onShowAllHistory={messageRowActions.showAllHistory}
+                                    />
+                                  );
+                                  return options.className ? (
+                                    <div key={options.key} className={options.className}>
+                                      {row}
+                                    </div>
+                                  ) : (
+                                    row
+                                  );
+                                }}
+                              />
                             </LiveBashOutputSourceContext.Provider>
                           </BackgroundBashProvider>
                         ) : null}

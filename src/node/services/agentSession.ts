@@ -630,6 +630,12 @@ const EMPTY_RESUME_HISTORY_ERROR =
 export interface AgentSessionChatEvent {
   workspaceId: string;
   message: WorkspaceChatMessage;
+  /**
+   * Set only by history replay for rows that passed the wire-schema self-healing check: the
+   * schema's parse output for `message`, which onChat sends as-is instead of validating the row a
+   * second time (#4868). `message` stays the persisted row for every other listener.
+   */
+  wireMessage?: WorkspaceChatMessage;
 }
 
 export interface AgentSessionMetadataEvent {
@@ -3049,10 +3055,16 @@ export class AgentSession {
     let streamReplayed = false;
 
     // Self-healing: persisted rows can fail the current wire schema (older
-    // writers, schema drift, corruption). oRPC validates every event yielded to
-    // onChat subscribers and a single invalid row terminates the iterator,
-    // which would permanently brick workspace fetch. Skip such rows instead of
-    // letting one bad line take down the whole transcript.
+    // writers, schema drift, corruption). onChat validates every event it yields
+    // and a single invalid row terminates the iterator, which would permanently
+    // brick workspace fetch. Skip such rows instead of letting one bad line take
+    // down the whole transcript.
+    //
+    // Also hand over the parse OUTPUT as `wireMessage` so onChat can send it
+    // without parsing every replayed row a second time (#4868). The bytes on the
+    // wire stay identical: this schema is the wire union's `message` member, and
+    // the union's parse output is exactly what oRPC used to send. Other listeners
+    // (getFullReplay, subscribeChat) keep receiving the persisted row.
     const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
       const validation = ChatMuxMessageSchema.safeParse(message);
       if (!validation.success) {
@@ -3066,7 +3078,7 @@ export class AgentSession {
         return false;
       }
       emittedReplayMessages = true;
-      listener({ workspaceId: this.workspaceId, message });
+      listener({ workspaceId: this.workspaceId, message, wireMessage: validation.data });
       return true;
     };
 

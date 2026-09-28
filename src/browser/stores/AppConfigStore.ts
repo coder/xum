@@ -1,6 +1,6 @@
 import type { APIClient } from "@/browser/contexts/API";
 import type { ThinkingLevel } from "@/common/types/thinking";
-import type { BashCollapsedSummaryMode } from "@/common/constants/storage";
+import type { BashCollapsedSummaryMode, TranscriptDensity } from "@/common/constants/storage";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 
 /**
@@ -19,6 +19,7 @@ export interface AppConfigSnapshot {
    * hydrates these through UserPreferencesContext / WorkspaceContext instead.
    */
   bashCollapsedSummaryMode?: BashCollapsedSummaryMode;
+  transcriptDensity?: TranscriptDensity;
   agentAiDefaults?: AgentAiDefaults;
 }
 
@@ -91,8 +92,9 @@ export class AppConfigStore {
           minThinkingLevelByModel: config.minThinkingLevelByModel,
           proposePlanImplementReplacesChatHistory:
             taskSettings?.proposePlanImplementReplacesChatHistory === true,
-          // The webview projection may omit both (see redactWebviewOrpcResult).
+          // The webview projection may omit these (see redactWebviewOrpcResult).
           bashCollapsedSummaryMode: config.userPreferences?.appearance?.bashCollapsedSummaryMode,
+          transcriptDensity: config.userPreferences?.appearance?.transcriptDensity,
           agentAiDefaults: config.agentAiDefaults,
         };
         this.notify();

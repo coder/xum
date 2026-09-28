@@ -513,6 +513,39 @@ function planStorageOf(runtimeConfig: RuntimeConfig): string | undefined {
   return isSSHRuntime(runtimeConfig) ? `ssh:${runtimeConfig.host}` : "local";
 }
 
+/** Labels are free text; the About dialog shows them verbatim, so they are cut here. */
+const MAX_RESTART_BLOCKER_LABEL_CHARS = 40;
+
+/**
+ * Sorted display names for a restart blocker's workspaces (#4770): title, else name, else ID. A
+ * hand-edited config can hold a non-string title or name, so those count as missing. Titles may
+ * repeat (across projects, repeated task titles), so a label two workspaces share gets the ID.
+ * Long labels are cut BEFORE that check and before the ID is appended (#5052): cutting the whole
+ * name afterwards dropped the ID, and two titles that differ only past the cut read the same.
+ */
+export function nameRestartBlockerWorkspaces(
+  workspaces: ReadonlyArray<{ id: string; title?: unknown; name?: unknown }>
+): string[] {
+  const labeled = workspaces.map((workspace) => {
+    const label =
+      [workspace.title, workspace.name].find(
+        (value): value is string => typeof value === "string" && value.length > 0
+      ) ?? workspace.id;
+    return {
+      id: workspace.id,
+      label:
+        label.length > MAX_RESTART_BLOCKER_LABEL_CHARS
+          ? `${label.slice(0, MAX_RESTART_BLOCKER_LABEL_CHARS - 1).trimEnd()}…`
+          : label,
+    };
+  });
+  const labelCounts = new Map<string, number>();
+  for (const { label } of labeled) labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  return labeled
+    .map(({ id, label }) => ((labelCounts.get(label) ?? 0) > 1 ? `${label} (${id})` : label))
+    .sort((a, b) => a.localeCompare(b));
+}
+
 /** Why the plan deletion before a history-discarding commit refused that commit. */
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
@@ -2619,6 +2652,8 @@ export class WorkspaceService
   // Serialize todo snapshot refreshes so back-to-back todo_write/propose_plan updates cannot
   // finish out of order and briefly restore stale progress in workspace activity metadata.
   private readonly todoStatusUpdateQueue = new Map<string, Promise<void>>();
+  /** Latest streaming=true metadata write per workspace; see updateStreamingStatus. */
+  private readonly pendingStreamingStartWrites = new Map<string, Promise<void>>();
 
   // AbortControllers for in-progress workspace initialization (postCreateSetup + initWorkspace).
   //
@@ -4213,26 +4248,33 @@ export class WorkspaceService
         } else {
           this.compactionStreamGenerations.delete(data.workspaceId);
         }
-        void this.updateStreamingStatus(data.workspaceId, true, {
-          model: data.model,
-          thinkingLevel: data.thinkingLevel,
-          generation,
-        });
+        // These metadata writes stay unawaited (EventEmitter does not await listeners) but go
+        // through the cleanup tracker so the shutdown join waits for them (#5055). The tracker
+        // calls each one synchronously, so updateStreamingStatus still queues them in event order.
+        void this.trackWorkspaceCleanup(() =>
+          this.updateStreamingStatus(data.workspaceId, true, {
+            model: data.model,
+            thinkingLevel: data.thinkingLevel,
+            generation,
+          })
+        );
       }
     });
 
     this.aiService.on("stream-end", (data: unknown) => {
       if (isStreamEndEvent(data)) {
-        void this.handleStreamCompletion(data.workspaceId, {
-          hiddenFlush: data.metadata?.muxMetadata?.contextBudgetFlush === true,
-        });
+        void this.trackWorkspaceCleanup(() =>
+          this.handleStreamCompletion(data.workspaceId, {
+            hiddenFlush: data.metadata?.muxMetadata?.contextBudgetFlush === true,
+          })
+        );
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
       }
     });
 
     this.aiService.on("stream-abort", (data: unknown) => {
       if (isStreamAbortEvent(data)) {
-        void this.stopStreamingStatus(data.workspaceId);
+        void this.trackWorkspaceCleanup(() => this.stopStreamingStatus(data.workspaceId));
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
         // Goal mutations are drained by AgentSession after any abort accounting
         // runs. Draining here would race ahead of AgentSession's stream-abort
@@ -4252,7 +4294,7 @@ export class WorkspaceService
             modelNotFound: data.errorType === "model_not_found",
           });
         }
-        void this.stopStreamingStatus(data.workspaceId);
+        void this.trackWorkspaceCleanup(() => this.stopStreamingStatus(data.workspaceId));
         this.scheduleBashMonitorWakeReconcile(data.workspaceId);
         void this.workspaceGoalService?.applyPendingAfterStreamEnd(data.workspaceId);
       }
@@ -4269,7 +4311,11 @@ export class WorkspaceService
           return;
         }
 
-        void this.updateAgentStatus(data.workspaceId, agentStatus);
+        // Tracked like the stream-listener writes above so the shutdown join waits (#5059).
+        // The tracker calls the write synchronously, so writes still start in event order.
+        void this.trackWorkspaceCleanup(() =>
+          this.updateAgentStatus(data.workspaceId, agentStatus)
+        );
         return;
       }
 
@@ -4277,7 +4323,8 @@ export class WorkspaceService
         (data.toolName === "todo_write" || data.toolName === "propose_plan") &&
         isSuccessfulToolResult(data.result)
       ) {
-        void this.updateTodoStatusFromStorage(data.workspaceId);
+        // Same shutdown join (#5059); ordering stays with todoStatusUpdateQueue.
+        void this.trackWorkspaceCleanup(() => this.updateTodoStatusFromStorage(data.workspaceId));
       }
     });
   }
@@ -4670,6 +4717,35 @@ export class WorkspaceService
     streaming: boolean,
     update: ExtensionMetadataStreamingUpdate = {}
   ): Promise<void> {
+    // Each write awaits file I/O before ExtensionMetadataService queues it, so a stream-start
+    // write could land after the stop that followed it and leave the workspace "streaming"
+    // (#5055). Starts run in call order and every stop waits for the start writes before it.
+    // A start never waits for a stop: a stale stop parked in its todo read must not delay a
+    // newer stream's start (the generation check then drops that stop).
+    // writeStreamingStatus never rejects.
+    const previousStart = this.pendingStreamingStartWrites.get(workspaceId);
+    if (!streaming) {
+      await previousStart;
+      return this.writeStreamingStatus(workspaceId, false, update);
+    }
+    const write = (previousStart ?? Promise.resolve()).then(() =>
+      this.writeStreamingStatus(workspaceId, true, update)
+    );
+    this.pendingStreamingStartWrites.set(workspaceId, write);
+    try {
+      await write;
+    } finally {
+      if (this.pendingStreamingStartWrites.get(workspaceId) === write) {
+        this.pendingStreamingStartWrites.delete(workspaceId);
+      }
+    }
+  }
+
+  private async writeStreamingStatus(
+    workspaceId: string,
+    streaming: boolean,
+    update: ExtensionMetadataStreamingUpdate
+  ): Promise<void> {
     const streamGeneration = update.generation ?? this.streamingGenerations.get(workspaceId) ?? 0;
     try {
       let { hasTodos, todoStatus } = update;
@@ -4913,16 +4989,21 @@ export class WorkspaceService
 
   collectRestartBlockers(): RestartBlocker[] {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
+    const config = this.config.loadConfigOrDefault();
     const pendingTurns = new Set(this.preflightSendCounts.keys());
     let queuedMessages = 0;
-    let heldInputs = 0;
+    const heldInputWorkspaces: Array<{ id: string; title?: unknown; name?: unknown }> = [];
     let autoRetries = 0;
     for (const [workspaceId, session] of sessions) {
       if (session.hasActiveOrPendingTurnWork()) pendingTurns.add(workspaceId);
       if (session.hasQueuedMessages()) queuedMessages++;
       // Held inputs are not queued work, but they live only in session memory: a restart would
       // silently drop the user's unsent text, attachments and reviews.
-      if (session.getHeldInputs().length > 0) heldInputs++;
+      // Named (#4770): an archived workspace shows its held input only when opened.
+      if (session.getHeldInputs().length > 0) {
+        const entry = findWorkspaceEntry(config, workspaceId)?.workspace;
+        heldInputWorkspaces.push({ id: workspaceId, title: entry?.title, name: entry?.name });
+      }
       if (session.hasPendingAutoRetry()) autoRetries++;
     }
     const blockers: RestartBlocker[] = [
@@ -4950,7 +5031,11 @@ export class WorkspaceService
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
-      { kind: "held-inputs", count: heldInputs },
+      {
+        kind: "held-inputs",
+        count: heldInputWorkspaces.length,
+        workspaceNames: nameRestartBlockerWorkspaces(heldInputWorkspaces),
+      },
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",
@@ -14538,7 +14623,12 @@ export class WorkspaceService
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
         const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
-        if (taskStatus === "interrupted") {
+        // Reactivation preserves the interrupted base status while a new continuation runs.
+        // Accept guidance for that live execution; the stop and attempt fences still apply.
+        if (
+          taskStatus === "interrupted" &&
+          !this.agentTaskIntegration?.hasLiveAgentTaskContinuation(workspaceId)
+        ) {
           return Err({
             type: "unknown",
             raw: "Interrupted task is still winding down. Wait until it is idle, then try again.",
@@ -16989,6 +17079,30 @@ export class WorkspaceService
       ids.add(aliasId);
     }
     return ids;
+  }
+
+  /**
+   * Every workspace id this backend knows, for the renderer's startup GC of orphaned
+   * workspace-scoped localStorage keys (see src/browser/utils/workspaceStorageGc.ts).
+   *
+   * Same union as pruneStaleExtensionMetadataOnce's destructive known-id set: the raw persisted
+   * superset covers entries normalization would drop or hide (malformed entries, multi-project
+   * workspaces), and the strict enumeration covers in-memory migrated ids and legacy aliases.
+   *
+   * Deliberately no catch: the renderer deletes every key whose id is absent, so a partial answer
+   * would delete live workspaces' drafts. Failing the call makes the renderer skip GC. A missing
+   * config file is a healthy empty set.
+   *
+   * Not strictly read-only: like workspace.list (which the renderer calls first at startup), the
+   * strict build persists idempotent read-time migrations such as assigning ids to id-less legacy
+   * entries. Opting out (persistMigrations: false) would need its own Config memo slot.
+   */
+  async listKnownIdsForStorageGc(): Promise<string[]> {
+    const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+    for (const workspaceId of await this.enumerateAuthoritativeWorkspaceIds()) {
+      knownIds.add(workspaceId);
+    }
+    return [...knownIds];
   }
 
   /**

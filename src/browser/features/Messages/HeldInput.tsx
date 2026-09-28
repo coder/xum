@@ -3,7 +3,13 @@ import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
-import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isDialogOpen,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import { cn } from "@/common/lib/utils";
@@ -13,6 +19,11 @@ interface HeldInputProps {
   heldInput: HeldInputData;
   /** The composer's held-input shortcuts act on this banner (the oldest held input). */
   isShortcutTarget: boolean;
+  /**
+   * False where the workspace cannot run a turn (transcript-only: its worktree is gone, #4770).
+   * The banner then offers Discard only; the backend would refuse a Send there anyway.
+   */
+  canSend?: boolean;
 }
 
 const SHORTCUT_HINT_CLASS =
@@ -130,6 +141,37 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
     return () => window.removeEventListener(CUSTOM_EVENTS.HELD_INPUT_ACTION, handler);
   }, [api, props.workspaceId, props.heldInput.id]);
 
+  // Without Send there is no composer (transcript-only, #4770), so nothing dispatches the event
+  // above: the shortcut target listens for Discard itself, outside editable fields and never
+  // under a modal (the banner is hidden behind it).
+  const ownsDiscardShortcut = props.canSend === false && props.isShortcutTarget;
+  useEffect(() => {
+    if (!ownsDiscardShortcut) return;
+    const handler = (event: KeyboardEvent) => {
+      if (
+        !matchesKeybind(event, KEYBINDS.DISCARD_HELD_INPUT) ||
+        isEditableElement(event.target) ||
+        isDialogOpen()
+      ) {
+        return;
+      }
+      event.preventDefault();
+      // Like the composer's handler: after a discard the next banner becomes the target, so an
+      // auto-repeating held chord would otherwise discard more than the oldest one (#5052).
+      if (event.repeat) return;
+      runHeldInputAction("discard", {
+        api,
+        workspaceId: props.workspaceId,
+        heldInputId: props.heldInput.id,
+        actionInFlightRef,
+        setActionError,
+        setPendingAction,
+      });
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [ownsDiscardShortcut, api, props.workspaceId, props.heldInput.id]);
+
   return (
     <ChatDockSurface>
       <div className="bg-surface-primary py-1.5" data-component="HeldInputBanner">
@@ -184,23 +226,27 @@ export const HeldInput: React.FC<HeldInputProps> = (props) => {
                 </kbd>
               )}
             </button>
-            <button
-              type="button"
-              aria-label="Send unsent message"
-              disabled={pendingAction != null}
-              onClick={() => runAction("send")}
-              className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {pendingAction === "send" ? (
-                <Loader2 className="size-3 animate-spin" />
-              ) : (
-                <Send className="size-3" />
-              )}
-              Send
-              {props.isShortcutTarget && (
-                <kbd className={SHORTCUT_HINT_CLASS}>{formatKeybind(KEYBINDS.SEND_HELD_INPUT)}</kbd>
-              )}
-            </button>
+            {props.canSend !== false && (
+              <button
+                type="button"
+                aria-label="Send unsent message"
+                disabled={pendingAction != null}
+                onClick={() => runAction("send")}
+                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 items-center gap-1 rounded-md px-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {pendingAction === "send" ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <Send className="size-3" />
+                )}
+                Send
+                {props.isShortcutTarget && (
+                  <kbd className={SHORTCUT_HINT_CLASS}>
+                    {formatKeybind(KEYBINDS.SEND_HELD_INPUT)}
+                  </kbd>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </div>

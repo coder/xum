@@ -920,6 +920,31 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(fakeSession.queueMessage).not.toHaveBeenCalled();
   });
 
+  test.each([false, true])(
+    "an interrupted child with a live continuation accepts queued input (stopping: %s)",
+    async (stopping) => {
+      const markInterruptedTaskRunning = mock(() => Promise.resolve(false));
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          getAgentTaskStatus: () => "interrupted",
+          hasLiveAgentTaskContinuation: () => true,
+          isWorkspaceStopInProgress: () => stopping,
+          markInterruptedTaskRunning,
+        })
+      );
+
+      const result = await workspaceService.sendMessage("test-workspace", "hello", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(!stopping);
+      expect(fakeSession.queueMessage).toHaveBeenCalledTimes(stopping ? 0 : 1);
+      expect(markInterruptedTaskRunning).not.toHaveBeenCalled();
+      expect(fakeSession.sendMessage).not.toHaveBeenCalled();
+    }
+  );
+
   // Queued sends reset the auto-resume counter unless the send is a synthetic
   // auto-resume continuation that opted out.
   test.each([

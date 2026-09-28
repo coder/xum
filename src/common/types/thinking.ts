@@ -404,12 +404,20 @@ export function isKimiK3Model(modelString: string): boolean {
  * Matched as the exact id (plus an optional date suffix, tolerating Bedrock's
  * `anthropic.` prefix and bracket suffixes) rather than as "Opus 5+", so
  * `claude-opus-5` keeps its "off" level.
+ *
+ * Claude Sonnet 5.5 rejects `disabled` too (breaking change from Sonnet 5). Its
+ * lowest setting is the new `thinking: { type: "between_tools" }`, but that
+ * setting only accepts low..high effort, takes no `display`/`block_binding`, and
+ * returns 400 when effort changes mid-conversation, which Xum allows per message.
+ * So "off" clamps to "low" adaptive here, as for Opus 5.5, rather than mapping to
+ * `between_tools`.
+ * See https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5
  */
 export function anthropicRejectsDisabledThinking(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
   return (
     /claude-(?:fable|mythos)-/.test(withoutPrefix) ||
-    /claude-opus-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix)
+    /claude-(?:opus|sonnet)-5-5(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(withoutPrefix)
   );
 }
 
@@ -417,12 +425,13 @@ export function anthropicRejectsDisabledThinking(modelString: string): boolean {
  * Whether the given Anthropic model binds each replayed thinking block to the
  * conversation prefix (system prompt, tools, and earlier messages) that produced it.
  *
- * On enforced accounts, Claude Opus 5.5 and Claude Fable 5.1 (Mythos 5.1 is the same
- * model) reject a request that replays a block whose prefix has since changed.
+ * On enforced accounts, Claude Opus 5.5, Claude Sonnet 5.5, and Claude Fable 5.1
+ * (Mythos 5.1 is the same model) reject a request that replays a block whose prefix
+ * has since changed.
  */
 export function anthropicBindsThinkingToPrefix(modelString: string): boolean {
   const withoutPrefix = stripModelProviderPrefixes(modelString);
-  return /claude-(?:opus-5-5|fable-5-1|mythos-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
+  return /claude-(?:opus-5-5|sonnet-5-5|fable-5-1|mythos-5-1)(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?(?![\w-])/.test(
     withoutPrefix
   );
 }

@@ -7,7 +7,7 @@
  */
 
 import type { ExecStream, FileStat } from "./Runtime";
-import { RuntimeError, isRuntimeTransportError } from "./Runtime";
+import { RuntimeError, isRuntimeRetryableTransportError } from "./Runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import { READ_RETRY_TIMEOUT_SECS } from "@/constants/runtimeReads";
 import { log } from "@/node/services/log";
@@ -34,10 +34,11 @@ export function readAttemptTimeoutSecs(attempt: number, firstAttemptSecs: number
  * Whether a failed read attempt gets its one retry: only a transport failure
  * (one blip: connection reset, channel refused under MaxSessions, a pool
  * refusal) and only when the caller has not aborted — an abort can surface as
- * a transport error too. Permission errors and missing files never retry.
+ * a transport error too. Permission errors, missing files and permanent SSH
+ * failures (rejected credentials, host key; #5034) never retry.
  */
 function shouldRetryRead(error: unknown, abortSignal: AbortSignal | undefined): boolean {
-  return abortSignal?.aborted !== true && isRuntimeTransportError(error);
+  return abortSignal?.aborted !== true && isRuntimeRetryableTransportError(error);
 }
 
 /**

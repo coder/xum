@@ -120,6 +120,66 @@ export const ComposerTooltip: AppStory = {
   },
 };
 
+/**
+ * #4770: a transcript-only workspace has no composer, so its held inputs render above the
+ * read-only notice with Discard only (the workspace cannot run a turn).
+ */
+export const TranscriptOnlyHeldInput: AppStory = {
+  // Mirrors the phone Pixel variant for local viewing.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-transcript-held",
+          transcriptOnly: true,
+          messages: [
+            createUserMessage("msg-1", "Migrate the storage layer to the new schema.", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 120_000,
+            }),
+            createAssistantMessage("msg-2", "Started the migration; stopped before archiving.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 60_000,
+            }),
+          ],
+          onChat: (workspaceId, emit) => {
+            emit({
+              type: "held-inputs-changed",
+              workspaceId,
+              heldInputs: [
+                {
+                  id: "held-archived",
+                  reason: "interrupted",
+                  displayText: "Run the migration once the lint pass is green.",
+                  attachmentCount: 1,
+                  reviewCount: 0,
+                },
+              ],
+            });
+          },
+        });
+      }}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
+    const canvas = within(storyRoot);
+    await waitFor(() => canvas.getByRole("button", { name: "Discard unsent message" }));
+    if (canvas.queryByRole("button", { name: "Send unsent message" }) != null) {
+      throw new Error("A transcript-only held input must not offer Send");
+    }
+    canvas.getByRole("note");
+  },
+};
+
 export const QueuedFollowUp: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
