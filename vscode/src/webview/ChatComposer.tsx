@@ -465,9 +465,11 @@ function ChatComposerInner(props: {
             }}
           />
           {/* Only shortcuts the webview handles: no FOCUS_CHAT handler exists here, and agent
-              cycling is hinted only when the picker itself is usable. */}
+              cycling is hinted only when the picker itself is usable. Unlike desktop, there is no
+              touch-layout hiding: the webview only runs inside VS Code, a keyboard surface where
+              these shortcuts work. */}
           {input.trim() === "" && (
-            <div className="mobile-hide-shortcut-hints text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
+            <div className="text-muted @container pointer-events-none absolute right-2 bottom-3 left-2 flex flex-nowrap items-center gap-4 overflow-hidden text-[11px] whitespace-nowrap">
               <span className="shrink-0">
                 <span className="font-mono">{formatKeybind(KEYBINDS.CYCLE_MODEL)}</span>
                 <span> - change model</span>

@@ -127,6 +127,13 @@ export const AgentModePicker: React.FC<AgentModePickerProps> = (props) => {
   // preventing stale event handlers from a hidden-but-open picker.
   const isPickerVisible = isPickerOpen && !isAgentLocked;
 
+  // A lock (or `disabled`, e.g. the VS Code host losing its agent scope) that lands while the
+  // picker is open also closes it, so lifting it later does not pop a stale menu back up.
+  if (isAgentLocked && isPickerOpen) {
+    setIsPickerOpen(false);
+    setHighlightedIndex(-1);
+  }
+
   const activeOption = !normalizedAgentId
     ? null
     : !activeDescriptor

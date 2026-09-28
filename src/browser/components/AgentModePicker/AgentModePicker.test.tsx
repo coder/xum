@@ -73,6 +73,7 @@ describe("AgentModePicker", () => {
     loaded?: boolean;
     currentAgent?: AgentDefinitionDescriptor;
     locked?: boolean;
+    disabled?: boolean;
     showAgentId?: boolean;
   }) {
     const [agentId, setAgentId] = React.useState(props.initialAgentId ?? "exec");
@@ -93,7 +94,7 @@ describe("AgentModePicker", () => {
       <AgentProvider value={contextValue}>
         <TooltipProvider>
           {props.showAgentId ? <div data-testid="agentId">{agentId}</div> : null}
-          <AgentModePicker />
+          <AgentModePicker disabled={props.disabled} />
         </TooltipProvider>
       </AgentProvider>
     );
@@ -124,6 +125,20 @@ describe("AgentModePicker", () => {
 
     fireEvent.click(triggerButton);
     expect(queryAllByTestId("agent-option").length).toBe(0);
+  });
+
+  test("disabling an open picker closes it for good", async () => {
+    const view = renderPicker();
+    fireEvent.click(view.getByLabelText("Select agent"));
+    await waitFor(() => expect(view.getAllByTestId("agent-option").length).toBe(3));
+
+    view.rerender(<Harness disabled />);
+    expect(view.queryAllByTestId("agent-option").length).toBe(0);
+
+    // Re-enabling must not bring back the menu that was open before.
+    view.rerender(<Harness />);
+    expect(view.queryAllByTestId("agent-option").length).toBe(0);
+    expect(view.getByLabelText("Select agent").getAttribute("aria-expanded")).toBe("false");
   });
 
   test("uiSelectable false without lock flag does not disable the picker", async () => {
