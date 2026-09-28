@@ -24,7 +24,7 @@ Rollover also pauses when applicable request middleware can change the toolset, 
 
 The agent keeps context across windows with a **checkpoint**: a memory file in `/memories/session/`. A good checkpoint states the goal, decisions, progress, learnings, and next steps, plus the window ID and item ID of every relevant user request and of important actions. The agent updates it while it works.
 
-The session scope belongs to the agent that writes it. A sub-agent's session scope is separate from its parent's, and every agent can write its own, including read-only agents such as Explore. The scope lasts across context windows, is deleted with the workspace, and is not part of the memory hot set or intuition recall. Shared memory scopes keep their normal rules.
+The session scope belongs to the agent that writes it. A sub-agent's session scope is separate from its parent's, and every agent can write its own, including read-only agents such as Explore. The scope lasts across context windows, is deleted with the workspace, and is not part of the memory hot set or intuition recall. The memory tool offers the scope only in token-budget mode. Shared memory scopes keep their normal rules.
 
 To help the agent record IDs, the system prompt shows the current context window ID and, after a rollover, the previous one. Each user message sent to the model ends with its `session_history` item ID.
 

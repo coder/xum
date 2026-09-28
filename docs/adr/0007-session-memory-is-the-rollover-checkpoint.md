@@ -24,7 +24,7 @@ Codex token-budget mode keeps a living checkpoint in a separate notes tool, inje
 ## Decision
 
 - Token budget requires Agent Memory. The mode is active only when both the Token Budget and Agent Memory experiments are on. Settings hides the **Token Budget** option without memory; a saved Token Budget preference stays saved, and the effective strategy is **Summarize**.
-- A new memory scope, `/memories/session/`, holds the checkpoint. It belongs to the acting workspace, not to the parent notebook, so no other agent reads or overwrites it. Every agent can write it, read-only agents included. It lasts across context windows, is deleted with the workspace, and is excluded from the memory hot set and intuition recall.
+- A new memory scope, `/memories/session/`, holds the checkpoint. The memory tool offers it only in token-budget mode. It belongs to the acting workspace, not to the parent notebook, so no other agent reads or overwrites it. Every agent can write it, read-only agents included. It lasts across context windows, is deleted with the workspace, and is excluded from the memory hot set and intuition recall.
 - A fresh window injects nothing from the old one. The lead-in tells the agent to read its checkpoint first and then use `session_history`.
 - In token-budget mode, the system prompt shows the current and previous context window IDs, and each user row ends with its `session_history` item ID. The guidance asks the agent to record these IDs in its checkpoint.
 - `new_context` takes no arguments. It is offered only when `memory` and `session_history` are both allowed.
@@ -44,4 +44,4 @@ Codex token-budget mode keeps a living checkpoint in a separate notes tool, inje
 
 - The checkpoint is only as good as the agent writes it. The transcript stays retrievable through `session_history`.
 - The final handoff step is skipped when the window is too small, the queue has input, `memory` or `session_history` is not allowed, or a single step jumps past the final zone. The forced rollover then seals the window with whatever checkpoint exists.
-- The session scope is always available while Agent Memory is on, not only in token-budget mode. Only the token-budget guidance mentions it.
+- The session scope exists only in token-budget mode. With another compaction mode, the memory tool does not list or accept `/memories/session/`, and checkpoints written earlier stay on disk until token-budget mode returns or the workspace is deleted.
