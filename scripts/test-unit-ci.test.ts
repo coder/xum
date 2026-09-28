@@ -59,11 +59,12 @@ test("kills a silent bun, names the stalled test, and retries it like a crash", 
   const pidFile = path.join(fakeBinDir, "pids");
   await writeFakeBun(
     [
-      `echo $$ >> "${pidFile}"`,
       'echo "src/fake/hang.test.ts:"',
       'echo "(pass) fake > before the hang"',
-      // exec keeps the PID, so the kill must reach this exact process.
-      "exec sleep 300",
+      // A forked child, like a test's subprocess, must die with the stuck parent.
+      "sleep 300 &",
+      `echo "$$ $!" >> "${pidFile}"`,
+      "wait",
     ].join("\n")
   );
 
@@ -79,8 +80,10 @@ test("kills a silent bun, names the stalled test, and retries it like a crash", 
   }
   expect(result.stdout.match(/retrying \(attempt \d of 3\)/g)).toHaveLength(2);
 
-  const pids = (await readFile(pidFile, "utf8")).trim().split("\n").map(Number);
-  expect(pids).toHaveLength(3);
+  const attempts = (await readFile(pidFile, "utf8")).trim().split("\n");
+  expect(attempts).toHaveLength(3);
+  const pids = attempts.flatMap((line) => line.split(" ").map(Number));
+  expect(pids).toHaveLength(6);
   for (const pid of pids) {
     expect(() => process.kill(pid, 0)).toThrow();
   }

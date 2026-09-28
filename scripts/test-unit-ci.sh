@@ -94,9 +94,21 @@ isolated_unit_tests=(
 # itself was stuck (a blocked JS thread or a native hang), and `bun test --timeout`
 # cannot catch that. Healthy shards never go quiet for longer than their slowest
 # single test (~11 s in CI), so BUN_TEST_STALL_SECS of silence means a hang: name the
-# file and last test, dump the process state for diagnosis, and SIGKILL it so the
+# file and last test, dump the process state for diagnosis, and SIGKILL it (with any
+# children, which the stuck process cannot tear down itself) so the
 # signal-exit retry below handles it like a crash.
 BUN_TEST_STALL_SECS="${BUN_TEST_STALL_SECS:-180}"
+# Stop each process before listing its children so none can fork or be reparented
+# away mid-walk, then kill the subtree bottom-up. A process group would also work,
+# but job control would detach Bun from the terminal's Ctrl-C for local runs.
+kill_process_tree() {
+  local child
+  kill -STOP "$1" 2>/dev/null || true
+  for child in $(pgrep -P "$1" || true); do
+    kill_process_tree "$child"
+  done
+  kill -KILL "$1" 2>/dev/null || true
+}
 bun_test_with_stall_watchdog() {
   local out pid size last_size=-1 quiet=0 exit_code=0
   out=$(mktemp)
@@ -129,7 +141,7 @@ bun_test_with_stall_watchdog() {
         done | sort | uniq -c
         free -m || true
       fi
-      kill -KILL "$pid" 2>/dev/null || true
+      kill_process_tree "$pid"
       break
     fi
   done
