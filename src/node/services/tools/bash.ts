@@ -1422,6 +1422,12 @@ ${scriptWithEnv}`;
             const completed = await foregroundCompletion;
             exitCode = completed[0];
           } else {
+            // Held until the command is registered below or terminated after a failed
+            // migration: a removal's cleanup() in between waits for it (#4805).
+            using _migration =
+              config.backgroundProcessManager && config.workspaceId
+                ? config.backgroundProcessManager.beginMigration(config.workspaceId)
+                : undefined;
             // Detach from abort signal as early as possible - process should continue running
             // even when the stream ends and fires abort.
             abortDetached = true;

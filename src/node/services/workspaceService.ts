@@ -477,6 +477,8 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 const STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS = 10_000;
+// Removal's join of MCP prompt discoveries it aborted (#4805); see abortAndJoinMcpPromptDiscoveries.
+const MCP_PROMPT_DISCOVERY_JOIN_TIMEOUT_MS = 10_000;
 
 /**
  * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
@@ -2567,8 +2569,12 @@ export class WorkspaceService
   private readonly preflightFileCompletionCounts = new Map<string, number>();
   // Same pairing for renderer MCP prompt discovery (workspace.mcp.prompts.list): it readies the
   // runtime (which can re-wake a stopped Coder workspace) and starts cached stdio servers inside
-  // the checkout. See acquireMcpPromptDiscoveryAdmission.
-  private readonly preflightMcpPromptDiscoveryCounts = new Map<string, number>();
+  // the checkout. See acquireMcpPromptDiscoveryAdmission. Each admitted discovery carries an
+  // abort controller and a settlement so a removal can stop and join it (#4805).
+  private readonly mcpPromptDiscoveries = new Map<
+    string,
+    Set<{ controller: AbortController; settled: Promise<void>; settle: () => void }>
+  >();
   /**
    * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
    * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
@@ -7053,6 +7059,10 @@ export class WorkspaceService
       if (initSettlement != null) {
         await initSettlement;
       }
+      // Same point for MCP prompt discoveries: new ones are refused since removingWorkspaces
+      // was set, so joining the admitted ones leaves none that could publish servers after
+      // the stopServers calls below (#4805).
+      await this.abortAndJoinMcpPromptDiscoveries(workspaceId);
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
@@ -10539,7 +10549,7 @@ export class WorkspaceService
     if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a fork of this workspace in progress");
     }
-    if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
+    if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
       activityLabels.push("an MCP prompt discovery in progress");
     }
     // In-flight native-terminal/editor opens passed their own archive guards before this
@@ -10769,7 +10779,7 @@ export class WorkspaceService
         if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a fork of this workspace in progress");
         }
-        if ((this.preflightMcpPromptDiscoveryCounts.get(workspaceId) ?? 0) > 0) {
+        if ((this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0) > 0) {
           activityLabels.push("an MCP prompt discovery in progress");
         }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
@@ -13418,10 +13428,12 @@ export class WorkspaceService
    * admitted first holds the archive gate open until the caller disposes the admission, and one
    * entering after the gate armed (or against an archived workspace) is refused with undefined.
    *
-   * Removal refuses new discoveries too (#4760). A discovery admitted before the removal
-   * started is not joined; that remaining window is tracked as a follow-up.
+   * Removal refuses new discoveries too (#4760), and aborts and joins the ones admitted before
+   * it started (#4805): the discovery must run under the returned signal.
    */
-  acquireMcpPromptDiscoveryAdmission(workspaceId: string): Disposable | undefined {
+  acquireMcpPromptDiscoveryAdmission(
+    workspaceId: string
+  ): (Disposable & { signal: AbortSignal }) | undefined {
     if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
       return undefined;
     }
@@ -13435,7 +13447,45 @@ export class WorkspaceService
     ) {
       return undefined;
     }
-    return this.acquirePreflightAdmission(this.preflightMcpPromptDiscoveryCounts, workspaceId);
+    const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
+    const discovery = { controller: new AbortController(), settled, settle };
+    let admitted = this.mcpPromptDiscoveries.get(workspaceId);
+    if (admitted === undefined) {
+      admitted = new Set();
+      this.mcpPromptDiscoveries.set(workspaceId, admitted);
+    }
+    admitted.add(discovery);
+    return {
+      signal: discovery.controller.signal,
+      [Symbol.dispose]: () => {
+        const current = this.mcpPromptDiscoveries.get(workspaceId);
+        current?.delete(discovery);
+        if (current?.size === 0) this.mcpPromptDiscoveries.delete(workspaceId);
+        discovery.settle();
+      },
+    };
+  }
+
+  /**
+   * #4805: a discovery admitted before a removal started can still publish stdio servers into
+   * the checkout. Abort each one and wait for it to settle, so anything it published exists
+   * before removal's stopServers runs. Bounded like the stream stop: a discovery that ignores
+   * its abort must not pin the removal, so the removal logs and proceeds.
+   */
+  private async abortAndJoinMcpPromptDiscoveries(workspaceId: string): Promise<void> {
+    const admitted = [...(this.mcpPromptDiscoveries.get(workspaceId) ?? [])];
+    if (admitted.length === 0) return;
+    for (const discovery of admitted) discovery.controller.abort();
+    const joined = await raceWithAbortAndTimeout(
+      Promise.all(admitted.map((discovery) => discovery.settled)),
+      { timeoutMs: MCP_PROMPT_DISCOVERY_JOIN_TIMEOUT_MS }
+    );
+    if (joined.kind !== "ok") {
+      log.warn("Workspace removal: an admitted MCP prompt discovery did not settle after abort", {
+        workspaceId,
+        pending: admitted.length,
+      });
+    }
   }
 
   /**

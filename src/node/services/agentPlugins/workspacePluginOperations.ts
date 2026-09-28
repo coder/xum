@@ -83,7 +83,7 @@ export async function getWorkspaceMcpOverrides(context: ORPCContext, workspaceId
 export async function listWorkspaceMcpPrompts(
   context: ORPCContext,
   workspaceId: string,
-  signal?: AbortSignal
+  callerSignal?: AbortSignal
 ) {
   // Archive admission pairing (see WorkspaceService.acquireMcpPromptDiscoveryAdmission): held
   // through ensureReady and server startup below, both of which would otherwise re-wake a
@@ -91,7 +91,13 @@ export async function listWorkspaceMcpPrompts(
   // Discovery degrades to an empty catalog instead of erroring, like file completions.
   using admission = context.workspaceService.acquireMcpPromptDiscoveryAdmission(workspaceId);
   if (admission === undefined) return [];
+  // A removal aborts discoveries admitted before it and waits for them to settle (#4805).
+  const signal =
+    callerSignal !== undefined
+      ? AbortSignal.any([callerSignal, admission.signal])
+      : admission.signal;
   await context.initStateManager.waitForInit(workspaceId, signal);
+  if (signal.aborted) return [];
   // A checkout whose launch sanitize failed (recorded before its init completed, #4674): refuse
   // with a typed error, unlike the archive degrade above, and never start MCP in it.
   const unsanitized = context.initStateManager.getUnsanitizedCheckoutError(workspaceId);
@@ -107,7 +113,7 @@ export async function listWorkspaceMcpPrompts(
   const runtimeResult = context.aiService.createWorkspaceRuntimeContext(workspaceId, metadata);
   if (!runtimeResult.success) throw new Error(formatSendMessageError(runtimeResult.error).message);
   const { runtime, workspacePath, hostCheckoutRoot } = runtimeResult.data;
-  const ready = await runtime.ensureReady(signal ? { signal } : undefined);
+  const ready = await runtime.ensureReady({ signal });
   if (!ready.ready) throw new Error(ready.error);
   // Forward the authority too: a snapshot the service could not establish
   // must make the manager re-read disk (and fail closed), not start servers.
@@ -118,14 +124,15 @@ export async function listWorkspaceMcpPrompts(
   const { overrides, authoritative } =
     await context.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId, {
       timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
-      ...(signal !== undefined ? { signal } : {}),
+      signal,
     });
-  if (signal?.aborted) return [];
+  if (signal.aborted) return [];
   const projectSecrets = await secretsToRecord(
     isMultiProject(metadata)
       ? mergeMultiProjectSecrets(metadata, context.secretsStore)
       : context.secretsStore.getEffectiveSecrets(metadata.projectPath)
   );
+  if (signal.aborted) return [];
   // `return await`, not `return`: `using` disposes at block exit, and a bare returned promise
   // would release the admission before server startup settles.
   return await context.mcpServerManager.getPromptsForWorkspace(
@@ -148,7 +155,7 @@ export async function listWorkspaceMcpPrompts(
         ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
         : null,
     },
-    signal ? { signal } : undefined
+    { signal }
   );
 }
 
