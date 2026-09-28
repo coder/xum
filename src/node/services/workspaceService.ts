@@ -7810,7 +7810,8 @@ export class WorkspaceService
       // path until the row is gone. If deregistration then fails, the workspace stays registered
       // without its plan, like its already deleted session. Without captured metadata there is no
       // path to derive.
-      if (removedMetadata) await this.deletePlanFilesOfRemovedWorkspace(workspaceId, removedMetadata);
+      if (removedMetadata)
+        await this.deletePlanFilesOfRemovedWorkspace(workspaceId, removedMetadata);
 
       // Remove from config
       try {
