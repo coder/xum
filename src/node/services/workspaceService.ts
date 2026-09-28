@@ -4311,7 +4311,11 @@ export class WorkspaceService
           return;
         }
 
-        void this.updateAgentStatus(data.workspaceId, agentStatus);
+        // Tracked like the stream-listener writes above so the shutdown join waits (#5059).
+        // The tracker calls the write synchronously, so writes still start in event order.
+        void this.trackWorkspaceCleanup(() =>
+          this.updateAgentStatus(data.workspaceId, agentStatus)
+        );
         return;
       }
 
@@ -4319,7 +4323,8 @@ export class WorkspaceService
         (data.toolName === "todo_write" || data.toolName === "propose_plan") &&
         isSuccessfulToolResult(data.result)
       ) {
-        void this.updateTodoStatusFromStorage(data.workspaceId);
+        // Same shutdown join (#5059); ordering stays with todoStatusUpdateQueue.
+        void this.trackWorkspaceCleanup(() => this.updateTodoStatusFromStorage(data.workspaceId));
       }
     });
   }

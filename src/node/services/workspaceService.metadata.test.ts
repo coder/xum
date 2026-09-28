@@ -97,7 +97,7 @@ describe("WorkspaceService metadata listeners", () => {
   });
 });
 
-// #5055: the stream listeners' streaming-status writes must be part of the shutdown join, or
+// #5055/#5059: the metadata listeners' writes must be part of the shutdown join, or
 // a write can land after teardown (ENOENT on a deleted root in tests, detached work in the app).
 describe("WorkspaceService metadata listener writes vs the shutdown join", () => {
   const workspaceId = "ws-shutdown-join";
@@ -125,24 +125,30 @@ describe("WorkspaceService metadata listener writes vs the shutdown join", () =>
     };
   }
 
-  test.each(events)("app-scope close waits for the %s write to settle", async (event, payload) => {
+  /** Hold the listener's metadata write open, close the app scope, and require the join. */
+  async function expectCloseWaitsForWrite(
+    method: "setStreaming" | "setAgentStatus" | "setTodoStatus",
+    emit: (aiEvents: EventEmitter) => void
+  ) {
     const { harness, aiEvents, close } = await createScopedHarness();
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     let writeSettled = false;
-    const setStreaming = harness.extensionMetadata.setStreaming.bind(harness.extensionMetadata);
-    spyOn(harness.extensionMetadata, "setStreaming").mockImplementationOnce(async (...args) => {
+    const write = harness.extensionMetadata[method].bind(harness.extensionMetadata) as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    spyOn(harness.extensionMetadata, method).mockImplementationOnce((async (...args: unknown[]) => {
       entered.resolve();
       await release.promise;
       try {
-        return await setStreaming(...args);
+        return await write(...args);
       } finally {
         writeSettled = true;
       }
-    });
+    }) as never);
     let closing: Promise<void> | undefined;
     try {
-      aiEvents.emit(event, { type: event, workspaceId, ...payload });
+      emit(aiEvents);
       await entered.promise;
       let closed = false;
       closing = close().then(() => {
@@ -159,7 +165,34 @@ describe("WorkspaceService metadata listener writes vs the shutdown join", () =>
       await (closing ?? close());
       await harness.cleanup();
     }
-  });
+  }
+
+  test.each(events)("app-scope close waits for the %s write to settle", (event, payload) =>
+    expectCloseWaitsForWrite("setStreaming", (aiEvents) =>
+      aiEvents.emit(event, { type: event, workspaceId, ...payload })
+    )
+  );
+
+  // #5059: the tool-call-end metadata writes must join shutdown the same way.
+  test.each([
+    ["status_set", "setAgentStatus", { success: true, emoji: "🔍", message: "Reading" }],
+    ["todo_write", "setTodoStatus", { success: true, count: 0 }],
+    ["propose_plan", "setTodoStatus", { success: true }],
+  ] as const)(
+    "app-scope close waits for the %s tool-call-end write to settle",
+    (toolName, method, result) =>
+      expectCloseWaitsForWrite(method, (aiEvents) =>
+        aiEvents.emit("tool-call-end", {
+          type: "tool-call-end",
+          workspaceId,
+          messageId: "m",
+          toolCallId: "t",
+          toolName,
+          result,
+          timestamp: Date.now(),
+        })
+      )
+  );
 
   test("a stop emitted after a start wins even when the start write is slower", async () => {
     const { harness, aiEvents, close } = await createScopedHarness();
