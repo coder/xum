@@ -727,6 +727,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const { api } = useAPI();
   const { confirm: confirmDialog } = useConfirmDialog();
   const settings = useSettings();
+  // The settings modal covers the chat without changing the route's workspace; treat the
+  // covered workspace as unselected so its unread state stays visible until settings closes.
+  const visibleSelectedWorkspaceId = settings.isOpen ? undefined : selectedWorkspace?.workspaceId;
 
   // Get project state and operations from context
   const {
@@ -1143,7 +1146,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       const isRemoving = workspace.isRemoving === true;
       const isArchiving = archivingWorkspaceIds.has(workspaceId);
       const isInitializing = workspace.isInitializing === true;
-      const isSelected = selectedWorkspace?.workspaceId === workspaceId;
+      const isSelected = visibleSelectedWorkspaceId === workspaceId;
       const recencyTimestamp = workspaceRecency[workspaceId] ?? null;
       const lastReadTimestamp = readPersistedState<number | null>(
         getWorkspaceLastReadKey(workspaceId),
@@ -1165,7 +1168,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         isUnread
       );
     },
-    [archivingWorkspaceIds, selectedWorkspace?.workspaceId, workspaceRecency, workspaceStore]
+    [archivingWorkspaceIds, visibleSelectedWorkspaceId, workspaceRecency, workspaceStore]
   );
 
   const archiveFlow = useArchiveWorkspaceConfirmation({
@@ -2236,7 +2239,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey));
       const isExpanded = expandedTaskGroups[group.storageKey] ?? defaultExpanded;
       const isGroupSelected = group.allMembers.some(
-        (member) => member.id === selectedWorkspace?.workspaceId
+        (member) => member.id === visibleSelectedWorkspaceId
       );
 
       const headerRow = (
@@ -2415,7 +2418,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         projectName={metadata.projectName}
         projectBadgeName={badge?.name}
         projectBadgeColor={badge?.color}
-        isSelected={selectedWorkspace?.workspaceId === metadata.id}
+        isSelected={visibleSelectedWorkspaceId === metadata.id}
         isArchiving={archivingWorkspaceIds.has(metadata.id)}
         isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
         onSelectWorkspace={handleSelectWorkspace}
@@ -2655,7 +2658,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               metadata={metadata}
                               projectPath={metadata.projectPath}
                               projectName={metadata.projectName}
-                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isSelected={visibleSelectedWorkspaceId === metadata.id}
                               isArchiving={archivingWorkspaceIds.has(metadata.id)}
                               isRemoving={
                                 removingWorkspaceIds.has(metadata.id) ||
@@ -2739,7 +2742,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                               metadata={metadata}
                               projectPath={metadata.projectPath}
                               projectName={metadata.projectName}
-                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isSelected={visibleSelectedWorkspaceId === metadata.id}
                               isArchiving={archivingWorkspaceIds.has(metadata.id)}
                               isRemoving={
                                 removingWorkspaceIds.has(metadata.id) ||
@@ -3275,7 +3278,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                       metadata={metadata}
                                       projectPath={projectPath}
                                       projectName={projectName}
-                                      isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                                      isSelected={visibleSelectedWorkspaceId === metadata.id}
                                       isArchiving={archivingWorkspaceIds.has(metadata.id)}
                                       isRemoving={
                                         removingWorkspaceIds.has(metadata.id) ||

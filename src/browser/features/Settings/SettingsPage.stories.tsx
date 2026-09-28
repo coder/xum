@@ -146,6 +146,8 @@ export const EscapeInInlineEditor: AppStory = {
     dialog.focus();
     await userEvent.keyboard("{Escape}");
     await waitForSettingsClosed();
+    // Settings has no DialogTrigger, so focus must be returned to the opener explicitly.
+    await waitFor(() => expect(within(canvasElement).getByTestId("settings-button")).toHaveFocus());
   },
 };
 

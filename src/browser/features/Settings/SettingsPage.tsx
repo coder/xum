@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   Blocks,
   Brain,
@@ -223,6 +223,7 @@ export function SettingsPage() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const remoteConnectionAvailable = window.api?.remoteConnection != null;
+  const openerRef = useRef<HTMLElement | null>(null);
 
   // Redirect restored links when an experiment or desktop bridge is unavailable.
   useEffect(() => {
@@ -272,6 +273,21 @@ export function SettingsPage() {
         showCloseButton={false}
         allowEditableEscape
         aria-describedby={undefined}
+        // Radix only returns focus to a DialogTrigger; settings opens from shortcuts, menus, and
+        // links, so remember whatever was focused when it opened.
+        onOpenAutoFocus={() => {
+          const active = document.activeElement;
+          openerRef.current =
+            active instanceof HTMLElement && active !== document.body ? active : null;
+        }}
+        onCloseAutoFocus={(e) => {
+          e.preventDefault();
+          const opener = openerRef.current;
+          openerRef.current = null;
+          if (opener?.isConnected) {
+            opener.focus();
+          }
+        }}
         className="top-0 left-0 flex h-full w-full max-w-none translate-x-0 translate-y-0 flex-col gap-0 overflow-hidden rounded-none border-0 p-0 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] md:top-[50%] md:left-[50%] md:h-[min(880px,88vh)] md:w-[min(1100px,92vw)] md:translate-x-[-50%] md:translate-y-[-50%] md:flex-row md:rounded-lg md:border"
       >
         <div className="border-border-medium flex min-w-0 shrink-0 flex-col border-b md:w-48 md:border-r md:border-b-0">

@@ -1113,6 +1113,8 @@ function AppInner() {
         if (!isDialogOpen()) setSidebarCollapsed((prev) => !prev);
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SETTINGS)) {
         e.preventDefault();
+        // An open palette would stay behind the settings modal and swallow its first Escape.
+        closeCommandPalette();
         openSettings();
       } else if (matchesKeybind(e, KEYBINDS.OPEN_SERVER_WINDOW) && window.api?.remoteConnection) {
         // Desktop-only: browser mode and server windows have no remote connection bridge.
@@ -1232,6 +1234,7 @@ function AppInner() {
         const iterator = await api.menu.onOpenSettings(undefined, { signal });
         for await (const _ of iterator) {
           if (signal.aborted) break;
+          closeCommandPalette();
           openSettings();
         }
       } catch {
@@ -1240,7 +1243,7 @@ function AppInner() {
     })();
 
     return () => abortController.abort();
-  }, [api, openSettings]);
+  }, [api, openSettings, closeCommandPalette]);
 
   // Handle workspace fork switch event
   useEffect(() => {

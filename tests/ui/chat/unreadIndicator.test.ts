@@ -265,6 +265,12 @@ describe("Unread indicator (mock AI router)", () => {
         expect(recencyTimestamp).not.toBeNull();
         expect(isUnread(lastReadAfterComplete)).toBe(true);
       });
+      // The covered workspace stays route-selected, but its sidebar row must still show unread.
+      await waitFor(() => {
+        expect(getWorkspaceUnreadIndicator(app.view.container, app.workspaceId)?.hasUnreadBar).toBe(
+          true
+        );
+      });
     }, 60_000);
 
     test("focus while the settings modal is open does NOT mark read", async () => {
