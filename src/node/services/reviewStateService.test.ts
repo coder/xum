@@ -125,21 +125,37 @@ describe("ReviewStateService", () => {
     expect(updated.sections.hunkExpand).toEqual({ h1: false });
   });
 
-  it("imports legacy sections only where the backend has never written them", async () => {
+  it("imports legacy entries the backend lacks without overwriting its own", async () => {
     using tempDir = new TestTempDir("review-state-import");
     const { config } = await createHarness(tempDir);
     const service = new ReviewStateService(config);
-    // Present-but-empty: the user cleared all reviews on the backend already.
-    await service.applyDelta(WORKSPACE_ID, { reviews: { delete: ["gone"] } });
+    await service.applyDelta(WORKSPACE_ID, {
+      reviews: { set: { shared: makeReview("shared", "backend copy") } },
+      firstSeen: { set: { h1: 100, h2: 50 } },
+    });
 
+    // Another origin's localStorage: its own notes plus an older copy of a shared one.
     const result = await service.importLegacy(WORKSPACE_ID, {
-      reviews: { stale: makeReview("stale", "from localStorage") },
+      reviews: {
+        shared: makeReview("shared", "legacy copy"),
+        other: makeReview("other", "other origin"),
+      },
+      firstSeen: { h1: 40, h2: 80, h3: 7 },
       readState: { h1: { hunkId: "h1", isRead: true, timestamp: 5 } },
     });
 
-    expect(result.results).toEqual({ reviews: "present", readState: "applied" });
+    expect(result.results).toEqual({
+      reviews: "present",
+      firstSeen: "present",
+      readState: "applied",
+    });
     const reloaded = await new ReviewStateService(config).getSnapshot(WORKSPACE_ID);
-    expect(reloaded.sections.reviews).toEqual({});
+    expect(reloaded.sections.reviews).toEqual({
+      shared: makeReview("shared", "backend copy"),
+      other: makeReview("other", "other origin"),
+    });
+    // First-seen keeps the earlier timestamp per hunk, as in every other merge.
+    expect(reloaded.sections.firstSeen).toEqual({ h1: 40, h2: 50, h3: 7 });
     expect(reloaded.sections.readState).toEqual({
       h1: { hunkId: "h1", isRead: true, timestamp: 5 },
     });

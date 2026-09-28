@@ -16,10 +16,29 @@ import {
 } from "@/common/orpc/schemas/reviewState";
 import {
   applyReviewStateDelta,
+  assignSection,
   createEmptyReviewStateSnapshot,
   sanitizeReviewStateSnapshot,
-  withReviewStateSection,
 } from "@/common/utils/reviewState";
+
+/**
+ * The legacy entries to add to one section: keys it lacks, plus (firstSeen) keys the legacy
+ * value should replace. Undefined when the section was not provided.
+ */
+function importDelta<V>(
+  existing: Record<string, V> | undefined,
+  legacy: Record<string, V> | undefined,
+  replaces?: (kept: V, legacy: V) => boolean
+): { set: Record<string, V> } | undefined {
+  if (legacy === undefined) return undefined;
+  const set = Object.fromEntries(
+    Object.entries(legacy).filter(
+      ([key, value]) =>
+        existing === undefined || !(key in existing) || (replaces?.(existing[key], value) ?? false)
+    )
+  );
+  return { set };
+}
 
 /**
  * Per-workspace code-review state (review notes, hunk read/first-seen/expand/read-more maps).
@@ -89,9 +108,15 @@ export class ReviewStateService extends EventEmitter {
   }
 
   /**
-   * One-time localStorage migration: write each provided section ONLY when it is absent
-   * on the backend. A present section (even an empty one) is newer than any leftover
-   * legacy value, so it is never overwritten.
+   * Non-clobbering, per-entry localStorage migration: add only the legacy entries whose keys a
+   * section lacks (creating an absent section); existing backend entries always win, except
+   * that firstSeen keeps the earlier timestamp, as in every other merge. Caps apply after.
+   *
+   * localStorage is per origin (desktop app vs a browser tab) while this file is shared, and a
+   * client removes its legacy keys once imported. So a key that still exists means that origin
+   * was never imported, and its missing entries are new data, not stale leftovers. Results:
+   * "applied" = the section was absent and was created, "present" = it existed and gained only
+   * missing entries.
    */
   async importLegacy(
     workspaceId: string,
@@ -103,21 +128,33 @@ export class ReviewStateService extends EventEmitter {
       // Sanitize the untrusted legacy payload with the same rules as the file load.
       const incoming = sanitizeReviewStateSnapshot({ sections }).snapshot.sections;
       const results: ReviewStateImportLegacyOutput["results"] = {};
-      let next = current.sections;
+      // A provided section the sanitizer dropped entirely (wrong shape) still creates it empty.
+      const provided: ReviewStateSections = {};
+      let changed = false;
       for (const section of REVIEW_STATE_SECTIONS) {
         if (sections[section] === undefined) continue;
-        if (current.sections[section] !== undefined) {
-          results[section] = "present";
-          continue;
-        }
-        next = withReviewStateSection(next, section, incoming[section] ?? {});
-        results[section] = "applied";
+        assignSection(provided, section, incoming[section] ?? {});
+        const present = current.sections[section] !== undefined;
+        results[section] = present ? "present" : "applied";
+        changed ||= !present;
       }
-      const snapshot: ReviewStateSnapshot = { sections: next };
-      const revision =
-        next !== current.sections
-          ? await this.persist(workspaceId, snapshot)
-          : this.getRevision(workspaceId);
+      const has = current.sections;
+      const delta: ReviewStateDelta = {
+        reviews: importDelta(has.reviews, provided.reviews),
+        readState: importDelta(has.readState, provided.readState),
+        firstSeen: importDelta(has.firstSeen, provided.firstSeen, (kept, legacy) => legacy < kept),
+        hunkExpand: importDelta(has.hunkExpand, provided.hunkExpand),
+        readMore: importDelta(has.readMore, provided.readMore),
+      };
+      changed ||= REVIEW_STATE_SECTIONS.some(
+        (section) => Object.keys(delta[section]?.set ?? {}).length > 0
+      );
+      const snapshot: ReviewStateSnapshot = {
+        sections: changed ? applyReviewStateDelta(has, delta) : has,
+      };
+      const revision = changed
+        ? await this.persist(workspaceId, snapshot)
+        : this.getRevision(workspaceId);
       return { snapshot, revision, results };
     });
   }
