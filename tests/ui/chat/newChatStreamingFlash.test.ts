@@ -72,7 +72,11 @@ async function createCreationHarness(options?: {
     await openProjectCreationView(view, projectPath);
     await waitForSourceBranch(view);
     const draftId = await waitForLatestDraftId(projectPath);
-    const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId));
+    const chat = new ChatHarness(view.container, getDraftScopeId(projectPath, draftId), {
+      kind: "creation",
+      projectPath,
+      draftId,
+    });
 
     return {
       env,

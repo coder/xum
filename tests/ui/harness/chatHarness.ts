@@ -1,12 +1,14 @@
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getDraftStore, type DraftStoreScope } from "@/browser/stores/DraftStore";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 export class ChatHarness {
   constructor(
     private readonly container: HTMLElement,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    /** The composer's draft scope; a creation composer passes its creation draft scope. */
+    private readonly draftScope: DraftStoreScope = { kind: "workspace", workspaceId }
   ) {}
 
   private async getActiveTextarea(): Promise<HTMLTextAreaElement> {
@@ -44,7 +46,7 @@ export class ChatHarness {
     // ChatInput renders the draft store, so writing the draft there is both deterministic
     // and exercises the real UI state path.
     act(() => {
-      getDraftStore().setText({ kind: "workspace", workspaceId: this.workspaceId }, text);
+      getDraftStore().setText(this.draftScope, text);
     });
 
     await waitFor(
@@ -141,7 +143,7 @@ export class ChatHarness {
     textarea.focus();
 
     act(() => {
-      getDraftStore().setText({ kind: "workspace", workspaceId: this.workspaceId }, text);
+      getDraftStore().setText(this.draftScope, text);
     });
 
     await waitFor(

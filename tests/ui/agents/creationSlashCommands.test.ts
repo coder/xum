@@ -58,7 +58,11 @@ async function setupCreationView(options?: { beforeRender?: () => void }): Promi
 
   const draftId = await waitForLatestDraftId(normalizedProjectPath);
 
-  const chat = new ChatHarness(view.container, getDraftScopeId(normalizedProjectPath, draftId));
+  const chat = new ChatHarness(view.container, getDraftScopeId(normalizedProjectPath, draftId), {
+    kind: "creation",
+    projectPath: normalizedProjectPath,
+    draftId,
+  });
 
   return {
     env,
