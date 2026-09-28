@@ -84,6 +84,8 @@ describe("collectOrphanedWorkspaceStorage", () => {
       `unregistered:${ORPHAN_ID}`,
     ];
     seed([...orphaned, ...kept]);
+    // A loaded map that lacks UNMAPPED_DRAFT: reintroducing map-based draft collection would
+    // remove that key, so the map is seeded on purpose even though GC never reads it.
     seedDraftsMap();
 
     const removed = await collectOrphanedWorkspaceStorage({
