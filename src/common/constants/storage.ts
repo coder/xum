@@ -25,6 +25,8 @@ export function getPendingScopeId(projectPath: string): string {
   return `__pending__${projectPath}`;
 }
 
+const DRAFT_SCOPE_ID_PREFIX = "__draft__/";
+
 /**
  * Get draft workspace scope ID for storage keys.
  *
@@ -34,7 +36,7 @@ export function getPendingScopeId(projectPath: string): string {
  * Format: "__draft__/{projectPath}/{draftId}"
  */
 export function getDraftScopeId(projectPath: string, draftId: string): string {
-  return `__draft__/${projectPath}/${draftId}`;
+  return `${DRAFT_SCOPE_ID_PREFIX}${projectPath}/${draftId}`;
 }
 
 /**
@@ -1057,6 +1059,29 @@ export function getWorkspaceKeyPrefix(getKey: (scopeId: string) => string): stri
   return getKey("");
 }
 
+/** Scope id embedded in a registered workspace-scoped key, or null for any other key. */
+function getWorkspaceScopeIdFromKey(key: string): string | null {
+  for (const entry of WORKSPACE_KEY_REGISTRATIONS) {
+    const prefix = getWorkspaceKeyPrefix(entry.getKey);
+    if (key.startsWith(prefix)) return key.slice(prefix.length);
+  }
+  return null;
+}
+
+const MCP_TEST_RESULTS_KEY_PREFIX = getWorkspaceKeyPrefix(getMCPTestResultsKey);
+
+/**
+ * Trailing segment of an "mcpTestResults:{projectPath}[:{workspaceId}]" key (text after the last
+ * ":"), or null for other keys. For project-level keys this is a piece of the project path; callers
+ * only treat it as a workspace id when it has the stable id shape.
+ */
+function getMcpTestResultsTrailingSegment(key: string): string | null {
+  if (!key.startsWith(MCP_TEST_RESULTS_KEY_PREFIX)) return null;
+  const rest = key.slice(MCP_TEST_RESULTS_KEY_PREFIX.length);
+  const separator = rest.lastIndexOf(":");
+  return separator === -1 ? null : rest.slice(separator + 1);
+}
+
 /** Classify a concrete localStorage key; undefined means unregistered (treated as non-evictable). */
 export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
   for (const entry of PERSISTED_KEY_REGISTRY) {
@@ -1116,6 +1141,87 @@ export function deleteWorkspaceStorage(workspaceId: string): void {
   for (const { getKey } of WORKSPACE_KEY_REGISTRATIONS) {
     localStorage.removeItem(getKey(workspaceId));
   }
+  // Workspace-scoped MCP test results embed the project path before the id, so they cannot be
+  // addressed by id alone; scan for them. Collect first: removing while indexing shifts keys.
+  const mcpTestResultsSuffix = `:${workspaceId}`;
+  const mcpTestResultsKeys: string[] = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (key?.startsWith(MCP_TEST_RESULTS_KEY_PREFIX) && key.endsWith(mcpTestResultsSuffix)) {
+      mcpTestResultsKeys.push(key);
+    }
+  }
+  for (const key of mcpTestResultsKeys) {
+    localStorage.removeItem(key);
+  }
+}
+
+/**
+ * New workspaces get crypto.randomBytes(5) hex ids (Config.generateStableId). Orphan GC only
+ * collects keys whose scope id has this shape, so legacy-format ids, project/global/pending scopes
+ * and legacy keys that share a prefix (e.g. "thinkingLevel:model:{model}") are never collected.
+ * Failing closed here leaks a little space at worst; guessing wrong would delete user data.
+ */
+const STABLE_WORKSPACE_ID_PATTERN = /^[0-9a-f]{10}$/;
+
+/** Owner of a key the orphan GC may collect. */
+type WorkspaceStorageGcOwner =
+  | { kind: "workspace"; workspaceId: string }
+  | { kind: "draft"; scopeId: string };
+
+function getWorkspaceStorageGcOwner(key: string): WorkspaceStorageGcOwner | null {
+  const scopeId = getWorkspaceScopeIdFromKey(key);
+  if (scopeId !== null) {
+    if (scopeId.startsWith(DRAFT_SCOPE_ID_PREFIX)) return { kind: "draft", scopeId };
+    return STABLE_WORKSPACE_ID_PATTERN.test(scopeId)
+      ? { kind: "workspace", workspaceId: scopeId }
+      : null;
+  }
+  // mcpTestResults is registered as an evictable cache, so misreading a project-level key whose
+  // path happens to end in ":{10 hex}" only drops re-testable results, never user data.
+  const mcpWorkspaceId = getMcpTestResultsTrailingSegment(key);
+  return mcpWorkspaceId !== null && STABLE_WORKSPACE_ID_PATTERN.test(mcpWorkspaceId)
+    ? { kind: "workspace", workspaceId: mcpWorkspaceId }
+    : null;
+}
+
+/**
+ * Every localStorage key the orphan GC could ever collect: registered workspace-scoped keys of
+ * stable workspace ids or creation drafts, and workspace-scoped mcpTestResults keys.
+ */
+export function listWorkspaceStorageGcCandidateKeys(): string[] {
+  const keys: string[] = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (key !== null && getWorkspaceStorageGcOwner(key) !== null) keys.push(key);
+  }
+  return keys;
+}
+
+/**
+ * Pick the candidate keys whose owner no longer exists.
+ *
+ * - Workspace keys are orphaned only when their stable workspace id is not in
+ *   `knownWorkspaceIds` (see STABLE_WORKSPACE_ID_PATTERN).
+ * - Creation-draft keys are orphaned only when `liveDraftScopeIds` is known (the drafts map was
+ *   loaded) and does not contain their exact scope id. Draft scope ids embed project paths that
+ *   may contain "/", so they are compared whole, never parsed.
+ * - Pending scopes (`__pending__{projectPath}`) are never collected: they are bounded to one per
+ *   project and are the source of the legacy pending-to-draft migration.
+ */
+export function findOrphanedWorkspaceStorageKeys(
+  candidateKeys: readonly string[],
+  knownWorkspaceIds: ReadonlySet<string>,
+  liveDraftScopeIds: ReadonlySet<string> | null
+): string[] {
+  return candidateKeys.filter((key) => {
+    const owner = getWorkspaceStorageGcOwner(key);
+    if (owner === null) return false;
+    if (owner.kind === "draft") {
+      return liveDraftScopeIds !== null && !liveDraftScopeIds.has(owner.scopeId);
+    }
+    return !knownWorkspaceIds.has(owner.workspaceId);
+  });
 }
 
 /**

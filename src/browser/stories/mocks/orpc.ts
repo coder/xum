@@ -1655,6 +1655,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           workspaces.filter((w) => !isWorkspaceArchived(w.archivedAt, w.unarchivedAt))
         );
       },
+      listKnownIdsForStorageGc: () =>
+        Promise.resolve({ workspaceIds: workspaces.map((workspace) => workspace.id) }),
       preflightArchive: () => Promise.resolve({ success: true, data: { kind: "ready" as const } }),
       archive: () => Promise.resolve({ success: true }),
       unarchive: () => Promise.resolve({ success: true }),

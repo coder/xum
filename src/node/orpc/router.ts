@@ -1586,6 +1586,12 @@ export const router = (authToken?: string) => {
         .handler(({ context, input }) =>
           context.workspaceService.listByArchivedStatus(input?.archived === true)
         ),
+      listKnownIdsForStorageGc: t
+        .input(schemas.workspace.listKnownIdsForStorageGc.input)
+        .output(schemas.workspace.listKnownIdsForStorageGc.output)
+        .handler(async ({ context }) => ({
+          workspaceIds: await context.workspaceService.listKnownIdsForStorageGc(),
+        })),
       create: t
         .input(schemas.workspace.create.input)
         .output(schemas.workspace.create.output)

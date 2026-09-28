@@ -15,6 +15,7 @@ import {
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
+  getInputKey,
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
@@ -35,6 +36,7 @@ import {
   resetAiSelectionIntentForTests,
 } from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
+import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 
@@ -2128,6 +2130,54 @@ describe("WorkspaceContext", () => {
       expect(pinnedAtById(ctx)).toEqual(afterSecond);
     });
   });
+
+  describe("startup orphaned storage GC", () => {
+    const ACTIVE_ID = "a0a0a0a0a0";
+    const ORPHAN_ID = "deadbeef00";
+
+    test("removes keys of workspaces the backend does not know after a successful load", async () => {
+      resetWorkspaceStorageGcForTests();
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
+          listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
+        },
+        localStorage: {
+          [getInputKey(ACTIVE_ID)]: JSON.stringify("live draft"),
+          [getInputKey(ORPHAN_ID)]: JSON.stringify("orphan draft"),
+        },
+      });
+
+      await setup();
+
+      await waitFor(() => expect(localStorage.getItem(getInputKey(ORPHAN_ID))).toBeNull());
+      expect(localStorage.getItem(getInputKey(ACTIVE_ID))).not.toBeNull();
+    });
+
+    test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
+      resetWorkspaceStorageGcForTests();
+      let failLoad = true;
+      const { workspace: workspaceApi } = createMockAPI({
+        workspace: {
+          list: () =>
+            failLoad
+              ? Promise.reject(new Error("metadata unavailable"))
+              : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
+          listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
+        },
+        localStorage: { [getInputKey(ORPHAN_ID)]: JSON.stringify("draft") },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().loading).toBe(false));
+      failLoad = false;
+      await act(() => ctx().refreshWorkspaceMetadata());
+      await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
+
+      expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
+      expect(localStorage.getItem(getInputKey(ORPHAN_ID))).not.toBeNull();
+    });
+  });
 });
 
 async function setup() {
@@ -2262,6 +2312,11 @@ function createMockAPI(options: MockAPIOptions = {}) {
         (() => Promise.resolve({ success: true as const, data: undefined }))
     ),
     getInfo: mock(options.workspace?.getInfo ?? (() => Promise.resolve(null))),
+    // Never settles by default, so startup storage GC removes nothing unless a test opts in.
+    listKnownIdsForStorageGc: mock(
+      options.workspace?.listKnownIdsForStorageGc ??
+        (() => new Promise<{ workspaceIds: string[] }>(() => undefined))
+    ),
     // Async generators for subscriptions
     onMetadata: mock(
       options.workspace?.onMetadata ??

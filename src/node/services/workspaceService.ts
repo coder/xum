@@ -16851,6 +16851,28 @@ export class WorkspaceService
   }
 
   /**
+   * Every workspace id this backend knows, for the renderer's startup GC of orphaned
+   * workspace-scoped localStorage keys (see src/browser/utils/workspaceStorageGc.ts).
+   *
+   * Same union as pruneStaleExtensionMetadataOnce's destructive known-id set: the raw persisted
+   * superset covers entries normalization would drop or hide (malformed entries, multi-project
+   * workspaces), and the strict enumeration covers in-memory migrated ids and legacy aliases.
+   * Archived and sub-agent workspaces are included because they stay in config.
+   *
+   * Deliberately no catch: both reads throw instead of resolving with a lossy set, and the
+   * renderer deletes every key whose id is absent, so a partial answer would delete live
+   * workspaces' drafts. Failing the call makes the renderer skip GC. A missing config file is a
+   * healthy empty set.
+   */
+  async listKnownIdsForStorageGc(): Promise<string[]> {
+    const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+    for (const workspaceId of await this.enumerateAuthoritativeWorkspaceIds()) {
+      knownIds.add(workspaceId);
+    }
+    return [...knownIds];
+  }
+
+  /**
    * Evict process-local activity caches for a removed (or removed-then-
    * revived) workspace id. The caches re-bootstrap from disk on next access;
    * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
