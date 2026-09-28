@@ -11,6 +11,8 @@
 /* Tell Tailwind where to look for class usage. */
 @source "./**/*.{ts,tsx}";
 @source "../../../src/browser/**/*.{ts,tsx}";
+/* Shared composer class constants (control height, container-query collapse ladder). */
+@source "../../../src/constants/layout.ts";
 
 /*
  * Minimal CSS bundle for the mux VS Code webview.
