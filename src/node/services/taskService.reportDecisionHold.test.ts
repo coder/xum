@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
@@ -89,6 +89,27 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   beforeEach(async () => {
     fixture = await createTestHistoryService();
     rootDir = fixture.tempDir;
+  });
+  // Every host a test built must end with nothing left running: a session (the root's, created
+  // to deliver a report) or a tracked cleanup still alive here keeps doing history I/O under a
+  // deleted temp root after this file ends, where later files' fs spies see it (#5010).
+  const hosts: WorkspaceService[] = [];
+  afterAll(() => {
+    const leftovers = hosts.flatMap((host, index) => {
+      const state = host as unknown as {
+        sessions: Map<string, unknown>;
+        transientStartupRecoverySessions: Map<string, unknown>;
+        pendingWorkspaceCleanup: Set<Promise<void>>;
+      };
+      return [
+        ...[...state.sessions.keys()].map((id) => `host ${index}: session ${id}`),
+        ...[...state.transientStartupRecoverySessions.keys()].map(
+          (id) => `host ${index}: startup session ${id}`
+        ),
+        ...(state.pendingWorkspaceCleanup.size > 0 ? [`host ${index}: pending cleanup`] : []),
+      ];
+    });
+    expect(leftovers).toEqual([]);
   });
   afterEach(async () => {
     await fixture.cleanup();
@@ -224,6 +245,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       childId,
       sessionHarness.session
     );
+    hosts.push(workspaceService);
     ledger.host = workspaceService as unknown as EventEmitter;
     const { taskService } = createTaskServiceStack(config, {
       historyService,
@@ -269,7 +291,15 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       for (const completion of completions) {
         completion.resolve({ status: "aborted", abortReason: "user" });
       }
+      // The host also runs sessions of its own: the root's, created to deliver the child's
+      // report. Latch it so nothing starts another session, then dispose every session it holds
+      // before the fixture deletes the temp root; otherwise the root's history I/O outlives the
+      // test and lands in later files (#5010).
+      workspaceService.beginShutdown();
       await sessionHarness.session.dispose();
+      const hostSessions = (workspaceService as unknown as { sessions: Map<string, unknown> })
+        .sessions;
+      await Promise.all([...hostSessions.keys()].map((id) => workspaceService.disposeSession(id)));
       await sessionHarness.cleanup();
     };
     return {
