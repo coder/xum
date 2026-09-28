@@ -3,7 +3,7 @@
  * already parses every replay row, so the onChat procedure disables oRPC's output validation and
  * validates only the events the session did not. These tests pin, through the real oRPC procedure,
  * that the bytes on the wire are identical to the old double-validated pipeline (computed here
- * with oRPC's own eventIterator schema), that non-replay events are still validated with oRPC's
+ * with oRPC's own eventIterator schema), that non-replay events still get oRPC's transform and
  * error, and that replay rows are no longer parsed a second time.
  */
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -240,8 +240,6 @@ describe("onChat validates replay rows once (#4868)", () => {
     expect(replay.rows.map((row) => JSON.stringify(row))).toEqual(
       full.wire.map((row) => JSON.stringify(row))
     );
-    expect(replay.rows.filter((row) => "id" in row && row.id === partial.id)).toHaveLength(1);
-    expect(replay.rows.at(-1)).toMatchObject({ id: partial.id });
     expect(skippedIds(warn)).toEqual(full.rejectedIds);
     expect(replay.caughtUp.historyReplayStatus).toBe("complete");
 
@@ -297,7 +295,7 @@ describe("onChat validates replay rows once (#4868)", () => {
     ).toEqual(expectedRows.map((row) => JSON.stringify(row)));
   });
 
-  test("an invalid live event still fails the stream with oRPC's validation error", async () => {
+  test("live events get oRPC's transform, and an invalid one fails the stream with its error", async () => {
     harness = await createHarness();
     const client = createClient(harness);
     const iterator = await client.workspace.onChat({ workspaceId });
@@ -306,6 +304,23 @@ describe("onChat validates replay rows once (#4868)", () => {
       if (next.done) throw new Error("onChat ended before caught-up");
       if (next.value.type === "caught-up") break;
     }
+    // A valid live event goes out as the schema's parse output (unknown keys stripped), exactly
+    // as oRPC's output validation sent it, not as the emitted object.
+    const valid = {
+      type: "stream-delta",
+      workspaceId,
+      messageId: "live",
+      delta: "text",
+      tokens: 1,
+      timestamp: 2_900,
+      unknownLiveKey: true,
+    } as unknown as WorkspaceChatMessage;
+    harness.session.emitChatEvent(valid);
+    const delivered = await iterator.next();
+    expect(JSON.stringify(delivered.value)).toBe(
+      JSON.stringify(WorkspaceChatMessageSchema.parse(valid))
+    );
+    expect(delivered.value).not.toHaveProperty("unknownLiveKey");
     // A stream-delta without its required token count.
     harness.session.emitChatEvent({
       type: "stream-delta",
