@@ -74,6 +74,11 @@ describe("findUnpreservedSubagentWork", () => {
     execSync("git checkout -q main", { cwd: repo });
     const copy = path.join(rootDir, "copy");
     execSync(`git clone -q ${repo} ${copy}`);
+    // A clone does not inherit the source's local identity config; CI runners have no global one.
+    execSync('git config user.email "test@example.com" && git config user.name test', {
+      cwd: copy,
+    });
+    execSync("git config commit.gpgsign false", { cwd: copy });
     execSync("git branch feature origin/feature && git checkout -q -b task", { cwd: copy });
     repo = copy;
   }
