@@ -670,6 +670,16 @@ export const ChatMuxMessageSchema = MuxMessageSchema.extend({
   type: z.literal("message"),
 });
 
+/**
+ * Consecutive replayed history rows in order, as parsed by the wire schema (#4868). Sent only to
+ * onChat subscribers that pass `batchReplay: true`, to save one event/frame per row on large
+ * replays; clients unpack it into single `message` rows.
+ */
+export const ChatMuxMessageBatchSchema = z.object({
+  type: z.literal("message-batch"),
+  messages: z.array(ChatMuxMessageSchema),
+});
+
 export const GoalBudgetLimitedEventSchema = z.object({
   type: z.literal("goal-budget-limited"),
   workspaceId: z.string(),
@@ -795,6 +805,7 @@ export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
   ...WorkspaceInitEventSchema.def.options,
   // Chat messages with type discriminator
   ChatMuxMessageSchema,
+  ChatMuxMessageBatchSchema,
 ]);
 
 // Update Status

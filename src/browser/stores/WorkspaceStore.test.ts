@@ -1458,6 +1458,33 @@ describe("WorkspaceStore", () => {
 
       expect(listener).not.toHaveBeenCalled();
     });
+
+    it("applies a message-batch exactly like its rows (#4868)", async () => {
+      const replayed = [1, 2, 3].map((seq) => createHistoryMessageEvent(`history-${seq}`, seq));
+      const live = [4, 5].map((seq) => createHistoryMessageEvent(`live-${seq}`, seq));
+      const batch = (rows: WorkspaceChatMessage[]): WorkspaceChatMessage => ({
+        type: "message-batch",
+        messages: rows.flatMap((row) => (row.type === "message" ? [row] : [])),
+      });
+      // Before caught-up the rows go to the replay buffer; after it, down the live path.
+      const scripts: Record<string, WorkspaceChatMessage[]> = {
+        batched: [batch(replayed), fullCaughtUpEvent(3, "history-3"), batch(live)],
+        single: [...replayed, fullCaughtUpEvent(3, "history-3"), ...live],
+      };
+      mockOnChat.mockImplementation(async function* (input, options) {
+        yield* scripts[input?.workspaceId ?? ""] ?? [];
+        await waitForAbortSignal(options?.signal);
+      });
+
+      const transcript = async (workspaceId: string) => {
+        createAndAddWorkspace(store, workspaceId);
+        expect(
+          await waitUntil(() => store.getWorkspaceState(workspaceId).messages.length === 5)
+        ).toBe(true);
+        return JSON.stringify(store.getWorkspaceState(workspaceId).messages);
+      };
+      expect(await transcript("batched")).toBe(await transcript("single"));
+    });
   });
 
   describe("active workspace subscriptions", () => {
@@ -3185,7 +3212,11 @@ describe("WorkspaceStore", () => {
         await tick(10);
       }
 
-      expect(mockOnChat).toHaveBeenCalledWith({ workspaceId: "workspace-1" }, expect.anything());
+      // batchReplay: the store unpacks replay batches (#4868).
+      expect(mockOnChat).toHaveBeenCalledWith(
+        { workspaceId: "workspace-1", batchReplay: true },
+        expect.anything()
+      );
     });
 
     it("opens onChat without waiting on any other workspace RPC after activation", async () => {

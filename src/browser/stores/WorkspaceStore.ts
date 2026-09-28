@@ -4426,10 +4426,11 @@ export class WorkspaceStore {
         const legacyAutoRetryEnabled = typeof legacyRaw === "boolean" ? legacyRaw : undefined;
         if (legacyRaw !== undefined && legacyAutoRetryEnabled === undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
+        // batchReplay: this store unpacks `message-batch` replay events (#4868).
         const input =
           legacyAutoRetryEnabled === undefined
-            ? { workspaceId, mode }
-            : { workspaceId, mode, legacyAutoRetryEnabled };
+            ? { workspaceId, mode, batchReplay: true }
+            : { workspaceId, mode, legacyAutoRetryEnabled, batchReplay: true };
         const iterator = await client.workspace.onChat(input, { signal: attemptSignal });
         if (legacyAutoRetryEnabled !== undefined)
           updatePersistedState<boolean | undefined>(autoRetryKey, undefined);
@@ -4965,6 +4966,12 @@ export class WorkspaceStore {
     data: WorkspaceChatMessage,
     attemptContext?: OnChatAttemptContext
   ): void {
+    // Replay batch (#4868): consecutive history rows grouped to save one frame per row. Each row
+    // takes the single-row path, which old servers and non-batchable rows still use.
+    if (data.type === "message-batch") {
+      for (const row of data.messages) this.handleChatMessage(workspaceId, row, attemptContext);
+      return;
+    }
     // Aggregator must exist - workspaces are initialized in addWorkspace() before subscriptions run.
     const aggregator = this.assertGet(workspaceId);
 
