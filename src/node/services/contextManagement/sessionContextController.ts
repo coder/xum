@@ -331,6 +331,11 @@ export class SessionContextController {
     const consumedSwapPending = this.continuous.continuousCompactor.hasConsumedSwap();
     let continuousResult: "none" | "applied" | "fallback" = "none";
     if (continuousContext.enabled || consumedSwapPending) {
+      // Continuous mode reaches checkMidStream only past the force level, which is the relief bar
+      // itself, so feed its live reading to the no-relief guard (#4421, #4796) here. This is the
+      // scale continuous mode uses for its own force decision.
+      if (continuousContext.contextWindowTokens > 0)
+        this.compactionMonitor.noteLiveUsage(usagePercent);
       // One usage handler owns the eventual resume; observe itself shares its
       // latch result, which must not dispatch the continuation twice.
       const observed = await this.continuous.runContinuousCompactionObservation(async (token) => {

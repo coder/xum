@@ -31,6 +31,7 @@ import { historyWriteLockPath } from "./workspaceRemoval";
 import { HistoryService } from "./historyService";
 import { CompactionCancellation } from "./compactionCancellation";
 import { eventSpine } from "./events/eventSpine";
+import { waitForCondition } from "./testDispatchHelpers";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -1296,6 +1297,89 @@ describe("AgentSession continuous compaction wiring", () => {
         expect(history.at(-1)?.parts.find((part) => part.type === "text")).toMatchObject({
           text: "Continue",
         });
+      mock.restore();
+    }
+  );
+
+  // #4796: the failed-fast-apply fallback compaction follows the #4421 no-relief guard, so a
+  // provider that keeps reporting high usage cannot loop fallback compactions.
+  test.each(["user turn", "usage drop"] as const)(
+    "a failed fast apply under constant pressure compacts once until a %s releases the guard",
+    async (release) => {
+      const h = await setup(76);
+      const observe = spyOn(continuous(h.session).continuousCompactor, "observe");
+      observe.mockResolvedValue("none");
+      // 76% of gpt-4o's window: past the 75% force level of the default 70% threshold.
+      const highUsage = { inputTokens: 76 * 1_280, outputTokens: 1, totalTokens: 76 * 1_280 + 1 };
+      let streams = 0;
+      let compactions = 0;
+      let active = "";
+      spyOn(h.aiService, "streamMessage").mockImplementation((request) => {
+        streams++;
+        active = `assistant-${streams}`;
+        if (request.messages.at(-1)?.metadata?.muxMetadata?.type === "compaction-request")
+          compactions++;
+        h.aiEmitter.emit("stream-start", {
+          type: "stream-start",
+          workspaceId,
+          messageId: active,
+          model,
+          historySequence: streams,
+          startTime: Date.now(),
+        });
+        return Promise.resolve(Ok(createStartedTurnHandle(h.session.closingSignal)));
+      });
+      // The provider reports the same high usage when the fast-apply stop aborts the stream.
+      spyOn(h.aiService, "stopStream").mockImplementation(() => {
+        void runSessionTerminalPolicy(h.session, h.aiEmitter, {
+          type: "stream-abort",
+          workspaceId,
+          messageId: active,
+          abortReason: "system",
+          metadata: { contextUsage: highUsage },
+        });
+        return Promise.resolve(Ok(undefined));
+      });
+      const endActiveStream = (text: string) =>
+        runSessionTerminalPolicy(h.session, h.aiEmitter, {
+          type: "stream-end",
+          workspaceId,
+          messageId: active,
+          parts: [{ type: "text", text }],
+          metadata: { model, agentId: "exec", finishReason: "stop", contextUsage: highUsage },
+        });
+      const lastText = async () =>
+        (await rows(h)).at(-1)?.parts.find((part) => part.type === "text");
+
+      expect((await h.session.sendMessage("Working", sendOptions)).success).toBe(true);
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      expect(compactions).toBe(1);
+      // The fallback compaction completes; its follow-up resumes the turn.
+      await endActiveStream("Summary");
+      await waitForCondition(() => streams === 3, { timeoutMs: 5_000 });
+
+      // Pressure stays high and the next fast apply fails again: no second compaction.
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      expect({ compactions, streams }).toEqual({ compactions: 1, streams: 4 });
+      expect(await lastText()).toMatchObject({ text: "Continue" });
+
+      if (release === "user turn") {
+        await endActiveStream("Done");
+        expect((await h.session.sendMessage("Next", sendOptions)).success).toBe(true);
+        expect(streams).toBe(5);
+      } else {
+        // A live reading under the level that triggered the compaction proves it helped.
+        const observed = observe.mock.calls.length;
+        h.aiEmitter.emit("usage-delta", {
+          type: "usage-delta",
+          workspaceId,
+          messageId: active,
+          usage: { inputTokens: 10 * 1_280, outputTokens: 1, totalTokens: 10 * 1_280 + 1 },
+        });
+        await waitForCondition(() => observe.mock.calls.length > observed);
+      }
+      expect(await applyThenFinish(h.session, () => Promise.resolve(false))).toBe(false);
+      expect(compactions).toBe(2);
       mock.restore();
     }
   );

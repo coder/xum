@@ -146,11 +146,7 @@ export class CompactionMonitor {
 
     const usagePercent = (usageTokens / contextLimit) * 100;
     const forceThresholdPercent = params.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT;
-    // Relief counts only from a live provider reading of the prompt. The on-send usage state
-    // right after a compaction is an estimate (the summary's size), not a reading.
-    if (this.reliefBelowPercent !== null && usagePercent < this.reliefBelowPercent) {
-      this.reliefBelowPercent = null;
-    }
+    this.noteLiveUsage(usagePercent);
 
     if (usagePercent < forceThresholdPercent) {
       return false;
@@ -170,6 +166,17 @@ export class CompactionMonitor {
 
   resetForNewStream(): void {
     this.hasTriggeredForCurrentStream = false;
+  }
+
+  /**
+   * A live provider reading under the level that triggered the last auto-compaction proves it
+   * helped and lifts the guard. Relief counts only from a live reading of the prompt: the on-send
+   * usage state right after a compaction is an estimate (the summary's size), not a reading.
+   */
+  noteLiveUsage(usagePercent: number): void {
+    if (this.reliefBelowPercent !== null && usagePercent < this.reliefBelowPercent) {
+      this.reliefBelowPercent = null;
+    }
   }
 
   /** A real user turn re-arms auto-compaction even while pressure stays high. */
