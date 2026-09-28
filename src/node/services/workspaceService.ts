@@ -3532,18 +3532,14 @@ export class WorkspaceService
         "a devcontainer creation must roll back through DevcontainerRuntime"
       );
     }
-    if (
-      rolledBack &&
-      !isWorktreeRuntime(args.runtimeConfig) &&
-      !devcontainer &&
-      args.runtimeConfig.type !== "local"
-    ) {
-      // Remote deletes can reach state this creation did not make (#4775).
-      log.warn("Left the checkout of an aborted creation on a non-worktree runtime", {
-        workspaceId,
-        runtime: args.runtimeConfig.type,
-      });
-    } else if (rolledBack && (isWorktreeRuntime(args.runtimeConfig) || devcontainer)) {
+    // SSH, Docker and Coder creations have made nothing to delete by now (#4775): createWorkspace
+    // only computes their path or container name (Docker also checks that the name is free), and
+    // the checkout, container or Coder workspace comes from init, which starts after publication,
+    // when no rollback point is left. Their runtime deletes would instead reach state this
+    // creation did not make: an existing remote directory, or a container or Coder workspace of
+    // the same name. So nothing is deleted. (A new-mode Coder creation's provisioning token is
+    // not disposed here: #5113.)
+    if (rolledBack && (isWorktreeRuntime(args.runtimeConfig) || devcontainer)) {
       const force = checkout.startsWith("force-");
       const deleteOptions = { keepBranch: checkout.endsWith("-keep-branch") };
       // Worktree directories are named after the sanitized workspace name (branch names may
@@ -13054,9 +13050,15 @@ export class WorkspaceService
         await initSettled;
         const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
         const leftovers: string[] = [];
-        if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
-          // Matches the copy-failure cleanup above: the fork's checkout
-          // is known fresh, so force-delete is safe here.
+        // Every fork except a project-dir (local) one made its own checkout before registering:
+        // a new worktree (worktree, devcontainer), a remote worktree at a path the fork checked
+        // was free (SSH; Coder forks share the source's Coder workspace in existing mode, so the
+        // delete leaves that workspace alone), or a container under a name the fork refused to
+        // reuse (Docker). Init was aborted and awaited above, so this is the same full delete as
+        // the copy-failure cleanup. For a devcontainer it also removes the container the fork's
+        // init may have started, which holds the fork's plan copy (#4775).
+        if (rolledBack && forkedRuntimeConfig.type !== "local") {
+          // The fork's checkout is known fresh, so force-delete is safe here.
           const deleteResult = await targetRuntime
             .deleteWorkspace(
               foundProjectPath,
@@ -13087,9 +13089,9 @@ export class WorkspaceService
         }
         // A later workspace with this name would inherit the copy. Only once the entry is gone,
         // like the checkout: while it persists, the workspace still references its plan. Not for
-        // devcontainers: the copy is inside the container, and deletePlanFiles would remove the
-        // host file at the same path instead, which is not this fork's (#4775 keeps devcontainer
-        // fork rollback open).
+        // devcontainers: the copy is inside the container, which the delete above removed, and
+        // deletePlanFiles would remove the host file at the same path instead, which is not this
+        // fork's. A failed delete is already reported through the checkout it left.
         if (
           rolledBack &&
           copiedPlanPath !== undefined &&

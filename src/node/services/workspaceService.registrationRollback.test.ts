@@ -12,6 +12,8 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { DockerRuntime } from "@/node/runtime/DockerRuntime";
 import * as devcontainerCli from "@/node/runtime/devcontainerCli";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import { ContainerManager } from "@/node/multiProject/containerManager";
@@ -1060,6 +1062,80 @@ describe("WorkspaceService registration rollback (#4745)", () => {
         });
       }
     );
+
+    // Item 2, devcontainer forks: the fork started its init, and so possibly its container, before
+    // it registered. Its rollback removes that container (which holds the fork's plan copy) with
+    // the checkout, and keeps a branch the fork reused.
+    test.each([
+      { label: "a branch it made", existingBranch: false },
+      { label: "an existing branch", existingBranch: true },
+    ])(
+      "devcontainer fork rollback on $label removes its checkout and container",
+      async ({ existingBranch }) => {
+        await withTempMuxRoot(async () => {
+          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+          spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+          const source = await service.create(projectPath, "dcf-src", "main", undefined, {
+            type: "devcontainer",
+            configPath: ".devcontainer/devcontainer.json",
+          });
+          if (!source.success) throw new Error(source.error);
+          const tip = existingBranch ? branchWithOwnCommit(projectPath, "dcf") : undefined;
+
+          await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "dcf"));
+          expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("dcf");
+          if (tip === undefined) {
+            expect(git(projectPath, "branch", "--list", "dcf")).toBe("");
+          } else {
+            expect(git(projectPath, "rev-parse", "dcf")).toBe(tip);
+          }
+          expect(down.mock.calls.map(([folder]) => path.basename(folder))).toEqual(["dcf"]);
+          expect((await service.fork(source.data.metadata.id, "dcf")).success).toBe(true);
+        });
+      }
+    );
+
+    // Item 2, remote forks: an SSH fork made its remote worktree at a path it checked was free, and
+    // a Docker fork made a container under a name it refused to reuse, before registering. Both are
+    // removed; the SSH branch is kept, since the fork does not report whether it made it.
+    test.each([
+      {
+        label: "SSH",
+        runtimeConfig: { type: "ssh" as const, host: "example.invalid", srcBaseDir: "/remote/src" },
+        prototype: SSHRuntime.prototype,
+      },
+      {
+        label: "Docker",
+        runtimeConfig: { type: "docker" as const, image: "example/image" },
+        prototype: DockerRuntime.prototype,
+      },
+    ])("$label fork rollback removes the fork's checkout", async ({ runtimeConfig, prototype }) => {
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          id: "fffffffff1",
+          name: "remote-src",
+          path: "/remote/src/project/remote-src",
+          runtimeConfig,
+        });
+        return cfg;
+      });
+      spyOn(prototype, "forkWorkspace").mockResolvedValue({
+        success: true,
+        workspacePath: "/remote/src/project/remote-fork",
+        sourceBranch: "remote-src",
+      });
+      const deleteWorkspace = spyOn(prototype, "deleteWorkspace").mockResolvedValue({
+        success: true,
+        deletedPath: "/remote/src/project/remote-fork",
+      });
+      spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(undefined);
+
+      await expectFailsWithSaveError(() => service.fork("fffffffff1", "remote-fork"));
+      expect(deleteWorkspace).toHaveBeenCalledTimes(1);
+      expect(deleteWorkspace.mock.calls[0].slice(0, 3)).toEqual([projectPath, "remote-fork", true]);
+      expect(deleteWorkspace.mock.calls[0][5]).toEqual({ keepBranch: true });
+      expect(persistedWorkspaceIds()).toEqual(["fffffffff1"]);
+    });
 
     // #4936 gap 1: the multi-project runtime names the disposable paths it could not delete.
     test("multi-project fork names the checkout and container it could not delete", async () => {
