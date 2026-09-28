@@ -274,6 +274,26 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     });
   });
 
+  // A legacy `{ type: "local", srcBaseDir }` config is a worktree runtime, not a project-dir one.
+  test("fork of a legacy local-with-srcBaseDir workspace removes its worktree", async () => {
+    const source = await service.create(
+      projectPath,
+      "legacy-src",
+      "main",
+      undefined,
+      { type: "local", srcBaseDir },
+      undefined,
+      undefined,
+      undefined,
+      { awaitMaterialization: true }
+    );
+    if (!source.success) throw new Error(source.error);
+
+    await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "legacy-fork"));
+    expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("legacy-fork");
+    expect(git(projectPath, "branch", "--list", "legacy-fork")).toBe("");
+  });
+
   test("rename moves the checkout back and keeps the save error", async () => {
     const created = await createWorktree("before");
     if (!created.success) throw new Error(created.error);
