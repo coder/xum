@@ -752,7 +752,7 @@ describe.skipIf(process.platform === "win32")(
         // (The recorded last error alone is not trusted: exec failures report into it too.)
         const next = acquire(pool, config, 5_000);
         expect(String(await next.result)).toContain(stderr);
-        expect(next.waits).toHaveLength(1);
+        expect(next.waits.length).toBeGreaterThanOrEqual(1); // a sleep can wake just before the deadline
         expect(await calls()).toBe(2);
       }
     );
@@ -768,7 +768,7 @@ describe.skipIf(process.platform === "win32")(
       const { waits, result } = acquire(pool, config, 5_000);
       // The helper maps a successful acquisition to this marker error.
       expect(String(await result)).toContain("unexpectedly succeeded");
-      expect(waits).toHaveLength(1);
+      expect(waits.length).toBeGreaterThanOrEqual(1); // a sleep can wake just before the deadline
       expect(await calls()).toBe(1);
     });
 

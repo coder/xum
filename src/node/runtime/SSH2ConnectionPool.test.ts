@@ -153,7 +153,7 @@ describe.skipIf(process.platform === "win32")(
       // is not trusted: other writers report failures into it too.)
       const next = acquire(pool, config, 5_000);
       expect(String(await next.result)).toContain("All configured authentication methods failed");
-      expect(next.waits).toHaveLength(1);
+      expect(next.waits.length).toBeGreaterThanOrEqual(1); // a sleep can wake just before the deadline
       expect(connections).toBe(2);
     });
 
