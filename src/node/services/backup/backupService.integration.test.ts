@@ -651,4 +651,87 @@ describe("BackupService against a real repository", () => {
     ).toBe("rocket memory\n");
     expect(otherConfig.loadConfigOrDefault().projects.has(path.resolve(movedPath))).toBe(true);
   });
+
+  it("offers backed-up plugins from the cached backup, never the local export over it", async () => {
+    const sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    const grill = {
+      name: "grill",
+      scope: "global",
+      source: {
+        type: "git" as const,
+        url: "https://github.com/example/grill.git",
+        ref: "main",
+        refType: "branch" as const,
+      },
+      lockedSha: sha,
+      installedAt: "2026-08-01T12:00:00.000Z",
+    };
+    await writeFixtureFile(muxRoot, "plugins.json", JSON.stringify({ plugins: [grill] }));
+    await pushOrThrow();
+
+    // Target machine: the same repository, no plugins installed.
+    const otherRoot = path.join(tempDir, "other-root");
+    await fs.mkdir(otherRoot, { recursive: true });
+    const otherConfig = new Config(otherRoot);
+    const createOtherService = () =>
+      new BackupService(otherConfig, {
+        gitRepo: createBackupGitRepo({ cacheRoot: path.join(otherRoot, "backup-cache") }),
+        payload: createBackupPayloadStore({ config: otherConfig }),
+      });
+    const otherService = createOtherService();
+    const saved = await otherService.saveSettings(settings);
+    if (!saved.success) throw new Error(saved.error.message);
+
+    const preview = await otherService.preview(settings);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.pendingPlugins).toBe(1);
+    const restored = await otherService.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.pendingPlugins).toBe(1);
+    expect(await fs.readdir(otherRoot)).not.toContain("plugins.json");
+
+    // The preview exported this machine's payload over the checkout; a fresh service (an app
+    // restart) must still read the backup itself, from local objects only.
+    const pendingGrill = [
+      {
+        recipe: { name: "grill", source: grill.source, lockedSha: sha },
+        conflict: false,
+      },
+    ];
+    await otherService.preview(settings);
+    const afterPreview = await createOtherService().getPluginRecipes();
+    if (!afterPreview.success) throw new Error(afterPreview.error.message);
+    expect(afterPreview.data).toEqual(pendingGrill);
+
+    // A push that fails after its local commit leaves the backup as it was on the remote.
+    const objectsDir = path.join(originPath, "objects");
+    await fs.chmod(objectsDir, 0o555);
+    try {
+      const failed = await otherService.push(settings);
+      expect(failed.success).toBe(false);
+    } finally {
+      await fs.chmod(objectsDir, 0o755);
+    }
+    const afterFailedPush = await createOtherService().getPluginRecipes();
+    if (!afterFailedPush.success) throw new Error(afterFailedPush.error.message);
+    expect(afterFailedPush.data).toEqual(pendingGrill);
+
+    // Installed from the same source, at any commit, it is no longer offered.
+    await writeFixtureFile(
+      otherRoot,
+      "plugins.json",
+      JSON.stringify({ plugins: [{ ...grill, lockedSha: "b".repeat(40) }] })
+    );
+    const afterInstall = await otherService.getPluginRecipes();
+    if (!afterInstall.success) throw new Error(afterInstall.error.message);
+    expect(afterInstall.data).toEqual([]);
+
+    // A successful push replaces the backup; its recipes are what this machine has now.
+    await fs.rm(path.join(otherRoot, "plugins.json"));
+    const pushed = await otherService.push(settings);
+    if (!pushed.success) throw new Error(pushed.error.message);
+    const afterPush = await otherService.getPluginRecipes();
+    if (!afterPush.success) throw new Error(afterPush.error.message);
+    expect(afterPush.data).toEqual([]);
+  });
 });

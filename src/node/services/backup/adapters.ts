@@ -28,6 +28,10 @@ import {
 } from "@/node/config/projectRegistrationLock";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  PLUGIN_REGISTRY_FILE_NAME,
+  readPluginRegistryDocument,
+} from "@/node/services/agentPlugins/registry";
+import {
   BackupServiceError,
   type BackupGitRepo,
   type BackupPayloadStore,
@@ -68,6 +72,7 @@ import {
   localOnlyPayloadFiles,
   planRestoreWrites,
   readBackupPayload,
+  readManifestPreferences,
   restoreBackupPayload,
   backupSecretApprovalDigest,
   scanBackupFilesForSecrets,
@@ -89,6 +94,7 @@ import {
   projectBackupSettings,
   readBackupSettings,
 } from "./settingsProjection";
+import { pendingBackupPlugins, projectBackupPlugins, readBackupPlugins } from "./pluginsProjection";
 
 /**
  * Parses `git status --porcelain=v1 -z`, whose records are NUL-terminated with verbatim
@@ -137,6 +143,10 @@ export function createBackupGitRepo(options: {
       const cache = newCache(settings);
       const refs = await cache.lsRemote();
       return { credential: refs.credential, empty: refs.refs.size === 0 };
+    },
+
+    async readCachedBackupFile(settings, relativePath) {
+      return await newCache(settings).readCachedBackupFile(relativePath);
     },
 
     async prepare(settings, options) {
@@ -268,6 +278,25 @@ export function createBackupPayloadStore(options: {
     return await resolveContainedPath(repositoryRoot, segments.join("/"));
   }
 
+  /**
+   * Through the registry's lenient reader: an unreadable registry counts as empty here, and
+   * the installer, which reads it strictly, still refuses to install over it.
+   */
+  async function pluginRegistryEntries(): Promise<unknown[]> {
+    const registryFile = path.join(muxRoot, PLUGIN_REGISTRY_FILE_NAME);
+    return (await readPluginRegistryDocument(registryFile, "lenient")).rawEntries;
+  }
+
+  /** Reads the recipes without writing any plugin state, and counts those not installed here. */
+  async function readRestorablePlugins(
+    document: unknown
+  ): Promise<{ pendingPlugins: number; unsupported: string[] }> {
+    const { recipes, unsupported } = readBackupPlugins(document);
+    const pending =
+      recipes.length === 0 ? [] : pendingBackupPlugins(recipes, await pluginRegistryEntries());
+    return { pendingPlugins: pending.length, unsupported };
+  }
+
   function backupSettingsDiffer(a: ProjectsConfig, b: ProjectsConfig): boolean {
     return JSON.stringify(projectBackupSettings(a)) !== JSON.stringify(projectBackupSettings(b));
   }
@@ -291,6 +320,9 @@ export function createBackupPayloadStore(options: {
         contents.includePreferences && options.experiments !== undefined
           ? projectBackupExperiments(await options.experiments.getOverrides())
           : undefined,
+      plugins: contents.includePreferences
+        ? projectBackupPlugins(await pluginRegistryEntries())
+        : undefined,
       muxVersion: resolveMuxVersion(),
       sourceLabel: path.basename(muxRoot),
       // The service owns the user-facing override, so report rather than throw.
@@ -575,6 +607,7 @@ export function createBackupPayloadStore(options: {
           projectImports: [],
           projectBundleSkipped: false,
           unsupportedSettings: [],
+          pendingPlugins: 0,
         };
       }
 
@@ -593,6 +626,7 @@ export function createBackupPayloadStore(options: {
       );
       const changes: BackupFileChange[] = [];
       let unsupportedSettings: string[] = [];
+      let pendingPlugins = 0;
       for (const file of payload.files) {
         // Preferences live in config, and restore merges them rather than replacing the
         // file, so compare the merge result. A backup that only repeats values the local
@@ -604,7 +638,14 @@ export function createBackupPayloadStore(options: {
           const merged = mergeBackupPreferences(local, document);
           const backupSettings = readBackupSettings(document);
           const backupExperiments = readRestorableExperiments(document);
-          unsupportedSettings = [...backupSettings.unsupported, ...backupExperiments.unsupported];
+          const backupPlugins = await readRestorablePlugins(document);
+          pendingPlugins = backupPlugins.pendingPlugins;
+          unsupportedSettings = [
+            ...backupSettings.unsupported,
+            ...backupExperiments.unsupported,
+            ...backupPlugins.unsupported,
+          ];
+          // Plugin recipes are not a change: a restore offers them and writes nothing.
           if (
             !serializeBackupPreferences(local).equals(serializeBackupPreferences(merged)) ||
             (backupSettings.settings !== undefined &&
@@ -667,6 +708,7 @@ export function createBackupPayloadStore(options: {
         projectImports,
         projectBundleSkipped,
         unsupportedSettings,
+        pendingPlugins,
       };
     },
 
@@ -751,7 +793,11 @@ export function createBackupPayloadStore(options: {
 
       const restoreCore = async (
         registration: ProjectRegistrationLockHandle | null
-      ): Promise<{ localOnlyFiles: string[]; unsupportedSettings: string[] }> => {
+      ): Promise<{
+        localOnlyFiles: string[];
+        unsupportedSettings: string[];
+        pendingPlugins: number;
+      }> => {
         const result = await restoreBackupPayload({
           muxRoot,
           contents,
@@ -759,10 +805,19 @@ export function createBackupPayloadStore(options: {
           approvedCommandTokens: restoreOptions.approvedCommandTokens,
         });
         let unsupportedSettings: string[] = [];
+        let pendingPlugins = 0;
         if (result.backupPreferences !== undefined) {
           const backupSettings = readBackupSettings(result.backupPreferences);
           const backupExperiments = readRestorableExperiments(result.backupPreferences);
-          unsupportedSettings = [...backupSettings.unsupported, ...backupExperiments.unsupported];
+          // Recipes are only counted here, never installed: Settings → Plugins offers each one
+          // to the install preview, where the user reviews and confirms it.
+          const backupPlugins = await readRestorablePlugins(result.backupPreferences);
+          pendingPlugins = backupPlugins.pendingPlugins;
+          unsupportedSettings = [
+            ...backupSettings.unsupported,
+            ...backupExperiments.unsupported,
+            ...backupPlugins.unsupported,
+          ];
           let merged: ProjectsConfig | undefined;
           await options.config.editConfig(
             (current) => {
@@ -808,13 +863,13 @@ export function createBackupPayloadStore(options: {
             await options.experiments.applyOverrides(backupExperiments.experiments);
           }
         }
-        return { localOnlyFiles: result.localOnlyFiles, unsupportedSettings };
+        return { localOnlyFiles: result.localOnlyFiles, unsupportedSettings, pendingPlugins };
       };
 
       let projectBundleSkipped = false;
       const restoredProjectMemory: Array<{ projectPath: string; files: string[] }> = [];
       const memoryChanges: string[] = [];
-      let core: { localOnlyFiles: string[]; unsupportedSettings: string[] };
+      let core: { localOnlyFiles: string[]; unsupportedSettings: string[]; pendingPlugins: number };
       // The bundle itself is read here — the repo lock holds the checkout stable — but its
       // plan is computed inside the memory lock below, where the inputs it depends on are.
       const bundle = contents.includeProjects ? await readProjectBundle(sourceDir) : null;
@@ -944,8 +999,22 @@ export function createBackupPayloadStore(options: {
         localOnlyFiles: core.localOnlyFiles,
         projectBundleSkipped,
         unsupportedSettings: core.unsupportedSettings,
+        pendingPlugins: core.pendingPlugins,
         restoredProjectMemory,
       };
+    },
+
+    async pendingPluginRecipes(pendingOptions) {
+      const document = readManifestPreferences(
+        pendingOptions.manifest,
+        pendingOptions.preferences,
+        pendingOptions.contents
+      );
+      if (document === undefined) return [];
+      return pendingBackupPlugins(
+        readBackupPlugins(document).recipes,
+        await pluginRegistryEntries()
+      );
     },
 
     async prepareProjectImports(prepareOptions) {

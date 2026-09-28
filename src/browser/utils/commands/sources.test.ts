@@ -1723,6 +1723,44 @@ test("plugin component action is gated and only targets present managed installs
   }
 });
 
+test("install-from-backup action offers only installable recipes and opens the prefilled form", async () => {
+  const recipe = (name: string, url: string) => ({
+    name,
+    source: { type: "git" as const, url, ref: "main", refType: "branch" as const },
+    lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+  });
+  const grill = recipe("grill", "https://github.com/example/grill.git");
+  const openSettings = mock(() => undefined);
+  const api = createMockORPCClient({
+    backupPluginRecipes: [
+      { recipe: grill, conflict: false },
+      { recipe: recipe("forked", "https://github.com/someone-else/forked.git"), conflict: true },
+    ],
+  });
+  const install = mock(() => Promise.resolve({ success: false as const, error: "Must preview" }));
+  api.agentPlugins.install = install;
+  const action = mk({ api, agentPluginsEnabled: true, onOpenSettings: openSettings })
+    .flatMap((source) => source())
+    .find((candidate) => candidate.id === CommandIds.pluginsInstallFromBackup());
+  const field = action?.prompt?.fields[0];
+  if (field?.type !== "select" || !action?.prompt) {
+    throw new Error("Expected backed-up plugin picker");
+  }
+  expect((await field.getOptions({})).map((option) => option.id)).toEqual(["grill"]);
+
+  consumePendingPluginsSectionIntent();
+  await action.prompt.onSubmit({ pluginName: "grill" });
+  expect(consumePendingPluginsSectionIntent()).toEqual({
+    type: "install-from-backup",
+    recipe: grill,
+  });
+  // A conflicting name only navigates: the installer would refuse it.
+  await action.prompt.onSubmit({ pluginName: "forked" });
+  expect(consumePendingPluginsSectionIntent()).toBeNull();
+  expect(openSettings).toHaveBeenCalledWith("plugins");
+  expect(install).not.toHaveBeenCalled();
+});
+
 describe("Open Server Window palette action", () => {
   const makeBridge = (result: OpenLocalServerResult) =>
     ({

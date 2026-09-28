@@ -1491,6 +1491,151 @@ describe("backup adapters", () => {
     expect(await target.getOverrides()).toEqual({ [EXPERIMENT_IDS.TIMELINE]: true });
   });
 
+  it("exports plugin recipes and restores none of them as installs", async () => {
+    const sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0";
+    const installed = (name: string, url: string) => ({
+      name,
+      scope: "global",
+      source: { type: "git", url, ref: "main", refType: "branch" },
+      lockedSha: sha,
+      installedAt: "2026-08-01T12:00:00.000Z",
+      manifest: { version: "1.2.0" },
+      importedComponents: { skills: ["grill"], mcpServers: [] },
+      autoUpdate: false,
+    });
+    await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");
+    await writeFixtureFile(
+      muxRoot,
+      "plugins.json",
+      JSON.stringify({
+        plugins: [
+          installed("grill", "https://github.com/example/grill.git"),
+          installed("leaky", "https://octocat:ghp_leakedtoken@github.com/example/leaky.git"),
+          installed("local", "/Users/me/plugins/local"),
+        ],
+      })
+    );
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+    await createBackupPayloadStore({ config }).exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+    const published = path.join(repository.rootDir, settings.path);
+    const raw = await fs.readFile(path.join(published, "preferences.json"), "utf-8");
+    const document = JSON.parse(raw) as { plugins: unknown[] };
+    expect(document.plugins).toEqual([
+      {
+        name: "grill",
+        source: {
+          type: "git",
+          url: "https://github.com/example/grill.git",
+          ref: "main",
+          refType: "branch",
+        },
+        lockedSha: sha,
+        importedComponents: { skills: ["grill"], mcpServers: [] },
+      },
+    ]);
+    expect(raw).not.toContain("ghp_leakedtoken");
+    expect(raw).not.toContain("installedAt");
+
+    // What someone with write access to the repository could add.
+    const tampered = (name: string, changes: Record<string, unknown>) => ({
+      ...(document.plugins[0] as Record<string, unknown>),
+      name,
+      ...changes,
+    });
+    await tamperPublishedFile(
+      published,
+      "preferences.json",
+      JSON.stringify({
+        ...document,
+        plugins: [
+          ...document.plugins,
+          tampered("helper", {
+            source: { type: "git", url: "ext::sh -c id", ref: "main", refType: "branch" },
+          }),
+          tampered("creds", {
+            source: {
+              type: "git",
+              url: "https://user:secret@github.com/example/creds.git",
+              ref: "main",
+              refType: "branch",
+            },
+          }),
+          tampered("badsha", { lockedSha: "not-a-sha" }),
+        ],
+      })
+    );
+    const unsupported = ["plugins.helper", "plugins.creds", "plugins.badsha"];
+
+    const secondRoot = path.join(tempDir, "second-root");
+    await fs.mkdir(secondRoot, { recursive: true });
+    const target = createBackupPayloadStore({ config: new TestBackupConfig(secondRoot) });
+    const preview = await target.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+    expect(preview.pendingPlugins).toBe(1);
+    expect(preview.unsupportedSettings).toEqual(unsupported);
+
+    const restored = await target.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjects: [],
+    });
+    expect(restored.pendingPlugins).toBe(1);
+    expect(restored.unsupportedSettings).toEqual(unsupported);
+    expect(await fs.readFile(path.join(secondRoot, "AGENTS.md"), "utf-8")).toBe("backed up\n");
+    // Offered, never installed: no registry, no plugin directory, no plugin data.
+    expect(await fs.readdir(secondRoot)).not.toContainEqual(expect.stringMatching(/^plugin/));
+
+    // Restoring where the plugin is installed leaves the registry byte-for-byte alone.
+    const registryPath = path.join(muxRoot, "plugins.json");
+    const registryBefore = await fs.readFile(registryPath);
+    const mtimeBefore = (await fs.stat(registryPath)).mtimeMs;
+    const inPlace = await createBackupPayloadStore({ config }).restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+      snapshotPath: path.join(tempDir, "in-place-snapshot"),
+      matchedProjects: [],
+    });
+    expect(inPlace.pendingPlugins).toBe(0);
+    expect((await fs.readFile(registryPath)).equals(registryBefore)).toBe(true);
+    expect((await fs.stat(registryPath)).mtimeMs).toBe(mtimeBefore);
+  });
+
+  it("offers no plugins from a backup written before plugins were backed up", async () => {
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+    await createBackupPayloadStore({ config }).exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+    const published = path.join(repository.rootDir, settings.path);
+    const document = JSON.parse(
+      await fs.readFile(path.join(published, "preferences.json"), "utf-8")
+    ) as Record<string, unknown>;
+    expect(document).not.toHaveProperty("plugins");
+
+    const restored = await createBackupPayloadStore({ config }).restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjects: [],
+    });
+    expect(restored.pendingPlugins).toBe(0);
+    expect(restored.unsupportedSettings).toEqual([]);
+  });
+
   it("keeps preferences another window saved while the restore ran", async () => {
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
     await writeFixtureFile(muxRoot, "AGENTS.md", "backed up\n");

@@ -2528,6 +2528,10 @@ export const router = (authToken?: string) => {
         .input(schemas.backup.restore.input)
         .output(schemas.backup.restore.output)
         .handler(({ context, input }) => context.backupService.restoreWithApproval(input)),
+      getPluginRecipes: t
+        .input(schemas.backup.getPluginRecipes.input)
+        .output(schemas.backup.getPluginRecipes.output)
+        .handler(({ context }) => context.backupService.getPluginRecipes()),
     },
     ssh: {
       prompt: {

@@ -27,6 +27,7 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
 import type { BackupExperiments } from "./experimentsProjection";
+import type { BackupPluginRecipe } from "@/common/config/schemas/settingsBackup";
 import type { BackupSettings } from "./settingsProjection";
 
 export const BACKUP_SCHEMA_VERSION = 1;
@@ -143,6 +144,7 @@ export interface CreateBackupPayloadOptions {
   preferences?: UserPreferences;
   settings?: BackupSettings;
   experiments?: BackupExperiments;
+  plugins?: BackupPluginRecipe[];
   muxVersion: string;
   sourceLabel: string;
   exportedAt?: string;
@@ -894,21 +896,23 @@ function copyJson<T>(value: T): T {
 }
 
 /**
- * Top-level settings and experiment overrides ride inside preferences.json rather than in
- * payload files of their own: an older build's manifest parser refuses unknown payload paths,
- * while its non-strict UserPreferencesSchema strips the unknown `settings` and `experiments`
- * keys and restores what it understands.
+ * Top-level settings, experiment overrides, and plugin recipes ride inside preferences.json
+ * rather than in payload files of their own: an older build's manifest parser refuses unknown
+ * payload paths, while its non-strict UserPreferencesSchema strips the unknown `settings`,
+ * `experiments`, and `plugins` keys and restores what it understands.
  */
 export function serializeBackupPreferences(
   preferences: unknown,
   settings?: BackupSettings,
-  experiments?: BackupExperiments
+  experiments?: BackupExperiments,
+  plugins?: BackupPluginRecipe[]
 ): Buffer {
   const document: Record<string, unknown> = { ...projectBackupPreferences(preferences) };
   if (settings !== undefined && Object.keys(settings).length > 0) document.settings = settings;
   if (experiments !== undefined && Object.keys(experiments).length > 0) {
     document.experiments = experiments;
   }
+  if (plugins !== undefined && plugins.length > 0) document.plugins = plugins;
   return Buffer.from(`${JSON.stringify(document, null, 2)}\n`, "utf-8");
 }
 
@@ -1629,7 +1633,8 @@ export async function createBackupPayload(
       content: serializeBackupPreferences(
         options.preferences,
         options.settings,
-        options.experiments
+        options.experiments,
+        options.plugins
       ),
     });
   }
@@ -1904,6 +1909,30 @@ export function isParseableBackupManifest(raw: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * The preferences document of a backup read straight from git objects rather than a
+ * checkout, held to the same manifest a restore reads: undefined when the selection or the
+ * manifest leaves preferences.json out, and refused when its bytes are not the listed ones.
+ */
+export function readManifestPreferences(
+  manifestRaw: string,
+  preferencesRaw: string,
+  contents: BackupContents
+): unknown {
+  try {
+    const listed = parseManifest(manifestRaw, true, contents).files.find(
+      (file) => file.path === "preferences.json"
+    );
+    if (listed === undefined) return undefined;
+    if (sha256(Buffer.from(preferencesRaw, "utf-8")) !== listed.sha256) {
+      throw new Error("Backup checksum mismatch for 'preferences.json'");
+    }
+    return JSON.parse(preferencesRaw) as unknown;
+  } catch (error) {
+    throw new BackupInvalidPayloadError(error);
   }
 }
 

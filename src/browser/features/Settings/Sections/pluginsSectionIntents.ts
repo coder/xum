@@ -1,4 +1,5 @@
 import type { AgentPluginUpdateReview } from "@/common/orpc/schemas/agentPlugins";
+import type { BackupPluginRecipe } from "@/common/config/schemas/settingsBackup";
 
 /**
  * Intents for the Settings → Plugins section, published by command-palette
@@ -23,6 +24,8 @@ export type PluginsSectionIntent =
   | { type: "confirm-uninstall"; name: string }
   /** Show the in-place update review for a capability-changing update the palette previewed. */
   | { type: "review-update"; review: AgentPluginUpdateReview }
+  /** Open the Add Plugin form prefilled from a settings-backup recipe (still preview + confirm). */
+  | { type: "install-from-backup"; recipe: BackupPluginRecipe }
   /** Backend plugin state changed outside the section (e.g. palette Update All); re-query. */
   | { type: "refresh" };
 

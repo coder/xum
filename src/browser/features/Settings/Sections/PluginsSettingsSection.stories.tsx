@@ -514,3 +514,74 @@ export const UpdateRequiresReviewPhoneViewport: Story = {
     }
   },
 };
+
+const BACKUP_PLUGINS: NonNullable<MockORPCClientOptions["backupPluginRecipes"]> = [
+  {
+    recipe: {
+      name: MAX_LENGTH_NAME,
+      source: {
+        type: "git",
+        url: `https://github.com/example/${MAX_LENGTH_NAME}.git`,
+        ref: "main",
+        refType: "branch",
+      },
+      lockedSha: "e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4",
+      importedComponents: { skills: ["review"], mcpServers: [] },
+    },
+    conflict: false,
+  },
+  {
+    recipe: {
+      name: "grill",
+      source: {
+        type: "git",
+        url: "git@github.com:someone-else/grill.git",
+        ref: "v1.0.0",
+        refType: "tag",
+      },
+      lockedSha: "f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5",
+    },
+    conflict: true,
+  },
+];
+
+/**
+ * Recipes a restored settings backup offers: a not-installed plugin with a max-length name
+ * (worst case for wrapping) and a same-name conflict, which has no install action. Pinned to a
+ * phone viewport so the source line and action button must wrap inside the card.
+ */
+export const BackupRecipesPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{ agentPlugins: { items: [MANAGED_ITEM] }, backupPluginRecipes: BACKUP_PLUGINS }}
+    >
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await canvas.findByText("From your settings backup");
+    await canvas.findByText("conflict");
+    const reviewButtons = await canvas.findAllByRole("button", { name: /Review and install/ });
+    if (reviewButtons.length !== 1) {
+      throw new Error("Only the non-conflicting recipe may offer Review & install");
+    }
+    const card = (await canvas.findByText(MAX_LENGTH_NAME)).closest("div[class*='rounded-md']");
+    if (card instanceof HTMLElement && card.scrollWidth > card.clientWidth + 1) {
+      throw new Error("Backup recipe row overflows its card at phone width");
+    }
+  },
+};

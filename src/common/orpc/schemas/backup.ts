@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  BackupPluginRecipeSchema,
   SettingsBackupInputSchema,
   SettingsBackupSchema,
 } from "@/common/config/schemas/settingsBackup";
@@ -85,6 +86,18 @@ export const BackupOperationErrorSchema = z.object({
   snapshotPath: z.string().nullish(),
 });
 
+/**
+ * A plugin recipe from the backup that is not installed here. `conflict` means a plugin of
+ * that name is installed from a different source, so installing the recipe would be refused.
+ */
+export const BackupPendingPluginSchema = z.object({
+  recipe: BackupPluginRecipeSchema,
+  conflict: z.boolean(),
+});
+
+/** Backed-up plugins not installed here; `backup.getPluginRecipes` lists them. */
+const PendingPluginCountSchema = z.number().int().nonnegative();
+
 export const BackupFileChangeSchema = z.object({
   path: z.string(),
   status: z.string(),
@@ -131,6 +144,7 @@ export const backup = {
          * export); a restore keeps the local values for them.
          */
         unsupportedSettings: z.array(z.string()),
+        pendingPlugins: PendingPluginCountSchema,
         /**
          * Why the push half could not be computed, if it could not. The restore half is
          * still reported so a local export problem never blocks reviewing or approving
@@ -174,6 +188,7 @@ export const backup = {
         projectBundleSkipped: z.boolean(),
         /** Backed-up settings left at their local values; see the preview output. */
         unsupportedSettings: z.array(z.string()),
+        pendingPlugins: PendingPluginCountSchema,
         /**
          * Candidates left unimported for lack of approval (no preview, or unchecked). Fresh
          * tokens, so the UI can offer them for approval right away.
@@ -181,6 +196,14 @@ export const backup = {
         unapprovedProjectImports: z.array(BackupProjectImportSchema),
       })
     ),
+  },
+  /**
+   * Plugin recipes in the configured backup, as the local cache last fetched or pushed it,
+   * that are not installed here. Offline: no fetch, so a preview or restore refreshes it.
+   */
+  getPluginRecipes: {
+    input: z.void(),
+    output: BackupResult(z.array(BackupPendingPluginSchema)),
   },
 };
 
@@ -191,3 +214,4 @@ export type BackupCommandApproval = z.infer<typeof BackupCommandApprovalSchema>;
 export type BackupCredentialKind = z.infer<typeof BackupCredentialKindSchema>;
 export type BackupProjectImport = z.infer<typeof BackupProjectImportSchema>;
 export type BackupProjectImportResult = z.infer<typeof BackupProjectImportResultSchema>;
+export type BackupPendingPlugin = z.infer<typeof BackupPendingPluginSchema>;

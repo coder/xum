@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { ArchiveRestore, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
+import { ArchiveRestore, Blocks, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useExperimentValue } from "@/browser/contexts/ExperimentsContext";
+import { useSettings } from "@/browser/contexts/SettingsContext";
 import { seedConfigMirrors } from "@/browser/utils/configMirrors";
 import {
   formatKeybind,
@@ -24,6 +26,7 @@ import {
   type BackupContents,
 } from "@/common/config/schemas/settingsBackup";
 import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 
 type BackupRoute = keyof APIClient["backup"];
 type BackupRouteOutput<Route extends BackupRoute> = Awaited<ReturnType<APIClient["backup"][Route]>>;
@@ -248,6 +251,46 @@ function ChangeList(props: {
   );
 }
 
+/**
+ * Restore never installs plugins; it only reports the backed-up ones missing here, and
+ * Settings → Plugins offers each to the normal install preview. A separate component so the
+ * settings navigation is only required where it is rendered.
+ */
+function PendingBackupPluginsNotice(props: { count: number }) {
+  const settings = useSettings();
+  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
+  const summary = `${props.count} ${props.count === 1 ? "plugin" : "plugins"} from this backup ${
+    props.count === 1 ? "is" : "are"
+  } not installed here.`;
+  return (
+    <div className="border-border-light text-muted flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-xs">
+      {agentPluginsEnabled ? (
+        <>
+          <p className="min-w-0">
+            {summary} Nothing is installed until you review and confirm each one in Settings →
+            Plugins.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => settings.setActiveSection("plugins")}
+            className="w-full sm:w-auto"
+          >
+            <Blocks />
+            Review plugins
+          </Button>
+        </>
+      ) : (
+        <p className="min-w-0">
+          {summary} Plugins need the Agent Plugins experiment, which a restore never turns on:
+          enable it in Settings → Experiments on this machine, then review them in Settings →
+          Plugins.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Inside the Settings dialog isDialogOpen() is always true, so ownership is scoped to focus: act
 // only while focus is in the dialog hosting this section, never in a nested dialog or popover.
 // A nested dialog without a trigger drops focus to the body when it closes; the section owns the
@@ -288,6 +331,7 @@ export function BackupSection() {
   const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
   const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
   const [unsupportedSettings, setUnsupportedSettings] = useState<string[]>([]);
+  const [pendingPlugins, setPendingPlugins] = useState(0);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
@@ -350,6 +394,7 @@ export function BackupSection() {
           setProjectImportSelections({});
           setProjectBundleSkipped(false);
           setUnsupportedSettings([]);
+          setPendingPlugins(0);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -467,6 +512,7 @@ export function BackupSection() {
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setUnsupportedSettings([]);
+      setPendingPlugins(0);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -535,6 +581,7 @@ export function BackupSection() {
     setProjectImports([]);
     setProjectBundleSkipped(false);
     setUnsupportedSettings([]);
+    setPendingPlugins(0);
 
     try {
       const result = await api.backup.preview(savedDraft);
@@ -568,6 +615,7 @@ export function BackupSection() {
       });
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setUnsupportedSettings(result.data.unsupportedSettings);
+      setPendingPlugins(result.data.pendingPlugins);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -611,6 +659,7 @@ export function BackupSection() {
       setProjectImportSelections({});
       setProjectBundleSkipped(false);
       setUnsupportedSettings([]);
+      setPendingPlugins(0);
       setStatusMessage(
         `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
@@ -690,6 +739,7 @@ export function BackupSection() {
       );
       setProjectBundleSkipped(result.data.projectBundleSkipped);
       setUnsupportedSettings(result.data.unsupportedSettings);
+      setPendingPlugins(result.data.pendingPlugins);
       await reseedConfigMirrors(api);
       setStatusMessage(
         `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
@@ -1080,6 +1130,8 @@ export function BackupSection() {
           skipped. Enable “Include project list &amp; project memories” and save to restore it.
         </div>
       ) : null}
+
+      {pendingPlugins > 0 ? <PendingBackupPluginsNotice count={pendingPlugins} /> : null}
 
       {unsupportedSettings.length > 0 ? (
         <div className="border-border-light text-muted rounded-md border p-3 text-xs">

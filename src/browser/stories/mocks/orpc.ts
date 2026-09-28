@@ -346,6 +346,8 @@ export interface MockORPCClientOptions {
   backupPreview?: MockBackupData<"preview">;
   backupPush?: MockBackupData<"push">;
   backupRestore?: MockBackupData<"restore">;
+  /** Returned by backup.getPluginRecipes (Settings → Plugins "From your settings backup"). */
+  backupPluginRecipes?: MockBackupData<"getPluginRecipes">;
   /** Per-workspace runtime statuses for RuntimeStatusStore stories */
   runtimeStatuses?: Map<string, "running" | "stopped" | "unknown" | "unsupported">;
 }
@@ -471,6 +473,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     backupPreview,
     backupPush,
     backupRestore,
+    backupPluginRecipes,
     clearLogsResult = { success: true, error: null },
     runtimeStatuses = new Map<string, "running" | "stopped" | "unknown" | "unsupported">(),
   } = options;
@@ -668,6 +671,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     projectImports: [],
     projectBundleSkipped: false,
     unsupportedSettings: [],
+    pendingPlugins: 0,
     pushError: null,
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
@@ -684,6 +688,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     projectImportResults: [],
     projectBundleSkipped: false,
     unsupportedSettings: [],
+    pendingPlugins: 0,
     unapprovedProjectImports: [],
   };
 
@@ -796,6 +801,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({ success: true as const, data: backupPushResult }),
       restore: (_input: Parameters<APIClient["backup"]["restore"]>[0]) =>
         Promise.resolve({ success: true as const, data: backupRestoreResult }),
+      getPluginRecipes: () =>
+        Promise.resolve({ success: true as const, data: backupPluginRecipes ?? [] }),
     },
     // Settings → Layouts (layout presets)
     // Stored in-memory for Storybook only.

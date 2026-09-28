@@ -79,6 +79,7 @@ function createGitRepo(overrides: Partial<BackupGitRepo> = {}): BackupGitRepo {
     getPushChanges: () => Promise.resolve([]),
     commitAndPush: () =>
       Promise.resolve({ commit: "pushed-commit", changed: true, credential: "gh" as const }),
+    readCachedBackupFile: () => Promise.resolve(null),
     ...overrides,
   };
 }
@@ -94,6 +95,7 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         projectImports: [],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
       }),
     validateRestore: () =>
       Promise.resolve({ hasProjectBundle: false, projectImports: [], matchedProjects: [] }),
@@ -104,10 +106,12 @@ function createPayload(overrides: Partial<BackupPayloadStore> = {}): BackupPaylo
         localOnlyFiles: [],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         restoredProjectMemory: [],
       }),
     prepareProjectImports: () =>
       Promise.resolve(importsWith(() => Promise.resolve({ writtenFiles: [], skippedFiles: [] }))),
+    pendingPluginRecipes: () => Promise.resolve([]),
     ...overrides,
   };
 }
@@ -165,6 +169,44 @@ describe("BackupService", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
+  test("reads plugin recipes from the cache only for saved settings that select preferences", async () => {
+    const cachedReads: string[] = [];
+    const pending = [
+      {
+        recipe: {
+          name: "grill",
+          source: {
+            type: "git" as const,
+            url: "https://github.com/example/grill.git",
+            ref: "main",
+            refType: "branch" as const,
+          },
+          lockedSha: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        },
+        conflict: false,
+      },
+    ];
+    const service = createService(tempDir, {
+      gitRepo: createGitRepo({
+        prepare: () => Promise.reject(new Error("getPluginRecipes must not fetch")),
+        readCachedBackupFile: (_settings, relativePath) => {
+          cachedReads.push(relativePath);
+          return Promise.resolve({ manifest: "{}", content: "{}" });
+        },
+      }),
+      payload: createPayload({ pendingPluginRecipes: () => Promise.resolve(pending) }),
+    });
+
+    expect(await service.getPluginRecipes()).toEqual({ success: true, data: [] });
+    await service.saveSettings({ ...SETTINGS, includePreferences: false });
+    expect(await service.getPluginRecipes()).toEqual({ success: true, data: [] });
+    expect(cachedReads).toEqual([]);
+
+    await service.saveSettings(SETTINGS);
+    expect(await service.getPluginRecipes()).toEqual({ success: true, data: pending });
+    expect(cachedReads).toEqual(["preferences.json"]);
+  });
+
   test("creates a safety snapshot before restoring and records the restored commit", async () => {
     const events: string[] = [];
     const service = createService(tempDir, {
@@ -188,6 +230,7 @@ describe("BackupService", () => {
             localOnlyFiles: ["skills/local/SKILL.md"],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
             restoredProjectMemory: [],
           });
         },
@@ -384,6 +427,7 @@ describe("BackupService", () => {
             projectImports: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
           };
         },
       }),
@@ -430,6 +474,7 @@ describe("BackupService", () => {
             localOnlyFiles: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
             restoredProjectMemory: [],
           };
         },
@@ -545,6 +590,7 @@ describe("BackupService", () => {
             projectImports: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
           });
         },
         exportTo: () => {
@@ -582,6 +628,7 @@ describe("BackupService", () => {
             projectImports: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
           });
         },
         exportTo: (options) => {
@@ -603,6 +650,7 @@ describe("BackupService", () => {
             localOnlyFiles: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
             restoredProjectMemory: [],
           });
         },
@@ -2626,6 +2674,7 @@ describe("BackupService project imports", () => {
             localOnlyFiles: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
             restoredProjectMemory: [],
           });
         },
@@ -2660,6 +2709,7 @@ describe("BackupService project imports", () => {
             localOnlyFiles: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
             restoredProjectMemory: [
               {
                 projectPath: "/home/dev/src/matched",
@@ -2760,6 +2810,7 @@ describe("BackupService project imports", () => {
             localOnlyFiles: [],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
             restoredProjectMemory: [
               { projectPath: "/home/dev/src/alpha", files: ["memory/project/alpha-abc/notes.md"] },
             ],
@@ -2845,6 +2896,7 @@ describe("BackupService project imports", () => {
             projectImports: [fresh],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 0,
           }),
         exportTo: () => Promise.reject(new Error("Backup has more than 256 projects")),
       }),

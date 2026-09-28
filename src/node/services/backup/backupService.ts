@@ -19,6 +19,7 @@ import {
   type BackupCredentialKind,
   type BackupFileChange,
   type BackupOperationError,
+  type BackupPendingPlugin,
   type BackupProjectImport,
   type BackupProjectImportResult,
 } from "@/common/orpc/schemas/backup";
@@ -64,6 +65,14 @@ export interface BackupGitRepo {
     options?: { onPrepareError?(repositoryRoot: string): Promise<void> }
   ): Promise<PreparedBackupRepository>;
   getPushChanges(repository: PreparedBackupRepository): Promise<BackupFileChange[]>;
+  /**
+   * The manifest and one payload file of the backup as the local cache last fetched or pushed
+   * it, without touching the network; null when the cache holds no such backup.
+   */
+  readCachedBackupFile(
+    settings: SettingsBackupInput,
+    relativePath: string
+  ): Promise<{ manifest: string; content: string } | null>;
   commitAndPush(
     repository: PreparedBackupRepository,
     options: {
@@ -90,6 +99,8 @@ export interface BackupPayloadStore {
     projectImports: BackupProjectImport[];
     projectBundleSkipped: boolean;
     unsupportedSettings: string[];
+    /** Plugin recipes in the backup that are not installed here. */
+    pendingPlugins: number;
   }>;
   validateRestore(options: {
     repositoryRoot: string;
@@ -120,6 +131,7 @@ export interface BackupPayloadStore {
     localOnlyFiles: string[];
     projectBundleSkipped: boolean;
     unsupportedSettings: string[];
+    pendingPlugins: number;
     /** Matched memory actually written, per registered project, for change notification. */
     restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
   }>;
@@ -132,6 +144,12 @@ export interface BackupPayloadStore {
     repositoryRoot: string;
     managedPath: string;
   }): Promise<BackupProjectImporter>;
+  /** The plugin recipes a cached preferences document offers that are not installed here. */
+  pendingPluginRecipes(options: {
+    manifest: string;
+    preferences: string;
+    contents: BackupContents;
+  }): Promise<BackupPendingPlugin[]>;
 }
 
 /** A validated matched entry: the recorded source and the local project it restores into. */
@@ -557,6 +575,7 @@ export class BackupService {
         projectImports: BackupProjectImport[];
         projectBundleSkipped: boolean;
         unsupportedSettings: string[];
+        pendingPlugins: number;
         pushError: string | null;
       },
       BackupOperationError
@@ -599,6 +618,7 @@ export class BackupService {
         projectImports: restorePreview.projectImports,
         projectBundleSkipped: restorePreview.projectBundleSkipped,
         unsupportedSettings: restorePreview.unsupportedSettings,
+        pendingPlugins: restorePreview.pendingPlugins,
         pushError: "pushError" in exported ? exported.pushError : null,
       });
     });
@@ -687,6 +707,7 @@ export class BackupService {
         projectImportResults: BackupProjectImportResult[];
         projectBundleSkipped: boolean;
         unsupportedSettings: string[];
+        pendingPlugins: number;
         /**
          * Candidates the restore did not import because no approval was given — a restore
          * run without a preview, or with candidates left unchecked. Reported so a
@@ -805,6 +826,7 @@ export class BackupService {
               projectImportResults,
               projectBundleSkipped: restored.projectBundleSkipped,
               unsupportedSettings: restored.unsupportedSettings,
+              pendingPlugins: restored.pendingPlugins,
               unapprovedProjectImports: [
                 ...unapprovedProjectImports,
                 ...validated.projectImports.filter((candidate) =>
@@ -832,6 +854,34 @@ export class BackupService {
           await closeProjectImportTargets(plannedImports);
         }
       });
+    });
+  }
+
+  /**
+   * Plugins the configured backup would reinstall here, for Settings → Plugins to offer. Read
+   * from the backup as the local cache last fetched or pushed it, so opening the section never
+   * waits on the network; a preview or restore refreshes the cache. Only listed, never
+   * installed: each recipe goes through the normal install preview and its consent.
+   */
+  async getPluginRecipes(): Promise<Result<BackupPendingPlugin[], BackupOperationError>> {
+    const settings = this.getSettings();
+    if (settings === null) return Ok([]);
+    return this.withRepoLock(settings, async (normalized) => {
+      const contents = resolveBackupContents(normalized);
+      // The recipes ride in preferences.json, so they follow its selection like a restore.
+      if (!contents.includePreferences) return Ok([]);
+      const cached = await this.dependencies.gitRepo.readCachedBackupFile(
+        normalized,
+        "preferences.json"
+      );
+      if (cached === null) return Ok([]);
+      return Ok(
+        await this.dependencies.payload.pendingPluginRecipes({
+          manifest: cached.manifest,
+          preferences: cached.content,
+          contents,
+        })
+      );
     });
   }
 

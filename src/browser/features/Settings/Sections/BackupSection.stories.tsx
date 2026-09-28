@@ -58,6 +58,7 @@ function renderBackupSection() {
             ],
             projectBundleSkipped: false,
             unsupportedSettings: [],
+            pendingPlugins: 2,
             pushError: null,
           },
         })
@@ -84,6 +85,7 @@ export const Configured: Story = {
     await canvas.findByText("agents/local-only.md");
     await canvas.findByRole("checkbox", { name: "Approve MCP command changes" });
     await canvas.findByText("Projects to reimport");
+    await canvas.findByText(/2 plugins from this backup are not installed here/);
   },
 };
 

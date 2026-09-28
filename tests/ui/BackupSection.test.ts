@@ -63,6 +63,7 @@ function renderBackupSection(
       projectImports: [],
       projectBundleSkipped: false,
       unsupportedSettings: [],
+      pendingPlugins: 0,
       pushError: null,
     },
     backupRestore: {
@@ -73,6 +74,7 @@ function renderBackupSection(
       projectImportResults: [],
       projectBundleSkipped: false,
       unsupportedSettings: [],
+      pendingPlugins: 0,
       unapprovedProjectImports: [],
     },
     ...overrides,
@@ -615,6 +617,7 @@ describe("BackupSection", () => {
         projectImports: [],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
     });
@@ -680,6 +683,7 @@ describe("BackupSection", () => {
         projectImports: [],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
     });
@@ -728,6 +732,7 @@ describe("BackupSection", () => {
         projectImportResults: [],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         unapprovedProjectImports: [],
       },
     });
@@ -782,6 +787,7 @@ describe("BackupSection", () => {
         projectImports: [candidate, unapproved],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
       backupRestore: {
@@ -802,6 +808,7 @@ describe("BackupSection", () => {
         ],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         unapprovedProjectImports: [],
       },
     });
@@ -848,6 +855,7 @@ describe("BackupSection", () => {
         projectImports: [candidate],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
       backupRestore: {
@@ -869,6 +877,7 @@ describe("BackupSection", () => {
         ],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         // The backend re-offers a conflicted import; the UI must not call it done.
         unapprovedProjectImports: [candidate],
       },
@@ -921,6 +930,7 @@ describe("BackupSection", () => {
       ],
       projectBundleSkipped: false,
       unsupportedSettings: [],
+      pendingPlugins: 0,
       unapprovedProjectImports: attemptResult.skippedFiles.length > 0 ? [candidate] : [],
     });
     const { view } = renderBackupSection(
@@ -934,6 +944,7 @@ describe("BackupSection", () => {
           projectImports: [candidate],
           projectBundleSkipped: false,
           unsupportedSettings: [],
+          pendingPlugins: 0,
           pushError: null,
         },
       },
@@ -1024,6 +1035,7 @@ describe("BackupSection", () => {
         projectImports: [staleCandidate],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
     });
@@ -1074,6 +1086,7 @@ describe("BackupSection", () => {
         ],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
     });
@@ -1100,6 +1113,7 @@ describe("BackupSection", () => {
         projectImports: [],
         projectBundleSkipped: false,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: "mcp.jsonc is not valid JSONC",
       },
     });
@@ -1123,6 +1137,7 @@ describe("BackupSection", () => {
         projectImports: [],
         projectBundleSkipped: true,
         unsupportedSettings: [],
+        pendingPlugins: 0,
         pushError: null,
       },
     });
@@ -1144,6 +1159,7 @@ describe("BackupSection", () => {
         projectImports: [],
         projectBundleSkipped: false,
         unsupportedSettings: ["agentAiDefaults", "defaultRuntime"],
+        pendingPlugins: 0,
         pushError: null,
       },
     });

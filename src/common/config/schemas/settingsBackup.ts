@@ -1,5 +1,9 @@
 import { z } from "zod";
 import { SSH_PROTOCOL_SCHEMES } from "@/constants/git";
+import {
+  AgentPluginGitSourceSchema,
+  AgentPluginInstallEntrySchema,
+} from "@/common/config/schemas/agentPluginInstalls";
 
 /**
  * Backup paths must be portable to Git for Windows. This rejects reserved device names,
@@ -266,6 +270,49 @@ export const BackupProjectBundleManifestSchema = z.object({
 
 export type BackupProjectBundleEntry = z.infer<typeof BackupProjectBundleEntrySchema>;
 export type BackupProjectBundleManifest = z.infer<typeof BackupProjectBundleManifestSchema>;
+
+/** Bounds a backup's plugin recipes the way the project bundle bounds its entries. */
+export const MAX_BACKUP_PLUGIN_RECIPES = 256;
+const MAX_BACKUP_PLUGIN_COMPONENTS = 1024;
+const MAX_BACKUP_PLUGIN_FIELD_CHARS = 256;
+const FULL_COMMIT_SHA = /^[0-9a-f]{40}$/i;
+// eslint-disable-next-line no-control-regex
+const PRINTABLE_TOKEN = /^[^\s\u0000-\u001f\u007f]+$/;
+
+const BackupPluginComponentNamesSchema = z
+  .array(z.string().min(1).max(MAX_BACKUP_PLUGIN_FIELD_CHARS))
+  .max(MAX_BACKUP_PLUGIN_COMPONENTS);
+
+/**
+ * A reinstall recipe for one managed plugin, carried in a backup's preferences.json. The
+ * backup is repository-controlled and a plugin runs third-party code, so a restore never
+ * installs a recipe: it only offers it to the normal install preview, where the user sees
+ * everything the plugin contributes and confirms. Every field is checked anyway, before it
+ * reaches IPC, the renderer, or git: the URL must be a plain remote that is safe to publish
+ * (no credentials, local paths, or `transport::` helpers), and the pinned commit a full SHA.
+ * Unknown keys are stripped rather than refused so a newer build's recipe still restores.
+ */
+export const BackupPluginRecipeSchema = z
+  .object({
+    name: AgentPluginInstallEntrySchema.shape.name,
+    source: AgentPluginGitSourceSchema.extend({
+      url: z.string().refine((url) => sanitizeBackupGitRemote(url) === url),
+      ref: z.string().max(MAX_BACKUP_PLUGIN_FIELD_CHARS).regex(PRINTABLE_TOKEN),
+      subpath: z.string().max(1024).refine(isValidBackupPath).optional(),
+    }),
+    lockedSha: z.string().regex(FULL_COMMIT_SHA),
+    importedComponents: z
+      .object({
+        skills: BackupPluginComponentNamesSchema,
+        mcpServers: BackupPluginComponentNamesSchema,
+      })
+      .optional(),
+  })
+  .refine(
+    (recipe) => recipe.source.refType !== "commit" || FULL_COMMIT_SHA.test(recipe.source.ref)
+  );
+
+export type BackupPluginRecipe = z.infer<typeof BackupPluginRecipeSchema>;
 
 /**
  * What a backup carries, and what a restore writes; one selection governs both directions.

@@ -22,6 +22,8 @@ import type {
   AgentPluginUpdateReview,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
+import type { BackupPluginRecipe } from "@/common/config/schemas/settingsBackup";
+import type { BackupPendingPlugin } from "@/common/orpc/schemas/backup";
 import { getErrorMessage } from "@/common/utils/errors";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
@@ -397,14 +399,36 @@ const ManageComponentsPanel: React.FC<{
   );
 };
 
+/**
+ * The initial consent selection for a preview: everything it offers, or, for a backup recipe,
+ * the recorded selection limited to what this tree still offers. A recipe without one came
+ * from an import-everything install.
+ */
+function previewSelection(
+  preview: AgentPluginInstallPreview,
+  recorded: AgentPluginImportedComponents | undefined
+): AgentPluginImportedComponents {
+  const skills = preview.skills.map((skill) => skill.name);
+  const mcpServers = preview.mcpServers.map((server) => server.serverName);
+  if (recorded === undefined) return { skills, mcpServers };
+  return {
+    skills: skills.filter((name) => recorded.skills.includes(name)),
+    mcpServers: mcpServers.filter((name) => recorded.mcpServers.includes(name)),
+  };
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
+  /** Prefills the form from a settings-backup recipe; preview and confirm stay the same. */
+  recipe?: BackupPluginRecipe;
   onInstalled: () => void;
   onClose: () => void;
 }> = (props) => {
   const { api } = useAPI();
-  const [input, setInput] = useState("");
-  const [ref, setRef] = useState("");
+  const [input, setInput] = useState(props.recipe?.source.url ?? "");
+  // The pinned commit rather than the recorded branch or tag, so the preview resolves to
+  // exactly the tree the backed-up install ran.
+  const [ref, setRef] = useState(props.recipe?.lockedSha ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
@@ -412,6 +436,12 @@ const AddPluginPanel: React.FC<{
     skills: [],
     mcpServers: [],
   });
+  // The recipe describes its own source and commit only; once the user edits either field,
+  // this is a different install and none of the recipe's metadata applies to it.
+  const recipe =
+    input.trim() === props.recipe?.source.url && ref.trim() === props.recipe.lockedSha
+      ? props.recipe
+      : undefined;
 
   const handlePreview = async () => {
     if (!api || input.trim().length === 0 || busy) return;
@@ -421,14 +451,20 @@ const AddPluginPanel: React.FC<{
       const result = await api.agentPlugins.preview({
         input: input.trim(),
         ref: ref.trim().length > 0 ? ref.trim() : null,
+        ...(recipe?.source.subpath !== undefined ? { subpath: recipe.source.subpath } : {}),
       });
       if (result.success) {
         setPreview(result.data);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
-        setSelected({
-          skills: result.data.skills.map((skill) => skill.name),
-          mcpServers: result.data.mcpServers.map((server) => server.serverName),
-        });
+        setSelected(
+          previewSelection(
+            result.data,
+            recipe !== undefined &&
+              result.data.lockedSha.toLowerCase() === recipe.lockedSha.toLowerCase()
+              ? recipe.importedComponents
+              : undefined
+          )
+        );
       } else {
         setError(result.error);
       }
@@ -555,6 +591,13 @@ const AddPluginPanel: React.FC<{
               {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
               {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
             </p>
+            {recipe !== undefined && (
+              <p className="text-muted text-[11px] break-all">
+                From your settings backup, where it tracked {recipe.source.refType}{" "}
+                {recipe.source.ref}. This install is pinned to the recorded commit; to track{" "}
+                {recipe.source.ref} again, install it from that ref instead.
+              </p>
+            )}
           </div>
 
           {preview.warnings.length > 0 && (
@@ -825,7 +868,15 @@ export const PluginsSettingsSection: React.FC = () => {
   // (same-route navigation preserves the mounted component, so no re-init
   // happens).
   const [initialIntent] = useState(() => consumePendingPluginsSectionIntent());
-  const [addOpen, setAddOpen] = useState(initialIntent?.type === "open-add-panel");
+  const [addOpen, setAddOpen] = useState(
+    initialIntent?.type === "open-add-panel" || initialIntent?.type === "install-from-backup"
+  );
+  /** The settings-backup recipe the Add Plugin form was opened from, if any. */
+  const [addRecipe, setAddRecipe] = useState<BackupPluginRecipe | null>(
+    initialIntent?.type === "install-from-backup" ? initialIntent.recipe : null
+  );
+  const [backupPlugins, setBackupPlugins] = useState<BackupPendingPlugin[]>([]);
+  const [backupPluginsError, setBackupPluginsError] = useState<string | null>(null);
   const [uninstallTarget, setUninstallTarget] = useState<string | null>(
     initialIntent?.type === "confirm-uninstall" ? initialIntent.name : null
   );
@@ -842,14 +893,38 @@ export const PluginsSettingsSection: React.FC = () => {
   /** Monotonic ids of the latest list/update-check requests; stale responses must not commit state. */
   const listGenerationRef = useRef(0);
   const checkGenerationRef = useRef(0);
+  const backupGenerationRef = useRef(0);
 
-  const openAddPanel = () => {
+  const openAddPanel = (recipe?: BackupPluginRecipe) => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
+    setAddRecipe(recipe ?? null);
     setAddOpen(true);
   };
 
-  const refresh = async () => {
+  const closeAddPanel = () => {
+    setAddOpen(false);
+    setAddRecipe(null);
+  };
+
+  /** Re-read with the list: installing or uninstalling changes which recipes are pending. */
+  const refreshBackupPlugins = async () => {
+    if (!api) return;
+    const generation = ++backupGenerationRef.current;
+    try {
+      const result = await api.backup.getPluginRecipes();
+      if (generation !== backupGenerationRef.current) return;
+      setBackupPlugins(result.success ? result.data : []);
+      setBackupPluginsError(result.success ? null : result.error.message);
+    } catch (err) {
+      if (generation === backupGenerationRef.current) {
+        setBackupPlugins([]);
+        setBackupPluginsError(getErrorMessage(err));
+      }
+    }
+  };
+
+  const refreshList = async () => {
     if (!api) return;
     // Overlapping list requests race the same way update checks do (mount
     // fetch vs a refresh published after a palette mutation): an older
@@ -873,6 +948,10 @@ export const PluginsSettingsSection: React.FC = () => {
         setError(getErrorMessage(err));
       }
     }
+  };
+
+  const refresh = async () => {
+    await Promise.all([refreshList(), refreshBackupPlugins()]);
   };
 
   const checkForUpdates = async () => {
@@ -918,6 +997,9 @@ export const PluginsSettingsSection: React.FC = () => {
       switch (intent.type) {
         case "open-add-panel":
           openAddPanel();
+          break;
+        case "install-from-backup":
+          openAddPanel(intent.recipe);
           break;
         case "manage-components":
           setComponentsTarget(intent.name);
@@ -1054,6 +1136,63 @@ export const PluginsSettingsSection: React.FC = () => {
         </p>
       </div>
 
+      {(backupPlugins.length > 0 || backupPluginsError !== null) && (
+        <div>
+          <h3 className="text-foreground mb-1 text-sm font-medium">From your settings backup</h3>
+          <p className="text-muted mb-3 text-xs">
+            These plugins were installed where your settings backup was made. Nothing is installed
+            until you review a plugin&apos;s install preview and confirm it; each one installs at
+            the commit the backup recorded.
+          </p>
+          {backupPluginsError !== null && (
+            <div className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+              <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              <span className="break-words">
+                Could not read plugins from your settings backup: {backupPluginsError}
+              </span>
+            </div>
+          )}
+          <div className="space-y-2">
+            {backupPlugins.map(({ recipe, conflict }) => (
+              <div key={recipe.name} className="border-border-medium rounded-md border p-3">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-baseline gap-2">
+                      <span className="text-foreground text-sm font-medium break-all">
+                        {recipe.name}
+                      </span>
+                      {conflict && <Badge tone="warning">conflict</Badge>}
+                    </div>
+                    {/* Repository-controlled text, rendered inert: never a link. */}
+                    <p className="text-muted mt-0.5 text-[11px] break-all">
+                      {recipe.source.url} @ {recipe.source.ref} · {recipe.lockedSha.slice(0, 12)}
+                    </p>
+                    {conflict && (
+                      <p className="text-warning mt-0.5 text-[11px] break-words">
+                        A plugin with this name is installed here from a different source, so this
+                        one cannot be installed next to it.
+                      </p>
+                    )}
+                  </div>
+                  {!conflict && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-xs"
+                      disabled={busyPlugin !== null}
+                      onClick={() => openAddPanel(recipe)}
+                      aria-label={`Review and install ${recipe.name}`}
+                    >
+                      Review &amp; install
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-foreground text-sm font-medium">Installed plugins</h3>
@@ -1072,7 +1211,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={openAddPanel}>
+              <Button size="sm" onClick={() => openAddPanel()}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -1083,13 +1222,16 @@ export const PluginsSettingsSection: React.FC = () => {
         {addOpen && (
           <div className="mb-4">
             <AddPluginPanel
+              // A new recipe (or none) starts a fresh form rather than editing the last one.
+              key={addRecipe === null ? "manual" : `backup:${addRecipe.name}`}
+              recipe={addRecipe ?? undefined}
               onInstalled={() => {
-                setAddOpen(false);
+                closeAddPanel();
                 setInstallSucceeded(true);
                 void refresh();
                 void checkForUpdates();
               }}
-              onClose={() => setAddOpen(false)}
+              onClose={closeAddPanel}
             />
           </div>
         )}

@@ -104,6 +104,8 @@ export const CommandIds = {
 
   // Agent Plugin commands (agent-plugins experiment)
   pluginsInstall: () => "plugins:install" as const,
+  pluginsReviewBackup: () => "plugins:review-backup" as const,
+  pluginsInstallFromBackup: () => "plugins:install-from-backup" as const,
   pluginsManageComponents: () => "plugins:manage-components" as const,
   pluginsUninstall: () => "plugins:uninstall" as const,
   pluginsCheckUpdates: () => "plugins:check-updates" as const,

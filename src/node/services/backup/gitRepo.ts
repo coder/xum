@@ -1061,16 +1061,23 @@ export class BackupRepoCache {
    * broken or oversized tree under the other spelling can never block the backup that is
    * actually in use, and pushes update the backup where it lives instead of forking it.
    */
-  private async resolveEffectiveManagedPath(remoteCommit: string | null): Promise<string> {
+  private async resolveEffectiveManagedPath(
+    remoteCommit: string | null,
+    options: { offline?: boolean } = {}
+  ): Promise<string> {
     const [configured, ...legacySpellings] = listBackupManagedPathSpellings(
       this.options.managedPath
     );
     if (remoteCommit === null || legacySpellings.length === 0) return configured;
-    if (await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(configured))) {
+    if (
+      await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(configured), options)
+    ) {
       return configured;
     }
     for (const legacy of legacySpellings) {
-      if (await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(legacy))) {
+      if (
+        await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(legacy), options)
+      ) {
         return legacy;
       }
     }
@@ -1087,21 +1094,82 @@ export class BackupRepoCache {
    */
   private async treeHasReadableBackupManifest(
     remoteCommit: string,
-    readPath: string
+    readPath: string,
+    options: { offline?: boolean } = {}
   ): Promise<boolean> {
+    const objectId = await this.blobIdAt(remoteCommit, `${readPath}/${BACKUP_MANIFEST_FILE}`);
+    if (objectId === null) return false;
+    const manifest =
+      options.offline === true
+        ? await this.readLocalBlob(objectId).catch(() => null)
+        : await this.readProbedBlob(objectId);
+    return manifest !== null && isParseableBackupManifest(manifest);
+  }
+
+  /** The id of the blob at `filePath` in `commit`; null when the path is not a blob there. */
+  private async blobIdAt(commit: string, filePath: string): Promise<string | null> {
     const { stdout } = await this.localGit(
-      ["ls-tree", "-z", remoteCommit, "--", `:(top,literal)${readPath}/${BACKUP_MANIFEST_FILE}`],
+      ["ls-tree", "-z", commit, "--", `:(top,literal)${filePath}`],
       { env: { GIT_NO_LAZY_FETCH: "1" }, maxOutputBytes: MANIFEST_LOOKUP_MAX_OUTPUT_BYTES }
     );
     const record = stdout.split("\0")[0] ?? "";
     const separator = record.indexOf("\t");
-    if (separator < 0) return false;
+    if (separator < 0) return null;
     const [, objectType, objectId] = record.slice(0, separator).trim().split(/\s+/);
     if (objectType !== "blob" || objectId === undefined || !/^[0-9a-f]{40,64}$/.test(objectId)) {
-      return false;
+      return null;
     }
-    const manifest = await this.readProbedBlob(objectId);
-    return manifest !== null && isParseableBackupManifest(manifest);
+    return objectId;
+  }
+
+  private async readLocalBlob(objectId: string): Promise<string> {
+    return (
+      await this.localGit(["cat-file", "blob", objectId], {
+        env: { GIT_NO_LAZY_FETCH: "1" },
+        maxOutputBytes: MAX_BACKUP_FILE_BYTES,
+      })
+    ).stdout;
+  }
+
+  /**
+   * `manifest.json` and one payload file of the backup as this cache last fetched or pushed
+   * it, from local objects only: it never fetches, so it answers offline. The remote-tracking
+   * ref rather than HEAD, which a push that committed but then failed leaves on the local
+   * export, and rather than the checkout, which every preview overwrites with the local
+   * export. Null when there is no cache, no fetched branch, or no such file.
+   */
+  async readCachedBackupFile(
+    relativePath: string
+  ): Promise<{ manifest: string; content: string } | null> {
+    await assertNotSymlink(this.options.cacheRoot);
+    await assertNotSymlink(this.cachePath);
+    await assertOwnGitDirectory(this.cachePath);
+    if (!(await isCompleteGitDirectory(path.join(this.cachePath, ".git")))) return null;
+    const commit = await this.remoteBranchCommit();
+    if (commit === null) return null;
+    const managedPath = safeRelativePath(
+      await this.resolveEffectiveManagedPath(commit, { offline: true })
+    );
+    const manifestId = await this.blobIdAt(commit, `${managedPath}/${BACKUP_MANIFEST_FILE}`);
+    const contentId = await this.blobIdAt(
+      commit,
+      `${managedPath}/${safeRelativePath(relativePath)}`
+    );
+    if (manifestId === null || contentId === null) return null;
+    try {
+      return {
+        manifest: await this.readLocalBlob(manifestId),
+        content: await this.readLocalBlob(contentId),
+      };
+    } catch (error) {
+      // An object the partial clone never received, or one past the payload limit: only a
+      // fresh preview can tell which, and saying nothing would read as "nothing to offer".
+      throw new BackupInvalidPayloadError(
+        new Error("The local backup cache cannot be read; preview the backup again", {
+          cause: error,
+        })
+      );
+    }
   }
 
   /**
@@ -1113,16 +1181,12 @@ export class BackupRepoCache {
    * the streaming cap kills the read as soon as it passes the limit.
    */
   private async readProbedBlob(objectId: string): Promise<string | null> {
-    const read = () =>
-      this.localGit(["cat-file", "blob", objectId], {
-        env: { GIT_NO_LAZY_FETCH: "1" },
-        maxOutputBytes: MAX_BACKUP_FILE_BYTES,
-      });
+    const read = () => this.readLocalBlob(objectId);
     const isOverLimit = (error: unknown) =>
       error instanceof Error &&
       error.message === `Command produced more than ${MAX_BACKUP_FILE_BYTES} bytes of output`;
     try {
-      return (await read()).stdout;
+      return await read();
     } catch (error) {
       // Over-limit is definitive: the blob exists locally and is too large, so fetching
       // it again could only re-buffer the same oversized bytes.
@@ -1143,7 +1207,7 @@ export class BackupRepoCache {
       await this.assertObjectStoreWithinBudget();
     }
     try {
-      return (await read()).stdout;
+      return await read();
     } catch {
       return null;
     }

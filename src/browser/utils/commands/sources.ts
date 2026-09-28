@@ -13,6 +13,7 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { BackupPluginRecipe } from "@/common/config/schemas/settingsBackup";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getFastModeProvider } from "@/browser/utils/fastModeServiceTier";
 import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
@@ -206,6 +207,16 @@ const section = {
   settings: COMMAND_SECTIONS.SETTINGS,
   goals: COMMAND_SECTIONS.GOALS,
 };
+
+/** Backed-up plugins the Add Plugin form can take; a conflicting name would be refused. */
+async function listInstallableBackupRecipes(
+  api: APIClient | null | undefined
+): Promise<BackupPluginRecipe[]> {
+  const result = await api?.backup.getPluginRecipes();
+  return result?.success
+    ? result.data.filter((pending) => !pending.conflict).map((pending) => pending.recipe)
+    : [];
+}
 
 function toFileUrl(filePath: string): string {
   const normalized = filePath.replace(/\\/g, "/");
@@ -1856,6 +1867,54 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 // Open the section with the add-plugin form already expanded.
                 publishPluginsSectionIntent({ type: "open-add-panel" });
                 openSettings("plugins");
+              },
+            },
+            {
+              id: CommandIds.pluginsReviewBackup(),
+              title: "Review Plugins from Settings Backup",
+              subtitle: "List backed-up plugins that are not installed here",
+              section: section.settings,
+              keywords: ["plugin", "backup", "restore", "reinstall", "settings backup"],
+              run: () => {
+                // A mounted section re-reads its backup list; a fresh mount reads it anyway.
+                publishPluginsSectionIntent({ type: "refresh" });
+                openSettings("plugins");
+              },
+            },
+            {
+              id: CommandIds.pluginsInstallFromBackup(),
+              title: "Install Plugin from Settings Backup…",
+              subtitle: "Review a backed-up plugin's install preview before installing it",
+              section: section.settings,
+              keywords: ["plugin", "backup", "restore", "reinstall", "install", "settings backup"],
+              run: () => undefined,
+              prompt: {
+                title: "Install Plugin from Settings Backup",
+                fields: [
+                  {
+                    type: "select",
+                    name: "pluginName",
+                    label: "Backed-up plugin",
+                    placeholder: "Search backed-up plugins…",
+                    getOptions: async () =>
+                      (await listInstallableBackupRecipes(p.api)).map((recipe) => ({
+                        id: recipe.name,
+                        label: recipe.name,
+                        keywords: [recipe.name, recipe.source.url],
+                      })),
+                  },
+                ],
+                onSubmit: async (values) => {
+                  // Only the name travels through the prompt, so the recipe is looked up again.
+                  const recipe = (await listInstallableBackupRecipes(p.api)).find(
+                    (candidate) => candidate.name === values.pluginName
+                  );
+                  // Opens the prefilled form; the section's preview and confirm still decide.
+                  if (recipe !== undefined) {
+                    publishPluginsSectionIntent({ type: "install-from-backup", recipe });
+                  }
+                  openSettings("plugins");
+                },
               },
             },
             {
