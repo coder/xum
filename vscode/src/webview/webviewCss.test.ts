@@ -14,7 +14,7 @@ import * as esbuild from "esbuild";
  * (vscode/src/webview/webview.css). When a component the webview bundles (or can import)
  * uses a Tailwind utility or CSS custom property that the desktop styles define but the
  * webview stylesheet does not, the webview renders it unstyled (for example transparent
- * tooltips when the tooltip tokens were missing). Both checks below compare against the
+ * tooltips when the tooltip tokens were missing). All checks below compare against the
  * desktop globals.css, so tokens that are undefined on desktop too (Radix runtime vars,
  * story-only vars) are not reported.
  */
@@ -81,7 +81,7 @@ function readCandidates(files: string[]): string[] {
   );
 }
 
-// Both tests need the same bundle scan; compute it once.
+// All tests need the same bundle scan; compute it once.
 let bundledSources: Promise<{ files: string[]; candidates: string[] }> | null = null;
 function loadBundledSources(): Promise<{ files: string[]; candidates: string[] }> {
   bundledSources ??= getBundledSourceFiles().then((bundled) => {
@@ -89,6 +89,72 @@ function loadBundledSources(): Promise<{ files: string[]; candidates: string[] }
     return { files, candidates: readCandidates(files) };
   });
   return bundledSources;
+}
+
+// Desktop globals.css compiled against the webview candidates, so theme tree-shaking matches.
+let desktopCompiledCss: Promise<string> | null = null;
+function loadDesktopCss(): Promise<string> {
+  desktopCompiledCss ??= (async () => {
+    const { candidates } = await loadBundledSources();
+    const compiler = await compile(fs.readFileSync(desktopCssPath, "utf8"), {
+      base: path.dirname(desktopCssPath),
+      from: desktopCssPath,
+      onDependency: () => undefined,
+    });
+    return compiler.build(candidates);
+  })();
+  return desktopCompiledCss;
+}
+
+let webviewCompiledCss: Promise<string> | null = null;
+function loadWebviewCss(): Promise<string> {
+  webviewCompiledCss ??= esbuildConfig.compileWebviewCss().then((result) => result.css);
+  return webviewCompiledCss;
+}
+
+/*
+ * Classes the desktop stylesheet defines for desktop-only surfaces. Check C skips them
+ * because the webview never renders those surfaces. Exact names, not prefixes: a new desktop
+ * class used by an importable module fails the guard until someone decides whether the
+ * webview needs it. Check C also fails when a listed name stops being desktop-only.
+ */
+const DESKTOP_ONLY_CLASSES = new Set([
+  // Electron titlebar insets and drag regions: VS Code owns the window chrome.
+  "titlebar-drag",
+  "titlebar-no-drag",
+  "titlebar-safe-left",
+  "titlebar-safe-left-gutter-4",
+  "titlebar-safe-right",
+  "titlebar-safe-right-gutter-2",
+  "titlebar-safe-right-gutter-3",
+  "titlebar-safe-right-minus-sidebar",
+  // Mobile/touch app shell: these rules live in the desktop shell's (max-width: 768px) and
+  // (pointer: coarse) media blocks (sidebar overlay, sticky header, 44px touch targets,
+  // shortcut-hint hiding). The webview has no app shell and its pointer is never coarse.
+  "mobile-bottom-inset-host",
+  "mobile-header-spacer",
+  "mobile-hide-right-sidebar",
+  "mobile-hide-shortcut-hints",
+  "mobile-layout",
+  "mobile-main-content",
+  "mobile-menu-btn",
+  "mobile-overlay",
+  "mobile-sidebar",
+  "mobile-sidebar-collapsed",
+  "mobile-sticky-header",
+  "mobile-touch-row",
+  // Project sidebar only: the webview shows one workspace and no project sidebar.
+  "react-colorful",
+  "section-color-picker",
+  "subagent-connector-active",
+  "subagent-connector-elbow-active",
+  "workspace-status-dot-active",
+  // First-run tutorial overlay: desktop only.
+  "tutorial-highlight",
+]);
+
+function classSelectors(css: string): Set<string> {
+  return new Set([...css.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)].map((match) => match[1]));
 }
 
 function declaredCustomProperties(css: string): Set<string> {
@@ -127,17 +193,10 @@ describe("webview stylesheet", () => {
   }, 30_000);
 
   test("defines every desktop custom property the webview references", async () => {
-    const { files: sourceFiles, candidates } = await loadBundledSources();
+    const { files: sourceFiles } = await loadBundledSources();
 
-    const { css: webviewCss } = await esbuildConfig.compileWebviewCss();
-
-    // Compile desktop globals.css against the same candidates so theme tree-shaking matches.
-    const desktopCompiler = await compile(fs.readFileSync(desktopCssPath, "utf8"), {
-      base: path.dirname(desktopCssPath),
-      from: desktopCssPath,
-      onDependency: () => undefined,
-    });
-    const desktopCss = desktopCompiler.build(candidates);
+    const webviewCss = await loadWebviewCss();
+    const desktopCss = await loadDesktopCss();
 
     const references = referencedCustomProperties(webviewCss);
     for (const file of sourceFiles) {
@@ -155,6 +214,44 @@ describe("webview stylesheet", () => {
       throw new Error(
         `Custom properties referenced by the webview are declared on desktop but not in the webview: ` +
           `${missing.sort().join(", ")}. ${FIX_HINT}`
+      );
+    }
+  }, 30_000);
+
+  // Plain classes (keyframe animations, base resets, hand-written rules in globals.css) are
+  // not Tailwind utilities, so the utility check cannot see them, and the webview compiles its
+  // own @source scan, so a class the bundle uses from an unscanned module is caught here too.
+  test("defines every desktop class selector used by webview-importable components", async () => {
+    const { candidates } = await loadBundledSources();
+    const desktopClasses = classSelectors(await loadDesktopCss());
+    const webviewClasses = classSelectors(await loadWebviewCss());
+
+    const missing = [
+      ...new Set(
+        candidates.filter(
+          (candidate) =>
+            /^-?[_a-zA-Z][\w-]*$/.test(candidate) &&
+            desktopClasses.has(candidate) &&
+            !webviewClasses.has(candidate) &&
+            !DESKTOP_ONLY_CLASSES.has(candidate)
+        )
+      ),
+    ];
+    if (missing.length > 0) {
+      throw new Error(
+        `Classes used by webview-importable components have desktop rules but none in the webview: ` +
+          `${missing.sort().join(", ")}. ${FIX_HINT} If the class only matters on desktop, add it ` +
+          `to DESKTOP_ONLY_CLASSES with a reason.`
+      );
+    }
+
+    const stale = [...DESKTOP_ONLY_CLASSES].filter(
+      (name) => webviewClasses.has(name) || !desktopClasses.has(name)
+    );
+    if (stale.length > 0) {
+      throw new Error(
+        `DESKTOP_ONLY_CLASSES lists classes that are no longer desktop-only (defined in the ` +
+          `webview or gone from the desktop CSS): ${stale.sort().join(", ")}. Remove them from the list.`
       );
     }
   }, 30_000);

@@ -1,15 +1,6 @@
 @import "tailwindcss";
 
-/* Disable the default browser focus outline (the blue ring).
-   Components can still use intentional focus styles like border-color changes.
-   Kept in the base layer (#4718) so component utilities such as
-   focus-visible:outline-* win without !important. */
-@layer base {
-  *:focus,
-  *:focus-visible {
-    outline: none;
-  }
-}
+@import "./focus-reset.css";
 
 @source "../node_modules/streamdown/dist/index.js";
 
@@ -789,19 +780,7 @@ body {
   background: var(--color-surface-quaternary);
 }
 
-/*
- * Override for Tailwind's scrollbar-none utility.
- * Keep this as a defensive Chromium/Electron fallback for full hiding.
- */
-.scrollbar-none::-webkit-scrollbar {
-  display: none;
-}
-
-/* Keep `.scrollbar-none` fully hidden even with global Firefox scrollbar theming. */
-.scrollbar-none {
-  scrollbar-width: none;
-  scrollbar-color: auto;
-}
+@import "./scrollbar-none.css";
 
 /* Root container */
 html,
@@ -1167,44 +1146,7 @@ html[data-renderer-inactive] *::after {
   }
 }
 
-/* HeartbeatToolCall: pulsing "live" dot + scanning ECG trace. Conveys an
-   actively-ticking schedule; both are gated on reduced-motion below. */
-@keyframes heartbeat-dot-pulse {
-  0%,
-  100% {
-    transform: scale(1);
-    opacity: 1;
-  }
-  50% {
-    transform: scale(1.75);
-    opacity: 0.35;
-  }
-}
-
-@keyframes heartbeat-trace-scan {
-  to {
-    /* Multiple of the 9px dash period (stroke-dasharray: 4 5) so the pattern aligns
-       across the loop boundary and scrolls seamlessly instead of jumping each cycle. */
-    stroke-dashoffset: -243;
-  }
-}
-
-.heartbeat-dot {
-  transform-origin: center;
-  animation: heartbeat-dot-pulse 1.7s ease-in-out infinite;
-}
-
-.heartbeat-trace {
-  stroke-dasharray: 4 5;
-  animation: heartbeat-trace-scan 4.5s linear infinite;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .heartbeat-dot,
-  .heartbeat-trace {
-    animation: none;
-  }
-}
+@import "./heartbeat.css";
 
 /* Animated dashed connector for active sub-agents */
 @keyframes connector-dash-scroll {

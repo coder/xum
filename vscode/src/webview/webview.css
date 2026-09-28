@@ -11,8 +11,9 @@
 /* Tell Tailwind where to look for class usage. */
 @source "./**/*.{ts,tsx}";
 @source "../../../src/browser/**/*.{ts,tsx}";
-/* Shared composer class constants (control height, container-query collapse ladder). */
-@source "../../../src/constants/layout.ts";
+/* Non-renderer modules the bundle imports can carry class names too (for example the composer
+   class constants in src/constants/layout.ts); the desktop build scans all of src. */
+@source "../../../src/{common,constants}/**/*.{ts,tsx}";
 
 /*
  * CSS bundle for the xum VS Code webview.
@@ -31,6 +32,7 @@
  * the composer redesign (#4970) removes the white-text fill instead.
  */
 @import "../../../src/browser/styles/theme-dark.css";
+@import "../../../src/browser/styles/focus-reset.css";
 
 /* Webview overrides. These come after theme-dark.css so they win. */
 @theme {
@@ -85,9 +87,11 @@ body {
   height: 100vh;
 }
 
+@import "../../../src/browser/styles/scrollbar-none.css";
 @import "../../../src/browser/styles/tool-surfaces.css";
 @import "../../../src/browser/styles/plan-content.css";
 @import "../../../src/browser/styles/transcript-content.css";
+@import "../../../src/browser/styles/heartbeat.css";
 
 /* Font utility classes (used by xum message/tool components; desktop defines them in globals.css).
    Declared after the shared imports to keep the desktop cascade order. */

@@ -1,0 +1,11 @@
+/* Shared by src/browser/styles/globals.css (desktop) and vscode/src/webview/webview.css (VS Code webview). */
+/* Disable the default browser focus outline (the blue ring).
+   Components can still use intentional focus styles like border-color changes.
+   Kept in the base layer (#4718) so component utilities such as
+   focus-visible:outline-* win without !important. */
+@layer base {
+  *:focus,
+  *:focus-visible {
+    outline: none;
+  }
+}
