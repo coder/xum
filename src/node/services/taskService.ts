@@ -13849,10 +13849,14 @@ export class TaskService implements AgentTaskIntegration {
       // that work unreported. Take the archive path's admission hold: it refuses while such
       // activity exists and admits no new sends, bash, terminals or opens until it is released
       // after the removal. Model-driven only: automatic cleanup and the user cascade never refuse.
+      // Only when removal deletes the checkout (see subagentRemovalPreservesCheckout): a preserved
+      // checkout loses no files, and the sticky app marker would block its removal forever.
+      const guardLiveWriters =
+        options?.lossyWorkPolicy === "refuse" && !subagentRemovalPreservesCheckout(entry.workspace);
       // The fresh background-process check first, as model-driven archive does: it refreshes exit
       // statuses (the hold's snapshot may still list an exited process) and sees crash orphans.
       if (
-        options?.lossyWorkPolicy === "refuse" &&
+        guardLiveWriters &&
         (await this.workspaceService.hasRunningBackgroundBashProcesses(taskId))
       ) {
         return Ok({
@@ -13863,14 +13867,13 @@ export class TaskService implements AgentTaskIntegration {
             "Background bash processes are still running in this sub-agent's checkout. Stop them before removing the sub-agent.",
         });
       }
-      const liveWriterHold =
-        options?.lossyWorkPolicy === "refuse"
-          ? this.workspaceService.acquirePreInterruptionArchiveHold(taskId, {
-              queuedDelegatedTurnCount: 0,
-              expectedDelegatedTurnCorrelations: [],
-              operation: "remove",
-            })
-          : undefined;
+      const liveWriterHold = guardLiveWriters
+        ? this.workspaceService.acquirePreInterruptionArchiveHold(taskId, {
+            queuedDelegatedTurnCount: 0,
+            expectedDelegatedTurnCorrelations: [],
+            operation: "remove",
+          })
+        : undefined;
       if (liveWriterHold?.success === false) {
         return Ok({ status: "error", action: "remove", ...target, error: liveWriterHold.error });
       }
@@ -13878,7 +13881,10 @@ export class TaskService implements AgentTaskIntegration {
       // Checked under the tree and patch-artifact locks, right before the tombstone and removal.
       if (options?.lossyWorkPolicy === "refuse") {
         // An editor or native terminal opened earlier is not trackable, so it may still write.
-        if (await this.workspaceService.hasUntrackableExternalAppOpen(taskId)) {
+        if (
+          guardLiveWriters &&
+          (await this.workspaceService.hasUntrackableExternalAppOpen(taskId))
+        ) {
           return Ok({
             status: "error",
             action: "remove",
@@ -13923,9 +13929,7 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<{ error: string; paths?: string[] } | null> {
     const ws = entry.workspace;
     const runtimeConfig = ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG;
-    // Removal deletes no checkout for isolation "none" children (they share the parent's) or for
-    // project-dir local runtimes (deleteWorkspace is a no-op there).
-    if (ws.taskIsolation === "none" || isLocalProjectRuntime(runtimeConfig)) return null;
+    if (subagentRemovalPreservesCheckout(ws)) return null;
     const workspacePath = coerceNonEmptyString(ws.path);
     const workspaceName = coerceNonEmptyString(ws.name);
     const check =
@@ -19810,4 +19814,14 @@ export class TaskService implements AgentTaskIntegration {
     });
     return removedCount;
   }
+}
+
+/**
+ * Removal deletes no checkout for isolation "none" children (they share the parent's) or for
+ * project-dir local runtimes (deleteWorkspace is a no-op there), so it cannot lose their files.
+ */
+function subagentRemovalPreservesCheckout(ws: WorkspaceConfigEntry): boolean {
+  return (
+    ws.taskIsolation === "none" || isLocalProjectRuntime(ws.runtimeConfig ?? DEFAULT_RUNTIME_CONFIG)
+  );
 }
