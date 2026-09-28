@@ -1,7 +1,7 @@
 import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { expandLeftSidebar } from "./helpers/uiState";
-import { openSettingsDialog } from "./storyPlayHelpers";
+import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { REMOTE_CONNECTION_URL_KEY } from "@/browser/features/Settings/Sections/RemoteConnectionSection";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -87,7 +87,7 @@ async function openRemoteSettings(canvasElement: HTMLElement) {
 
 async function exerciseConnection(canvasElement: HTMLElement) {
   const section = await openRemoteSettings(canvasElement);
-  const canvas = within(within(document.body).getByRole("dialog", { name: "Settings" }));
+  const canvas = within(getSettingsDialog());
   await waitFor(() => expect(section.getByRole("status")).toHaveTextContent("Disconnected"));
   const input = section.getByRole("textbox", { name: "Server URL" });
   await expect(input).toHaveValue(SAVED_SERVER_URL);

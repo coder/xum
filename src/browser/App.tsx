@@ -347,7 +347,7 @@ function AppInner() {
   // The settings modal covers the chat, so a workspace behind it is selected but not visible:
   // keep lastRead from advancing and keep its completion notifications.
   const visibleChatWorkspaceId = isSettingsOpen ? null : currentWorkspaceId;
-  // Ref for route-level workspace visibility to avoid stale closure in response callbacks
+  // Ref for chat visibility to avoid stale closure in response callbacks
   const visibleChatWorkspaceIdRef = useRef(visibleChatWorkspaceId);
   visibleChatWorkspaceIdRef.current = visibleChatWorkspaceId;
   useEffect(() => {

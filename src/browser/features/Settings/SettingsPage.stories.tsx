@@ -1,6 +1,6 @@
 import { appMeta, AppWithMocks, type AppStory } from "@/browser/stories/meta.js";
 import { expect, waitFor, within, userEvent } from "@storybook/test";
-import { openSettingsDialog } from "@/browser/stories/storyPlayHelpers.js";
+import { getSettingsDialog, openSettingsDialog } from "@/browser/stories/storyPlayHelpers.js";
 import type { LayoutPresetsConfig } from "@/common/types/uiLayouts";
 import { setupSettingsStory } from "./Sections/settingsStoryUtils.js";
 
@@ -140,7 +140,7 @@ export const EscapeInInlineEditor: AppStory = {
     await waitFor(() =>
       expect(settings.queryByRole("textbox", { name: "Rename layout Slot 1" })).toBeNull()
     );
-    await expect(within(document.body).getByRole("dialog", { name: "Settings" })).toBe(dialog);
+    await expect(getSettingsDialog()).toBe(dialog);
     await expect(settings.getByText("My Layout")).toBeVisible();
 
     dialog.focus();

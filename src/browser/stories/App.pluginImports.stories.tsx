@@ -1,7 +1,7 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import { expandLeftSidebar } from "./helpers/uiState";
-import { openSettingsDialog } from "./storyPlayHelpers";
+import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { AgentPluginInstallPreview } from "@/common/orpc/schemas/agentPlugins";
@@ -124,8 +124,7 @@ async function checkPhoneBounds() {
   await waitFor(() =>
     expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(window.innerWidth)
   );
-  const dialog = within(document.body).getByRole("dialog", { name: "Settings" });
-  for (const group of within(dialog).getAllByRole("group")) {
+  for (const group of within(getSettingsDialog()).getAllByRole("group")) {
     await expect(group.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
   }
 }

@@ -14,6 +14,10 @@ export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HT
   );
 }
 
+export function getSettingsDialog(): HTMLElement {
+  return within(document.body).getByRole("dialog", { name: "Settings" });
+}
+
 /**
  * Wait for chat messages to finish loading.
  *

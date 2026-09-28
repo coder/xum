@@ -2,7 +2,7 @@ import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 import { wrapAsyncIterator } from "@orpc/shared";
 import type { APIClient } from "@/browser/contexts/API";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
-import { openSettingsDialog } from "./storyPlayHelpers";
+import { getSettingsDialog, openSettingsDialog } from "./storyPlayHelpers";
 import { expandLeftSidebar } from "./helpers/uiState";
 import { setupSettingsStory } from "@/browser/features/Settings/Sections/settingsStoryUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
@@ -178,7 +178,7 @@ export const TokenBudgetConflict: AppStory = {
   render: () => <AppWithMocks setup={() => setupCompactionSettings("conflict")} />,
   play: async ({ canvasElement }) => {
     const trigger = await openCompactionSettings(canvasElement);
-    const canvas = within(within(document.body).getByRole("dialog", { name: "Settings" }));
+    const canvas = within(getSettingsDialog());
     await expect(trigger).toHaveTextContent("Token Budget");
     const warning = canvas.getByRole("status");
     await expect(warning).toBeVisible();

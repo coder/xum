@@ -284,7 +284,7 @@ const SETTINGS_ROUTE_PATTERN = /^\/settings\/([^/]+)$/;
 // treated as "no background" (the settings modal then sits over the root shell).
 function getSettingsBackground(state: unknown): SettingsBackgroundLocation | null {
   if (!state || typeof state !== "object" || !("settingsBackground" in state)) return null;
-  const background = (state as { settingsBackground?: unknown }).settingsBackground;
+  const background = state.settingsBackground;
   if (!background || typeof background !== "object") return null;
   const { pathname, search, state: backgroundState } = background as Record<string, unknown>;
   if (typeof pathname !== "string" || !pathname.startsWith("/")) return null;
@@ -322,7 +322,7 @@ function RouterContextInner(props: { children: ReactNode; embedded: boolean }) {
   // (workspace, project, draft, analytics) comes from that background location. Cold settings
   // links have no background and sit over the root shell.
   const effectiveLocation: SettingsBackgroundLocation = settingsMatch
-    ? (getSettingsBackground(location.state) ?? { pathname: "/", search: "", state: null })
+    ? (getSettingsBackground(locationState) ?? { pathname: "/", search: "", state: null })
     : location;
   const effectiveSearchParams = new URLSearchParams(effectiveLocation.search);
   const isProjectRoute = effectiveLocation.pathname === "/project";
