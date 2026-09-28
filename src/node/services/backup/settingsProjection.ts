@@ -8,6 +8,10 @@ import {
 import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
 import { LayoutPresetsConfigSchema } from "@/common/orpc/schemas/uiLayouts";
 import { AgentIdSchema } from "@/common/schemas/ids";
+import {
+  AutoModelRoutingConfigSchema,
+  normalizeAutoModelRoutingConfig,
+} from "@/common/types/autoModelRouting";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { ProjectsConfig } from "@/common/types/project";
 import { normalizeTaskSettings } from "@/common/types/tasks";
@@ -17,6 +21,7 @@ import { isPlainObject } from "@/common/utils/isPlainObject";
 import { normalizeGoalDefaults } from "@/constants/goals";
 import {
   normalizeAiDefaultsModelStrings,
+  normalizeEvaluationDefaults,
   normalizeMinThinkingLevelByModel,
   normalizeModelFallbacks,
   normalizeOptionalModelString,
@@ -29,48 +34,103 @@ import {
 } from "@/node/config";
 
 /**
- * The top-level config.json settings a backup carries. Everything else stays local, so an
- * addition fails closed until it is listed here:
- * - bound to the machine or its network: apiServerBindHost, apiServerPort, apiServerServeWebUi,
- *   mdnsAdvertisementEnabled, mdnsServiceName, serverSshHost, serverAuthGithubOwner,
- *   defaultProjectDir, terminalDefaultShell, updateChannel, useSSH2Transport;
- * - secrets and enrollment: muxGovernorUrl, muxGovernorToken;
- * - derived from providers.jsonc credentials, which are never exported (see
- *   providerService.syncGatewayLifecycleEffect): routePriority, routeOverrides, and the legacy
- *   muxGatewayEnabled and muxGatewayModels;
- * - destructive archive policies: coderWorkspaceArchiveBehavior and worktreeArchiveBehavior
- *   (with their legacy deleteWorktreeOnArchive and stopCoderWorkspaceOnArchive spellings). A
- *   repository-controlled "delete" would make every later archive remove worktrees and Coder
- *   workspaces, and unpushed work with them, with no prompt naming the policy;
- * - agent-executed text: heartbeatDefaultPrompt. A repository-controlled prompt would run
+ * Where each top-level config key goes in a backup. Exhaustive over both the on-disk schema
+ * and the loaded config, so a new key fails typecheck until it is classified here; only
+ * "settings" keys travel in the settings block, and every other class stays local:
+ * - preferences: userPreferences, which has its own projection, projectBackupPreferences;
+ * - machine: bound to the machine or its network;
+ * - secret: secrets and enrollment;
+ * - credentials: derived from providers.jsonc credentials, which are never exported (see
+ *   providerService.syncGatewayLifecycleEffect);
+ * - destructive: archive policies (with their legacy spellings). A repository-controlled
+ *   "delete" would make every later archive remove worktrees and Coder workspaces, and
+ *   unpushed work with them, with no prompt naming the policy;
+ * - agentExecuted: text agents act on. A repository-controlled heartbeat prompt would run
  *   unattended in every workspace whose heartbeat has no message of its own;
- * - save-time projections and internal state: subagentAiDefaults, preferredCompactionModel
- *   (unused), projects (the project bundle), viewedSplashScreens, migrations, writeId,
- *   settingsBackup, onePasswordAccountName.
- * userPreferences has its own projection, projectBackupPreferences.
+ * - internal: save-time projections and internal state.
  */
-const BACKED_UP_SETTINGS_KEYS = [
-  "agentAiDefaults",
-  "defaultModel",
-  "hiddenModels",
-  "minThinkingLevelByModel",
-  "modelFallbacks",
-  "advisorModelString",
-  "advisorThinkingLevel",
-  "advisorReasoningMode",
-  "advisorMaxUsesPerTurn",
-  "advisorMaxOutputTokens",
-  "taskSettings",
-  "heartbeatDefaultIntervalMs",
-  "goalDefaults",
-  "chatTranscriptFullWidth",
-  "llmDebugLogs",
-  "runtimeEnablement",
-  "defaultRuntime",
-  "layoutPresets",
-] as const satisfies ReadonlyArray<keyof ProjectsConfig & keyof typeof AppConfigOnDiskSchema.shape>;
+const CONFIG_KEY_BACKUP = {
+  agentAiDefaults: "settings",
+  defaultModel: "settings",
+  hiddenModels: "settings",
+  minThinkingLevelByModel: "settings",
+  modelFallbacks: "settings",
+  advisorModelString: "settings",
+  advisorThinkingLevel: "settings",
+  advisorReasoningMode: "settings",
+  advisorMaxUsesPerTurn: "settings",
+  advisorMaxOutputTokens: "settings",
+  taskSettings: "settings",
+  heartbeatDefaultIntervalMs: "settings",
+  goalDefaults: "settings",
+  chatTranscriptFullWidth: "settings",
+  llmDebugLogs: "settings",
+  runtimeEnablement: "settings",
+  defaultRuntime: "settings",
+  layoutPresets: "settings",
+  autoModelRouting: "settings",
+  evaluationDefaults: "settings",
+  // Harmless where it has no effect: only the desktop app holds a sleep blocker.
+  keepScreenAwake: "settings",
+  userPreferences: "preferences",
+  apiServerBindHost: "machine",
+  apiServerPort: "machine",
+  apiServerServeWebUi: "machine",
+  mdnsAdvertisementEnabled: "machine",
+  mdnsServiceName: "machine",
+  serverSshHost: "machine",
+  serverAuthGithubOwner: "machine",
+  defaultProjectDir: "machine",
+  terminalDefaultShell: "machine",
+  updateChannel: "machine",
+  useSSH2Transport: "machine",
+  muxGovernorUrl: "secret",
+  muxGovernorToken: "secret",
+  routePriority: "credentials",
+  routeOverrides: "credentials",
+  muxGatewayEnabled: "credentials",
+  muxGatewayModels: "credentials",
+  coderWorkspaceArchiveBehavior: "destructive",
+  worktreeArchiveBehavior: "destructive",
+  deleteWorktreeOnArchive: "destructive",
+  stopCoderWorkspaceOnArchive: "destructive",
+  heartbeatDefaultPrompt: "agentExecuted",
+  subagentAiDefaults: "internal",
+  // Unused.
+  preferredCompactionModel: "internal",
+  // Carried by the project bundle.
+  projects: "internal",
+  viewedSplashScreens: "internal",
+  migrations: "internal",
+  writeId: "internal",
+  settingsBackup: "internal",
+  onePasswordAccountName: "internal",
+  legacyOnePasswordAccountName: "internal",
+} as const satisfies Record<
+  keyof ProjectsConfig | keyof typeof AppConfigOnDiskSchema.shape,
+  | "settings"
+  | "preferences"
+  | "machine"
+  | "secret"
+  | "credentials"
+  | "destructive"
+  | "agentExecuted"
+  | "internal"
+>;
 
-type BackedUpSettingsKey = (typeof BACKED_UP_SETTINGS_KEYS)[number];
+type ConfigKey = keyof typeof CONFIG_KEY_BACKUP;
+
+/** Fails typecheck when a key classified as a setting is missing on disk or in memory. */
+type SubsetOf<T extends U, U> = T;
+
+type BackedUpSettingsKey = SubsetOf<
+  { [K in ConfigKey]: (typeof CONFIG_KEY_BACKUP)[K] extends "settings" ? K : never }[ConfigKey],
+  keyof ProjectsConfig & keyof typeof AppConfigOnDiskSchema.shape
+>;
+
+const BACKED_UP_SETTINGS_KEYS = (Object.keys(CONFIG_KEY_BACKUP) as ConfigKey[]).filter(
+  (key): key is BackedUpSettingsKey => CONFIG_KEY_BACKUP[key] === "settings"
+);
 
 /**
  * A backup's settings block. Every key an export writes is present, so a value the user reset
@@ -127,6 +187,9 @@ const NORMALIZE: { [K in BackedUpSettingsKey]: (value: unknown) => ProjectsConfi
     const normalized = normalizeLayoutPresetsConfig(value);
     return isLayoutPresetsConfigEmpty(normalized) ? undefined : normalized;
   },
+  autoModelRouting: (value) => (value == null ? undefined : normalizeAutoModelRoutingConfig(value)),
+  evaluationDefaults: normalizeEvaluationDefaults,
+  keepScreenAwake: (value) => value === true,
 };
 
 function isEmptySpelling(value: unknown): boolean {
@@ -169,6 +232,11 @@ const FIELD_SCHEMA_OVERRIDES: Partial<Record<BackedUpSettingsKey, z.ZodType>> = 
     .refine(acceptedBy(normalizeRuntimeEnablementOverrides)),
   layoutPresets: LayoutPresetsConfigSchema.refine(
     (value) => normalizeLayoutPresetsConfig(value).slots.length === value.slots.length
+  ),
+  // The on-disk shape accepts any tier list (and `.catch` turns anything else into unset);
+  // normalization would then heal a damaged or newer-build block into the default tiers.
+  autoModelRouting: AutoModelRoutingConfigSchema.refine(
+    (value) => new Set(value.tiers.map((tier) => tier.id)).size === value.tiers.length
   ),
 };
 

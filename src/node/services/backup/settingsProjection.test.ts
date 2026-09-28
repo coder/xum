@@ -4,6 +4,7 @@ import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { DEFAULT_LAYOUT_PRESETS_CONFIG } from "@/common/types/uiLayouts";
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 import { ADVISOR_DEFAULT_MAX_USES_PER_TURN } from "@/common/constants/advisor";
+import { getDefaultAutoModelRoutingConfig } from "@/common/types/autoModelRouting";
 import {
   mergeBackupSettings,
   projectBackupSettings,
@@ -31,6 +32,9 @@ const UNSET_EXPORT = {
   runtimeEnablement: null,
   defaultRuntime: null,
   layoutPresets: null,
+  autoModelRouting: null,
+  evaluationDefaults: null,
+  keepScreenAwake: false,
 };
 
 describe("settingsProjection", () => {
@@ -70,6 +74,15 @@ describe("settingsProjection", () => {
       llmDebugLogs: false,
       runtimeEnablement: { docker: false },
       defaultRuntime: "worktree",
+      autoModelRouting: {
+        tiers: [
+          { id: "quick", label: "Quick", description: "Lookups", thinkingLevel: "low" },
+          { id: "deep", label: "Deep", description: "Refactors", model: "openai:gpt-plan" },
+        ],
+        evaluationModel: getDefaultAutoModelRoutingConfig().evaluationModel,
+      },
+      evaluationDefaults: { model: "anthropic:claude-exec" },
+      keepScreenAwake: true,
     } satisfies Partial<ProjectsConfig>;
     const config: ProjectsConfig = {
       projects: new Map([["/repo", { workspaces: [] }]]),
@@ -355,6 +368,30 @@ describe("settingsProjection", () => {
       },
       unsupported: [],
     });
+  });
+
+  it("keeps the local routing tiers when the backup's block would heal into defaults", () => {
+    const current: ProjectsConfig = {
+      projects: new Map(),
+      autoModelRouting: {
+        tiers: [
+          { id: "quick", label: "Quick", description: "Lookups" },
+          { id: "deep", label: "Deep", description: "Refactors" },
+        ],
+        evaluationModel: getDefaultAutoModelRoutingConfig().evaluationModel,
+      },
+    };
+    const tier = { id: "quick", label: "Quick", description: "Lookups" };
+    // Each normalizes without error: to the default tiers, the default evaluator, or unset.
+    for (const autoModelRouting of [
+      { tiers: [tier, tier] },
+      { tiers: [tier, { ...tier, id: "deep" }], evaluationModel: "provider-from-a-newer-build:x" },
+      "garbage",
+    ]) {
+      const read = readBackupSettings({ settings: { autoModelRouting } });
+      expect(read).toEqual({ settings: {}, unsupported: ["autoModelRouting"] });
+      expect(mergeBackupSettings(current, read.settings!)).toEqual(current);
+    }
   });
 
   it("keeps the local agent defaults when a nested model string does not canonicalize", () => {

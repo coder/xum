@@ -196,7 +196,7 @@ export function parseOptionalNonEmptyString(value: unknown): string | undefined 
  * non-empty string. Blank or malformed input clears the block so a stale
  * `{}` never lingers on disk and `getClientConfig()` reports "no default".
  */
-function normalizeEvaluationDefaults(value: unknown): EvaluationDefaults | undefined {
+export function normalizeEvaluationDefaults(value: unknown): EvaluationDefaults | undefined {
   if (!value || typeof value !== "object") {
     return undefined;
   }
