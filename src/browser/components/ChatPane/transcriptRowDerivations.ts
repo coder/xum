@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
 import {
   computeBashOutputGroupInfos,
@@ -12,6 +12,8 @@ import type { DisplayedMessage } from "@/common/types/message";
 
 // Row props ChatPane derives over the whole transcript (bash_output grouping, task report
 // linking, prompt navigation), shared with the VS Code webview (#5002) so both render them alike.
+
+const EMPTY_GROUPS: ReadonlySet<string> = new Set();
 
 export interface TranscriptRowDerivations {
   /** Indexed like the full message array. */
@@ -29,32 +31,39 @@ export function useTranscriptRowDerivations(params: {
 }): TranscriptRowDerivations {
   const { workspaceId, messages } = params;
 
-  // Track which bash_output groups are expanded (keyed by first message ID)
-  const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
-
-  // Expansion choices belong to one workspace's transcript.
-  useEffect(() => {
-    setExpandedBashGroups(new Set());
-  }, [workspaceId]);
+  // Track which bash_output groups are expanded (keyed by first message ID). Expansion choices
+  // belong to one workspace's transcript: the set is stored with its workspace and reads as empty
+  // for any other, so a switch never renders the previous workspace's choices (forked transcripts
+  // share message IDs), not even for the frame an effect-based reset would leave.
+  const [bashGroupExpansion, setBashGroupExpansion] = useState<{
+    workspaceId: string;
+    groups: ReadonlySet<string>;
+  }>(() => ({ workspaceId, groups: EMPTY_GROUPS }));
+  const expandedBashGroups =
+    bashGroupExpansion.workspaceId === workspaceId ? bashGroupExpansion.groups : EMPTY_GROUPS;
 
   const taskReportLinking = useMemo(() => computeTaskReportLinking(messages), [messages]);
 
   // Precompute bash_output grouping once per message snapshot so row rendering stays O(n).
   const bashOutputGroupInfos = useMemo(() => computeBashOutputGroupInfos(messages), [messages]);
 
+  const updateBashGroups = (update: (groups: Set<string>) => void) => {
+    setBashGroupExpansion((current) => {
+      const groups = new Set(current.workspaceId === workspaceId ? current.groups : EMPTY_GROUPS);
+      update(groups);
+      return { workspaceId, groups };
+    });
+  };
+
   const expandBashGroup = (groupKey: string) => {
-    setExpandedBashGroups((current) => new Set(current).add(groupKey));
+    updateBashGroups((groups) => groups.add(groupKey));
   };
 
   const toggleBashOutputGroup = (groupKey: string) => {
-    setExpandedBashGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
+    updateBashGroups((groups) => {
+      if (!groups.delete(groupKey)) {
+        groups.add(groupKey);
       }
-      return next;
     });
   };
 
