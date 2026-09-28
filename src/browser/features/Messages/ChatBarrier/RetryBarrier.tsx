@@ -45,6 +45,11 @@ interface RetryBarrierContentProps extends RetryBarrierProps {
    * WorkspaceStore and passes its own aggregator state) sets a sub-agent's locked agent (#4738).
    */
   agentId?: string;
+  /**
+   * Replaces the default Stop (desktop stopStream, whose failures surface in the desktop chat
+   * input). The VS Code webview passes its own interrupt path, which reports failures itself.
+   */
+  onStopAutoRetry?: () => void;
 }
 
 export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) => {
@@ -271,6 +276,10 @@ export const RetryBarrierContent: React.FC<RetryBarrierContentProps> = (props) =
   const handleStopAutoRetry = async () => {
     setCountdown(0);
     setManualRetryError(null);
+    if (props.onStopAutoRetry) {
+      props.onStopAutoRetry();
+      return;
+    }
     if (!api) return;
     await stopStream(api, props.workspaceId, { disableAutoRetry: true });
   };

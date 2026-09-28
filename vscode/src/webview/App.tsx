@@ -732,6 +732,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
   };
   const interruptStreamRef = useRef(interruptStream);
   interruptStreamRef.current = interruptStream;
+  // The retry barrier's Stop (auto-retry scheduled): no partial stream exists to abandon.
+  const stopAutoRetry = () => interruptStream({ abandonPartial: false });
   // The window key listeners read the latest retry derivation and resume through these refs,
   // which are updated where both are computed below.
   const retryBarrierRef = useRef<RetryBarrierDerivation | null>(null);
@@ -1078,6 +1080,9 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                                 isStreamStarting={streamState.isStreamStarting}
                                 canInterrupt={streamState.canInterrupt}
                                 agentId={lockedAgentId}
+                                // The webview has no chat-error toast consumer, so Stop goes
+                                // through its interrupt path, which reports failures as notices.
+                                onStopAutoRetry={stopAutoRetry}
                               />
                             ) : null}
                           </LiveBashOutputSourceContext.Provider>

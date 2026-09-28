@@ -2335,6 +2335,9 @@ describe("vscode webview retry barrier (#5092)", () => {
     expect(view.container.textContent).toContain("Retrying in");
     expect(view.container.textContent).toContain("(attempt 2)");
     await click(view.getByRole("button", { name: /^Stop/ }));
+    // A refused Stop is reported in the webview (it has no desktop chat-error toast consumer).
+    await bridge.answer("workspace.interruptStream", { success: false, error: "stop refused" });
+    expect(view.container.textContent).toContain("Failed to interrupt stream. (stop refused)");
     // As on desktop, Esc stops too while the retry barrier shows, with no stream running.
     await act(async () => {
       fireEvent.keyDown(window, { key: "Escape" });
