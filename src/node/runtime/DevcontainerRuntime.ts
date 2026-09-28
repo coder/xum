@@ -833,6 +833,26 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     );
   }
 
+  /**
+   * Remove only the host worktree, without `devcontainer down`. For a creation rollback before
+   * init: no container exists yet, and `devcontainer down` matches containers by path (#4775).
+   */
+  deleteHostWorktree(
+    projectPath: string,
+    workspaceName: string,
+    force: boolean,
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
+  }
+
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
     // Fork creates a new worktree - container will be built on first ensureReady
     return this.worktreeManager.forkWorkspace(params);

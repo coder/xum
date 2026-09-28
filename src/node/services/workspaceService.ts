@@ -171,7 +171,7 @@ import {
   type NameGenerationCandidate,
 } from "@/node/services/workspaceTitleGenerator";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
-import type { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
 import {
   getDevcontainerContainerName,
@@ -3464,32 +3464,53 @@ export class WorkspaceService
     // no-op by design, but we never call it here to keep that contract
     // explicit). Only after a successful config rollback: while the entry
     // persists, the checkout is still referenced.
+    // A devcontainer creation made only a host worktree: its container comes from init, which
+    // starts after every rollback point. Its runtime delete would also run `devcontainer down`,
+    // which matches containers by path, so remove the worktree alone (#4775).
+    const devcontainer = isDevcontainerRuntime(args.runtimeConfig);
+    if (devcontainer) {
+      assert(
+        args.runtime instanceof DevcontainerRuntime,
+        "a devcontainer creation must roll back through DevcontainerRuntime"
+      );
+    }
     if (
       rolledBack &&
       !isWorktreeRuntime(args.runtimeConfig) &&
+      !devcontainer &&
       args.runtimeConfig.type !== "local"
     ) {
-      // Devcontainer/remote deletes can reach state this creation did not make (#4775).
+      // Remote deletes can reach state this creation did not make (#4775).
       log.warn("Left the checkout of an aborted creation on a non-worktree runtime", {
         workspaceId,
         runtime: args.runtimeConfig.type,
       });
-    } else if (rolledBack && isWorktreeRuntime(args.runtimeConfig)) {
-      const deleteResult = await args.runtime
-        .deleteWorkspace(
-          args.projectPath,
-          // Worktree directories are named after the sanitized workspace
-          // name (branch names may contain "/").
-          args.workspaceName,
-          checkout.startsWith("force-"),
-          undefined,
-          args.trusted,
-          { keepBranch: checkout.endsWith("-keep-branch") }
-        )
-        .catch((error: unknown) => ({
-          success: false as const,
-          error: getErrorMessage(error),
-        }));
+    } else if (rolledBack && (isWorktreeRuntime(args.runtimeConfig) || devcontainer)) {
+      const force = checkout.startsWith("force-");
+      const deleteOptions = { keepBranch: checkout.endsWith("-keep-branch") };
+      // Worktree directories are named after the sanitized workspace name (branch names may
+      // contain "/").
+      const deleteResult = await (
+        args.runtime instanceof DevcontainerRuntime
+          ? args.runtime.deleteHostWorktree(
+              args.projectPath,
+              args.workspaceName,
+              force,
+              args.trusted,
+              deleteOptions
+            )
+          : args.runtime.deleteWorkspace(
+              args.projectPath,
+              args.workspaceName,
+              force,
+              undefined,
+              args.trusted,
+              deleteOptions
+            )
+      ).catch((error: unknown) => ({
+        success: false as const,
+        error: getErrorMessage(error),
+      }));
       if (!deleteResult.success) {
         log.warn("Failed to remove created worktree after sanitization aborted creation", {
           workspaceId,
@@ -3507,17 +3528,19 @@ export class WorkspaceService
   }
 
   /**
-   * The path a fork's failed checkout delete left (#4899). Not reported for multi-project forks:
-   * their runtime deletes one checkout per project plus the container, its workspace path is only
-   * the container, and a local project's path is the user's repository (follow-up #4936).
+   * The paths a fork's failed checkout delete left (#4899). A multi-project runtime deletes one
+   * checkout per project plus the container, so it names the ones it could not delete itself; its
+   * workspace path is only the container (#4936).
    */
   private forkCleanupLeftovers(
     runtime: Runtime,
     projectPath: string,
-    workspaceName: string
+    workspaceName: string,
+    deleteResult: Awaited<ReturnType<Runtime["deleteWorkspace"]>>
   ): string[] {
+    if (deleteResult.success) return [];
     return runtime instanceof MultiProjectRuntime
-      ? []
+      ? (deleteResult.leftoverPaths ?? [])
       : [runtime.getWorkspacePath(projectPath, workspaceName)];
   }
 
@@ -12560,6 +12583,8 @@ export class WorkspaceService
       // Removed tail captured inside the try, summarized only after setup
       // survives the rollback window (see the comment at the capture site).
       let abandonedBranchMessages: MuxMessage[] | null = null;
+      // The plan file this fork wrote, which its registration rollback deletes (#4775).
+      let copiedPlanPath: string | undefined;
       try {
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
           sourceWorkspaceId,
@@ -12686,7 +12711,7 @@ export class WorkspaceService
         // Copy plan file using explicit source/target runtimes for cross-runtime safety. Inside
         // this try: a plan the source runtime could not read (or the target could not store)
         // fails the fork through the same cleanup, instead of a fork missing its plan (#4826).
-        await copyPlanFileAcrossRuntimes(
+        copiedPlanPath = await copyPlanFileAcrossRuntimes(
           freshSourceRuntime,
           targetRuntime,
           sourceMetadata.name,
@@ -12718,15 +12743,14 @@ export class WorkspaceService
           });
         }
         // No config entry exists yet, so the creation-state cleanup owns everything else: the
-        // registered session, in-memory and persisted init state, and the session dir.
-        await this.discardCreationState(newWorkspaceId, initAbortController, true);
+        // registered session, in-memory and persisted init state, and the session dir. A failure
+        // there is logged, so the leftovers below are still reported (#4936).
+        await this.discardCreationStateAfterRollback(newWorkspaceId, initAbortController, true);
         const message = getErrorMessage(copyError);
         return Err(
           withRollbackLeftovers(
             `Failed to copy fork state: ${message}`,
-            deleteResult.success
-              ? []
-              : this.forkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName)
+            this.forkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName, deleteResult)
           )
         );
       }
@@ -12816,8 +12840,31 @@ export class WorkspaceService
               error: deleteResult.error,
             });
             leftovers.push(
-              ...this.forkCleanupLeftovers(targetRuntime, foundProjectPath, resolvedName)
+              ...this.forkCleanupLeftovers(
+                targetRuntime,
+                foundProjectPath,
+                resolvedName,
+                deleteResult
+              )
             );
+          }
+        }
+        // A later workspace with this name would inherit the copy. Only once the entry is gone,
+        // like the checkout: while it persists, the workspace still references its plan.
+        if (rolledBack && copiedPlanPath !== undefined) {
+          const planDeleted = await this.deletePlanFiles(
+            targetRuntime,
+            forkedRuntimeConfig,
+            copiedPlanPath,
+            // The fork never writes its legacy path; deleting a missing file is a no-op.
+            getLegacyPlanFilePath(newWorkspaceId, targetRuntime.getXumHome())
+          );
+          if (!planDeleted.success) {
+            log.warn("Failed to remove the plan file copied by an aborted fork", {
+              newWorkspaceId,
+              error: planDeleted.error.message,
+            });
+            leftovers.push(copiedPlanPath);
           }
         }
         await this.discardCreationStateAfterRollback(
@@ -15856,10 +15903,26 @@ export class WorkspaceService
     // Create runtime to get correct xumHome (local ~/.xum, SSH ~/.mux, Docker /var/mux)
     const runtime = createRuntimeForWorkspace(metadata);
     const xumHome = runtime.getXumHome();
-    const planPath = getPlanFilePath(metadata.name, metadata.projectName, xumHome);
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, xumHome);
+    return this.deletePlanFiles(
+      runtime,
+      metadata.runtimeConfig,
+      getPlanFilePath(metadata.name, metadata.projectName, xumHome),
+      getLegacyPlanFilePath(workspaceId, xumHome)
+    );
+  }
 
-    if (isDockerRuntime(metadata.runtimeConfig) || isSSHRuntime(metadata.runtimeConfig)) {
+  /**
+   * Delete a plan file and its legacy path where `runtime` stores them: over exec for SSH and
+   * Docker, on the local filesystem otherwise. Missing files are fine; any other failure is
+   * returned.
+   */
+  private async deletePlanFiles(
+    runtime: Runtime,
+    runtimeConfig: RuntimeConfig,
+    planPath: string,
+    legacyPlanPath: string
+  ): Promise<Result<void, PlanFileDeletionError>> {
+    if (isDockerRuntime(runtimeConfig) || isSSHRuntime(runtimeConfig)) {
       // Plan paths are absolute or home-relative, never relative to the cwd below.
       for (const remotePath of [planPath, legacyPlanPath]) {
         assert(
@@ -15892,7 +15955,7 @@ export class WorkspaceService
       if (
         result.exitCode === EXIT_CODE_TIMEOUT ||
         result.exitCode === EXIT_CODE_ABORTED ||
-        (isSSHRuntime(metadata.runtimeConfig) && result.exitCode === 255)
+        (isSSHRuntime(runtimeConfig) && result.exitCode === 255)
       ) {
         return Err({
           type: "runtime_unreachable",

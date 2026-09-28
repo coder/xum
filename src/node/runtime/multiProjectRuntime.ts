@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import path from "node:path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -19,6 +20,7 @@ import type {
   WorkspaceInitResult,
   ReadFileOptions,
 } from "./Runtime";
+import { LocalRuntime } from "./LocalRuntime";
 
 export interface MultiProjectRuntimeEntry {
   projectPath: string;
@@ -202,8 +204,14 @@ export class MultiProjectRuntime implements Runtime {
     abortSignal?: AbortSignal,
     trusted?: boolean,
     options?: { keepBranch?: boolean }
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | { success: false; error: string; leftoverPaths: string[] }
+  > {
     const errors: string[] = [];
+    // What a rollback may tell the user to delete (#4936): the checkouts this workspace owns and the
+    // container. Never a local project's workspace path: that is the user's own repository.
+    const leftoverPaths: string[] = [];
 
     for (const projectRuntime of this.projectRuntimes) {
       try {
@@ -223,9 +231,11 @@ export class MultiProjectRuntime implements Runtime {
           errors.push(
             `[${projectRuntime.projectName}] ${deleteResult.error ?? "Unknown delete error"}`
           );
+          this.pushOwnedCheckout(leftoverPaths, projectRuntime, workspaceName);
         }
       } catch (error) {
         errors.push(`[${projectRuntime.projectName}] ${getErrorMessage(error)}`);
+        this.pushOwnedCheckout(leftoverPaths, projectRuntime, workspaceName);
       }
     }
 
@@ -233,12 +243,14 @@ export class MultiProjectRuntime implements Runtime {
       await this.containerManager.removeContainer(workspaceName);
     } catch (error) {
       errors.push(`[container] ${getErrorMessage(error)}`);
+      leftoverPaths.push(this.containerManager.getContainerPath(workspaceName));
     }
 
     if (errors.length > 0) {
       return {
         success: false,
         error: `Failed to delete multi-project workspace: ${errors.join("; ")}`,
+        leftoverPaths,
       };
     }
 
@@ -246,6 +258,22 @@ export class MultiProjectRuntime implements Runtime {
       success: true,
       deletedPath: this.containerManager.getContainerPath(workspaceName),
     };
+  }
+
+  /** Adds a project's checkout unless it is the project directory itself (LocalRuntime). */
+  private pushOwnedCheckout(
+    leftoverPaths: string[],
+    projectRuntime: MultiProjectRuntimeEntry,
+    workspaceName: string
+  ): void {
+    if (projectRuntime.runtime instanceof LocalRuntime) return;
+    const checkout = projectRuntime.runtime.getWorkspacePath(
+      projectRuntime.projectPath,
+      workspaceName
+    );
+    // Defense in depth: whatever the runtime, never list the user's repository for deletion.
+    if (path.resolve(checkout) === path.resolve(projectRuntime.projectPath)) return;
+    leftoverPaths.push(checkout);
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {

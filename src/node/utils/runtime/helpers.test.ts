@@ -280,7 +280,7 @@ async function settleWithin<T>(p: Promise<T>, ms: number, label: string): Promis
       fifos.push(p);
     }
 
-    function copy(): Promise<void> {
+    function copy(): Promise<string | undefined> {
       const attempt = copyPlanFileAcrossRuntimes(
         new HomeRuntime(path.join(dir, "source")),
         new HomeRuntime(path.join(dir, "target")),

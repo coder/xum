@@ -663,7 +663,18 @@ export interface Runtime {
     trusted?: boolean,
     /** keepBranch: remove only the checkout, e.g. a rollback on a branch it did not create (#4775). */
     options?: { keepBranch?: boolean }
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }>;
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | {
+        success: false;
+        error: string;
+        /**
+         * Set by a runtime that deletes several paths (MultiProjectRuntime): the disposable ones it
+         * could not delete, so a rollback can name them (#4936).
+         */
+        leftoverPaths?: string[];
+      }
+  >;
 
   /**
    * Ensure the runtime is ready for operations.

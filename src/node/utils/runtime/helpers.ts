@@ -253,7 +253,8 @@ export async function movePlanFile(
  * bug where DockerRuntime.forkWorkspace() changes this.containerName to the target.
  * Silently succeeds if no regular source file exists at either location. Throws
  * when a source read fails in transport or the target write fails, so a fork
- * never proceeds without a plan it could not copy (#4826).
+ * never proceeds without a plan it could not copy (#4826). Returns the target path
+ * it wrote, so a rollback deletes only a copy it made (#4775).
  */
 export async function copyPlanFileAcrossRuntimes(
   sourceRuntime: Runtime,
@@ -262,7 +263,7 @@ export async function copyPlanFileAcrossRuntimes(
   sourceWorkspaceId: string,
   targetWorkspaceName: string,
   projectName: string
-): Promise<void> {
+): Promise<string | undefined> {
   const sourceMuxHome = sourceRuntime.getXumHome();
   const targetXumHome = targetRuntime.getXumHome();
   const sourcePath = getPlanFilePath(sourceWorkspaceName, projectName, sourceMuxHome);
@@ -283,6 +284,7 @@ export async function copyPlanFileAcrossRuntimes(
       continue; // Missing (or not a regular file): try the next candidate.
     }
     await writeFileString(targetRuntime, targetPath, content);
-    return;
+    return targetPath;
   }
+  return undefined;
 }

@@ -11,6 +11,9 @@ import { WorkspaceGoalService } from "./workspaceGoalService";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { RuntimeError } from "@/node/runtime/Runtime";
 import { WorktreeRuntime } from "@/node/runtime/WorktreeRuntime";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import * as devcontainerCli from "@/node/runtime/devcontainerCli";
+import { getPlanFilePath } from "@/common/utils/planStorage";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import type { InitStateManager } from "./initStateManager";
@@ -18,6 +21,8 @@ import { WorkspaceUseLeases, type WorkspaceUseLease } from "./workspaceUseLeases
 import type { WorkspaceService } from "./workspaceService";
 import {
   createWorkspaceServiceHarness,
+  withTempMuxRoot,
+  writePlanFile,
   type WorkspaceServiceHarness,
 } from "./workspaceService.testHarness";
 
@@ -790,5 +795,164 @@ describe("WorkspaceService registration rollback (#4745)", () => {
     expect(result.success ? "" : result.error).toContain("Failed to fork project other");
     expect(git(projectPath, "rev-parse", "multi-busy")).toBe(tip);
     expect(worktreePaths(projectPath).map((p) => path.basename(p))).not.toContain("multi-busy");
+  });
+
+  // #4775 items 2 and 3, #4936: leftovers the creation and fork rollbacks used to miss.
+  describe("rollback gaps (#4775, #4936)", () => {
+    const leftoverSentence = (paths: string[]) =>
+      `The workspace could not be fully cleaned up: ${paths.join(", ")}; delete ${paths.length === 1 ? "it" : "them"} before retrying.`;
+
+    test("fork copy failure keeps naming the leftover checkout when a later cleanup step throws", async () => {
+      const source = await createWorktree("copy-src");
+      if (!source.success) throw new Error(source.error);
+      spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockRejectedValueOnce(
+        new Error("plan unreadable")
+      );
+      spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockResolvedValueOnce({
+        success: false,
+        error: "EBUSY",
+      });
+      spyOn(initStateManager, "deleteInitStatus").mockRejectedValueOnce(new Error("EBUSY"));
+
+      const result = await service.fork(source.data.metadata.id, "copy-fork");
+      const error = result.success ? "" : result.error;
+      const checkout = worktreePaths(projectPath).find((p) => path.basename(p) === "copy-fork");
+      expect(checkout).toBeDefined();
+      expect(error).toBe(
+        `Failed to copy fork state: plan unreadable ${leftoverSentence([checkout!])}`
+      );
+    });
+
+    // A later workspace with the fork's name would inherit a plan copy left behind.
+    test.each([
+      { label: "registration write rejects", sanitizeFails: false },
+      { label: "sanitization fails", sanitizeFails: true },
+    ])("fork whose $label deletes the plan it copied", async ({ sanitizeFails }) => {
+      await withTempMuxRoot(async (root) => {
+        const source = await createWorktree("plan-src");
+        if (!source.success) throw new Error(source.error);
+        const sourcePlan = await writePlanFile(root, "project", "plan-src");
+        if (sanitizeFails) {
+          spyOn(
+            service as unknown as {
+              sanitizeStalePluginOverridesForNewWorkspace: () => Promise<string | undefined>;
+            },
+            "sanitizeStalePluginOverridesForNewWorkspace"
+          ).mockResolvedValue("override file unreadable");
+          const result = await service.fork(source.data.metadata.id, "plan-fork");
+          expect(result.success ? "" : result.error).toBe("override file unreadable");
+        } else {
+          await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "plan-fork"));
+        }
+        expect(await exists(getPlanFilePath("plan-fork", "project", root))).toBe(false);
+        expect(await exists(sourcePlan)).toBe(true);
+      });
+    });
+
+    test("fork names the plan copy it could not delete", async () => {
+      await withTempMuxRoot(async (root) => {
+        const source = await createWorktree("plan-src2");
+        if (!source.success) throw new Error(source.error);
+        await writePlanFile(root, "project", "plan-src2");
+        const forkPlan = getPlanFilePath("plan-fork2", "project", root);
+        // A directory where the copy's file goes: `rm -f` cannot remove it.
+        spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockImplementationOnce(async () => {
+          await fs.mkdir(path.join(forkPlan, "blocker"), { recursive: true });
+          return "~/.xum/plans/project/plan-fork2.md";
+        });
+
+        const publish = failConfigPublish();
+        const result = await service
+          .fork(source.data.metadata.id, "plan-fork2")
+          .finally(() => publish.mockRestore());
+        expect(result.success ? "" : result.error).toEndWith(
+          leftoverSentence(["~/.xum/plans/project/plan-fork2.md"])
+        );
+      });
+    });
+
+    // Item 2: a devcontainer creation owns only its host worktree before init runs; no container
+    // exists yet, and `devcontainer down` matches containers by path, so it must not run.
+    test.each([
+      { label: "a branch it made", existingBranch: false },
+      { label: "an existing branch", existingBranch: true },
+    ])(
+      "devcontainer create rollback on $label removes only the host worktree",
+      async ({ existingBranch }) => {
+        await withTempMuxRoot(async () => {
+          const tip = existingBranch ? branchWithOwnCommit(projectPath, "dc-a") : undefined;
+          const down = spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+          const createDevcontainer = () =>
+            service.create(projectPath, "dc-a", "main", undefined, {
+              type: "devcontainer",
+              configPath: ".devcontainer/devcontainer.json",
+            });
+
+          await expectFailsWithSaveError(createDevcontainer);
+          expect(worktreePaths(projectPath)).toHaveLength(1);
+          if (tip === undefined) {
+            expect(git(projectPath, "branch", "--list", "dc-a")).toBe("");
+          } else {
+            expect(git(projectPath, "rev-parse", "dc-a")).toBe(tip);
+          }
+          expect(down).not.toHaveBeenCalled();
+          expect((await createDevcontainer()).success).toBe(true);
+        });
+      }
+    );
+
+    // #4936 gap 1: the multi-project runtime names the disposable paths it could not delete.
+    test("multi-project fork names the checkout and container it could not delete", async () => {
+      const sourceId = await createMultiSource();
+      await initSettlements().get(sourceId);
+      spyOn(WorktreeRuntime.prototype, "deleteWorkspace").mockRejectedValueOnce(new Error("EIO"));
+      spyOn(ContainerManager.prototype, "removeContainer").mockRejectedValueOnce(
+        new Error("EBUSY")
+      );
+
+      const publish = failConfigPublish();
+      const result = await service
+        .fork(sourceId, "multi-left")
+        .finally(() => publish.mockRestore());
+      const checkout = worktreePaths(projectPath).find((p) => path.basename(p) === "multi-left");
+      expect(checkout).toBeDefined();
+      // The other project's checkout was deleted, so it is not named.
+      expect(worktreePaths(otherProjectPath).map((p) => path.basename(p))).not.toContain(
+        "multi-left"
+      );
+      const container = path.join(srcBaseDir, "_workspaces", "multi-left");
+      expect(result.success ? "" : result.error).toEndWith(
+        leftoverSentence([checkout!, container])
+      );
+    });
+
+    test("local multi-project fork never names a project's own repository", async () => {
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push({
+          id: "eeeeeeeee1",
+          name: "local-src",
+          path: projectPath,
+          runtimeConfig: { type: "local" },
+          projects: projects(),
+        });
+        return cfg;
+      });
+      await fs.mkdir(path.join(harness.config.srcDir, "_workspaces", "local-src"), {
+        recursive: true,
+      });
+      spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockRejectedValueOnce(
+        new Error("plan unreadable")
+      );
+      spyOn(LocalRuntime.prototype, "deleteWorkspace").mockRejectedValue(new Error("EIO"));
+      spyOn(ContainerManager.prototype, "removeContainer").mockRejectedValueOnce(
+        new Error("EBUSY")
+      );
+
+      const result = await service.fork("eeeeeeeee1", "local-fork");
+      const container = path.join(harness.config.srcDir, "_workspaces", "local-fork");
+      expect(result.success ? "" : result.error).toBe(
+        `Failed to copy fork state: plan unreadable ${leftoverSentence([container])}`
+      );
+    });
   });
 });
