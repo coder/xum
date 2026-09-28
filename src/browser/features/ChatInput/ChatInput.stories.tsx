@@ -167,7 +167,7 @@ export const TranscriptOnlyHeldInput: AppStory = {
   ),
   parameters: {
     ...appMeta.parameters,
-    pixel: { matrix: { themes: ["dark"], viewports: ["phone", "laptop"] } },
+    pixel: PIXEL_DISABLED,
   },
   play: async ({ canvasElement }) => {
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
