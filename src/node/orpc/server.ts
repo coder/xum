@@ -778,6 +778,12 @@ function getListenErrorCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+/** The address family is disabled or has no loopback address on this host. */
+function isLoopbackFamilyUnavailable(error: unknown): boolean {
+  const code = getListenErrorCode(error);
+  return code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL";
+}
+
 /** Random-port attempts before giving up when ::1 is taken on the port chosen for 127.0.0.1. */
 const LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS = 5;
 
@@ -793,8 +799,9 @@ const LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS = 5;
  * The ::1 listener is a second HTTP server that re-emits its request, upgrade, and
  * clientError events on the primary server, so both families share one set of handlers.
  * (Handing raw sockets over with emit("connection") works in Node but not in Bun.)
- * Returns null when the host has no IPv6 loopback (IPv4-only containers), keeping the
- * previous single-family bind.
+ * When one family has no loopback (IPv4-only containers, IPv6-only hosts), binds the other
+ * one alone, as the previous single-family bind did. Returns the IPv6 server, or null when
+ * the primary server is the only listener.
  */
 async function listenOnBothLoopbacks(
   httpServer: http.Server,
@@ -802,9 +809,28 @@ async function listenOnBothLoopbacks(
 ): Promise<http.Server | null> {
   const attempts = port === 0 ? LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS : 1;
   for (let attempt = 1; ; attempt++) {
-    await listenOnce(httpServer, port, "127.0.0.1");
+    try {
+      await listenOnce(httpServer, port, "127.0.0.1");
+    } catch (error) {
+      if (!isLoopbackFamilyUnavailable(error)) {
+        throw error;
+      }
+      log.debug("IPv4 loopback unavailable; listening on ::1 only");
+      await listenOnce(httpServer, port, "::1");
+      return null;
+    }
     const address = httpServer.address();
     assert(address !== null && typeof address !== "string", "expected a TCP listen address");
+
+    // Clients can connect to 127.0.0.1 before the ::1 bind settles. If that bind fails,
+    // close() would wait on them (upgraded WebSockets are never closed by the HTTP server),
+    // so track them and destroy them on failure.
+    const bindWindowSockets = new Set<net.Socket>();
+    const trackSocket = (socket: net.Socket) => {
+      bindWindowSockets.add(socket);
+      socket.once("close", () => bindWindowSockets.delete(socket));
+    };
+    httpServer.on("connection", trackSocket);
 
     const ipv6Server = http.createServer();
     attachStreamErrorHandler(ipv6Server, "orpc-http-server-ipv6", { logger: log });
@@ -815,19 +841,24 @@ async function listenOnBothLoopbacks(
       await listenOnce(ipv6Server, address.port, "::1");
       return ipv6Server;
     } catch (error) {
-      const code = getListenErrorCode(error);
-      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
-        log.debug(`IPv6 loopback unavailable (${code}); listening on 127.0.0.1 only`);
+      if (isLoopbackFamilyUnavailable(error)) {
+        log.debug("IPv6 loopback unavailable; listening on 127.0.0.1 only");
         return null;
       }
 
-      await closeListener(httpServer);
+      const closed = closeListener(httpServer);
+      for (const socket of bindWindowSockets) {
+        socket.destroy();
+      }
+      await closed;
       // A random IPv4 port can already be in use on ::1; pick another one. An explicit
       // port stays an error: someone else owns it on ::1, which is the clash we prevent.
-      if (code === "EADDRINUSE" && attempt < attempts) {
+      if (getListenErrorCode(error) === "EADDRINUSE" && attempt < attempts) {
         continue;
       }
       throw error;
+    } finally {
+      httpServer.removeListener("connection", trackSocket);
     }
   }
 }
@@ -1850,10 +1881,22 @@ export async function createOrpcServer({
 
   // Start listening
   let ipv6LoopbackServer: http.Server | null = null;
-  if (host === "localhost") {
-    ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
-  } else {
-    await listenOnce(httpServer, port, host);
+  try {
+    // Hostnames are case-insensitive; normalize like ServerService.isLoopbackHost.
+    if (host.trim().toLowerCase() === "localhost") {
+      ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
+    } else {
+      await listenOnce(httpServer, port, host);
+    }
+  } catch (error) {
+    // The caller gets no OrpcServer to close, and desktop startup keeps running after a
+    // failed bind, so release what was created above instead of leaking it per attempt.
+    clearInterval(heartbeatInterval);
+    for (const ws of wsServer.clients) {
+      ws.terminate();
+    }
+    wsServer.close();
+    throw error;
   }
 
   // Get actual port (useful when port=0)

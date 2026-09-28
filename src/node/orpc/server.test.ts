@@ -1375,16 +1375,17 @@ describe("createOrpcServer", () => {
   test("localhost binds both loopback families on one port", async () => {
     // Regression: binding "localhost" used to take only the first resolved family,
     // leaving the other loopback address free for another dev server on the same port.
+    // Mixed case also exercises hostname normalization.
     const stubContext: Partial<ORPCContext> = {};
     const server = await createOrpcServer({
-      host: "localhost",
+      host: "LocalHost",
       port: 0,
       context: stubContext as ORPCContext,
       authToken: "test-token",
     });
 
     try {
-      expect(server.baseUrl).toBe(`http://localhost:${server.port}`);
+      expect(server.baseUrl).toBe(`http://LocalHost:${server.port}`);
       const v4 = await fetch(`http://127.0.0.1:${server.port}/version`);
       expect(v4.status).toBe(200);
 
