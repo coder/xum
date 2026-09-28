@@ -1998,7 +1998,10 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
           const defaultScope = defaultCreationDraftScope(projectPath);
           const pending = getDraftStore().getView(defaultScope);
           if (pending.text.trim().length > 0 || pending.attachmentCount > 0) {
-            getDraftStore().moveDraft(defaultScope, { kind: "creation", projectPath, draftId });
+            // Never rejects; the default draft is deleted only once the new one is saved.
+            getDraftStore()
+              .moveDraft(defaultScope, { kind: "creation", projectPath, draftId })
+              .catch(() => undefined);
             migrateWorkspaceStorage(pendingScopeId, getDraftScopeId(projectPath, draftId));
           }
         }

@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import {
   defaultCreationDraftScope,
   getDraftStore,
-  draftStoreScopeKey,
   useDraft,
   type DraftStoreScope,
 } from "@/browser/stores/DraftStore";
@@ -72,14 +71,13 @@ export function useComposerDraft(options: UseComposerDraftOptions) {
       creationProjectPath,
       pendingDraftId,
     });
-    const scopeKey = draftStoreScopeKey(scope);
     // Hydration carries attachment metadata only; fetch this draft's payloads once it is shown.
     getDraftStore()
       .ensurePayloads(scope)
       .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
     // A persistent save failure (e.g. a draft over the size limit) is surfaced once per streak.
-    const unsubscribeSaveErrors = getDraftStore().subscribeSaveErrors((failedScopeKey, message) => {
-      if (failedScopeKey !== scopeKey) return;
+    // A failure after unmount stays unreported, so the next composer of this scope surfaces it.
+    const unsubscribeSaveErrors = getDraftStore().subscribeSaveErrors(scope, (message) => {
       pushToastRef.current({
         type: "error",
         message: `Failed to save draft: ${message}`,

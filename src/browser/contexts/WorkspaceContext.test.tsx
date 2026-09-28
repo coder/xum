@@ -15,7 +15,6 @@ import {
   LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
   getAgentIdKey,
-  getInputKey,
   getModelKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
@@ -2142,16 +2141,17 @@ describe("WorkspaceContext", () => {
           list: () => Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
           listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
         },
+        // Drafts live on the backend now; any registered workspace-scoped key shows the GC.
         localStorage: {
-          [getInputKey(ACTIVE_ID)]: JSON.stringify("live draft"),
-          [getInputKey(ORPHAN_ID)]: JSON.stringify("orphan draft"),
+          [getModelKey(ACTIVE_ID)]: JSON.stringify("live model"),
+          [getModelKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
         },
       });
 
       await setup();
 
-      await waitFor(() => expect(localStorage.getItem(getInputKey(ORPHAN_ID))).toBeNull());
-      expect(localStorage.getItem(getInputKey(ACTIVE_ID))).not.toBeNull();
+      await waitFor(() => expect(localStorage.getItem(getModelKey(ORPHAN_ID))).toBeNull());
+      expect(localStorage.getItem(getModelKey(ACTIVE_ID))).not.toBeNull();
     });
 
     test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
@@ -2165,7 +2165,7 @@ describe("WorkspaceContext", () => {
               : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
           listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
         },
-        localStorage: { [getInputKey(ORPHAN_ID)]: JSON.stringify("draft") },
+        localStorage: { [getModelKey(ORPHAN_ID)]: JSON.stringify("draft") },
       });
 
       const ctx = await setup();
@@ -2175,7 +2175,7 @@ describe("WorkspaceContext", () => {
       await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
 
       expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
-      expect(localStorage.getItem(getInputKey(ORPHAN_ID))).not.toBeNull();
+      expect(localStorage.getItem(getModelKey(ORPHAN_ID))).not.toBeNull();
     });
   });
 });

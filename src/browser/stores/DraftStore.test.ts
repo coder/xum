@@ -575,21 +575,15 @@ describe("DraftStore", () => {
     });
 
     const listed: DraftScope = { kind: "creation", projectPath, draftId: "first-listed" };
-    store.moveDraft(scope, listed);
-    await waitFor(() => store.getView(listed).attachmentCount === 1);
-    await store.flush(listed);
+    await store.moveDraft(scope, listed);
     expect(await service.get(listed)).toMatchObject({
       text: "typed before reload",
       attachments: [image],
     });
-    const deadline = Date.now() + 2_000;
-    while (
+    expect(
       (await service.list()).some(
         (draft) => draftStoreScopeKey(draft.scope) === draftStoreScopeKey(scope)
       )
-    ) {
-      if (Date.now() > deadline) throw new Error("the moved default draft was not deleted");
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
+    ).toBe(false);
   });
 });
