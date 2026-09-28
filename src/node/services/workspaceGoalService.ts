@@ -3050,7 +3050,10 @@ export class WorkspaceGoalService {
     if (!hasBudgetedResumableGoal(goal)) {
       return true;
     }
-    const model = (await this.getKickoffSendOptions(workspaceId, kickoffModel))?.model;
+    // An unreachable runtime cannot name the persisted model: allow the mutation like a
+    // missing model does. Arming stays guarded, and the send-time pricing gate still
+    // rejects an unpriced model.
+    const model = (await this.getKickoffSendOptionsForArming(workspaceId, kickoffModel))?.model;
     if (!model) {
       return true;
     }
@@ -3077,10 +3080,11 @@ export class WorkspaceGoalService {
   }
 
   /**
-   * Kickoff options for arming a continuation. Arming runs after the goal is
-   * persisted, so an unreachable runtime (#4829) must neither throw out of the
-   * caller nor arm with default AI settings: the goal stays idle and the user's
-   * next turn resumes it through the stream-end continuation.
+   * Kickoff options for arming a continuation (and for the budget-pricing probe
+   * that gates goal mutations). Arming runs after the goal is persisted, so an
+   * unreachable runtime (#4829) must neither throw out of the caller nor arm
+   * with default AI settings: the goal stays idle and the user's next turn
+   * resumes it through the stream-end continuation.
    */
   private async getKickoffSendOptionsForArming(
     workspaceId: string,

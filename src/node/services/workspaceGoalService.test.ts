@@ -706,10 +706,15 @@ describe("WorkspaceGoalService", () => {
 
     // The goal is already written when arming runs: set_goal must still succeed,
     // and no kickoff may run with settings resolved without the agent definition.
-    const goal = await setGoalOk(service, { workspaceId, objective: "Remote host is down" });
+    // Budgeted goals also probe the kickoff model for pricing before they persist.
+    const goal = await setGoalOk(service, {
+      workspaceId,
+      objective: "Remote host is down",
+      budgetCents: 500,
+    });
     await drainPendingDispatches();
 
-    expect(goal).toMatchObject({ status: "active" });
+    expect(goal).toMatchObject({ status: "active", budgetCents: 500 });
     expect(execute).not.toHaveBeenCalled();
   });
 
