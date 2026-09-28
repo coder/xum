@@ -80,7 +80,7 @@ describe("commandParser", () => {
     });
 
     it("should parse /model with full provider:model format", () => {
-      expectModelSet("/model anthropic:claude-sonnet-5", KNOWN_MODELS.SONNET.id);
+      expectModelSet(`/model ${KNOWN_MODELS.SONNET.id}`, KNOWN_MODELS.SONNET.id);
     });
 
     it("should parse /compact -m with alias", () => {

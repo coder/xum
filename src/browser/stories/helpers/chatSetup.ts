@@ -106,6 +106,8 @@ export interface SimpleChatSetupOptions {
   timelineEvents?: TimelineEvent[];
   /** Admin policy served by policy.get (defaults to no policy). */
   policyResponse?: MockORPCClientOptions["policyResponse"];
+  /** Render the chat workspace as transcript-only (worktree gone; no composer). */
+  transcriptOnly?: boolean;
 }
 
 /**
@@ -122,6 +124,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
       name: opts.workspaceName ?? "feature",
       projectName,
       projectPath,
+      transcriptOnly: opts.transcriptOnly,
     }),
     ...(opts.additionalWorkspaces ?? []),
   ];

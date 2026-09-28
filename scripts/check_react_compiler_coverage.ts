@@ -26,6 +26,10 @@ const HOT_COMPONENTS: Record<string, readonly string[]> = {
   "src/browser/features/ChatInput/index.tsx": ["ChatInputInner"],
   "src/browser/features/ChatInput/CreationControls.tsx": ["CreationControls"],
   "src/browser/components/ChatPane/ChatPane.tsx": ["ChatPaneContent"],
+  "src/browser/components/ChatPane/TranscriptBundles.tsx": [
+    "TranscriptBundleRows",
+    "useTranscriptBundles",
+  ],
   "src/browser/features/Messages/MessageRenderer.tsx": ["MessageRenderer"],
   "src/browser/features/Messages/MessageWindow.tsx": ["MessageWindow"],
   "src/browser/features/Messages/AssistantMessage.tsx": ["AssistantMessage"],

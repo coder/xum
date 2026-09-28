@@ -396,3 +396,67 @@ describe("subscriptionIterable ordering and buffering", () => {
     }
   });
 });
+
+// onChat validates its own output through mapValue (#4868): every delivered value must pass
+// through it, and a rejected value must end the subscription without leaking the listener.
+describe("subscriptionIterable mapValue", () => {
+  test("maps pushed values and heartbeats before they are yielded", async () => {
+    const app = makeAppRuntime(TestClock.layer());
+    const controller = new AbortController();
+    let emitHandle: SubscriptionEmit<string> | undefined;
+    const values: string[] = [];
+    const iterable = subscriptionIterable<string>({
+      context: app.context,
+      signal: controller.signal,
+      heartbeat: { value: "heartbeat", intervalMs: 1_000 },
+      subscribe: (emit) => {
+        emitHandle = emit;
+        return () => undefined;
+      },
+      mapValue: (value) => `mapped:${value}`,
+    });
+    const consumed = (async () => {
+      for await (const value of iterable) values.push(value);
+    })();
+    try {
+      await waitFor(() => emitHandle !== undefined);
+      emitHandle?.push("event");
+      await app.managed.runPromise(TestClock.adjust(1_000));
+      await waitFor(() => values.length === 2);
+      expect(values).toEqual(["mapped:event", "mapped:heartbeat"]);
+    } finally {
+      controller.abort();
+      await consumed;
+      await disposeAppRuntime(app.managed);
+    }
+  });
+
+  test("a throwing mapValue rejects the iteration and detaches the listener", async () => {
+    const emitter = new EventEmitter();
+    const boom = new Error("invalid event");
+    const iterable = subscriptionIterable<number>({
+      subscribe: (emit) => {
+        emitter.on("value", emit.push);
+        return () => emitter.off("value", emit.push);
+      },
+      mapValue: (value) => {
+        if (value === 2) throw boom;
+        return value;
+      },
+    });
+
+    const values: number[] = [];
+    const consumed = (async () => {
+      for await (const value of iterable) values.push(value);
+    })();
+    await waitFor(() => emitter.listenerCount("value") === 1);
+    emitter.emit("value", 1);
+    emitter.emit("value", 2);
+    emitter.emit("value", 3);
+    let failure: unknown;
+    await consumed.catch((error: unknown) => (failure = error));
+    expect(failure).toBe(boom);
+    expect(values).toEqual([1]);
+    expect(emitter.listenerCount("value")).toBe(0);
+  });
+});

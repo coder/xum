@@ -16,7 +16,7 @@ Xum ships with curated models kept up to date with the frontier. Use any custom 
 | Fable 5.1              | anthropic:claude-fable-5-1    | `fable`                                                      |         |
 | Mythos 5.1             | anthropic:claude-mythos-5-1   | `mythos`                                                     |         |
 | Opus 5.5               | anthropic:claude-opus-5-5     | `opus`                                                       | ✓       |
-| Sonnet 5               | anthropic:claude-sonnet-5     | `sonnet`                                                     |         |
+| Sonnet 5.5             | anthropic:claude-sonnet-5-5   | `sonnet`                                                     |         |
 | Haiku 4.5              | anthropic:claude-haiku-4-5    | `haiku`                                                      |         |
 | GPT-6 Sol              | openai:gpt-6-sol              | `gpt`, `sol`                                                 |         |
 | GPT-5.6 Terra          | openai:gpt-5.6-terra          | `terra`                                                      |         |
@@ -124,10 +124,10 @@ Append `+level` to any model alias. Levels can be **named** (`off`, `low`, `medi
 
 Numeric levels are **model-relative** — they map to the model's allowed thinking range:
 
-- `0` = model's lowest allowed level (e.g., `off` for Sonnet, `medium` for GPT-5.5 Pro)
+- `0` = model's lowest allowed level (e.g., `off` for Haiku, `low` for Sonnet, `medium` for GPT-5.5 Pro)
 - Higher numbers select progressively higher levels, clamped to the model's maximum
 
-This means `/sonnet+0` disables thinking while `/gpt-pro+0` sets thinking to medium (GPT-5.5 Pro's minimum).
+This means `/haiku+0` disables thinking while `/gpt-pro+0` sets thinking to medium (GPT-5.5 Pro's minimum).
 
 Use `/+level` (no model) to override thinking on the current model: `/+0 quick answer`
 

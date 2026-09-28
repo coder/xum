@@ -484,7 +484,7 @@ export type TranscriptDensity = (typeof TRANSCRIPT_DENSITIES)[number];
 
 export const DEFAULT_TRANSCRIPT_DENSITY: TranscriptDensity = "normal";
 
-function isTranscriptDensity(value: unknown): value is TranscriptDensity {
+export function isTranscriptDensity(value: unknown): value is TranscriptDensity {
   return typeof value === "string" && TRANSCRIPT_DENSITIES.includes(value as TranscriptDensity);
 }
 
@@ -1038,6 +1038,29 @@ export function getWorkspaceKeyPrefix(getKey: (scopeId: string) => string): stri
   return getKey("");
 }
 
+/** Scope id embedded in a registered workspace-scoped key, or null for any other key. */
+function getWorkspaceScopeIdFromKey(key: string): string | null {
+  for (const entry of WORKSPACE_KEY_REGISTRATIONS) {
+    const prefix = getWorkspaceKeyPrefix(entry.getKey);
+    if (key.startsWith(prefix)) return key.slice(prefix.length);
+  }
+  return null;
+}
+
+const MCP_TEST_RESULTS_KEY_PREFIX = getWorkspaceKeyPrefix(getMCPTestResultsKey);
+
+/**
+ * Trailing segment of an "mcpTestResults:{projectPath}[:{workspaceId}]" key (text after the last
+ * ":"), or null for other keys. For project-level keys this is a piece of the project path; callers
+ * only treat it as a workspace id when it has the stable id shape.
+ */
+function getMcpTestResultsTrailingSegment(key: string): string | null {
+  if (!key.startsWith(MCP_TEST_RESULTS_KEY_PREFIX)) return null;
+  const rest = key.slice(MCP_TEST_RESULTS_KEY_PREFIX.length);
+  const separator = rest.lastIndexOf(":");
+  return separator === -1 ? null : rest.slice(separator + 1);
+}
+
 /** Classify a concrete localStorage key; undefined means unregistered (treated as non-evictable). */
 export function getPersistedKeyKind(key: string): PersistedKeyKind | undefined {
   for (const entry of PERSISTED_KEY_REGISTRY) {
@@ -1097,6 +1120,62 @@ export function deleteWorkspaceStorage(workspaceId: string): void {
   for (const { getKey } of WORKSPACE_KEY_REGISTRATIONS) {
     localStorage.removeItem(getKey(workspaceId));
   }
+  // Workspace-scoped MCP test results embed the project path before the id, so they cannot be
+  // addressed by id alone; scan for them. Collect first: removing while indexing shifts keys.
+  const mcpTestResultsSuffix = `:${workspaceId}`;
+  const mcpTestResultsKeys: string[] = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (key?.startsWith(MCP_TEST_RESULTS_KEY_PREFIX) && key.endsWith(mcpTestResultsSuffix)) {
+      mcpTestResultsKeys.push(key);
+    }
+  }
+  for (const key of mcpTestResultsKeys) {
+    localStorage.removeItem(key);
+  }
+}
+
+/**
+ * New workspaces get crypto.randomBytes(5) hex ids (Config.generateStableId). Orphan GC only
+ * collects keys whose scope id has this shape, so legacy-format ids, creation-draft, pending,
+ * project and global scopes and legacy keys that share a prefix (e.g. "thinkingLevel:model:{model}") are never collected.
+ * Failing closed here leaks a little space at worst; guessing wrong would delete user data.
+ */
+const STABLE_WORKSPACE_ID_PATTERN = /^[0-9a-f]{10}$/;
+
+/**
+ * Stable workspace id owning a key the orphan GC may collect, or null for every other key
+ * (legacy-format ids, creation-draft/pending/project/global scopes, unregistered keys).
+ */
+function getWorkspaceStorageGcOwnerId(key: string): string | null {
+  const scopeId = getWorkspaceScopeIdFromKey(key) ?? getMcpTestResultsTrailingSegment(key);
+  // mcpTestResults is registered as an evictable cache, so misreading a project-level key whose
+  // path happens to end in ":{10 hex}" only drops re-testable results, never user data.
+  return scopeId !== null && STABLE_WORKSPACE_ID_PATTERN.test(scopeId) ? scopeId : null;
+}
+
+/**
+ * Every localStorage key the orphan GC could ever collect: registered workspace-scoped keys and
+ * workspace-scoped mcpTestResults keys of stable workspace ids.
+ */
+export function listWorkspaceStorageGcCandidateKeys(): string[] {
+  const keys: string[] = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index);
+    if (key !== null && getWorkspaceStorageGcOwnerId(key) !== null) keys.push(key);
+  }
+  return keys;
+}
+
+/** Pick the candidate keys whose stable workspace id is not in `knownWorkspaceIds`. */
+export function findOrphanedWorkspaceStorageKeys(
+  candidateKeys: readonly string[],
+  knownWorkspaceIds: ReadonlySet<string>
+): string[] {
+  return candidateKeys.filter((key) => {
+    const ownerId = getWorkspaceStorageGcOwnerId(key);
+    return ownerId !== null && !knownWorkspaceIds.has(ownerId);
+  });
 }
 
 /**

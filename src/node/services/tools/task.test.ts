@@ -12,6 +12,7 @@ import {
   TestTempDir,
 } from "./testHelpers";
 import { Ok, Err } from "@/common/types/result";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { ForegroundWaitBackgroundedError, type TaskService } from "@/node/services/taskService";
 
 function expectQueuedOrRunningTaskToolResult(
@@ -709,7 +710,7 @@ describe("task tool", () => {
 
     expect(create).toHaveBeenCalledTimes(1);
     const createArgs = create.mock.calls[0]?.[0];
-    expect(createArgs?.modelString).toBe("anthropic:claude-sonnet-5");
+    expect(createArgs?.modelString).toBe(KNOWN_MODELS.SONNET.id);
     expect(createArgs?.thinkingLevel).toBe("high");
     // Parent runtime hint is still forwarded so unspecified fields keep inheriting.
     expect(createArgs?.parentRuntimeAiSettings).toEqual({
@@ -723,7 +724,7 @@ describe("task tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
     // Shape of one models_list entry for a built-in; the handler must accept the
     // canonical ID and every alias and forward the normalized pair unchanged.
-    const entry = { model: "anthropic:claude-sonnet-5", aliases: ["sonnet"], thinking: "low" };
+    const entry = { model: KNOWN_MODELS.SONNET.id, aliases: ["sonnet"], thinking: "low" };
 
     for (const model of [entry.model, ...entry.aliases]) {
       const create = mock((_: { modelString?: unknown; thinkingLevel?: unknown }) =>
