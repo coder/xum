@@ -6,7 +6,8 @@
  * swapped for a held queue so every intermediate state is observable: the composer keeps
  * working, a stream renders at the tail while older rows are still unmounted, "Load older
  * messages" waits for the last chunk, and a navigation to a not-yet-mounted row scrolls once
- * its chunk lands.
+ * its chunk lands. Past the automatic rows budget the reveal pauses, and navigations reveal down
+ * to their target instead of waiting for chunks that no longer come.
  */
 import "../dom";
 
@@ -19,10 +20,15 @@ import { act, fireEvent, waitFor } from "@testing-library/react";
 import React from "react";
 
 import { preloadTestModules } from "../../ipc/setup";
-import { createAppHarness } from "../harness";
+import { createAppHarness, type AppHarness } from "../harness";
 import { transcriptRevealFrameScheduler } from "@/browser/hooks/useBoundedTranscriptReveal";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
-import { TRANSCRIPT_REVEAL_TAIL_ROWS } from "@/common/constants/ui";
+import {
+  TRANSCRIPT_REVEAL_AUTO_MAX_ROWS,
+  TRANSCRIPT_REVEAL_CHUNK_ROWS,
+  TRANSCRIPT_REVEAL_TAIL_ROWS,
+} from "@/common/constants/ui";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { createMuxMessage } from "@/common/types/message";
 import * as mockAiStreamAdapter from "@/node/services/mock/mockAiStreamAdapter";
 
@@ -41,6 +47,58 @@ function useHeldTransition(): ReturnType<typeof React.useTransition> {
   return [isPending, (callback) => heldTransitions.push(() => startTransition(callback))];
 }
 
+/**
+ * A completed turn plus a compaction give the replay a since-cursor and a boundary, so the rows
+ * seeded afterwards arrive as one since-replay and "Load older messages" has a page to offer.
+ */
+async function seedAfterCompaction(app: AppHarness, rowCount: number): Promise<void> {
+  await app.chat.send("Seed before the compaction");
+  await app.chat.expectTranscriptContains("Mock response: Seed before the compaction");
+  await app.chat.expectStreamComplete();
+  await app.chat.send("/compact -t 500");
+  await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
+  await app.chat.expectStreamComplete();
+
+  const historyService = app.env.services.toORPCContext().historyService;
+  for (let index = 0; index < rowCount; index++) {
+    const appended = await historyService.appendToHistory(
+      app.workspaceId,
+      createMuxMessage(seedId(index), index % 2 === 0 ? "user" : "assistant", seedText(index))
+    );
+    if (!appended.success) throw new Error(appended.error);
+  }
+}
+
+/**
+ * Holds the reveal's frames so each step is explicit, and records navigation scrolls by the
+ * scrolled row's message id. `restore` undoes both.
+ */
+function holdRevealFramesAndRecordScrolls() {
+  const heldFrames: (() => void)[] = [];
+  const scrolledTo: string[] = [];
+  const originalSchedule = transcriptRevealFrameScheduler.schedule;
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- saved only to restore the prototype method afterwards
+  const originalScrollIntoView = Element.prototype.scrollIntoView;
+  transcriptRevealFrameScheduler.schedule = (callback) => {
+    heldFrames.push(callback);
+    return () => {
+      const held = heldFrames.indexOf(callback);
+      if (held !== -1) heldFrames.splice(held, 1);
+    };
+  };
+  Element.prototype.scrollIntoView = function (this: Element) {
+    scrolledTo.push(this.getAttribute("data-message-id") ?? "?");
+  };
+  return {
+    heldFrames,
+    scrolledTo,
+    restore: () => {
+      transcriptRevealFrameScheduler.schedule = originalSchedule;
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    },
+  };
+}
+
 function mountedRowIds(container: HTMLElement): string[] {
   return Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]")).map(
     (element) => element.getAttribute("data-message-id") ?? ""
@@ -54,42 +112,12 @@ describe("Tail-first transcript reveal (mock AI router)", () => {
 
   test("mounts the tail first, keeps the UI live, and reveals the rest in chunks", async () => {
     const app = await createAppHarness({ branchPrefix: "bounded-reveal" });
-    const heldFrames: (() => void)[] = [];
-    const originalSchedule = transcriptRevealFrameScheduler.schedule;
-    const scrolledTo: string[] = [];
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- saved only to restore the prototype method afterwards
-    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    let probes: ReturnType<typeof holdRevealFramesAndRecordScrolls> | null = null;
 
     try {
-      // A completed turn plus a compaction give the replay a since-cursor and a boundary, so
-      // the seeded rows arrive as one since-replay and "Load older messages" has a page to offer.
-      await app.chat.send("Seed before the compaction");
-      await app.chat.expectTranscriptContains("Mock response: Seed before the compaction");
-      await app.chat.expectStreamComplete();
-      await app.chat.send("/compact -t 500");
-      await app.chat.expectTranscriptContains("Mock compaction summary:", 60_000);
-      await app.chat.expectStreamComplete();
-
-      const historyService = app.env.services.toORPCContext().historyService;
-      for (let index = 0; index < SEEDED_ROWS; index++) {
-        const appended = await historyService.appendToHistory(
-          app.workspaceId,
-          createMuxMessage(seedId(index), index % 2 === 0 ? "user" : "assistant", seedText(index))
-        );
-        if (!appended.success) throw new Error(appended.error);
-      }
-
-      // Hold the reveal's frames so each step is explicit, and record navigation scrolls.
-      transcriptRevealFrameScheduler.schedule = (callback) => {
-        heldFrames.push(callback);
-        return () => {
-          const held = heldFrames.indexOf(callback);
-          if (held !== -1) heldFrames.splice(held, 1);
-        };
-      };
-      Element.prototype.scrollIntoView = function (this: Element) {
-        scrolledTo.push(this.getAttribute("data-message-id") ?? "?");
-      };
+      await seedAfterCompaction(app, SEEDED_ROWS);
+      probes = holdRevealFramesAndRecordScrolls();
+      const { heldFrames, scrolledTo } = probes;
 
       // Leave and re-enter: the since-replay lands all seeded rows at once (bulk arrival).
       workspaceStore.setActiveWorkspaceId(null);
@@ -233,9 +261,83 @@ describe("Tail-first transcript reveal (mock AI router)", () => {
       });
       expect(scrolledTo).toEqual([targetId]);
     } finally {
-      transcriptRevealFrameScheduler.schedule = originalSchedule;
-      Element.prototype.scrollIntoView = originalScrollIntoView;
+      probes?.restore();
       await app.dispose();
     }
   }, 120_000);
+
+  test("a navigation to a row above the paused reveal reveals down to it, then pauses again", async () => {
+    // Enough rows that the displayed transcript (every user prompt is kept) exceeds the automatic
+    // budget by more than a chunk.
+    const seededRows = 2 * (TRANSCRIPT_REVEAL_AUTO_MAX_ROWS + 2 * TRANSCRIPT_REVEAL_CHUNK_ROWS);
+    const app = await createAppHarness({ branchPrefix: "bounded-reveal-paused" });
+    let probes: ReturnType<typeof holdRevealFramesAndRecordScrolls> | null = null;
+
+    try {
+      await seedAfterCompaction(app, seededRows);
+      probes = holdRevealFramesAndRecordScrolls();
+      const { heldFrames, scrolledTo } = probes;
+      const transcript = () => app.view.container.textContent ?? "";
+      const releaseFramesUntilPaused = () => {
+        let steps = 0;
+        while (heldFrames.length > 0) {
+          if (++steps > 50) throw new Error("reveal did not pause within 50 steps");
+          const frame = heldFrames.shift()!;
+          act(() => frame());
+        }
+      };
+
+      workspaceStore.setActiveWorkspaceId(null);
+      workspaceStore.setActiveWorkspaceId(app.workspaceId);
+      await app.chat.expectTranscriptContains(seedText(seededRows - 1), 30_000);
+
+      // The automatic reveal stops scheduling frames at its budget and offers Load older.
+      releaseFramesUntilPaused();
+      await waitFor(() => expect(transcript()).toContain("Load older messages"));
+      expect(mountedRowIds(app.view.container)).not.toContain(seedId(0));
+
+      // Previous message from the earliest mounted prompt targets a row just above the boundary:
+      // no automatic chunk will mount it, so the navigation must ask the reveal to reach it.
+      const earliestMountedUserIndex = mountedRowIds(app.view.container)
+        .map((id) => Number(id.split("-").at(-1)))
+        .filter((index) => Number.isInteger(index) && index % 2 === 0)
+        .sort((a, b) => a - b)[0];
+      const previousTargetId = seedId(earliestMountedUserIndex - 2);
+      const previousButton = Array.from(
+        app.view.container.querySelectorAll<HTMLButtonElement>(
+          'button[aria-label="Previous message"]'
+        )
+      ).find((button) => !button.disabled)!;
+      fireEvent.click(previousButton);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(heldFrames.length).toBe(1);
+      releaseFramesUntilPaused();
+      expect(mountedRowIds(app.view.container)).toContain(previousTargetId);
+      await waitFor(() => expect(scrolledTo).toEqual([previousTargetId]));
+
+      // A timeline reveal of a prompt many chunks above the boundary reveals down to it and
+      // stops there, instead of revealing every row.
+      const timelineTargetIndex = 2 * Math.floor(earliestMountedUserIndex / 4);
+      expect(timelineTargetIndex).toBeGreaterThan(2 * TRANSCRIPT_REVEAL_CHUNK_ROWS);
+      const timelineTargetId = seedId(timelineTargetIndex);
+      act(() => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, {
+            workspaceId: app.workspaceId,
+            messageId: timelineTargetId,
+          })
+        );
+      });
+      expect(heldFrames.length).toBe(1);
+      releaseFramesUntilPaused();
+      expect(mountedRowIds(app.view.container)).toContain(timelineTargetId);
+      expect(mountedRowIds(app.view.container)).not.toContain(seedId(0));
+      await waitFor(() => expect(scrolledTo).toEqual([previousTargetId, timelineTargetId]));
+    } finally {
+      probes?.restore();
+      await app.dispose();
+    }
+  }, 180_000);
 });

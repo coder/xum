@@ -549,8 +549,10 @@ describe("useBoundedTranscriptReveal", () => {
       runFrames();
       act(() => result.current.revealMore());
       act(() => result.current.revealThrough(0));
-      // Switch to another long workspace before either request finished.
-      setProps({ workspaceId: "ws-2", messages: rows(LONG, "other") });
+      // Switch to another long workspace before either request finished. Its row ids match the
+      // old ones, so a target carried across the restart would still be found (not dropped as
+      // vanished) and would reveal every row.
+      setProps({ workspaceId: "ws-2", messages: rows(LONG) });
       runFrames();
       expect(result.current.isRevealPaused).toBe(true);
       expect(mounted(result.current.fromIndex)).toBeLessThan(
