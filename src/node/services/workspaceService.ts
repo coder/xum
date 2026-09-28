@@ -3544,10 +3544,10 @@ export class WorkspaceService
     rollback: () => Promise<CreationRollbackResult>,
     error: string
   ): Promise<string> {
-    const { entryGone, leftovers } = await rollback().catch(async (rollbackError: unknown) => {
+    const { entryGone, leftovers } = await rollback().catch((rollbackError: unknown) => {
       logRegistrationRollbackFailure(workspaceId, rollbackError);
       // A cleanup step after the deregistration can throw too.
-      return { entryGone: await this.isRegistrationProvablyGone(workspaceId), leftovers: [] };
+      return { entryGone: this.isRegistrationProvablyGone(workspaceId), leftovers: [] };
     });
     if (!entryGone) {
       return `${error} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${workspaceId} manually before retrying.`;
