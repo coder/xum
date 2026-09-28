@@ -26,6 +26,7 @@ import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/cons
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
+import type { BackupExperiments } from "./experimentsProjection";
 import type { BackupSettings } from "./settingsProjection";
 
 export const BACKUP_SCHEMA_VERSION = 1;
@@ -141,6 +142,7 @@ export interface CreateBackupPayloadOptions {
   contents: BackupContents;
   preferences?: UserPreferences;
   settings?: BackupSettings;
+  experiments?: BackupExperiments;
   muxVersion: string;
   sourceLabel: string;
   exportedAt?: string;
@@ -892,16 +894,21 @@ function copyJson<T>(value: T): T {
 }
 
 /**
- * Top-level settings ride inside preferences.json rather than in a payload file of their own:
- * an older build's manifest parser refuses unknown payload paths, while its non-strict
- * UserPreferencesSchema strips the unknown `settings` key and restores what it understands.
+ * Top-level settings and experiment overrides ride inside preferences.json rather than in
+ * payload files of their own: an older build's manifest parser refuses unknown payload paths,
+ * while its non-strict UserPreferencesSchema strips the unknown `settings` and `experiments`
+ * keys and restores what it understands.
  */
 export function serializeBackupPreferences(
   preferences: unknown,
-  settings?: BackupSettings
+  settings?: BackupSettings,
+  experiments?: BackupExperiments
 ): Buffer {
   const document: Record<string, unknown> = { ...projectBackupPreferences(preferences) };
   if (settings !== undefined && Object.keys(settings).length > 0) document.settings = settings;
+  if (experiments !== undefined && Object.keys(experiments).length > 0) {
+    document.experiments = experiments;
+  }
   return Buffer.from(`${JSON.stringify(document, null, 2)}\n`, "utf-8");
 }
 
@@ -1619,7 +1626,11 @@ export async function createBackupPayload(
   if (options.contents.includePreferences) {
     files.push({
       path: "preferences.json",
-      content: serializeBackupPreferences(options.preferences, options.settings),
+      content: serializeBackupPreferences(
+        options.preferences,
+        options.settings,
+        options.experiments
+      ),
     });
   }
   // Count and complexity only: this payload may be a local snapshot, whose names keep

@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { VERSION } from "@/version";
 import type { Config } from "@/node/config";
+import type { ExperimentsService } from "@/node/services/experimentsService";
 import type { BackupFileChange, BackupProjectImport } from "@/common/orpc/schemas/backup";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import {
@@ -77,6 +78,12 @@ import {
   type MatchedProjectEntry,
   type ProjectBundleRestorePlan,
 } from "./payload";
+import {
+  backupExperimentsDiffer,
+  projectBackupExperiments,
+  readBackupExperiments,
+  type BackupExperimentsRead,
+} from "./experimentsProjection";
 import {
   mergeBackupSettings,
   projectBackupSettings,
@@ -237,8 +244,22 @@ async function readProjectGitRemote(
   }
 }
 
-export function createBackupPayloadStore(options: { config: Config }): BackupPayloadStore {
+export function createBackupPayloadStore(options: {
+  config: Config;
+  /** Absent where no ExperimentsService runs (tests): no experiments are exported or applied. */
+  experiments?: Pick<ExperimentsService, "getOverrides" | "applyOverrides">;
+}): BackupPayloadStore {
   const muxRoot = options.config.rootDir;
+
+  /**
+   * Reported unsupported only when this store can apply experiments at all; without a service
+   * the block is ignored like any key this build does not read.
+   */
+  function readRestorableExperiments(document: unknown): BackupExperimentsRead {
+    return options.experiments === undefined
+      ? { experiments: undefined, unsupported: [] }
+      : readBackupExperiments(document);
+  }
 
   // Walks the chain so a symlinked ancestor is rejected before writeBackupPayload's
   // recursive removal could follow it out of the cache clone.
@@ -266,6 +287,10 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       contents,
       preferences: projectBackupPreferences(config.userPreferences ?? {}),
       settings: projectBackupSettings(config),
+      experiments:
+        contents.includePreferences && options.experiments !== undefined
+          ? projectBackupExperiments(await options.experiments.getOverrides())
+          : undefined,
       muxVersion: resolveMuxVersion(),
       sourceLabel: path.basename(muxRoot),
       // The service owns the user-facing override, so report rather than throw.
@@ -578,13 +603,20 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
           const local = localConfig.userPreferences;
           const merged = mergeBackupPreferences(local, document);
           const backupSettings = readBackupSettings(document);
-          unsupportedSettings = backupSettings.unsupported;
+          const backupExperiments = readRestorableExperiments(document);
+          unsupportedSettings = [...backupSettings.unsupported, ...backupExperiments.unsupported];
           if (
             !serializeBackupPreferences(local).equals(serializeBackupPreferences(merged)) ||
             (backupSettings.settings !== undefined &&
               backupSettingsDiffer(
                 localConfig,
                 mergeBackupSettings(localConfig, backupSettings.settings)
+              )) ||
+            (backupExperiments.experiments !== undefined &&
+              options.experiments !== undefined &&
+              backupExperimentsDiffer(
+                await options.experiments.getOverrides(),
+                backupExperiments.experiments
               ))
           ) {
             changes.push({ status: "M", path: file.path });
@@ -729,7 +761,8 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
         let unsupportedSettings: string[] = [];
         if (result.backupPreferences !== undefined) {
           const backupSettings = readBackupSettings(result.backupPreferences);
-          unsupportedSettings = backupSettings.unsupported;
+          const backupExperiments = readRestorableExperiments(result.backupPreferences);
+          unsupportedSettings = [...backupSettings.unsupported, ...backupExperiments.unsupported];
           let merged: ProjectsConfig | undefined;
           await options.config.editConfig(
             (current) => {
@@ -768,6 +801,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
               "IO_ERROR",
               "The restored preferences could not be written to config.json"
             );
+          }
+          // Through the service, whose acknowledged write is the check, so backend gates and
+          // open renderers see the restored experiments at once.
+          if (backupExperiments.experiments !== undefined && options.experiments !== undefined) {
+            await options.experiments.applyOverrides(backupExperiments.experiments);
           }
         }
         return { localOnlyFiles: result.localOnlyFiles, unsupportedSettings };

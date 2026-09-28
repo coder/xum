@@ -375,7 +375,7 @@ export const MiscDesktopLive: Layer.Layer<
       gitRepo: createBackupGitRepo({
         cacheRoot: path.join(config.rootDir, "backup-cache"),
       }),
-      payload: createBackupPayloadStore({ config }),
+      payload: createBackupPayloadStore({ config, experiments: experimentsService }),
     });
     // Managed Agent Plugin installer (agent-plugins experiment). Gated on the
     // backend ExperimentsService exactly like the plugin MCP provider; the

@@ -92,7 +92,7 @@ const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
     flag: "includePreferences",
     label: "Portable preferences",
     description:
-      "Appearance and workflow preferences, plus model and agent settings such as default models, thinking levels, advisor and task settings, and layout presets.",
+      "Appearance and workflow preferences, model and agent settings such as default models, thinking levels, advisor and task settings, and layout presets, plus experiment toggles.",
     shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
   },
   {

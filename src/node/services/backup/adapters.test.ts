@@ -24,6 +24,9 @@ import {
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
 import { withProjectRegistrationLock } from "@/node/config/projectRegistrationLock";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { ExperimentsService } from "@/node/services/experimentsService";
+import type { TelemetryService } from "@/node/services/telemetryService";
 import { TestBackupConfig, captureRejection, runGit, writeFixtureFile } from "./testHelpers";
 
 const CORE_CONTENTS = resolveBackupContents({});
@@ -68,6 +71,13 @@ describe("backup adapters", () => {
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
+
+  function createExperiments(home: string): ExperimentsService {
+    return new ExperimentsService({
+      telemetryService: { setFeatureFlagVariant: () => undefined } as unknown as TelemetryService,
+      xumHome: path.join(tempDir, home),
+    });
+  }
 
   it("exports, pushes, and reports a second push as unchanged", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "global instructions\n");
@@ -1351,6 +1361,134 @@ describe("backup adapters", () => {
       })
     );
     expect((error as Error).message).toContain("could not be written");
+  });
+
+  it("restores portable experiments through the service and never the local ones", async () => {
+    const source = createExperiments("source-home");
+    await source.applyOverrides({
+      [EXPERIMENT_IDS.ADVISOR_TOOL]: true,
+      [EXPERIMENT_IDS.MEMORY]: false,
+      [EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT]: true,
+      [EXPERIMENT_IDS.AGENT_PLUGINS]: true,
+    });
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+    await createBackupPayloadStore({ config, experiments: source }).exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+    const published = path.join(repository.rootDir, settings.path);
+    const document = JSON.parse(
+      await fs.readFile(path.join(published, "preferences.json"), "utf-8")
+    ) as { experiments: Record<string, unknown> };
+    expect(document.experiments).toMatchObject({
+      [EXPERIMENT_IDS.ADVISOR_TOOL]: true,
+      [EXPERIMENT_IDS.MEMORY]: false,
+      // Unset is written too, so a reset on the source restores as a reset.
+      [EXPERIMENT_IDS.TIMELINE]: null,
+    });
+    for (const local of [
+      EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT,
+      EXPERIMENT_IDS.AGENT_PLUGINS,
+      EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+    ]) {
+      expect(document.experiments).not.toHaveProperty(local);
+    }
+
+    // What someone with write access to the repository could add.
+    await tamperPublishedFile(
+      published,
+      "preferences.json",
+      JSON.stringify({
+        ...document,
+        experiments: {
+          ...document.experiments,
+          [EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT]: true,
+          [EXPERIMENT_IDS.AGENT_PLUGINS]: true,
+          [EXPERIMENT_IDS.MEMORY_HOT_SET]: "yes",
+          "experiment-from-a-newer-build": true,
+        },
+      })
+    );
+
+    const target = createExperiments("target-home");
+    await target.applyOverrides({
+      [EXPERIMENT_IDS.TIMELINE]: true,
+      [EXPERIMENT_IDS.MEMORY_HOT_SET]: true,
+    });
+    const payload = createBackupPayloadStore({ config, experiments: target });
+    const unsupported = [
+      `experiments.${EXPERIMENT_IDS.MEMORY_HOT_SET}`,
+      "experiments.experiment-from-a-newer-build",
+    ];
+    const preview = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+    expect(preview.changes).toEqual([{ status: "M", path: "preferences.json" }]);
+    expect(preview.unsupportedSettings).toEqual(unsupported);
+
+    const snapshotPath = path.join(tempDir, "restore-snapshot");
+    await payload.writeSafetySnapshot(snapshotPath, CORE_CONTENTS);
+    const snapshot = JSON.parse(
+      await fs.readFile(path.join(snapshotPath, "preferences.json"), "utf-8")
+    ) as { experiments: Record<string, unknown> };
+    expect(snapshot.experiments[EXPERIMENT_IDS.TIMELINE]).toBe(true);
+
+    const writes: unknown[] = [];
+    target.onOverridesChange((overrides) => writes.push(overrides));
+    const restored = await payload.restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+      snapshotPath,
+      matchedProjects: [],
+    });
+    expect(restored.unsupportedSettings).toEqual(unsupported);
+    expect(target.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL)).toBe(true);
+    expect(target.isExperimentEnabled(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT)).toBe(false);
+    expect(target.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS)).toBe(false);
+    const overrides = await target.getOverrides();
+    expect(overrides).toEqual({
+      [EXPERIMENT_IDS.ADVISOR_TOOL]: true,
+      [EXPERIMENT_IDS.MEMORY]: false,
+      // Not decided by a value this build cannot read.
+      [EXPERIMENT_IDS.MEMORY_HOT_SET]: true,
+    });
+    // One write, announced to open renderers.
+    expect(writes).toEqual([overrides]);
+
+    const afterRestore = await payload.previewRestore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+    expect(afterRestore.changes).toEqual([]);
+  });
+
+  it("leaves local experiments alone when the backup predates them", async () => {
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const repository = await gitRepo.prepare(settings);
+    // An export without an experiments service writes no block, like an older build.
+    await createBackupPayloadStore({ config }).exportTo({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+    });
+
+    const target = createExperiments("target-home");
+    await target.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    const restored = await createBackupPayloadStore({ config, experiments: target }).restore({
+      repositoryRoot: repository.rootDir,
+      managedPath: settings.path,
+      contents: CORE_CONTENTS,
+      snapshotPath: path.join(tempDir, "restore-snapshot"),
+      matchedProjects: [],
+    });
+    expect(restored.unsupportedSettings).toEqual([]);
+    expect(await target.getOverrides()).toEqual({ [EXPERIMENT_IDS.TIMELINE]: true });
   });
 
   it("keeps preferences another window saved while the restore ran", async () => {
