@@ -587,10 +587,7 @@ const STAGED_ATTACHMENT_ID_PATTERN =
  * Returns null for anything staging could not have produced: legacy `.mux` paths (never
  * mirrored), non-UUID directories, nested segments, or names that sanitizing would change.
  */
-export function resolveStagedAttachmentMirrorPath(
-  sessionDir: string,
-  stagedPath: string
-): string | null {
+function resolveStagedAttachmentMirrorPath(sessionDir: string, stagedPath: string): string | null {
   const normalized = normalizeReadableStagedPath(stagedPath);
   if (!normalized?.startsWith(`${STAGED_ATTACHMENT_DIR}/`)) {
     return null;
@@ -604,6 +601,28 @@ export function resolveStagedAttachmentMirrorPath(
     return null;
   }
   return path.join(sessionDir, STAGED_ATTACHMENT_MIRROR_DIR_NAME, id, filename);
+}
+
+/**
+ * Whether the mirror holds exactly the checkout's current bytes for a canonical staged path, so
+ * that rehydration after a snapshot archive restores the upload unchanged (#4895). False for
+ * anything else: legacy or non-canonical paths, links, special or oversized files, a missing or
+ * stale mirror, or a read error. Never follows links in the checkout.
+ */
+export async function stagedAttachmentMirrorMatchesCheckout(input: {
+  workspacePath: string;
+  sessionDir: string;
+  stagedPath: string;
+}): Promise<boolean> {
+  try {
+    const [checkout, mirror] = await Promise.all([
+      readCheckoutFileWithoutFollowingLinks(input.workspacePath, input.stagedPath),
+      readStagedAttachmentMirrorFile(input.sessionDir, input.stagedPath),
+    ]);
+    return checkout != null && mirror != null && checkout.equals(mirror);
+  } catch {
+    return false;
+  }
 }
 
 /** Read a mirror entry, or null when it is absent, not a regular file, or over the size cap. */

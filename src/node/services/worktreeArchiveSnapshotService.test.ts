@@ -1173,6 +1173,7 @@ describe("WorktreeArchiveSnapshotService", () => {
     const unmirroredId = "22222222-2222-4222-8222-222222222222";
     const mismatchId = "33333333-3333-4333-8333-333333333333";
     const legacyId = "44444444-4444-4444-8444-444444444444";
+    const staleId = "55555555-5555-4555-8555-555555555555";
     const stage = async (dir: string, id: string, name: string, mirror?: string) => {
       await fs.mkdir(path.join(ws, dir, id), { recursive: true });
       await fs.writeFile(path.join(ws, dir, id, name), "image-bytes");
@@ -1189,6 +1190,8 @@ describe("WorktreeArchiveSnapshotService", () => {
     await stage(".xum/user-attachments", mirroredId, "kept.png", "image-bytes");
     await stage(".xum/user-attachments", unmirroredId, "lost.png");
     await stage(".xum/user-attachments", mismatchId, "partial.png", "image");
+    // Same length, different bytes: the checkout copy was replaced after mirroring.
+    await stage(".xum/user-attachments", staleId, "stale.png", "IMAGE-BYTES");
     await stage(".mux/user-attachments", legacyId, "legacy.png");
     // Staging never nests deeper than <uuid>/<name>: a deeper directory is listed, not walked.
     await fs.mkdir(path.join(ws, ".xum/user-attachments", mirroredId, "nested", "deep"), {
@@ -1206,6 +1209,7 @@ describe("WorktreeArchiveSnapshotService", () => {
         `.xum/user-attachments/${mirroredId}/nested/`,
         `.xum/user-attachments/${unmirroredId}/lost.png`,
         `.xum/user-attachments/${mismatchId}/partial.png`,
+        `.xum/user-attachments/${staleId}/stale.png`,
       ])
     );
   });

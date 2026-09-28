@@ -23,11 +23,8 @@ import { log } from "@/node/services/log";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
-import {
-  MAX_STAGED_ATTACHMENT_SIZE_BYTES,
-  STAGED_ATTACHMENT_DIRS,
-} from "@/common/constants/stagedAttachments";
-import { resolveStagedAttachmentMirrorPath } from "@/node/utils/attachments/stageWorkspaceAttachment";
+import { STAGED_ATTACHMENT_DIRS } from "@/common/constants/stagedAttachments";
+import { stagedAttachmentMirrorMatchesCheckout } from "@/node/utils/attachments/stageWorkspaceAttachment";
 
 const SNAPSHOT_VERSION = 1;
 const SNAPSHOT_DIR_NAME = "archive-state";
@@ -93,7 +90,7 @@ function findWorkspaceEntryByIdOrPath(
  * tracks files under `.xum/` or `.mux/`. A staged file survives only through its session-dir
  * mirror copy (restored after unarchive), so list every entry without a valid one: legacy `.mux`
  * uploads (never mirrored), non-canonical names, symlinks and special files, and files whose
- * mirror is missing or has a different size. Draft-only uploads that were never staged into the
+ * mirror is missing or holds different bytes. Draft-only uploads that were never staged into the
  * checkout are invisible here (they live in renderer storage).
  * Never follows symlinks; an unreadable directory is listed itself (fail closed).
  */
@@ -130,25 +127,8 @@ async function listUnmirroredStagedAttachments(
       }
     }
   };
-  const hasValidMirror = async (stagedPath: string): Promise<boolean> => {
-    const mirrorPath = resolveStagedAttachmentMirrorPath(sessionDir, stagedPath);
-    if (mirrorPath == null) return false;
-    try {
-      const [source, mirror] = await Promise.all([
-        fsPromises.lstat(path.join(workspacePath, stagedPath)),
-        fsPromises.lstat(mirrorPath),
-      ]);
-      // Rehydration skips mirror files over the staging cap, so those count as lost too.
-      return (
-        source.isFile() &&
-        mirror.isFile() &&
-        mirror.size === source.size &&
-        mirror.size <= MAX_STAGED_ATTACHMENT_SIZE_BYTES
-      );
-    } catch {
-      return false;
-    }
-  };
+  const hasValidMirror = (stagedPath: string): Promise<boolean> =>
+    stagedAttachmentMirrorMatchesCheckout({ workspacePath, sessionDir, stagedPath });
   for (const stagingDir of STAGED_ATTACHMENT_DIRS) {
     // Only a real directory chain (no symlinked `.xum` or staging dir) holds staged uploads.
     const [metadataDir] = stagingDir.split("/");

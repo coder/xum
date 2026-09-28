@@ -11,10 +11,7 @@ import path from "path";
 import os from "os";
 import { execFileSync } from "child_process";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import {
-  resolveStagedAttachmentMirrorPath,
-  stageWorkspaceAttachment,
-} from "@/node/utils/attachments/stageWorkspaceAttachment";
+import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspaceAttachment";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -2955,7 +2952,12 @@ describe("WorkspaceService snapshot archive backfills pre-mirror staged attachme
   test("mirrors a referenced pre-mirror upload before listing lossy files", async () => {
     const stagedPath = await stagePreMirrorUpload(Buffer.from("referenced, not yet mirrored"));
     const sessionDir = path.join(harness.config.sessionsDir, workspaceId);
-    const mirrorPath = resolveStagedAttachmentMirrorPath(sessionDir, stagedPath)!;
+    // `.xum/user-attachments/<uuid>/<name>` is mirrored at `staged-attachments/<uuid>/<name>`.
+    const mirrorPath = path.join(
+      sessionDir,
+      "staged-attachments",
+      ...stagedPath.split("/").slice(2)
+    );
     useSnapshotService(async () => {
       const mirrored = await fsPromises.access(mirrorPath).then(
         () => true,
