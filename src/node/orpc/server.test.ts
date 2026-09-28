@@ -54,9 +54,10 @@ async function waitForWebSocketOpen(ws: WebSocket): Promise<void> {
 }
 
 async function waitForWebSocketRejection(ws: WebSocket): Promise<void> {
-  // Bun >= 1.3.10 re-emits 'error' when the caller's terminate() runs after the rejected
-  // handshake but before 'close'. The listeners below detach once settled, so keep one for
-  // the socket's lifetime; otherwise that re-emitted error is thrown as unhandled.
+  // Since Bun 1.3.10 the `ws` client shim's once() installs two native forwarders, so a
+  // rejected handshake fires 'error' twice (and terminate() before 'close' re-emits it).
+  // The listeners below detach once settled, so keep one for the socket's lifetime;
+  // otherwise the extra 'error' is thrown as unhandled.
   ws.on("error", () => undefined);
   return new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
