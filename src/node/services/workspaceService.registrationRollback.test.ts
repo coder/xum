@@ -871,6 +871,26 @@ describe("WorkspaceService registration rollback (#4745)", () => {
       });
     });
 
+    // A devcontainer stores the fork's plan inside its container; the host file at the same path is
+    // someone else's.
+    test("devcontainer fork rollback leaves the host plan path alone", async () => {
+      await withTempMuxRoot(async (root) => {
+        spyOn(devcontainerCli, "devcontainerDown").mockResolvedValue(undefined);
+        const source = await service.create(projectPath, "dc-src", "main", undefined, {
+          type: "devcontainer",
+          configPath: ".devcontainer/devcontainer.json",
+        });
+        if (!source.success) throw new Error(source.error);
+        const hostPlan = await writePlanFile(root, "project", "dc-fork");
+        spyOn(runtimeHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValueOnce(
+          "~/.xum/plans/project/dc-fork.md"
+        );
+
+        await expectFailsWithSaveError(() => service.fork(source.data.metadata.id, "dc-fork"));
+        expect(await exists(hostPlan)).toBe(true);
+      });
+    });
+
     // Item 2: a devcontainer creation owns only its host worktree before init runs; no container
     // exists yet, and `devcontainer down` matches containers by path, so it must not run.
     test.each([

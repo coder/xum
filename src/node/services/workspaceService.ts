@@ -12850,8 +12850,15 @@ export class WorkspaceService
           }
         }
         // A later workspace with this name would inherit the copy. Only once the entry is gone,
-        // like the checkout: while it persists, the workspace still references its plan.
-        if (rolledBack && copiedPlanPath !== undefined) {
+        // like the checkout: while it persists, the workspace still references its plan. Not for
+        // devcontainers: the copy is inside the container, and deletePlanFiles would remove the
+        // host file at the same path instead, which is not this fork's (#4775 keeps devcontainer
+        // fork rollback open).
+        if (
+          rolledBack &&
+          copiedPlanPath !== undefined &&
+          !isDevcontainerRuntime(forkedRuntimeConfig)
+        ) {
           const planDeleted = await this.deletePlanFiles(
             targetRuntime,
             forkedRuntimeConfig,
