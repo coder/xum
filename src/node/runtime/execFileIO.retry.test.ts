@@ -303,7 +303,6 @@ describe("real SSH2 acquisition failure shapes (#5034)", () => {
     const config: SSHRuntimeConfig = {
       host: "127.0.0.1",
       port: (server.address() as AddressInfo).port,
-      user: "testuser",
       identityFile,
       srcBaseDir: "/remote/src",
     };
